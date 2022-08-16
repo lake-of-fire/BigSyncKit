@@ -746,7 +746,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 if property.type == PropertyType.object {
                     if let target = object.value(forKey: property.name) as? Object {
-                        let targetIdentifier = self.getStringIdentifier(for: target, usingPrimaryKey: primaryKey)
+                        let targetPrimaryKey = (type(of: target).primaryKey() ?? target.objectSchema.primaryKeyProperty?.name)!
+                        let targetIdentifier = self.getStringIdentifier(for: target, usingPrimaryKey: targetPrimaryKey)
                         let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
                         let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                         // if we set the parent we must make the action .deleteSelf, otherwise we get errors if we ever try to delete the parent record
