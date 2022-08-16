@@ -406,6 +406,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             return try! ObjectId(string: objectIdentifier)
         case .string:
             return objectIdentifier
+        case .UUID:
+            return UUID(uuidString: objectIdentifier)
         default:
             return objectIdentifier
         }
@@ -688,6 +690,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 break
             }
             
+            if !hasRealmObjectClass(name: syncedEntity.entityType) {
+                continue
+            }
+            
             var entity: SyncedEntity! = syncedEntity
             while entity != nil && entity.state == state.rawValue && !includedEntityIDs.contains(entity.identifier) {
                 var parentEntity: SyncedEntity? = nil
@@ -751,10 +757,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             parent = target
                         }
                     }
-                } else if !property.isArray &&
-                            property.type != PropertyType.linkingObjects &&
-                            !(property.name == objectClass.primaryKey()!) {
-                    
+                } else if (
+                    !property.isArray &&
+                    property.type != PropertyType.linkingObjects &&
+                    !(property.name == (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!)
+                ) {
                     let value = object.value(forKey: property.name)
                     if property.type == PropertyType.data,
                         let data = value as? Data,
@@ -920,7 +927,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         
                         if let object = object {
                             
-                            let primaryKey = objectClass.primaryKey()!
+                            let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
                             let stringIdentifier = getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                             self.realmProvider.targetRealm.delete(object)
                         }

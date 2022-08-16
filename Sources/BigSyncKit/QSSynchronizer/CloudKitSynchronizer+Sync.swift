@@ -378,7 +378,7 @@ extension CloudKitSynchronizer {
         }
     }
     
-    func uploadRecords(adapter: ModelAdapter,  completion: @escaping (Error?)->()) {
+    func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?)->()) {
         let records = adapter.recordsToUpload(limit: batchSize)
         let recordCount = records.count
         let requestedBatchSize = batchSize
