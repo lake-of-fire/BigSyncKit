@@ -122,7 +122,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public var forceDataTypeInsteadOfAsset: Bool = false
     
     private lazy var tempFileManager: TempFileManager = {
-        TempFileManager(identifier: "\(recordZoneID.ownerName).\(recordZoneID.zoneName)")
+        TempFileManager(identifier: "\(recordZoneID.ownerName).\(recordZoneID.zoneName).\(targetRealmConfiguration.fileURL?.lastPathComponent ?? UUID().uuidString).\(targetRealmConfiguration.schemaVersion)")
     }()
     
     var realmProvider: RealmProvider!
