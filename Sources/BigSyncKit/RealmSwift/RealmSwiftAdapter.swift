@@ -407,7 +407,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         case .string:
             return objectIdentifier
         case .UUID:
-            return UUID(uuidString: objectIdentifier)
+            return UUID(uuidString: objectIdentifier)!
         default:
             return objectIdentifier
         }
@@ -427,6 +427,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             return try! ObjectId(string: stringObjectId)
         case .string:
             return stringObjectId
+        case .UUID:
+            return UUID(uuidString: stringObjectId)!
         default:
             return stringObjectId
         }
