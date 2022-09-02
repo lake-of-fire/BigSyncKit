@@ -53,6 +53,7 @@ extension CloudKitSynchronizer {
                             adapter.deleteChangeTracking()
                             self.removeModelAdapter(adapter)
                         }
+                        self.fetchChanges()
                     default:
                         break
                     }
