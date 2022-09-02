@@ -43,6 +43,20 @@ extension CloudKitSynchronizer {
             if let error = error {
                 self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [CloudKitSynchronizer.errorKey: error])
                 self.delegate?.synchronizerDidfailToSync(self, error: error)
+                
+                if let error = error as? CKError {
+                    switch error.code {
+                    case .changeTokenExpired:
+                        // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
+                        self.resetDatabaseToken()
+                        for adapter in self.modelAdapters {
+                            adapter.deleteChangeTracking()
+                            self.removeModelAdapter(adapter)
+                        }
+                    default:
+                        break
+                    }
+                }
             } else {
                 self.postNotification(.SynchronizerDidSynchronize)
                 self.delegate?.synchronizerDidSync(self)
