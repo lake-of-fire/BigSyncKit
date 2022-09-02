@@ -346,8 +346,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             try? realmProvider.persistenceRealm.safeWrite {
                 if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
-                    syncedEntity.state = SyncedEntityState.changed.rawValue
-                    // If state was New then leave it as that
+                    syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
+                    // If state was New (or Modified already) then leave it as that
                 }
             }
         }
@@ -364,10 +364,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @discardableResult
     func createSyncedEntity(entityType: String, identifier: String, realm: Realm) -> SyncedEntity {
-        let syncedEntity = SyncedEntity(entityType: entityType, identifier: "\(entityType).\(identifier)", state: SyncedEntityState.new.rawValue)
+        let syncedEntity = SyncedEntity(entityType: entityType, identifier: "\(entityType).\(identifier)", state: SyncedEntityState.newOrChanged.rawValue)
         
         try? realm.safeWrite {
-            realm.add(syncedEntity)
+            realm.add(syncedEntity, update: .modified)
         }
         
         return syncedEntity
@@ -459,7 +459,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func applyChanges(in record: CKRecord, to object: Object, syncedEntity: SyncedEntity, realmProvider: RealmProvider) {
-        if syncedEntity.state == SyncedEntityState.changed.rawValue || syncedEntity.state == SyncedEntityState.new.rawValue {
+        if syncedEntity.state == SyncedEntityState.newOrChanged.rawValue {
             if mergePolicy == .server {
                 for property in object.objectSchema.properties {
                     if shouldIgnore(key: property.name) {
@@ -740,7 +740,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var parent: Object? = nil
         
         for property in object.objectSchema.properties {
-            if entityState == SyncedEntityState.new.rawValue || entityState == SyncedEntityState.changed.rawValue {
+            if entityState == SyncedEntityState.newOrChanged.rawValue {
                 if let recordProcessingDelegate = recordProcessingDelegate,
                    !recordProcessingDelegate.shouldProcessPropertyBeforeUpload(propertyName: property.name, object: object, record: record) {
                     continue
@@ -783,8 +783,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         if let parentKey = parentKey,
-            entityState == SyncedEntityState.new.rawValue || entityState == SyncedEntityState.changed.rawValue,
-            let reference = record[parentKey] as? CKRecord.Reference {
+           entityState == SyncedEntityState.newOrChanged.rawValue,
+           let reference = record[parentKey] as? CKRecord.Reference {
             
             record.parent = CKRecord.Reference(recordID: reference.recordID, action: .none)
             if let parent = parent {
@@ -971,7 +971,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         executeOnMainQueue {
             
             let recordLimit = limit == 0 ? Int.max : limit
-            var uploadingState = SyncedEntityState.new
+            var uploadingState = SyncedEntityState.newOrChanged
             
             var innerLimit = recordLimit
             while recordsArray.count < recordLimit && uploadingState.rawValue < SyncedEntityState.deleted.rawValue {

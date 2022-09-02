@@ -8,8 +8,7 @@
 import Foundation
 
 enum SyncedEntityState: Int {
-    case new = 0
-    case changed
+    case newOrChanged = 1
     case deleted
     case synced
     case inserted
