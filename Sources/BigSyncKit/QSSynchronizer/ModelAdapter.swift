@@ -111,9 +111,4 @@ public extension Notification.Name {
     /// Delete existing `CKShare` for given model object.
     /// - Parameter object: Model object.
     @available(iOS 10.0, OSX 10.12, *) func deleteShare(for object: AnyObject)
-    
-    /// Returns a list of records for the given object and any parent records, recursively.
-    /// - Parameter object: Model object.
-    /// - Returns: Array of `CKRecord`
-    func recordsToUpdateParentRelationshipsForRoot(_ object: AnyObject) -> [CKRecord]
 }

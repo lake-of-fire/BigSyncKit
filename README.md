@@ -6,11 +6,12 @@ Fork of [mentrena's SyncKit](https://mentrena.github.io/SyncKit) for these reaso
 
 - Scales to larger Realm databases
 - Supports UUID primary keys
+- Moves most operations from the main thread into background threads (see BackgroundWorker)
 
 The downsides that were traded off to achieve this:
 - Gives up ability to use fine-grained changed properties notifications to resolve merge conflicts. This was not a default behavior in SyncKit but could be enabled via the `client` merge policy.
 - Removes CoreData support in order to simplify maintenance needed for this fork, and because it can better focus on the primary use case of this fork.
-- Requires using isDeleted soft-deletes for reliable deletion sync. Cleans up automatically, deleting corresponding CKRecords and Realm objects.
+- Requires using isDeleted soft-deletes for reliable deletion sync. (Future to-do: Cleans up automatically, deleting corresponding CKRecords and Realm objects.)
 
 -------------
 **Old readme copied below:**

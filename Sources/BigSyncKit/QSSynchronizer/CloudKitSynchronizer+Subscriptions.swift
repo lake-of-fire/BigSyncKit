@@ -73,7 +73,7 @@ import CloudKit
                     subscriptionsToSave: [subscription],
                     subscriptionIDsToDelete: []
                 )
-                operation.qualityOfService = .userInitiated
+//                operation.qualityOfService = .userInitiated
                 self.database.add(operation)
             }
         }
@@ -125,7 +125,7 @@ import CloudKit
                     subscriptionsToSave: [subscription],
                     subscriptionIDsToDelete: []
                 )
-                operation.qualityOfService = .userInitiated
+//                operation.qualityOfService = .userInitiated
                 self.database.add(operation)
             }
         }
