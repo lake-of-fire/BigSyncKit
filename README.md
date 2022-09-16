@@ -4,8 +4,9 @@ Synchronize RealmSwift databases with CloudKit.
 
 Fork of [mentrena's SyncKit](https://mentrena.github.io/SyncKit) for these reasons:
 
-- Scales to larger Realm databases
+- Scales to much larger Realm databases
 - Supports UUID primary keys
+- Supports List properties for primitives and custom object types
 - Moves most operations from the main thread into background threads (see BackgroundWorker)
 
 The downsides that were traded off to achieve this:

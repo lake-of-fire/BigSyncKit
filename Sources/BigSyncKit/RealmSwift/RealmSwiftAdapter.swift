@@ -358,7 +358,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         if !hasChanges && isNewChange {
             hasChanges = true
-            NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
+            }
         }
     }
     
