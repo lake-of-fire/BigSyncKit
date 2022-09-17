@@ -16,16 +16,6 @@ import UIKit
 import RealmSwift
 import Realm
 
-func executeOnMainQueue(_ closure: () -> ()) {
-    if Thread.isMainThread {
-        closure()
-    } else {
-        DispatchQueue.main.sync {
-            closure()
-        }
-    }
-}
-
 extension Realm {
     public func safeWrite(_ block: (() throws -> Void)) throws {
         if isInWriteTransaction {
@@ -159,20 +149,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func invalidateRealmAndTokens() {
-        executeOnMainQueue {
-            for token in collectionNotificationTokens {
-                token.invalidate()
-            }
-            collectionNotificationTokens.removeAll()
-            
-            realmProvider?.persistenceRealm.invalidate()
-            realmProvider = nil
+        for token in collectionNotificationTokens {
+            token.invalidate()
         }
+        collectionNotificationTokens.removeAll()
+        
+        realmProvider?.persistenceRealm.invalidate()
+        realmProvider = nil
     }
     
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 1
+        configuration.schemaVersion = 2
         configuration.migrationBlock = { migration, oldSchemaVersion in
             
         }
@@ -206,7 +194,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     for index in insertions {
                         let object = collection[index]
                         
-                        if (object as? SyncedDeletable)?.isDeleted ?? false {
+                        if (object as? SyncableObject)?.isDeleted ?? false {
                             continue
                         }
                         
@@ -224,7 +212,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     for index in modifications {
                         let object = collection[index]
                         let identifier = self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                        let isDeletion = (object as? SyncedDeletable)?.isDeleted ?? false
+                        let isDeletion = (object as? SyncableObject)?.isDeleted ?? false
                         /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
                          * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
                          */
@@ -256,7 +244,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         updateHasChanges(realm: realmProvider.persistenceRealm)
         
         if hasChanges {
-            NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
+            }
         }
         
         startObservingTermination()
@@ -919,20 +909,22 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func startObservingTermination() {
-        #if os(iOS) || os(tvOS)
-        NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: UIApplication.willTerminateNotification, object: nil)
-        #elseif os(macOS)
-        NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: NSApplication.willTerminateNotification, object: nil)
-        #endif
+        Task { @MainActor in
+#if os(iOS) || os(tvOS)
+            NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: UIApplication.willTerminateNotification, object: nil)
+#elseif os(macOS)
+            NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: NSApplication.willTerminateNotification, object: nil)
+#endif
+        }
     }
     
     /// Deletes soft-deleted objects.
     @objc func cleanUp() {
         for schema in realmProvider.targetRealm.schema.objectSchema {
             let objectClass = realmObjectClass(name: schema.className)
-            guard objectClass.self is SyncedDeletable.Type else { continue }
+            guard objectClass.self is SyncableObject.Type else { continue }
             
-            let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? SyncedDeletable)?.isDeleted ?? false }
+            let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? SyncableObject)?.isDeleted ?? false }
             realmProvider.targetRealm.beginWrite()
             results.forEach({ realmProvider.targetRealm.delete($0) })
             commitTargetWriteTransactionWithoutNotifying()
@@ -951,7 +943,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         if let relationships = childRelationships[syncedEntity.entityType] {
             for relationship in relationships {
-                
                 let objectID = getObjectIdentifier(for: syncedEntity)
                 let objectClass = realmObjectClass(name: syncedEntity.entityType) as Object.Type
                 if let object = realmProvider.targetRealm.object(ofType: objectClass.self, forPrimaryKey: objectID) {
@@ -972,13 +963,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         return records
     }
-    
-//    - (RLMResults *)childrenOf:(RLMObject *)parent withRelationship:(QSChildRelationship *)relationship
-//    {
-//    Class objectClass = NSClassFromString(relationship.childEntityName);
-//    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"%K == %@", relationship.childParentKey, parent];
-//    return [objectClass objectsInRealm:parent.realm withPredicate:predicate];
-//    }
     
     // MARK: - QSModelAdapter
     
@@ -1047,7 +1031,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 if let syncedEntity = self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: self.realmProvider.persistenceRealm) {
                     
                     if syncedEntity.entityType != "CKShare" {
-                        
                         let objectClass = self.realmObjectClass(name: syncedEntity.entityType)
                         let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
                         let object = self.realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
@@ -1262,7 +1245,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     public func deleteChangeTracking() {
-        invalidateRealmAndTokens()
+        BackgroundWorker.shared.start { [weak self] in
+            self?.invalidateRealmAndTokens()
+        }
         
         let config = self.persistenceRealmConfiguration
         let realmFileURLs: [URL] = [config.fileURL,
