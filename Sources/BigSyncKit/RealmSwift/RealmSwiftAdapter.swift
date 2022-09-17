@@ -486,10 +486,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         continue
                     }
                     
-                    if !shouldIgnore(key: property.name)
-                        && property.type != .object)
-                        !(record[property.name] is CKRecord.Reference) {
-
+                    if !shouldIgnore(key: property.name) {
                         if let asset = record[property.name] as? CKAsset {
                             recordChanges[property.name] = asset.fileURL != nil ? NSData(contentsOf: asset.fileURL!) : NSNull()
                         } else {
