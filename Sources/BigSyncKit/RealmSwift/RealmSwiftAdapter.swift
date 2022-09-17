@@ -811,8 +811,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             parentKey = type(of: childObject).parentKey()
         }
         
-        var parent: Object? = nil
-        
         for property in object.objectSchema.properties {
             if entityState == SyncedEntityState.newOrChanged.rawValue {
                 if let recordProcessingDelegate = recordProcessingDelegate,
@@ -827,9 +825,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
                         let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                         record[property.name] = recordID.recordName as CKRecordValue
-                        if parentKey == property.name {
-                            parent = target
-                        }
                     }
                 } else if property.isArray {
                     // Array handling forked from IceCream: https://github.com/caiyue1993/IceCream/blob/b29dfe81e41cc929c8191c3266189a7070cb5bc5/IceCream/Classes/CKRecordConvertible.swift
@@ -1036,9 +1031,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         let object = self.realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
                         
                         if let object = object {
-                            
-                            let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
-                            let stringIdentifier = self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                             self.realmProvider.targetRealm.delete(object)
                         }
                     }
