@@ -33,7 +33,6 @@ public enum MultiRealmCollectionChange {
 }
 
 public class MultiRealmObserver {
-    
     let id: UUID
     let block: (MultiRealmCollectionChange) -> Void
     private let _invalidate: (UUID) -> Void
@@ -57,7 +56,6 @@ private class WeakReference<T: AnyObject> {
 }
 
 public class MultiRealmResultsController<T: Object> {
-    
     public private(set) var results: [Results<T>]
     private var realmTokens: [NotificationToken] = []
     private var listeners: [WeakReference<MultiRealmObserver>] = []
@@ -92,7 +90,6 @@ public class MultiRealmResultsController<T: Object> {
     }
     
     private func updateResults() {
-        
         results = [Results<T>]()
         
         provider.realms.forEach { (zoneID, configuration) in
@@ -128,7 +125,6 @@ public class MultiRealmResultsController<T: Object> {
     }
     
     @objc func didChangeAdapters(notification: Notification) {
-        
         DispatchQueue.main.async {
             self.updateResults()
             self.didChangeRealms?(self)

@@ -9,6 +9,5 @@ import Foundation
 import RealmSwift
 
 class ServerToken: Object {
-    
     @objc dynamic var token: Data? = nil
 }

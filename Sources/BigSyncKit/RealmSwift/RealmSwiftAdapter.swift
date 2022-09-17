@@ -14,6 +14,7 @@ import Cocoa
 import UIKit
 #endif
 import RealmSwift
+import Realm
 
 func executeOnMainQueue(_ closure: () -> ()) {
     if Thread.isMainThread {
@@ -44,7 +45,7 @@ public protocol RealmSwiftAdapterDelegate: AnyObject {
      *  @param changeDictionary Dictionary containing keys and values with changes for the managed object. Values can be [NSNull null] to represent a nil value.
      *  @param object           The `RLMObject` that has changed on iCloud.
      */
-    func realmSwiftAdapter(_ adapter:RealmSwiftAdapter, gotChanges changes: [String: Any], object: Object)
+    func realmSwiftAdapter(_ adapter:RealmSwiftAdapter, gotChanges changes: [String: Any], object: Object) -> Bool
 }
 
 public protocol RealmSwiftAdapterRecordProcessing: AnyObject {
@@ -471,21 +472,22 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     if shouldIgnore(key: property.name) {
                         continue
                     }
-                    if property.isArray || property.type == PropertyType.linkingObjects {
+                    if property.type == PropertyType.linkingObjects {
                         continue
                     }
                     
-                    applyChange(property: property.name, record: record, object: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
+                    applyChange(property: property, record: record, object: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
                 }
             } else if mergePolicy == .custom {
                 var recordChanges = [String: Any]()
                 
                 for property in object.objectSchema.properties {
-                    if property.isArray || property.type == PropertyType.linkingObjects {
+                    if property.type == PropertyType.linkingObjects {
                         continue
                     }
                     
-                    if !shouldIgnore(key: property.name) &&
+                    if !shouldIgnore(key: property.name)
+                        && property.type != .object)
                         !(record[property.name] is CKRecord.Reference) {
 
                         if let asset = record[property.name] as? CKAsset {
@@ -496,23 +498,35 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
                 
-                delegate?.realmSwiftAdapter(self, gotChanges: recordChanges, object: object)
+                if delegate?.realmSwiftAdapter(self, gotChanges: recordChanges, object: object) ?? false {
+                    for property in object.objectSchema.properties {
+                        if shouldIgnore(key: property.name) {
+                            continue
+                        }
+                        if property.type == PropertyType.linkingObjects {
+                            continue
+                        }
+                        
+                        applyChange(property: property, record: record, object: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
+                    }
+                }
             }
         } else {
             for property in object.objectSchema.properties {
                 if shouldIgnore(key: property.name) {
                     continue
                 }
-                if property.isArray || property.type == PropertyType.linkingObjects {
+                if property.type == PropertyType.linkingObjects {
                     continue
                 }
                 
-                applyChange(property: property.name, record: record, object: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
+                applyChange(property: property, record: record, object: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
             }
         }
     }
     
-    func applyChange(property key: String, record: CKRecord, object: Object, syncedEntity: SyncedEntity, realmProvider: RealmProvider) {
+    func applyChange(property: Property, record: CKRecord, object: Object, syncedEntity: SyncedEntity, realmProvider: RealmProvider) {
+        let key = property.name
         if key == object.objectSchema.primaryKeyProperty!.name {
             return
         }
@@ -523,10 +537,78 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         let value = record[key]
-        if let reference = value as? CKRecord.Reference {
+        
+        // List support forked from IceCream: https://github.com/caiyue1993/IceCream/blob/master/IceCream/Classes/CKRecordRecoverable.swift
+        var recordValue: Any?
+        if property.isArray {
+            switch property.type {
+            case .int:
+                guard let value = record.value(forKey: property.name) as? [Int] else { break }
+                let list = List<Int>()
+                list.append(objectsIn: value)
+                recordValue = list
+            case .string:
+                guard let value = record.value(forKey: property.name) as? [String] else { break }
+                let list = List<String>()
+                list.append(objectsIn: value)
+                recordValue = list
+            case .bool:
+                guard let value = record.value(forKey: property.name) as? [Bool] else { break }
+                let list = List<Bool>()
+                list.append(objectsIn: value)
+                recordValue = list
+            case .float:
+                guard let value = record.value(forKey: property.name) as? [Float] else { break }
+                let list = List<Float>()
+                list.append(objectsIn: value)
+                recordValue = list
+            case .double:
+                guard let value = record.value(forKey: property.name) as? [Double] else { break }
+                let list = List<Double>()
+                list.append(objectsIn: value)
+                recordValue = list
+            case .data:
+                guard let value = record.value(forKey: property.name) as? [Data] else { break }
+                let list = List<Data>()
+                list.append(objectsIn: value)
+                recordValue = list
+            case .date:
+                guard let value = record.value(forKey: property.name) as? [Date] else { break }
+                let list = List<Date>()
+                list.append(objectsIn: value)
+                recordValue = list
+            case .object:
+                // Save relationship to be applied after all records have been downloaded and persisted
+                // to ensure target of the relationship has already been created
+                if let value = record.value(forKey: property.name) as? [String] {
+                    for recordName in value {
+                        let separatorRange = recordName.range(of: ".")!
+                        let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        savePendingRelationship(name: property.name, syncedEntity: syncedEntity, targetIdentifier: objectIdentifier, realm: realmProvider.persistenceRealm)
+                    }
+                } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
+                    for reference in value {
+                        guard let recordName = reference.value(forKey: property.name) as? String else { return }
+                        let separatorRange = recordName.range(of: ".")!
+                        let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        savePendingRelationship(name: property.name, syncedEntity: syncedEntity, targetIdentifier: objectIdentifier, realm: realmProvider.persistenceRealm)
+                    }
+                }
+            default:
+                break
+            }
+            object.setValue(recordValue, forKey: property.name)
+        } else if let reference = value as? CKRecord.Reference {
             // Save relationship to be applied after all records have been downloaded and persisted
             // to ensure target of the relationship has already been created
             let recordName = reference.recordID.recordName
+            let separatorRange = recordName.range(of: ".")!
+            let objectIdentifier = String(recordName[separatorRange.upperBound...])
+            savePendingRelationship(name: key, syncedEntity: syncedEntity, targetIdentifier: objectIdentifier, realm: realmProvider.persistenceRealm)
+        } else if property.type == .object {
+            // Save relationship to be applied after all records have been downloaded and persisted
+            // to ensure target of the relationship has already been created
+            guard let recordName = record.value(forKey: property.name) as? String else { return }
             let separatorRange = recordName.range(of: ".")!
             let objectIdentifier = String(recordName[separatorRange.upperBound...])
             savePendingRelationship(name: key, syncedEntity: syncedEntity, targetIdentifier: objectIdentifier, realm: realmProvider.persistenceRealm)
@@ -535,7 +617,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 let data =  NSData(contentsOf: fileURL) {
                 object.setValue(data, forKey: key)
             }
-        } else if value != nil || object.objectSchema[key]?.isOptional == true {
+        } else if value != nil || property.isOptional == true {
             // If property is not a relationship or value is nil and property is optional.
             // If value is nil and property is non-optional, it is ignored. This is something that could happen
             // when extending an object model with a new non-optional property, when an old record is applied to the object.
@@ -722,7 +804,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let record = getRecord(for: syncedEntity) ?? CKRecord(recordType: syncedEntity.entityType, recordID: CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
         
         let objectClass = realmObjectClass(name: syncedEntity.entityType)
-        let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
         let objectIdentifier = getObjectIdentifier(for: syncedEntity)
         let object = realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
         let entityState = syncedEntity.state
@@ -758,16 +839,65 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         let targetIdentifier = self.getStringIdentifier(for: target, usingPrimaryKey: targetPrimaryKey)
                         let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
                         let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
-                        // if we set the parent we must make the action .deleteSelf, otherwise we get errors if we ever try to delete the parent record
-                        let action: CKRecord.Reference.Action = parentKey == property.name ? .deleteSelf : .none
-                        let recordReference = CKRecord.Reference(recordID: recordID, action: action)
-                        record[property.name] = recordReference;
+                        record[property.name] = recordID.recordName as CKRecordValue
                         if parentKey == property.name {
                             parent = target
                         }
                     }
+                } else if property.isArray {
+                    // Array handling forked from IceCream: https://github.com/caiyue1993/IceCream/blob/b29dfe81e41cc929c8191c3266189a7070cb5bc5/IceCream/Classes/CKRecordConvertible.swift
+                    let value = object.value(forKey: property.name)
+                    switch property.type {
+                    case .object:
+                        /// We may get List<Cat> here
+                        /// The item cannot be casted as List<Object>
+                        /// It can be casted at a low-level type `ListBase`
+                        /// Updated -- see: https://github.com/caiyue1993/IceCream/pull/256#issuecomment-1034336992
+                        guard let list = value as? RLMSwiftCollectionBase, list._rlmCollection.count > 0 else { break }
+                        var referenceArray = [String]()
+                        let wrappedArray = list._rlmCollection
+                        for index in 0..<wrappedArray.count {
+                            guard let object = wrappedArray[index] as? Object, let targetPrimaryKey = (type(of: object).primaryKey() ?? object.objectSchema.primaryKeyProperty?.name) else { continue }
+                            #warning("Confirm here that isDeleted is false before referencing, as icecream does (link above)")
+                            let targetIdentifier = self.getStringIdentifier(for: object, usingPrimaryKey: targetPrimaryKey)
+                            let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
+                            let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
+                            referenceArray.append(recordID.recordName)
+                        }
+                        record[property.name] = referenceArray as CKRecordValue
+                    case .int:
+                        guard let list = value as? List<Int>, !list.isEmpty else { break }
+                        let array = Array(list)
+                        record[property.name] = array as CKRecordValue
+                    case .string:
+                        guard let list = value as? List<String>, !list.isEmpty else { break }
+                        let array = Array(list)
+                        record[property.name] = array as CKRecordValue
+                    case .bool:
+                        guard let list = value as? List<Bool>, !list.isEmpty else { break }
+                        let array = Array(list)
+                        record[property.name] = array as CKRecordValue
+                    case .float:
+                        guard let list = value as? List<Float>, !list.isEmpty else { break }
+                        let array = Array(list)
+                        record[property.name] = array as CKRecordValue
+                    case .double:
+                        guard let list = value as? List<Double>, !list.isEmpty else { break }
+                        let array = Array(list)
+                        record[property.name] = array as CKRecordValue
+                    case .data:
+                        guard let list = value as? List<Data>, !list.isEmpty else { break }
+                        let array = Array(list)
+                        record[property.name] = array as CKRecordValue
+                    case .date:
+                        guard let list = value as? List<Date>, !list.isEmpty else { break }
+                        let array = Array(list)
+                        record[property.name] = array as CKRecordValue
+                    default:
+                        // Other inner types of List is not supported yet
+                        break
+                    }
                 } else if (
-                    !property.isArray &&
                     property.type != PropertyType.linkingObjects &&
                     !(property.name == (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!)
                 ) {
@@ -785,16 +915,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         record[property.name] = recordValue
                     }
                 }
-            }
-        }
-        
-        if let parentKey = parentKey,
-           entityState == SyncedEntityState.newOrChanged.rawValue,
-           let reference = record[parentKey] as? CKRecord.Reference {
-            
-            record.parent = CKRecord.Reference(recordID: reference.recordID, action: .none)
-            if let parent = parent {
-                parentSyncedEntity = self.syncedEntity(for: parent, realm: realmProvider.persistenceRealm)
             }
         }
         

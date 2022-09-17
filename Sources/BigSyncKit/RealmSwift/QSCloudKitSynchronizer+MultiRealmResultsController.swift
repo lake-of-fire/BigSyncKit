@@ -9,9 +9,7 @@ import Foundation
 import RealmSwift
 
 extension CloudKitSynchronizer {
-    
     public func multiRealmResultsController<T: Object>(predicate: NSPredicate? = nil) -> MultiRealmResultsController<T>? {
-        
         if let provider = self.adapterProvider as? DefaultRealmProvider {
             return MultiRealmResultsController(provider: provider, predicate: predicate)
         }
