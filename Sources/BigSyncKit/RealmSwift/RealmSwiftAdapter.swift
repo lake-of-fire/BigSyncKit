@@ -194,7 +194,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     for index in insertions {
                         let object = collection[index]
                         
-                        if (object as? SyncableObject)?.isDeleted ?? false {
+                        if (object as? (any SyncableObject))?.isDeleted ?? false {
                             continue
                         }
                         
@@ -212,7 +212,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     for index in modifications {
                         let object = collection[index]
                         let identifier = self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                        let isDeletion = (object as? SyncableObject)?.isDeleted ?? false
+                        let isDeletion = (object as? (any SyncableObject))?.isDeleted ?? false
                         /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
                          * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
                          */
@@ -917,9 +917,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @objc func cleanUp() {
         for schema in realmProvider.targetRealm.schema.objectSchema {
             let objectClass = realmObjectClass(name: schema.className)
-            guard objectClass.self is SyncableObject.Type else { continue }
+            guard objectClass.self is any SyncableObject.Type else { continue }
             
-            let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? SyncableObject)?.isDeleted ?? false }
+            let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
             realmProvider.targetRealm.beginWrite()
             results.forEach({ realmProvider.targetRealm.delete($0) })
             commitTargetWriteTransactionWithoutNotifying()
