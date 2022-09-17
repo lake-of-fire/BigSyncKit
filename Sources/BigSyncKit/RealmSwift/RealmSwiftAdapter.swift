@@ -356,7 +356,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func commitTargetWriteTransactionWithoutNotifying() {
-        try? realmProvider.targetRealm.commitWrite(withoutNotifying: collectionNotificationTokens)
+        Task { @MainActor in
+            try? realmProvider.targetRealm.commitWrite(withoutNotifying: collectionNotificationTokens)
+        }
     }
     
     @discardableResult
@@ -920,7 +922,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard objectClass.self is any SyncableObject.Type else { continue }
             
             let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
-            realmProvider.targetRealm.beginWrite()
+            if results.isEmpty {
+                continue
+            }
+            if !realmProvider.targetRealm.isInWriteTransaction {
+                realmProvider.targetRealm.beginWrite()
+            }
             results.forEach({ realmProvider.targetRealm.delete($0) })
             commitTargetWriteTransactionWithoutNotifying()
         }
