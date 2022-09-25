@@ -171,7 +171,7 @@ extension CloudKitSynchronizer {
             return
         }
         
-        closure(first) { error in
+        closure(first) { [weak self] error in
             guard error == nil else {
                 final(error)
                 return
@@ -179,7 +179,7 @@ extension CloudKitSynchronizer {
             
             var remaining = objects
             remaining.removeFirst()
-            self.sequential(objects: remaining, closure: closure, final: final)
+            self?.sequential(objects: remaining, closure: closure, final: final)
         }
     }
     
@@ -332,7 +332,8 @@ extension CloudKitSynchronizer {
         
         postNotification(.SynchronizerWillUploadChanges)
         
-        uploadChanges() { (error) in
+        uploadChanges() { [weak self] (error) in
+            guard let self = self else { return }
             if let error = error {
                 if self.shouldRetryUpload(for: error as NSError) {
                     self.uploadRetries += 1
@@ -348,21 +349,22 @@ extension CloudKitSynchronizer {
     }
     
     func uploadChanges(completion: @escaping (Error?) -> ()) {
-        sequential(objects: modelAdapters, closure: setupZoneAndUploadRecords) { (error) in
+        sequential(objects: modelAdapters, closure: setupZoneAndUploadRecords) { [weak self] (error) in
             guard error == nil else { completion(error); return }
+            guard let self = self else { return }
             
             self.sequential(objects: self.modelAdapters, closure: self.uploadDeletions, final: completion)
         }
     }
     
     func setupZoneAndUploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) -> ()) {
-        setupRecordZoneIfNeeded(adapter: adapter) { (error) in
+        setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
             guard error == nil else {
                 completion(error)
                 return
             }
             
-            self.uploadRecords(adapter: adapter, completion: { (error) in
+            self?.uploadRecords(adapter: adapter, completion: { (error) in
                 completion(error)
             })
         }

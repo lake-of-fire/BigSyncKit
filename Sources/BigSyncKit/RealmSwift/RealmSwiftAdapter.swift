@@ -357,7 +357,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     func commitTargetWriteTransactionWithoutNotifying() {
         Task { @MainActor in
-            try? realmProvider.targetRealm.commitWrite(withoutNotifying: collectionNotificationTokens)
+            try? realmProvider.targetRealm.commitWrite()
+        }
+        DispatchQueue(label: "commitTargetWriteTransactionWithoutNotifying").async { [weak self] in
+            autoreleasepool { // Silence notifications on writes in thread
+                try? self?.realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+            }
         }
     }
     
@@ -917,19 +922,23 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     /// Deletes soft-deleted objects.
     @objc func cleanUp() {
-        for schema in realmProvider.targetRealm.schema.objectSchema {
-            let objectClass = realmObjectClass(name: schema.className)
-            guard objectClass.self is any SyncableObject.Type else { continue }
-            
-            let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
-            if results.isEmpty {
-                continue
+        DispatchQueue(label: "RealmSwiftAadapter.cleanUp").async { [weak self] in
+            autoreleasepool {
+                guard let self = self else { return }
+                for schema in self.realmProvider.targetRealm.schema.objectSchema {
+                    let objectClass = self.realmObjectClass(name: schema.className)
+                    guard objectClass.self is any SyncableObject.Type else { continue }
+                    
+                    let results = self.realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
+                    if results.isEmpty {
+                        continue
+                    }
+                    self.realmProvider.targetRealm.beginWrite()
+                    results.forEach({ self.realmProvider.targetRealm.delete($0) })
+//                    commitTargetWriteTransactionWithoutNotifying()
+                    try? self.realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+                }
             }
-            if !realmProvider.targetRealm.isInWriteTransaction {
-                realmProvider.targetRealm.beginWrite()
-            }
-            results.forEach({ realmProvider.targetRealm.delete($0) })
-            commitTargetWriteTransactionWithoutNotifying()
         }
     }
     
@@ -978,42 +987,45 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             return
         }
         
-        BackgroundWorker.shared.start { [weak self] in
-            guard let self = self else { return }
-            self.realmProvider.persistenceRealm.beginWrite()
-            self.realmProvider.targetRealm .beginWrite()
-            
-            for record in records {
-                var syncedEntity: SyncedEntity! = self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: self.realmProvider.persistenceRealm)
-                if syncedEntity == nil {
-                    if #available(iOS 10.0, *) {
-                        if let share = record as? CKShare {
-                            syncedEntity = self.createSyncedEntity(for: share, realmProvider: self.realmProvider)
+        DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
+            autoreleasepool {
+                guard let self = self else { return }
+                self.realmProvider.persistenceRealm.beginWrite()
+                self.realmProvider.targetRealm.beginWrite()
+                
+                for record in records {
+                    var syncedEntity: SyncedEntity! = self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: self.realmProvider.persistenceRealm)
+                    if syncedEntity == nil {
+                        if #available(iOS 10.0, *) {
+                            if let share = record as? CKShare {
+                                syncedEntity = self.createSyncedEntity(for: share, realmProvider: self.realmProvider)
+                            } else {
+                                syncedEntity = self.createSyncedEntity(record: record, realmProvider: self.realmProvider)
+                            }
                         } else {
                             syncedEntity = self.createSyncedEntity(record: record, realmProvider: self.realmProvider)
                         }
-                    } else {
-                        syncedEntity = self.createSyncedEntity(record: record, realmProvider: self.realmProvider)
-                    }
-                }
-                
-                if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
-                    let objectClass = self.realmObjectClass(name: record.recordType)
-                    let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
-                    guard let object = self.realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
-                        continue
                     }
                     
-                    self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: self.realmProvider)
-                    self.saveShareRelationship(for: syncedEntity, record: record)
+                    if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
+                        let objectClass = self.realmObjectClass(name: record.recordType)
+                        let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
+                        guard let object = self.realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
+                            continue
+                        }
+                        
+                        self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: self.realmProvider)
+                        self.saveShareRelationship(for: syncedEntity, record: record)
+                    }
+                    
+                    self.save(record: record, for: syncedEntity)
                 }
-                
-                self.save(record: record, for: syncedEntity)
+                // Order is important here. Notifications might be delivered after targetRealm is saved and
+                // it's convenient if the persistenceRealm is not in a write transaction
+                try? self.realmProvider.persistenceRealm.commitWrite()
+//                self.commitTargetWriteTransactionWithoutNotifying()
+                try? self.realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
             }
-            // Order is important here. Notifications might be delivered after targetRealm is saved and
-            // it's convenient if the persistenceRealm is not in a write transaction
-            try? self.realmProvider.persistenceRealm.commitWrite()
-            self.commitTargetWriteTransactionWithoutNotifying()
         }
     }
     
@@ -1024,34 +1036,37 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             return
         }
         
-        BackgroundWorker.shared.start { [weak self] in
-            guard let self = self else { return }
-            self.realmProvider.persistenceRealm.beginWrite()
-            self.realmProvider.targetRealm.beginWrite()
-            
-            for recordID in recordIDs {
-                if let syncedEntity = self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: self.realmProvider.persistenceRealm) {
-                    
-                    if syncedEntity.entityType != "CKShare" {
-                        let objectClass = self.realmObjectClass(name: syncedEntity.entityType)
-                        let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
-                        let object = self.realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
+        DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
+            autoreleasepool {
+                guard let self = self else { return }
+                self.realmProvider.persistenceRealm.beginWrite()
+                self.realmProvider.targetRealm.beginWrite()
+                
+                for recordID in recordIDs {
+                    if let syncedEntity = self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: self.realmProvider.persistenceRealm) {
                         
-                        if let object = object {
-                            self.realmProvider.targetRealm.delete(object)
+                        if syncedEntity.entityType != "CKShare" {
+                            let objectClass = self.realmObjectClass(name: syncedEntity.entityType)
+                            let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
+                            let object = self.realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
+                            
+                            if let object = object {
+                                self.realmProvider.targetRealm.delete(object)
+                            }
                         }
+                        
+                        if let record = syncedEntity.record {
+                            self.realmProvider.persistenceRealm.delete(record);
+                        }
+                        
+                        self.realmProvider.persistenceRealm.delete(syncedEntity)
                     }
-                    
-                    if let record = syncedEntity.record {
-                        self.realmProvider.persistenceRealm.delete(record);
-                    }
-                    
-                    self.realmProvider.persistenceRealm.delete(syncedEntity)
                 }
+                
+                try? self.realmProvider.persistenceRealm.commitWrite()
+                //                self.commitTargetWriteTransactionWithoutNotifying()
+                try? self.realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
             }
-            
-            try? self.realmProvider.persistenceRealm.commitWrite()
-            self.commitTargetWriteTransactionWithoutNotifying()
         }
     }
     
@@ -1112,16 +1127,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var recordIDs = [CKRecord.ID]()
         
-        BackgroundWorker.shared.start { [weak self] in
-            guard let self = self else { return }
-            let predicate = NSPredicate(format: "state == %ld", SyncedEntityState.deleted.rawValue)
-            let deletedEntities = self.realmProvider.persistenceRealm.objects(SyncedEntity.self).filter(predicate)
-            
-            for syncedEntity in deletedEntities {
-                if recordIDs.count >= limit {
-                    break
+        DispatchQueue(label: "recordIDsMarkedForDeletion").async { [weak self] in
+            autoreleasepool { // Silence notifications on writes in thread
+                guard let self = self else { return }
+                let predicate = NSPredicate(format: "state == %ld", SyncedEntityState.deleted.rawValue)
+                let deletedEntities = self.realmProvider.persistenceRealm.objects(SyncedEntity.self).filter(predicate)
+                
+                for syncedEntity in deletedEntities {
+                    if recordIDs.count >= limit {
+                        break
+                    }
+                    recordIDs.append(CKRecord.ID(recordName: syncedEntity.identifier, zoneID: self.zoneID))
                 }
-                recordIDs.append(CKRecord.ID(recordName: syncedEntity.identifier, zoneID: self.zoneID))
             }
         }
         
