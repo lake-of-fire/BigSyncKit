@@ -261,9 +261,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func updateHasChanges(realm: Realm) {
-        let predicate = NSPredicate(format: "state != %ld", SyncedEntityState.synced.rawValue)
-        let results = realm.objects(SyncedEntity.self).filter(predicate)
-        
+        let results = realm.objects(SyncedEntity.self).where { $0.state != SyncedEntityState.synced.rawValue }
         hasChanges = results.count > 0;
     }
     
@@ -764,8 +762,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func recordsToUpload(withState state: SyncedEntityState, limit: Int, realmProvider: RealmProvider) -> [CKRecord] {
-        let predicate = NSPredicate(format: "state == %ld", state.rawValue)
-        let results = realmProvider.persistenceRealm.objects(SyncedEntity.self).filter(predicate)
+        let results = realmProvider.persistenceRealm.objects(SyncedEntity.self).where { $0.state == state.rawValue }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
         for syncedEntity in results {
@@ -1137,7 +1134,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             autoreleasepool { // Silence notifications on writes in thread
                 guard let self = self else { return }
                 let predicate = NSPredicate(format: "state == %ld", SyncedEntityState.deleted.rawValue)
-                let deletedEntities = self.realmProvider.persistenceRealm.objects(SyncedEntity.self).filter(predicate)
+                let deletedEntities = self.realmProvider.persistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deleted.rawValue }
                 
                 for syncedEntity in deletedEntities {
                     if recordIDs.count >= limit {
