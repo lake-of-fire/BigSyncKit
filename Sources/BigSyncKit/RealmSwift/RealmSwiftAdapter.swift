@@ -890,7 +890,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     let value = object.value(forKey: property.name)
                     if property.type == PropertyType.data,
                         let data = value as? Data,
-                        forceDataTypeInsteadOfAsset == false  {
+                        forceDataTypeInsteadOfAsset == false {
                         
                         let fileURL = self.tempFileManager.store(data: data)
                         let asset = CKAsset(fileURL: fileURL)
