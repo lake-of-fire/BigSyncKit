@@ -14,6 +14,9 @@ public protocol SyncableBase: RealmSwift.Object, Identifiable, Codable {
     var needsSyncToServer: Bool { get }
 }
 
+public protocol UnownedSyncableObject: SyncableBase {
+}
+
 public protocol SyncableObject: SyncableBase {
     var owner: OwnerObject? { get }
     
