@@ -7,7 +7,7 @@ This project began with a fork of [mentrena's SyncKit](https://mentrena.github.i
 - Scales to much larger Realm databases. The goal is to scale to millions of records and beyond.
 - Supports latest RealmSwift versions with modern `@Persisted` annotation.
 - Supports UUID primary keys.
-- Supports List (Array) properties for primitives and custom object types.
+- Supports List (Array) and MutableSet (Set) properties for primitives and custom object types.
 - Moves most operations from the main thread into background threads (see BackgroundWorker).
 - Adds schema version metadata for use in custom conflict resolution and migrating older incoming data.
 

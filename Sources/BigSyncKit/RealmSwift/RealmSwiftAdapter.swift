@@ -532,7 +532,65 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         // List support forked from IceCream: https://github.com/caiyue1993/IceCream/blob/master/IceCream/Classes/CKRecordRecoverable.swift
         var recordValue: Any?
-        if property.isArray {
+        if property.isSet {
+            switch property.type {
+            case .int:
+                guard let value = record.value(forKey: property.name) as? [Int] else { break }
+                var set = Set<Int>()
+                value.forEach { set.insert($0) }
+                recordValue = set
+            case .string:
+                guard let value = record.value(forKey: property.name) as? [String] else { break }
+                var set = Set<String>()
+                value.forEach { set.insert($0) }
+                recordValue = set
+            case .bool:
+                guard let value = record.value(forKey: property.name) as? [Bool] else { break }
+                var set = Set<Bool>()
+                value.forEach { set.insert($0) }
+                recordValue = set
+            case .float:
+                guard let value = record.value(forKey: property.name) as? [Float] else { break }
+                var set = Set<Float>()
+                value.forEach { set.insert($0) }
+                recordValue = set
+            case .double:
+                guard let value = record.value(forKey: property.name) as? [Double] else { break }
+                var set = Set<Double>()
+                value.forEach { set.insert($0) }
+                recordValue = set
+            case .data:
+                guard let value = record.value(forKey: property.name) as? [Data] else { break }
+                var set = Set<Data>()
+                value.forEach { set.insert($0) }
+                recordValue = set
+            case .date:
+                guard let value = record.value(forKey: property.name) as? [Date] else { break }
+                var set = Set<Date>()
+                value.forEach { set.insert($0) }
+                recordValue = set
+            case .object:
+                // Save relationship to be applied after all records have been downloaded and persisted
+                // to ensure target of the relationship has already been created
+                if let value = record.value(forKey: property.name) as? [String] {
+                    for recordName in value {
+                        let separatorRange = recordName.range(of: ".")!
+                        let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        savePendingRelationship(name: property.name, syncedEntity: syncedEntity, targetIdentifier: objectIdentifier, realm: realmProvider.persistenceRealm)
+                    }
+                } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
+                    for reference in value {
+                        guard let recordName = reference.value(forKey: property.name) as? String else { return }
+                        let separatorRange = recordName.range(of: ".")!
+                        let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        savePendingRelationship(name: property.name, syncedEntity: syncedEntity, targetIdentifier: objectIdentifier, realm: realmProvider.persistenceRealm)
+                    }
+                }
+            default:
+                break
+            }
+            object.setValue(recordValue, forKey: property.name)
+        } else if property.isArray {
             switch property.type {
             case .int:
                 guard let value = record.value(forKey: property.name) as? [Int] else { break }
@@ -829,6 +887,58 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
                         let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                         record[property.name] = recordID.recordName as CKRecordValue
+                    }
+                } else if property.isSet {
+                    let value = object.value(forKey: property.name)
+                    switch property.type {
+                    case .object:
+                        /// We may get MutableSet<Cat> here
+                        /// The item cannot be casted as MutableSet<Object>
+                        /// It can be casted at a low-level type `SetBase`
+                        /// Updated -- see: https://github.com/caiyue1993/IceCream/pull/256#issuecomment-1034336992
+                        guard let set = value as? RLMSwiftCollectionBase, set._rlmCollection.count > 0 else { break }
+                        var referenceArray = [String]()
+                        let wrappedSet = set._rlmCollection
+                        for index in 0..<wrappedSet.count {
+                            guard let object = wrappedSet[index] as? Object, let targetPrimaryKey = (type(of: object).primaryKey() ?? object.objectSchema.primaryKeyProperty?.name) else { continue }
+                            #warning("Confirm here that isDeleted is false before referencing, as icecream does (link above)")
+                            let targetIdentifier = self.getStringIdentifier(for: object, usingPrimaryKey: targetPrimaryKey)
+                            let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
+                            let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
+                            referenceArray.append(recordID.recordName)
+                        }
+                        record[property.name] = referenceArray as CKRecordValue
+                    case .int:
+                        guard let set = value as? Set<Int>, !set.isEmpty else { break }
+                        let array = Array(set)
+                        record[property.name] = array as CKRecordValue
+                    case .string:
+                        guard let set = value as? Set<String>, !set.isEmpty else { break }
+                        let array = Array(set)
+                        record[property.name] = array as CKRecordValue
+                    case .bool:
+                        guard let set = value as? Set<Bool>, !set.isEmpty else { break }
+                        let array = Array(set)
+                        record[property.name] = array as CKRecordValue
+                    case .float:
+                        guard let set = value as? Set<Float>, !set.isEmpty else { break }
+                        let array = Array(set)
+                        record[property.name] = array as CKRecordValue
+                    case .double:
+                        guard let set = value as? Set<Double>, !set.isEmpty else { break }
+                        let array = Array(set)
+                        record[property.name] = array as CKRecordValue
+                    case .data:
+                        guard let set = value as? Set<Data>, !set.isEmpty else { break }
+                        let array = Array(set)
+                        record[property.name] = array as CKRecordValue
+                    case .date:
+                        guard let set = value as? Set<Date>, !set.isEmpty else { break }
+                        let array = Array(set)
+                        record[property.name] = array as CKRecordValue
+                    default:
+                        // Other inner types of Set is not supported yet
+                        break
                     }
                 } else if property.isArray {
                     // Array handling forked from IceCream: https://github.com/caiyue1993/IceCream/blob/b29dfe81e41cc929c8191c3266189a7070cb5bc5/IceCream/Classes/CKRecordConvertible.swift
