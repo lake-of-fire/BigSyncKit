@@ -191,7 +191,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 case .update(let collection, _, let insertions, let modifications):
                     // Deletions are covered via soft-delete (SyncedDeletable) under modifications.
                     
-                    for index in insertions {
+                    for index in insertions.filter({ $0 < collection.count }) {
                         let object = collection[index]
                         
                         if (object as? (any SyncableObject))?.isDeleted ?? false {
@@ -209,7 +209,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         }
                     }
                     
-                    for index in modifications {
+                    for index in modifications.filter({ $0 < collection.count }) {
                         let object = collection[index]
                         let identifier = self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                         let isDeletion = (object as? (any SyncableObject))?.isDeleted ?? false
