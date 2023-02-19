@@ -389,11 +389,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
         let objectIdentifier = getObjectIdentifier(for: syncedEntity)
-        let object = objectClass.init()
-        object.setValue(objectIdentifier, forKey: primaryKey)
-        realmProvider.targetRealm.add(object)
+         
+        // If the row already exists somehow (for some reasons outside of syncing), merge changes instead of crashing.
+        if let object = realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) {
+            applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
+            saveShareRelationship(for: syncedEntity, record: record)
+        } else {
+            let object = objectClass.init()
+            object.setValue(objectIdentifier, forKey: primaryKey)
+            realmProvider.targetRealm.add(object)
+        }
         
-        return syncedEntity;
+        return syncedEntity
     }
     
     func getObjectIdentifier(for syncedEntity: SyncedEntity) -> Any {
@@ -1123,7 +1130,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 self.realmProvider.targetRealm.beginWrite()
                 
                 for record in records {
-                    var syncedEntity: SyncedEntity! = self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: self.realmProvider.persistenceRealm)
+                    var syncedEntity: SyncedEntity? = self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: self.realmProvider.persistenceRealm)
                     if syncedEntity == nil {
                         if #available(iOS 10.0, *) {
                             if let share = record as? CKShare {
@@ -1134,6 +1141,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         } else {
                             syncedEntity = self.createSyncedEntity(record: record, realmProvider: self.realmProvider)
                         }
+                    }
+                    
+                    guard let syncedEntity = syncedEntity else {
+                        // Can happen when iCloud has records for a model that no longer exists locally.
+                        continue
                     }
                     
                     if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
@@ -1269,7 +1281,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         DispatchQueue(label: "recordIDsMarkedForDeletion").async { [weak self] in
             autoreleasepool { // Silence notifications on writes in thread
                 guard let self = self else { return }
-                let predicate = NSPredicate(format: "state == %ld", SyncedEntityState.deleted.rawValue)
                 let deletedEntities = self.realmProvider.persistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deleted.rawValue }
                 
                 for syncedEntity in deletedEntities {
@@ -1292,7 +1303,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 guard let self = self else { return }
                 self.realmProvider.persistenceRealm.beginWrite()
                 for recordID in deletedRecordIDs {
-                    
                     if let syncedEntity = self.realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName) {
                         if let record = syncedEntity.record {
                             self.realmProvider.persistenceRealm.delete(record)
