@@ -180,7 +180,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let needsInitialSetup = realmProvider.persistenceRealm.objects(SyncedEntity.self).count <= 0
         
         for schema in realmProvider.targetRealm.schema.objectSchema {
-            let objectClass = realmObjectClass(name: schema.className)
+            guard let objectClass = self.realmObjectClass(name: schema.className) else {
+                continue
+            }
             let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
             let results = realmProvider.targetRealm.objects(objectClass)
             
@@ -256,8 +258,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return modelTypes.keys.contains(name)
     }
     
-    func realmObjectClass(name: String) -> Object.Type {
-        return modelTypes[name]!
+    func realmObjectClass(name: String) -> Object.Type? {
+        return modelTypes[name]
     }
     
     func updateHasChanges(realm: Realm) {
@@ -269,7 +271,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         childRelationships.removeAll()
         
         for objectSchema in realmProvider.targetRealm.schema.objectSchema {
-            let objectClass = realmObjectClass(name: objectSchema.className)
+            guard let objectClass = self.realmObjectClass(name: objectSchema.className) else {
+                continue
+            }
             if let parentClass = objectClass.self as? ParentKey.Type {
                 let parentKey = parentClass.parentKey()
                 let parentProperty = objectSchema.properties.first { $0.name == parentKey }
@@ -375,12 +379,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return syncedEntity
     }
     
-    func createSyncedEntity(record: CKRecord, realmProvider: RealmProvider) -> SyncedEntity {
+    func createSyncedEntity(record: CKRecord, realmProvider: RealmProvider) -> SyncedEntity? {
         let syncedEntity = SyncedEntity(entityType: record.recordType, identifier: record.recordID.recordName, state: SyncedEntityState.synced.rawValue)
         
         realmProvider.persistenceRealm.add(syncedEntity)
         
-        let objectClass = realmObjectClass(name: record.recordType)
+        guard let objectClass = self.realmObjectClass(name: record.recordType) else {
+            return nil
+        }
         let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
         let objectIdentifier = getObjectIdentifier(for: syncedEntity)
         let object = objectClass.init()
@@ -396,7 +402,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let objectIdentifier = String(syncedEntity.identifier[index...])
         let objectClass = realmObjectClass(name: syncedEntity.entityType)
         
-        guard let objectSchema = objectClass.sharedSchema(),
+        guard let objectSchema = objectClass?.sharedSchema(),
               let keyType = objectSchema.primaryKeyProperty?.type else {
             return objectIdentifier
         }
@@ -416,8 +422,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func getObjectIdentifier(stringObjectId: String, entityType: String) -> Any? {
-        let objectClass = realmObjectClass(name: entityType)
-        guard let schema = objectClass.sharedSchema(),
+        guard let schema = self.realmObjectClass(name: entityType)?.sharedSchema(),
               let keyType = schema.primaryKeyProperty?.type else {
             return nil
         }
@@ -437,7 +442,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func syncedEntity(for object: Object, realm: Realm) -> SyncedEntity? {
-        let objectClass = realmObjectClass(name: object.objectSchema.className)
+        guard let objectClass = self.realmObjectClass(name: object.objectSchema.className) else {
+            return nil
+        }
         let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
         let identifier = object.objectSchema.className + "." + getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
         return getSyncedEntity(objectIdentifier: identifier, realm: realm)
@@ -709,9 +716,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let syncedEntity = entity,
                 syncedEntity.entityState != .deleted else { continue }
             
-            let originObjectClass = realmObjectClass(name: syncedEntity.entityType)
+            guard let originObjectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
+                continue
+            }
             let objectIdentifier = getObjectIdentifier(for: syncedEntity)
-            guard let originObject = realmProvider.targetRealm.object(ofType: originObjectClass, forPrimaryKey: objectIdentifier) else { continue }
+            guard let originObject = realmProvider.targetRealm.object(ofType: originObjectClass, forPrimaryKey: objectIdentifier) else {
+                continue
+            }
             
             if relationship.relationshipName == RealmSwiftAdapter.shareRelationshipKey {
                 syncedEntity.share = getSyncedEntity(objectIdentifier: relationship.targetIdentifier, realm: realmProvider.persistenceRealm)
@@ -731,7 +742,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 continue
             }
             
-            let targetObjectClass = realmObjectClass(name: className)
+            guard let targetObjectClass = self.realmObjectClass(name: className) else {
+                continue
+            }
             let targetObjectIdentifier = getObjectIdentifier(stringObjectId: relationship.targetIdentifier, entityType: className)
             let targetObject = realmProvider.targetRealm.object(ofType: targetObjectClass, forPrimaryKey: targetObjectIdentifier)
             
@@ -852,7 +865,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     func recordToUpload(syncedEntity: SyncedEntity, realmProvider: RealmProvider, parentSyncedEntity: inout SyncedEntity?) -> CKRecord? {
         let record = getRecord(for: syncedEntity) ?? CKRecord(recordType: syncedEntity.entityType, recordID: CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
         
-        let objectClass = realmObjectClass(name: syncedEntity.entityType)
+        guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
+            return nil
+        }
         let objectIdentifier = getObjectIdentifier(for: syncedEntity)
         let object = realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
         let entityState = syncedEntity.state
@@ -1033,8 +1048,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             autoreleasepool {
                 guard let self = self else { return }
                 for schema in self.realmProvider.targetRealm.schema.objectSchema {
-                    let objectClass = self.realmObjectClass(name: schema.className)
-                    guard objectClass.self is any SyncableObject.Type else { continue }
+                    guard let objectClass = self.realmObjectClass(name: schema.className) else {
+                        continue
+                    }
+                    guard objectClass.self is any SyncableObject.Type else {
+                        continue
+                    }
                     
                     let results = self.realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
                     if results.isEmpty {
@@ -1062,11 +1081,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         if let relationships = childRelationships[syncedEntity.entityType] {
             for relationship in relationships {
                 let objectID = getObjectIdentifier(for: syncedEntity)
-                let objectClass = realmObjectClass(name: syncedEntity.entityType) as Object.Type
-                if let object = realmProvider.targetRealm.object(ofType: objectClass.self, forPrimaryKey: objectID) {
-                    
+                guard let objectClass = realmObjectClass(name: syncedEntity.entityType) else {
+                    continue
+                }
+                if let object = realmProvider.targetRealm.object(ofType: (objectClass as Object.Type).self, forPrimaryKey: objectID) {
                     // Get children
-                    let childObjectClass = realmObjectClass(name: relationship.childEntityName)
+                    guard let childObjectClass = realmObjectClass(name: relationship.childEntityName) else {
+                        continue
+                    }
                     let predicate = NSPredicate(format: "%K == %@", relationship.childParentKey, object)
                     let children = realmProvider.targetRealm.objects(childObjectClass.self).filter(predicate)
                     
@@ -1115,7 +1137,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                     
                     if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
-                        let objectClass = self.realmObjectClass(name: record.recordType)
+                        guard let objectClass = self.realmObjectClass(name: record.recordType) else {
+                            continue
+                        }
                         let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
                         guard let object = self.realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
                             continue
@@ -1153,7 +1177,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     if let syncedEntity = self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: self.realmProvider.persistenceRealm) {
                         
                         if syncedEntity.entityType != "CKShare" {
-                            let objectClass = self.realmObjectClass(name: syncedEntity.entityType)
+                            guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
+                                continue
+                            }
                             let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
                             let object = self.realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
                             
