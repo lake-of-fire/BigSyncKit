@@ -544,7 +544,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         let value = record[key]
         
-        // List support forked from IceCream: https://github.com/caiyue1993/IceCream/blob/master/IceCream/Classes/CKRecordRecoverable.swift
+        // List/Set support forked from IceCream: https://github.com/caiyue1993/IceCream/blob/master/IceCream/Classes/CKRecordRecoverable.swift
         var recordValue: Any?
         if property.isSet {
             switch property.type {
