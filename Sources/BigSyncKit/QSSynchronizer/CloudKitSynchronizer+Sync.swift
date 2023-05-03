@@ -63,7 +63,7 @@ extension CloudKitSynchronizer {
                 self.delegate?.synchronizerDidSync(self)
             }
             
-            debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
+//            debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
         }
     }
 }
