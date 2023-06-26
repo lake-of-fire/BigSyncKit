@@ -134,6 +134,7 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
         return adapter
     }
     
+    @MainActor
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) {
         guard let adapter = adapterDictionary[recordZoneID],
             adapter.serverChangeToken != nil else {

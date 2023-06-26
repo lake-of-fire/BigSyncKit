@@ -34,7 +34,7 @@ extension CloudKitSynchronizer {
             adapter.didFinishImport(with: error)
         }
         
-        DispatchQueue.main.async {
+        Task { @MainActor in
             self.syncing = false
             self.cancelSync = false
             self.completion?(error)
@@ -251,7 +251,7 @@ extension CloudKitSynchronizer {
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?)->()) {
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { (zoneResults) in
             
-            self.dispatchQueue.async {
+            Task { @MainActor in
                 var pendingZones = [CKRecordZone.ID]()
                 var error: Error? = nil
                 
@@ -265,23 +265,32 @@ extension CloudKitSynchronizer {
                             break
                         }
                     } else {
-                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.description)")
-                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.description)")
+                        if !result.downloadedRecords.isEmpty {
+                            debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.description)")
+                        }
+                        if !result.deletedRecordIDs.isEmpty {
+                            debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.description)")
+                        }
                         self.activeZoneTokens[zoneID] = result.serverChangeToken
                         adapter?.saveChanges(in: result.downloadedRecords)
                         adapter?.deleteRecords(with: result.deletedRecordIDs)
                         if result.moreComing {
                             pendingZones.append(zoneID)
                         } else {
-                            self.delegate?.synchronizerDidFetchChanges(self, in: zoneID)
-                        }
+                                self.delegate?.synchronizerDidFetchChanges(self, in: zoneID)
+                            }
                     }
                 }
                 
                 if pendingZones.count > 0 && error == nil {
-                    self.fetchZoneChanges(pendingZones, completion: completion)
+                    let zones = pendingZones
+//                    Task { @MainActor in
+                        self.fetchZoneChanges(zones, completion: completion)
+//                    }
                 } else {
-                    completion(error)
+//                    Task { @MainActor in
+                        completion(error)
+//                    }
                 }
             }
         }
@@ -395,7 +404,7 @@ extension CloudKitSynchronizer {
         }
     }
     
-    func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?)->()) {
+    func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) -> ()) {
         let records = adapter.recordsToUpload(limit: batchSize)
         let recordCount = records.count
         let requestedBatchSize = batchSize
@@ -414,7 +423,6 @@ extension CloudKitSynchronizer {
                                                recordIDsToDelete: nil)
         { (savedRecords, deleted, conflicted, operationError) in
             self.dispatchQueue.async {
-                
                 debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                 adapter.didUpload(savedRecords: savedRecords ?? [])
                 
@@ -483,7 +491,7 @@ extension CloudKitSynchronizer {
     
     func updateTokens() {
         let operation = FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (databaseToken, changedZoneIDs, deletedZoneIDs) in
-            self.dispatchQueue.async {
+            Task { @MainActor in
                 self.notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 if changedZoneIDs.count > 0 {
                     let zoneIDs = self.loadTokens(for: changedZoneIDs, loadAdapters: false)

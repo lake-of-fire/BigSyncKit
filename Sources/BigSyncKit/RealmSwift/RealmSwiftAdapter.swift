@@ -106,7 +106,6 @@ struct ObjectUpdate {
     let updateType: UpdateType
 }
 
-
 public class RealmSwiftAdapter: NSObject, ModelAdapter {
     static let shareRelationshipKey = "com.syncKit.shareRelationship"
     
@@ -137,17 +136,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         super.init()
         
-        BackgroundWorker.shared.start { [weak self] in
-            self?.setupTypeNamesLookup()
-            self?.setup()
-            self?.setupChildrenRelationshipsLookup()
-        }
+        setupTypeNamesLookup()
+        setup()
+        setupChildrenRelationshipsLookup()
     }
     
     deinit {
-        invalidateRealmAndTokens()
+        Task { @MainActor in
+            invalidateRealmAndTokens()
+        }
     }
     
+    @MainActor
     func invalidateRealmAndTokens() {
         for token in collectionNotificationTokens {
             token.invalidate()
@@ -353,17 +353,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             hasChanges = true
             Task { @MainActor in
                 NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
-            }
-        }
-    }
-    
-    func commitTargetWriteTransactionWithoutNotifying() {
-        Task { @MainActor in
-            try? realmProvider.targetRealm.commitWrite()
-        }
-        DispatchQueue(label: "commitTargetWriteTransactionWithoutNotifying").async { [weak self] in
-            autoreleasepool { // Silence notifications on writes in thread
-                try? self?.realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
             }
         }
     }
@@ -707,6 +696,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
+    @MainActor
     func applyPendingRelationships(realmProvider: RealmProvider) {
         let pendingRelationships = realmProvider.persistenceRealm.objects(PendingRelationship.self)
         
@@ -764,7 +754,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         try? realmProvider.persistenceRealm.commitWrite()
-        commitTargetWriteTransactionWithoutNotifying()
+//        commitTargetWriteTransactionWithoutNotifying()
+        try? realmProvider.targetRealm.commitWrite()
         debugPrint("Finished applying pending relationships")
     }
     
@@ -1215,19 +1206,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
+    @MainActor
     public func persistImportedChanges(completion: @escaping ((Error?) -> Void)) {
         guard realmProvider != nil else {
             completion(nil)
             return
         }
         
-        DispatchQueue(label: "persistImportedChanges").async { [weak self] in
-            autoreleasepool { // Silence notifications on writes in thread
-                guard let realmProvider = self?.realmProvider else { return }
-                self?.applyPendingRelationships(realmProvider: realmProvider)
-            }
-        }
-        
+        applyPendingRelationships(realmProvider: realmProvider)
         completion(nil)
     }
     
@@ -1236,9 +1222,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var recordsArray = [CKRecord]()
         
-        DispatchQueue(label: "recordsToUpload").async { [weak self] in
-            autoreleasepool { // Silence notifications on writes in thread
-                guard let self = self else { return }
+//        DispatchQueue(label: "recordsToUpload").async { [weak self] in
+//            autoreleasepool { // Silence notifications on writes in thread
+//                guard let self = self else { return }
                 let recordLimit = limit == 0 ? Int.max : limit
                 var uploadingState = SyncedEntityState.newOrChanged
                 
@@ -1248,8 +1234,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     uploadingState = self.nextStateToSync(after: uploadingState)
                     innerLimit = recordLimit - recordsArray.count
                 }
-            }
-        }
+//            }
+//        }
         
         return recordsArray
     }
@@ -1266,7 +1252,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         syncedEntity.state = SyncedEntityState.synced.rawValue
                         self.save(record: record, for: syncedEntity)
                     }
-                    
                 }
                 try? self.realmProvider.persistenceRealm.commitWrite()
             }
@@ -1278,19 +1263,19 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var recordIDs = [CKRecord.ID]()
         
-        DispatchQueue(label: "recordIDsMarkedForDeletion").async { [weak self] in
-            autoreleasepool { // Silence notifications on writes in thread
-                guard let self = self else { return }
-                let deletedEntities = self.realmProvider.persistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deleted.rawValue }
+//        DispatchQueue(label: "recordIDsMarkedForDeletion").async { [weak self] in
+//            autoreleasepool { // Silence notifications on writes in thread
+//                guard let self = self else { return }
+                let deletedEntities = realmProvider.persistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deleted.rawValue }
                 
                 for syncedEntity in deletedEntities {
                     if recordIDs.count >= limit {
                         break
                     }
-                    recordIDs.append(CKRecord.ID(recordName: syncedEntity.identifier, zoneID: self.zoneID))
+                    recordIDs.append(CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
                 }
-            }
-        }
+//            }
+//        }
         
         return recordIDs
     }
@@ -1319,13 +1304,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard realmProvider != nil else { return false }
         
         var hasRecord = false
-        DispatchQueue(label: "hasRecordID").async { [weak self] in
-            autoreleasepool { // Silence notifications on writes in thread
-                guard let self = self else { return }
-                let syncedEntity = self.realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName)
+//        DispatchQueue(label: "hasRecordID").async { [weak self] in
+//            autoreleasepool { // Silence notifications on writes in thread
+//                guard let self = self else { return }
+                let syncedEntity = realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName)
                 hasRecord = syncedEntity != nil
-            }
-        }
+//            }
+//        }
         return hasRecord
     }
     
@@ -1351,15 +1336,15 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var record: CKRecord?
         
-        DispatchQueue(label: "recordForObject").async { [weak self] in
-            autoreleasepool { // Silence notifications on writes in thread
-                guard let self = self else { return }
-                if let syncedEntity = self.syncedEntity(for: realmObject, realm: self.realmProvider.persistenceRealm) {
+//        DispatchQueue(label: "recordForObject").async { [weak self] in
+//            autoreleasepool { // Silence notifications on writes in thread
+//                guard let self = self else { return }
+                if let syncedEntity = syncedEntity(for: realmObject, realm: realmProvider.persistenceRealm) {
                     var parent: SyncedEntity?
-                    record = self.recordToUpload(syncedEntity: syncedEntity, realmProvider: self.realmProvider, parentSyncedEntity: &parent)
+                    record = recordToUpload(syncedEntity: syncedEntity, realmProvider: realmProvider, parentSyncedEntity: &parent)
                 }
-            }
-        }
+//            }
+//        }
         
         return record
     }
@@ -1421,10 +1406,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
+    @MainActor
     public func deleteChangeTracking() {
-        BackgroundWorker.shared.start { [weak self] in
-            self?.invalidateRealmAndTokens()
-        }
+        invalidateRealmAndTokens()
         
         let config = self.persistenceRealmConfiguration
         let realmFileURLs: [URL] = [config.fileURL,
