@@ -344,6 +344,16 @@ extension CloudKitSynchronizer {
         uploadChanges() { [weak self] (error) in
             guard let self = self else { return }
             if let error = error {
+#warning("FIXME: handle zone not found...")
+                //                if let error = error as? CKError {
+//                    if let errors = error.partialErrorsByItemID {
+//                        if errors.contains(where: { ($0.value as? CKError)?.code == .zoneNotFound || ($0.value as? CKError)?.code == .userDeletedZone }) {
+//                        }
+//                    }
+//                    if error.code == .zoneNotFound || error.code == .userDeletedZone ||  {
+//                    }
+//                }
+
                 if self.shouldRetryUpload(for: error as NSError) {
                     self.uploadRetries += 1
                     self.fetchChanges()
@@ -423,7 +433,9 @@ extension CloudKitSynchronizer {
                                                recordIDsToDelete: nil)
         { (savedRecords, deleted, conflicted, operationError) in
             self.dispatchQueue.async {
-                debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
+                if !(savedRecords?.isEmpty ?? true) {
+                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
+                }
                 adapter.didUpload(savedRecords: savedRecords ?? [])
                 
                 if let error = operationError {

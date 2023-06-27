@@ -8,7 +8,7 @@
 import Foundation
 import CloudKit
 
-private let customZoneName = "BigSyncKitZone"
+private let customZoneName = "BigSyncKit"
 private let storedDeviceUUIDKey = "QSCloudKitStoredDeviceUUIDKey"
 private let subscriptionIdentifierKey = "QSSubscriptionIdentifierKey"
 private let databaseServerChangeTokenKey = "QSDatabaseServerChangeTokenKey"

@@ -237,7 +237,7 @@ public class CloudKitSynchronizer: NSObject {
     */
     @objc public func eraseLocalMetadata() {
         cancelSynchronization()
-        dispatchQueue.async {
+//        dispatchQueue.async {
             self.storedDatabaseToken = nil
             self.clearAllStoredSubscriptionIDs()
             self.deviceUUID = nil
@@ -245,7 +245,7 @@ public class CloudKitSynchronizer: NSObject {
                 $0.deleteChangeTracking()
                 self.removeModelAdapter($0)
             }
-        }
+//        }
     }
     
     /// Deletes the corresponding record zone on CloudKit, along with any data in it.

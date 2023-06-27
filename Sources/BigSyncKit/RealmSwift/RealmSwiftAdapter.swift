@@ -233,7 +233,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if needsInitialSetup {
                 for object in results {
                     let identifier = self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                    createSyncedEntity(entityType: schema.className, identifier: identifier, realm: realmProvider.persistenceRealm)
+                    let realmProvider = realmProvider
+                    Task.detached(priority: .utility) {
+                        guard let realmProvider = realmProvider else { return }
+                        Self.createSyncedEntity(entityType: schema.className, identifier: identifier, realm: realmProvider.persistenceRealm)
+                    }
                 }
             }
         }
@@ -316,49 +320,54 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func updateTracking(objectIdentifier: String, entityName: String, inserted: Bool, modified: Bool, deleted: Bool, realmProvider: RealmProvider) {
-        var isNewChange = false
-        let identifier = "\(entityName).\(objectIdentifier)"
-        let syncedEntity = getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm)
-        
-        if deleted {
-            isNewChange = true
+        Task.detached(priority: .utility) {
+            let identifier = "\(entityName).\(objectIdentifier)"
+            var isNewChange = false
+            let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm)
             
-            if let syncedEntity = syncedEntity {
-                try? realmProvider.persistenceRealm.safeWrite {
-                    syncedEntity.state = SyncedEntityState.deleted.rawValue
-                }
-            }
-        } else if syncedEntity == nil {
-            self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, realm: self.realmProvider.persistenceRealm)
-            
-            if inserted {
+            if deleted {
                 isNewChange = true
-            }
-        } else if !inserted {
-            guard let syncedEntity = syncedEntity else {
-                return
-            }
-            
-            isNewChange = true
-            
-            try? realmProvider.persistenceRealm.safeWrite {
-                if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
-                    syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
-                    // If state was New (or Modified already) then leave it as that
+                
+                if let syncedEntity = syncedEntity {
+                    try? realmProvider.persistenceRealm.safeWrite {
+                        syncedEntity.state = SyncedEntityState.deleted.rawValue
+                    }
+                }
+            } else if syncedEntity == nil {
+                Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, realm: self.realmProvider.persistenceRealm)
+                
+                if inserted {
+                    isNewChange = true
+                }
+            } else if !inserted {
+                guard let syncedEntity = syncedEntity else {
+                    return
+                }
+                
+                isNewChange = true
+                
+                try? realmProvider.persistenceRealm.safeWrite {
+                    if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
+                        syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
+                        // If state was New (or Modified already) then leave it as that
+                    }
                 }
             }
-        }
-        
-        if !hasChanges && isNewChange {
-            hasChanges = true
-            Task { @MainActor in
-                NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
+            
+            let isNewChangeFinal = isNewChange
+            Task { @MainActor [weak self] in
+                if !(self?.hasChanges ?? false) && isNewChangeFinal {
+                    self?.hasChanges = true
+                    if let self = self {
+                        NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
+                    }
+                }
             }
         }
     }
     
     @discardableResult
-    func createSyncedEntity(entityType: String, identifier: String, realm: Realm) -> SyncedEntity {
+    static func createSyncedEntity(entityType: String, identifier: String, realm: Realm) -> SyncedEntity {
         let syncedEntity = SyncedEntity(entityType: entityType, identifier: "\(entityType).\(identifier)", state: SyncedEntityState.newOrChanged.rawValue)
         
         try? realm.safeWrite {
@@ -443,7 +452,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
         let identifier = object.objectSchema.className + "." + getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-        return getSyncedEntity(objectIdentifier: identifier, realm: realm)
+        return Self.getSyncedEntity(objectIdentifier: identifier, realm: realm)
     }
     
     func getStringIdentifier(for object: Object, usingPrimaryKey key: String) -> String {
@@ -455,7 +464,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
-    func getSyncedEntity(objectIdentifier: String, realm: Realm) -> SyncedEntity? {
+    static func getSyncedEntity(objectIdentifier: String, realm: Realm) -> SyncedEntity? {
         return realm.object(ofType: SyncedEntity.self, forPrimaryKey: objectIdentifier)
     }
     
@@ -722,7 +731,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
             
             if relationship.relationshipName == RealmSwiftAdapter.shareRelationshipKey {
-                syncedEntity.share = getSyncedEntity(objectIdentifier: relationship.targetIdentifier, realm: realmProvider.persistenceRealm)
+                syncedEntity.share = Self.getSyncedEntity(objectIdentifier: relationship.targetIdentifier, realm: realmProvider.persistenceRealm)
                 realmProvider.persistenceRealm.delete(relationship)
                 continue;
             }
@@ -1121,7 +1130,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 self.realmProvider.targetRealm.beginWrite()
                 
                 for record in records {
-                    var syncedEntity: SyncedEntity? = self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: self.realmProvider.persistenceRealm)
+                    var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: self.realmProvider.persistenceRealm)
                     if syncedEntity == nil {
                         if #available(iOS 10.0, *) {
                             if let share = record as? CKShare {
@@ -1164,11 +1173,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     public func deleteRecords(with recordIDs: [CKRecord.ID]) {
-        debugPrint("Deleting records with record ids \(recordIDs)")
         guard recordIDs.count != 0,
             realmProvider != nil else {
             return
         }
+        debugPrint("Deleting records with record ids \(recordIDs)")
         
         DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
             autoreleasepool {
@@ -1177,7 +1186,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 self.realmProvider.targetRealm.beginWrite()
                 
                 for recordID in recordIDs {
-                    if let syncedEntity = self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: self.realmProvider.persistenceRealm) {
+                    if let syncedEntity = Self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: self.realmProvider.persistenceRealm) {
                         
                         if syncedEntity.entityType != "CKShare" {
                             guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
