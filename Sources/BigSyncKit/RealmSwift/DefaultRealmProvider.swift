@@ -123,18 +123,17 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
         let persistenceURL = folderURL.appendingPathComponent(DefaultRealmProviderPersistenceFileName)
         
         var adapter: RealmSwiftAdapter!
-        DispatchQueue.main.sync {
-            adapter = realmSwiftAdapterFor(targetRealmURL: stackURL, persistenceRealmURL: persistenceURL, zoneID: recordZoneID)
-        }
+        adapter = realmSwiftAdapterFor(targetRealmURL: stackURL, persistenceRealmURL: persistenceURL, zoneID: recordZoneID)
         
         adapterDictionary[recordZoneID] = adapter
         
-        NotificationCenter.default.post(name: .realmProviderDidAddAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
+        Task { @MainActor in
+            NotificationCenter.default.post(name: .realmProviderDidAddAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
+        }
         
         return adapter
     }
     
-    @MainActor
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) {
         guard let adapter = adapterDictionary[recordZoneID],
             adapter.serverChangeToken != nil else {
@@ -152,6 +151,8 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
         let folderURL = directoryURL.appendingPathComponent(folderName)
         try? FileManager.default.removeItem(at: folderURL)
         
-        NotificationCenter.default.post(name: .realmProviderDidRemoveAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
+        Task { @MainActor in
+            NotificationCenter.default.post(name: .realmProviderDidRemoveAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
+        }
     }
 }

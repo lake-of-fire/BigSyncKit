@@ -31,7 +31,6 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         return adapter
     }
     
-    @MainActor
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) {
         let adapterHasSyncedBefore = adapter.serverChangeToken != nil
         if recordZoneID == zoneID && adapterHasSyncedBefore {

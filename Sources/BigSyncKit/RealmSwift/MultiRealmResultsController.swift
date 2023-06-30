@@ -125,9 +125,9 @@ public class MultiRealmResultsController<T: Object> {
     }
     
     @objc func didChangeAdapters(notification: Notification) {
-        DispatchQueue.main.async {
+//        DispatchQueue.main.async {
             self.updateResults()
             self.didChangeRealms?(self)
-        }
+//        }
     }
 }

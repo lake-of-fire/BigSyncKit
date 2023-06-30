@@ -118,58 +118,58 @@ import CloudKit
         addMetadata(to: [record, share])
         
         let operation = ModifyRecordsOperation(database: database, records: [record, share], recordIDsToDelete: nil) { (savedRecords, deleted, conflicted, operationError) in
-            self.dispatchQueue.async {
+            //            self.dispatchQueue.async {
+            
+            let uploadedShare = savedRecords?.first { $0 is CKShare} as? CKShare
+            
+            if let savedRecords = savedRecords,
+               operationError == nil,
+               let share = uploadedShare {
                 
-                let uploadedShare = savedRecords?.first { $0 is CKShare} as? CKShare
-                
-                if let savedRecords = savedRecords,
-                   operationError == nil,
-                   let share = uploadedShare {
+                modelAdapter.prepareToImport()
+                let records = savedRecords.filter { $0 != share }
+                modelAdapter.didUpload(savedRecords: records)
+                modelAdapter.persistImportedChanges(completion: { (error) in
                     
+                    //                        self.dispatchQueue.async {
+                    
+                    if error == nil {
+                        modelAdapter.save(share: share, for: object)
+                    }
+                    modelAdapter.didFinishImport(with: error)
+                    
+                    //                    DispatchQueue.main.async {
+                        self.syncing = false
+                        completion?(uploadedShare, error)
+//                    }
+                    //                        }
+                })
+                
+            } else if let error = operationError {
+                if self.isServerRecordChangedError(error as NSError),
+                   !conflicted.isEmpty {
                     modelAdapter.prepareToImport()
-                    let records = savedRecords.filter { $0 != share }
-                    modelAdapter.didUpload(savedRecords: records)
-                    modelAdapter.persistImportedChanges(completion: { (error) in
-                        
-                        self.dispatchQueue.async {
-                            
-                            if error == nil {
-                                modelAdapter.save(share: share, for: object)
-                            }
-                            modelAdapter.didFinishImport(with: error)
-                            
-                            DispatchQueue.main.async {
-                                self.syncing = false
-                                completion?(uploadedShare, error)
-                            }
-                        }
-                    })
-                    
-                } else if let error = operationError {
-                    if self.isServerRecordChangedError(error as NSError),
-                       !conflicted.isEmpty {
-                        modelAdapter.prepareToImport()
-                        modelAdapter.saveChanges(in: conflicted)
-                        modelAdapter.persistImportedChanges { (error) in
-                            modelAdapter.didFinishImport(with: error)
-                            DispatchQueue.main.async {
-                                self.syncing = false
-                                self.share(object: object, publicPermission: publicPermission, participants: participants, completion: completion)
-                            }
-                        }
-                    } else {
-                        DispatchQueue.main.async {
-                            self.syncing = false
-                            completion?(uploadedShare, operationError)
-                        }
+                    modelAdapter.saveChanges(in: conflicted)
+                    modelAdapter.persistImportedChanges { (error) in
+                        modelAdapter.didFinishImport(with: error)
+                        //                        DispatchQueue.main.async {
+                        self.syncing = false
+                        self.share(object: object, publicPermission: publicPermission, participants: participants, completion: completion)
+                        //                        }
                     }
                 } else {
-                    DispatchQueue.main.async {
-                        self.syncing = false
-                        completion?(nil, operationError)
-                    }
+                    //                    DispatchQueue.main.async {
+                    self.syncing = false
+                    completion?(uploadedShare, operationError)
+                    //                    }
                 }
+            } else {
+                //                DispatchQueue.main.async {
+                self.syncing = false
+                completion?(nil, operationError)
+                //                }
             }
+            //            }
         }
         runOperation(operation)
     }
@@ -199,36 +199,38 @@ import CloudKit
         let operation = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: [share.recordID])
         operation.modifyRecordsCompletionBlock = { savedRecords, deletedRecordIDs, operationError in
             
-            self.dispatchQueue.async {
+            //            self.dispatchQueue.async {
+            
+            if let savedRecords = savedRecords,
+               operationError == nil {
                 
-                if let savedRecords = savedRecords,
-                    operationError == nil {
+                modelAdapter.prepareToImport()
+                modelAdapter.didUpload(savedRecords: savedRecords)
+                modelAdapter.persistImportedChanges(completion: { (error) in
                     
-                    modelAdapter.prepareToImport()
-                    modelAdapter.didUpload(savedRecords: savedRecords)
-                    modelAdapter.persistImportedChanges(completion: { (error) in
-                        
-                        self.dispatchQueue.async {
-                            if error == nil {
-                                modelAdapter.deleteShare(for: object)
-                            }
-                            modelAdapter.didFinishImport(with: error)
-                            
-                            DispatchQueue.main.async {
-                                self.syncing = false
-                                completion?(error)
-                            }
-                        }
-                    })
-                    
-                } else {
-                    
-                    DispatchQueue.main.async {
-                        self.syncing = false
-                        completion?(operationError)
+                    //                    self.dispatchQueue.async {
+                    if error == nil {
+                        modelAdapter.deleteShare(for: object)
                     }
-                }
+                    modelAdapter.didFinishImport(with: error)
+                    
+//                    DispatchQueue.main.async {
+//                    Task { @MainActor in
+                        self.syncing = false
+                        completion?(error)
+//                    }
+                    //                    }
+                })
+                
+            } else {
+                
+//                DispatchQueue.main.async {
+//                Task { @MainActor in
+                    self.syncing = false
+                    completion?(operationError)
+//                }
             }
+            //            }
         }
         
         database.add(operation)
