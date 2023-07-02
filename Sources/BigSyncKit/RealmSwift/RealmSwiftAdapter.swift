@@ -27,6 +27,14 @@ extension Realm {
     }
 }
 
+extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        return stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
+    }
+}
+
 public protocol RealmSwiftAdapterDelegate: AnyObject {
     /**
      *  Asks the delegate to resolve conflicts for a managed object when using a custom mergePolicy.
@@ -192,85 +200,80 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             results.changesetPublisher
                 .threadSafeReference()
                 .freeze()
-//                .subscribe(on: DispatchQueue(label: "BigSyncKit_RealmSwiftAdapter"))
                 .receive(on: DispatchQueue(label: "BigSyncKit_RealmSwiftAdapter", qos: .utility))
                 .sink { [weak self] collectionChange in
-                    autoreleasepool {
-                        //            let token = results.observe({ collectionChange in
-                        //                    Task.detached(priority: .utility) { [weak self] in
-                        switch collectionChange {
-                        case .update(let collection, _, let insertions, let modifications):
-                            // Deletions are covered via soft-delete (SyncedDeletable) under modifications.
-//                            let collection = collection.map { ThreadSafeReference(to: $0) }
-//                                Task.detached(priority: .utility) { [weak self] in
-//                            Task(priority: .utility) { [weak self] in
-                                guard let self = self else { return }
-                                guard let realmProvider = self.realmProvider else { return }
-//                                let collection = collection.map { realmProvider.targetRealm.resolve($0)?.thaw() }
-                                let collection = collection.map { $0.thaw() }
-                                for index in insertions.filter({ $0 < collection.count }) {
-                                    guard let object = collection[index] else { continue }
-                                    if (object as? (any SyncableObject))?.isDeleted ?? false {
-                                        continue
+                    switch collectionChange {
+                    case .update(let collection, _, let insertions, let modifications):
+                        // Deletions are covered via soft-delete (SyncedDeletable) under modifications.
+                        for chunk in insertions.filter({ $0 < collection.count }).chunked(into: 25) {
+                            autoreleasepool { [weak self] in
+                                try? realmProvider.persistenceRealm.safeWrite {
+                                    for index in chunk {
+                                        let collection = collection.map { $0.thaw() }
+                                        guard let object = collection[index] else { return }
+                                        if (object as? (any SyncableObject))?.isDeleted ?? false {
+                                            return
+                                        }
+                                        guard let identifier = self?.getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
+                                        /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
+                                         * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
+                                         */
+                                        if object.realm!.isInWriteTransaction {
+                                            self?.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: .insertion))
+                                        } else {
+                                            guard let realmProvider = self?.realmProvider else { return }
+                                            self?.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: true, modified: false, deleted: false, realmProvider: realmProvider)
+                                        }
                                     }
-                                    
-                                    let identifier = self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                                    /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
-                                     * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
-                                     */
-                                    if object.realm!.isInWriteTransaction {
-                                        self.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: .insertion))
-                                    } else {
-                                        //                                    Task.detached(priority: .utility) { [weak self] in
-                                        self.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: true, modified: false, deleted: false, realmProvider: realmProvider)
-                                        //                                    }
-                                    }
-                                }
-                                
-                            for index in modifications.filter({ $0 < collection.count }) {
-                                guard let object = collection[index] else { continue }
-                                let identifier = self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                                let isDeletion = (object as? (any SyncableObject))?.isDeleted ?? false
-                                /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
-                                 * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
-                                 */
-                                if object.realm!.isInWriteTransaction {
-                                    self.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: isDeletion ? .deletion : .modification))
-                                } else {
-                                    //                                    Task.detached(priority: .utility) { [weak self] in
-                                    guard let realmProvider = self.realmProvider else { return }
-                                    self.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: false, modified: !isDeletion, deleted: isDeletion, realmProvider: realmProvider)
-                                    //                                    }
                                 }
                             }
-//                            }
-                            
-                        default: break
                         }
+                        
+                        for chunk in modifications.filter({ $0 < collection.count }).chunked(into: 25) {
+                            autoreleasepool { [weak self] in
+                                try? realmProvider.persistenceRealm.safeWrite {
+                                    for index in chunk {
+                                        let collection = collection.map { $0.thaw() }
+                                        guard let object = collection[index] else { return }
+                                        guard let identifier = self?.getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
+                                        let isDeletion = (object as? (any SyncableObject))?.isDeleted ?? false
+                                        /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
+                                         * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
+                                         */
+                                        if object.realm!.isInWriteTransaction {
+                                            self?.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: isDeletion ? .deletion : .modification))
+                                        } else {
+                                            guard let realmProvider = self?.realmProvider else { return }
+                                            self?.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: false, modified: !isDeletion, deleted: isDeletion, realmProvider: realmProvider)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                    default: break
                     }
                 }
                 .store(in: &collectionNotificationTokens)
-            
-//            })
-//            collectionNotificationTokens.append(token)
             
             if needsInitialSetup {
                 Task.detached(priority: .utility) { [weak self] in
                     guard let realmProvider = self?.realmProvider else { return }
                     let results = realmProvider.targetRealm.objects(objectClass)
                     let realm = realmProvider.persistenceRealm
-                    try? realm.safeWrite {
-                        for object in results {
-                            guard let identifier = self?.getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
-                            Self.createSyncedEntity(entityType: schema.className, identifier: identifier, realm: realmProvider.persistenceRealm)
+                    for object in results {
+                        autoreleasepool { [weak self] in
+                            try? realm.safeWrite {
+                                guard let identifier = self?.getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
+                                Self.createSyncedEntity(entityType: schema.className, identifier: identifier, realm: realmProvider.persistenceRealm)
+                            }
                         }
                     }
                 }
             }
-                    
         }
         
-//        let token = realmProvider.targetRealm.observe { (_, _) in
+        //        let token = realmProvider.targetRealm.observe { (_, _) in
 //        results.changesetPublisher
 //            .subscribe(on: DispatchQueue(label: "BigSyncKit_RealmSwiftAdapter"))
 //            .threadSafeReference()
@@ -709,7 +712,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             savePendingRelationship(name: key, syncedEntity: syncedEntity, targetIdentifier: objectIdentifier, realm: realmProvider.persistenceRealm)
         } else if let asset = value as? CKAsset {
             if let fileURL = asset.fileURL,
-                let data =  NSData(contentsOf: fileURL) {
+                let data = NSData(contentsOf: fileURL) {
                 object.setValue(data, forKey: key)
             }
         } else if value != nil || property.isOptional == true {
