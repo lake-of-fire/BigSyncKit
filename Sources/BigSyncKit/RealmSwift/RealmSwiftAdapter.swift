@@ -1089,7 +1089,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //        DispatchQueue(label: "RealmSwiftAadapter.cleanUp").async { [weak self] in
         //            autoreleasepool {
 //        guard let self = self else { return }
-        for schema in self.realmProvider.targetRealm.schema.objectSchema {
+        guard let realmProvider = realmProvider else { return }
+        for schema in realmProvider.targetRealm.schema.objectSchema {
             guard let objectClass = self.realmObjectClass(name: schema.className) else {
                 continue
             }
@@ -1097,14 +1098,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 continue
             }
             
-            let results = self.realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
+            let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
             if results.isEmpty {
                 continue
             }
-            self.realmProvider.targetRealm.beginWrite()
-            results.forEach({ self.realmProvider.targetRealm.delete($0) })
+            realmProvider.targetRealm.beginWrite()
+            results.forEach({ realmProvider.targetRealm.delete($0) })
             //                    commitTargetWriteTransactionWithoutNotifying()
-            try? self.realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
         }
         //            }
         //        }
