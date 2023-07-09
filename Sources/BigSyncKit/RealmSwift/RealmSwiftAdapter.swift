@@ -185,9 +185,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     func setup() {
         realmProvider = RealmProvider(persistenceConfiguration: persistenceRealmConfiguration, targetConfiguration: targetRealmConfiguration)
+        guard let realmProvider = realmProvider else { return }
         
         let needsInitialSetup = realmProvider.persistenceRealm.objects(SyncedEntity.self).count <= 0
-        guard let realmProvider = realmProvider else { return }
         
         for schema in realmProvider.targetRealm.schema.objectSchema {
             guard let objectClass = self.realmObjectClass(name: schema.className) else {
