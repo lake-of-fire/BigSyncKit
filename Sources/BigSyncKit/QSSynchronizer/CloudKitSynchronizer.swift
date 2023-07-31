@@ -58,7 +58,6 @@ public extension Notification.Name {
     func synchronizerWillStartSyncing(_ synchronizer: CloudKitSynchronizer)
     func synchronizerWillCheckForChanges(_ synchronizer: CloudKitSynchronizer)
     func synchronizerWillFetchChanges(_ synchronizer: CloudKitSynchronizer, in recordZone: CKRecordZone.ID)
-    func synchronizerDidFetchChanges(_ synchronizer: CloudKitSynchronizer, in recordZone: CKRecordZone.ID)
     func synchronizerWillUploadChanges(_ synchronizer: CloudKitSynchronizer, to recordZone: CKRecordZone.ID)
     func synchronizerDidSync(_ synchronizer: CloudKitSynchronizer)
     func synchronizerDidfailToSync(_ synchronizer: CloudKitSynchronizer, error: Error)

@@ -270,13 +270,13 @@ extension CloudKitSynchronizer {
                     if !result.deletedRecordIDs.isEmpty {
                         debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.description)")
                     }
-                    self.activeZoneTokens[zoneID] = result.serverChangeToken
+                    Task { @MainActor [weak self] in
+                        self?.activeZoneTokens[zoneID] = result.serverChangeToken
+                    }
                     adapter?.saveChanges(in: result.downloadedRecords)
                     adapter?.deleteRecords(with: result.deletedRecordIDs)
                     if result.moreComing {
                         pendingZones.append(zoneID)
-                    } else {
-                        self.delegate?.synchronizerDidFetchChanges(self, in: zoneID)
                     }
                 }
             }
