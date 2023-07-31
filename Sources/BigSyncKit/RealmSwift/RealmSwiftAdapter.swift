@@ -258,19 +258,21 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 .store(in: &collectionNotificationTokens)
             
             if needsInitialSetup {
-                Task.detached(priority: .utility) { [weak self] in
-                    guard let realmProvider = self?.realmProvider else { return }
+//                Task.detached(priority: .utility) { [weak self] in
+//                    guard let self = self else { return }
                     let results = realmProvider.targetRealm.objects(objectClass)
                     let realm = realmProvider.persistenceRealm
+                try? realm.safeWrite {
                     for object in results {
-                        autoreleasepool { [weak self] in
-                            try? realm.safeWrite {
-                                guard let realmProvider = self?.realmProvider else { return }
-                                guard let identifier = self?.getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
-                                Self.createSyncedEntity(entityType: schema.className, identifier: identifier, realm: realmProvider.persistenceRealm)
-                            }
-                        }
+                        //                        autoreleasepool { [weak self] in
+                        //                            try? realm.safeWrite {
+                        //                                guard let identifier = getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
+                        let identifier = getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+                        Self.createSyncedEntity(entityType: schema.className, identifier: identifier, realm: realmProvider.persistenceRealm)
+                        //                            }
+                        //                        }
                     }
+                    //                }
                 }
             }
         }
@@ -395,14 +397,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         let isNewChangeFinal = isNewChange
-        Task { @MainActor [weak self] in
-            if !(self?.hasChanges ?? false) && isNewChangeFinal {
-                self?.hasChanges = true
-                if let self = self {
-                    NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
-                }
+//        Task { @MainActor [weak self] in
+            if !hasChanges && isNewChangeFinal {
+                hasChanges = true
+                NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
             }
-        }
+//        }
     }
     
     @discardableResult
@@ -1078,13 +1078,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func startObservingTermination() {
-        Task { @MainActor in
+//        Task { @MainActor in
 #if os(iOS) || os(tvOS)
             NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: UIApplication.willTerminateNotification, object: nil)
 #elseif os(macOS)
             NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: NSApplication.willTerminateNotification, object: nil)
 #endif
-        }
+//        }
     }
     
     /// Deletes soft-deleted objects.

@@ -55,7 +55,6 @@ public extension Notification.Name {
 }
 
 @objc public protocol CloudKitSynchronizerDelegate: AnyObject {
-    func synchronizerWillCheckForChanges(_ synchronizer: CloudKitSynchronizer)
     func synchronizerWillFetchChanges(_ synchronizer: CloudKitSynchronizer, in recordZone: CKRecordZone.ID)
     func synchronizerWillUploadChanges(_ synchronizer: CloudKitSynchronizer, to recordZone: CKRecordZone.ID)
     func synchronizerDidSync(_ synchronizer: CloudKitSynchronizer)
