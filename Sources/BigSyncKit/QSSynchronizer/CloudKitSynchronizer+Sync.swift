@@ -10,61 +10,62 @@ import CloudKit
 
 extension CloudKitSynchronizer {
     func performSynchronization() {
+        postNotification(.SynchronizerWillSynchronize)
+        serverChangeToken = storedDatabaseToken
+        uploadRetries = 0
+        didNotifyUpload = Set<CKRecordZone.ID>()
+        
+        modelAdapters.forEach {
+            $0.prepareToImport()
+        }
+            
         Task.detached { [weak self] in
-            self?.postNotification(.SynchronizerWillSynchronize)
-            if let self = self {
-                self.delegate?.synchronizerWillStartSyncing(self)
-            }
-            self?.serverChangeToken = self?.storedDatabaseToken
-            self?.uploadRetries = 0
-            self?.didNotifyUpload = Set<CKRecordZone.ID>()
-            
-            self?.modelAdapters.forEach {
-                $0.prepareToImport()
-            }
-            
             self?.fetchChanges()
         }
     }
     
     func finishSynchronization(error: Error?) {
-        resetActiveTokens()
-        
-        self.uploadRetries = 0
-        
-        for adapter in modelAdapters {
-            adapter.didFinishImport(with: error)
-        }
-        
-        self.syncing = false
-        self.cancelSync = false
-        self.completion?(error)
-        self.completion = nil
-        
-        if let error = error {
-            self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [CloudKitSynchronizer.errorKey: error])
-            self.delegate?.synchronizerDidfailToSync(self, error: error)
+        Task { @MainActor in
+            resetActiveTokens()
             
-            if let error = error as? CKError {
-                switch error.code {
-                case .changeTokenExpired:
-                    // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
-                    self.resetDatabaseToken()
-                    for adapter in self.modelAdapters {
-                        adapter.deleteChangeTracking()
-                        self.removeModelAdapter(adapter)
-                    }
-                    self.fetchChanges()
-                default:
-                    break
-                }
+            self.uploadRetries = 0
+            
+            for adapter in modelAdapters {
+                adapter.didFinishImport(with: error)
             }
-        } else {
-            self.postNotification(.SynchronizerDidSynchronize)
-            self.delegate?.synchronizerDidSync(self)
+            
+            self.syncing = false
+            self.cancelSync = false
+            self.completion?(error)
+            self.completion = nil
+            
+            if let error = error {
+                self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [CloudKitSynchronizer.errorKey: error])
+                self.delegate?.synchronizerDidfailToSync(self, error: error)
+                
+                if let error = error as? CKError {
+                    switch error.code {
+                    case .changeTokenExpired:
+                        // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
+                        self.resetDatabaseToken()
+                        for adapter in self.modelAdapters {
+                            adapter.deleteChangeTracking()
+                            self.removeModelAdapter(adapter)
+                        }
+                        Task.detached {
+                            self.fetchChanges()
+                        }
+                    default:
+                        break
+                    }
+                }
+            } else {
+                self.postNotification(.SynchronizerDidSynchronize)
+                self.delegate?.synchronizerDidSync(self)
+            }
+            
+            //            debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
         }
-        
-        //            debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
     }
 }
 
