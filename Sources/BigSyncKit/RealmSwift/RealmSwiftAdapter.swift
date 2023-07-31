@@ -1527,8 +1527,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             var serverToken: ServerToken! = realmProvider.persistenceRealm.objects(ServerToken.self).first
             
 //            realmProvider.persistenceRealm.beginWrite()
-            try! realmProvider.persistenceRealm.write {
-                
+//            try! realmProvider.persistenceRealm.write {
+            realmProvider.persistenceRealm.writeAsync {
                 if serverToken == nil {
                     serverToken = ServerToken()
                     realmProvider.persistenceRealm.add(serverToken)
