@@ -117,6 +117,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         }
         
         operation.fetchRecordZoneChangesCompletionBlock = { operationError in
+//            self.dispatchQueue.async {
             self.dispatchQueue.async {
                 if let error = operationError,
                    (error as NSError).code != CKError.partialFailure.rawValue { // Partial errors are returned per zone

@@ -100,15 +100,15 @@ public extension Notification.Name {
 
     /// Returns CKShare for the given model object, if one exists.
     /// - Parameter object: Model object.
-    @available(iOS 10.0, OSX 10.12, *) func share(for object: AnyObject) -> CKShare?
+    //    @available(iOS 10.0, OSX 10.12, *) func share(for object: AnyObject) -> CKShare?
     
     /// Store CKShare for given model object.
     /// - Parameters:
     ///   - share: `CKShare` object to save.
     ///   - object: Model object.
-    @available(iOS 10.0, OSX 10.12, *) func save(share: CKShare, for object: AnyObject)
+//    @available(iOS 10.0, OSX 10.12, *) func save(share: CKShare, for object: AnyObject)
     
     /// Delete existing `CKShare` for given model object.
     /// - Parameter object: Model object.
-    @available(iOS 10.0, OSX 10.12, *) func deleteShare(for object: AnyObject)
+//    @available(iOS 10.0, OSX 10.12, *) func deleteShare(for object: AnyObject)
 }
