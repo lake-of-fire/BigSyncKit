@@ -253,46 +253,48 @@ extension CloudKitSynchronizer {
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { (zoneResults) in
             
             //            Task { @MainActor in
-            var pendingZones = [CKRecordZone.ID]()
-            var error: Error? = nil
-            
-            for (zoneID, result) in zoneResults {
-                let adapter = self.modelAdapterDictionary[zoneID]
-                if let resultError = result.error {
-                    if (self.isZoneNotFoundOrDeletedError(error)) {
-                        self.notifyProviderForDeletedZoneIDs([zoneID])
+            self.dispatchQueue.async {
+                var pendingZones = [CKRecordZone.ID]()
+                var error: Error? = nil
+                
+                for (zoneID, result) in zoneResults {
+                    let adapter = self.modelAdapterDictionary[zoneID]
+                    if let resultError = result.error {
+                        if (self.isZoneNotFoundOrDeletedError(error)) {
+                            self.notifyProviderForDeletedZoneIDs([zoneID])
+                        } else {
+                            error = resultError
+                            break
+                        }
                     } else {
-                        error = resultError
-                        break
-                    }
-                } else {
-                    if !result.downloadedRecords.isEmpty {
-                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.description)")
-                    }
-                    if !result.deletedRecordIDs.isEmpty {
-                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.description)")
-                    }
-//                    Task { @MainActor [weak self] in
-                    self.activeZoneTokens[zoneID] = result.serverChangeToken
-//                    }
-                    adapter?.saveChanges(in: result.downloadedRecords)
-                    adapter?.deleteRecords(with: result.deletedRecordIDs)
-                    if result.moreComing {
-                        pendingZones.append(zoneID)
+                        if !result.downloadedRecords.isEmpty {
+                            debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.description)")
+                        }
+                        if !result.deletedRecordIDs.isEmpty {
+                            debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.description)")
+                        }
+                        //                    Task { @MainActor [weak self] in
+                        self.activeZoneTokens[zoneID] = result.serverChangeToken
+                        //                    }
+                        adapter?.saveChanges(in: result.downloadedRecords)
+                        adapter?.deleteRecords(with: result.deletedRecordIDs)
+                        if result.moreComing {
+                            pendingZones.append(zoneID)
+                        }
                     }
                 }
-            }
-            
-            if pendingZones.count > 0 && error == nil {
-                let zones = pendingZones
-                //                    Task { @MainActor in
-                self.fetchZoneChanges(zones, completion: completion)
-                //                    }
-            } else {
-                //                    Task { @MainActor in
-                completion(error)
-                //                    }
-                //                }
+                
+                if pendingZones.count > 0 && error == nil {
+                    let zones = pendingZones
+                    //                    Task { @MainActor in
+                    self.fetchZoneChanges(zones, completion: completion)
+                    //                    }
+                } else {
+                    //                    Task { @MainActor in
+                    completion(error)
+                    //                    }
+                    //                }
+                }
             }
         }
         
