@@ -434,7 +434,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         // If the row already exists somehow (for some reasons outside of syncing), merge changes instead of crashing.
         if let object = realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) {
             applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
-            saveShareRelationship(for: syncedEntity, record: record)
+//            saveShareRelationship(for: syncedEntity, record: record)
         } else {
             let object = objectClass.init()
             object.setValue(objectIdentifier, forKey: primaryKey)
@@ -738,15 +738,15 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         realm.add(pendingRelationship)
     }
     
-    func saveShareRelationship(for entity: SyncedEntity, record: CKRecord) {
-        if let share = record.share {
-            let relationship = PendingRelationship()
-            relationship.relationshipName = RealmSwiftAdapter.shareRelationshipKey
-            relationship.targetIdentifier = share.recordID.recordName
-            relationship.forSyncedEntity = entity
-            entity.realm?.add(relationship)
-        }
-    }
+//    func saveShareRelationship(for entity: SyncedEntity, record: CKRecord) {
+//        if let share = record.share {
+//            let relationship = PendingRelationship()
+//            relationship.relationshipName = RealmSwiftAdapter.shareRelationshipKey
+//            relationship.targetIdentifier = share.recordID.recordName
+//            relationship.forSyncedEntity = entity
+//            entity.realm?.add(relationship)
+//        }
+//    }
     
     func applyPendingRelationships(realmProvider: RealmProvider) {
         let pendingRelationships = realmProvider.persistenceRealm.objects(PendingRelationship.self)
@@ -755,10 +755,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             return
         }
         
-        realmProvider.persistenceRealm.beginWrite()
-        realmProvider.targetRealm.beginWrite()
+//        realmProvider.persistenceRealm.beginWrite()
+//        realmProvider.targetRealm.beginWrite()
         for relationship in pendingRelationships {
-            
             let entity = relationship.forSyncedEntity
             
             guard let syncedEntity = entity,
@@ -772,11 +771,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 continue
             }
             
-            if relationship.relationshipName == RealmSwiftAdapter.shareRelationshipKey {
-                syncedEntity.share = Self.getSyncedEntity(objectIdentifier: relationship.targetIdentifier, realm: realmProvider.persistenceRealm)
-                realmProvider.persistenceRealm.delete(relationship)
-                continue;
-            }
+//            if relationship.relationshipName == RealmSwiftAdapter.shareRelationshipKey {
+//                syncedEntity.share = Self.getSyncedEntity(objectIdentifier: relationship.targetIdentifier, realm: realmProvider.persistenceRealm)
+//                    realmProvider.persistenceRealm.delete(relationship)
+//                continue;
+//            }
             
             var targetClassName: String?
             for property in originObject.objectSchema.properties {
@@ -799,14 +798,23 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let target = targetObject else {
                 continue
             }
-            originObject.setValue(target, forKey: relationship.relationshipName)
             
-            realmProvider.persistenceRealm.delete(relationship)
+            realmProvider.targetRealm.writeAsync {
+                originObject.setValue(target, forKey: relationship.relationshipName)
+            } onComplete: { error in
+                guard error == nil else {
+                    print("Failed to set pending relationship")
+                    return
+                }
+                realmProvider.persistenceRealm.writeAsync {
+                    realmProvider.persistenceRealm.delete(relationship)
+                }
+            }
         }
         
-        try? realmProvider.persistenceRealm.commitWrite()
+//        try? realmProvider.persistenceRealm.commitWrite()
 //        commitTargetWriteTransactionWithoutNotifying()
-        try? realmProvider.targetRealm.commitWrite()
+//        try? realmProvider.targetRealm.commitWrite()
         debugPrint("Finished applying pending relationships")
     }
     
@@ -1110,7 +1118,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 continue
             }
 //            realmProvider.targetRealm.beginWrite()
-            try! realmProvider.targetRealm.write {
+            realmProvider.targetRealm.writeAsync {
                 results.forEach({ realmProvider.targetRealm.delete($0) })
                 //                    commitTargetWriteTransactionWithoutNotifying()
                 //            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
@@ -1184,15 +1192,15 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             guard let self = self else { return }
                             var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: realmProvider.persistenceRealm)
                             if syncedEntity == nil {
-                                if #available(iOS 10.0, *) {
-                                    if let share = record as? CKShare {
-                                        syncedEntity = self.createSyncedEntity(for: share, realmProvider: realmProvider)
-                                    } else {
-                                        syncedEntity = self.createSyncedEntity(record: record, realmProvider: realmProvider)
-                                    }
-                                } else {
+//                                if #available(iOS 10.0, *) {
+//                                    if let share = record as? CKShare {
+//                                        syncedEntity = self.createSyncedEntity(for: share, realmProvider: realmProvider)
+//                                    } else {
+//                                        syncedEntity = self.createSyncedEntity(record: record, realmProvider: realmProvider)
+//                                    }
+//                                } else {
                                     syncedEntity = self.createSyncedEntity(record: record, realmProvider: realmProvider)
-                                }
+//                                }
                             }
                             
                             guard let syncedEntity = syncedEntity else {
@@ -1213,7 +1221,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                 }
                                 
                                 self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
-                                self.saveShareRelationship(for: syncedEntity, record: record)
+//                                self.saveShareRelationship(for: syncedEntity, record: record)
                             }
                             
                             self.save(record: record, for: syncedEntity)
@@ -1377,7 +1385,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             //            autoreleasepool { // Silence notifications on writes in thread
             //        guard let self = self else { return }
 //            realmProvider.persistenceRealm.beginWrite()
-            try! realmProvider.persistenceRealm.write {
+            realmProvider.persistenceRealm.writeAsync {
                 for recordID in deletedRecordIDs {
                     if let syncedEntity = realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName) {
                         if let record = syncedEntity.record {
@@ -1554,7 +1562,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
             
 //            try? realmProvider.persistenceRealm.commitWrite()
-            //            }
+//        }
         }
     }
 }
