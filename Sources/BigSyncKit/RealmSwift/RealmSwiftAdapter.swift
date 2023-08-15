@@ -771,13 +771,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func savePendingRelationship(name: String, syncedEntity: SyncedEntity, targetIdentifier: String, realm: Realm) {
-        realm.writeAsync {
+//        realm.writeAsync {
             let pendingRelationship = PendingRelationship()
             pendingRelationship.relationshipName = name
             pendingRelationship.forSyncedEntity = syncedEntity
             pendingRelationship.targetIdentifier = targetIdentifier
             realm.add(pendingRelationship)
-        }
+//        }
     }
     
 //    func saveShareRelationship(for entity: SyncedEntity, record: CKRecord) {
@@ -794,14 +794,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let pendingRelationships = realmProvider.persistenceRealm.objects(PendingRelationship.self)
         
         if pendingRelationships.count == 0 {
-            completion()
             return
         }
         
-//        realmProvider.persistenceRealm.beginWrite()
-//        realmProvider.targetRealm.beginWrite()
+        realmProvider.persistenceRealm.beginWrite()
+        realmProvider.targetRealm.beginWrite()
         for relationship in pendingRelationships {
-            print("pending rel... \(relationship.description)")
+            
             let entity = relationship.forSyncedEntity
             
             guard let syncedEntity = entity,
@@ -810,68 +809,123 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let originObjectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
                 continue
             }
-            
             let objectIdentifier = getObjectIdentifier(for: syncedEntity)
-            guard let relationshipName = relationship.relationshipName else { continue }
-            guard let targetIdentifier = relationship.targetIdentifier else { continue }
-            let targetRealm = realmProvider.targetRealm
-            targetRealm.writeAsync { [weak self] in
-                guard let self = self else { return }
-                guard let originObject = targetRealm.object(ofType: originObjectClass, forPrimaryKey: objectIdentifier) else {
-//                    continue
-                    return
-                }
-                
-                //            if relationship.relationshipName == RealmSwiftAdapter.shareRelationshipKey {
-                //                syncedEntity.share = Self.getSyncedEntity(objectIdentifier: relationship.targetIdentifier, realm: realmProvider.persistenceRealm)
-                //                    realmProvider.persistenceRealm.delete(relationship)
-                //                continue;
-                //            }
-                
-                var targetClassName: String?
-                for property in originObject.objectSchema.properties {
-                    if property.name == relationshipName {
-                        targetClassName = property.objectClassName
-                        break
-                    }
-                }
-                
-                guard let className = targetClassName else {
-//                    continue
-                    return
-                }
-                
-                guard let targetObjectClass = self.realmObjectClass(name: className) else {
-//                    continue
-                    return
-                }
-                let targetObjectIdentifier = self.getObjectIdentifier(stringObjectId: targetIdentifier, entityType: className)
-                let targetObject = targetRealm.object(ofType: targetObjectClass, forPrimaryKey: targetObjectIdentifier)
-                
-                guard let target = targetObject else {
-                    //                    continue
-                    return
-                }
-                
-                originObject.setValue(target, forKey: relationshipName)
-            } onComplete: { error in
-                guard error == nil else {
-                    print("Failed to set pending relationship")
-                    completion()
-                    return
-                }
-                let persistenceRealm = realmProvider.persistenceRealm
-                persistenceRealm.writeAsync {
-                    persistenceRealm.delete(relationship)
-                }
-                debugPrint("Finished applying pending relationships")
-                completion()
+            guard let originObject = realmProvider.targetRealm.object(ofType: originObjectClass, forPrimaryKey: objectIdentifier) else { continue }
+            
+            if relationship.relationshipName == RealmSwiftAdapter.shareRelationshipKey {
+                syncedEntity.share = Self.getSyncedEntity(objectIdentifier: relationship.targetIdentifier, realm: realmProvider.persistenceRealm)
+                realmProvider.persistenceRealm.delete(relationship)
+                continue;
             }
+            
+            var targetClassName: String?
+            for property in originObject.objectSchema.properties {
+                if property.name == relationship.relationshipName {
+                    targetClassName = property.objectClassName
+                    break
+                }
+            }
+            
+            guard let className = targetClassName else {
+                continue
+            }
+            
+            guard let targetObjectClass = realmObjectClass(name: className) else { continue }
+            let targetObjectIdentifier = getObjectIdentifier(stringObjectId: relationship.targetIdentifier, entityType: className)
+            let targetObject = realmProvider.targetRealm.object(ofType: targetObjectClass, forPrimaryKey: targetObjectIdentifier)
+            
+            guard let target = targetObject else {
+                continue
+            }
+            originObject.setValue(target, forKey: relationship.relationshipName)
+            
+            realmProvider.persistenceRealm.delete(relationship)
         }
         
-//        try? realmProvider.persistenceRealm.commitWrite()
+        try? realmProvider.persistenceRealm.commitWrite()
 //        commitTargetWriteTransactionWithoutNotifying()
-//        try? realmProvider.targetRealm.commitWrite()
+        debugPrint("Finished applying pending relationships")
+//        let pendingRelationships = realmProvider.persistenceRealm.objects(PendingRelationship.self)
+//
+//        if pendingRelationships.count == 0 {
+//            completion()
+//            return
+//        }
+//
+//        realmProvider.persistenceRealm.beginWrite()
+//        realmProvider.targetRealm.beginWrite()
+//        for relationship in pendingRelationships {
+//            print("pending rel... \(relationship.description)")
+//            let entity = relationship.forSyncedEntity
+//
+//            guard let syncedEntity = entity,
+//                syncedEntity.entityState != .deleted else { continue }
+//
+//            guard let originObjectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
+//                continue
+//            }
+//
+//            let objectIdentifier = getObjectIdentifier(for: syncedEntity)
+//            guard let relationshipName = relationship.relationshipName else { continue }
+//            guard let targetIdentifier = relationship.targetIdentifier else { continue }
+//            let targetRealm = realmProvider.targetRealm
+////            targetRealm.writeAsync { [weak self] in
+////                guard let self = self else { return }
+//                guard let originObject = targetRealm.object(ofType: originObjectClass, forPrimaryKey: objectIdentifier) else {
+////                    continue
+//                    return
+//                }
+//
+//                //            if relationship.relationshipName == RealmSwiftAdapter.shareRelationshipKey {
+//                //                syncedEntity.share = Self.getSyncedEntity(objectIdentifier: relationship.targetIdentifier, realm: realmProvider.persistenceRealm)
+//                //                    realmProvider.persistenceRealm.delete(relationship)
+//                //                continue;
+//                //            }
+//
+//                var targetClassName: String?
+//                for property in originObject.objectSchema.properties {
+//                    if property.name == relationshipName {
+//                        targetClassName = property.objectClassName
+//                        break
+//                    }
+//                }
+//
+//                guard let className = targetClassName else {
+////                    continue
+//                    return
+//                }
+//
+//                guard let targetObjectClass = self.realmObjectClass(name: className) else {
+////                    continue
+//                    return
+//                }
+//                let targetObjectIdentifier = self.getObjectIdentifier(stringObjectId: targetIdentifier, entityType: className)
+//                let targetObject = targetRealm.object(ofType: targetObjectClass, forPrimaryKey: targetObjectIdentifier)
+//
+//                guard let target = targetObject else {
+//                    //                    continue
+//                    return
+//                }
+//
+//                originObject.setValue(target, forKey: relationshipName)
+//            } onComplete: { error in
+//                guard error == nil else {
+//                    print("Failed to set pending relationship")
+//                    completion()
+//                    return
+//                }
+//                let persistenceRealm = realmProvider.persistenceRealm
+//                persistenceRealm.writeAsync {
+//                    persistenceRealm.delete(relationship)
+//                }
+//                debugPrint("Finished applying pending relationships")
+//                completion()
+//            }
+//        }
+//
+////        try? realmProvider.persistenceRealm.commitWrite()
+////        commitTargetWriteTransactionWithoutNotifying()
+////        try? realmProvider.targetRealm.commitWrite()
     }
     
     func save(record: CKRecord, for syncedEntity: SyncedEntity) {
