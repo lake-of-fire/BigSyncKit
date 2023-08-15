@@ -222,10 +222,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                          * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
                          */
                         if object.realm!.isInWriteTransaction {
-                            
                             self.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: .insertion))
                         } else {
-                            
                             self.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: true, modified: false, deleted: false, realmProvider: realmProvider)
                             //                                       self.updateTracking(insertedObject: object, identifier: identifier, entityName: schema.className, provider: self.realmProvider)
                         }
@@ -238,10 +236,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                          * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
                          */
                         if object.realm!.isInWriteTransaction {
-                            
                             self.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: .modification))
                         } else {
-                            
                             self.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: false, modified: true, deleted: false, realmProvider: realmProvider)
                             //                                       self.updateTracking(insertedObject: object, identifier: identifier, entityName: schema.className, provider: self.realmProvider)
                         }

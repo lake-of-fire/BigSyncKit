@@ -5,13 +5,10 @@
 //  Created by Kit Forge on 5/9/19.
 //
 import Foundation
-import RealmSwift
 
 // Based on https://academy.realm.io/posts/realm-notifications-on-background-threads-with-swift/
 // Tweaked a little by Yue Cai
-class BackgroundWorker: NSObject {
-    static let shared = BackgroundWorker()
-    
+public class BackgroundWorker: NSObject {
     private var thread: Thread?
     private var block: (() -> Void)?
     
@@ -44,7 +41,7 @@ class BackgroundWorker: NSObject {
         }
     }
     
-    func stop() {
+    public func stop() {
         thread?.cancel()
     }
     
