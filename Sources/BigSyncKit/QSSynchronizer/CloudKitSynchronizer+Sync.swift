@@ -253,7 +253,7 @@ extension CloudKitSynchronizer {
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { (zoneResults) in
             
             //            Task { @MainActor in
-            self.dispatchQueue.async {
+//            self.dispatchQueue.async {
                 var pendingZones = [CKRecordZone.ID]()
                 var error: Error? = nil
                 
@@ -296,7 +296,7 @@ extension CloudKitSynchronizer {
                     //                    }
                     //                }
                 }
-            }
+//            }
         }
         
         runOperation(operation)
@@ -321,7 +321,7 @@ extension CloudKitSynchronizer {
     func mergeChangesIntoAdapter(_ adapter: ModelAdapter, completion: @escaping (Error?)->()) {
 
         adapter.persistImportedChanges { error in
-            self.dispatchQueue.async {
+//            self.dispatchQueue.async {
                 guard error == nil else {
                     completion(error)
                     return
@@ -329,7 +329,7 @@ extension CloudKitSynchronizer {
                 
                 adapter.saveToken(self.activeZoneTokens[adapter.recordZoneID])
                 completion(nil)
-            }
+//            }
         }
     }
 }
@@ -439,7 +439,7 @@ extension CloudKitSynchronizer {
                                                records: records,
                                                recordIDsToDelete: nil)
         { (savedRecords, deleted, conflicted, operationError) in
-            self.dispatchQueue.async {
+//            self.dispatchQueue.async {
                 if !(savedRecords?.isEmpty ?? true) {
                     debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                 }
@@ -464,7 +464,7 @@ extension CloudKitSynchronizer {
                         completion(nil)
                     }
                 }
-            }
+//            }
         }
         
         runOperation(modifyRecordsOperation)
@@ -482,7 +482,7 @@ extension CloudKitSynchronizer {
         
         let modifyRecordsOperation = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: recordIDs)
         modifyRecordsOperation.modifyRecordsCompletionBlock = { savedRecords, deletedRecordIDs, operationError in
-            self.dispatchQueue.async {
+//            self.dispatchQueue.async {
                 debugPrint("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
                 adapter.didDelete(recordIDs: deletedRecordIDs ?? [])
                 
@@ -498,7 +498,7 @@ extension CloudKitSynchronizer {
                         completion(nil)
                     }
                 }
-            }
+//            }
         }
         
         currentOperation = modifyRecordsOperation
@@ -545,7 +545,7 @@ extension CloudKitSynchronizer {
         }
         
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: recordZoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: ["recordID", CloudKitSynchronizer.deviceUUIDKey]) { (zoneResults) in
-            self.dispatchQueue.async {
+//            self.dispatchQueue.async {
                 var pendingZones = [CKRecordZone.ID]()
                 var needsToRefetch = false
                 
@@ -567,7 +567,7 @@ extension CloudKitSynchronizer {
                 } else {
                     completion(needsToRefetch)
                 }
-            }
+//            }
         }
         runOperation(operation)
     }
