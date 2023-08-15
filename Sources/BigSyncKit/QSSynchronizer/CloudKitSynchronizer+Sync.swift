@@ -281,6 +281,7 @@ extension CloudKitSynchronizer {
                         if result.moreComing {
                             pendingZones.append(zoneID)
                         }
+                            
                     }
                 }
                 
