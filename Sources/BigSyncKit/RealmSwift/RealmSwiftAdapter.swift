@@ -1266,7 +1266,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 //            try! persistenceRealm.write {
                 //            persistenceRealm.writeAsync {
                 for record in records {
-                    print("save changes to record \(record.description)")
+//                    print("save changes to record \(record.description)")
                     //                            realmProvider.persistenceRealm.beginWrite()
                     //                            realmProvider.targetRealm.beginWrite()
                     //                            guard let self = self else { return }
