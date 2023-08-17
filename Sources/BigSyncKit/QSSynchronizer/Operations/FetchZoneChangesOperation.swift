@@ -27,7 +27,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     
     var zoneResults = [CKRecordZone.ID: FetchZoneChangesOperationZoneResult]()
     
-//    let dispatchQueue = DispatchQueue(label: "fetchZoneChangesDispatchQueue")
+    let dispatchQueue = DispatchQueue(label: "fetchZoneChangesDispatchQueue")
     weak var internalOperation: CKFetchRecordZoneChangesOperation?
     
     init(database: CloudKitDatabaseAdapter,
@@ -72,64 +72,69 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         operation.fetchAllChanges = false
         
         operation.recordChangedBlock = { record in
-            
             let ignoreDeviceIdentifier: String = self.ignoreDeviceIdentifier ?? " "
-//            self.dispatchQueue.async {
-                
-                let isShare = record is CKShare
-                if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String || isShare {
-                    
-                    if !isShare,
-                       let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
-                       self.modelVersion > 0 && version > self.modelVersion {
+            self.dispatchQueue.async {
+                autoreleasepool {
+                    let isShare = record is CKShare
+                    if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String || isShare {
                         
-                        higherModelVersionFound = true
-                    } else {
-                        
-                        self.zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
+                        if !isShare,
+                           let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
+                           self.modelVersion > 0 && version > self.modelVersion {
+                            
+                            higherModelVersionFound = true
+                        } else {
+                            
+                            self.zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
+                        }
                     }
                 }
-//            }
+            }
         }
         
         operation.recordWithIDWasDeletedBlock = { recordID, recordType in
-//            self.dispatchQueue.async {
-                self.zoneResults[recordID.zoneID]?.deletedRecordIDs.append(recordID)
-//            }
+            self.dispatchQueue.async {
+                autoreleasepool {
+                    self.zoneResults[recordID.zoneID]?.deletedRecordIDs.append(recordID)
+                }
+            }
         }
         
         operation.recordZoneFetchCompletionBlock = {
             zoneID, serverChangeToken, clientChangeTokenData, moreComing, recordZoneError in
             
-//            self.dispatchQueue.async {
-                
-                let results = self.zoneResults[zoneID]!
-                
-                results.error = recordZoneError
-                results.serverChangeToken = serverChangeToken
-                
-                if !higherModelVersionFound {
-                    if moreComing {
-                        results.moreComing = true
+            self.dispatchQueue.async {
+                autoreleasepool {
+                    let results = self.zoneResults[zoneID]!
+                    
+                    results.error = recordZoneError
+                    results.serverChangeToken = serverChangeToken
+                    
+                    if !higherModelVersionFound {
+                        if moreComing {
+                            results.moreComing = true
+                        }
                     }
                 }
-//            }
+            }
         }
         
         operation.fetchRecordZoneChangesCompletionBlock = { operationError in
-//            self.dispatchQueue.async {
-                if let error = operationError,
-                   (error as NSError).code != CKError.partialFailure.rawValue { // Partial errors are returned per zone
-                    self.finish(error: error)
-                } else if higherModelVersionFound {
-                    self.finish(error: CloudKitSynchronizer.SyncError.higherModelVersionFound)
-                } else if self.isCancelled {
-                    self.finish(error: CloudKitSynchronizer.SyncError.cancelled)
-                } else {
-                    self.completion(self.zoneResults)
-                    self.finish(error: nil)
+            self.dispatchQueue.async {
+                autoreleasepool {
+                    if let error = operationError,
+                       (error as NSError).code != CKError.partialFailure.rawValue { // Partial errors are returned per zone
+                        self.finish(error: error)
+                    } else if higherModelVersionFound {
+                        self.finish(error: CloudKitSynchronizer.SyncError.higherModelVersionFound)
+                    } else if self.isCancelled {
+                        self.finish(error: CloudKitSynchronizer.SyncError.cancelled)
+                    } else {
+                        self.completion(self.zoneResults)
+                        self.finish(error: nil)
+                    }
                 }
-//            }
+            }
         }
         
         internalOperation = operation

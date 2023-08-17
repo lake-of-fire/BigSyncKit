@@ -38,7 +38,6 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
             }
         }
         operation.modifyRecordsCompletionBlock = { saved, deleted, operationError in
-            
             self.completion(saved, deleted, self.conflictedRecords, operationError)
         }
         

@@ -17,16 +17,6 @@ import RealmSwift
 import Realm
 import Combine
 
-func executeOnMainQueue(_ closure: () -> ()) {
-    if Thread.isMainThread {
-        closure()
-    } else {
-        DispatchQueue.main.sync {
-            closure()
-        }
-    }
-}
-
 extension Realm {
     public func safeWrite(_ block: (() throws -> Void)) throws {
         if isInWriteTransaction {
@@ -150,6 +140,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public private(set) var hasChanges = false
     
     public init(persistenceRealmConfiguration: Realm.Configuration, targetRealmConfiguration: Realm.Configuration, recordZoneID: CKRecordZone.ID) {
+        
         self.persistenceRealmConfiguration = persistenceRealmConfiguration
         self.targetRealmConfiguration = targetRealmConfiguration
         self.zoneID = recordZoneID
@@ -158,10 +149,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
 //        Task.detached(priority: .utility) { [weak self] in
 //        executeOnMainQueue {
-            setupTypeNamesLookup()
-            setup()
-            setupChildrenRelationshipsLookup()
-//        }
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                setupTypeNamesLookup()
+                setup()
+                setupChildrenRelationshipsLookup()
+            }
+        }
     }
     
     deinit {
@@ -170,15 +164,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     func invalidateRealmAndTokens() {
 //        executeOnMainQueue {
-            for token in collectionNotificationTokens {
-                token.invalidate()
-//                token.cancel()
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                for token in collectionNotificationTokens {
+                    token.invalidate()
+                    //                token.cancel()
+                }
+                collectionNotificationTokens.removeAll()
+                
+                realmProvider?.persistenceRealm.invalidate()
+                realmProvider = nil
             }
-            collectionNotificationTokens.removeAll()
-            
-            realmProvider?.persistenceRealm.invalidate()
-            realmProvider = nil
-//        }
+        }
     }
     
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
@@ -307,12 +304,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if needsInitialSetup {
 //                Task.detached(priority: .utility) { [weak self] in
 //                    guard let self = self else { return }
-                    let realm = realmProvider.persistenceRealm
+//                    let realm = realmProvider.persistenceRealm
                 let results = realmProvider.targetRealm.objects(objectClass)
                 let identifiers = results.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) }
                 
 //                realm.writeAsync {
-                try! realm.safeWrite {
                     for identifier in identifiers {
                         //                        autoreleasepool { [weak self] in
                         //                            try? realm.safeWrite {
@@ -322,7 +318,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         //                        }
                     }
                     //                }
-                }
             }
         }
         
@@ -343,9 +338,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         updateHasChanges(realm: realmProvider.persistenceRealm)
         
         if hasChanges {
-            Task { @MainActor in
+//            Task { @MainActor in
                 NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
-            }
+//            }
         }
         
         startObservingTermination()
@@ -786,7 +781,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //        }
 //    }
     
-    func applyPendingRelationships(realmProvider: RealmProvider, completion: @escaping () -> Void) {
+    func applyPendingRelationships(realmProvider: RealmProvider) {
         let pendingRelationships = realmProvider.persistenceRealm.objects(PendingRelationship.self)
         
         if pendingRelationships.count == 0 {
@@ -1160,39 +1155,43 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func startObservingTermination() {
-//        Task { @MainActor in
+        Task { @MainActor in
 #if os(iOS) || os(tvOS)
             NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: UIApplication.willTerminateNotification, object: nil)
 #elseif os(macOS)
             NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: NSApplication.willTerminateNotification, object: nil)
 #endif
-//        }
+        }
     }
     
     /// Deletes soft-deleted objects.
     @objc func cleanUp() {
-        //        DispatchQueue(label: "RealmSwiftAadapter.cleanUp").async { [weak self] in
-        //            autoreleasepool {
-//        guard let self = self else { return }
-        guard let realmProvider = realmProvider else { return }
-        for schema in realmProvider.targetRealm.schema.objectSchema {
-            guard let objectClass = self.realmObjectClass(name: schema.className) else {
-                continue
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        DispatchQueue(label: "RealmSwiftAadapter.cleanUp").async { [weak self] in
+                //            autoreleasepool {
+                //        guard let self = self else { return }
+                guard let realmProvider = realmProvider else { return }
+                for schema in realmProvider.targetRealm.schema.objectSchema {
+                    guard let objectClass = self.realmObjectClass(name: schema.className) else {
+                        continue
+                    }
+                    guard objectClass.self is any SyncableObject.Type else {
+                        continue
+                    }
+                    
+                    let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
+                    if results.isEmpty {
+                        continue
+                    }
+                    realmProvider.targetRealm.beginWrite()
+                    //            realmProvider.targetRealm.writeAsync {
+                    results.forEach({ realmProvider.targetRealm.delete($0) })
+                    //                    commitTargetWriteTransactionWithoutNotifying()
+                    try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+                    //            }
+                }
             }
-            guard objectClass.self is any SyncableObject.Type else {
-                continue
-            }
-            
-            let results = realmProvider.targetRealm.objects(objectClass).filter { ($0 as? (any SyncableObject))?.isDeleted ?? false }
-            if results.isEmpty {
-                continue
-            }
-            realmProvider.targetRealm.beginWrite()
-//            realmProvider.targetRealm.writeAsync {
-                results.forEach({ realmProvider.targetRealm.delete($0) })
-                //                    commitTargetWriteTransactionWithoutNotifying()
-            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
-//            }
         }
         //            }
         //        }
@@ -1249,21 +1248,23 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
 //        executeOnMainQueue {
-        self.realmProvider.persistenceRealm.beginWrite()
-        self.realmProvider.targetRealm .beginWrite()
-        
-            //        DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
-            //            autoreleasepool {
-            //        guard let self = self else { return }
-//            realmProvider.persistenceRealm.beginWrite()
-//            realmProvider.targetRealm.beginWrite()
-            
-//            for chunk in records.chunked(into: 2000) {
-//                DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
-//                    autoreleasepool { [weak self] in
-//            let persistenceRealm = realmProvider.persistenceRealm
-//            try! persistenceRealm.write {
-//            persistenceRealm.writeAsync {
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                realmProvider.persistenceRealm.beginWrite()
+                realmProvider.targetRealm.beginWrite()
+                
+                //        DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
+                //            autoreleasepool {
+                //        guard let self = self else { return }
+                //            realmProvider.persistenceRealm.beginWrite()
+                //            realmProvider.targetRealm.beginWrite()
+                
+                //            for chunk in records.chunked(into: 2000) {
+                //                DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
+                //                    autoreleasepool { [weak self] in
+                //            let persistenceRealm = realmProvider.persistenceRealm
+                //            try! persistenceRealm.write {
+                //            persistenceRealm.writeAsync {
                 for record in records {
                     print("save changes to record \(record.description)")
                     //                            realmProvider.persistenceRealm.beginWrite()
@@ -1278,9 +1279,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         //                                        syncedEntity = self.createSyncedEntity(record: record, realmProvider: realmProvider)
                         //                                    }
                         //                                } else {
-//                        realmProvider.targetRealm.beginWrite()
+                        //                        realmProvider.targetRealm.beginWrite()
                         syncedEntity = self.createSyncedEntity(record: record, realmProvider: realmProvider)
-//                        try? realmProvider.targetRealm.commitWrite()
+                        //                        try? realmProvider.targetRealm.commitWrite()
                         //                                }
                     }
                     
@@ -1307,29 +1308,30 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         //                        } onComplete: { error in
                         //                            }
                     }
-                        //                                self.saveShareRelationship(for: syncedEntity, record: record)
-                        self.save(record: record, for: syncedEntity)
+                    //                                self.saveShareRelationship(for: syncedEntity, record: record)
+                    self.save(record: record, for: syncedEntity)
                     // Order is important here. Notifications might be delivered after targetRealm is saved and
                     // it's convenient if the persistenceRealm is not in a write transaction
                     //                            try? realmProvider.persistenceRealm.commitWrite()
                     //                            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
                 }
-//            } onComplete: { error in
-//                completion()
-//            }
-        try? self.realmProvider.persistenceRealm.commitWrite()
-        try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
-//        }
-        //                    }
-        //                }
-        //            }
+                //            } onComplete: { error in
+                //                completion()
+                //            }
+                try? realmProvider.persistenceRealm.commitWrite()
+                try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+            }
+            //                    }
+            //                }
+            //            }
             // Order is important here. Notifications might be delivered after targetRealm is saved and
             // it's convenient if the persistenceRealm is not in a write transaction
-//            try? realmProvider.persistenceRealm.commitWrite()
+            //            try? realmProvider.persistenceRealm.commitWrite()
             //                self.commitTargetWriteTransactionWithoutNotifying()
-//            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+            //            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
             //            }
-//        }
+            //        }
+        }
     }
     
     public func deleteRecords(with recordIDs: [CKRecord.ID]) {
@@ -1338,50 +1340,53 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         debugPrint("Deleting records with record ids \(recordIDs)")
         
 //        executeOnMainQueue {
-            //        DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
-            //            autoreleasepool {
-            //        guard let self = self else { return }
-            realmProvider.persistenceRealm.beginWrite()
-            realmProvider.targetRealm.beginWrite()
-            
-//            for chunk in recordIDs.chunked(into: 2000) {
-//                DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
-//                    autoreleasepool { [weak self] in
-                        for recordID in recordIDs {
-//                            realmProvider.persistenceRealm.beginWrite()
-//                            realmProvider.targetRealm.beginWrite()
-                            if let syncedEntity = Self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: realmProvider.persistenceRealm) {
-                                
-                                if syncedEntity.entityType != "CKShare" {
-                                    guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
-                                        //                                    continue
-                                        return
-                                    }
-                                    let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
-                                    let object = realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
-                                    
-                                    if let object = object {
-                                        realmProvider.targetRealm.delete(object)
-                                    }
-                                }
-                                
-                                if let record = syncedEntity.record {
-                                    realmProvider.persistenceRealm.delete(record);
-                                }
-                                
-                                realmProvider.persistenceRealm.delete(syncedEntity)
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
+                //            autoreleasepool {
+                //        guard let self = self else { return }
+                realmProvider.persistenceRealm.beginWrite()
+                realmProvider.targetRealm.beginWrite()
+                
+                //            for chunk in recordIDs.chunked(into: 2000) {
+                //                DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
+                //                    autoreleasepool { [weak self] in
+                for recordID in recordIDs {
+                    //                            realmProvider.persistenceRealm.beginWrite()
+                    //                            realmProvider.targetRealm.beginWrite()
+                    if let syncedEntity = Self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: realmProvider.persistenceRealm) {
+                        
+                        if syncedEntity.entityType != "CKShare" {
+                            guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
+                                //                                    continue
+                                return
                             }
-//                            try? realmProvider.persistenceRealm.commitWrite()
-//                            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+                            let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
+                            let object = realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
+                            
+                            if let object = object {
+                                realmProvider.targetRealm.delete(object)
+                            }
                         }
-//                    }
-//                }
-//            }
-            try? realmProvider.persistenceRealm.commitWrite()
-            //                self.commitTargetWriteTransactionWithoutNotifying()
-            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
-            //            }
-//        }
+                        
+                        if let record = syncedEntity.record {
+                            realmProvider.persistenceRealm.delete(record);
+                        }
+                        
+                        realmProvider.persistenceRealm.delete(syncedEntity)
+                    }
+                    //                            try? realmProvider.persistenceRealm.commitWrite()
+                    //                            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+                }
+                //                    }
+                //                }
+                //            }
+                try? realmProvider.persistenceRealm.commitWrite()
+                //                self.commitTargetWriteTransactionWithoutNotifying()
+                try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+                //            }
+            }
+        }
     }
     
     public func persistImportedChanges(completion: @escaping ((Error?) -> Void)) {
@@ -1391,10 +1396,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
 //        executeOnMainQueue {
-            applyPendingRelationships(realmProvider: realmProvider) {
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                applyPendingRelationships(realmProvider: realmProvider)
                 completion(nil)
             }
-//        }
+        }
     }
     
     public func recordsToUpload(limit: Int) -> [CKRecord] {
@@ -1403,20 +1410,22 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var recordsArray = [CKRecord]()
         
 //        executeOnMainQueue {
-            //        DispatchQueue(label: "recordsToUpload").async { [weak self] in
-            //            autoreleasepool { // Silence notifications on writes in thread
-            //                guard let self = self else { return }
-            let recordLimit = limit == 0 ? Int.max : limit
-            var uploadingState = SyncedEntityState.newOrChanged
-            
-            var innerLimit = recordLimit
-            while recordsArray.count < recordLimit && uploadingState.rawValue < SyncedEntityState.deleted.rawValue {
-                recordsArray.append(contentsOf: self.recordsToUpload(withState: uploadingState, limit: innerLimit, realmProvider: realmProvider))
-                uploadingState = self.nextStateToSync(after: uploadingState)
-                innerLimit = recordLimit - recordsArray.count
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        DispatchQueue(label: "recordsToUpload").async { [weak self] in
+                //            autoreleasepool { // Silence notifications on writes in thread
+                //                guard let self = self else { return }
+                let recordLimit = limit == 0 ? Int.max : limit
+                var uploadingState = SyncedEntityState.newOrChanged
+                
+                var innerLimit = recordLimit
+                while recordsArray.count < recordLimit && uploadingState.rawValue < SyncedEntityState.deleted.rawValue {
+                    recordsArray.append(contentsOf: self.recordsToUpload(withState: uploadingState, limit: innerLimit, realmProvider: realmProvider))
+                    uploadingState = self.nextStateToSync(after: uploadingState)
+                    innerLimit = recordLimit - recordsArray.count
+                }
             }
-            //            }
-//        }
+        }
         
         return recordsArray
     }
@@ -1424,24 +1433,27 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func didUpload(savedRecords: [CKRecord]) {
         guard let realmProvider = realmProvider else { return }
         
-                    realmProvider.persistenceRealm.beginWrite()
-        for record in savedRecords {
-            //            executeOnMainQueue {
-//            DispatchQueue(label: "didUpload").async { [weak self] in
-//                autoreleasepool { // Silence notifications on writes in thread
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                realmProvider.persistenceRealm.beginWrite()
+                for record in savedRecords {
+                    //            executeOnMainQueue {
+                    //            DispatchQueue(label: "didUpload").async { [weak self] in
+                    //                autoreleasepool { // Silence notifications on writes in thread
                     //        guard let self = self else { return }
-//                    try! realmProvider.persistenceRealm.safeWrite {
-                        //            for record in savedRecords {
-                        if let syncedEntity = realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
-                            syncedEntity.state = SyncedEntityState.synced.rawValue
-                            save(record: record, for: syncedEntity)
-                        }
-                        //                            }
-//                    }
-                    try? realmProvider.persistenceRealm.commitWrite()
+                    //                    try! realmProvider.persistenceRealm.safeWrite {
+                    //            for record in savedRecords {
+                    if let syncedEntity = realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
+                        syncedEntity.state = SyncedEntityState.synced.rawValue
+                        save(record: record, for: syncedEntity)
+                    }
+                    //                            }
+                    //                    }
                 }
-//            }
-//        }
+                //            }
+                try? realmProvider.persistenceRealm.commitWrite()
+            }
+        }
     }
     
     public func recordIDsMarkedForDeletion(limit: Int) -> [CKRecord.ID] {
@@ -1449,19 +1461,22 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var recordIDs = [CKRecord.ID]()
         
-        executeOnMainQueue {
-            //        DispatchQueue(label: "recordIDsMarkedForDeletion").async { [weak self] in
-            //            autoreleasepool { // Silence notifications on writes in thread
-            //                guard let self = self else { return }
-            let deletedEntities = realmProvider.persistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deleted.rawValue }
-            
-            for syncedEntity in deletedEntities {
-                if recordIDs.count >= limit {
-                    break
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        executeOnMainQueue {
+                //        DispatchQueue(label: "recordIDsMarkedForDeletion").async { [weak self] in
+                //            autoreleasepool { // Silence notifications on writes in thread
+                //                guard let self = self else { return }
+                let deletedEntities = realmProvider.persistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deleted.rawValue }
+                
+                for syncedEntity in deletedEntities {
+                    if recordIDs.count >= limit {
+                        break
+                    }
+                    recordIDs.append(CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
                 }
-                recordIDs.append(CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
+                //            }
             }
-            //            }
         }
         
         return recordIDs
@@ -1470,12 +1485,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func didDelete(recordIDs deletedRecordIDs: [CKRecord.ID]) {
         guard let realmProvider = realmProvider else { return }
         
-//        executeOnMainQueue {
-            //        DispatchQueue(label: "didDelete").async { [weak self] in
-            //            autoreleasepool { // Silence notifications on writes in thread
-            //        guard let self = self else { return }
-            realmProvider.persistenceRealm.beginWrite()
-//            realmProvider.persistenceRealm.writeAsync {
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        executeOnMainQueue {
+                //            autoreleasepool { // Silence notifications on writes in thread
+                //        guard let self = self else { return }
+                realmProvider.persistenceRealm.beginWrite()
+                //            realmProvider.persistenceRealm.writeAsync {
                 for recordID in deletedRecordIDs {
                     if let syncedEntity = realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName) {
                         if let record = syncedEntity.record {
@@ -1485,8 +1501,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
                 try? realmProvider.persistenceRealm.commitWrite()
-//            }
-//        }
+                //            }
+            }
+        }
     }
     
     public func hasRecordID(_ recordID: CKRecord.ID) -> Bool {
@@ -1494,13 +1511,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var hasRecord = false
 //        executeOnMainQueue {
-            //        DispatchQueue(label: "hasRecordID").async { [weak self] in
-            //            autoreleasepool { // Silence notifications on writes in thread
-            //                guard let self = self else { return }
-            let syncedEntity = realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName)
-            hasRecord = syncedEntity != nil
-            //            }
-//        }
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        DispatchQueue(label: "hasRecordID").async { [weak self] in
+                //            autoreleasepool { // Silence notifications on writes in thread
+                //                guard let self = self else { return }
+                let syncedEntity = realmProvider.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName)
+                hasRecord = syncedEntity != nil
+                //            }
+            }
+        }
         return hasRecord
     }
     
@@ -1509,14 +1529,15 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         tempFileManager.clearTempFiles()
         
-//        DispatchQueue(label: "didFinishImport").async { [weak self] in
-//        executeOnMainQueue {
-//            autoreleasepool { // Silence notifications on writes in thread
-//                guard let self = self else { return }
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        executeOnMainQueue {
+                //            autoreleasepool { // Silence notifications on writes in thread
+                //                guard let self = self else { return }
                 guard let realmProvider = self.realmProvider else { return }
                 self.updateHasChanges(realm: realmProvider.persistenceRealm)
-//            }
-//        }
+            }
+        }
     }
     
     public func record(for object: AnyObject) -> CKRecord? {
@@ -1525,16 +1546,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var record: CKRecord?
         
-//        executeOnMainQueue {
-            //        DispatchQueue(label: "recordForObject").async { [weak self] in
-            //            autoreleasepool { // Silence notifications on writes in thread
-            //                guard let self = self else { return }
-            if let syncedEntity = syncedEntity(for: realmObject, realm: realmProvider.persistenceRealm) {
-                var parent: SyncedEntity?
-                record = recordToUpload(syncedEntity: syncedEntity, realmProvider: realmProvider, parentSyncedEntity: &parent)
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        executeOnMainQueue {
+                //        DispatchQueue(label: "recordForObject").async { [weak self] in
+                //            autoreleasepool { // Silence notifications on writes in thread
+                //                guard let self = self else { return }
+                if let syncedEntity = syncedEntity(for: realmObject, realm: realmProvider.persistenceRealm) {
+                    var parent: SyncedEntity?
+                    record = recordToUpload(syncedEntity: syncedEntity, realmProvider: realmProvider, parentSyncedEntity: &parent)
+                }
             }
-            //            }
-//        }
+        }
         
         return record
     }
@@ -1566,26 +1589,31 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let realmProvider = realmProvider else { return nil }
         
         var token: CKServerChangeToken?
-//        executeOnMainQueue {
-            let serverToken = realmProvider.persistenceRealm.objects(ServerToken.self).first
-            if let tokenData = serverToken?.token {
-                token = NSKeyedUnarchiver.unarchiveObject(with: tokenData) as? CKServerChangeToken
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        executeOnMainQueue {
+                let serverToken = realmProvider.persistenceRealm.objects(ServerToken.self).first
+                if let tokenData = serverToken?.token {
+                    token = NSKeyedUnarchiver.unarchiveObject(with: tokenData) as? CKServerChangeToken
+                }
             }
-//        }
+        }
         return token
     }
     
     public func saveToken(_ token: CKServerChangeToken?) {
         guard let realmProvider = realmProvider else { return }
 //        executeOnMainQueue {
-            //        DispatchQueue(label: "saveTokenCKServerChangeToken").async { [weak self] in
-            //            autoreleasepool { // Silence notifications on writes in thread
-            //        guard let self = self else { return }
-            var serverToken: ServerToken! = realmProvider.persistenceRealm.objects(ServerToken.self).first
-            
-            realmProvider.persistenceRealm.beginWrite()
-//            try! realmProvider.persistenceRealm.write {
-//            realmProvider.persistenceRealm.writeAsync {
+        DispatchQueue(label: "BigSyncKit").sync {
+            autoreleasepool {
+                //        DispatchQueue(label: "saveTokenCKServerChangeToken").async { [weak self] in
+                //            autoreleasepool { // Silence notifications on writes in thread
+                //        guard let self = self else { return }
+                var serverToken: ServerToken! = realmProvider.persistenceRealm.objects(ServerToken.self).first
+                
+                realmProvider.persistenceRealm.beginWrite()
+                //            try! realmProvider.persistenceRealm.write {
+                //            realmProvider.persistenceRealm.writeAsync {
                 if serverToken == nil {
                     serverToken = ServerToken()
                     realmProvider.persistenceRealm.add(serverToken)
@@ -1596,10 +1624,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 } else {
                     serverToken.token = nil
                 }
-//            }
-            
-            try? realmProvider.persistenceRealm.commitWrite()
-//        }
-//        }
+                //            }
+                
+                try? realmProvider.persistenceRealm.commitWrite()
+            }
+        }
     }
 }

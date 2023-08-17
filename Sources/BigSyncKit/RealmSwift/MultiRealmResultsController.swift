@@ -125,9 +125,12 @@ public class MultiRealmResultsController<T: Object> {
     }
     
     @objc func didChangeAdapters(notification: Notification) {
-        DispatchQueue.main.async {
-            self.updateResults()
-            self.didChangeRealms?(self)
+        DispatchQueue(label: "BigSyncKit").async {
+            autoreleasepool {
+                //        DispatchQueue.main.async {
+                self.updateResults()
+                self.didChangeRealms?(self)
+            }
         }
     }
 }
