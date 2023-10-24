@@ -13,9 +13,7 @@ let package = Package(
             targets: ["BigSyncKit"]),
     ],
     dependencies: [
-        // Dependencies declare other packages that this package depends on.
-        // .package(url: /* package url */, from: "1.0.0"),
-        .package(url: "https://github.com/realm/realm-swift.git", from: "10.28.1"),
+        .package(url: "https://github.com/RomanEsin/RealmBinary.git", branch: "release/v10.43.1"),
     ],
     targets: [
         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
@@ -23,8 +21,8 @@ let package = Package(
         .target(
             name: "BigSyncKit",
             dependencies: [
-                .product(name: "Realm", package: "realm-swift"),
-                .product(name: "RealmSwift", package: "realm-swift"),
+                .product(name: "Realm", package: "RealmBinary"),
+                .product(name: "RealmSwift", package: "RealmBinary"),
             ]),
         .testTarget(
             name: "BigSyncKitTests",
