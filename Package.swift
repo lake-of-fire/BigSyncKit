@@ -13,7 +13,7 @@ let package = Package(
             targets: ["BigSyncKit"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/RomanEsin/RealmBinary.git", branch: "release/v10.43.1"),
+        .package(url: "https://github.com/lake-of-fire/RealmBinary", branch: "main"),
     ],
     targets: [
         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
