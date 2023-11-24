@@ -131,7 +131,11 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
         
         adapterDictionary[recordZoneID] = adapter
         
-        NotificationCenter.default.post(name: .realmProviderDidAddAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
+        DispatchQueue(label: "BigSyncKit").async {
+            autoreleasepool {
+                NotificationCenter.default.post(name: .realmProviderDidAddAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
+            }
+        }
         
         return adapter
     }
@@ -153,6 +157,10 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
         let folderURL = directoryURL.appendingPathComponent(folderName)
         try? FileManager.default.removeItem(at: folderURL)
         
-        NotificationCenter.default.post(name: .realmProviderDidRemoveAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
+        DispatchQueue(label: "BigSyncKit").async {
+            autoreleasepool {
+                NotificationCenter.default.post(name: .realmProviderDidRemoveAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
+            }
+        }
     }
 }
