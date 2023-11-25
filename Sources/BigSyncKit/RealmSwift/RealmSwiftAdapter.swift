@@ -338,13 +338,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         updateHasChanges(realm: realmProvider.persistenceRealm)
         
         if hasChanges {
-//            Task { @MainActor in
-            DispatchQueue(label: "BigSyncKit").async {
-                autoreleasepool {
-                    NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
-                }
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
             }
-//            }
         }
         
         startObservingTermination()
@@ -439,10 +435,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //        executeOnMainQueue {
             if !hasChanges && isNewChangeFinal {
                 hasChanges = true
-                DispatchQueue(label: "BigSyncKit").async {
-                    autoreleasepool {
-                        NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
-                    }
+                Task { @MainActor in
+                    NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
                 }
             }
 //        }

@@ -77,11 +77,8 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     func postNotification(_ notification: Notification.Name, object: Any? = nil, userInfo: [AnyHashable: Any]? = nil) {
         let object = object ?? self
-//        Task { @MainActor in
-        DispatchQueue(label: "BigSyncKit").async {
-            autoreleasepool {
-                NotificationCenter.default.post(name: notification, object: object, userInfo: userInfo)
-            }
+        Task { @MainActor in
+            NotificationCenter.default.post(name: notification, object: object, userInfo: userInfo)
         }
     }
     
