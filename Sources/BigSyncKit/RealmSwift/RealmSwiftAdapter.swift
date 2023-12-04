@@ -420,7 +420,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             isNewChange = true
             
             if let syncedEntity = syncedEntity {
-                try? realmProvider.persistenceRealm.safeWrite {
+//                try? realmProvider.persistenceRealm.safeWrite {
+                realmProvider.persistenceRealm.writeAsync {
                     syncedEntity.state = SyncedEntityState.deleted.rawValue
                 }
             }
@@ -439,12 +440,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
                 // Hack to avoid crashing issue: https://github.com/realm/realm-swift/issues/8333
-                Task {
-                    if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm) {
-                        try? realmProvider.persistenceRealm.safeWrite {
-                            syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
-                            // If state was New (or Modified already) then leave it as that
-                        }
+                if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm) {
+//                    try? realmProvider.persistenceRealm.safeWrite {
+                    realmProvider.persistenceRealm.writeAsync {
+                        syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
+                        // If state was New (or Modified already) then leave it as that
                     }
                 }
             }
