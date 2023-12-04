@@ -422,8 +422,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             isNewChange = true
             
-            try? realmProvider.persistenceRealm.safeWrite {
-                if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
+            if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
+                try? realmProvider.persistenceRealm.safeWrite {
                     syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
                     // If state was New (or Modified already) then leave it as that
                 }
