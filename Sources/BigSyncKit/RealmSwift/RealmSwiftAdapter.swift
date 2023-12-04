@@ -214,11 +214,15 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             let results = realmProvider.targetRealm.objects(objectClass)
             
             // Register for collection notifications
-            let token = results.changesetPublisher
+            results.changesetPublisher
                 .freeze()
+                .threadSafeReference()
                 .debounce(for: 0.0001, scheduler: DispatchSerialQueue(label: "BigSyncKit.RealmSwiftAdapter"))
                 .sink(receiveValue: { [weak self] collectionChange in
+                    //                let ref = ThreadSafeReference(to: collectionChange)
+                    //                Task { @MainActor [weak self] in
                     guard let self = self else { return }
+//                    let collectionChange = realmProvider.targetRealm.resolve(ref)
                     switch collectionChange {
                     case .update(_, _, let insertions, let modifications):
                         for index in insertions {
