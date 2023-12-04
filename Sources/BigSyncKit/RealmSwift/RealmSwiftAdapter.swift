@@ -216,6 +216,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             // Register for collection notifications
             results.changesetPublisher
                 .freeze()
+                .threadSafeReference()
                 .debounce(for: 0.0001, scheduler: DispatchSerialQueue(label: "BigSyncKit.RealmSwiftAdapter"))
                 .sink(receiveValue: { [weak self] collectionChange in
 //                    let ref = ThreadSafeReference(to: collectionChange)
