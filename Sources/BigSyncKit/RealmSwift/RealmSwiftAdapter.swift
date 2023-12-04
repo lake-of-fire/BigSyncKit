@@ -212,31 +212,33 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 guard let self = self else { return }
                 switch collectionChange {
                 case .update(_, _, let insertions, let modifications):
-                    for index in insertions {
-                        let object = results[index]
-                        let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                        /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
-                         * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
-                         */
-                        if object.realm!.isInWriteTransaction {
-                            self.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: .insertion))
-                        } else {
-                            self.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: true, modified: false, deleted: false, realmProvider: realmProvider)
-                            //                                       self.updateTracking(insertedObject: object, identifier: identifier, entityName: schema.className, provider: self.realmProvider)
+                    autoreleasepool {
+                        for index in insertions {
+                            let object = results[index]
+                            let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+                            /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
+                             * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
+                             */
+                            if object.realm!.isInWriteTransaction {
+                                self.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: .insertion))
+                            } else {
+                                self.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: true, modified: false, deleted: false, realmProvider: realmProvider)
+                                //                                       self.updateTracking(insertedObject: object, identifier: identifier, entityName: schema.className, provider: self.realmProvider)
+                            }
                         }
-                    }
-
-                    for index in modifications {
-                        let object = results[index]
-                        let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                        /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
-                         * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
-                         */
-                        if object.realm!.isInWriteTransaction {
-                            self.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: .modification))
-                        } else {
-                            self.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: false, modified: true, deleted: false, realmProvider: realmProvider)
-                            //                                       self.updateTracking(insertedObject: object, identifier: identifier, entityName: schema.className, provider: self.realmProvider)
+                        
+                        for index in modifications {
+                            let object = results[index]
+                            let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+                            /* This can be called during a transaction, and it's illegal to add a notification block during a transaction,
+                             * so we keep all the insertions in a list to be processed as soon as the realm finishes the current transaction
+                             */
+                            if object.realm!.isInWriteTransaction {
+                                self.pendingTrackingUpdates.append(ObjectUpdate(object: object, identifier: identifier, entityType: schema.className, updateType: .modification))
+                            } else {
+                                self.updateTracking(objectIdentifier: identifier, entityName: schema.className, inserted: false, modified: true, deleted: false, realmProvider: realmProvider)
+                                //                                       self.updateTracking(insertedObject: object, identifier: identifier, entityName: schema.className, provider: self.realmProvider)
+                            }
                         }
                     }
                 default: break
@@ -424,7 +426,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
                 // Hack to avoid crashing issue: https://github.com/realm/realm-swift/issues/8333
-                Thread.sleep(forTimeInterval: 0.001)
+//                Thread.sleep(forTimeInterval: 0.001)
                 try? realmProvider.persistenceRealm.safeWrite {
                     syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
                     // If state was New (or Modified already) then leave it as that
