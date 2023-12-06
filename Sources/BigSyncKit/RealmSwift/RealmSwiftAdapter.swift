@@ -18,8 +18,10 @@ import Realm
 import Combine
 
 @globalActor
-actor RealmBackgroundActor {
-    static var shared = RealmBackgroundActor()
+public actor RealmBackgroundActor {
+    public static var shared = RealmBackgroundActor()
+    
+    public init() { }
 }
 extension Realm {
     public func safeWrite(_ block: (() throws -> Void)) throws {
