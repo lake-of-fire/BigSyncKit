@@ -14,6 +14,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/lake-of-fire/RealmBinary.git", branch: "main"),
+        .package(url: "https://github.com/lake-of-fire/RealmSwiftGaps.git", branch: "main"),
     ],
     targets: [
         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
@@ -23,6 +24,7 @@ let package = Package(
             dependencies: [
                 .product(name: "Realm", package: "RealmBinary"),
                 .product(name: "RealmSwift", package: "RealmBinary"),
+                .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
             ]),
         .testTarget(
             name: "BigSyncKitTests",

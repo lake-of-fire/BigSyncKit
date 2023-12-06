@@ -16,22 +16,17 @@ import UIKit
 import RealmSwift
 import Realm
 import Combine
+import RealmSwiftGaps
 
-@globalActor
-public actor RealmBackgroundActor {
-    public static var shared = RealmBackgroundActor()
-    
-    public init() { }
-}
-extension Realm {
-    public func safeWrite(_ block: (() throws -> Void)) throws {
-        if isInWriteTransaction {
-            try block()
-        } else {
-            try write(block)
-        }
-    }
-}
+//extension Realm {
+//    public func safeWrite(_ block: (() throws -> Void)) throws {
+//        if isInWriteTransaction {
+//            try block()
+//        } else {
+//            try write(block)
+//        }
+//    }
+//}
 
 extension Array {
     func chunked(into size: Int) -> [[Element]] {
@@ -457,7 +452,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         } else if syncedEntity == nil {
             if let realm = await self.realmProvider?.persistenceRealm {
-                Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, realm: realm)
+                await Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, realm: realm)
             }
             
             if inserted {
@@ -496,10 +491,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @RealmBackgroundActor
     @discardableResult
-    static func createSyncedEntity(entityType: String, identifier: String, realm: Realm) -> SyncedEntity {
+    static func createSyncedEntity(entityType: String, identifier: String, realm: Realm) async -> SyncedEntity {
         let syncedEntity = SyncedEntity(entityType: entityType, identifier: "\(entityType).\(identifier)", state: SyncedEntityState.newOrChanged.rawValue)
         
-        try? realm.safeWrite {
+//        try? realm.safeWrite {
+        try? await realm.asyncWrite {
             realm.add(syncedEntity, update: .modified)
         }
         
