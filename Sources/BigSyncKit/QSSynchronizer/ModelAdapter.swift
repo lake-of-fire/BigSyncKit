@@ -67,7 +67,7 @@ public extension Notification.Name {
     /// Asks the model adapter whether it has a local object for the given record identifier.
     /// - Parameter recordID: Record identifier.
     /// - Returns: Whether there is a corresponding object for this identifier.
-    func hasRecordID(_ recordID: CKRecord.ID) -> Bool
+//    func hasRecordID(_ recordID: CKRecord.ID) -> Bool
     
     /// Tells the model adapter that the current import operation finished.
     /// - Parameter error: Optional error, if any error happened.
@@ -96,7 +96,7 @@ public extension Notification.Name {
     
     /// Returns corresponding `CKRecord` for the given model object.
     /// - Parameter object: Model object.
-    func record(for object: AnyObject) -> CKRecord?
+//    func record(for object: AnyObject) -> CKRecord?
 
     /// Returns CKShare for the given model object, if one exists.
     /// - Parameter object: Model object.
