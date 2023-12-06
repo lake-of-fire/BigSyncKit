@@ -1409,7 +1409,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         //                            }
                     }
                     //                                self.saveShareRelationship(for: syncedEntity, record: record)
-                    self.save(record: record, for: syncedEntity)
+                    try? await realmProvider.persistenceRealm.asyncWrite {
+                        self.save(record: record, for: syncedEntity)
+                    }
                     // Order is important here. Notifications might be delivered after targetRealm is saved and
                     // it's convenient if the persistenceRealm is not in a write transaction
                     //                            try? realmProvider.persistenceRealm.commitWrite()
