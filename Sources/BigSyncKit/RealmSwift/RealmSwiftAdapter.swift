@@ -1557,7 +1557,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     let persistenceRealm = await realmProvider.persistenceRealm
                     try? await realmProvider.persistenceRealm.asyncWrite {
                         syncedEntity.state = SyncedEntityState.synced.rawValue
-                        save(record: record, for: syncedEntity)
+                        self.save(record: record, for: syncedEntity)
                     }
                 }
                 //                            }
