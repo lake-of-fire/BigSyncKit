@@ -874,7 +874,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
 //        realmProvider.persistenceRealm.beginWrite()
 //        realmProvider.targetRealm.beginWrite()
-        for relationship in pendingRelationships {
+        for relationship in Array(pendingRelationships) {
             let entity = relationship.forSyncedEntity
             
             guard let syncedEntity = entity,
@@ -1052,7 +1052,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let results = realmProvider.syncPersistenceRealm.objects(SyncedEntity.self).where { $0.state == state.rawValue }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
-        for syncedEntity in results {
+        for syncedEntity in Array(results) {
             if resultArray.count > limit {
                 break
             }
@@ -1586,7 +1586,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 //                guard let self = self else { return }
                 let deletedEntities = realmProvider.syncPersistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deleted.rawValue }
                 
-                for syncedEntity in deletedEntities {
+                for syncedEntity in Array(deletedEntities) {
                     if recordIDs.count >= limit {
                         break
                     }
