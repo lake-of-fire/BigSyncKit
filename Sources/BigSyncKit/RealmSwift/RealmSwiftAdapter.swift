@@ -506,7 +506,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     func createSyncedEntity(record: CKRecord, realmProvider: RealmProvider) async -> SyncedEntity? {
         let syncedEntity = SyncedEntity(entityType: record.recordType, identifier: record.recordID.recordName, state: SyncedEntityState.synced.rawValue)
         
-        await realmProvider.persistenceRealm.add(syncedEntity)
+        let persistenceRealm = await realmProvider.persistenceRealm
+        try? await realmProvider.persistenceRealm.asyncWrite {
+            persistenceRealm.add(syncedEntity)
+        }
         
         guard let objectClass = self.realmObjectClass(name: record.recordType) else {
             return nil
@@ -521,7 +524,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         } else {
             let object = objectClass.init()
             object.setValue(objectIdentifier, forKey: primaryKey)
-            await realmProvider.targetRealm.add(object)
+            let targetRealm = await realmProvider.targetRealm
+            try? await realmProvider.targetRealm.asyncWrite {
+                targetRealm.add(object)
+            }
         }
         
         return syncedEntity
