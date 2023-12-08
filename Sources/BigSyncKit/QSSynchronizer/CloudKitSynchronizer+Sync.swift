@@ -237,7 +237,7 @@ extension CloudKitSynchronizer {
                     return
                 }
                 
-                Task { @MainActor [weak self] in
+                await Task { @MainActor [weak self] in
                     guard let self = self else { return }
                     zoneIDsToFetch.forEach {
                         self.delegate?.synchronizerWillFetchChanges(self, in: $0)
@@ -254,7 +254,7 @@ extension CloudKitSynchronizer {
                             await completion(token, error)
                         }
                     }
-                }
+                }.value
             }
         }
         
