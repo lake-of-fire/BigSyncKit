@@ -9,9 +9,10 @@ import Foundation
 import CloudKit
 
 extension CloudKitSynchronizer {
-    func performSynchronization() {
-        dispatchQueue.async {
-            autoreleasepool {
+    @MainActor
+    func performSynchronization() async {
+//        dispatchQueue.async {
+//            autoreleasepool {
                 self.postNotification(.SynchronizerWillSynchronize)
                 self.serverChangeToken = self.storedDatabaseToken
                 self.uploadRetries = 0
@@ -21,54 +22,51 @@ extension CloudKitSynchronizer {
                     $0.prepareToImport()
                 }
                 
-                self.fetchChanges()
-            }
-        }
+                await fetchChanges()
     }
     
-    func finishSynchronization(error: Error?) {
-//        Task { @MainActor in
-            resetActiveTokens()
-            
-            self.uploadRetries = 0
-            
-            for adapter in modelAdapters {
-                adapter.didFinishImport(with: error)
-            }
-            
-        DispatchQueue(label: "BigSyncKit").async {
-            autoreleasepool {
-                self.syncing = false
-                self.cancelSync = false
-                self.completion?(error)
-                self.completion = nil
-                
-                if let error = error {
-                    self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [CloudKitSynchronizer.errorKey: error])
-                    self.delegate?.synchronizerDidfailToSync(self, error: error)
-                    
-                    if let error = error as? CKError {
-                        switch error.code {
-                        case .changeTokenExpired:
-                            // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
-                            self.resetDatabaseToken()
-                            for adapter in self.modelAdapters {
-                                adapter.deleteChangeTracking()
-                                self.removeModelAdapter(adapter)
-                            }
-                            self.fetchChanges()
-                        default:
-                            break
-                        }
-                    }
-                } else {
-                    self.postNotification(.SynchronizerDidSynchronize)
-                    self.delegate?.synchronizerDidSync(self)
-                }
-                
-                //            debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
-            }
+    @MainActor
+    func finishSynchronization(error: Error?) async {
+        //        Task { @MainActor in
+        resetActiveTokens()
+        
+        uploadRetries = 0
+        
+        for adapter in modelAdapters {
+            adapter.didFinishImport(with: error)
         }
+        
+        //        DispatchQueue(label: "BigSyncKit").async {
+        //            autoreleasepool {
+        syncing = false
+        cancelSync = false
+        completion?(error)
+        completion = nil
+        
+        if let error = error {
+            self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [CloudKitSynchronizer.errorKey: error])
+            self.delegate?.synchronizerDidfailToSync(self, error: error)
+            
+            if let error = error as? CKError {
+                switch error.code {
+                case .changeTokenExpired:
+                    // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
+                    self.resetDatabaseToken()
+                    for adapter in self.modelAdapters {
+                        adapter.deleteChangeTracking()
+                        self.removeModelAdapter(adapter)
+                    }
+                    await fetchChanges()
+                default:
+                    break
+                }
+            }
+        } else {
+            postNotification(.SynchronizerDidSynchronize)
+            delegate?.synchronizerDidSync(self)
+        }
+        
+        //            debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
     }
 }
 
@@ -84,7 +82,9 @@ extension CloudKitSynchronizer {
     
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
         operation.errorHandler = { [weak self] operation, error in
-            self?.finishSynchronization(error: error)
+            Task { [weak self] in
+                await self?.finishSynchronization(error: error)
+            }
         }
         currentOperation = operation
         operationQueue.addOperation(operation)
@@ -169,21 +169,21 @@ extension CloudKitSynchronizer {
         return error.code == CKError.limitExceeded.rawValue
     }
     
-    func sequential<T>(objects: [T], closure: @escaping (T, @escaping (Error?)->())->(), final: @escaping  (Error?)->()) {
+    func sequential<T>(objects: [T], closure: @escaping (T, @escaping (Error?) async -> ()) async -> (), final: @escaping (Error?) async -> ()) async {
         guard let first = objects.first else {
-            final(nil)
+            await final(nil)
             return
         }
         
-        closure(first) { [weak self] error in
+        await closure(first) { [weak self] error in
             guard error == nil else {
-                final(error)
+                await final(error)
                 return
             }
             
             var remaining = objects
             remaining.removeFirst()
-            self?.sequential(objects: remaining, closure: closure, final: final)
+            await self?.sequential(objects: remaining, closure: closure, final: final)
         }
     }
     
@@ -195,81 +195,87 @@ extension CloudKitSynchronizer {
 //MARK: - Fetch changes
 
 extension CloudKitSynchronizer {
-    func fetchChanges() {
+    @MainActor
+    func fetchChanges() async {
         guard cancelSync == false else {
-            finishSynchronization(error: SyncError.cancelled)
+            await finishSynchronization(error: SyncError.cancelled)
             return
         }
         
 //        Task { @MainActor in
             postNotification(.SynchronizerWillFetchChanges)
-            fetchDatabaseChanges() { token, error in
+            await fetchDatabaseChanges() { [weak self] token, error in
+                guard let self = self else { return }
                 guard error == nil else {
-                    self.finishSynchronization(error: error)
+                    await finishSynchronization(error: error)
                     return
                 }
                 
-                self.serverChangeToken = token
-                self.storedDatabaseToken = token
-                if self.syncMode == .sync {
-                    self.uploadChanges()
+                serverChangeToken = token
+                storedDatabaseToken = token
+                if syncMode == .sync {
+                    await uploadChanges()
                 } else {
-                    self.finishSynchronization(error: nil)
+                    await finishSynchronization(error: nil)
                 }
             }
 //        }
     }
     
-//    @MainActor
-    func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) -> ()) {
-        let operation = FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
-            self.dispatchQueue.async {
-                autoreleasepool {
-                    self.notifyProviderForDeletedZoneIDs(deletedZoneIDs)
-                    
-                    let zoneIDsToFetch = self.loadTokens(for: changedZoneIDs, loadAdapters: true)
-                    
-                    guard zoneIDsToFetch.count > 0 else {
-                        self.resetActiveTokens()
-                        completion(token, nil)
-                        return
-                    }
-                    
+    @BigSyncActor
+    func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async -> ()) async {
+        let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
+            Task.detached(priority: .background) { @BigSyncActor [weak self] in
+                guard let self = self else { return }
+                await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                
+                let zoneIDsToFetch = await loadTokens(for: changedZoneIDs, loadAdapters: true)
+                
+                guard zoneIDsToFetch.count > 0 else {
+                    await self.resetActiveTokens()
+                    await completion(token, nil)
+                    return
+                }
+                
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
                     zoneIDsToFetch.forEach {
                         self.delegate?.synchronizerWillFetchChanges(self, in: $0)
                     }
                     
-                    self.fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
+                    fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
+                        guard let self = self else { return }
                         guard error == nil else {
-                            self?.finishSynchronization(error: error)
+                            await finishSynchronization(error: error)
                             return
                         }
                         
-                        self?.mergeChanges() { error in
-                            completion(token, error)
+                        await mergeChanges() { error in
+                            await completion(token, error)
                         }
                     }
                 }
             }
         }
         
-        runOperation(operation)
+        await runOperation(operation)
     }
     
-//    @MainActor
-    func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?)->()) {
+    @MainActor
+    func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async -> ()) {
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { (zoneResults) in
             
-            //            Task { @MainActor in
-            self.dispatchQueue.async {
+            //            self.dispatchQueue.async {
+            Task.detached(priority: .background) { [weak self] in
+                guard let self = self else { return }
                 var pendingZones = [CKRecordZone.ID]()
                 var error: Error? = nil
                 
                 for (zoneID, result) in zoneResults {
-                    let adapter = self.modelAdapterDictionary[zoneID]
+                    let adapter = await modelAdapterDictionary[zoneID]
                     if let resultError = result.error {
-                        if (self.isZoneNotFoundOrDeletedError(error)) {
-                            self.notifyProviderForDeletedZoneIDs([zoneID])
+                        if await isZoneNotFoundOrDeletedError(error) {
+                            await notifyProviderForDeletedZoneIDs([zoneID])
                         } else {
                             error = resultError
                             break
@@ -282,25 +288,27 @@ extension CloudKitSynchronizer {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.description)")
                         }
                         //                    Task { @MainActor [weak self] in
-                        self.activeZoneTokens[zoneID] = result.serverChangeToken
-                        //                    }
-                        adapter?.saveChanges(in: result.downloadedRecords)
-                        adapter?.deleteRecords(with: result.deletedRecordIDs)
+                        await Task { @MainActor [weak self] in
+                            guard let self = self else { return }
+                            activeZoneTokens[zoneID] = result.serverChangeToken
+                            //                    }
+                            adapter?.saveChanges(in: result.downloadedRecords)
+                            adapter?.deleteRecords(with: result.deletedRecordIDs)
+                        }.value
                         if result.moreComing {
                             pendingZones.append(zoneID)
                         }
-                            
                     }
                 }
                 
                 if pendingZones.count > 0 && error == nil {
                     let zones = pendingZones
                     //                    Task { @MainActor in
-                    self.fetchZoneChanges(zones, completion: completion)
+                    await fetchZoneChanges(zones, completion: completion)
                     //                    }
                 } else {
                     //                    Task { @MainActor in
-                    completion(error)
+                    await completion(error)
                     //                    }
                     //                }
                 }
@@ -310,9 +318,10 @@ extension CloudKitSynchronizer {
         runOperation(operation)
     }
     
-    func mergeChanges(completion: @escaping (Error?)->()) {
+    @MainActor
+    func mergeChanges(completion: @escaping (Error?) async -> ()) async {
         guard cancelSync == false else {
-            finishSynchronization(error: SyncError.cancelled)
+            await finishSynchronization(error: SyncError.cancelled)
             return
         }
         
@@ -323,22 +332,23 @@ extension CloudKitSynchronizer {
             }
         }
 
-        sequential(objects: adapterSet, closure: mergeChangesIntoAdapter, final: completion)
+        await sequential(objects: adapterSet, closure: mergeChangesIntoAdapter, final: completion)
     }
     
-    func mergeChangesIntoAdapter(_ adapter: ModelAdapter, completion: @escaping (Error?)->()) {
+    func mergeChangesIntoAdapter(_ adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
 
-        adapter.persistImportedChanges { error in
-            self.dispatchQueue.async {
-                autoreleasepool {
-                    guard error == nil else {
-                        completion(error)
-                        return
-                    }
-                    
-                    adapter.saveToken(self.activeZoneTokens[adapter.recordZoneID])
-                    completion(nil)
+        adapter.persistImportedChanges { [weak self] error in
+//            self.dispatchQueue.async {
+//                autoreleasepool {
+            Task { [weak self] in
+                guard let self = self else { return }
+                guard error == nil else {
+                    await completion(error)
+                    return
                 }
+                
+                adapter.saveToken(self.activeZoneTokens[adapter.recordZoneID])
+                await completion(nil)
             }
         }
     }
@@ -347,16 +357,16 @@ extension CloudKitSynchronizer {
 // MARK: - Upload changes
 
 extension CloudKitSynchronizer {
-//    @MainActor
-    func uploadChanges() {
+    @MainActor
+    func uploadChanges() async {
         guard cancelSync == false else {
-            finishSynchronization(error: SyncError.cancelled)
+            await finishSynchronization(error: SyncError.cancelled)
             return
         }
         
         postNotification(.SynchronizerWillUploadChanges)
         
-        uploadChanges() { [weak self] (error) in
+        await uploadChanges() { [weak self] (error) in
             guard let self = self else { return }
             if let error = error {
 #warning("FIXME: handle zone not found...")
@@ -369,73 +379,81 @@ extension CloudKitSynchronizer {
 //                    }
 //                }
 
-                if self.shouldRetryUpload(for: error as NSError) {
-                    self.uploadRetries += 1
+                if shouldRetryUpload(for: error as NSError) {
+                    uploadRetries += 1
 //                    Task.detached { [weak self] in
-                        self.fetchChanges()
+                        await fetchChanges()
 //                    }
                 } else {
-                    self.finishSynchronization(error: error)
+                    await finishSynchronization(error: error)
                 }
             } else {
-                self.increaseBatchSize()
-                self.updateTokens()
+                increaseBatchSize()
+                updateTokens()
             }
         }
     }
     
-    func uploadChanges(completion: @escaping (Error?) -> ()) {
-        sequential(objects: modelAdapters, closure: setupZoneAndUploadRecords) { [weak self] (error) in
-            guard error == nil else { completion(error); return }
+    @MainActor
+    func uploadChanges(completion: @escaping (Error?) async -> ()) async {
+        await sequential(objects: modelAdapters, closure: setupZoneAndUploadRecords) { [weak self] (error) in
+            guard error == nil else { await completion(error); return }
             guard let self = self else { return }
             
-            self.sequential(objects: self.modelAdapters, closure: self.uploadDeletions, final: completion)
+            await sequential(objects: modelAdapters, closure: uploadDeletions, final: completion)
         }
     }
     
-    func setupZoneAndUploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) -> ()) {
-        setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
-            guard error == nil else {
-                completion(error)
+    @MainActor
+    func setupZoneAndUploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
+        await setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
+            guard let self = self, error == nil else {
+                await completion(error)
                 return
             }
-            
-            self?.uploadRecords(adapter: adapter, completion: { (error) in
-                completion(error)
+            await uploadRecords(adapter: adapter, completion: { (error) in
+                await completion(error)
             })
         }
     }
     
-    func setupRecordZoneIfNeeded(adapter: ModelAdapter, completion: @escaping (Error?) -> ()) {
+    @MainActor
+    func setupRecordZoneIfNeeded(adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
         guard needsZoneSetup(adapter: adapter) else {
-            completion(nil)
+            await completion(nil)
             return
         }
         
         setupRecordZoneID(adapter.recordZoneID, completion: completion)
     }
     
-    func setupRecordZoneID(_ zoneID: CKRecordZone.ID, completion: @escaping (Error?) -> ()) {
-        database.fetch(withRecordZoneID: zoneID) { (zone, error) in
-            if self.isZoneNotFoundOrDeletedError(error) {
+    @MainActor
+    func setupRecordZoneID(_ zoneID: CKRecordZone.ID, completion: @escaping (Error?) async -> ()) {
+        database.fetch(withRecordZoneID: zoneID) { [weak self] (zone, error) in
+            guard let self = self else { return }
+            if isZoneNotFoundOrDeletedError(error) {
                 let newZone = CKRecordZone(zoneID: zoneID)
-                self.database.save(zone: newZone, completionHandler: { (zone, error) in
+                database.save(zone: newZone, completionHandler: { (zone, error) in
                     if error == nil && zone != nil {
                         debugPrint("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
                     }
-                    completion(error)
+                    Task {
+                        await completion(error)
+                    }
                 })
             } else {
-                completion(error)
+                Task {
+                    await completion(error)
+                }
             }
         }
     }
     
-    func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) -> ()) {
+    func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
         let records = adapter.recordsToUpload(limit: batchSize)
         let recordCount = records.count
         let requestedBatchSize = batchSize
-        guard recordCount > 0 else { completion(nil); return }
+        guard recordCount > 0 else { await completion(nil); return }
         
         if !didNotifyUpload.contains(adapter.recordZoneID) {
             didNotifyUpload.insert(adapter.recordZoneID)
@@ -448,70 +466,77 @@ extension CloudKitSynchronizer {
         let modifyRecordsOperation = ModifyRecordsOperation(database: database,
                                                records: records,
                                                recordIDsToDelete: nil)
-        { (savedRecords, deleted, conflicted, operationError) in
-            self.dispatchQueue.async {
-                autoreleasepool {
-                    if !(savedRecords?.isEmpty ?? true) {
-                        debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
-                    }
-                    adapter.didUpload(savedRecords: savedRecords ?? [])
-                    
-                    if let error = operationError {
-                        if self.isLimitExceededError(error as NSError) {
-                            self.reduceBatchSize()
-                            completion(error)
-                        } else if !conflicted.isEmpty {
-                            adapter.saveChanges(in: conflicted)
-                            adapter.persistImportedChanges { (persistError) in
-                                completion(error)
+        { [weak self] (savedRecords, deleted, conflicted, operationError) in
+            Task { [weak self] in
+                guard let self = self else { return }
+                //            self.dispatchQueue.async {
+                //                autoreleasepool {
+                if !(savedRecords?.isEmpty ?? true) {
+                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
+                }
+                adapter.didUpload(savedRecords: savedRecords ?? [])
+                
+                if let error = operationError {
+                    if self.isLimitExceededError(error as NSError) {
+                        reduceBatchSize()
+                        await completion(error)
+                    } else if !conflicted.isEmpty {
+                        adapter.saveChanges(in: conflicted)
+                        adapter.persistImportedChanges { (persistError) in
+                            Task {
+                                await completion(error)
                             }
-                        } else {
-                            completion(error)
                         }
                     } else {
-                        if recordCount >= requestedBatchSize {
-                            self.uploadRecords(adapter: adapter, completion: completion)
-                        } else {
-                            completion(nil)
-                        }
+                        await completion(error)
+                    }
+                } else {
+                    if recordCount >= requestedBatchSize {
+                        await uploadRecords(adapter: adapter, completion: completion)
+                    } else {
+                        await completion(nil)
                     }
                 }
+                //                }
             }
         }
         
         runOperation(modifyRecordsOperation)
     }
     
-    func uploadDeletions(adapter: ModelAdapter, completion: @escaping (Error?)->()) {
+    @MainActor
+    func uploadDeletions(adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
         let recordIDs = adapter.recordIDsMarkedForDeletion(limit: batchSize)
         let recordCount = recordIDs.count
         let requestedBatchSize = batchSize
         
         guard recordCount > 0 else {
-            completion(nil)
+            await completion(nil)
             return
         }
         
         let modifyRecordsOperation = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: recordIDs)
         modifyRecordsOperation.modifyRecordsCompletionBlock = { savedRecords, deletedRecordIDs, operationError in
-            self.dispatchQueue.async {
-                autoreleasepool {
-                    debugPrint("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
+//            self.dispatchQueue.async {
+//                autoreleasepool {
+            Task { [weak self] in
+                guard let self = self else { return }
+                debugPrint("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
                     adapter.didDelete(recordIDs: deletedRecordIDs ?? [])
                     
                     if let error = operationError {
-                        if self.isLimitExceededError(error as NSError) {
-                            self.reduceBatchSize()
+                        if isLimitExceededError(error as NSError) {
+                            reduceBatchSize()
                         }
-                        completion(error)
+                        await completion(error)
                     } else {
                         if recordCount >= requestedBatchSize {
-                            self.uploadDeletions(adapter: adapter, completion: completion)
+                            await uploadDeletions(adapter: adapter, completion: completion)
                         } else {
-                            completion(nil)
+                            await completion(nil)
                         }
                     }
-                }
+//                }
             }
         }
         
@@ -521,35 +546,36 @@ extension CloudKitSynchronizer {
     
     // MARK: - 
     
-//    @MainActor
+    @MainActor
     func updateTokens() {
         let operation = FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (databaseToken, changedZoneIDs, deletedZoneIDs) in
-            self.dispatchQueue.async {
-                autoreleasepool {
-                    //            Task { @MainActor in
-                    self.notifyProviderForDeletedZoneIDs(deletedZoneIDs)
-                    if changedZoneIDs.count > 0 {
-                        let zoneIDs = self.loadTokens(for: changedZoneIDs, loadAdapters: false)
-                        self.updateServerToken(for: zoneIDs, completion: { (needsToFetchChanges) in
-                            if needsToFetchChanges {
-                                self.performSynchronization()
-                            } else {
-                                self.storedDatabaseToken = databaseToken
-                                self.finishSynchronization(error: nil)
-                            }
-                        })
-                    } else {
-                        self.finishSynchronization(error: nil)
-                    }
-                    //            }
+            Task { [weak self] in
+                guard let self = self else { return }
+                //            self.dispatchQueue.async {
+                //                autoreleasepool {
+                //            Task { @MainActor in
+                self.notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                if changedZoneIDs.count > 0 {
+                    let zoneIDs = loadTokens(for: changedZoneIDs, loadAdapters: false)
+                    await updateServerToken(for: zoneIDs, completion: { [weak self] (needsToFetchChanges) in
+                        guard let self = self else { return }
+                        if needsToFetchChanges {
+                            await performSynchronization()
+                        } else {
+                            storedDatabaseToken = databaseToken
+                            await finishSynchronization(error: nil)
+                        }
+                    })
+                } else {
+                    await finishSynchronization(error: nil)
                 }
             }
         }
         runOperation(operation)
     }
     
-//    @MainActor
-    func updateServerToken(for recordZoneIDs: [CKRecordZone.ID], completion: @escaping (Bool)->()) {
+    @MainActor
+    func updateServerToken(for recordZoneIDs: [CKRecordZone.ID], completion: @escaping (Bool) async -> ()) async {
         // If we found a new record zone at this point then needsToFetchChanges=true
         var hasAllTokens = true
         for zoneID in recordZoneIDs {
@@ -558,35 +584,34 @@ extension CloudKitSynchronizer {
             }
         }
         guard hasAllTokens else {
-            completion(true)
+            await completion(true)
             return
         }
         
-        let operation = FetchZoneChangesOperation(database: database, zoneIDs: recordZoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: ["recordID", CloudKitSynchronizer.deviceUUIDKey]) { (zoneResults) in
-            self.dispatchQueue.async {
-                autoreleasepool {
-                    var pendingZones = [CKRecordZone.ID]()
-                    var needsToRefetch = false
-                    
-                    for (zoneID, result) in zoneResults {
-                        let adapter = self.modelAdapterDictionary[zoneID]
-                        if result.downloadedRecords.count > 0 || result.deletedRecordIDs.count > 0 {
-                            needsToRefetch = true
-                        } else {
-                            self.activeZoneTokens[zoneID] = result.serverChangeToken
-                            adapter?.saveToken(result.serverChangeToken)
-                        }
-                        if result.moreComing {
-                            pendingZones.append(zoneID)
-                        }
-                    }
-                    
-                    if pendingZones.count > 0 && !needsToRefetch {
-                        self.updateServerToken(for: pendingZones, completion: completion)
-                    } else {
-                        completion(needsToRefetch)
-                    }
+        let operation = FetchZoneChangesOperation(database: database, zoneIDs: recordZoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: ["recordID", CloudKitSynchronizer.deviceUUIDKey]) { @MainActor [weak self] zoneResults in
+            //            self.dispatchQueue.async {
+            //                autoreleasepool {
+            guard let self = self else { return }
+            var pendingZones = [CKRecordZone.ID]()
+            var needsToRefetch = false
+            
+            for (zoneID, result) in zoneResults {
+                let adapter = modelAdapterDictionary[zoneID]
+                if result.downloadedRecords.count > 0 || result.deletedRecordIDs.count > 0 {
+                    needsToRefetch = true
+                } else {
+                    activeZoneTokens[zoneID] = result.serverChangeToken
+                    adapter?.saveToken(result.serverChangeToken)
                 }
+                if result.moreComing {
+                    pendingZones.append(zoneID)
+                }
+            }
+            
+            if pendingZones.count > 0 && !needsToRefetch {
+                await updateServerToken(for: pendingZones, completion: completion)
+            } else {
+                await completion(needsToRefetch)
             }
         }
         runOperation(operation)

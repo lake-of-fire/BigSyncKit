@@ -69,6 +69,7 @@ public extension Notification.Name {
  
  `CloudKitSynchronizer` will post notifications at different steps of the synchronization process.
  */
+@MainActor
 public class CloudKitSynchronizer: NSObject {
     /// SyncError
     @objc public enum SyncError: Int, Error {
@@ -137,7 +138,7 @@ public class CloudKitSynchronizer: NSObject {
     
     @objc public var delegate: CloudKitSynchronizerDelegate?
     
-    internal let dispatchQueue = DispatchQueue(label: "QSCloudKitSynchronizer")
+//    internal let dispatchQueue = DispatchQueue(label: "QSCloudKitSynchronizer")
     internal let operationQueue = OperationQueue()
     internal var modelAdapterDictionary = [CKRecordZone.ID: ModelAdapter]()
     internal var serverChangeToken: CKServerChangeToken?
@@ -209,7 +210,10 @@ public class CloudKitSynchronizer: NSObject {
         cancelSync = false
         syncing = true
         self.completion = completion
-        performSynchronization()
+        
+        Task { [weak self] in
+            await self?.performSynchronization()
+        }
     }
     
     /// Cancel synchronization. It will cause a current synchronization to end with a `cancelled` error.
@@ -234,11 +238,13 @@ public class CloudKitSynchronizer: NSObject {
     */
     @objc public func eraseLocalMetadata() {
         cancelSynchronization()
-        dispatchQueue.async {
-            self.storedDatabaseToken = nil
-            self.clearAllStoredSubscriptionIDs()
-            self.deviceUUID = nil
-            self.modelAdapters.forEach {
+//        dispatchQueue.async {
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            storedDatabaseToken = nil
+            clearAllStoredSubscriptionIDs()
+            deviceUUID = nil
+            modelAdapters.forEach {
                 $0.deleteChangeTracking()
                 self.removeModelAdapter($0)
             }
@@ -249,7 +255,7 @@ public class CloudKitSynchronizer: NSObject {
     /// - Parameters:
     ///   - adapter: Model adapter whose corresponding record zone should be deleted
     ///   - completion: Completion block.
-    @objc public func deleteRecordZone(for adapter: ModelAdapter, completion: ((Error?)->())?) {
+    @objc public func deleteRecordZone(for adapter: ModelAdapter, completion: ((Error?) -> ())?) {
         database.delete(withRecordZoneID: adapter.recordZoneID) { (zoneID, error) in
             if let error = error {
                 debugPrint("CloudKitSynchronizer >> Error: \(error)")

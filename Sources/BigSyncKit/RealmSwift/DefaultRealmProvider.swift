@@ -123,11 +123,11 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
         let persistenceURL = folderURL.appendingPathComponent(DefaultRealmProviderPersistenceFileName)
         
         var adapter: RealmSwiftAdapter!
-        DispatchQueue(label: "BigSyncKit").sync {
-            autoreleasepool {
+//        DispatchQueue(label: "BigSyncKit").sync {
+//            autoreleasepool {
                 adapter = realmSwiftAdapterFor(targetRealmURL: stackURL, persistenceRealmURL: persistenceURL, zoneID: recordZoneID)
-            }
-        }
+//            }
+//        }
         
         adapterDictionary[recordZoneID] = adapter
         
@@ -138,6 +138,7 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
         return adapter
     }
     
+    @MainActor
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) {
         guard let adapter = adapterDictionary[recordZoneID],
             adapter.serverChangeToken != nil else {

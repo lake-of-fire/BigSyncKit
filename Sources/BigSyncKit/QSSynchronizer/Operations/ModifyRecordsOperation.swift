@@ -24,7 +24,7 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     
     private var conflictedRecords = [CKRecord]()
     
-    let dispatchQueue = DispatchQueue(label: "modifyRecordsDispatchQueue")
+//    let dispatchQueue = DispatchQueue(label: "modifyRecordsDispatchQueue")
     weak var internalOperation: CKModifyRecordsOperation?
         
     override func start() {
