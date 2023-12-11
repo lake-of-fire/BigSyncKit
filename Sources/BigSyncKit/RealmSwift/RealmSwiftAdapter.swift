@@ -346,7 +346,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 let identifiers = results.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) }
                 
 //                realm.writeAsync {
-                    for identifier in identifiers {
+                    for identifier in Array(identifiers) {
                         //                        autoreleasepool { [weak self] in
                         //                            try? realm.safeWrite {
                         //                                guard let identifier = getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
