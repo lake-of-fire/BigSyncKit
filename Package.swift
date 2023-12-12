@@ -1,4 +1,4 @@
-// swift-tools-version: 5.6
+// swift-tools-version: 5.9
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -13,7 +13,8 @@ let package = Package(
             targets: ["BigSyncKit"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/lake-of-fire/RealmBinary.git", branch: "main"),
+//        .package(url: "https://github.com/lake-of-fire/RealmBinary.git", branch: "main"),
+        .package(url: "https://github.com/realm/realm-swift.git", branch: "master"),
         .package(url: "https://github.com/lake-of-fire/RealmSwiftGaps.git", branch: "main"),
     ],
     targets: [
@@ -22,8 +23,10 @@ let package = Package(
         .target(
             name: "BigSyncKit",
             dependencies: [
-                .product(name: "Realm", package: "RealmBinary"),
-                .product(name: "RealmSwift", package: "RealmBinary"),
+//                .product(name: "Realm", package: "RealmBinary"),
+//                .product(name: "RealmSwift", package: "RealmBinary"),
+                .product(name: "Realm", package: "realm-swift"),
+                .product(name: "RealmSwift", package: "realm-swift"),
                 .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
             ]),
         .testTarget(
