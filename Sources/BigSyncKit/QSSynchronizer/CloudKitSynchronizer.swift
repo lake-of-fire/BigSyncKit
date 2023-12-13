@@ -234,6 +234,10 @@ public class CloudKitSynchronizer: NSObject {
         storedDatabaseToken = nil
     }
     
+    internal func activeZoneToken(zoneID: CKRecordZone.ID) -> CKServerChangeToken? {
+        return activeZoneTokens[zoneID]
+    }
+    
     /**
     * Deletes saved database token and all local metadata used to track changes in models.
     * The synchronizer should not be used after calling this function, create a new synchronizer instead if you need it.

@@ -293,8 +293,8 @@ extension CloudKitSynchronizer {
                             guard let self = self else { return }
                             activeZoneTokens[zoneID] = result.serverChangeToken
                             //                    }
-                            adapter?.saveChanges(in: result.downloadedRecords)
-                            adapter?.deleteRecords(with: result.deletedRecordIDs)
+                            await adapter?.saveChanges(in: result.downloadedRecords)
+                            await adapter?.deleteRecords(with: result.deletedRecordIDs)
                         }.value
                         if result.moreComing {
                             pendingZones.append(zoneID)
@@ -336,21 +336,20 @@ extension CloudKitSynchronizer {
         await sequential(objects: adapterSet, closure: mergeChangesIntoAdapter, final: completion)
     }
     
+    @MainActor
     func mergeChangesIntoAdapter(_ adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
-
-        adapter.persistImportedChanges { [weak self] error in
-//            self.dispatchQueue.async {
-//                autoreleasepool {
-            Task { [weak self] in
-                guard let self = self else { return }
-                guard error == nil else {
-                    await completion(error)
-                    return
-                }
-                let token = self.activeZoneTokens[adapter.recordZoneID]
-                await adapter.saveToken(token)
-                await completion(nil)
+        await adapter.persistImportedChanges { @MainActor [weak self] error in
+            //            self.dispatchQueue.async {
+            //                autoreleasepool {
+            guard let self = self else { return }
+            guard error == nil else {
+                await completion(error)
+                return
             }
+            if let token = activeZoneToken(zoneID: adapter.recordZoneID) {
+                await adapter.saveToken(token)
+            }
+            await completion(nil)
         }
     }
 }
@@ -482,11 +481,9 @@ extension CloudKitSynchronizer {
                         reduceBatchSize()
                         await completion(error)
                     } else if !conflicted.isEmpty {
-                        adapter.saveChanges(in: conflicted)
-                        adapter.persistImportedChanges { (persistError) in
-                            Task {
-                                await completion(error)
-                            }
+                        await adapter.saveChanges(in: conflicted)
+                        await adapter.persistImportedChanges { (persistError) in
+                            await completion(error)
                         }
                     } else {
                         await completion(error)

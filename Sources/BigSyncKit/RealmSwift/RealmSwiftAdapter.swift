@@ -1344,182 +1344,178 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
     }
     
-    public func saveChanges(in records: [CKRecord]) {
+    @RealmBackgroundActor
+    public func saveChanges(in records: [CKRecord]) async {
         guard let realmProvider = realmProvider else { return }
         guard records.count != 0 else {
             return
         }
         
-//        executeOnMainQueue {
-//        DispatchQueue(label: "BigSyncKit").sync {
-//            autoreleasepool {
-        Task { @RealmBackgroundActor [weak self] in
-            guard let self = self else { return }
-//                await realmProvider.persistenceRealm.beginWrite()
-//                await realmProvider.targetRealm.beginWrite()
-                
-                //        DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
-                //            autoreleasepool {
-                //        guard let self = self else { return }
-                //            realmProvider.persistenceRealm.beginWrite()
-                //            realmProvider.targetRealm.beginWrite()
-                
-                //            for chunk in records.chunked(into: 2000) {
-                //                DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
-                //                    autoreleasepool { [weak self] in
-                //            let persistenceRealm = realmProvider.persistenceRealm
-                //            try! persistenceRealm.write {
-                //            persistenceRealm.writeAsync {
-                for record in records {
-//                    print("save changes to record \(record.description)")
-                    //                            realmProvider.persistenceRealm.beginWrite()
-                    //                            realmProvider.targetRealm.beginWrite()
-                    //                            guard let self = self else { return }
-                    var syncedEntity: SyncedEntity? = await Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: realmProvider.persistenceRealm)
-                    if syncedEntity == nil {
-                        //                                if #available(iOS 10.0, *) {
-                        //                                    if let share = record as? CKShare {
-                        //                                        syncedEntity = self.createSyncedEntity(for: share, realmProvider: realmProvider)
-                        //                                    } else {
-                        //                                        syncedEntity = self.createSyncedEntity(record: record, realmProvider: realmProvider)
-                        //                                    }
-                        //                                } else {
-                        //                        realmProvider.targetRealm.beginWrite()
-                        syncedEntity = await self.createSyncedEntity(record: record, realmProvider: realmProvider)
-                        //                        try? realmProvider.targetRealm.commitWrite()
-                        //                                }
-                    }
-                    
-                    guard let syncedEntity = syncedEntity else {
-                        // Can happen when iCloud has records for a model that no longer exists locally.
-                        continue
-                        //                        return
-                    }
-                    
-                    if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
-                        guard let objectClass = self.realmObjectClass(name: record.recordType) else {
-                            continue
-                            //                            return
-                        }
-                        let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
-                        guard let object = await realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
-                            continue
-                            //                            return
-                        }
-                        
-                        //                        realmProvider.targetRealm.writeAsync {
-                        
-                        await self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
-                        //                        } onComplete: { error in
-                        //                            }
-                    }
-                    //                                self.saveShareRelationship(for: syncedEntity, record: record)
-                    try? await realmProvider.persistenceRealm.asyncWrite {
-                        self.save(record: record, for: syncedEntity)
-                    }
-                    // Order is important here. Notifications might be delivered after targetRealm is saved and
-                    // it's convenient if the persistenceRealm is not in a write transaction
-                    //                            try? realmProvider.persistenceRealm.commitWrite()
-                    //                            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+        //        executeOnMainQueue {
+        //        DispatchQueue(label: "BigSyncKit").sync {
+        //            autoreleasepool {
+        //                await realmProvider.persistenceRealm.beginWrite()
+        //                await realmProvider.targetRealm.beginWrite()
+        
+        //        DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
+        //            autoreleasepool {
+        //        guard let self = self else { return }
+        //            realmProvider.persistenceRealm.beginWrite()
+        //            realmProvider.targetRealm.beginWrite()
+        
+        //            for chunk in records.chunked(into: 2000) {
+        //                DispatchQueue(label: "RealmSwiftAadapter.saveChanges").async { [weak self] in
+        //                    autoreleasepool { [weak self] in
+        //            let persistenceRealm = realmProvider.persistenceRealm
+        //            try! persistenceRealm.write {
+        //            persistenceRealm.writeAsync {
+        for record in records {
+            //                    print("save changes to record \(record.description)")
+            //                            realmProvider.persistenceRealm.beginWrite()
+            //                            realmProvider.targetRealm.beginWrite()
+            //                            guard let self = self else { return }
+            var syncedEntity: SyncedEntity? = await Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: realmProvider.persistenceRealm)
+            if syncedEntity == nil {
+                //                                if #available(iOS 10.0, *) {
+                //                                    if let share = record as? CKShare {
+                //                                        syncedEntity = self.createSyncedEntity(for: share, realmProvider: realmProvider)
+                //                                    } else {
+                //                                        syncedEntity = self.createSyncedEntity(record: record, realmProvider: realmProvider)
+                //                                    }
+                //                                } else {
+                //                        realmProvider.targetRealm.beginWrite()
+                syncedEntity = await self.createSyncedEntity(record: record, realmProvider: realmProvider)
+                //                        try? realmProvider.targetRealm.commitWrite()
+                //                                }
+            }
+            
+            guard let syncedEntity = syncedEntity else {
+                // Can happen when iCloud has records for a model that no longer exists locally.
+                continue
+                //                        return
+            }
+            
+            if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
+                guard let objectClass = self.realmObjectClass(name: record.recordType) else {
+                    continue
+                    //                            return
                 }
-                //            } onComplete: { error in
-                //                completion()
-                //            }
-//                try? realmProvider.persistenceRealm.commitWrite()
-//                try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
-//            }
-            //                    }
-            //                }
-            //            }
+                let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
+                guard let object = await realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
+                    continue
+                    //                            return
+                }
+                
+                //                        realmProvider.targetRealm.writeAsync {
+                
+                await self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
+                //                        } onComplete: { error in
+                //                            }
+            }
+            //                                self.saveShareRelationship(for: syncedEntity, record: record)
+            try? await realmProvider.persistenceRealm.asyncWrite {
+                self.save(record: record, for: syncedEntity)
+            }
             // Order is important here. Notifications might be delivered after targetRealm is saved and
             // it's convenient if the persistenceRealm is not in a write transaction
-            //            try? realmProvider.persistenceRealm.commitWrite()
-            //                self.commitTargetWriteTransactionWithoutNotifying()
-            //            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
-            //            }
-            //        }
+            //                            try? realmProvider.persistenceRealm.commitWrite()
+            //                            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
         }
+        //            } onComplete: { error in
+        //                completion()
+        //            }
+        //                try? realmProvider.persistenceRealm.commitWrite()
+        //                try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+        //            }
+        //                    }
+        //                }
+        //            }
+        // Order is important here. Notifications might be delivered after targetRealm is saved and
+        // it's convenient if the persistenceRealm is not in a write transaction
+        //            try? realmProvider.persistenceRealm.commitWrite()
+        //                self.commitTargetWriteTransactionWithoutNotifying()
+        //            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+        //            }
+        //        }
     }
     
-    public func deleteRecords(with recordIDs: [CKRecord.ID]) {
-        Task { @RealmBackgroundActor [weak self] in
-            guard let self = self, let realmProvider = realmProvider else { return }
-            guard recordIDs.count != 0 else { return }
-            debugPrint("Deleting records with record ids \(recordIDs)")
-            
-            //        executeOnMainQueue {
-            //        DispatchQueue(label: "BigSyncKit").sync {
-            //            autoreleasepool {
-            //        DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
-            //            autoreleasepool {
-            //        guard let self = self else { return }
-            //                realmProvider.persistenceRealm.beginWrite()
-            //                realmProvider.targetRealm.beginWrite()
-            
-            //            for chunk in recordIDs.chunked(into: 2000) {
-            //                DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
-            //                    autoreleasepool { [weak self] in
-            for recordID in recordIDs {
-                //                            realmProvider.persistenceRealm.beginWrite()
-                //                            realmProvider.targetRealm.beginWrite()
-                if let syncedEntity = await Self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: realmProvider.persistenceRealm) {
-                    
-                    if syncedEntity.entityType != "CKShare" {
-                        guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
-                            //                                    continue
-                            return
-                        }
-                        let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
-                        let object = await realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
-                        
-                        if let object = object {
-                            let targetRealm = await realmProvider.targetRealm
-                            try? await realmProvider.targetRealm.asyncWrite {
-                                targetRealm.delete(object)
-                            }
-                        }
+    @RealmBackgroundActor
+    public func deleteRecords(with recordIDs: [CKRecord.ID]) async {
+        guard let realmProvider = realmProvider else { return }
+        guard recordIDs.count != 0 else { return }
+        debugPrint("Deleting records with record ids \(recordIDs)")
+        
+        //        executeOnMainQueue {
+        //        DispatchQueue(label: "BigSyncKit").sync {
+        //            autoreleasepool {
+        //        DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
+        //            autoreleasepool {
+        //        guard let self = self else { return }
+        //                realmProvider.persistenceRealm.beginWrite()
+        //                realmProvider.targetRealm.beginWrite()
+        
+        //            for chunk in recordIDs.chunked(into: 2000) {
+        //                DispatchQueue(label: "RealmSwiftAadapter.deleteRecords").async { [weak self] in
+        //                    autoreleasepool { [weak self] in
+        for recordID in recordIDs {
+            //                            realmProvider.persistenceRealm.beginWrite()
+            //                            realmProvider.targetRealm.beginWrite()
+            if let syncedEntity = await Self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: realmProvider.persistenceRealm) {
+                
+                if syncedEntity.entityType != "CKShare" {
+                    guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
+                        //                                    continue
+                        return
                     }
+                    let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
+                    let object = await realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
                     
-                    if let record = syncedEntity.record {
-                        let persistenceRealm = await realmProvider.persistenceRealm
-                        try? await realmProvider.persistenceRealm.asyncWrite {
-                            persistenceRealm.delete(record);
+                    if let object = object {
+                        let targetRealm = await realmProvider.targetRealm
+                        try? await realmProvider.targetRealm.asyncWrite {
+                            targetRealm.delete(object)
                         }
-                    }
-                    
-                    let persistenceRealm = await realmProvider.persistenceRealm
-                    try? await realmProvider.persistenceRealm.asyncWrite {
-                        persistenceRealm.delete(syncedEntity)
                     }
                 }
-                //                            try? realmProvider.persistenceRealm.commitWrite()
-                //                            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+                
+                if let record = syncedEntity.record {
+                    let persistenceRealm = await realmProvider.persistenceRealm
+                    try? await realmProvider.persistenceRealm.asyncWrite {
+                        persistenceRealm.delete(record);
+                    }
+                }
+                
+                let persistenceRealm = await realmProvider.persistenceRealm
+                try? await realmProvider.persistenceRealm.asyncWrite {
+                    persistenceRealm.delete(syncedEntity)
+                }
             }
-            //                    }
-            //                }
-            //            }
-            //                try? realmProvider.persistenceRealm.commitWrite()
-            //                self.commitTargetWriteTransactionWithoutNotifying()
-            //                try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
-            //            }
-            //            }
+            //                            try? realmProvider.persistenceRealm.commitWrite()
+            //                            try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
         }
+        //                    }
+        //                }
+        //            }
+        //                try? realmProvider.persistenceRealm.commitWrite()
+        //                self.commitTargetWriteTransactionWithoutNotifying()
+        //                try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
+        //            }
+        //            }
     }
     
-    public func persistImportedChanges(completion: @escaping ((Error?) -> Void)) {
+    @RealmBackgroundActor
+    public func persistImportedChanges(completion: @escaping ((Error?) async -> Void)) async {
         guard let realmProvider = realmProvider else {
-            completion(nil)
+            await completion(nil)
             return
         }
         
-//        executeOnMainQueue {
-//        DispatchQueue(label: "BigSyncKit").sync {
-//            autoreleasepool {
-        Task { @RealmBackgroundActor [weak self] in
-            await self?.applyPendingRelationships(realmProvider: realmProvider)
-                completion(nil)
-//            }
-        }
+        //        executeOnMainQueue {
+        //        DispatchQueue(label: "BigSyncKit").sync {
+        //            autoreleasepool {
+        await applyPendingRelationships(realmProvider: realmProvider)
+        await completion(nil)
+        //            }
     }
     
     public func recordsToUpload(limit: Int) -> [CKRecord] {
@@ -1707,6 +1703,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
 //    @RealmBackgroundActor
+//    @MainActor
     public var recordZoneID: CKRecordZone.ID {
         return zoneID
     }
