@@ -346,7 +346,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 let identifiers = results.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) }
                 
 //                realm.writeAsync {
-                    for identifier in Array(identifiers) {
+                    for identifier in identifiers {
                         //                        autoreleasepool { [weak self] in
                         //                            try? realm.safeWrite {
                         //                                guard let identifier = getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
@@ -876,7 +876,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
 //        realmProvider.persistenceRealm.beginWrite()
 //        realmProvider.targetRealm.beginWrite()
-        for relationship in Array(pendingRelationships) {
+//        for relationship in Array(pendingRelationships) {
+        for relationship in pendingRelationships {
             let entity = relationship.forSyncedEntity
             
             guard let syncedEntity = entity,
@@ -1054,7 +1055,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let results = realmProvider.syncPersistenceRealm.objects(SyncedEntity.self).where { $0.state == state.rawValue }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
-        for syncedEntity in Array(results) {
+        for syncedEntity in results {
             if resultArray.count > limit {
                 break
             }
