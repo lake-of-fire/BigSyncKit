@@ -25,9 +25,15 @@ public extension Notification.Name {
     /// /// Sent by the model adapter when it detects changes to some objects. The notification is sent only once, if there were no changes before and new changes were detected.
     static let ModelAdapterHasChangesNotification: NSString = "QSModelAdapterHasChangesNotification"
 }
+//public protocol ModelAdapter: AnyObject {
+//    /// Tells the model adapter that these records were uploaded successfully to CloudKit.
+//    /// - Parameter savedRecords: Records that were saved.
+//    func didUpload(savedRecords: [CKRecord])
+//}
 
 /// An object conforming to `ModelAdapter` will track the local model, provide changes to upload to CloudKit and import downloaded changes.
-@objc public protocol ModelAdapter: AnyObject {
+//@objc public protocol ModelAdapter: AnyObject {
+public protocol ModelAdapter: AnyObject {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
     
@@ -53,7 +59,7 @@ public extension Notification.Name {
     
     /// Tells the model adapter that these records were uploaded successfully to CloudKit.
     /// - Parameter savedRecords: Records that were saved.
-    func didUpload(savedRecords: [CKRecord])
+    func didUpload(savedRecords: [CKRecord]) async
     
     /// Provides an array of record IDs to be deleted on CloudKit, for model objects that were deleted locally.
     /// - Parameter limit: Maximum number of records that should be provided.
@@ -62,7 +68,7 @@ public extension Notification.Name {
     
     /// Tells the model adapter that these record identifiers were deleted successfully from CloudKit.
     /// - Parameter recordIDs: Record IDs that were deleted on CloudKit.
-    func didDelete(recordIDs: [CKRecord.ID])
+    func didDelete(recordIDs: [CKRecord.ID]) async
     
     /// Asks the model adapter whether it has a local object for the given record identifier.
     /// - Parameter recordID: Record identifier.
@@ -71,7 +77,7 @@ public extension Notification.Name {
     
     /// Tells the model adapter that the current import operation finished.
     /// - Parameter error: Optional error, if any error happened.
-    func didFinishImport(with error: Error?)
+    func didFinishImport(with error: Error?) async
     
     /// Record zone ID managed by this adapter
     var recordZoneID: CKRecordZone.ID { get }
@@ -81,15 +87,14 @@ public extension Notification.Name {
     
     /// Save given token for future use by this adapter.
     /// - Parameter token: `CKServerChangeToken`
-    func saveToken(_ token: CKServerChangeToken?)
+    func saveToken(_ token: CKServerChangeToken?) async
     
     /**
      *  Deletes all tracking information and detaches from local model.
      *  This adapter should not be used after calling this method, create a new adapter if you wish to synchronize
      *  the same model again.
      */
-    func deleteChangeTracking()
-    
+    func deleteChangeTracking() async
     
     /// Merge policy in case of conflicts. Default is `server`.
     var mergePolicy: MergePolicy {get set}

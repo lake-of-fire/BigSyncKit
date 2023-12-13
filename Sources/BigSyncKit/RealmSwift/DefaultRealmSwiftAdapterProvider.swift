@@ -32,10 +32,10 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     }
     
     @MainActor
-    public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) {
+    public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) async {
         let adapterHasSyncedBefore = adapter.serverChangeToken != nil
         if recordZoneID == zoneID && adapterHasSyncedBefore {
-            adapter.deleteChangeTracking()
+            await adapter.deleteChangeTracking()
             synchronizer.removeModelAdapter(adapter)
             
             adapter = createAdapter()

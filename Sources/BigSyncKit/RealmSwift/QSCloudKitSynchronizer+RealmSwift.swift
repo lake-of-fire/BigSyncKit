@@ -20,7 +20,7 @@ extension CloudKitSynchronizer {
      
      -Returns: A new CloudKit synchronizer for the given realm.
      */
-    public class func privateSynchronizer(containerName: String, configuration: Realm.Configuration, suiteName: String? = nil, recordZoneID: CKRecordZone.ID? = nil) -> CloudKitSynchronizer {
+    public class func privateSynchronizer(containerName: String, configuration: Realm.Configuration, suiteName: String? = nil, recordZoneID: CKRecordZone.ID? = nil) async -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
         let provider = DefaultRealmSwiftAdapterProvider(targetConfiguration: configuration, zoneID: zoneID)
         let userDefaults = UserDefaults(suiteName: suiteName)!
@@ -32,7 +32,7 @@ extension CloudKitSynchronizer {
                                                 adapterProvider: provider,
                                                 keyValueStore: userDefaultsAdapter)
         synchronizer.addModelAdapter(provider.adapter)
-        transferOldServerChangeToken(to: provider.adapter, userDefaults: userDefaultsAdapter, containerName: containerName)
+        await transferOldServerChangeToken(to: provider.adapter, userDefaults: userDefaultsAdapter, containerName: containerName)
         
         return synchronizer
     }
@@ -65,11 +65,11 @@ extension CloudKitSynchronizer {
         return synchronizer
     }
     
-    fileprivate class func transferOldServerChangeToken(to adapter: ModelAdapter, userDefaults: KeyValueStore, containerName: String) {
+    fileprivate class func transferOldServerChangeToken(to adapter: ModelAdapter, userDefaults: KeyValueStore, containerName: String) async {
         let key = containerName.appending("QSCloudKitFetchChangesServerTokenKey")
         if let encodedToken = userDefaults.object(forKey: key) as? Data {
             if let token = NSKeyedUnarchiver.unarchiveObject(with: encodedToken) as? CKServerChangeToken {
-                adapter.saveToken(token)
+                await adapter.saveToken(token)
             }
             userDefaults.removeObject(forKey: key)
         }

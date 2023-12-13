@@ -38,7 +38,8 @@ public extension Notification.Name {
 }
 
 /// An `AdapterProvider` gets requested for new model adapters when a `CloudKitSynchronizer` encounters a new `CKRecordZone` that does not already correspond to an existing model adapter.
-@objc public protocol AdapterProvider {
+//@objc public protocol AdapterProvider {
+public protocol AdapterProvider {
 
     /// The `CloudKitSynchronizer` requests a new model adapter for the given record zone.
     /// - Parameters:
@@ -51,10 +52,11 @@ public extension Notification.Name {
     /// - Parameters:
     ///   - synchronizer: `QSCloudKitSynchronizer` that found the deleted record zone.
     ///   - zoneID: `CKRecordZoneID` of the record zone that was deleted.
-    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID)
+    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async
 }
 
-@objc public protocol CloudKitSynchronizerDelegate: AnyObject {
+//@objc public protocol CloudKitSynchronizerDelegate: AnyObject {
+public protocol CloudKitSynchronizerDelegate: AnyObject {
     func synchronizerWillFetchChanges(_ synchronizer: CloudKitSynchronizer, in recordZone: CKRecordZone.ID)
     func synchronizerWillUploadChanges(_ synchronizer: CloudKitSynchronizer, to recordZone: CKRecordZone.ID)
     func synchronizerDidSync(_ synchronizer: CloudKitSynchronizer)
@@ -72,7 +74,7 @@ public extension Notification.Name {
 @MainActor
 public class CloudKitSynchronizer: NSObject {
     /// SyncError
-    @objc public enum SyncError: Int, Error {
+    public enum SyncError: Int, Error {
         /**
          *  Received when synchronize is called while there was an ongoing synchronization.
          */
@@ -93,7 +95,7 @@ public class CloudKitSynchronizer: NSObject {
     }
     
     /// `CloudKitSynchronizer` can be configured to only download changes, never uploading local changes to CloudKit.
-    @objc public enum SynchronizeMode: Int {
+    public enum SynchronizeMode: Int {
         /// Download and upload all changes
         case sync
         /// Only download changes
@@ -107,36 +109,36 @@ public class CloudKitSynchronizer: NSObject {
      More than one `CloudKitSynchronizer` may be created in an app.
      The identifier is used to persist some state, so it should always be the same for a synchronizer –if you change your app to use a different identifier state might be lost.
      */
-    @objc public let identifier: String
+    public let identifier: String
     
     /// iCloud container identifier.
-    @objc public let containerIdentifier: String?
+    public let containerIdentifier: String?
     
     /// Adapter wrapping a `CKDatabase`. The synchronizer will run CloudKit operations on the given database.
     public let database: CloudKitDatabaseAdapter
     
     /// Provides the model adapter to the synchronizer.
-    @objc public let adapterProvider: AdapterProvider
+    public let adapterProvider: AdapterProvider
     
     /// Required by the synchronizer to persist some state. `UserDefaults` can be used via `UserDefaultsAdapter`.
     public let keyValueStore: KeyValueStore
     
     /// Indicates whether the instance is currently synchronizing data.
-    @objc public internal(set) var syncing: Bool = false
+    public internal(set) var syncing: Bool = false
     
     ///  Number of records that are sent in an upload operation.
-    @objc public var batchSize: Int = CloudKitSynchronizer.defaultBatchSize
+    public var batchSize: Int = CloudKitSynchronizer.defaultBatchSize
     
     /**
     *  When set, if the synchronizer finds records uploaded by a different device using a higher compatibility version,
     *   it will end synchronization with a `higherModelVersionFound` error.
     */
-    @objc public var compatibilityVersion: Int = 0
+    public var compatibilityVersion: Int = 0
     
     /// Whether the synchronizer will only download data or also upload any local changes.
-    @objc public var syncMode: SynchronizeMode = .sync
+    public var syncMode: SynchronizeMode = .sync
     
-    @objc public var delegate: CloudKitSynchronizerDelegate?
+    public var delegate: CloudKitSynchronizerDelegate?
     
 //    internal let dispatchQueue = DispatchQueue(label: "QSCloudKitSynchronizer")
     internal let operationQueue = OperationQueue()
@@ -150,7 +152,7 @@ public class CloudKitSynchronizer: NSObject {
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     
     /// Default number of records to send in an upload operation.
-    @objc public static var defaultBatchSize = 200
+    public static var defaultBatchSize = 200
     static let deviceUUIDKey = "QSCloudKitDeviceUUIDKey"
     static let modelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
     
@@ -162,7 +164,7 @@ public class CloudKitSynchronizer: NSObject {
     ///   - adapterProvider: `CloudKitSynchronizerAdapterProvider`
     ///   - keyValueStore: Object conforming to KeyValueStore (`UserDefaultsAdapter`, for example)
     /// - Returns: Initialized synchronizer or `nil` if no iCloud container can be found with the provided identifier.
-    @objc public init(identifier: String, containerIdentifier: String? = nil, database: CloudKitDatabaseAdapter, adapterProvider: AdapterProvider, keyValueStore: KeyValueStore = UserDefaultsAdapter(userDefaults: UserDefaults.standard)) {
+    public init(identifier: String, containerIdentifier: String? = nil, database: CloudKitDatabaseAdapter, adapterProvider: AdapterProvider, keyValueStore: KeyValueStore = UserDefaultsAdapter(userDefaults: UserDefaults.standard)) {
         self.identifier = identifier
         self.containerIdentifier = containerIdentifier
         self.adapterProvider = adapterProvider
@@ -244,9 +246,9 @@ public class CloudKitSynchronizer: NSObject {
             storedDatabaseToken = nil
             clearAllStoredSubscriptionIDs()
             deviceUUID = nil
-            modelAdapters.forEach {
-                $0.deleteChangeTracking()
-                self.removeModelAdapter($0)
+            for modelAdapter in modelAdapters {
+                await modelAdapter.deleteChangeTracking()
+                removeModelAdapter(modelAdapter)
             }
         }
     }
@@ -255,7 +257,7 @@ public class CloudKitSynchronizer: NSObject {
     /// - Parameters:
     ///   - adapter: Model adapter whose corresponding record zone should be deleted
     ///   - completion: Completion block.
-    @objc public func deleteRecordZone(for adapter: ModelAdapter, completion: ((Error?) -> ())?) {
+    public func deleteRecordZone(for adapter: ModelAdapter, completion: ((Error?) -> ())?) {
         database.delete(withRecordZoneID: adapter.recordZoneID) { (zoneID, error) in
             if let error = error {
                 debugPrint("CloudKitSynchronizer >> Error: \(error)")
@@ -267,19 +269,19 @@ public class CloudKitSynchronizer: NSObject {
     }
     
     /// Model adapters in use by this synchronizer
-    @objc public var modelAdapters: [ModelAdapter] {
+    public var modelAdapters: [ModelAdapter] {
         return Array(modelAdapterDictionary.values)
     }
     
     /// Adds a new model adapter to be synchronized with CloudKit.
     /// - Parameter adapter: The adapter to be managed by this synchronizer.
-    @objc public func addModelAdapter(_ adapter: ModelAdapter) {
+    public func addModelAdapter(_ adapter: ModelAdapter) {
         modelAdapterDictionary[adapter.recordZoneID] = adapter
     }
     
     /// Removes the model adapter so data managed by it won't be synced with CloudKit any more.
     /// - Parameter adapter: Adapter to be removed from the synchronizer
-    @objc  public func removeModelAdapter(_ adapter: ModelAdapter) {
+    public func removeModelAdapter(_ adapter: ModelAdapter) {
         modelAdapterDictionary.removeValue(forKey: adapter.recordZoneID)
     }
 }

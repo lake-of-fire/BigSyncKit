@@ -33,7 +33,7 @@ extension CloudKitSynchronizer {
         uploadRetries = 0
         
         for adapter in modelAdapters {
-            adapter.didFinishImport(with: error)
+            await adapter.didFinishImport(with: error)
         }
         
         //        DispatchQueue(label: "BigSyncKit").async {
@@ -53,7 +53,7 @@ extension CloudKitSynchronizer {
                     // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
                     self.resetDatabaseToken()
                     for adapter in self.modelAdapters {
-                        adapter.deleteChangeTracking()
+                        await adapter.deleteChangeTracking()
                         self.removeModelAdapter(adapter)
                     }
                     await fetchChanges()
@@ -90,10 +90,11 @@ extension CloudKitSynchronizer {
         operationQueue.addOperation(operation)
     }
     
-    func notifyProviderForDeletedZoneIDs(_ zoneIDs: [CKRecordZone.ID]) {
-        zoneIDs.forEach {
-            self.adapterProvider.cloudKitSynchronizer(self, zoneWasDeletedWithZoneID: $0)
-            self.delegate?.synchronizer(self, zoneIDWasDeleted: $0)
+    @MainActor
+    func notifyProviderForDeletedZoneIDs(_ zoneIDs: [CKRecordZone.ID]) async {
+        for zoneID in zoneIDs {
+            await self.adapterProvider.cloudKitSynchronizer(self, zoneWasDeletedWithZoneID: zoneID)
+            self.delegate?.synchronizer(self, zoneIDWasDeleted: zoneID)
         }
     }
     
@@ -346,8 +347,8 @@ extension CloudKitSynchronizer {
                     await completion(error)
                     return
                 }
-                
-                adapter.saveToken(self.activeZoneTokens[adapter.recordZoneID])
+                let token = self.activeZoneTokens[adapter.recordZoneID]
+                await adapter.saveToken(token)
                 await completion(nil)
             }
         }
@@ -474,7 +475,7 @@ extension CloudKitSynchronizer {
                 if !(savedRecords?.isEmpty ?? true) {
                     debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                 }
-                adapter.didUpload(savedRecords: savedRecords ?? [])
+                await adapter.didUpload(savedRecords: savedRecords ?? [])
                 
                 if let error = operationError {
                     if self.isLimitExceededError(error as NSError) {
@@ -522,7 +523,7 @@ extension CloudKitSynchronizer {
             Task { [weak self] in
                 guard let self = self else { return }
                 debugPrint("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
-                    adapter.didDelete(recordIDs: deletedRecordIDs ?? [])
+                    await adapter.didDelete(recordIDs: deletedRecordIDs ?? [])
                     
                     if let error = operationError {
                         if isLimitExceededError(error as NSError) {
@@ -554,7 +555,7 @@ extension CloudKitSynchronizer {
                 //            self.dispatchQueue.async {
                 //                autoreleasepool {
                 //            Task { @MainActor in
-                self.notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 if changedZoneIDs.count > 0 {
                     let zoneIDs = loadTokens(for: changedZoneIDs, loadAdapters: false)
                     await updateServerToken(for: zoneIDs, completion: { [weak self] (needsToFetchChanges) in
@@ -601,7 +602,7 @@ extension CloudKitSynchronizer {
                     needsToRefetch = true
                 } else {
                     activeZoneTokens[zoneID] = result.serverChangeToken
-                    adapter?.saveToken(result.serverChangeToken)
+                    await adapter?.saveToken(result.serverChangeToken)
                 }
                 if result.moreComing {
                     pendingZones.append(zoneID)

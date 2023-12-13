@@ -23,7 +23,7 @@ public class BigSyncBackgroundWorker: BackgroundWorker {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 
-                self.realmSynchronizer = CloudKitSynchronizer.privateSynchronizer(containerName: containerName, configuration: configuration)
+                self.realmSynchronizer = await CloudKitSynchronizer.privateSynchronizer(containerName: containerName, configuration: configuration)
                 
                 (self.realmSynchronizer?.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
                 (self.realmSynchronizer?.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
