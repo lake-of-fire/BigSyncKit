@@ -453,9 +453,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             }
         } else if syncedEntity == nil {
-            if let realm = await self.realmProvider?.persistenceRealm {
-                await Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, getRealm: { await realmProvider.persistenceRealm })
-            }
+            await Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, getRealm: { await realmProvider.persistenceRealm })
             
             if inserted {
                 isNewChange = true
