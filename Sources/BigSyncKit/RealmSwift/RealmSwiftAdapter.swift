@@ -347,12 +347,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
 //                realm.writeAsync {
 //                    for identifier in identifiers {
-                for result in results {
+                for result in Array(results) {
                     let identifier = Self.getStringIdentifier(for: result, usingPrimaryKey: primaryKey)
                         //                        autoreleasepool { [weak self] in
                         //                            try? realm.safeWrite {
                         //                                guard let identifier = getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
-                        await Self.createSyncedEntity(entityType: schema.className, identifier: identifier, realm: realmProvider.persistenceRealm)
+                    await Self.createSyncedEntity(entityType: schema.className, identifier: identifier, getRealm: { await realmProvider.persistenceRealm })
                         //                            }
                         //                        }
                     }
@@ -454,7 +454,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         } else if syncedEntity == nil {
             if let realm = await self.realmProvider?.persistenceRealm {
-                await Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, realm: realm)
+                await Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, getRealm: { await realmProvider.persistenceRealm })
             }
             
             if inserted {
@@ -493,10 +493,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @RealmBackgroundActor
     @discardableResult
-    static func createSyncedEntity(entityType: String, identifier: String, realm: Realm) async -> SyncedEntity {
+    static func createSyncedEntity(entityType: String, identifier: String, getRealm: () async -> Realm) async -> SyncedEntity {
         let syncedEntity = SyncedEntity(entityType: entityType, identifier: "\(entityType).\(identifier)", state: SyncedEntityState.newOrChanged.rawValue)
         
-//        try? realm.safeWrite {
+        let realm = await getRealm()
+        realm.refresh()
         try? await realm.asyncWrite {
             realm.add(syncedEntity, update: .modified)
         }
@@ -879,7 +880,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //        realmProvider.persistenceRealm.beginWrite()
 //        realmProvider.targetRealm.beginWrite()
 //        for relationship in Array(pendingRelationships) {
-        for relationship in pendingRelationships {
+        for relationship in Array(pendingRelationships) {
             let entity = relationship.forSyncedEntity
             
             guard let syncedEntity = entity,
@@ -1389,32 +1390,35 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 //                                }
             }
             
-            guard let syncedEntity = syncedEntity else {
+            if let syncedEntity = syncedEntity {
+                if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
+                    guard let objectClass = self.realmObjectClass(name: record.recordType) else {
+                        continue
+                        //                            return
+                    }
+                    let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
+                    guard let object = await realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
+                        continue
+                        //                            return
+                    }
+                    
+                    //                        realmProvider.targetRealm.writeAsync {
+                    
+                    await self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
+                    //                        } onComplete: { error in
+                    //                            }
+                }
+            } else {
                 // Can happen when iCloud has records for a model that no longer exists locally.
                 continue
-                //                        return
-            }
-            
-            if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
-                guard let objectClass = self.realmObjectClass(name: record.recordType) else {
-                    continue
-                    //                            return
-                }
-                let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
-                guard let object = await realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
-                    continue
-                    //                            return
-                }
-                
-                //                        realmProvider.targetRealm.writeAsync {
-                
-                await self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
-                //                        } onComplete: { error in
-                //                            }
             }
             //                                self.saveShareRelationship(for: syncedEntity, record: record)
-            try? await realmProvider.persistenceRealm.asyncWrite {
-                self.save(record: record, for: syncedEntity)
+            
+            // Refresh to avoid invalidated crash
+            if let syncedEntity = await Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: realmProvider.persistenceRealm) {
+                try? await realmProvider.persistenceRealm.asyncWrite {
+                    self.save(record: record, for: syncedEntity)
+                }
             }
             // Order is important here. Notifications might be delivered after targetRealm is saved and
             // it's convenient if the persistenceRealm is not in a write transaction
