@@ -203,24 +203,25 @@ extension CloudKitSynchronizer {
             return
         }
         
-//        Task { @MainActor in
-            postNotification(.SynchronizerWillFetchChanges)
-            await fetchDatabaseChanges() { [weak self] token, error in
-                guard let self = self else { return }
-                guard error == nil else {
-                    await finishSynchronization(error: error)
-                    return
-                }
-                
-                serverChangeToken = token
-                storedDatabaseToken = token
-                if syncMode == .sync {
-                    await uploadChanges()
-                } else {
-                    await finishSynchronization(error: nil)
-                }
+        postNotification(.SynchronizerWillFetchChanges)
+        
+//        print("!! fetch DB changes")
+        await fetchDatabaseChanges() { [weak self] token, error in
+//        print("!! fetch DB changes: FINISHED")
+            guard let self = self else { return }
+            guard error == nil else {
+                await finishSynchronization(error: error)
+                return
             }
-//        }
+            
+            serverChangeToken = token
+            storedDatabaseToken = token
+            if syncMode == .sync {
+                await uploadChanges()
+            } else {
+                await finishSynchronization(error: nil)
+            }
+        }
     }
     
     @BigSyncActor
@@ -267,7 +268,7 @@ extension CloudKitSynchronizer {
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { (zoneResults) in
             
             //            self.dispatchQueue.async {
-            Task.detached(priority: .background) { [weak self] in
+            await Task.detached(priority: .background) { [weak self] in
                 guard let self = self else { return }
                 var pendingZones = [CKRecordZone.ID]()
                 var error: Error? = nil
@@ -288,11 +289,9 @@ extension CloudKitSynchronizer {
                         if !result.deletedRecordIDs.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.description)")
                         }
-                        //                    Task { @MainActor [weak self] in
                         await Task { @MainActor [weak self] in
                             guard let self = self else { return }
                             activeZoneTokens[zoneID] = result.serverChangeToken
-                            //                    }
                             await adapter?.saveChanges(in: result.downloadedRecords)
                             await adapter?.deleteRecords(with: result.deletedRecordIDs)
                         }.value
@@ -313,7 +312,7 @@ extension CloudKitSynchronizer {
                     //                    }
                     //                }
                 }
-            }
+            }.value
         }
         
         runOperation(operation)

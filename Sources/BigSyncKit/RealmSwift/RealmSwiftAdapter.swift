@@ -538,7 +538,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     func createSyncedEntity(record: CKRecord, realmProvider: RealmProvider) async -> SyncedEntity? {
         let syncedEntity = SyncedEntity(entityType: record.recordType, identifier: record.recordID.recordName, state: SyncedEntityState.synced.rawValue)
         
-        let persistenceRealm = await realmProvider.persistenceRealm
+        let persistenceRealm = realmProvider.persistenceRealm
         try? await realmProvider.persistenceRealm.asyncWrite {
             persistenceRealm.add(syncedEntity, update: .modified)
         }
@@ -550,13 +550,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let objectIdentifier = getObjectIdentifier(for: syncedEntity)
          
         // If the row already exists somehow (for some reasons outside of syncing), merge changes instead of crashing.
-        if let object = await realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) {
+        if let object = realmProvider.targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) {
             await applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
 //            saveShareRelationship(for: syncedEntity, record: record)
         } else {
             let object = objectClass.init()
             object.setValue(objectIdentifier, forKey: primaryKey)
-            let targetRealm = await realmProvider.targetRealm
+            let targetRealm = realmProvider.targetRealm
             try? await realmProvider.targetRealm.asyncWrite {
                 targetRealm.add(object)
             }
@@ -711,6 +711,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         let value = record[key]
         
+        // TODO: Compare existing value before writing new one.
         // List/Set support forked from IceCream: https://github.com/caiyue1993/IceCream/blob/master/IceCream/Classes/CKRecordRecoverable.swift
         var recordValue: Any?
         if property.isSet {
@@ -1399,6 +1400,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //            try! persistenceRealm.write {
         //            persistenceRealm.writeAsync {
         for record in records {
+//            print("!! record to save... \(record.recordID.recordName) \(record.recordID.className)")
             //                    print("save changes to record \(record.description)")
             //                            realmProvider.persistenceRealm.beginWrite()
             //                            realmProvider.targetRealm.beginWrite()
