@@ -1477,7 +1477,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func deleteRecords(with recordIDs: [CKRecord.ID]) async {
         guard let realmProvider = realmProvider else { return }
         guard recordIDs.count != 0 else { return }
-        debugPrint("Deleting records with record ids \(recordIDs)")
+        debugPrint("Deleting records with record ids \(recordIDs.map { $0.recordName })")
         
         //        executeOnMainQueue {
         //        DispatchQueue(label: "BigSyncKit").sync {
@@ -1727,7 +1727,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                     config.fileURL?.appendingPathExtension("management")
         ].compactMap { $0 }
         
-        for url in realmFileURLs {
+        for url in realmFileURLs where FileManager.default.fileExists(atPath: url.path) {
             do {
                 try FileManager.default.removeItem(at: url)
             } catch {

@@ -284,10 +284,10 @@ extension CloudKitSynchronizer {
                         }
                     } else {
                         if !result.downloadedRecords.isEmpty {
-                            debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.description)")
+                            debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
                         }
                         if !result.deletedRecordIDs.isEmpty {
-                            debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.description)")
+                            debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
                         }
                         await Task { @MainActor [weak self] in
                             guard let self = self else { return }
