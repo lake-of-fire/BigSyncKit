@@ -498,6 +498,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
                 // Hack to avoid crashing issue: https://github.com/realm/realm-swift/issues/8333
+                realmProvider.persistenceRealm.refresh()
                 if let syncedEntity = await Self.getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm) {
 //                    try? realmProvider.persistenceRealm.safeWrite {
                     try? await realmProvider.persistenceRealm.asyncWrite {
