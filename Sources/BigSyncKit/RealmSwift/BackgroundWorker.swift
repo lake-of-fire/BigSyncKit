@@ -8,11 +8,11 @@ import Foundation
 
 // Based on https://academy.realm.io/posts/realm-notifications-on-background-threads-with-swift/
 // Tweaked a little by Yue Cai
-public class BackgroundWorker: NSObject {
+open class BackgroundWorker: NSObject {
     private var thread: Thread?
     private var block: (() -> Void)?
     
-    func start(_ block: @escaping () -> Void) {
+    public func start(_ block: @escaping () -> Void) {
         self.block = block
         
         if thread == nil {
