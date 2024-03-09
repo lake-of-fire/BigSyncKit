@@ -624,11 +624,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     static func getStringIdentifier(for object: Object, usingPrimaryKey key: String) -> String {
         let objectId = object.value(forKey: key)
+        let identifier: String
         if let value = objectId as? CustomStringConvertible {
-            return String(describing: value)
+            identifier = String(describing: value)
         } else {
-            return objectId as! String
+            identifier = objectId as! String
         }
+//        guard identifier.count <= 255 else {
+//            
+//        }
+        return identifier
     }
     
     @BigSyncBackgroundActor
