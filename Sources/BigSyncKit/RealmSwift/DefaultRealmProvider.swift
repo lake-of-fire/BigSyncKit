@@ -84,7 +84,6 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
                 adapterDictionary[zoneID] = adapter
             }
         }
-        
     }
     
     private func realmSwiftAdapterFor(targetRealmURL: URL, persistenceRealmURL: URL, zoneID: CKRecordZone.ID) -> RealmSwiftAdapter {
