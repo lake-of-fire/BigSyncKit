@@ -20,17 +20,19 @@ extension CloudKitSynchronizer {
      
      -Returns: A new CloudKit synchronizer for the given realm.
      */
-    public class func privateSynchronizer(containerName: String, configuration: Realm.Configuration, suiteName: String? = nil, recordZoneID: CKRecordZone.ID? = nil) async -> CloudKitSynchronizer {
+    public class func privateSynchronizer(containerName: String, configuration: Realm.Configuration, excludedClassNames: [String], suiteName: String? = nil, recordZoneID: CKRecordZone.ID? = nil) async -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
-        let provider = DefaultRealmSwiftAdapterProvider(targetConfiguration: configuration, zoneID: zoneID)
+        let provider = DefaultRealmSwiftAdapterProvider(targetConfiguration: configuration, excludedClassNames: excludedClassNames, zoneID: zoneID)
         let userDefaults = UserDefaults(suiteName: suiteName)!
         let userDefaultsAdapter = UserDefaultsAdapter(userDefaults: userDefaults)
         let container = CKContainer(identifier: containerName)
-        let synchronizer = CloudKitSynchronizer(identifier: "DefaultRealmSwiftPrivateSynchronizer",
-                                                containerIdentifier: containerName,
-                                                database: DefaultCloudKitDatabaseAdapter(database: container.privateCloudDatabase),
-                                                adapterProvider: provider,
-                                                keyValueStore: userDefaultsAdapter)
+        let synchronizer = CloudKitSynchronizer(
+            identifier: "DefaultRealmSwiftPrivateSynchronizer",
+            containerIdentifier: containerName,
+            database: DefaultCloudKitDatabaseAdapter(database: container.privateCloudDatabase),
+            adapterProvider: provider,
+            keyValueStore: userDefaultsAdapter
+        )
         synchronizer.addModelAdapter(provider.adapter)
         await transferOldServerChangeToken(to: provider.adapter, userDefaults: userDefaultsAdapter, containerName: containerName)
         
@@ -46,13 +48,16 @@ extension CloudKitSynchronizer {
      
      -Returns: A new CloudKit synchronizer for the given realm.
      */
-    public class func sharedSynchronizer(containerName: String, configuration: Realm.Configuration, suiteName: String? = nil) -> CloudKitSynchronizer {
+    public class func sharedSynchronizer(containerName: String, configuration: Realm.Configuration, excludedClassNames: [String], suiteName: String? = nil) -> CloudKitSynchronizer {
         let userDefaults = UserDefaults(suiteName: suiteName)!
         let userDefaultsAdapter = UserDefaultsAdapter(userDefaults: userDefaults)
         let container = CKContainer(identifier: containerName)
-        let provider = DefaultRealmProvider(identifier: "DefaultRealmSwiftSharedStackProvider",
-                                            realmConfiguration: configuration,
-                                            appGroup: suiteName)
+        let provider = DefaultRealmProvider(
+            identifier: "DefaultRealmSwiftSharedStackProvider",
+            realmConfiguration: configuration,
+            appGroup: suiteName,
+            excludedClassNames: excludedClassNames
+        )
         let synchronizer = CloudKitSynchronizer(identifier: "DefaultRealmSwiftSharedSynchronizer",
                                                 containerIdentifier: containerName,
                                                 database: DefaultCloudKitDatabaseAdapter(database: container.sharedCloudDatabase),

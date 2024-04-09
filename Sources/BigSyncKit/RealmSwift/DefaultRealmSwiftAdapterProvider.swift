@@ -13,11 +13,13 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let zoneID: CKRecordZone.ID
     let persistenceConfiguration: Realm.Configuration
     let targetConfiguration: Realm.Configuration
+    let excludedClassNames: [String]
     let appGroup: String?
     public private(set) var adapter: RealmSwiftAdapter!
     
-    public init(targetConfiguration: Realm.Configuration, zoneID: CKRecordZone.ID, appGroup: String? = nil) {
+    public init(targetConfiguration: Realm.Configuration, excludedClassNames: [String], zoneID: CKRecordZone.ID, appGroup: String? = nil) {
         self.targetConfiguration = targetConfiguration
+        self.excludedClassNames = excludedClassNames
         self.zoneID = zoneID
         self.appGroup = appGroup
         persistenceConfiguration = DefaultRealmSwiftAdapterProvider.createPersistenceConfiguration(suiteName: appGroup)
@@ -44,7 +46,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     }
     
     fileprivate func createAdapter() -> RealmSwiftAdapter {
-        return RealmSwiftAdapter(persistenceRealmConfiguration: persistenceConfiguration, targetRealmConfiguration: targetConfiguration, recordZoneID: zoneID)
+        return RealmSwiftAdapter(persistenceRealmConfiguration: persistenceConfiguration, targetRealmConfiguration: targetConfiguration, excludedClassNames: excludedClassNames, recordZoneID: zoneID)
     }
     
     // MARK: - File directory

@@ -26,14 +26,16 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
     private(set) var adapterDictionary: [CKRecordZone.ID: RealmSwiftAdapter]
     private(set) var realms: [CKRecordZone.ID: Realm.Configuration]
     let appGroup: String?
+    let excludedClassNames: [String]
     let realmConfiguration: Realm.Configuration
     
     private let DefaultRealmProviderTargetFileName = "DefaultRealmProviderTargetFileName"
     private let DefaultRealmProviderPersistenceFileName = "DefaultRealmProviderPersistenceFileName"
     
-    public init(identifier: String, realmConfiguration: Realm.Configuration, appGroup: String?) {
+    public init(identifier: String, realmConfiguration: Realm.Configuration, appGroup: String?, excludedClassNames: [String]) {
         self.identifier = identifier
         self.appGroup = appGroup
+        self.excludedClassNames = excludedClassNames
         adapterDictionary = [CKRecordZone.ID: RealmSwiftAdapter]()
         realms = [CKRecordZone.ID: Realm.Configuration]()
         self.realmConfiguration = realmConfiguration
@@ -102,9 +104,12 @@ public class DefaultRealmProvider: NSObject, AdapterProvider {
         
         realms[zoneID] = targetConfiguration
         
-        return RealmSwiftAdapter(persistenceRealmConfiguration: persistenceConfiguration,
-                                       targetRealmConfiguration: targetConfiguration,
-                                       recordZoneID: zoneID)
+        return RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfiguration: targetConfiguration,
+            excludedClassNames: excludedClassNames,
+            recordZoneID: zoneID
+        )
     }
     
     private func folderNameFor(recordZoneID: CKRecordZone.ID) -> String {

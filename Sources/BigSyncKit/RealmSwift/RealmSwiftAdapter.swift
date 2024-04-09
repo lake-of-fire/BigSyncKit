@@ -164,6 +164,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     public let persistenceRealmConfiguration: Realm.Configuration
     public let targetRealmConfiguration: Realm.Configuration
+    public let excludedClassNames: [String]
     public let zoneID: CKRecordZone.ID
     public var mergePolicy: MergePolicy = .server
     public weak var delegate: RealmSwiftAdapterDelegate?
@@ -186,10 +187,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private var cancellables = Set<AnyCancellable>()
     
-    public init(persistenceRealmConfiguration: Realm.Configuration, targetRealmConfiguration: Realm.Configuration, recordZoneID: CKRecordZone.ID) {
+    public init(persistenceRealmConfiguration: Realm.Configuration, targetRealmConfiguration: Realm.Configuration, excludedClassNames: [String], recordZoneID: CKRecordZone.ID) {
         
         self.persistenceRealmConfiguration = persistenceRealmConfiguration
         self.targetRealmConfiguration = targetRealmConfiguration
+        self.excludedClassNames = excludedClassNames
         self.zoneID = recordZoneID
         
         super.init()
@@ -256,7 +258,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         let needsInitialSetup = realmProvider.persistenceRealm.objects(SyncedEntity.self).count <= 0
         
-        for schema in realmProvider.targetRealm.schema.objectSchema {
+        for schema in realmProvider.targetRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
             guard let objectClass = self.realmObjectClass(name: schema.className) else {
                 continue
             }
@@ -435,7 +437,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         childRelationships.removeAll()
         
         guard let realmProvider = realmProvider else { return }
-        for objectSchema in await realmProvider.targetRealm.schema.objectSchema {
+        for objectSchema in realmProvider.targetRealm.schema.objectSchema where !excludedClassNames.contains(objectSchema.className) {
             guard let objectClass = self.realmObjectClass(name: objectSchema.className) else {
                 continue
             }
@@ -1307,7 +1309,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 //            autoreleasepool {
                 //        guard let self = self else { return }
                 guard let realmProvider = realmProvider else { return }
-                for schema in realmProvider.targetRealm.schema.objectSchema {
+                for schema in realmProvider.targetRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
                     guard let objectClass = self.realmObjectClass(name: schema.className) else {
                         continue
                     }

@@ -7,10 +7,12 @@ import Combine
 public struct BigSyncBackgroundWorkerConfiguration {
     let containerName: String
     let configuration: Realm.Configuration
+    let excludedClassNames: [String]
     
-    public init(containerName: String, configuration: Realm.Configuration) {
+    public init(containerName: String, configuration: Realm.Configuration, excludedClassNames: [String]) {
         self.containerName = containerName
         self.configuration = configuration
+        self.excludedClassNames = excludedClassNames
     }
 }
 
@@ -33,7 +35,7 @@ public class BigSyncBackgroundWorker: BackgroundWorker {
                 guard let self = self else { return }
                 
                 for config in configurations {
-                    let synchronizer = await CloudKitSynchronizer.privateSynchronizer(containerName: config.containerName, configuration: config.configuration)
+                    let synchronizer = await CloudKitSynchronizer.privateSynchronizer(containerName: config.containerName, configuration: config.configuration, excludedClassNames: config.excludedClassNames)
                     
                     (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
                     (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
