@@ -1,7 +1,7 @@
 import Foundation
 import RealmSwift
 import RealmSwiftGaps
-import Device
+//import Device
 
 public class SyncedDevice: Object, UnownedSyncableObject, ObjectKeyIdentifiable {
     @Persisted(primaryKey: true) public var id = UUID()
@@ -26,7 +26,7 @@ public class SyncedDevice: Object, UnownedSyncableObject, ObjectKeyIdentifiable 
         try await realm.asyncWrite {
             if let device = realm.object(ofType: SyncedDevice.self, forPrimaryKey: uuid) {
                 if force || device.lastSeenOnline.distance(to: Date()) > TimeInterval(60 * 60 * 1) {
-                    device.deviceName = Device.current.name
+//                    device.deviceName = Device.current.name
                     device.lastSeenOnline = Date()
                     device.modifiedAt = Date()
                     device.isDeleted = false
@@ -34,7 +34,7 @@ public class SyncedDevice: Object, UnownedSyncableObject, ObjectKeyIdentifiable 
             } else {
                 let device = realm.create(SyncedDevice.self, value: [
                     "id": uuid,
-                    "deviceName": Device.current.name,
+//                    "deviceName": Device.current.name,
                     "lastSeenOnline": Date(),
                     "isDeleted": false,
                 ], update: .modified)
