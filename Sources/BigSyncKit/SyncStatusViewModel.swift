@@ -1,14 +1,16 @@
 import SwiftUI
+import RealmSwift
+import RealmSwiftGaps
 import CloudKit
 import Combine
 
 public struct LastSeenDevice: Identifiable {
-    let id: UUID
-    let deviceName: String
-    let lastSeenOnline: Date
-   let humanReadableLastSeenOnline: String
+    public let id: UUID
+    public let deviceName: String
+    public let lastSeenOnline: Date
+    public let humanReadableLastSeenOnline: String
     
-    init(id: UUID, deviceName: String, lastSeenOnline: Date) {
+    public init(id: UUID, deviceName: String, lastSeenOnline: Date) {
         self.id = id
         self.deviceName = deviceName
         self.lastSeenOnline = lastSeenOnline
@@ -28,7 +30,7 @@ public struct LastSeenDevice: Identifiable {
         } else if let nanosecond = interval.nanosecond, nanosecond > 0 {
             intervalText = "\(nanosecond / 1000000000) second\(nanosecond != 1000000000 ? "s" : "")"
         } else {
-            return ""
+            intervalText = ""
         }
         humanReadableLastSeenOnline = "\(intervalText) ago"
     }
@@ -39,37 +41,41 @@ public class SyncStatusViewModel: ObservableObject {
 //    @Published public var syncStatusWithoutFailure: String = "Initializing"
     @Published public var syncFailed = false
     @Published public var currentDeviceID: UUID?
-    @Published public var lastSeenDevices: [SyncedDevice]?
+    @Published public var lastSeenDevices: [LastSeenDevice]?
 
     private var cancellables = Set<AnyCancellable>()
     
     public init() {
         NotificationCenter.default.publisher(for: .SynchronizerWillSynchronize)
             .sink { [weak self] _ in
-                self?.syncStatus = "Preparing to Synchronize"
-                self?.syncFailed = false
+                guard let self = self else { return }
+                syncStatus = "Preparing to Synchronize"
+                syncFailed = false
             }
             .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerWillFetchChanges)
             .sink { [weak self] _ in
-                self?.syncStatus = "Fetching Changes"
-                self?.syncFailed = false
+                guard let self = self else { return }
+                syncStatus = "Fetching Changes"
+                syncFailed = false
             }
             .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerWillUploadChanges)
             .sink { [weak self] _ in
-                self?.syncStatus = "Uploading Changes"
-                self?.syncFailed = false
+                guard let self = self else { return }
+                syncStatus = "Uploading Changes"
+                syncFailed = false
             }
             .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerDidSynchronize)
             .sink { [weak self] _ in
-                self?.syncStatus = "Synchronization Completed"
-                self?.syncFailed = false
-                self?.syncIsOver()
+                guard let self = self else { return }
+                syncStatus = "Synchronization Completed"
+                syncFailed = false
+                syncIsOver()
             }
             .store(in: &cancellables)
         
@@ -90,7 +96,7 @@ public class SyncStatusViewModel: ObservableObject {
                     }
                     syncFailed = true
                     
-                    self?.syncIsOver()
+                    syncIsOver()
                 }
             }
             .store(in: &cancellables)
@@ -102,12 +108,12 @@ public class SyncStatusViewModel: ObservableObject {
             try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID)
             
             let realm = try await Realm(actor: RealmBackgroundActor.shared)
-            let syncedDevices = realm.objects(ofType: SyncedDevice.self)
+            let syncedDevices = realm.objects(SyncedDevice.self)
                 .where { !$0.isDeleted }
                 .sorted(by: \.lastSeenOnline, ascending: false)
             lastSeenDevices = Array(syncedDevices).map {
                 LastSeenDevice(
-                    deviceName: $0.deviceName,
+                    id: $0.id, deviceName: $0.deviceName,
                     lastSeenOnline: $0.lastSeenOnline
                 )
             }
