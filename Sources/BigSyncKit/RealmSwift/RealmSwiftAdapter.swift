@@ -679,7 +679,27 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
                 
-                if delegate?.realmSwiftAdapter(self, gotChanges: recordChanges, object: object) ?? false {
+                let acceptRemoteChange: Bool
+                if let delegate = delegate {
+                    acceptRemoteChange = delegate.realmSwiftAdapter(self, gotChanges: recordChanges, object: object)
+                } else {
+                    // Default conflict resolution.
+                    // Forkable into delegate.
+                    acceptRemoteChange = { adapter, changes, object in
+#if os(macOS)
+                        guard adapter.hasRealmObjectClass(name: object.className) else { return false }
+#else
+                        guard adapter.hasRealmObjectClass(name: String(describing: type(of: object))) else { return false }
+#endif
+                        
+                        if let remoteChangeAt = changes["modifiedAt"] as? Date, let localChangeAt = object.value(forKey: "modifiedAt") as? Date, remoteChangeAt <= localChangeAt {
+                            return false
+                        }
+                        return true
+                    }(self, recordChanges, object)
+                }
+                
+                if acceptRemoteChange {
                     for property in object.objectSchema.properties {
                         if shouldIgnore(key: property.name) {
                             continue

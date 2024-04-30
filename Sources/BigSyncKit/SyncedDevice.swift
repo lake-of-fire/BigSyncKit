@@ -32,7 +32,7 @@ public class SyncedDevice: Object, UnownedSyncableObject, ObjectKeyIdentifiable 
                     device.isDeleted = false
                 }
             } else {
-                let device = realm.create(SyncedDevice.self, value: [
+                _ = realm.create(SyncedDevice.self, value: [
                     "id": uuid,
 //                    "deviceName": Device.current.name,
                     "lastSeenOnline": Date(),
