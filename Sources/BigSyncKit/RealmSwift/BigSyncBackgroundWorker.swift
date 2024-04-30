@@ -24,7 +24,7 @@ public class BigSyncBackgroundWorker: BackgroundWorker {
     private var subscriptions = Set<AnyCancellable>()
 //    private let notificationQueue = DispatchQueue(label: "BigSyncBackgroundWorker.notificationQueue")
     
-    public init(configurations: [BigSyncBackgroundWorkerConfiguration], delegate: RealmSwiftAdapterDelegate) {
+    public init(configurations: [BigSyncBackgroundWorkerConfiguration], delegate: RealmSwiftAdapterDelegate? = nil) {
         synchronizerDelegate = delegate
         
         super.init()
