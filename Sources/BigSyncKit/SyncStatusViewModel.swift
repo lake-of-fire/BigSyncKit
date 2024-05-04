@@ -37,6 +37,8 @@ public struct LastSeenDevice: Identifiable {
 }
 
 public class SyncStatusViewModel: ObservableObject {
+    public let realmConfiguration: Realm.Configuration
+    
     @Published public var syncStatus: String = "Initializing"
 //    @Published public var syncStatusWithoutFailure: String = "Initializing"
     @Published public var syncFailed = false
@@ -45,12 +47,15 @@ public class SyncStatusViewModel: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
     
-    public init() {
+    public init(realmConfiguration: Realm.Configuration) {
+        self.realmConfiguration = realmConfiguration
+        
         NotificationCenter.default.publisher(for: .SynchronizerWillSynchronize)
             .sink { [weak self] _ in
                 guard let self = self else { return }
                 syncStatus = "Preparing to Synchronize"
                 syncFailed = false
+                syncBegan()
             }
             .store(in: &cancellables)
         
@@ -102,21 +107,33 @@ public class SyncStatusViewModel: ObservableObject {
             .store(in: &cancellables)
     }
     
+    private func syncBegan() {
+        guard let currentDeviceID = currentDeviceID else { return }
+        Task { @RealmBackgroundActor in
+            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID, realmConfiguration: realmConfiguration)
+            try await refreshLastSeenDevices()
+        }
+    }
+    
     private func syncIsOver() {
         guard let currentDeviceID = currentDeviceID else { return }
         Task { @RealmBackgroundActor in
-            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID)
-            
-            let realm = try await Realm(actor: RealmBackgroundActor.shared)
-            let syncedDevices = realm.objects(SyncedDevice.self)
-                .where { !$0.isDeleted }
-                .sorted(by: \.lastSeenOnline, ascending: false)
-            lastSeenDevices = Array(syncedDevices).map {
-                LastSeenDevice(
-                    id: $0.id, deviceName: $0.deviceName,
-                    lastSeenOnline: $0.lastSeenOnline
-                )
-            }
+            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID, realmConfiguration: realmConfiguration)
+            try await refreshLastSeenDevices()
+        }
+    }
+    
+    @RealmBackgroundActor
+    private func refreshLastSeenDevices() async throws {
+        let realm = try await Realm(configuration: realmConfiguration, actor: RealmBackgroundActor.shared)
+        let syncedDevices = realm.objects(SyncedDevice.self)
+            .where { !$0.isDeleted }
+            .sorted(by: \.lastSeenOnline, ascending: false)
+        lastSeenDevices = Array(syncedDevices).map {
+            LastSeenDevice(
+                id: $0.id, deviceName: $0.deviceName,
+                lastSeenOnline: $0.lastSeenOnline
+            )
         }
     }
 }

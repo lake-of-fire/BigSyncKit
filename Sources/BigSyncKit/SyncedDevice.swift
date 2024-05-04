@@ -21,8 +21,8 @@ public class SyncedDevice: Object, UnownedSyncableObject, ObjectKeyIdentifiable 
     }
     
     @RealmBackgroundActor
-    static func updateLastSeenOnlineIfNeeded(forUUID uuid: UUID, force: Bool = false) async throws {
-        let realm = try await Realm(actor: RealmBackgroundActor.shared)
+    static func updateLastSeenOnlineIfNeeded(forUUID uuid: UUID, realmConfiguration: Realm.Configuration, force: Bool = false) async throws {
+        let realm = try await Realm(configuration: realmConfiguration, actor: RealmBackgroundActor.shared)
         try await realm.asyncWrite {
             if let device = realm.object(ofType: SyncedDevice.self, forPrimaryKey: uuid) {
                 if force || device.lastSeenOnline.distance(to: Date()) > TimeInterval(60 * 60 * 1) {
