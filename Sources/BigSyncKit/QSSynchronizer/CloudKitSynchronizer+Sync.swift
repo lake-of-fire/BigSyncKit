@@ -368,7 +368,7 @@ extension CloudKitSynchronizer {
         
         await uploadChanges() { [weak self] (error) in
             guard let self = self else { return }
-            if let error = error {
+            if let error = error as? NSError {
 #warning("FIXME: handle zone not found...")
                 //                if let error = error as? CKError {
 //                    if let errors = error.partialErrorsByItemID {
@@ -378,8 +378,8 @@ extension CloudKitSynchronizer {
 //                    if error.code == .zoneNotFound || error.code == .userDeletedZone ||  {
 //                    }
 //                }
-
-                if shouldRetryUpload(for: error as NSError) {
+                
+                if shouldRetryUpload(for: error) {
                     uploadRetries += 1
 //                    Task.detached { [weak self] in
                         await fetchChanges()
@@ -469,6 +469,7 @@ extension CloudKitSynchronizer {
         { [weak self] (savedRecords, deleted, conflicted, operationError) in
             Task { [weak self] in
                 guard let self = self else { return }
+                var conflicted = conflicted
                 //            self.dispatchQueue.async {
                 //                autoreleasepool {
                 if !(savedRecords?.isEmpty ?? true) {
@@ -476,14 +477,33 @@ extension CloudKitSynchronizer {
                 }
                 await adapter.didUpload(savedRecords: savedRecords ?? [])
                 
-                if let error = operationError {
-                    if self.isLimitExceededError(error as NSError) {
+                if let error = operationError as? NSError {
+//                    if error.code == CKError.partialFailure.rawValue,
+//                       let errorsByItemID = error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] {
+//                        for (recordID, error) in errorsByItemID where error.code == CKError.serverRecordChanged.rawValue {
+//                            if let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
+//                                // Handle the server record changed error
+//                                if let serverMessage = error.userInfo[NSLocalizedDescriptionKey] as? String,
+//                                   serverMessage.contains("record to insert already exists") {
+//                                    if !conflicted.contains(where: { $0.recordID == serverRecord.recordID }) {
+////                                        conflicted.append(serverRecord)
+//                                        print("!! WAS GONNA ADD ::")
+//                                    }
+//                                    // Handle the specific case where the record already exists
+//                                    print("!! Record \(recordID) already exists on the server.")
+//                                    //serverRecord/
+//                                }
+//                            }
+//                        }
+//                    }
+                    
+                    if self.isLimitExceededError(error) {
                         reduceBatchSize()
                         await completion(error)
                     } else if !conflicted.isEmpty {
                         await adapter.saveChanges(in: conflicted)
                         await adapter.persistImportedChanges { (persistError) in
-                            await completion(error)
+                            await completion(persistError)
                         }
                     } else {
                         await completion(error)

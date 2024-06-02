@@ -31,9 +31,12 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
         let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: recordIDsToDelete)
         
         operation.perRecordCompletionBlock = { record, error in
+//            debugPrint("!! perRecordCompletionBlock", error, (error as? NSError)?.code, CKRecordChangedErrorServerRecordKey)
+//            debugPrint("!! perRecordCompletionBlock ckerror", error as? CKError)
             if let error = error as? CKError,
                 error.code == CKError.serverRecordChanged,
-                let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord{
+                let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
+//                debugPrint("!! added conflicted record too")
                 self.conflictedRecords.append(serverRecord)
             }
         }

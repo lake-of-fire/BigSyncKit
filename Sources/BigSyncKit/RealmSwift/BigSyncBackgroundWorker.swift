@@ -1,4 +1,5 @@
 import SwiftUI
+import CloudKit
 import Realm
 import RealmSwift
 import Combine
@@ -94,8 +95,8 @@ public class BigSyncBackgroundWorker: BackgroundWorker {
                     case .recordNotFound:
                         print("Sync error: \(error.localizedDescription) A record for the provided object was not found, so the object cannot be shared on CloudKit.")
                     }
-                } else if let error = error {
-                    print("Unknown CloudKit sync error: \(error.localizedDescription) \(error)")
+                } else if let error = error as? NSError {
+                    print("CloudKit sync error: \(error.localizedDescription) \(error)")
                 }
                 continuation.resume()
             }
