@@ -108,19 +108,19 @@ public class SyncStatusViewModel: ObservableObject {
     }
     
     private func syncBegan() {
-        guard let currentDeviceID = currentDeviceID else { return }
-        Task { @RealmBackgroundActor in
-            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID, realmConfiguration: realmConfiguration)
-            try await refreshLastSeenDevices()
-        }
+//        guard let currentDeviceID = currentDeviceID else { return }
+//        Task { @RealmBackgroundActor in
+//            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID, realmConfiguration: realmConfiguration)
+//            try await refreshLastSeenDevices()
+//        }
     }
     
     private func syncIsOver() {
-        guard let currentDeviceID = currentDeviceID else { return }
-        Task { @RealmBackgroundActor in
-            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID, realmConfiguration: realmConfiguration)
-            try await refreshLastSeenDevices()
-        }
+//        guard let currentDeviceID = currentDeviceID else { return }
+//        Task { @RealmBackgroundActor in
+//            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID, realmConfiguration: realmConfiguration)
+//            try await refreshLastSeenDevices()
+//        }
     }
     
     @RealmBackgroundActor

@@ -52,31 +52,32 @@ public class SyncedDevice: Object, UnownedSyncableObject, ObjectKeyIdentifiable 
         return false
     }
     
-    @RealmBackgroundActor
-    static func updateLastSeenOnlineIfNeeded(forUUID uuid: UUID, realmConfiguration: Realm.Configuration, force: Bool = false) async throws {
-        let realm = try await Realm(configuration: realmConfiguration, actor: RealmBackgroundActor.shared)
-        
-        // Ensure the device name is fetched on the main actor
-        let deviceName = await MainActor.run {
-            Device.current.localizedModel
-        }
-        
-        try await realm.asyncWrite {
-            if let device = realm.object(ofType: SyncedDevice.self, forPrimaryKey: uuid) {
-                if force || device.lastSeenOnline.distance(to: Date()) > TimeInterval(60 * 60 * 1) {
-                    device.deviceName = deviceName
-                    device.lastSeenOnline = Date()
-                    device.modifiedAt = Date()
-                    device.isDeleted = false
-                }
-            } else {
-                _ = realm.create(SyncedDevice.self, value: [
-                    "id": uuid,
-                    "deviceName": deviceName, // Use the deviceName obtained from the custom Device struct
-                    "lastSeenOnline": Date(),
-                    "isDeleted": false,
-                ], update: .modified)
-            }
-        }
-    }
+    // TODO: To restore this, its crashes must be fixed; I think it's writing to user's realm file but not using the same actor as user's realm's other writers
+//    @RealmBackgroundActor
+//    static func updateLastSeenOnlineIfNeeded(forUUID uuid: UUID, realmConfiguration: Realm.Configuration, force: Bool = false) async throws {
+//        let realm = try await Realm(configuration: realmConfiguration, actor: RealmBackgroundActor.shared)
+//        
+//        // Ensure the device name is fetched on the main actor
+//        let deviceName = await MainActor.run {
+//            Device.current.localizedModel
+//        }
+//        
+//        try await realm.asyncWrite {
+//            if let device = realm.object(ofType: SyncedDevice.self, forPrimaryKey: uuid) {
+//                if force || device.lastSeenOnline.distance(to: Date()) > TimeInterval(60 * 60 * 1) {
+//                    device.deviceName = deviceName
+//                    device.lastSeenOnline = Date()
+//                    device.modifiedAt = Date()
+//                    device.isDeleted = false
+//                }
+//            } else {
+//                _ = realm.create(SyncedDevice.self, value: [
+//                    "id": uuid,
+//                    "deviceName": deviceName, // Use the deviceName obtained from the custom Device struct
+//                    "lastSeenOnline": Date(),
+//                    "isDeleted": false,
+//                ], update: .modified)
+//            }
+//        }
+//    }
 }

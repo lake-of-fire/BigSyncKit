@@ -133,6 +133,7 @@ actor RealmProvider {
 //        }
 //    }
     
+    @BigSyncBackgroundActor
     init?(persistenceConfiguration: Realm.Configuration, targetConfiguration: Realm.Configuration) async {
         self.persistenceConfiguration = persistenceConfiguration
         self.targetConfiguration = targetConfiguration
@@ -375,7 +376,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //                Task.detached(priority: .utility) { [weak self] in
 //                    guard let self = self else { return }
 //                    let realm = realmProvider.persistenceRealm
-                let results = await realmProvider.targetRealm.objects(objectClass)
+                let results = realmProvider.targetRealm.objects(objectClass)
 //                let identifiers = results.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) }
                 
 //                realm.writeAsync {
@@ -385,7 +386,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         //                        autoreleasepool { [weak self] in
                         //                            try? realm.safeWrite {
                         //                                guard let identifier = getStringIdentifier(for: object, usingPrimaryKey: primaryKey) else { return }
-                    await Self.createSyncedEntity(entityType: schema.className, identifier: identifier, getRealm: { await realmProvider.persistenceRealm })
+                    await Self.createSyncedEntity(entityType: schema.className, identifier: identifier, getRealm: { realmProvider.persistenceRealm })
                         //                            }
                         //                        }
                     }
@@ -407,7 +408,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //        }
 //        collectionNotificationTokens.append(token)
         
-        await updateHasChanges(realm: realmProvider.persistenceRealm)
+        updateHasChanges(realm: realmProvider.persistenceRealm)
         
         if hasChanges {
             Task { @MainActor in
@@ -474,7 +475,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     func updateTracking(objectIdentifier: String, entityName: String, inserted: Bool, modified: Bool, deleted: Bool, realmProvider: RealmProvider) async {
         let identifier = "\(entityName).\(objectIdentifier)"
         var isNewChange = false
-        let syncedEntity = await Self.getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm)
+        let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm)
         
         if deleted {
             isNewChange = true
@@ -486,7 +487,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             }
         } else if syncedEntity == nil {
-            await Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, getRealm: { await realmProvider.persistenceRealm })
+            await Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, getRealm: { realmProvider.persistenceRealm })
             
             if inserted {
                 isNewChange = true
@@ -501,7 +502,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
                 // Hack to avoid crashing issue: https://github.com/realm/realm-swift/issues/8333
                 realmProvider.persistenceRealm.refresh()
-                if let syncedEntity = await Self.getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm) {
+                if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: realmProvider.persistenceRealm) {
 //                    try? realmProvider.persistenceRealm.safeWrite {
                     try? await realmProvider.persistenceRealm.asyncWrite {
                         syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
@@ -643,7 +644,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return realm.object(ofType: SyncedEntity.self, forPrimaryKey: objectIdentifier)
     }
     
-    @BigSyncBackgroundActor
+    @MainActor
     func shouldIgnore(key: String) -> Bool {
         return CloudKitSynchronizer.metadataKeys.contains(key)
     }
@@ -653,7 +654,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         if syncedEntity.state == SyncedEntityState.newOrChanged.rawValue {
             if mergePolicy == .server {
                 for property in object.objectSchema.properties {
-                    if shouldIgnore(key: property.name) {
+                    if await shouldIgnore(key: property.name) {
                         continue
                     }
                     if property.type == PropertyType.linkingObjects {
@@ -670,7 +671,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         continue
                     }
                     
-                    if !shouldIgnore(key: property.name) {
+                    if await !shouldIgnore(key: property.name) {
                         if let asset = record[property.name] as? CKAsset {
                             recordChanges[property.name] = asset.fileURL != nil ? NSData(contentsOf: asset.fileURL!) : NSNull()
                         } else {
@@ -701,7 +702,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 if acceptRemoteChange {
                     for property in object.objectSchema.properties {
-                        if shouldIgnore(key: property.name) {
+                        if await shouldIgnore(key: property.name) {
                             continue
                         }
                         if property.type == PropertyType.linkingObjects {
@@ -714,7 +715,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         } else {
             for property in object.objectSchema.properties {
-                if shouldIgnore(key: property.name) {
+                if await shouldIgnore(key: property.name) {
                     continue
                 }
                 if property.type == PropertyType.linkingObjects {
