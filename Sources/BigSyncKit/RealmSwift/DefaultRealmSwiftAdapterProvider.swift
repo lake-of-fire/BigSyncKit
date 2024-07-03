@@ -16,7 +16,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let excludedClassNames: [String]
     let appGroup: String?
     public private(set) var adapter: RealmSwiftAdapter!
-    
+   
     public init(targetConfiguration: Realm.Configuration, excludedClassNames: [String], zoneID: CKRecordZone.ID, appGroup: String? = nil) {
         self.targetConfiguration = targetConfiguration
         self.excludedClassNames = excludedClassNames
@@ -61,7 +61,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
      */
     
     public static func realmPath(appGroup: String?) -> String {
-        return applicationBackupRealmPath(suiteName: appGroup).appending(realmFileName())
+        return applicationBackupRealmPath(suiteName: appGroup).appending("/" + realmFileName())
     }
     
     fileprivate static func applicationBackupRealmPath(suiteName: String?) -> String! {
@@ -71,17 +71,17 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         } else {
             rootDirectory = applicationDocumentsDirectory()
         }
-        return rootDirectory?.appending("Realm")
+        return rootDirectory?.appending("/BigSyncKit")
     }
     
     fileprivate static func applicationDocumentsDirectory() -> String? {
-        #if TARGET_OS_IPHONE
+#if os(iOS)
         return NSSearchPathForDirectoriesInDomains(.libraryDirectory, .userDomainMask, true).last
-        #else
+#elseif os(macOS)
         let urls = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-//        return urls.last?.appendingPathComponent("com.lake-of-fire.BigSyncKit").path
+        //        return urls.last?.appendingPathComponent("com.lake-of-fire.BigSyncKit").path
         return urls.last?.path
-        #endif
+#endif
     }
     
     fileprivate static func realmFileName() -> String {
