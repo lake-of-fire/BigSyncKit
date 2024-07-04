@@ -567,7 +567,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try? await targetRealm.asyncWrite {
                     targetRealm.add(object)
                 }
-                debugPrint("createSyncedEntity added object", record.recordID, primaryKey, object.description)
+//                debugPrint("createSyncedEntity added object", record.recordID, primaryKey, object.description)
             }.value
         }
         

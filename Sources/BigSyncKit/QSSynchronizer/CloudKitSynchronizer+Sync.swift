@@ -285,7 +285,7 @@ extension CloudKitSynchronizer {
                     } else {
                         if !result.downloadedRecords.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
-                            debugPrint("QSCloudKitSynchronizer >> Downloads: \(result.downloadedRecords.map { ($0.recordID.recordName, $0.creationDate) })")
+//                            debugPrint("QSCloudKitSynchronizer >> Downloads: \(result.downloadedRecords.map { ($0.recordID.recordName, $0.creationDate) })")
                         }
                         if !result.deletedRecordIDs.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
