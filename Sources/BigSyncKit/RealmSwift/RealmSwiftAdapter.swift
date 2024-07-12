@@ -560,7 +560,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             await applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
 //            saveShareRelationship(for: syncedEntity, record: record)
         } else {
-            try? await Task { @RealmBackgroundActor in
+            try? await Task(priority: .background) { @RealmBackgroundActor in
                 let object = objectClass.init()
                 object.setValue(objectIdentifier, forKey: primaryKey)
                 let targetRealm = realmProvider.targetWriterRealm
@@ -812,7 +812,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
             let ref = ThreadSafeReference(to: object)
             let recordValueToSet = recordValue
-            try? await Task { @RealmBackgroundActor in
+            try? await Task(priority: .background) { @RealmBackgroundActor in
                 if let object = realmProvider.targetWriterRealm.resolve(ref) {
                     try? await realmProvider.targetWriterRealm.asyncWrite {
                         object.setValue(recordValueToSet, forKey: property.name)
@@ -882,7 +882,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
             let ref = ThreadSafeReference(to: object)
             let recordValueToSet = recordValue
-            try? await Task { @RealmBackgroundActor in
+            try? await Task(priority: .background) { @RealmBackgroundActor in
                 if let object = realmProvider.targetWriterRealm.resolve(ref) {
                     try? await realmProvider.targetWriterRealm.asyncWrite {
                         object.setValue(recordValueToSet, forKey: property.name)
@@ -913,7 +913,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 let ref = ThreadSafeReference(to: object)
                 let recordValueToSet = recordValue
-                try? await Task { @RealmBackgroundActor in
+                try? await Task(priority: .background) { @RealmBackgroundActor in
                     if let object = realmProvider.targetWriterRealm.resolve(ref) {
                         try? await realmProvider.targetWriterRealm.asyncWrite {
                             object.setValue(data, forKey: key)
@@ -927,7 +927,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             // when extending an object model with a new non-optional property, when an old record is applied to the object.
             let ref = ThreadSafeReference(to: object)
             let recordValueToSet = recordValue
-            try? await Task { @RealmBackgroundActor in
+            try? await Task(priority: .background) { @RealmBackgroundActor in
                 if let object = realmProvider.targetWriterRealm.resolve(ref) {
                     try? await realmProvider.targetWriterRealm.asyncWrite {
                         object.setValue(value, forKey: key)
@@ -1008,7 +1008,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             let relationshipName = relationship.relationshipName
             let originRef = ThreadSafeReference(to: originObject)
-            let targetExisted = try? await Task { @RealmBackgroundActor in
+            let targetExisted = try? await Task(priority: .background) { @RealmBackgroundActor in
                 guard let relationshipName = relationshipName else {
                     return false
                 }
@@ -1577,7 +1577,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                     let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
                     
-                    try? await Task { @RealmBackgroundActor in
+                    try? await Task(priority: .background) { @RealmBackgroundActor in
                         let object = realmProvider.targetWriterRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
                         
                         if let object = object {
