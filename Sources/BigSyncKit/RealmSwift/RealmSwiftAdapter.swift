@@ -202,7 +202,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
 //        Task.detached(priority: .utility) { [weak self] in
 //        executeOnMainQueue {
-        Task { @BigSyncBackgroundActor [weak self] in
+        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard let self = self else { return }
 //            autoreleasepool {
                 setupTypeNamesLookup()
@@ -279,7 +279,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //                    let ref = ThreadSafeReference(to: collectionChange)
 //                    Task { @MainActor [weak self] in
 //                        guard let self = self, let collectionChange = realmProvider.targetRealm.resolve(ref) else { return }
-                    Task { @BigSyncBackgroundActor [weak self] in
+                    Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                         guard let self = self else { return }
                         switch collectionChange {
                         case .update(let results, _, let insertions, let modifications):
