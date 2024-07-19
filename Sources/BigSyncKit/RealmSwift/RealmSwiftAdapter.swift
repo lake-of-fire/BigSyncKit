@@ -283,6 +283,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         guard let self = self else { return }
                         switch collectionChange {
                         case .update(let results, _, let insertions, let modifications):
+//                            debugPrint("!! ", schema.className, ", ins", insertions, "mod", modifications, Date())
                             for index in insertions {
                                 let object = results[index]
                                 let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
@@ -310,6 +311,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                     //                                       self.updateTracking(insertedObject: object, identifier: identifier, entityName: schema.className, provider: self.realmProvider)
                                 }
                             }
+//                            debugPrint("!! DONE!!!", schema.className," ins", insertions, "mod", modifications, "DONE!!", Date())
                         default: break
                         }
                     }
