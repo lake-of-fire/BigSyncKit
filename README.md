@@ -1,5 +1,7 @@
 # BigSyncKit
 
+CURRENT STATUS: Not fully reliable yet, but getting there.
+
 Synchronize RealmSwift databases with CloudKit.
 
 This project began with a fork of [mentrena's SyncKit](https://mentrena.github.io/SyncKit) and combines pieces of [caiyue1993's IceCream](https://github.com/caiyue1993/IceCream) to improve some gaps and scalability. This project builds on that foundation with further scalability-focused improvements.
