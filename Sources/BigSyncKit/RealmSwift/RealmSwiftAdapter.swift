@@ -1477,6 +1477,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //            try! persistenceRealm.write {
         //            persistenceRealm.writeAsync {
         for record in records {
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 500_000)
+            
 //            debugPrint("save changes to record \(record.description)")
             //                            realmProvider.persistenceRealm.beginWrite()
             //                            realmProvider.targetRealm.beginWrite()
@@ -1522,9 +1525,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             // Refresh to avoid invalidated crash
             if let syncedEntity = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: realmProvider.persistenceRealm) {
+                await Task.yield()
                 try? await realmProvider.persistenceRealm.asyncWrite {
                     self.save(record: record, for: syncedEntity)
                 }
+                await Task.yield()
             }
             // Order is important here. Notifications might be delivered after targetRealm is saved and
             // it's convenient if the persistenceRealm is not in a write transaction

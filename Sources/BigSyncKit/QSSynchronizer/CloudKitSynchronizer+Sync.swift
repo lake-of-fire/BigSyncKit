@@ -185,6 +185,10 @@ extension CloudKitSynchronizer {
             var remaining = objects
             remaining.removeFirst()
             await self?.sequential(objects: remaining, closure: closure, final: final)
+            
+            // For lowering CPU priority gently
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 500_000)
         }
     }
     
@@ -239,7 +243,7 @@ extension CloudKitSynchronizer {
                     return
                 }
                 
-                await Task { @MainActor [weak self] in
+                await Task(priority: .background) { @MainActor [weak self] in
                     guard let self = self else { return }
                     zoneIDsToFetch.forEach {
                         self.delegate?.synchronizerWillFetchChanges(self, in: $0)
@@ -290,11 +294,14 @@ extension CloudKitSynchronizer {
                         if !result.deletedRecordIDs.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
                         }
-                        await Task { @MainActor [weak self] in
+                        await Task(priority: .background) { @MainActor [weak self] in
                             guard let self = self else { return }
                             activeZoneTokens[zoneID] = result.serverChangeToken
+                            await Task.yield()
                             await adapter?.saveChanges(in: result.downloadedRecords)
+                            await Task.yield()
                             await adapter?.deleteRecords(with: result.deletedRecordIDs)
+                            await Task.yield()
                         }.value
                         if result.moreComing {
                             pendingZones.append(zoneID)
@@ -467,7 +474,7 @@ extension CloudKitSynchronizer {
                                                records: records,
                                                recordIDsToDelete: nil)
         { [weak self] (savedRecords, deleted, conflicted, operationError) in
-            Task { [weak self] in
+            Task(priority: .background) { [weak self] in
                 guard let self = self else { return }
                 var conflicted = conflicted
                 //            self.dispatchQueue.async {
