@@ -90,17 +90,30 @@ public class SyncStatusViewModel: ObservableObject {
                 let userInfo = notification.userInfo
                 Task { @MainActor [weak self] in
                     guard let self = self else { return }
+                    var syncFailed = true
                     if let error = userInfo?[CloudKitSynchronizer.errorKey] as? Error {
                         if let error = error as? CKError {
-                            syncStatus = "Synchronization Failed: \(String(describing: error).prefix(150))"
+                            switch error.code {
+                            case .changeTokenExpired:
+                                syncStatus = "Reloading Synchronization"
+                                syncFailed = false
+                            case .accountTemporarilyUnavailable:
+                                syncStatus = "Account Temporarily Unavailable"
+                            case .constraintViolation:
+                                syncStatus = "Synchronization Failed: Constraint Violation"
+                            case .limitExceeded:
+                                // It restarts...
+                                syncFailed = false
+                            default:
+                                syncStatus = "Synchronization Failed: \(String(describing: error).prefix(150))"
+                            }
                         } else {
                             syncStatus = "Synchronization Failed: \(error.localizedDescription)"
                         }
                     } else {
                         syncStatus = "Synchronization Failed: Unknown Error"
                     }
-                    syncFailed = true
-                    
+                    self.syncFailed = syncFailed
                     syncIsOver()
                 }
             }
