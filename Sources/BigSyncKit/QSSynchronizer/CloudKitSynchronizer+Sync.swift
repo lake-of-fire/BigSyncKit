@@ -18,10 +18,6 @@ extension CloudKitSynchronizer {
                 self.uploadRetries = 0
                 self.didNotifyUpload = Set<CKRecordZone.ID>()
                 
-                self.modelAdapters.forEach {
-                    $0.prepareToImport()
-                }
-                
                 await fetchChanges()
     }
     
@@ -109,7 +105,6 @@ extension CloudKitSynchronizer {
                     modelAdapter = newModelAdapter
                     modelAdapterDictionary[zoneID] = newModelAdapter
                     delegate?.synchronizer(self, didAddAdapter: newModelAdapter, forRecordZoneID: zoneID)
-                    newModelAdapter.prepareToImport()
                 }
             }
             
@@ -176,19 +171,26 @@ extension CloudKitSynchronizer {
             return
         }
         
+        do {
+            try Task.checkCancellation()
+        } catch {
+            await final(error)
+            return
+        }
+        
         await closure(first) { [weak self] error in
             guard error == nil else {
                 await final(error)
                 return
             }
             
+            // For lowering CPU priority gently
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 200_000)
+            
             var remaining = objects
             remaining.removeFirst()
             await self?.sequential(objects: remaining, closure: closure, final: final)
-            
-            // For lowering CPU priority gently
-            await Task.yield()
-            try? await Task.sleep(nanoseconds: 500_000)
         }
     }
     
@@ -294,17 +296,22 @@ extension CloudKitSynchronizer {
                         if !result.deletedRecordIDs.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
                         }
-                        await Task(priority: .background) { @MainActor [weak self] in
-                            guard let self = self else { return }
-                            activeZoneTokens[zoneID] = result.serverChangeToken
-                            await Task.yield()
-                            await adapter?.saveChanges(in: result.downloadedRecords)
-                            await Task.yield()
-                            await adapter?.deleteRecords(with: result.deletedRecordIDs)
-                            await Task.yield()
-                        }.value
-                        if result.moreComing {
-                            pendingZones.append(zoneID)
+                        do {
+                            try await Task(priority: .background) { @MainActor [weak self] in
+                                guard let self = self else { return }
+                                activeZoneTokens[zoneID] = result.serverChangeToken
+                                await Task.yield()
+                                try await adapter?.saveChanges(in: result.downloadedRecords)
+                                await Task.yield()
+                                try await adapter?.deleteRecords(with: result.deletedRecordIDs)
+                                await Task.yield()
+                            }.value
+                            if result.moreComing {
+                                pendingZones.append(zoneID)
+                            }
+                        } catch {
+                            await completion(error)
+                            return
                         }
                     }
                 }
@@ -508,7 +515,12 @@ extension CloudKitSynchronizer {
                         reduceBatchSize()
                         await completion(error)
                     } else if !conflicted.isEmpty {
-                        await adapter.saveChanges(in: conflicted)
+                        do {
+                            try await adapter.saveChanges(in: conflicted)
+                        } catch {
+                            await completion(error)
+                            return
+                        }
                         await adapter.persistImportedChanges { (persistError) in
                             await completion(persistError)
                         }

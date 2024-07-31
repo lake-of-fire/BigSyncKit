@@ -37,12 +37,9 @@ public protocol ModelAdapter: AnyObject {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
     
-    /// Tells the model adapter that an import operation will begin
-    func prepareToImport()
-    
     /// Apply changes in the provided record to the local model objects and save the records.
     /// - Parameter records: Array of `CKRecord` that were obtained from CloudKit.
-    func saveChanges(in records: [CKRecord]) async
+    func saveChanges(in records: [CKRecord]) async throws
     
     /// Delete the local model objects corresponding to the given record IDs.
     /// - Parameter recordIDs: Array of identifiers of records that were deleted on CloudKit.

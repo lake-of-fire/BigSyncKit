@@ -90,6 +90,13 @@ public class BigSyncBackgroundWorker: BackgroundWorker {
     }
     
     @MainActor
+    public func cancelSynchronization() {
+        for synchronizer in realmSynchronizers {
+            synchronizer.cancelSynchronization()
+        }
+    }
+    
+    @MainActor
     public func synchronizeCloudKit(using synchronizer: CloudKitSynchronizer) async {
         guard !synchronizer.syncing else { return }
         

@@ -71,7 +71,6 @@
 //
 //        database.fetch(withRecordID: record.recordID) { (updated, error) in
 //            if let updated = updated {
-//                modelAdapter.prepareToImport()
 //                modelAdapter.saveChanges(in: [updated])
 //                modelAdapter.persistImportedChanges { (error) in
 //                    modelAdapter.didFinishImport(with: error)
@@ -126,7 +125,6 @@
 //               operationError == nil,
 //               let share = uploadedShare {
 //                
-//                modelAdapter.prepareToImport()
 //                let records = savedRecords.filter { $0 != share }
 //                modelAdapter.didUpload(savedRecords: records)
 //                modelAdapter.persistImportedChanges(completion: { (error) in
@@ -148,7 +146,6 @@
 //            } else if let error = operationError {
 //                if self.isServerRecordChangedError(error as NSError),
 //                   !conflicted.isEmpty {
-//                    modelAdapter.prepareToImport()
 //                    modelAdapter.saveChanges(in: conflicted)
 //                    modelAdapter.persistImportedChanges { (error) in
 //                        modelAdapter.didFinishImport(with: error)
@@ -204,7 +201,6 @@
 //            if let savedRecords = savedRecords,
 //               operationError == nil {
 //                
-//                modelAdapter.prepareToImport()
 //                modelAdapter.didUpload(savedRecords: savedRecords)
 //                modelAdapter.persistImportedChanges(completion: { (error) in
 //                    
