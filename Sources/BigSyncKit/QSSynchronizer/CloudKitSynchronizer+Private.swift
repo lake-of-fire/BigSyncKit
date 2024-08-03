@@ -9,7 +9,7 @@ import Foundation
 import CloudKit
 
 private let customZoneName = "BigSyncKit"
-private let storedDeviceUUIDKey = "QSCloudKitStoredDeviceUUIDKey"
+private let storedDeviceUUIDKey = "QSCloudKitStoredDeviceUUIDKeyV7"
 private let subscriptionIdentifierKey = "QSSubscriptionIdentifierKey"
 private let databaseServerChangeTokenKey = "QSDatabaseServerChangeTokenKey"
 
@@ -90,6 +90,7 @@ extension CloudKitSynchronizer {
     }
     
     func addMetadata(to records: [CKRecord]) {
+        debugPrint("!! addMetadata()", records.count, self.deviceIdentifier)
         records.forEach {
             $0[CloudKitSynchronizer.deviceUUIDKey] = self.deviceIdentifier
             if self.compatibilityVersion > 0 {

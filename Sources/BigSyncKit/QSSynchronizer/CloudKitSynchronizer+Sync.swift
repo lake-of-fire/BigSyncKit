@@ -230,11 +230,11 @@ extension CloudKitSynchronizer {
         }
     }
     
-    @BigSyncActor
+    @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async -> ()) async {
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
 //            debugPrint("!! inside fetchDatabaseChanges callback")
-            Task.detached(priority: .background) { @BigSyncActor [weak self] in
+            Task.detached(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 
@@ -252,6 +252,7 @@ extension CloudKitSynchronizer {
                         self.delegate?.synchronizerWillFetchChanges(self, in: $0)
                     }
                     
+                    debugPrint("!! zoneIDs to fetch", zoneIDsToFetch.map { $0.zoneName })
                     fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
                         guard let self = self else { return }
                         guard error == nil else {
@@ -272,11 +273,13 @@ extension CloudKitSynchronizer {
     
     @MainActor
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async -> ()) {
+        debugPrint("!! fetchZoneChanges for zones", zoneIDs.map { $0.zoneName })
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { (zoneResults) in
-            
+            debugPrint("!! fetchz one inner", zoneIDs.map { $0.zoneName }, "has more comning?", zoneResults.mapValues { $0.moreComing })
+
             //            self.dispatchQueue.async {
-            await Task.detached(priority: .background) { [weak self] in
-                guard let self = self else { return }
+            await Task.detached(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
                 var pendingZones = [CKRecordZone.ID]()
                 var error: Error? = nil
                 
@@ -294,7 +297,9 @@ extension CloudKitSynchronizer {
 //                        await debugPrint("!! zoneResults result", zoneID.zoneName, result.downloadedRecords.count, "downloaded", result.deletedRecordIDs.count, "deleted")
                         if !result.downloadedRecords.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
-                            debugPrint("QSCloudKitSynchronizer >> Downloads: \(result.downloadedRecords.map { ($0.recordID.recordName) })")
+//                            debugPrint("QSCloudKitSynchronizer >> Downloads: \(result.downloadedRecords.map { ($0.recordID.recordName) })")
+                        } else {
+                            debugPrint("!! result.downloadedRecourds empty", zoneIDs.map { $0.zoneName }, "has more comning?", result.moreComing)
                         }
                         if !result.deletedRecordIDs.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
@@ -313,9 +318,9 @@ extension CloudKitSynchronizer {
                                 await Task.yield()
                             }.value
 //                            await debugPrint("!! more coming?", result.moreComing)
-                            if result.moreComing {
-                                pendingZones.append(zoneID)
-                            }
+//                            if result.moreComing {
+//                                pendingZones.append(zoneID)
+//                            }
                         } catch {
                             await completion(error)
                             return
@@ -323,17 +328,17 @@ extension CloudKitSynchronizer {
                     }
                 }
                 
-                if pendingZones.count > 0 && error == nil {
-                    let zones = pendingZones
-                    //                    Task { @MainActor in
-                    await fetchZoneChanges(zones, completion: completion)
-                    //                    }
-                } else {
+//                if pendingZones.count > 0 && error == nil {
+//                    let zones = pendingZones
+//                    //                    Task { @MainActor in
+//                    await fetchZoneChanges(zones, completion: completion)
+//                    //                    }
+//                } else {
                     //                    Task { @MainActor in
                     await completion(error)
                     //                    }
                     //                }
-                }
+//                }
             }.value
         }
         
@@ -428,6 +433,7 @@ extension CloudKitSynchronizer {
     @MainActor
     func setupZoneAndUploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
         await setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
+            debugPrint("!! zone needed setup", adapter.recordZoneID.zoneName)
             guard let self = self, error == nil else {
                 await completion(error)
                 return
@@ -636,7 +642,7 @@ extension CloudKitSynchronizer {
             //            self.dispatchQueue.async {
             //                autoreleasepool {
             guard let self = self else { return }
-            var pendingZones = [CKRecordZone.ID]()
+//            var pendingZones = [CKRecordZone.ID]()
             var needsToRefetch = false
             
             for (zoneID, result) in zoneResults {
@@ -647,16 +653,16 @@ extension CloudKitSynchronizer {
                     activeZoneTokens[zoneID] = result.serverChangeToken
                     await adapter?.saveToken(result.serverChangeToken)
                 }
-                if result.moreComing {
-                    pendingZones.append(zoneID)
-                }
+//                if result.moreComing {
+//                    pendingZones.append(zoneID)
+//                }
             }
             
-            if pendingZones.count > 0 && !needsToRefetch {
-                await updateServerToken(for: pendingZones, completion: completion)
-            } else {
+//            if pendingZones.count > 0 && !needsToRefetch {
+//                await updateServerToken(for: pendingZones, completion: completion)
+//            } else {
                 await completion(needsToRefetch)
-            }
+//            }
         }
         runOperation(operation)
     }

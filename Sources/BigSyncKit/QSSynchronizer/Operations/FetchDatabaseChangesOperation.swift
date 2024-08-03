@@ -31,6 +31,7 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
         databaseChangesOperation.fetchAllChanges = true
 
         databaseChangesOperation.recordZoneWithIDChangedBlock = { zoneID in
+            debugPrint("!! changedZoneIDs append", zoneID)
             self.changedZoneIDs.append(zoneID)
         }
 
