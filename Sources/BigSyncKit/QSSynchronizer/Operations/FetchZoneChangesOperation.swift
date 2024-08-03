@@ -78,7 +78,6 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
             let ignoreDeviceIdentifier: String = self.ignoreDeviceIdentifier ?? " "
             let isShare = record is CKShare
             if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String || isShare {
-                
                 if !isShare,
                    let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
                    self.modelVersion > 0 && version > self.modelVersion {

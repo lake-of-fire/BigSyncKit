@@ -184,19 +184,6 @@ actor RealmProvider {
     }
 }
 
-//struct ObjectUpdate {
-//    enum UpdateType {
-//        case insertion
-//        case modification
-//        case deletion
-//    }
-//    
-//    let object: Object
-//    let identifier: String
-//    let entityType: String
-//    let updateType: UpdateType
-//}
-
 struct ResultsChangeSet {
     var insertions: [String: Set<String>] = [:] // schemaName -> Set of insertions
     var modifications: [String: Set<String>] = [:] // schemaName -> Set of modifications
@@ -440,7 +427,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let identifier = "\(entityName).\(objectIdentifier)"
         var isNewChange = false
         
-        debugPrint("!! updateTracking", identifier, "ins", inserted, "mod", modified)
+//        debugPrint("!! updateTracking", identifier, "ins", inserted, "mod", modified)
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
         
@@ -455,7 +442,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         } else if syncedEntity == nil {
             await Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, realm: persistenceRealm)
-            debugPrint("!! createSyncedEntity for inserted", objectIdentifier)
+//            debugPrint("!! createSyncedEntity for inserted", objectIdentifier)
             if inserted {
                 isNewChange = true
             }
@@ -1438,7 +1425,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             await Task.yield()
             try Task.checkCancellation()
             
-            try? await Task.sleep(nanoseconds: 500_000)
+            try? await Task.sleep(nanoseconds: 50_000)
             
             guard let persistenceRealm = realmProvider.persistenceRealm else { return }
             var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm)

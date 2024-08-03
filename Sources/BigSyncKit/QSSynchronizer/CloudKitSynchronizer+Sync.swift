@@ -213,7 +213,7 @@ extension CloudKitSynchronizer {
         
         debugPrint("!! fetch DB changes")
         await fetchDatabaseChanges() { [weak self] token, error in
-        debugPrint("!! fetch DB changes: FINISHED", token, error)
+            debugPrint("!! fetch DB changes: FINISHED", token, error)
             guard let self = self else { return }
             guard error == nil else {
                 await finishSynchronization(error: error)
@@ -280,7 +280,6 @@ extension CloudKitSynchronizer {
                 var pendingZones = [CKRecordZone.ID]()
                 var error: Error? = nil
                 
-                await debugPrint("!! zoneResults", identifier, zoneResults.count, zoneResults)
                 for (zoneID, result) in zoneResults {
                     let adapter = await modelAdapterDictionary[zoneID]
                     if let resultError = result.error {
@@ -292,10 +291,10 @@ extension CloudKitSynchronizer {
                             break
                         }
                     } else {
-                        await debugPrint("!! zoneResults result", identifier, result.downloadedRecords.count, "downloaded", result.deletedRecordIDs.count, "deleted")
+//                        await debugPrint("!! zoneResults result", zoneID.zoneName, result.downloadedRecords.count, "downloaded", result.deletedRecordIDs.count, "deleted")
                         if !result.downloadedRecords.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
-//                            debugPrint("QSCloudKitSynchronizer >> Downloads: \(result.downloadedRecords.map { ($0.recordID.recordName, $0.creationDate) })")
+                            debugPrint("QSCloudKitSynchronizer >> Downloads: \(result.downloadedRecords.map { ($0.recordID.recordName) })")
                         }
                         if !result.deletedRecordIDs.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
@@ -308,12 +307,12 @@ extension CloudKitSynchronizer {
                                 try await adapter?.saveChanges(in: result.downloadedRecords)
                                 await Task.yield()
                                 
-                                await debugPrint("!! delete records", result.deletedRecordIDs.count, identifier)
+//                                await debugPrint("!! delete records", result.deletedRecordIDs.count, identifier)
                                 try await adapter?.deleteRecords(with: result.deletedRecordIDs)
-                                await debugPrint("!! finished deleting records", result.deletedRecordIDs.count, identifier)
+//                                await debugPrint("!! finished deleting records", result.deletedRecordIDs.count, identifier)
                                 await Task.yield()
                             }.value
-                            await debugPrint("!! more coming?", result.moreComing)
+//                            await debugPrint("!! more coming?", result.moreComing)
                             if result.moreComing {
                                 pendingZones.append(zoneID)
                             }
