@@ -3,7 +3,6 @@ import CloudKit
 import Realm
 import RealmSwift
 import Combine
-//import RealmSwiftGaps
 
 public struct BigSyncBackgroundWorkerConfiguration {
     let synchronizerName: String
@@ -63,6 +62,7 @@ public class BigSyncBackgroundWorker: BackgroundWorker {
                     NotificationCenter.default.publisher(for: .ModelAdapterHasChangesNotification)
                         .sink { [weak self] _ in
                             Task { @MainActor [weak self] in
+                                debugPrint("!! ModelAdapterHasChangesNotification triggering sync")
                                 await self?.synchronizeCloudKit()
                             }
                         }

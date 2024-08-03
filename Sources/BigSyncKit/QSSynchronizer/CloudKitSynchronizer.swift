@@ -208,7 +208,7 @@ public class CloudKitSynchronizer: NSObject {
             return
         }
         
-//        debugPrint("CloudKitSynchronizer >> Initiating synchronization")
+        debugPrint("CloudKitSynchronizer >> Initiating synchronization", identifier, containerIdentifier)
         cancelSync = false
         syncing = true
         self.completion = completion

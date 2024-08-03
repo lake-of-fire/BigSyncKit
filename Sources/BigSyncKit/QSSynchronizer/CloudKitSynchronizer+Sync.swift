@@ -186,7 +186,7 @@ extension CloudKitSynchronizer {
             
             // For lowering CPU priority gently
             await Task.yield()
-            try? await Task.sleep(nanoseconds: 200_000)
+            try? await Task.sleep(nanoseconds: 20_000)
             
             var remaining = objects
             remaining.removeFirst()
@@ -211,9 +211,9 @@ extension CloudKitSynchronizer {
         
         postNotification(.SynchronizerWillFetchChanges)
         
-//        print("!! fetch DB changes")
+        debugPrint("!! fetch DB changes")
         await fetchDatabaseChanges() { [weak self] token, error in
-//        print("!! fetch DB changes: FINISHED")
+        debugPrint("!! fetch DB changes: FINISHED", token, error)
             guard let self = self else { return }
             guard error == nil else {
                 await finishSynchronization(error: error)
@@ -233,6 +233,7 @@ extension CloudKitSynchronizer {
     @BigSyncActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async -> ()) async {
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
+//            debugPrint("!! inside fetchDatabaseChanges callback")
             Task.detached(priority: .background) { @BigSyncActor [weak self] in
                 guard let self = self else { return }
                 await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
@@ -279,9 +280,11 @@ extension CloudKitSynchronizer {
                 var pendingZones = [CKRecordZone.ID]()
                 var error: Error? = nil
                 
+                await debugPrint("!! zoneResults", identifier, zoneResults.count, zoneResults)
                 for (zoneID, result) in zoneResults {
                     let adapter = await modelAdapterDictionary[zoneID]
                     if let resultError = result.error {
+                        await debugPrint("!! zoneResults resultError", identifier, resultError)
                         if await isZoneNotFoundOrDeletedError(error) {
                             await notifyProviderForDeletedZoneIDs([zoneID])
                         } else {
@@ -289,6 +292,7 @@ extension CloudKitSynchronizer {
                             break
                         }
                     } else {
+                        await debugPrint("!! zoneResults result", identifier, result.downloadedRecords.count, "downloaded", result.deletedRecordIDs.count, "deleted")
                         if !result.downloadedRecords.isEmpty {
                             debugPrint("QSCloudKitSynchronizer >> Downloaded \(result.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
 //                            debugPrint("QSCloudKitSynchronizer >> Downloads: \(result.downloadedRecords.map { ($0.recordID.recordName, $0.creationDate) })")
@@ -303,9 +307,13 @@ extension CloudKitSynchronizer {
                                 await Task.yield()
                                 try await adapter?.saveChanges(in: result.downloadedRecords)
                                 await Task.yield()
+                                
+                                await debugPrint("!! delete records", result.deletedRecordIDs.count, identifier)
                                 try await adapter?.deleteRecords(with: result.deletedRecordIDs)
+                                await debugPrint("!! finished deleting records", result.deletedRecordIDs.count, identifier)
                                 await Task.yield()
                             }.value
+                            await debugPrint("!! more coming?", result.moreComing)
                             if result.moreComing {
                                 pendingZones.append(zoneID)
                             }
@@ -346,7 +354,7 @@ extension CloudKitSynchronizer {
                 adapterSet.append(adapter)
             }
         }
-
+        
         await sequential(objects: adapterSet, closure: mergeChangesIntoAdapter, final: completion)
     }
     
