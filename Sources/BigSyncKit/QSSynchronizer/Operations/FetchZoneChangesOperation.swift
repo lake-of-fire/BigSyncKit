@@ -84,10 +84,9 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         operation.recordChangedBlock = { record in
             debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName} )
             let ignoreDeviceIdentifier: String = self.ignoreDeviceIdentifier ?? " "
-            let isShare = record is CKShare
-            if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String || isShare {
-                if !isShare,
-                   let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
+            // TODO: Also check that the one being checked already exists as a SyncedEntity, otherwise dwonload again...
+            if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String {
+                if let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
                    self.modelVersion > 0 && version > self.modelVersion {
                     debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName }, "higher model version found!")
        

@@ -7,6 +7,7 @@
 
 import Foundation
 import CloudKit
+import RealmSwift
 
 /// The merge policy to resolve change conflicts. Default value is `server`
 @objc public enum MergePolicy: Int {
@@ -36,6 +37,8 @@ public extension Notification.Name {
 public protocol ModelAdapter: AnyObject {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
+    
+    func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool
     
     /// Apply changes in the provided record to the local model objects and save the records.
     /// - Parameter records: Array of `CKRecord` that were obtained from CloudKit.

@@ -17,6 +17,7 @@ let package = Package(
         .package(url: "https://github.com/realm/realm-swift.git", from: "10.52.1"),
         .package(url: "https://github.com/lake-of-fire/RealmSwiftGaps.git", branch: "main"),
         .package(url: "https://github.com/lake-of-fire/Device.git", branch: "main"),
+        .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
     ],
     targets: [
         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
@@ -30,6 +31,7 @@ let package = Package(
                 .product(name: "RealmSwift", package: "realm-swift"),
                 .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
                 .product(name: "Device Library", package: "Device"),
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
             ]),
         .testTarget(
             name: "BigSyncKitTests",
