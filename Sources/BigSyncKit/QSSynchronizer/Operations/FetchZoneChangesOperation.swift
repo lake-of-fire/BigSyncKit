@@ -22,6 +22,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     var zoneChangeTokens: [CKRecordZone.ID: CKServerChangeToken]
     let modelVersion: Int
     let ignoreDeviceIdentifier: String?
+    let onResult: ((CKRecord?, CKRecord.ID?) async -> ())?
     let completion: ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async -> ()
     let desiredKeys: [String]?
     
@@ -30,13 +31,16 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
 //    let dispatchQueue = DispatchQueue(label: "fetchZoneChangesDispatchQueue")
     weak var internalOperation: CKFetchRecordZoneChangesOperation?
     
-    init(database: CloudKitDatabaseAdapter,
-                      zoneIDs: [CKRecordZone.ID],
-                      zoneChangeTokens: [CKRecordZone.ID: CKServerChangeToken],
-                      modelVersion: Int,
-                      ignoreDeviceIdentifier: String?,
-                      desiredKeys: [String]?,
-                      completion: @escaping ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async -> ()) {
+    init(
+        database: CloudKitDatabaseAdapter,
+        zoneIDs: [CKRecordZone.ID],
+        zoneChangeTokens: [CKRecordZone.ID: CKServerChangeToken],
+        modelVersion: Int,
+        ignoreDeviceIdentifier: String?,
+        desiredKeys: [String]?,
+        onResult: ((CKRecord?, CKRecord.ID?) async -> ())? = nil,
+        completion: @escaping ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async -> ()
+    ) {
         
         self.database = database
         self.zoneIDs = zoneIDs
@@ -44,6 +48,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         self.modelVersion = modelVersion
         self.ignoreDeviceIdentifier = ignoreDeviceIdentifier
         self.desiredKeys = desiredKeys
+        self.onResult = onResult
         self.completion = completion
         
         super.init()
@@ -91,6 +96,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
                     debugPrint("!! adding fetched downloaded record", record.recordID.recordName)
                     Task { @MainActor [weak self] in
                         self?.zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
+                        await onResult?(record, nil)
                     }
                 }
             } else {
@@ -105,6 +111,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 zoneResults[recordID.zoneID]?.deletedRecordIDs.append(recordID)
+                await onResult?(nil, recordID)
             }
         }
         
