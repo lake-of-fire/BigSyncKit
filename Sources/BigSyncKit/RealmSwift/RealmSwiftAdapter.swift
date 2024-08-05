@@ -530,36 +530,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @BigSyncBackgroundActor
     func createSyncedEntity(record: CKRecord, realmProvider: RealmProvider) async -> SyncedEntity? {
         let syncedEntity = SyncedEntity(entityType: record.recordType, identifier: record.recordID.recordName, state: SyncedEntityState.synced.rawValue)
-        
         guard let persistenceRealm = realmProvider.persistenceRealm else { return nil }
         try? await persistenceRealm.asyncWrite {
             persistenceRealm.add(syncedEntity, update: .modified)
         }
-        
-        /*
-        guard let objectClass = self.realmObjectClass(name: record.recordType) else {
-            return nil
-        }
-        let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
-        let objectIdentifier = getObjectIdentifier(for: syncedEntity)
-        
-        // If the row already exists somehow (for some reasons outside of syncing), merge changes instead of crashing.
-        if let object = realmProvider.targetReaderRealm?.object(ofType: objectClass, forPrimaryKey: objectIdentifier) {
-            // TODO: Implement aforementioned merging here?
-            //            saveShareRelationship(for: syncedEntity, record: record)
-        } else {
-            try? await Task(priority: .background) { @RealmBackgroundActor in
-                let object = objectClass.init()
-                object.setValue(objectIdentifier, forKey: primaryKey)
-                guard let targetRealm = realmProvider.targetWriterRealm else { return }
-                try? await targetRealm.asyncWrite {
-                    targetRealm.add(object)
-                }
-                //                debugPrint("createSyncedEntity added object", record.recordID, primaryKey, object.description)
-            }.value
-        }
-         */
-        
         return syncedEntity
     }
     
@@ -1400,35 +1374,43 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var recordsToSave: [(record: CKRecord, objectClass: RealmSwift.Object.Type, objectIdentifier: Any, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
         
-        for record in records {
-            try Task.checkCancellation()
-            
-            guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-            var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm)
-            if syncedEntity == nil {
-                syncedEntity = await createSyncedEntity(record: record, realmProvider: realmProvider)
-            }
-            
-            if let syncedEntity = syncedEntity {
-                if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
-                    guard let objectClass = self.realmObjectClass(name: record.recordType) else {
-                        continue
-                    }
-                    let objectIdentifier = getObjectIdentifier(for: syncedEntity)
-                    guard let object = realmProvider.targetReaderRealm?.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
-                        continue
-                    }
-                    
-                    if hasChanges(record: record, object: object) {
-                        recordsToSave.append((record, objectClass, objectIdentifier, syncedEntity.identifier, syncedEntity.entityState, syncedEntity.entityType))
-                    } else {
-                        debugPrint("!! no Changes found with object", record.recordID.recordName)
-                    }
+        for chunk in records.chunked(into: 1000) {
+            for record in chunk {
+                try Task.checkCancellation()
+                
+                guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm)
+                if syncedEntity == nil {
+                    syncedEntity = await createSyncedEntity(record: record, realmProvider: realmProvider)
                 }
-            } else {
-                // Can happen when iCloud has records for a model that no longer exists locally.
-                continue
+                
+                if let syncedEntity = syncedEntity {
+                    if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
+                        guard let objectClass = self.realmObjectClass(name: record.recordType) else {
+                            continue
+                        }
+                        let objectIdentifier = getObjectIdentifier(for: syncedEntity)
+                        
+                        let recordToSave = (record, objectClass, objectIdentifier, syncedEntity.identifier, syncedEntity.entityState, syncedEntity.entityType)
+                        
+                        guard let object = realmProvider.targetReaderRealm?.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
+                            recordsToSave.append(recordToSave)
+                            continue
+                        }
+                        
+                        if hasChanges(record: record, object: object) {
+                            recordsToSave.append(recordToSave)
+//                        } else {
+//                            debugPrint("!! no Changes found with object", record.recordID.recordName)
+                        }
+                    }
+                } else {
+                    // Can happen when iCloud has records for a model that no longer exists locally.
+                    continue
+                }
             }
+            
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
         
         if !recordsToSave.isEmpty {
@@ -1447,20 +1429,28 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try await Task { @RealmBackgroundActor in
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
                     debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
-                    try await realmProvider.targetWriterRealm?.asyncWrite { [weak self] in
+                    guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
+                    try await targetWriterRealm.asyncWrite { [weak self] in
                         guard let self = self else { return }
                         for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk {
-                            guard let object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier) else {
-                                continue
+                            var object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier)
+                            if object == nil {
+                                object = objectType.init()
+                                if let object {
+                                    object.setValue(objectIdentifier, forKey: (objectType.primaryKey() ?? objectType.sharedSchema()?.primaryKeyProperty?.name)!)
+                                    targetWriterRealm.add(object, update: .modified)
+                                }
                             }
-                            self.applyChanges(in: record, to: object, syncedEntityID: syncedEntityID, syncedEntityState: syncedEntityState, entityType: entityType, realmProvider: realmProvider)
+                            if let object {
+                                self.applyChanges(in: record, to: object, syncedEntityID: syncedEntityID, syncedEntityState: syncedEntityState, entityType: entityType, realmProvider: realmProvider)
+                            }
                         }
                     }
                 }.value
                 
                 await persistPendingRelationships()
                 
-                try? await Task.sleep(nanoseconds: 10_000_000)
+                try? await Task.sleep(nanoseconds: 20_000_000)
             }
         }
     }

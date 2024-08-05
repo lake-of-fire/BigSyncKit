@@ -51,7 +51,7 @@ fileprivate class ChangeRequestProcessor {
     
     @BigSyncBackgroundActor
     private func processChangeRequests() async {
-        debugPrint("!! PROC req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName.split(separator: ".").last! })
+//        debugPrint("!! PROC req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
  
         lastExecutionTime = DispatchTime.now().uptimeNanoseconds
         let batch = changeRequests
@@ -61,7 +61,6 @@ fileprivate class ChangeRequestProcessor {
         do {
             let downloadedRecords = batch.compactMap { $0.downloadedRecord }
             if !downloadedRecords.isEmpty {
-//                debugPrint("!! downloaded recs count", downloadedRecords.count)
                 try await batch.first?.adapter.saveChanges(in: downloadedRecords)
             }
             
@@ -83,7 +82,6 @@ fileprivate class ChangeRequestProcessor {
         await processChangeRequests()
     }
 }
-
 
 fileprivate func isZoneNotFoundOrDeletedError(_ error: Error?) -> Bool {
     if let error = error {
