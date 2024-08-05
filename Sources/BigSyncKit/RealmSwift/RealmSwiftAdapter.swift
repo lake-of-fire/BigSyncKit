@@ -720,14 +720,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return false
     }
     
-   
-    @BigSyncBackgroundActor
+    @RealmBackgroundActor
     func applyChanges(in record: CKRecord, to object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String, realmProvider: RealmProvider) {
         let objectProperties = object.objectSchema.properties
-        let objectType = type(of: object)
-        guard let objectID = getObjectIdentifier(stringObjectId: syncedEntityID, entityType: entityType) else {
-            return
-        }
         
         if syncedEntityState == .newOrChanged {
             if mergePolicy == .server {
@@ -1478,7 +1473,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let realmProvider = realmProvider else { return }
         guard records.count != 0 else { return }
         
-        var recordsToSave: [(record: CKRecord, object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
+        var recordsToSave: [(record: CKRecord, objectClass: RealmSwift.Object.Type, objectIdentifier: Any, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
         
         for record in records {
             try Task.checkCancellation()
@@ -1494,15 +1489,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     guard let objectClass = self.realmObjectClass(name: record.recordType) else {
                         continue
                     }
-                    guard let objectIdentifier = getObjectIdentifier(stringObjectId: syncedEntity.identifier, entityType: syncedEntity.entityType) else {
-                        continue
-                    }
+                    let objectIdentifier = getObjectIdentifier(for: syncedEntity)
                     guard let object = realmProvider.targetReaderRealm?.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
                         continue
                     }
                     
                     if hasChanges(record: record, object: object) {
-                        recordsToSave.append((record, object, syncedEntity.identifier, syncedEntity.entityState, syncedEntity.entityType))
+                        recordsToSave.append((record, objectClass, objectIdentifier, syncedEntity.identifier, syncedEntity.entityState, syncedEntity.entityType))
                     } else {
                         debugPrint("!! no Changes found with object", record.recordID.recordName)
                     }
@@ -1519,7 +1512,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             try await realmProvider.persistenceRealm?.asyncWrite { [weak self] in
                 guard let self = self else { return }
                 
-                for (record, _, syncedEntityID, syncedEntityState, _) in recordsToSave {
+                for (record, _, objectIdentifier, syncedEntityID, syncedEntityState, _) in recordsToSave {
                     guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                     if let syncedEntity = Self.getSyncedEntity(objectIdentifier: syncedEntityID, realm: persistenceRealm) {
                         self.save(record: record, for: syncedEntity)
@@ -1527,13 +1520,19 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             }
             
-            try await realmProvider.targetWriterRealm?.asyncWrite { [weak self] in
-                guard let self = self else { return }
-                
-                for (record, object, syncedEntityID, syncedEntityState, entityType) in recordsToSave {
-                    self.applyChanges(in: record, to: object, syncedEntityID: syncedEntityID, syncedEntityState: syncedEntityState, entityType: entityType, realmProvider: realmProvider)
+            try await Task { @RealmBackgroundActor in
+                guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
+                try await realmProvider.targetWriterRealm?.asyncWrite { [weak self] in
+                    guard let self = self else { return }
+                    
+                    for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in recordsToSave {
+                        guard let object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier) else {
+                            continue
+                        }
+                        self.applyChanges(in: record, to: object, syncedEntityID: syncedEntityID, syncedEntityState: syncedEntityState, entityType: entityType, realmProvider: realmProvider)
+                    }
                 }
-            }
+            }.value
         }
     }
     
