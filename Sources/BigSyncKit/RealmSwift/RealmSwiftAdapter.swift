@@ -315,7 +315,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
             guard let results = realmProvider.targetReaderRealm?.objects(objectClass) else { return }
             
-            debugPrint("!! schema setup()", schema.className)
             // Register for collection notifications
             results.changesetPublisher
                 .freeze()
@@ -329,18 +328,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                             self.resultsChangeSet.insertions[schema.className, default: []].insert(identifier)
                         }
-                        if !insertions.isEmpty {
-                            debugPrint("!! INS RECS", insertions.compactMap { results[$0].description.prefix(50) })
-                        }
+//                        if !insertions.isEmpty {
+//                            debugPrint("!! INS RECS", insertions.compactMap { results[$0].description.prefix(50) })
+//                        }
 
                         for index in modifications {
                             let object = results[index]
                             let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                             self.resultsChangeSet.modifications[schema.className, default: []].insert(identifier)
                         }
-                        if !modifications.isEmpty {
-                            debugPrint("!! MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })
-                        }
+//                        if !modifications.isEmpty {
+//                            debugPrint("!! MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })
+//                        }
 
                         self.resultsChangeSetPublisher.send(())
                     default: break
@@ -357,7 +356,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
                 }
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-                debugPrint("!! Initial setup: createSyncedEntity()", schema.className, "identifiers count", identifiers.count)
                 await Self.createSyncedEntities(entityType: schema.className, identifiers: identifiers, realm: persistenceRealm)
             }
         }
@@ -1080,7 +1078,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     func recordsToUpload(withState state: SyncedEntityState, limit: Int, syncRealmProvider: SyncRealmProvider) -> [CKRecord] {
         let results = syncRealmProvider.syncPersistenceRealm.objects(SyncedEntity.self).where { $0.state == state.rawValue }
-        debugPrint("!! recordsToUpload limit", limit, "first synced entity", results.first?.entityType, results.first?.identifier)
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
         for syncedEntity in results {
@@ -1428,7 +1425,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 try await Task { @RealmBackgroundActor in
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
-                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
+//                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
                     try await targetWriterRealm.asyncWrite { [weak self] in
                         guard let self = self else { return }

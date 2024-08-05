@@ -66,7 +66,6 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     
     @BigSyncBackgroundActor
     func performFetchOperation(with zones: [CKRecordZone.ID]) {
-        debugPrint("!! perform Fetch Op", zones.map { $0.zoneName} )
         var higherModelVersionFound = false
         var zoneOptions = [CKRecordZone.ID: CKFetchRecordZoneChangesOperation.ZoneOptions]()
         
@@ -132,9 +131,6 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         }
         
         operation.fetchRecordZoneChangesCompletionBlock = { operationError in
-            debugPrint("!! perform Fetch, fetch record zone changes comnpletion", zones.map { $0.zoneName} )
-//            self.dispatchQueue.async {
-//                autoreleasepool {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 if let error = operationError,

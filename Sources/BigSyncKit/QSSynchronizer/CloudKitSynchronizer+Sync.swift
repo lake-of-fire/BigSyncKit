@@ -280,9 +280,7 @@ extension CloudKitSynchronizer {
         
         postNotification(.SynchronizerWillFetchChanges)
         
-        debugPrint("!! fetch DB changes")
         await fetchDatabaseChanges() { [weak self] token, error in
-            debugPrint("!! fetch DB changes: FINISHED", token, error)
             guard let self = self else { return }
             guard error == nil else {
                 await finishSynchronization(error: error)
@@ -321,7 +319,6 @@ extension CloudKitSynchronizer {
                         self.delegate?.synchronizerWillFetchChanges(self, in: $0)
                     }
                     
-                    debugPrint("!! zoneIDs to fetch", zoneIDsToFetch.map { $0.zoneName })
                     fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
                         guard let self = self else { return }
                         guard error == nil else {
@@ -341,8 +338,6 @@ extension CloudKitSynchronizer {
     
     @MainActor
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async -> ()) {
-        debugPrint("!! fetchZoneChanges for zones", zoneIDs.map { $0.zoneName })
-        
         let changeRequestProcessor = ChangeRequestProcessor()
         var localErrors: [Error] = []
         
@@ -375,9 +370,6 @@ extension CloudKitSynchronizer {
                     }
                     return nil
                 }).first
-                if let error {
-                    debugPrint("!! zoneResults resultError", identifier, error)
-                }
                 for (zoneID, zoneResult) in zoneResults {
                     if !zoneResult.downloadedRecords.isEmpty {
                         debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
@@ -489,7 +481,6 @@ extension CloudKitSynchronizer {
     @MainActor
     func setupZoneAndUploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
         await setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
-            debugPrint("!! zone needed setup", adapter.recordZoneID.zoneName)
             guard let self = self, error == nil else {
                 await completion(error)
                 return
