@@ -26,15 +26,14 @@ fileprivate class ChangeRequestProcessor {
         changeRequests.append(request)
         let currentTime = DispatchTime.now().uptimeNanoseconds
         
-        if currentTime - lastExecutionTime >= debounceInterval {
-            debounceTask?.cancel()
+        if lastExecutionTime == 0 || currentTime >= lastExecutionTime + debounceInterval {            debounceTask?.cancel()
             Task {
                 await processChangeRequests()
             }
         } else {
             debounceTask?.cancel()
             debounceTask = Task {
-                let timeSinceLastExecution = currentTime - lastExecutionTime
+                let timeSinceLastExecution = currentTime >= lastExecutionTime ? currentTime - lastExecutionTime : 0
                 let remainingTime = debounceInterval > timeSinceLastExecution ? debounceInterval - timeSinceLastExecution : 0
                 try? await Task.sleep(nanoseconds: remainingTime)
                 await processChangeRequests()
