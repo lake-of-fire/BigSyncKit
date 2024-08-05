@@ -191,7 +191,7 @@ public class CloudKitSynchronizer: NSObject {
         return _deviceIdentifier
     }
     
-    func clearDeviceIdentifier() {
+    internal func clearDeviceIdentifier() {
         deviceUUID = nil
     }
     

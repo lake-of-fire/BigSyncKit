@@ -33,6 +33,9 @@ extension CloudKitSynchronizer {
             adapterProvider: provider,
             keyValueStore: userDefaultsAdapter
         )
+        provider.beforeInitialSetup = {
+            synchronizer.clearDeviceIdentifier()
+        }
         synchronizer.addModelAdapter(provider.adapter)
         await transferOldServerChangeToken(to: provider.adapter, userDefaults: userDefaultsAdapter, containerName: containerName)
         

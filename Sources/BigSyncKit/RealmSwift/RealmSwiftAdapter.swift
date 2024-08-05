@@ -195,6 +195,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public weak var recordProcessingDelegate: RealmSwiftAdapterRecordProcessing?
     public var forceDataTypeInsteadOfAsset: Bool = false
     
+    public var beforeInitialSetup: (() -> Void)?
+    
     private lazy var tempFileManager: TempFileManager = {
         TempFileManager(identifier: "\(recordZoneID.ownerName).\(recordZoneID.zoneName).\(targetRealmConfiguration.fileURL?.lastPathComponent ?? UUID().uuidString).\(targetRealmConfiguration.schemaVersion)")
     }()
@@ -324,6 +326,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 .store(in: &cancellables)
             
             if needsInitialSetup {
+                beforeInitialSetup?()
+                
                 guard let results = realmProvider.targetReaderRealm?.objects(objectClass) else { return }
                 
                 let identifiers = Array(results).map {
@@ -971,7 +975,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             // If value is nil and property is non-optional, it is ignored. This is something that could happen
             // when extending an object model with a new non-optional property, when an old record is applied to the object.
             //            let ref = ThreadSafeReference(to: object)
-            debugPrint("!! applyChange", type(of: object), key, value.debugDescription.prefix(100))
+//            debugPrint("!! applyChange", type(of: object), key, value.debugDescription.prefix(100))
             object.setValue(value, forKey: key)
         }
     }
@@ -1498,12 +1502,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard records.count != 0 else {
             return
         }
-        debugPrint("!! save changes to record types", Set(records.map { $0.recordID.recordName.split(separator: ".").first! }), records.count)
         for record in records {
-//            await Task.yield()
             try Task.checkCancellation()
-            
-//            try? await Task.sleep(nanoseconds: 50_000)
             
             guard let persistenceRealm = realmProvider.persistenceRealm else { return }
             var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm)
@@ -1522,6 +1522,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                     
                     if hasChanges(record: record, object: object) {
+                        debugPrint("!! save changes to record types", Set(records.map { $0.recordID.recordName.split(separator: ".").first! }), records.count)
                         await self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
                     } else { debugPrint("!! no Changes found with object", record.recordID.recordName)
                     }
@@ -1534,12 +1535,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             // Refresh to avoid invalidated crash
             guard let persistenceRealm = realmProvider.persistenceRealm else { return }
             if let syncedEntity = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm) {
-//                await Task.yield()
                 try? await realmProvider.persistenceRealm?.asyncWrite {
                     self.save(record: record, for: syncedEntity)
                 }
                 try Task.checkCancellation()
-//                await Task.yield()
             }
         }
 //        debugPrint("!! save changes to record types DONE", Set(records.map { $0.recordID.recordName.split(separator: ".").first! }))

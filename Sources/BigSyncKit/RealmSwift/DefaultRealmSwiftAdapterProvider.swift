@@ -17,6 +17,12 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let appGroup: String?
     public private(set) var adapter: RealmSwiftAdapter!
    
+    public var beforeInitialSetup: (() -> Void)? {
+        didSet {
+            adapter.beforeInitialSetup = beforeInitialSetup
+        }
+    }
+    
     public init(targetConfiguration: Realm.Configuration, excludedClassNames: [String], zoneID: CKRecordZone.ID, appGroup: String? = nil) {
         self.targetConfiguration = targetConfiguration
         self.excludedClassNames = excludedClassNames

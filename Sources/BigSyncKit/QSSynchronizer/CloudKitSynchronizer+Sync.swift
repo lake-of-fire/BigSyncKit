@@ -15,6 +15,66 @@ fileprivate struct ChangeRequest {
     let adapter: ModelAdapter
 }
 
+fileprivate class ChangeRequestProcessor {
+    private var changeRequests = [ChangeRequest]()
+    private let debounceInterval: UInt64 = 2_000_000_000 // 2 seconds in nanoseconds
+    private var lastExecutionTime: UInt64 = 0
+    private var debounceTask: Task<Void, Never>?
+    private var localErrors: [Error] = []
+    
+    fileprivate func addChangeRequest(_ request: ChangeRequest) {
+        changeRequests.append(request)
+        let currentTime = DispatchTime.now().uptimeNanoseconds
+        
+        if currentTime - lastExecutionTime >= debounceInterval {
+            debounceTask?.cancel()
+            Task {
+                await processChangeRequests()
+            }
+        } else {
+            debounceTask?.cancel()
+            debounceTask = Task {
+                let timeSinceLastExecution = currentTime - lastExecutionTime
+                let remainingTime = debounceInterval > timeSinceLastExecution ? debounceInterval - timeSinceLastExecution : 0
+                try? await Task.sleep(nanoseconds: remainingTime)
+                await processChangeRequests()
+            }
+        }
+    }
+    
+    private func processChangeRequests() async {
+        lastExecutionTime = DispatchTime.now().uptimeNanoseconds
+        let batch = changeRequests
+        guard !batch.isEmpty else { return }
+        
+        do {
+            let downloadedRecords = batch.compactMap { $0.downloadedRecord }
+            if !downloadedRecords.isEmpty {
+                try await batch.first?.adapter.saveChanges(in: downloadedRecords)
+            }
+            
+            let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
+            if !deletedRecordIDs.isEmpty {
+                try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
+            }
+        } catch {
+            localErrors.append(error)
+        }
+        
+        changeRequests.removeAll()
+    }
+    
+    func getErrors() -> [Error] {
+        return localErrors
+    }
+    
+    func finishProcessing() async {
+        debounceTask?.cancel()
+        await processChangeRequests()
+    }
+}
+
+
 fileprivate func isZoneNotFoundOrDeletedError(_ error: Error?) -> Bool {
     if let error = error {
         let nserror = error as NSError
@@ -274,29 +334,9 @@ extension CloudKitSynchronizer {
     @MainActor
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async -> ()) {
         debugPrint("!! fetchZoneChanges for zones", zoneIDs.map { $0.zoneName })
-        let changeRequests = AsyncChannel<ChangeRequest>()
-        var localErrors: [Error] = []
         
-        let processingTask = Task { @BigSyncBackgroundActor in
-            var count = 0
-            for await request in changeRequests {
-                count += 1
-                do {
-                    if let downloadedRecord = request.downloadedRecord {
-                        if count % 50 == 0 {
-                            debugPrint("!! ...  sleep between fetch zone writes ...")
-                            try await Task.sleep(nanoseconds: 8_000_000)
-                        }
-                        try await request.adapter.saveChanges(in: [downloadedRecord])
-                    }
-                    if let deletedRecordID = request.deletedRecordID {
-                        try await request.adapter.deleteRecords(with: [deletedRecordID])
-                    }
-                } catch {
-                    localErrors.append(error)
-                }
-            }
-        }
+        let changeRequestProcessor = ChangeRequestProcessor()
+        var localErrors: [Error] = []
         
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { [weak self] (downloadedRecord, deletedRecordID) in
             guard let self else { return }
@@ -304,12 +344,11 @@ extension CloudKitSynchronizer {
                 debugPrint("Unexpectedly found no downloaded record or deleted record ID")
                 return
             }
-            debugPrint("!! fetchz one inner", zoneID.zoneName, downloadedRecord?.recordID.recordName ?? deletedRecordID?.recordName ?? "untitled")
+            
             let adapter = await modelAdapterDictionary[zoneID]
             if let adapter {
-                Task {
-                    await changeRequests.send(ChangeRequest(downloadedRecord: downloadedRecord, deletedRecordID: deletedRecordID, adapter: adapter))
-                }
+                let changeRequest = ChangeRequest(downloadedRecord: downloadedRecord, deletedRecordID: deletedRecordID, adapter: adapter)
+                changeRequestProcessor.addChangeRequest(changeRequest)
             }
         } completion: { [weak self] zoneResults in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -349,14 +388,16 @@ extension CloudKitSynchronizer {
                     }
                 }
                 
-                Task {
-                    await processingTask.value
-                    
-                    if let firstError = localErrors.first {
-                        await completion(firstError)
-                    } else {
-                        await completion(error)
-                    }
+                // Process any remaining change requests
+                await changeRequestProcessor.finishProcessing()
+                
+                // Collect any errors from the processor
+                localErrors.append(contentsOf: changeRequestProcessor.getErrors())
+                
+                if let firstError = localErrors.first {
+                    await completion(firstError)
+                } else {
+                    await completion(error)
                 }
             }
         }
@@ -403,7 +444,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @MainActor
     func uploadChanges() async {
-        guard cancelSync == false else {
+        guard !cancelSync else {
             await finishSynchronization(error: SyncError.cancelled)
             return
         }

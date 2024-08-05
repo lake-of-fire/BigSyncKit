@@ -82,24 +82,24 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         operation.fetchAllChanges = true
 
         operation.recordChangedBlock = { record in
-            debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName} )
+//            debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName} )
             let ignoreDeviceIdentifier: String = self.ignoreDeviceIdentifier ?? " "
             // TODO: Also check that the one being checked already exists as a SyncedEntity, otherwise dwonload again...
             if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String {
                 if let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
                    self.modelVersion > 0 && version > self.modelVersion {
-                    debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName }, "higher model version found!")
+//                    debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName }, "higher model version found!")
        
                     higherModelVersionFound = true
                 } else {
-                    debugPrint("!! adding fetched downloaded record", record.recordID.recordName)
+//                    debugPrint("!! adding fetched downloaded record", record.recordID.recordName)
                     Task { @MainActor [weak self] in
                         self?.zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
                         await onResult?(record, nil)
                     }
                 }
-            } else {
-                debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName }, "IGNORE!!!!:", ignoreDeviceIdentifier, "user one:", record[CloudKitSynchronizer.deviceUUIDKey], record[CloudKitSynchronizer.deviceUUIDKey] as? String)
+//            } else {
+//                debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName }, "IGNORE!!!!:", ignoreDeviceIdentifier, "user one:", record[CloudKitSynchronizer.deviceUUIDKey], record[CloudKitSynchronizer.deviceUUIDKey] as? String)
 
             }
         }
