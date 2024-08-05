@@ -16,12 +16,14 @@ fileprivate struct ChangeRequest {
 }
 
 fileprivate class ChangeRequestProcessor {
+    @BigSyncBackgroundActor
     private var changeRequests = [ChangeRequest]()
     private let debounceInterval: UInt64 = 2_000_000_000 // 2 seconds in nanoseconds
     private var lastExecutionTime: UInt64 = 0
     private var debounceTask: Task<Void, Never>?
     private var localErrors: [Error] = []
     
+    @BigSyncBackgroundActor
     fileprivate func addChangeRequest(_ request: ChangeRequest) {
         changeRequests.append(request)
         let currentTime = DispatchTime.now().uptimeNanoseconds
@@ -32,7 +34,7 @@ fileprivate class ChangeRequestProcessor {
             }
         } else {
             debounceTask?.cancel()
-            debounceTask = Task {
+            debounceTask = Task { @BigSyncBackgroundActor in
                 let timeSinceLastExecution = currentTime >= lastExecutionTime ? currentTime - lastExecutionTime : 0
                 let remainingTime = debounceInterval > timeSinceLastExecution ? debounceInterval - timeSinceLastExecution : 0
                 try? await Task.sleep(nanoseconds: remainingTime)
@@ -41,11 +43,13 @@ fileprivate class ChangeRequestProcessor {
         }
     }
     
+    @BigSyncBackgroundActor
     private func processChangeRequests() async {
         lastExecutionTime = DispatchTime.now().uptimeNanoseconds
         let batch = changeRequests
         guard !batch.isEmpty else { return }
-        
+        changeRequests.removeAll()
+
         do {
             let downloadedRecords = batch.compactMap { $0.downloadedRecord }
             if !downloadedRecords.isEmpty {
@@ -59,8 +63,6 @@ fileprivate class ChangeRequestProcessor {
         } catch {
             localErrors.append(error)
         }
-        
-        changeRequests.removeAll()
     }
     
     func getErrors() -> [Error] {
@@ -347,7 +349,7 @@ extension CloudKitSynchronizer {
             let adapter = await modelAdapterDictionary[zoneID]
             if let adapter {
                 let changeRequest = ChangeRequest(downloadedRecord: downloadedRecord, deletedRecordID: deletedRecordID, adapter: adapter)
-                changeRequestProcessor.addChangeRequest(changeRequest)
+                await changeRequestProcessor.addChangeRequest(changeRequest)
             }
         } completion: { [weak self] zoneResults in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
