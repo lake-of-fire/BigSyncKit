@@ -720,39 +720,33 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return false
     }
     
+   
     @BigSyncBackgroundActor
-    func applyChanges(in record: CKRecord, to object: Object, syncedEntity: SyncedEntity, realmProvider: RealmProvider) async {
+    func applyChanges(in record: CKRecord, to object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String, realmProvider: RealmProvider) {
         let objectProperties = object.objectSchema.properties
         let objectType = type(of: object)
-        let objectID = getObjectIdentifier(for: syncedEntity)
- 
-        if syncedEntity.state == SyncedEntityState.newOrChanged.rawValue {
+        guard let objectID = getObjectIdentifier(stringObjectId: syncedEntityID, entityType: entityType) else {
+            return
+        }
+        
+        if syncedEntityState == .newOrChanged {
             if mergePolicy == .server {
-                let syncedEntityIdentifier = syncedEntity.identifier
-                await Task(priority: .background) { @RealmBackgroundActor in
-                    guard let targetWriterRealm = realmProvider.targetWriterRealm else { return }
-                    try? await targetWriterRealm.asyncWrite {
-                        for property in objectProperties {
-                            if shouldIgnore(key: property.name) {
-                                continue
-                            }
-                            if property.type == PropertyType.linkingObjects {
-                                continue
-                            }
-                            guard let object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectID) else { return }
-                            applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityIdentifier, realmProvider: realmProvider)
-                        }
-                    }
-                }.value
-            } else if mergePolicy == .custom {
-                var recordChanges = [String: Any]()
-                
-                for property in object.objectSchema.properties {
-                    if property.type == PropertyType.linkingObjects {
+                for property in objectProperties {
+                    if shouldIgnore(key: property.name) {
                         continue
                     }
-                    
-                    if await !shouldIgnore(key: property.name) {
+                    if property.type == .linkingObjects {
+                        continue
+                    }
+                    applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID, realmProvider: realmProvider)
+                }
+            } else if mergePolicy == .custom {
+                var recordChanges = [String: Any]()
+                for property in objectProperties {
+                    if property.type == .linkingObjects {
+                        continue
+                    }
+                    if !shouldIgnore(key: property.name) {
                         if let asset = record[property.name] as? CKAsset {
                             recordChanges[property.name] = asset.fileURL != nil ? NSData(contentsOf: asset.fileURL!) : NSNull()
                         } else {
@@ -765,15 +759,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 if let delegate = delegate {
                     acceptRemoteChange = delegate.realmSwiftAdapter(self, gotChanges: recordChanges, object: object)
                 } else {
-                    // Default conflict resolution.
-                    // Forkable into delegate.
                     acceptRemoteChange = { adapter, changes, object in
 #if os(macOS)
                         guard adapter.hasRealmObjectClass(name: object.className) else { return false }
 #else
                         guard adapter.hasRealmObjectClass(name: String(describing: type(of: object))) else { return false }
 #endif
-                        
                         if let remoteChangeAt = changes["modifiedAt"] as? Date, let localChangeAt = object.value(forKey: "modifiedAt") as? Date, remoteChangeAt <= localChangeAt {
                             return false
                         }
@@ -782,41 +773,27 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
                 
                 if acceptRemoteChange {
-                    let syncedEntityIdentifier = syncedEntity.identifier
-                    await Task { @RealmBackgroundActor in
-                        guard let targetWriterRealm = realmProvider.targetWriterRealm else { return }
-                        try? await targetWriterRealm.asyncWrite {
-                            for property in objectProperties {
-                                if shouldIgnore(key: property.name) {
-                                    continue
-                                }
-                                if property.type == PropertyType.linkingObjects {
-                                    continue
-                                }
-                                guard let object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectID) else { return }
-                                applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityIdentifier, realmProvider: realmProvider)
-                            }
-                        }
-                    }.value
-                }
-            }
-        } else {
-            let syncedEntityIdentifier = syncedEntity.identifier
-            await Task(priority: .background) { @RealmBackgroundActor in
-                guard let targetWriterRealm = realmProvider.targetWriterRealm else { return }
-                try? await targetWriterRealm.asyncWrite {
                     for property in objectProperties {
                         if shouldIgnore(key: property.name) {
                             continue
                         }
-                        if property.type == PropertyType.linkingObjects {
+                        if property.type == .linkingObjects {
                             continue
                         }
-                        guard let object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectID) else { return }
-                        applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityIdentifier, realmProvider: realmProvider)
+                        applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID, realmProvider: realmProvider)
                     }
                 }
-            }.value
+            }
+        } else {
+            for property in objectProperties {
+                if shouldIgnore(key: property.name) {
+                    continue
+                }
+                if property.type == .linkingObjects {
+                    continue
+                }
+                applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID, realmProvider: realmProvider)
+            }
         }
     }
     
@@ -1499,9 +1476,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @BigSyncBackgroundActor
     public func saveChanges(in records: [CKRecord]) async throws {
         guard let realmProvider = realmProvider else { return }
-        guard records.count != 0 else {
-            return
-        }
+        guard records.count != 0 else { return }
+        
+        var recordsToSave: [(record: CKRecord, object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
+        
         for record in records {
             try Task.checkCancellation()
             
@@ -1516,32 +1494,47 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     guard let objectClass = self.realmObjectClass(name: record.recordType) else {
                         continue
                     }
-                    let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
+                    guard let objectIdentifier = getObjectIdentifier(stringObjectId: syncedEntity.identifier, entityType: syncedEntity.entityType) else {
+                        continue
+                    }
                     guard let object = realmProvider.targetReaderRealm?.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
                         continue
                     }
                     
                     if hasChanges(record: record, object: object) {
-                        debugPrint("!! save changes to record types", Set(records.map { $0.recordID.recordName.split(separator: ".").first! }), records.count)
-                        await self.applyChanges(in: record, to: object, syncedEntity: syncedEntity, realmProvider: realmProvider)
-                    } else { debugPrint("!! no Changes found with object", record.recordID.recordName)
+                        recordsToSave.append((record, object, syncedEntity.identifier, syncedEntity.entityState, syncedEntity.entityType))
+                    } else {
+                        debugPrint("!! no Changes found with object", record.recordID.recordName)
                     }
                 }
             } else {
                 // Can happen when iCloud has records for a model that no longer exists locally.
                 continue
             }
+        }
+        
+        if !recordsToSave.isEmpty {
+            debugPrint("!! save changes to record types", Set(recordsToSave.map { $0.record.recordID.recordName.split(separator: ".").first! }), recordsToSave.count)
             
-            // Refresh to avoid invalidated crash
-            guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-            if let syncedEntity = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm) {
-                try? await realmProvider.persistenceRealm?.asyncWrite {
-                    self.save(record: record, for: syncedEntity)
+            try await realmProvider.persistenceRealm?.asyncWrite { [weak self] in
+                guard let self = self else { return }
+                
+                for (record, _, syncedEntityID, syncedEntityState, _) in recordsToSave {
+                    guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                    if let syncedEntity = Self.getSyncedEntity(objectIdentifier: syncedEntityID, realm: persistenceRealm) {
+                        self.save(record: record, for: syncedEntity)
+                    }
                 }
-                try Task.checkCancellation()
+            }
+            
+            try await realmProvider.targetWriterRealm?.asyncWrite { [weak self] in
+                guard let self = self else { return }
+                
+                for (record, object, syncedEntityID, syncedEntityState, entityType) in recordsToSave {
+                    self.applyChanges(in: record, to: object, syncedEntityID: syncedEntityID, syncedEntityState: syncedEntityState, entityType: entityType, realmProvider: realmProvider)
+                }
             }
         }
-//        debugPrint("!! save changes to record types DONE", Set(records.map { $0.recordID.recordName.split(separator: ".").first! }))
     }
     
     @BigSyncBackgroundActor
