@@ -18,17 +18,20 @@ fileprivate struct ChangeRequest {
 fileprivate class ChangeRequestProcessor {
     @BigSyncBackgroundActor
     private var changeRequests = [ChangeRequest]()
-    private let debounceInterval: UInt64 = 2_000_000_000 // 2 seconds in nanoseconds
+    private let debounceInterval: UInt64 = 3_000_000_000 // 2 seconds in nanoseconds
     private var lastExecutionTime: UInt64 = 0
     private var debounceTask: Task<Void, Never>?
     private var localErrors: [Error] = []
     
     @BigSyncBackgroundActor
     fileprivate func addChangeRequest(_ request: ChangeRequest) {
+//        debugPrint("!! addChangeReq", request.downloadedRecord?.recordID.recordName)
         changeRequests.append(request)
+//        debugPrint("!! enq req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }))
         let currentTime = DispatchTime.now().uptimeNanoseconds
         
-        if lastExecutionTime == 0 || currentTime >= lastExecutionTime + debounceInterval {            debounceTask?.cancel()
+        if lastExecutionTime == 0 || currentTime >= lastExecutionTime + debounceInterval {
+            debounceTask?.cancel()
             Task {
                 await processChangeRequests()
             }
@@ -38,21 +41,27 @@ fileprivate class ChangeRequestProcessor {
                 let timeSinceLastExecution = currentTime >= lastExecutionTime ? currentTime - lastExecutionTime : 0
                 let remainingTime = debounceInterval > timeSinceLastExecution ? debounceInterval - timeSinceLastExecution : 0
                 try? await Task.sleep(nanoseconds: remainingTime)
-                await processChangeRequests()
+                do {
+                    try Task.checkCancellation()
+                    await processChangeRequests()
+                } catch { }
             }
         }
     }
     
     @BigSyncBackgroundActor
     private func processChangeRequests() async {
+        debugPrint("!! PROC req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName.split(separator: ".").last! })
+ 
         lastExecutionTime = DispatchTime.now().uptimeNanoseconds
         let batch = changeRequests
         guard !batch.isEmpty else { return }
         changeRequests.removeAll()
-
+        
         do {
             let downloadedRecords = batch.compactMap { $0.downloadedRecord }
             if !downloadedRecords.isEmpty {
+//                debugPrint("!! downloaded recs count", downloadedRecords.count)
                 try await batch.first?.adapter.saveChanges(in: downloadedRecords)
             }
             

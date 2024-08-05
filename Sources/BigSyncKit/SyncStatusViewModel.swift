@@ -44,6 +44,8 @@ public class SyncStatusViewModel: ObservableObject {
     @Published public var syncFailed = false
     @Published public var currentDeviceID: UUID?
     @Published public var lastSeenDevices: [LastSeenDevice]?
+    
+    public var bigSyncBackgroundWorker: BigSyncBackgroundWorker?
 
     private var cancellables = Set<AnyCancellable>()
     

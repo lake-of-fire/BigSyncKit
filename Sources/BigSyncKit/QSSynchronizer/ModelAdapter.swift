@@ -38,6 +38,8 @@ public protocol ModelAdapter: AnyObject {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
     
+    func resetSyncCaches()
+    
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool
     
     /// Apply changes in the provided record to the local model objects and save the records.

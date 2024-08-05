@@ -195,6 +195,17 @@ public class CloudKitSynchronizer: NSObject {
         deviceUUID = nil
     }
     
+    public func resetSyncCaches() {
+        clearDeviceIdentifier()
+        resetDatabaseToken()
+        resetActiveTokens()
+        
+        for adapter in
+                modelAdapters {
+            adapter.resetSyncCaches()
+        }
+    }
+    
     // MARK: - Public
     
     ///  These keys will be added to CKRecords uploaded to CloudKit and are used by SyncKit internally.
