@@ -90,7 +90,6 @@ extension CloudKitSynchronizer {
     }
     
     func addMetadata(to records: [CKRecord]) {
-        debugPrint("!! addMetadata()", records.count, self.deviceIdentifier)
         records.forEach {
             $0[CloudKitSynchronizer.deviceUUIDKey] = self.deviceIdentifier
             if self.compatibilityVersion > 0 {
