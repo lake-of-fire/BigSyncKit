@@ -339,8 +339,6 @@ extension CloudKitSynchronizer {
     @MainActor
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async -> ()) {
         let changeRequestProcessor = ChangeRequestProcessor()
-        var localErrors: [Error] = []
-        
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { [weak self] (downloadedRecord, deletedRecordID) in
             guard let self else { return }
             guard let zoneID = downloadedRecord?.recordID.zoneID ?? deletedRecordID?.zoneID else {
@@ -392,9 +390,7 @@ extension CloudKitSynchronizer {
                 await changeRequestProcessor.finishProcessing()
                 
                 // Collect any errors from the processor
-                localErrors.append(contentsOf: changeRequestProcessor.getErrors())
-                
-                if let firstError = localErrors.first {
+                if let firstError = changeRequestProcessor.getErrors().first {
                     await completion(firstError)
                 } else {
                     await completion(error)
