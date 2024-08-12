@@ -66,7 +66,19 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     
     @BigSyncBackgroundActor
     func performFetchOperation(with zones: [CKRecordZone.ID]) {
-        var higherModelVersionFound = false
+        actor ModelVersionChecker {
+            var higherModelVersionFound = false
+            
+            func setHigherModelVersionFound() {
+                higherModelVersionFound = true
+            }
+            
+            func isHigherModelVersionFound() -> Bool {
+                return higherModelVersionFound
+            }
+        }
+        
+        let versionChecker = ModelVersionChecker()
         var zoneOptions = [CKRecordZone.ID: CKFetchRecordZoneChangesOperation.ZoneOptions]()
         
         for zoneID in zones {
@@ -77,35 +89,27 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         }
         
         let operation = CKFetchRecordZoneChangesOperation(recordZoneIDs: zones, optionsByRecordZoneID: zoneOptions)
-//        operation.fetchAllChanges = false
         operation.fetchAllChanges = true
-
+        
         operation.recordChangedBlock = { record in
-//            debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName} )
             let ignoreDeviceIdentifier: String = self.ignoreDeviceIdentifier ?? " "
-            // TODO: Also check that the one being checked already exists as a SyncedEntity, otherwise dwonload again...
+            
             if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String {
                 if let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
                    self.modelVersion > 0 && version > self.modelVersion {
-//                    debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName }, "higher model version found!")
-       
-                    higherModelVersionFound = true
+                    Task {
+                        await versionChecker.setHigherModelVersionFound()
+                    }
                 } else {
-//                    debugPrint("!! adding fetched downloaded record", record.recordID.recordName)
                     Task { @MainActor [weak self] in
                         self?.zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
                         await onResult?(record, nil)
                     }
                 }
-//            } else {
-//                debugPrint("!! perform Fetch, record changed block", zones.map { $0.zoneName }, "IGNORE!!!!:", ignoreDeviceIdentifier, "user one:", record[CloudKitSynchronizer.deviceUUIDKey], record[CloudKitSynchronizer.deviceUUIDKey] as? String)
-
             }
         }
         
         operation.recordWithIDWasDeletedBlock = { recordID, recordType in
-//            self.dispatchQueue.async {
-//                autoreleasepool {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 zoneResults[recordID.zoneID]?.deletedRecordIDs.append(recordID)
@@ -122,7 +126,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
                 results.error = recordZoneError
                 results.serverChangeToken = serverChangeToken
                 
-                if !higherModelVersionFound {
+                if !(await versionChecker.isHigherModelVersionFound()) {
                     if moreComing {
                         results.moreComing = true
                     }
@@ -136,7 +140,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
                 if let error = operationError,
                    (error as NSError).code != CKError.partialFailure.rawValue { // Partial errors are returned per zone
                     self.finish(error: error)
-                } else if higherModelVersionFound {
+                } else if await versionChecker.isHigherModelVersionFound() {
                     self.finish(error: CloudKitSynchronizer.SyncError.higherModelVersionFound)
                 } else if self.isCancelled {
                     self.finish(error: CloudKitSynchronizer.SyncError.cancelled)
