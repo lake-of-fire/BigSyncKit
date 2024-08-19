@@ -40,8 +40,6 @@ public class BigSyncBackgroundWorker: BackgroundWorker {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 
-//                return ;
-                
                 for config in configurations {
                     let synchronizer = await CloudKitSynchronizer.privateSynchronizer(
                         synchronizerName: config.synchronizerName,
