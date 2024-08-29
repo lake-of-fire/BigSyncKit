@@ -109,6 +109,8 @@ public class SyncStatusViewModel: ObservableObject {
                             default:
                                 syncStatus = "Synchronization Failed: \(String(describing: error).prefix(150))"
                             }
+                        } else if let cancellationError = error as? CancellationError {
+                            syncFailed = false
                         } else {
                             syncStatus = "Synchronization Failed: \(error.localizedDescription)"
                         }

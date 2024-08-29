@@ -1423,7 +1423,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
                 
-                try await Task { @RealmBackgroundActor in
+                async let task = { @RealmBackgroundActor in
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
 //                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
@@ -1443,7 +1443,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             }
                         }
                     }
-                }.value
+                }()
+                try await task
                 
                 await persistPendingRelationships()
                 
@@ -1469,7 +1470,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                     let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
                     
-                    try? await Task(priority: .background) { @RealmBackgroundActor in
+                    try? await { @RealmBackgroundActor in
                         guard let targetWriterRealm = realmProvider.targetWriterRealm else { return }
                         let object = targetWriterRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
                         
@@ -1479,7 +1480,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                 targetRealm.delete(object)
                             }
                         }
-                    }.value
+                    }()
                 }
                 
                 if let record = syncedEntity.record {

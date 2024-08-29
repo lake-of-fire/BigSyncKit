@@ -376,10 +376,10 @@ extension CloudKitSynchronizer {
                         debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
                     }
                     do {
-                        try await Task(priority: .background) { @MainActor [weak self] in
+                        try await { @MainActor [weak self] in
                             guard let self = self else { return }
                             activeZoneTokens[zoneID] = zoneResult.serverChangeToken
-                        }
+                        }()
                     } catch {
                         await completion(error)
                         return
