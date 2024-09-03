@@ -1286,6 +1286,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     /// Deletes soft-deleted objects.
+    #warning("TODO: cleanUp is not yet used; it should also check for 'needsSyncToServer' and avoid deleting anything that hasn't propagated to backend yet")
     @objc func cleanUp() {
         Task { @RealmBackgroundActor in
 //        DispatchQueue(label: "BigSyncKit").sync {
