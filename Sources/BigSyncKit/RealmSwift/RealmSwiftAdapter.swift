@@ -482,7 +482,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
                 // Hack to avoid crashing issue: https://github.com/realm/realm-swift/issues/8333
                 if let persistenceRealm = realmProvider.persistenceRealm {
-                    persistenceRealm.refresh()
+//                    persistenceRealm.refresh()
                     if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) {
                         //                    try? realmProvider.persistenceRealm.safeWrite {
                         syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
@@ -505,7 +505,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @discardableResult
     static func createSyncedEntities(entityType: String, identifiers: [String], realm: Realm) async {
         for chunk in identifiers.chunked(into: 5000) {
-            realm.refresh()
+//            realm.refresh()
             try? await realm.asyncWrite {
                 for identifier in chunk {
                     let syncedEntity = SyncedEntity(entityType: entityType, identifier: entityType + "." + identifier, state: SyncedEntityState.newOrChanged.rawValue)
@@ -1010,7 +1010,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             let relationshipName = relationship.relationshipName
             let originRef = ThreadSafeReference(to: originObject)
-            let targetExisted = try? await Task(priority: .background) { @RealmBackgroundActor in
+            let targetExisted = try? await { @RealmBackgroundActor in
                 guard let relationshipName = relationshipName else {
                     return false
                 }
@@ -1024,7 +1024,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
                 return true
-            }.value
+            }()
             if !(targetExisted ?? false) {
                 continue
             }
@@ -1424,7 +1424,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
                 
-                async let task = { @RealmBackgroundActor in
+                try await { @RealmBackgroundActor in
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
 //                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
@@ -1445,7 +1445,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         }
                     }
                 }()
-                try await task
                 
                 await persistPendingRelationships()
                 
