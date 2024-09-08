@@ -8,7 +8,7 @@ import Foundation
 
 // Based on https://academy.realm.io/posts/realm-notifications-on-background-threads-with-swift/
 // Tweaked a little by Yue Cai
-open class BackgroundWorker: NSObject {
+public class BigSyncBackgroundWorkerBase: NSObject {
     private var thread: Thread?
     private var block: (() -> Void)?
     

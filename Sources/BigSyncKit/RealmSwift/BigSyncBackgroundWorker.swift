@@ -22,7 +22,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
     }
 }
 
-public class BigSyncBackgroundWorker: BackgroundWorker {
+public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
     public var realmSynchronizers: [CloudKitSynchronizer] = []
     
     private weak var synchronizerDelegate: RealmSwiftAdapterDelegate?
