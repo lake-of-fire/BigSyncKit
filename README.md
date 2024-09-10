@@ -1,6 +1,6 @@
 # BigSyncKit
 
-CURRENT STATUS: Not fully reliable yet, but getting there.
+CURRENT STATUS: Working reliably in production, but docs and code need cleanup. Test suite hasn't been updated.
 
 Synchronize RealmSwift databases with CloudKit.
 
