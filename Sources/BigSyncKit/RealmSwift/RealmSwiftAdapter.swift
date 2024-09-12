@@ -17,7 +17,7 @@ import RealmSwift
 import Realm
 import Combine
 import RealmSwiftGaps
-
+import Algorithms
 
 //extension Realm {
 //    public func safeWrite(_ block: (() throws -> Void)) throws {
@@ -311,6 +311,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let objectClass = self.realmObjectClass(name: schema.className) else {
                 continue
             }
+            if !(objectClass is (any SoftDeletable)) {
+                fatalError("\(objectClass.className()) must conform to SoftDeletable in order to sync")
+            }
             
             let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
             guard let results = realmProvider.targetReaderRealm?.objects(objectClass) else { return }
@@ -370,6 +373,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         startObservingTermination()
+        cleanUp()
     }
     
     @BigSyncBackgroundActor
@@ -434,6 +438,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         for objectSchema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(objectSchema.className) {
             guard let objectClass = self.realmObjectClass(name: objectSchema.className) else {
                 continue
+            }
+            if !(objectClass is (any SoftDeletable)) {
+                fatalError("\(objectClass.className()) must conform to SoftDeletable in order to sync")
             }
             if let parentClass = objectClass.self as? ParentKey.Type {
                 let parentKey = parentClass.parentKey()
@@ -1286,41 +1293,36 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     /// Deletes soft-deleted objects.
-    #warning("TODO: cleanUp is not yet used; it should also check for 'needsSyncToServer' and avoid deleting anything that hasn't propagated to backend yet")
     @objc func cleanUp() {
         Task { @RealmBackgroundActor in
-//        DispatchQueue(label: "BigSyncKit").sync {
-//            autoreleasepool {
-                //        DispatchQueue(label: "RealmSwiftAadapter.cleanUp").async { [weak self] in
-                //            autoreleasepool {
-                //        guard let self = self else { return }
             guard let targetWriterRealm = realmProvider?.targetWriterRealm else { return }
                 for schema in targetWriterRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
                     guard let objectClass = self.realmObjectClass(name: schema.className) else {
                         continue
                     }
-                    guard objectClass.self is any SyncableObject.Type else {
-                        continue
+                    let predicate: NSPredicate
+                    if objectClass.self is any SyncableBase.Type {
+                        predicate = NSPredicate(format: "isDeleted == %@ && needsSyncToServer == %@", NSNumber(booleanLiteral: true), NSNumber(booleanLiteral: false))
+                    } else {
+                        predicate = NSPredicate(format: "isDeleted == %@", NSNumber(booleanLiteral: true))
                     }
-                    
-                    guard let results = realmProvider?.targetWriterRealm?.objects(objectClass).filter({ ($0 as? (any SyncableObject))?.isDeleted ?? false }) else { return }
+                    guard var results = realmProvider?.targetWriterRealm?.objects(objectClass).filter(predicate) else { continue }
                     if results.isEmpty {
                         continue
                     }
-//                    realmProvider.targetRealm.beginWrite()
-//                                realmProvider.targetRealm.writeAsync {
                     guard let targetRealm = realmProvider?.targetWriterRealm else { return }
-                    try? await targetRealm.asyncWrite {
-                        results.forEach({ targetRealm.delete($0) })
+                    for chunk in Array(results).chunks(ofCount: 500) {
+                        try? await targetRealm.asyncWrite {
+                            for item in chunk {
+                                debugPrint("!! delete", item)
+                                targetRealm.delete(item)
+                            }
+                        }
                     }
-                        //                    commitTargetWriteTransactionWithoutNotifying()
-                        //                    try? realmProvider.targetRealm.commitWrite() // No need to use withoutNotifying
-                    //            }
+                    await Task.yield()
+                    try? await Task.sleep(nanoseconds: 10_000_000)
                 }
-//            }
         }
-        //            }
-        //        }
     }
     
     // MARK: - Children records
