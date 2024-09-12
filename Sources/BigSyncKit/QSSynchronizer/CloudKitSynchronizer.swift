@@ -152,7 +152,7 @@ public class CloudKitSynchronizer: NSObject {
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     
     /// Default number of records to send in an upload operation.
-    public static var defaultBatchSize = 200
+    public static var defaultBatchSize = 1500
     static let deviceUUIDKey = "QSCloudKitDeviceUUIDKey"
     static let modelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
     
