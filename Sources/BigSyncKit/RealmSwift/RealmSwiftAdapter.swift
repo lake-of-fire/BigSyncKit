@@ -311,7 +311,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let objectClass = self.realmObjectClass(name: schema.className) else {
                 continue
             }
-            if !(objectClass is (any SoftDeletable)) {
+            guard objectClass.conforms(to: SoftDeletable.self) else {
                 fatalError("\(objectClass.className()) must conform to SoftDeletable in order to sync")
             }
             
@@ -439,7 +439,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let objectClass = self.realmObjectClass(name: objectSchema.className) else {
                 continue
             }
-            if !(objectClass is (any SoftDeletable)) {
+            guard objectClass.conforms(to: SoftDeletable.self) else {
                 fatalError("\(objectClass.className()) must conform to SoftDeletable in order to sync")
             }
             if let parentClass = objectClass.self as? ParentKey.Type {
@@ -1300,21 +1300,24 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     guard let objectClass = self.realmObjectClass(name: schema.className) else {
                         continue
                     }
-                    let predicate: NSPredicate
-                    if objectClass.self is any SyncableBase.Type {
-                        predicate = NSPredicate(format: "isDeleted == %@ && needsSyncToServer == %@", NSNumber(booleanLiteral: true), NSNumber(booleanLiteral: false))
-                    } else {
-                        predicate = NSPredicate(format: "isDeleted == %@", NSNumber(booleanLiteral: true))
-                    }
-                    guard var results = realmProvider?.targetWriterRealm?.objects(objectClass).filter(predicate) else { continue }
+                    let predicate = NSPredicate(format: "isDeleted == %@", NSNumber(booleanLiteral: true))
+                    guard let lazyResults = realmProvider?.targetWriterRealm?.objects(objectClass).filter(predicate) else { continue }
+                    var results = Array(lazyResults)
                     if results.isEmpty {
                         continue
+                    }
+                    if objectClass.self is any SyncableBase.Type {
+                        results = results.filter { result in
+                            guard let result = result as? (any SyncableBase) else {
+                                fatalError("SyncableBase object class unexpectedly had non-SyncableBase element")
+                            }
+                            return !result.needsSyncToServer
+                        }
                     }
                     guard let targetRealm = realmProvider?.targetWriterRealm else { return }
                     for chunk in Array(results).chunks(ofCount: 500) {
                         try? await targetRealm.asyncWrite {
                             for item in chunk {
-                                debugPrint("!! delete", item)
                                 targetRealm.delete(item)
                             }
                         }

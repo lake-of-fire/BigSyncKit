@@ -8,11 +8,11 @@
 import Foundation
 import RealmSwift
 
-public protocol SoftDeletable: RealmSwift.Object, Identifiable {
+@objc public protocol SoftDeletable {
     var isDeleted: Bool { get }
 }
 
-public protocol SyncableBase: SoftDeletable, Codable {
+public protocol SyncableBase: RealmSwift.Object, Identifiable, SoftDeletable, Codable {
     var modifiedAt: Date { get }
     var needsSyncToServer: Bool { get }
 }
