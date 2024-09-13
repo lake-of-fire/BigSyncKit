@@ -1314,7 +1314,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
                 var identifiersToDelete = [String]()
-                results = try await Array(results.async.filter { object in
+                results = try await Array(results.async.filter { @RealmBackgroundActor object in
                     // TODO: Consolidate with syncedEntity(for ...)
                     guard let objectClass = self.realmObjectClass(name: object.objectSchema.className) else {
                         debugPrint("Unexpectedly could not get realm object class for", object.objectSchema.className)
