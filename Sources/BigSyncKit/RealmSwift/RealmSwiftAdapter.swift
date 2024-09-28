@@ -532,13 +532,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    func createSyncedEntity(record: CKRecord, realmProvider: RealmProvider) async -> SyncedEntity? {
-        let syncedEntity = SyncedEntity(entityType: record.recordType, identifier: record.recordID.recordName, state: SyncedEntityState.synced.rawValue)
-        guard let persistenceRealm = realmProvider.persistenceRealm else { return nil }
+    func writeSyncedEntities(syncedEntities: [SyncedEntity], realmProvider: RealmProvider) async throws {
+        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         try? await persistenceRealm.asyncWrite {
-            persistenceRealm.add(syncedEntity, update: .modified)
+            for entity in syncedEntities {
+                persistenceRealm.add(entity, update: .modified)
+            }
         }
-        return syncedEntity
     }
     
     func getObjectIdentifier(for syncedEntity: SyncedEntity) -> Any {
@@ -1403,17 +1403,19 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard records.count != 0 else { return }
         
         var recordsToSave: [(record: CKRecord, objectClass: RealmSwift.Object.Type, objectIdentifier: Any, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
+        var syncedEntitiesToCreate: [SyncedEntity] = []
         
-        for chunk in records.chunked(into: 1000) {
+        for chunk in records.chunked(into: 2000) {
             for record in chunk {
                 try Task.checkCancellation()
                 
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                 var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm)
                 if syncedEntity == nil {
-                    syncedEntity = await createSyncedEntity(record: record, realmProvider: realmProvider)
+                    let newSyncedEntity = SyncedEntity(entityType: record.recordType, identifier: record.recordID.recordName, state: SyncedEntityState.synced.rawValue)
+                    syncedEntitiesToCreate.append(newSyncedEntity)
+                    syncedEntity = newSyncedEntity
                 }
-                
                 if let syncedEntity = syncedEntity {
                     if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
                         guard let objectClass = self.realmObjectClass(name: record.recordType) else {
@@ -1438,6 +1440,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     // Can happen when iCloud has records for a model that no longer exists locally.
                     continue
                 }
+            }
+            
+            // Batch write all syncedEntities after processing each chunk
+            if !syncedEntitiesToCreate.isEmpty {
+                try? await writeSyncedEntities(syncedEntities: syncedEntitiesToCreate, realmProvider: realmProvider)
+                syncedEntitiesToCreate.removeAll()
             }
             
             try? await Task.sleep(nanoseconds: 20_000_000)
