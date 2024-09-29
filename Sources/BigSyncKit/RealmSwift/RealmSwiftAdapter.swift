@@ -1008,7 +1008,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         for relationship in pendingRelationships {
             let relationshipName = relationship.relationshipName ?? ""
             let targetIdentifier = relationship.targetIdentifier ?? ""
-            let syncedEntityID = relationship.forSyncedEntity.identifier ?? ""
+            let syncedEntityID = relationship.forSyncedEntity?.identifier ?? ""
             let uniqueKey = relationshipName + ":" + targetIdentifier + ":" + syncedEntityID
             if uniqueRelationships.contains(uniqueKey) {
                 duplicatesToDelete.append(relationship)
