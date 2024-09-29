@@ -962,29 +962,64 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    func persistPendingRelationships() async {
-        for chunk in pendingRelationshipQueue.chunked(into: 5000) {
-            try? Task.checkCancellation()
+    func persistPendingRelationships() async throws {
+        while !pendingRelationshipQueue.isEmpty {
+            let chunk = Array(pendingRelationshipQueue.prefix(5000))
+            try Task.checkCancellation()
             
-            guard let realm = await realmProvider?.persistenceRealm else { continue }
-            try? await realm.asyncWrite {
-                for request in chunk {
-                    let pendingRelationship = PendingRelationship()
-                    pendingRelationship.relationshipName = request.name
-                    pendingRelationship.forSyncedEntity = realm.object(ofType: SyncedEntity.self, forPrimaryKey: request.syncedEntityID)
-                    pendingRelationship.targetIdentifier = request.targetIdentifier
-                    realm.add(pendingRelationship)
+            guard let persistenceRealm = await realmProvider?.persistenceRealm else { break }
+            
+            do {
+                try await persistenceRealm.asyncWrite {
+                    for request in chunk {
+                        let pendingRelationship = PendingRelationship()
+                        pendingRelationship.relationshipName = request.name
+                        pendingRelationship.forSyncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: request.syncedEntityID)
+                        pendingRelationship.targetIdentifier = request.targetIdentifier
+                        persistenceRealm.add(pendingRelationship)
+                    }
                 }
+                
+                for processedRequest in chunk {
+                    if let index = pendingRelationshipQueue.firstIndex(where: {
+                        $0.name == processedRequest.name &&
+                        $0.syncedEntityID == processedRequest.syncedEntityID &&
+                        $0.targetIdentifier == processedRequest.targetIdentifier
+                    }) {
+                        pendingRelationshipQueue.remove(at: index)
+                    }
+                }
+            } catch {
+                debugPrint("Error during persistPendingRelationships:", error)
+                break
             }
         }
     }
     
     @BigSyncBackgroundActor
     func applyPendingRelationships(realmProvider: RealmProvider) async throws {
-        guard let pendingRelationships = realmProvider.persistenceRealm?.objects(PendingRelationship.self) else { return }
+        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+        let pendingRelationships = persistenceRealm.objects(PendingRelationship.self)
+        guard !pendingRelationships.isEmpty else { return }
         
-        if pendingRelationships.count == 0 {
-            return
+        // De-dupe
+        var duplicatesToDelete = [PendingRelationship]()
+        var uniqueRelationships = Set<String>()
+        for relationship in pendingRelationships {
+            let relationshipName = relationship.relationshipName ?? ""
+            let targetIdentifier = relationship.targetIdentifier ?? ""
+            let syncedEntityID = relationship.forSyncedEntity.identifier ?? ""
+            let uniqueKey = relationshipName + ":" + targetIdentifier + ":" + syncedEntityID
+            if uniqueRelationships.contains(uniqueKey) {
+                duplicatesToDelete.append(relationship)
+            } else {
+                uniqueRelationships.insert(uniqueKey)
+            }
+        }
+        if !duplicatesToDelete.isEmpty {
+            try await persistenceRealm.asyncWrite {
+                persistenceRealm.delete(duplicatesToDelete)
+            }
         }
         
         for relationship in Array(pendingRelationships) {
@@ -1035,7 +1070,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 continue
             }
             
-            guard let persistenceRealm = realmProvider.persistenceRealm else { return }
             try? await persistenceRealm.asyncWrite {
                 persistenceRealm.delete(relationship)
             }
@@ -1486,7 +1520,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }()
                 
-                await persistPendingRelationships()
+                try? await persistPendingRelationships()
                 
                 try? await Task.sleep(nanoseconds: 20_000_000)
             }
