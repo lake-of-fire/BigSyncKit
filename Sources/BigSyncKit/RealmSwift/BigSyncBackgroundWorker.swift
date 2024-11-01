@@ -30,33 +30,40 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
     private var subscriptions = Set<AnyCancellable>()
 //    private let notificationQueue = DispatchQueue(label: "BigSyncBackgroundWorker.notificationQueue")
     
+#warning("need to manually refresh() in bg threads (after write block) for notifs to work here (?)")
+    
     public init(configurations: [BigSyncBackgroundWorkerConfiguration], delegate: RealmSwiftAdapterDelegate? = nil) {
         synchronizerDelegate = delegate
         
         super.init()
         
-#warning("need to manually refresh() in bg threads (after write block) for notifs to work here")
+        for config in configurations {
+            let synchronizer = CloudKitSynchronizer.privateSynchronizer(
+                synchronizerName: config.synchronizerName,
+                containerName: config.containerName,
+                configuration: config.configuration,
+                excludedClassNames: config.excludedClassNames,
+                suiteName: config.suiteName,
+                recordZoneID: config.recordZoneID
+            )
+            
+            (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
+            (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
+            synchronizer.compatibilityVersion = Int(config.configuration.schemaVersion)
+            self.realmSynchronizers.append(synchronizer)
+        }
+
         start { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 
-                for config in configurations {
-                    let synchronizer = await CloudKitSynchronizer.privateSynchronizer(
-                        synchronizerName: config.synchronizerName,
-                        containerName: config.containerName,
-                        configuration: config.configuration,
-                        excludedClassNames: config.excludedClassNames,
-                        suiteName: config.suiteName,
-                        recordZoneID: config.recordZoneID
-                    )
+                for synchronizer in realmSynchronizers {
+                    if let containerIdentifier = synchronizer.containerIdentifier {
+                        for modelAdapter in synchronizer.modelAdapters {
+                            await CloudKitSynchronizer.transferOldServerChangeToken(to: modelAdapter, userDefaults: synchronizer.keyValueStore, containerName: containerIdentifier)
+                        }
+                    }
                     
-                    (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
-                    (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
-                    synchronizer.compatibilityVersion = Int(config.configuration.schemaVersion)
-                    self.realmSynchronizers.append(synchronizer)
-                }
-                
-                for synchronizer in self.realmSynchronizers {
                     NotificationCenter.default.publisher(for: .ModelAdapterHasChangesNotification)
                         .sink { [weak self] _ in
                             Task { @MainActor [weak self] in
@@ -76,7 +83,14 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
         }
     }
     
-    deinit {
+    /// Call this on app start before accessing Realm to delete objects without invalidating them during use.
+    @MainActor
+    public func cleanUp() {
+        for synchronizer in realmSynchronizers {
+            for adapter in synchronizer.modelAdapters {
+                adapter.cleanUp()
+            }
+        }
     }
     
     @MainActor

@@ -20,7 +20,7 @@ extension CloudKitSynchronizer {
      
      -Returns: A new CloudKit synchronizer for the given realm.
      */
-    public class func privateSynchronizer(synchronizerName: String = "DefaultRealmSwiftPrivateSynchronizer", containerName: String, configuration: Realm.Configuration, excludedClassNames: [String], suiteName: String? = nil, recordZoneID: CKRecordZone.ID? = nil) async -> CloudKitSynchronizer {
+    public class func privateSynchronizer(synchronizerName: String = "DefaultRealmSwiftPrivateSynchronizer", containerName: String, configuration: Realm.Configuration, excludedClassNames: [String], suiteName: String? = nil, recordZoneID: CKRecordZone.ID? = nil) -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
         let provider = DefaultRealmSwiftAdapterProvider(targetConfiguration: configuration, excludedClassNames: excludedClassNames, zoneID: zoneID, appGroup: suiteName)
         let userDefaults = UserDefaults(suiteName: suiteName)!
@@ -37,7 +37,6 @@ extension CloudKitSynchronizer {
             synchronizer.clearDeviceIdentifier()
         }
         synchronizer.addModelAdapter(provider.adapter)
-        await transferOldServerChangeToken(to: provider.adapter, userDefaults: userDefaultsAdapter, containerName: containerName)
         
         return synchronizer
     }
@@ -73,7 +72,8 @@ extension CloudKitSynchronizer {
 //        return synchronizer
 //    }
     
-    fileprivate class func transferOldServerChangeToken(to adapter: ModelAdapter, userDefaults: KeyValueStore, containerName: String) async {
+    /// Must call this after initializing synchronizer.
+    internal class func transferOldServerChangeToken(to adapter: ModelAdapter, userDefaults: KeyValueStore, containerName: String) async {
         let key = containerName.appending("QSCloudKitFetchChangesServerTokenKey")
         if let encodedToken = userDefaults.object(forKey: key) as? Data {
             if let token = NSKeyedUnarchiver.unarchiveObject(with: encodedToken) as? CKServerChangeToken {

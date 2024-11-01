@@ -233,6 +233,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         super.init()
         
+        setupSynchronousRealm()
+        
         //        Task.detached(priority: .utility) { [weak self] in
         //        executeOnMainQueue {
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -298,9 +300,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
+    func setupSynchronousRealm() {
+        syncRealmProvider = SyncRealmProvider(persistenceConfiguration: persistenceRealmConfiguration, targetConfiguration: targetRealmConfiguration)
+    }
+    
     @BigSyncBackgroundActor
     func setup() async {
-        syncRealmProvider = SyncRealmProvider(persistenceConfiguration: persistenceRealmConfiguration, targetConfiguration: targetRealmConfiguration)
         realmProvider = await RealmProvider(persistenceConfiguration: persistenceRealmConfiguration, targetConfiguration: targetRealmConfiguration)
         guard let realmProvider = realmProvider else { return }
         
@@ -372,9 +377,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
             }
         }
-        
-        startObservingTermination()
-        cleanUp()
     }
     
     @BigSyncBackgroundActor
@@ -386,9 +388,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         for (schema, identifiers) in currentChangeSet.insertions {
             for chunk in Array(identifiers).chunked(into: 500) {
-                try? await realmProvider.persistenceRealm?.asyncWrite {
+                guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                try? await persistenceRealm.asyncWrite {
                     for identifier in chunk {
-                        self.updateTracking(objectIdentifier: identifier, entityName: schema, inserted: true, modified: false, deleted: false, realmProvider: realmProvider)
+                        self.updateTracking(objectIdentifier: identifier, entityName: schema, inserted: true, modified: false, deleted: false, persistenceRealm: persistenceRealm)
                     }
                 }
             }
@@ -396,9 +399,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         for (schema, identifiers) in currentChangeSet.modifications {
             for chunk in Array(identifiers).chunked(into: 500) {
-                try? await realmProvider.persistenceRealm?.asyncWrite {
+                guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                try? await persistenceRealm.asyncWrite {
                     for identifier in chunk {
-                        self.updateTracking(objectIdentifier: identifier, entityName: schema, inserted: false, modified: true, deleted: false, realmProvider: realmProvider)
+                        self.updateTracking(objectIdentifier: identifier, entityName: schema, inserted: false, modified: true, deleted: false, persistenceRealm: persistenceRealm)
                     }
                 }
             }
@@ -457,12 +461,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    func updateTracking(objectIdentifier: String, entityName: String, inserted: Bool, modified: Bool, deleted: Bool, realmProvider: RealmProvider) {
+    func updateTracking(objectIdentifier: String, entityName: String, inserted: Bool, modified: Bool, deleted: Bool, persistenceRealm: Realm) {
         let identifier = "\(entityName).\(objectIdentifier)"
         var isNewChange = false
         
         //        debugPrint("!! updateTracking", identifier, "ins", inserted, "mod", modified)
-        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
         
         if deleted {
@@ -473,7 +476,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 syncedEntity.state = SyncedEntityState.deleted.rawValue
             }
         } else if syncedEntity == nil {
-            guard let persistenceRealm = realmProvider.persistenceRealm else { return }
             Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, realm: persistenceRealm)
             //            debugPrint("!! createSyncedEntity for inserted", objectIdentifier)
             if inserted {
@@ -488,13 +490,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
                 // Hack to avoid crashing issue: https://github.com/realm/realm-swift/issues/8333
-                if let persistenceRealm = realmProvider.persistenceRealm {
-//                    persistenceRealm.refresh()
-                    if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) {
-                        //                    try? realmProvider.persistenceRealm.safeWrite {
-                        syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
-                        // If state was New (or Modified already) then leave it as that
-                    }
+                //                    persistenceRealm.refresh()
+                if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) {
+                    //                    try? realmProvider.persistenceRealm.safeWrite {
+                    syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
+                    // If state was New (or Modified already) then leave it as that
                 }
             }
         }
@@ -528,7 +528,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let syncedEntity = SyncedEntity(entityType: entityType, identifier: "\(entityType).\(identifier)", state: SyncedEntityState.newOrChanged.rawValue)
         
 //        realm.refresh()
-        realm.add(syncedEntity) //, update: .modified)
+        realm.add(syncedEntity, update: .modified)
         return syncedEntity
     }
     
@@ -726,7 +726,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @RealmBackgroundActor
-    func applyChanges(in record: CKRecord, to object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String, realmProvider: RealmProvider) {
+    func applyChanges(in record: CKRecord, to object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String) {
         let objectProperties = object.objectSchema.properties
         
         if syncedEntityState == .newOrChanged {
@@ -738,7 +738,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     if property.type == .linkingObjects {
                         continue
                     }
-                    applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID, realmProvider: realmProvider)
+                    applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
                 }
             } else if mergePolicy == .custom {
                 var recordChanges = [String: Any]()
@@ -780,7 +780,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         if property.type == .linkingObjects {
                             continue
                         }
-                        applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID, realmProvider: realmProvider)
+                        applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
                     }
                 }
             }
@@ -792,12 +792,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 if property.type == .linkingObjects {
                     continue
                 }
-                applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID, realmProvider: realmProvider)
+                applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
             }
         }
     }
     
-    func applyChange(property: Property, record: CKRecord, object: Object, syncedEntityIdentifier: String, realmProvider: RealmProvider) {
+    func applyChange(property: Property, record: CKRecord, object: Object, syncedEntityIdentifier: String) {
         let key = property.name
         if key == object.objectSchema.primaryKeyProperty!.name {
             return
@@ -1316,77 +1316,66 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return record;
     }
     
-    func startObservingTermination() {
-        Task { @MainActor in
-#if os(iOS) || os(tvOS)
-            NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: UIApplication.willTerminateNotification, object: nil)
-#elseif os(macOS)
-            NotificationCenter.default.addObserver(self, selector: #selector(self.cleanUp), name: NSApplication.willTerminateNotification, object: nil)
-#endif
-        }
-    }
-    
     /// Deletes soft-deleted objects.
-    @objc func cleanUp() {
-        Task { @RealmBackgroundActor in
-            guard let targetWriterRealm = realmProvider?.targetWriterRealm else { return }
-            for schema in targetWriterRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
-                guard let objectClass = self.realmObjectClass(name: schema.className) else {
-                    continue
+    @RealmBackgroundActor
+    public func cleanUp() {
+        guard let targetWriterRealm = realmProvider?.targetWriterRealm else { return }
+        for schema in targetWriterRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
+            guard let objectClass = self.realmObjectClass(name: schema.className) else {
+                continue
+            }
+            let predicate = NSPredicate(format: "isDeleted == %@", NSNumber(booleanLiteral: true))
+            guard let lazyResults = realmProvider?.targetWriterRealm?.objects(objectClass).filter(predicate) else { continue }
+            var results = Array(lazyResults)
+            if results.isEmpty {
+                continue
+            }
+            if objectClass.self is any SyncableBase.Type {
+                results = results.filter { result in
+                    guard let result = result as? (any SyncableBase) else {
+                        fatalError("SyncableBase object class unexpectedly had non-SyncableBase element")
+                    }
+                    return !result.needsSyncToServer
                 }
-                let predicate = NSPredicate(format: "isDeleted == %@", NSNumber(booleanLiteral: true))
-                guard let lazyResults = realmProvider?.targetWriterRealm?.objects(objectClass).filter(predicate) else { continue }
-                var results = Array(lazyResults)
-                if results.isEmpty {
-                    continue
+            }
+            var identifiersToDelete = [String]()
+            results = try await Array(results.async.filter { @RealmBackgroundActor object in
+                // TODO: Consolidate with syncedEntity(for ...)
+                guard let objectClass = self.realmObjectClass(name: object.objectSchema.className) else {
+                    debugPrint("Unexpectedly could not get realm object class for", object.objectSchema.className)
+                    return false
                 }
-                if objectClass.self is any SyncableBase.Type {
-                    results = results.filter { result in
-                        guard let result = result as? (any SyncableBase) else {
-                            fatalError("SyncableBase object class unexpectedly had non-SyncableBase element")
-                        }
-                        return !result.needsSyncToServer
+                let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
+                let identifier = object.objectSchema.className + "." + Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+                identifiersToDelete
+                let isSynced = try await { @BigSyncBackgroundActor [weak self] in
+                    guard let self else { return false }
+                    guard let persistenceRealm = realmProvider?.persistenceRealm else { return false }
+                    let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
+                    return syncedEntity?.entityState == .synced
+                }()
+                if isSynced {
+                    identifiersToDelete.append(identifier)
+                }
+                return isSynced
+            })
+            
+            guard let targetRealm = realmProvider?.targetWriterRealm else { return }
+            for chunk in Array(results).chunks(ofCount: 500) {
+                try? await targetRealm.asyncWrite {
+                    for item in chunk {
+                        targetRealm.delete(item)
                     }
                 }
-                var identifiersToDelete = [String]()
-                results = try await Array(results.async.filter { @RealmBackgroundActor object in
-                    // TODO: Consolidate with syncedEntity(for ...)
-                    guard let objectClass = self.realmObjectClass(name: object.objectSchema.className) else {
-                        debugPrint("Unexpectedly could not get realm object class for", object.objectSchema.className)
-                        return false
-                    }
-                    let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
-                    let identifier = object.objectSchema.className + "." + Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                    identifiersToDelete
-                    let isSynced = try await { @BigSyncBackgroundActor [weak self] in
-                        guard let self else { return false }
-                        guard let persistenceRealm = realmProvider?.persistenceRealm else { return false }
-                        let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
-                        return syncedEntity?.entityState == .synced
-                    }()
-                    if isSynced {
-                        identifiersToDelete.append(identifier)
-                    }
-                    return isSynced
-                })
-                
-                guard let targetRealm = realmProvider?.targetWriterRealm else { return }
-                for chunk in Array(results).chunks(ofCount: 500) {
-                    try? await targetRealm.asyncWrite {
-                        for item in chunk {
-                            targetRealm.delete(item)
-                        }
-                    }
-                    
-                    await Task.yield()
-                    try? await Task.sleep(nanoseconds: 10_000_000)
-                }
-                
-                await didDelete(identifiers: identifiersToDelete)
                 
                 await Task.yield()
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
+            
+            await didDelete(identifiers: identifiersToDelete)
+            
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
     
@@ -1515,7 +1504,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                 }
                             }
                             if let object {
-                                self.applyChanges(in: record, to: object, syncedEntityID: syncedEntityID, syncedEntityState: syncedEntityState, entityType: entityType, realmProvider: realmProvider)
+                                self.applyChanges(in: record, to: object, syncedEntityID: syncedEntityID, syncedEntityState: syncedEntityState, entityType: entityType)
                             }
                         }
                     }
@@ -1672,6 +1661,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
     }
+    
     @BigSyncBackgroundActor
     public func didFinishImport(with error: Error?) async {
         guard let realmProvider else { return }

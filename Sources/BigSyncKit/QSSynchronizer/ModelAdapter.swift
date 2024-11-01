@@ -38,6 +38,8 @@ public protocol ModelAdapter: AnyObject {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
     
+    func cleanUp()
+    
     func resetSyncCaches()
     
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool
