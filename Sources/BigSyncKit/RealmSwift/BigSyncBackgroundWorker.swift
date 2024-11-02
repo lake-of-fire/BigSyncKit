@@ -84,7 +84,6 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
     }
     
     /// Call this on app start before accessing Realm to delete objects without invalidating them during use.
-    @MainActor
     public func cleanUp() {
         for synchronizer in realmSynchronizers {
             for adapter in synchronizer.modelAdapters {

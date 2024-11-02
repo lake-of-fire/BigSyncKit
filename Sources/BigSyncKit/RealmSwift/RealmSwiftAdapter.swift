@@ -1315,7 +1315,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     /// Deletes soft-deleted objects.
-    @RealmBackgroundActor
     public func cleanUp() {
         guard let targetWriterRealm = syncRealmProvider?.syncTargetRealm else { return }
         for schema in targetWriterRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
