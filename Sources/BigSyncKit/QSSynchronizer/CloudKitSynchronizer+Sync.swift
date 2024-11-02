@@ -148,6 +148,7 @@ extension CloudKitSynchronizer {
 // MARK: - Utilities
 
 extension CloudKitSynchronizer {
+    @MainActor
     func postNotification(_ notification: Notification.Name, object: Any? = nil, userInfo: [AnyHashable: Any]? = nil) {
         let object = object ?? self
         Task(priority: .background) { @MainActor in
@@ -155,6 +156,7 @@ extension CloudKitSynchronizer {
         }
     }
     
+    @MainActor
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
         operation.errorHandler = { [weak self] operation, error in
             Task(priority: .background) { [weak self] in
@@ -173,6 +175,7 @@ extension CloudKitSynchronizer {
         }
     }
     
+    @MainActor
     func loadTokens(for zoneIDs: [CKRecordZone.ID], loadAdapters: Bool) -> [CKRecordZone.ID] {
         var filteredZoneIDs = [CKRecordZone.ID]()
         activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
@@ -519,6 +522,7 @@ extension CloudKitSynchronizer {
         }
     }
     
+    @MainActor
     func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
         let records = adapter.recordsToUpload(limit: batchSize)
         let recordCount = records.count

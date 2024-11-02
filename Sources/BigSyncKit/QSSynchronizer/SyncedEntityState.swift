@@ -9,7 +9,6 @@ import Foundation
 
 enum SyncedEntityState: Int {
     case newOrChanged = 1
-    case deleted // No longer used; see SoftDeletable
-    case synced
-    case inserted
+    case deleted = 2
+    case synced = 3
 }
