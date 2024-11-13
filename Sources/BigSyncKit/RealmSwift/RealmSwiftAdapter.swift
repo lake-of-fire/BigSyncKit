@@ -600,7 +600,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     static func getStringIdentifier(for object: Object, usingPrimaryKey key: String) -> String {
         let objectId = object.value(forKey: key)
         let identifier: String
-        if let value = objectId as? CustomStringConvertible {
+        if let value = objectId as? String {
+            identifier = value
+        } else if let value = objectId as? CustomStringConvertible {
             identifier = String(describing: value)
         } else {
             identifier = objectId as! String
