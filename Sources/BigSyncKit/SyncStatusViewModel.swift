@@ -140,17 +140,17 @@ public class SyncStatusViewModel: ObservableObject {
 //        }
     }
     
-    @RealmBackgroundActor
-    private func refreshLastSeenDevices() async throws {
-        let realm = try await Realm(configuration: realmConfiguration, actor: RealmBackgroundActor.shared)
-        let syncedDevices = realm.objects(SyncedDevice.self)
-            .where { !$0.isDeleted }
-            .sorted(by: \.lastSeenOnline, ascending: false)
-        lastSeenDevices = Array(syncedDevices).map {
-            LastSeenDevice(
-                id: $0.id, deviceName: $0.deviceName,
-                lastSeenOnline: $0.lastSeenOnline
-            )
-        }
-    }
+//    @RealmBackgroundActor
+//    private func refreshLastSeenDevices() async throws {
+//        let realm = try await Realm(configuration: realmConfiguration, actor: RealmBackgroundActor.shared)
+//        let syncedDevices = realm.objects(SyncedDevice.self)
+//            .where { !$0.isDeleted }
+//            .sorted(by: \.lastSeenOnline, ascending: false)
+//        lastSeenDevices = Array(syncedDevices).map {
+//            LastSeenDevice(
+//                id: $0.id, deviceName: $0.deviceName,
+//                lastSeenOnline: $0.lastSeenOnline
+//            )
+//        }
+//    }
 }

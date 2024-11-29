@@ -177,7 +177,8 @@ actor RealmProvider {
         do {
             persistenceRealmObject = try await Realm(configuration: persistenceConfiguration, actor: BigSyncBackgroundActor.shared)
             targetReaderRealmObject = try await Realm(configuration: targetConfiguration, actor: BigSyncBackgroundActor.shared)
-            targetWriterRealmObject = try await Realm(configuration: targetConfiguration, actor: RealmBackgroundActor.shared)
+            guard let realmBackgroundActorRealm = await RealmBackgroundActor.shared.cachedRealm(for: targetConfiguration) else { fatalError("No Realm for BigSyncKit targetWriterRealmObject") }
+            targetWriterRealmObject = realmBackgroundActorRealm
         } catch {
             return nil
         }
@@ -336,9 +337,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                             self.resultsChangeSet.insertions[schema.className, default: []].insert(identifier)
                         }
-//                        if !insertions.isEmpty {
-//                            debugPrint("!! INS RECS", insertions.compactMap { results[$0].description.prefix(50) })
-//                        }
 
                         for index in modifications {
                             let object = results[index]
@@ -349,6 +347,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //                            debugPrint("!! MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })
 //                        }
                         
+//                        if !insertions.isEmpty { debugPrint("# insertions for", schema.className, insertions.count) }
+//                        if !modifications.isEmpty { debugPrint("# mods for", schema.className, modifications.count) }
                         self.resultsChangeSetPublisher.send(())
                     default: break
                     }
@@ -410,7 +410,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private func setupPublisherDebouncer() {
         resultsChangeSetPublisher
-            .debounce(for: .seconds(1), scheduler: DispatchQueue.global())
+            .debounce(for: .seconds(2), scheduler: DispatchQueue.global())
             .sink { [weak self] _ in
                 Task(priority: .background) { [weak self] in
                     await self?.processEnqueuedChanges()
