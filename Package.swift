@@ -14,7 +14,7 @@ let package = Package(
             targets: ["BigSyncKit"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ugiacoman/RealmBinary.git", from: "10.53.0"),
+        .package(url: "https://github.com/lake-of-fire/RealmBinary.git", branch: "main"),
         //                .package(url: "https://github.com/realm/realm-swift.git", from: "10.53.0"),
         .package(url: "https://github.com/lake-of-fire/RealmSwiftGaps.git", branch: "main"),
         .package(url: "https://github.com/lake-of-fire/Device.git", branch: "main"),
