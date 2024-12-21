@@ -475,7 +475,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 syncedEntity.state = SyncedEntityState.deleted.rawValue
             }
         } else if syncedEntity == nil {
-            Self.createSyncedEntity(entityType: entityName, identifier: objectIdentifier, realm: persistenceRealm)
+            Self.createSyncedEntity(
+                entityType: entityName,
+                identifier: objectIdentifier,
+                modified: modified,
+                realm: persistenceRealm
+            )
             //            debugPrint("!! createSyncedEntity for inserted", objectIdentifier)
             if inserted {
                 isNewChange = true
@@ -490,9 +495,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
                 // Hack to avoid crashing issue: https://github.com/realm/realm-swift/issues/8333
                 //                    persistenceRealm.refresh()
-                if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) {
+                if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm), syncedEntity.state != SyncedEntityState.changed.rawValue {
                     //                    try? realmProvider.persistenceRealm.safeWrite {
-                    syncedEntity.state = SyncedEntityState.newOrChanged.rawValue
+                    syncedEntity.state = SyncedEntityState.changed.rawValue
                     // If state was New (or Modified already) then leave it as that
                 }
             }
@@ -514,7 +519,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //            realm.refresh()
             try? await realm.asyncWrite {
                 for identifier in chunk {
-                    let syncedEntity = SyncedEntity(entityType: entityType, identifier: entityType + "." + identifier, state: SyncedEntityState.newOrChanged.rawValue)
+                    let syncedEntity = SyncedEntity(entityType: entityType, identifier: entityType + "." + identifier, state: SyncedEntityState.new.rawValue)
                     realm.add(syncedEntity, update: .modified)
                 }
             }
@@ -523,8 +528,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @BigSyncBackgroundActor
     @discardableResult
-    static func createSyncedEntity(entityType: String, identifier: String, realm: Realm) -> SyncedEntity {
-        let syncedEntity = SyncedEntity(entityType: entityType, identifier: "\(entityType).\(identifier)", state: SyncedEntityState.newOrChanged.rawValue)
+    static func createSyncedEntity(entityType: String, identifier: String, modified: Bool, realm: Realm) -> SyncedEntity {
+        let syncedEntity = SyncedEntity(entityType: entityType, identifier: "\(entityType).\(identifier)", state: modified ? SyncedEntityState.changed.rawValue : SyncedEntityState.new.rawValue)
         
 //        realm.refresh()
         realm.add(syncedEntity, update: .modified)
@@ -729,7 +734,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     func applyChanges(in record: CKRecord, to object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String) {
         let objectProperties = object.objectSchema.properties
         
-        if syncedEntityState == .newOrChanged {
+        if syncedEntityState == .newOrChanged || syncedEntityState == .new || syncedEntityState == .changed {
             if mergePolicy == .server {
                 for property in objectProperties {
                     if shouldIgnore(key: property.name) {
@@ -1173,7 +1178,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //        }
         
         for property in object.objectSchema.properties {
-            if entityState == SyncedEntityState.newOrChanged.rawValue {
+            if entityState == SyncedEntityState.newOrChanged.rawValue || entityState == SyncedEntityState.new.rawValue || entityState == SyncedEntityState.changed.rawValue {
                 if let recordProcessingDelegate = recordProcessingDelegate,
                    !recordProcessingDelegate.shouldProcessPropertyBeforeUpload(propertyName: property.name, object: object, record: record) {
                     continue
@@ -1350,8 +1355,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     guard let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else {
                         return false
                     }
-                    let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
-                    return syncedEntity?.entityState == .synced
+                    guard let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) else {
+                        debugPrint("Warning: No synced entity found for identifier", identifier)
+                        return false
+                    }
+                    return syncedEntity.entityState == .synced || syncedEntity.entityState == .new
                 }()
                 if isSynced {
                     identifiersToDelete.append(identifier)
