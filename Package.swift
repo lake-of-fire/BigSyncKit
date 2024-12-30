@@ -27,9 +27,9 @@ let package = Package(
         .target(
             name: "BigSyncKit",
             dependencies: [
-                .product(name: "Realm", package: "RealmBinary"),
+//                .product(name: "Realm", package: "RealmBinary"),
 //                .product(name: "RealmSwift", package: "RealmBinary"),
-//                .product(name: "RealmSwift", package: "realm-swift"),
+                .product(name: "RealmSwift", package: "realm-swift"),
                 .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
 //                .product(name: "Device Library", package: "Device"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
