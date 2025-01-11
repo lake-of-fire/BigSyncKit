@@ -325,6 +325,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let results = realmProvider.targetReaderRealm?.objects(objectClass) else { return }
             
             // Register for collection notifications
+            // TODO: Optimize by changing to a collection publisher! Requires modifiedAt on syncable protocol
             results.changesetPublisher
                 .freeze()
                 .threadSafeReference()
@@ -337,7 +338,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                             self.resultsChangeSet.insertions[schema.className, default: []].insert(identifier)
                         }
-
+                        
                         for index in modifications {
                             let object = results[index]
                             let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
