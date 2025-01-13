@@ -347,15 +347,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             guard let self else { return }
                             guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                             guard let targetReaderRealm = realmProvider.targetReaderRealm else { return }
-                            let syncedEntityType = Self.getOrCreateSyncedEntityType(schema.className, realm: persistenceRealm)
-                            let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt
-                            let createdPredicate = NSPredicate(format: "createdAt > %@", lastTrackedChangesAt)
-                            let modifiedPredicate = NSPredicate(format: "modifiedAt > %@", lastTrackedChangesAt)
+                            guard let syncedEntityType = try await getOrCreateSyncedEntityType(schema.className) else {
+                                print("Could not get or create SyncedEntityType")
+                                return
+                            }
+                            let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt ?? .distantPast
+                            let createdPredicate = NSPredicate(format: "createdAt > %@", lastTrackedChangesAt as NSDate)
+                            let modifiedPredicate = NSPredicate(format: "modifiedAt > %@", lastTrackedChangesAt as NSDate)
                             let nextTrackedChangesAt = Date()
                             let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate))
                             let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate))
-                            resultsChangeSet.insertions[schema.className, default: []]?.formUnion(created.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
-                            resultsChangeSet.modifications[schema.className, default: []]?.formUnion(modified.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+                            resultsChangeSet.insertions[schema.className, default: []].formUnion(created.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+                            resultsChangeSet.modifications[schema.className, default: []].formUnion(modified.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
                             try? await persistenceRealm.asyncWrite {
                                 syncedEntityType.lastTrackedChangesAt = nextTrackedChangesAt
                             }
@@ -388,7 +391,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             Task { @BigSyncBackgroundActor [weak self] in
                                 guard let self else { return }
                                 if !inserted.isEmpty {
-                                    resultsChangeSet.insertions[schema.className, default: []]?.formUnion(inserted)
+                                    resultsChangeSet.insertions[schema.className, default: []].formUnion(inserted)
                                 }
                                 if !modified.isEmpty {
                                     resultsChangeSet.modifications[schema.className, default: []].formUnion(modified)
@@ -670,16 +673,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return realm.object(ofType: SyncedEntity.self, forPrimaryKey: objectIdentifier)
     }
     
-    static func getOrCreateSyncedEntityType(_ entityType: String, realm: Realm) throws -> SyncedEntityType {
-        if let syncedEntityType = realm.object(ofType: SyncedEntityType.self, forPrimaryKey: entityType) {
+    @BigSyncBackgroundActor
+    func getOrCreateSyncedEntityType(_ entityType: String) async throws -> SyncedEntityType? {
+        guard let persistenceRealm = await realmProvider?.persistenceRealm else { return nil }
+
+        if let syncedEntityType = persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: entityType) {
             return syncedEntityType
         }
         let syncedEntityType = SyncedEntityType(
-            entityType: entityType,
-            lastTrackedChangesAt: .distantPast
+            entityType: entityType
         )
-        try await realm.asyncWrite {
-            realm.add(syncedEntityType, update: .modified)
+        try await persistenceRealm.asyncWrite {
+            persistenceRealm.add(syncedEntityType, update: .modified)
         }
         return syncedEntityType
     }

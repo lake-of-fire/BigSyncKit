@@ -5,7 +5,7 @@ class SyncedEntityType: Object {
     @objc dynamic var entityType: String = ""
     @objc dynamic var lastTrackedChangesAt: Date?
     
-    convenience init(entityType: String, lastTrackedChangesAt: Date) {
+    convenience init(entityType: String, lastTrackedChangesAt: Date? = nil) {
         self.init()
         
         self.entityType = entityType
