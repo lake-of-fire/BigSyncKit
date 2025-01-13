@@ -340,7 +340,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 results.collectionPublisher
                     .subscribe(on: bigSyncKitQueue)
                     .map { _ in }
-                    .debounce(for: .seconds(5), scheduler: bigSyncKitQueue)
+                    .debounce(for: .seconds(10), scheduler: bigSyncKitQueue)
                     .receive(on: bigSyncKitQueue)
                     .sink(receiveCompletion: { _ in }, receiveValue: { _ in
                         Task { @BigSyncBackgroundActor [weak self] in
@@ -369,6 +369,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //                if results.count > 1000 {
 //                    return ;
 //                }
+//                debugPrint("# RES PUB", schema.className)
                 results.changesetPublisher
                     .subscribe(on: bigSyncKitQueue)
                     .receive(on: bigSyncKitQueue)
@@ -397,8 +398,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                     resultsChangeSet.modifications[schema.className, default: []].formUnion(modified)
                                 }
                             }
-                            if !insertions.isEmpty {                            debugPrint("!! INSERT RECS", insertions.compactMap { results[$0].description.prefix(50) })                        }
-                            if !modifications.isEmpty {                            debugPrint("!! MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })                        }
+//                            if !insertions.isEmpty {                            debugPrint("!! INSERT RECS", insertions.compactMap { results[$0].description.prefix(50) })                        }
+//                            if !modifications.isEmpty {                            debugPrint("!! MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })                        }
                             self.resultsChangeSetPublisher.send(())
                         default: break
                         }
