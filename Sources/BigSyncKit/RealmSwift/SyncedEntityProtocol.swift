@@ -10,11 +10,11 @@ import RealmSwift
 
 @objc public protocol ChangeMetadataRecordable: SoftDeletable {
     var createdAt: Date { get }
-    var modifiedAt: Date { get }
+    var modifiedAt: Date { get set }
 }
 
 @objc public protocol SoftDeletable {
-    var isDeleted: Bool { get }
+    var isDeleted: Bool { get set }
 }
 
 public protocol SyncableBase: RealmSwift.Object, Identifiable, SoftDeletable, Codable {
