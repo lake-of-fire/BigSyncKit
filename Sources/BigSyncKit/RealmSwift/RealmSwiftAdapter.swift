@@ -340,7 +340,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 results.collectionPublisher
                     .subscribe(on: bigSyncKitQueue)
                     .map { _ in }
-                    .debounce(for: .seconds(10), scheduler: bigSyncKitQueue)
+                    .debounce(for: .seconds(8), scheduler: bigSyncKitQueue)
                     .receive(on: bigSyncKitQueue)
                     .sink(receiveCompletion: { _ in }, receiveValue: { _ in
                         Task { @BigSyncBackgroundActor [weak self] in
