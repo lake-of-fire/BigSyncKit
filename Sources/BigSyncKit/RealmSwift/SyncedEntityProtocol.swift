@@ -8,6 +8,11 @@
 import Foundation
 import RealmSwift
 
+@objc public protocol ChangeMetadataRecordable: SoftDeletable {
+    var createdAt: Date { get }
+    var modifiedAt: Date { get }
+}
+
 @objc public protocol SoftDeletable {
     var isDeleted: Bool { get }
 }

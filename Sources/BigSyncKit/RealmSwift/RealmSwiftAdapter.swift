@@ -30,6 +30,8 @@ import AsyncAlgorithms
 //    }
 //}
 
+let bigSyncKitQueue = DispatchQueue(label: "BigSyncKit")
+
 extension Array {
     func chunked(into size: Int) -> [[Element]] {
         return stride(from: 0, to: count, by: size).map {
@@ -287,10 +289,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 2
+        configuration.schemaVersion = 3
         configuration.migrationBlock = { migration, oldSchemaVersion in
         }
-        configuration.objectTypes = [SyncedEntity.self, Record.self, PendingRelationship.self, ServerToken.self]
+        configuration.objectTypes = [
+            SyncedEntity.self,
+            SyncedEntityType.self,
+            Record.self,
+            PendingRelationship.self,
+            ServerToken.self
+        ]
         return configuration
     }
     
@@ -306,6 +314,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @BigSyncBackgroundActor
     func setup() async {
+//        return ;
         realmProvider = await RealmProvider(persistenceConfiguration: persistenceRealmConfiguration, targetConfiguration: targetRealmConfiguration)
         guard let realmProvider = realmProvider else { return }
         
@@ -318,7 +327,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 continue
             }
             guard objectClass.conforms(to: SoftDeletable.self) else {
-                fatalError("\(objectClass.className()) must conform to SoftDeletable in order to sync")
+                fatalError("\(objectClass.className()) must conform to SoftDeletable in order to sync with iCloud via BigSyncKit")
             }
             
             let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
@@ -326,35 +335,73 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             // Register for collection notifications
             // TODO: Optimize by changing to a collection publisher! Requires modifiedAt on syncable protocol
-            results.changesetPublisher
-                .freeze()
-                .threadSafeReference()
-                .sink(receiveValue: { [weak self] collectionChange in
-                    guard let self = self else { return }
-                    switch collectionChange {
-                    case .update(let results, _, let insertions, let modifications):
-                        for index in insertions {
-                            let object = results[index]
-                            let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                            self.resultsChangeSet.insertions[schema.className, default: []].insert(identifier)
+            
+            if objectClass.conforms(to: ChangeMetadataRecordable.self) {
+                results.collectionPublisher
+                    .subscribe(on: bigSyncKitQueue)
+                    .map { _ in }
+                    .debounce(for: .seconds(5), scheduler: bigSyncKitQueue)
+                    .receive(on: bigSyncKitQueue)
+                    .sink(receiveCompletion: { _ in }, receiveValue: { _ in
+                        Task { @BigSyncBackgroundActor [weak self] in
+                            guard let self else { return }
+                            guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                            guard let targetReaderRealm = realmProvider.targetReaderRealm else { return }
+                            let syncedEntityType = Self.getOrCreateSyncedEntityType(schema.className, realm: persistenceRealm)
+                            let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt
+                            let createdPredicate = NSPredicate(format: "createdAt > %@", lastTrackedChangesAt)
+                            let modifiedPredicate = NSPredicate(format: "modifiedAt > %@", lastTrackedChangesAt)
+                            let nextTrackedChangesAt = Date()
+                            let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate))
+                            let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate))
+                            resultsChangeSet.insertions[schema.className, default: []]?.formUnion(created.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+                            resultsChangeSet.modifications[schema.className, default: []]?.formUnion(modified.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+                            try? await persistenceRealm.asyncWrite {
+                                syncedEntityType.lastTrackedChangesAt = nextTrackedChangesAt
+                            }
                         }
-                        
-                        for index in modifications {
-                            let object = results[index]
-                            let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                            self.resultsChangeSet.modifications[schema.className, default: []].insert(identifier)
+                    })
+                    .store(in: &cancellables)
+            } else {
+//                if results.count > 1000 {
+//                    return ;
+//                }
+                results.changesetPublisher
+                    .subscribe(on: bigSyncKitQueue)
+                    .receive(on: bigSyncKitQueue)
+                    .sink(receiveValue: { [weak self] collectionChange in
+                        guard let self = self else { return }
+                        switch collectionChange {
+                        case .update(let results, _, let insertions, let modifications):
+                            var inserted = [String]()
+                            var modified = [String]()
+                            for index in insertions {
+                                let object = results[index]
+                                let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+                                inserted.append(identifier)
+                            }
+                            for index in modifications {
+                                let object = results[index]
+                                let identifier = Self.getStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+                                modified.append(identifier)
+                            }
+                            Task { @BigSyncBackgroundActor [weak self] in
+                                guard let self else { return }
+                                if !inserted.isEmpty {
+                                    resultsChangeSet.insertions[schema.className, default: []]?.formUnion(inserted)
+                                }
+                                if !modified.isEmpty {
+                                    resultsChangeSet.modifications[schema.className, default: []].formUnion(modified)
+                                }
+                            }
+                            if !insertions.isEmpty {                            debugPrint("!! INSERT RECS", insertions.compactMap { results[$0].description.prefix(50) })                        }
+                            if !modifications.isEmpty {                            debugPrint("!! MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })                        }
+                            self.resultsChangeSetPublisher.send(())
+                        default: break
                         }
-//                        if !modifications.isEmpty {
-//                            debugPrint("!! MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })
-//                        }
-                        
-//                        if !insertions.isEmpty { debugPrint("# insertions for", schema.className, insertions.count) }
-//                        if !modifications.isEmpty { debugPrint("# mods for", schema.className, modifications.count) }
-                        self.resultsChangeSetPublisher.send(())
-                    default: break
-                    }
-                })
-                .store(in: &cancellables)
+                    })
+                    .store(in: &cancellables)
+            }
             
             if needsInitialSetup {
                 beforeInitialSetup?()
@@ -411,7 +458,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private func setupPublisherDebouncer() {
         resultsChangeSetPublisher
-            .debounce(for: .seconds(2), scheduler: DispatchQueue.global())
+            .debounce(for: .seconds(2), scheduler: bigSyncKitQueue)
             .sink { [weak self] _ in
                 Task(priority: .background) { [weak self] in
                     await self?.processEnqueuedChanges()
@@ -623,6 +670,20 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return realm.object(ofType: SyncedEntity.self, forPrimaryKey: objectIdentifier)
     }
     
+    static func getOrCreateSyncedEntityType(_ entityType: String, realm: Realm) throws -> SyncedEntityType {
+        if let syncedEntityType = realm.object(ofType: SyncedEntityType.self, forPrimaryKey: entityType) {
+            return syncedEntityType
+        }
+        let syncedEntityType = SyncedEntityType(
+            entityType: entityType,
+            lastTrackedChangesAt: .distantPast
+        )
+        try await realm.asyncWrite {
+            realm.add(syncedEntityType, update: .modified)
+        }
+        return syncedEntityType
+    }
+
     func shouldIgnore(key: String) -> Bool {
         return CloudKitSynchronizer.metadataKeys.contains(key)
     }
