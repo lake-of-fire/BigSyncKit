@@ -223,6 +223,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     private var resultsChangeSet = ResultsChangeSet()
     private let resultsChangeSetPublisher = PassthroughSubject<Void, Never>()
     
+    private var lastRealmCheckDates: [URL: Date] = [:]
+    private var lastRealmFileModDates: [URL: Date] = [:]
+    private var realmPollTimer: AnyCancellable?
+    private var appForegroundCancellable: AnyCancellable?
+    private let immediateChecksSubject = PassthroughSubject<Void, Never>()
+
     private var pendingRelationshipQueue = [PendingRelationshipRequest]()
     
     private var cancellables = Set<AnyCancellable>()
@@ -336,39 +342,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             // Register for collection notifications
             // TODO: Optimize by changing to a collection publisher! Requires modifiedAt on syncable protocol
             
-            if objectClass.conforms(to: ChangeMetadataRecordable.self) {
-                results.collectionPublisher
-                    .subscribe(on: bigSyncKitQueue)
-                    .map { _ in }
-                    .debounce(for: .seconds(8), scheduler: bigSyncKitQueue)
-                    .receive(on: bigSyncKitQueue)
-                    .sink(receiveCompletion: { _ in }, receiveValue: { _ in
-                        Task { @BigSyncBackgroundActor [weak self] in
-                            guard let self else { return }
-                            guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-                            guard let targetReaderRealm = realmProvider.targetReaderRealm else { return }
-                            guard let syncedEntityType = try await getOrCreateSyncedEntityType(schema.className) else {
-                                print("Could not get or create SyncedEntityType")
-                                return
-                            }
-                            let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt ?? .distantPast
-                            let createdPredicate = NSPredicate(format: "createdAt > %@", lastTrackedChangesAt as NSDate)
-                            let modifiedPredicate = NSPredicate(format: "modifiedAt > %@", lastTrackedChangesAt as NSDate)
-                            let nextTrackedChangesAt = Date()
-                            let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate))
-                            let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate))
-                            resultsChangeSet.insertions[schema.className, default: []].formUnion(created.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
-                            resultsChangeSet.modifications[schema.className, default: []].formUnion(modified.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
-                            try? await persistenceRealm.asyncWrite {
-                                syncedEntityType.lastTrackedChangesAt = nextTrackedChangesAt
-                            }
-                        }
-                    })
-                    .store(in: &cancellables)
-            } else {
-//                if results.count > 1000 {
-//                    return ;
-//                }
+            if !objectClass.conforms(to: ChangeMetadataRecordable.self) {
 //                debugPrint("# RES PUB", schema.className)
                 results.changesetPublisher
                     .subscribe(on: bigSyncKitQueue)
@@ -420,13 +394,130 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
         
+        startPollingForChanges()
+
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         updateHasChanges(realm: persistenceRealm)
-        
+
         if hasChanges {
             Task { @MainActor in
                 NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
             }
+        }
+    }
+    
+    private func observeAppForegroundNotifications() {
+#if canImport(UIKit)
+        NotificationCenter.default
+            .publisher(for: UIApplication.willEnterForegroundNotification)
+            .merge(with: NotificationCenter.default
+                .publisher(for: UIApplication.didBecomeActiveNotification)
+            )
+            .sink { [weak self] _ in
+                self?.immediateChecksSubject.send(())
+            }
+            .store(in: &cancellables)
+#endif
+        
+        appForegroundCancellable = immediateChecksSubject
+            .debounce(for: .seconds(5), scheduler: bigSyncKitQueue)
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                    await self?.pollForChangesIfFileModified()
+                }
+            }
+        
+        immediateChecksSubject.send(())
+    }
+    
+    private func startPollingForChanges() {
+#if DEBUG
+        let interval: TimeInterval = 2
+#else
+        let interval: TimeInterval = 20
+#endif
+        realmPollTimer = Timer.publish(every: interval, on: .main, in: .common)
+            .autoconnect()
+            .subscribe(on: bigSyncKitQueue)
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                    await self?.pollForChangesIfFileModified()
+                }
+            }
+    }
+    
+    @BigSyncBackgroundActor
+    private func pollForChangesIfFileModified() async {
+        guard let realmProvider = self.realmProvider,
+              let fileURL = realmProvider.targetConfiguration.fileURL else { return }
+        guard let fileModDate = self.modificationDateForFile(at: fileURL) else { return }
+        
+        let lastKnownModDate = lastRealmFileModDates[fileURL] ?? .distantPast
+        if fileModDate <= lastKnownModDate {
+            // File hasn’t changed on disk, skip queries
+            return
+        }
+        
+        if let targetReaderRealm = realmProvider.targetReaderRealm {
+            for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
+                guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
+                guard objectClass.conforms(to: ChangeMetadataRecordable.self) else { continue }
+
+                await self.enqueueCreatedAndModified(
+                    in: objectClass,
+                    schemaName: schema.className,
+                    realmProvider: realmProvider)
+            }
+        }
+        
+        lastRealmFileModDates[fileURL] = fileModDate
+        lastRealmCheckDates[fileURL] = Date()
+    }
+    
+    private func modificationDateForFile(at url: URL) -> Date? {
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            return attrs[.modificationDate] as? Date
+        } catch {
+            print("Could not read file attributes for \(url.path): \(error)")
+            return nil
+        }
+    }
+    
+    @BigSyncBackgroundActor
+    private func enqueueCreatedAndModified(
+        in objectClass: Object.Type,
+        schemaName: String,
+        realmProvider: RealmProvider
+    ) async {
+        guard let persistenceRealm = realmProvider.persistenceRealm,
+              let targetReaderRealm = realmProvider.targetReaderRealm,
+              let syncedEntityType = try? await getOrCreateSyncedEntityType(schemaName)
+        else {
+            print("Could not get realms or syncedEntityType for \(schemaName)")
+            return
+        }
+        
+        let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt ?? .distantPast
+        let createdPredicate = NSPredicate(format: "createdAt > %@", lastTrackedChangesAt as NSDate)
+        let modifiedPredicate = NSPredicate(format: "modifiedAt > %@", lastTrackedChangesAt as NSDate)
+        let nextTrackedChangesAt = Date()
+        
+        let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate))
+        let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate))
+        
+        let primaryKey = objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name ?? ""
+        
+        resultsChangeSet.insertions[schemaName, default: []]
+            .formUnion(created.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+        resultsChangeSet.modifications[schemaName, default: []]
+            .formUnion(modified.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+        
+        // Persist the new lastTrackedChangesAt
+        try? await persistenceRealm.asyncWrite {
+            syncedEntityType.lastTrackedChangesAt = nextTrackedChangesAt
         }
     }
     
