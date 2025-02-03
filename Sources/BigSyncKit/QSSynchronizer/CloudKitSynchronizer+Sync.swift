@@ -24,7 +24,7 @@ fileprivate class ChangeRequestProcessor {
     private var localErrors: [Error] = []
     
     @BigSyncBackgroundActor
-    fileprivate func addChangeRequest(_ request: ChangeRequest) {
+    fileprivate func addFetchedChangeRequest(_ request: ChangeRequest) {
 //        debugPrint("!! addChangeReq", request.downloadedRecord?.recordID.recordName)
         changeRequests.append(request)
 //        debugPrint("!! enq req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }))
@@ -33,7 +33,7 @@ fileprivate class ChangeRequestProcessor {
         if lastExecutionTime == 0 || currentTime >= lastExecutionTime + debounceInterval {
             debounceTask?.cancel()
             Task {
-                await processChangeRequests()
+                await processFetchedChangeRequests()
             }
         } else {
             debounceTask?.cancel()
@@ -43,15 +43,15 @@ fileprivate class ChangeRequestProcessor {
                 try? await Task.sleep(nanoseconds: remainingTime)
                 do {
                     try Task.checkCancellation()
-                    await processChangeRequests()
+                    await processFetchedChangeRequests()
                 } catch { }
             }
         }
     }
     
     @BigSyncBackgroundActor
-    private func processChangeRequests() async {
-//        debugPrint("!! PROC req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
+    private func processFetchedChangeRequests() async {
+        debugPrint("# processFetchedChangeRequests fetched change req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
  
         lastExecutionTime = DispatchTime.now().uptimeNanoseconds
         let batch = changeRequests
@@ -79,7 +79,7 @@ fileprivate class ChangeRequestProcessor {
     
     func finishProcessing() async {
         debounceTask?.cancel()
-        await processChangeRequests()
+        await processFetchedChangeRequests()
     }
 }
 
@@ -141,7 +141,7 @@ extension CloudKitSynchronizer {
             delegate?.synchronizerDidSync(self)
         }
         
-        //            debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
+                    debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
     }
 }
 
@@ -352,7 +352,7 @@ extension CloudKitSynchronizer {
             let adapter = await modelAdapterDictionary[zoneID]
             if let adapter {
                 let changeRequest = ChangeRequest(downloadedRecord: downloadedRecord, deletedRecordID: deletedRecordID, adapter: adapter)
-                await changeRequestProcessor.addChangeRequest(changeRequest)
+                await changeRequestProcessor.addFetchedChangeRequest(changeRequest)
             }
         } completion: { [weak self] zoneResults in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in

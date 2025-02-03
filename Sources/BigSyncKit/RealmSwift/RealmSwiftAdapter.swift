@@ -372,8 +372,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                     resultsChangeSet.modifications[schema.className, default: []].formUnion(modified)
                                 }
                             }
-//                            if !insertions.isEmpty {                            debugPrint("!! INSERT RECS", insertions.compactMap { results[$0].description.prefix(50) })                        }
-//                            if !modifications.isEmpty {                            debugPrint("!! MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })                        }
+                            if !insertions.isEmpty {                            debugPrint("# INSERT RECS", insertions.compactMap { results[$0].description.prefix(50) })                        }
+                            if !modifications.isEmpty {                            debugPrint("# MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })                        }
                             self.resultsChangeSetPublisher.send(())
                         default: break
                         }
@@ -510,10 +510,24 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         let primaryKey = objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name ?? ""
         
-        resultsChangeSet.insertions[schemaName, default: []]
-            .formUnion(created.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
-        resultsChangeSet.modifications[schemaName, default: []]
-            .formUnion(modified.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+//        if created.isEmpty && modified.isEmpty {
+//            let (maxCreatedAt, maxModifiedAt) =  (
+//                targetReaderRealm.objects(objectClass as! Object.Type)
+//                    .max(ofProperty: "createdAt") as Date?,
+//                targetReaderRealm.objects(objectClass as! Object.Type)
+//                    .max(ofProperty: "modifiedAt") as Date?
+//            )
+//            debugPrint("Warning: enueueCreatedAndModified called without any matching records to enqueue as created or modified. Object class:", objectClass, "Last tracked changes at:", lastTrackedChangesAt, "Last created at:", maxCreatedAt, "Last modified at:", maxModifiedAt)
+//        }
+        
+        if !created.isEmpty {
+            resultsChangeSet.insertions[schemaName, default: []]
+                .formUnion(created.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+        }
+        if !modified.isEmpty {
+            resultsChangeSet.modifications[schemaName, default: []]
+                .formUnion(modified.map { Self.getStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+        }
         
         // Persist the new lastTrackedChangesAt
         try? await persistenceRealm.asyncWrite {
@@ -527,6 +541,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let currentChangeSet: ResultsChangeSet
         currentChangeSet = self.resultsChangeSet
         self.resultsChangeSet = ResultsChangeSet() // Reset for next batch
+        
+        if !currentChangeSet.insertions.isEmpty {                            debugPrint("# processEnqueuedChanges INSERT RECS", currentChangeSet.insertions.compactMap { $0 })                        }
+        if !currentChangeSet.modifications.isEmpty {                            debugPrint("# processEnqueuedChanges MODIFY RECS", currentChangeSet.modifications.values.compactMap { $0 })                        }
         
         for (schema, identifiers) in currentChangeSet.insertions {
             for chunk in Array(identifiers).chunked(into: 500) {
@@ -607,9 +624,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let identifier = "\(entityName).\(objectIdentifier)"
         var isNewChange = false
         
-        //        debugPrint("!! updateTracking", identifier, "ins", inserted, "mod", modified)
         let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
-        
+        debugPrint("# updateTracking", identifier, "ins", inserted, "mod", modified, "syncedentity exists?", syncedEntity != nil)
+
         if deleted {
             isNewChange = true
             
