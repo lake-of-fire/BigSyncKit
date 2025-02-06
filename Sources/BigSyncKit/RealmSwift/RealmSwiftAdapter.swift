@@ -372,8 +372,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                     resultsChangeSet.modifications[schema.className, default: []].formUnion(modified)
                                 }
                             }
-                            if !insertions.isEmpty {                            debugPrint("# INSERT RECS", insertions.compactMap { results[$0].description.prefix(50) })                        }
-                            if !modifications.isEmpty {                            debugPrint("# MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })                        }
+//                            if !insertions.isEmpty {                            debugPrint("# INSERT RECS", insertions.compactMap { results[$0].description.prefix(50) })                        }
+//                            if !modifications.isEmpty {                            debugPrint("# MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })                        }
                             self.resultsChangeSetPublisher.send(())
                         default: break
                         }
@@ -464,7 +464,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
                 guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
                 guard objectClass.conforms(to: ChangeMetadataRecordable.self) else { continue }
-
+                
                 await self.enqueueCreatedAndModified(
                     in: objectClass,
                     schemaName: schema.className,
@@ -533,6 +533,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         try? await persistenceRealm.asyncWrite {
             syncedEntityType.lastTrackedChangesAt = nextTrackedChangesAt
         }
+        
+        if !created.isEmpty || !modified.isEmpty {
+            resultsChangeSetPublisher.send(())
+        }
     }
     
     @BigSyncBackgroundActor
@@ -542,8 +546,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         currentChangeSet = self.resultsChangeSet
         self.resultsChangeSet = ResultsChangeSet() // Reset for next batch
         
-        if !currentChangeSet.insertions.isEmpty {                            debugPrint("# processEnqueuedChanges INSERT RECS", currentChangeSet.insertions.compactMap { $0 })                        }
-        if !currentChangeSet.modifications.isEmpty {                            debugPrint("# processEnqueuedChanges MODIFY RECS", currentChangeSet.modifications.values.compactMap { $0 })                        }
+//        if !currentChangeSet.insertions.isEmpty {                            debugPrint("# processEnqueuedChanges INSERT RECS", currentChangeSet.insertions.compactMap { $0 })                        }
+//        if !currentChangeSet.modifications.isEmpty {                            debugPrint("# processEnqueuedChanges MODIFY RECS", currentChangeSet.modifications.values.compactMap { $0 })                        }
         
         for (schema, identifiers) in currentChangeSet.insertions {
             for chunk in Array(identifiers).chunked(into: 500) {
@@ -625,7 +629,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var isNewChange = false
         
         let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
-        debugPrint("# updateTracking", identifier, "ins", inserted, "mod", modified, "syncedentity exists?", syncedEntity != nil)
+//        debugPrint("# updateTracking", identifier, "ins", inserted, "mod", modified, "syncedentity exists?", syncedEntity != nil)
 
         if deleted {
             isNewChange = true
@@ -710,28 +714,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let range = syncedEntity.identifier.range(of: syncedEntity.entityType)!
         let index = syncedEntity.identifier.index(range.upperBound, offsetBy: 1)
         let objectIdentifier = String(syncedEntity.identifier[index...])
-        let objectClass = realmObjectClass(name: syncedEntity.entityType)
-        
-        guard let objectSchema = objectClass?.sharedSchema(),
-              let keyType = objectSchema.primaryKeyProperty?.type else {
-            return objectIdentifier
-        }
-        
-        switch keyType {
-        case .int:
-            return Int(objectIdentifier)!
-        case .objectId:
-            return try! ObjectId(string: objectIdentifier)
-        case .string:
-            return objectIdentifier
-        case .UUID:
-            return UUID(uuidString: objectIdentifier)!
-        default:
-            return objectIdentifier
-        }
+        return getObjectIdentifier(stringObjectId: objectIdentifier, entityType: syncedEntity.entityType) ?? objectIdentifier
     }
     
-    @BigSyncBackgroundActor
     func getObjectIdentifier(stringObjectId: String, entityType: String) -> Any? {
         guard let schema = self.realmObjectClass(name: entityType)?.sharedSchema(),
               let keyType = schema.primaryKeyProperty?.type else {
@@ -1328,6 +1313,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func recordToUpload(syncedEntity: SyncedEntity, syncRealmProvider: SyncRealmProvider, parentSyncedEntity: inout SyncedEntity?) -> CKRecord? {
+        if syncedEntity.identifier.isEmpty {
+            
+        }
         let record = getRecord(for: syncedEntity) ?? CKRecord(recordType: syncedEntity.entityType, recordID: CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
         
         guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
