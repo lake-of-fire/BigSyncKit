@@ -26,7 +26,5 @@ public protocol UnownedSyncableObject: SyncableBase {
 }
 
 public protocol SyncableObject: SyncableBase {
-    var owner: OwnerObject? { get }
-    
-    associatedtype OwnerObject: Object
+    var ownerID: Int? { get }
 }
