@@ -267,6 +267,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func resetSyncCaches() {
         Task { @BigSyncBackgroundActor in
             if let persistenceRealm = realmProvider?.persistenceRealm {
+                await persistenceRealm.asyncRefresh()
                 try await persistenceRealm.asyncWrite {
                     persistenceRealm.delete(persistenceRealm.objects(SyncedEntity.self))
                 }
@@ -530,6 +531,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         // Persist the new lastTrackedChangesAt
+        await persistenceRealm.asyncRefresh()
         try? await persistenceRealm.asyncWrite {
             syncedEntityType.lastTrackedChangesAt = nextTrackedChangesAt
         }
@@ -552,6 +554,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         for (schema, identifiers) in currentChangeSet.insertions {
             for chunk in Array(identifiers).chunked(into: 500) {
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     for identifier in chunk {
                         self.updateTracking(objectIdentifier: identifier, entityName: schema, inserted: true, modified: false, deleted: false, persistenceRealm: persistenceRealm)
@@ -563,6 +566,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         for (schema, identifiers) in currentChangeSet.modifications {
             for chunk in Array(identifiers).chunked(into: 500) {
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     for identifier in chunk {
                         self.updateTracking(objectIdentifier: identifier, entityName: schema, inserted: false, modified: true, deleted: false, persistenceRealm: persistenceRealm)
@@ -680,7 +684,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @discardableResult
     static func createSyncedEntities(entityType: String, identifiers: [String], realm: Realm) async {
         for chunk in identifiers.chunked(into: 5000) {
-//            realm.refresh()
+            await realm.asyncRefresh()
             try? await realm.asyncWrite {
                 for identifier in chunk {
                     let syncedEntity = SyncedEntity(entityType: entityType, identifier: entityType + "." + identifier, state: SyncedEntityState.new.rawValue)
@@ -703,6 +707,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @BigSyncBackgroundActor
     func writeSyncedEntities(syncedEntities: [SyncedEntity], realmProvider: RealmProvider) async throws {
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+        await persistenceRealm.asyncRefresh()
         try? await persistenceRealm.asyncWrite {
             for entity in syncedEntities {
                 persistenceRealm.add(entity, update: .modified)
@@ -777,6 +782,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let syncedEntityType = SyncedEntityType(
             entityType: entityType
         )
+        await persistenceRealm.asyncRefresh()
         try await persistenceRealm.asyncWrite {
             persistenceRealm.add(syncedEntityType, update: .modified)
         }
@@ -1137,6 +1143,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let persistenceRealm = await realmProvider?.persistenceRealm else { break }
             
             do {
+                await persistenceRealm.asyncRefresh()
                 try await persistenceRealm.asyncWrite {
                     for request in chunk {
                         let pendingRelationship = PendingRelationship()
@@ -1184,6 +1191,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
         if !duplicatesToDelete.isEmpty {
+            await persistenceRealm.asyncRefresh()
             try await persistenceRealm.asyncWrite {
                 persistenceRealm.delete(duplicatesToDelete)
             }
@@ -1227,6 +1235,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 guard let targetWriterRealm = realmProvider.targetWriterRealm else { return false }
                 if let originObject = targetWriterRealm.resolve(originRef) {
+                    await targetWriterRealm.asyncRefresh()
                     try await targetWriterRealm.asyncWrite {
                         originObject.setValue(targetObject, forKey: relationshipName)
                     }
@@ -1237,6 +1246,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 continue
             }
             
+            await persistenceRealm.asyncRefresh()
             try? await persistenceRealm.asyncWrite {
                 persistenceRealm.delete(relationship)
             }
@@ -1641,6 +1651,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         if !recordsToSave.isEmpty {
             for chunk in recordsToSave.chunked(into: 1000) {
+                await realmProvider.persistenceRealm?.asyncRefresh()
                 try await realmProvider.persistenceRealm?.asyncWrite { [weak self] in
                     guard let self = self else { return }
                     
@@ -1656,6 +1667,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
 //                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
                     guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
+                    await targetWriterRealm.asyncRefresh()
                     try await targetWriterRealm.asyncWrite { [weak self] in
                         guard let self = self else { return }
                         for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk {
@@ -1704,6 +1716,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         
                         if let object = object {
                             guard let targetRealm = realmProvider.targetWriterRealm else { return }
+                            await targetRealm.asyncRefresh()
                             try? await targetRealm.asyncWrite {
                                 targetRealm.delete(object)
                             }
@@ -1713,12 +1726,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 if let record = syncedEntity.record {
                     guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                    await realmProvider.persistenceRealm?.asyncRefresh()
                     try? await realmProvider.persistenceRealm?.asyncWrite {
                         persistenceRealm.delete(record);
                     }
                 }
                 
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                await realmProvider.persistenceRealm?.asyncRefresh()
                 try? await realmProvider.persistenceRealm?.asyncWrite {
                     persistenceRealm.delete(syncedEntity)
                 }
@@ -1763,6 +1778,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let realmProvider = realmProvider else { return }
         
         for chunk in savedRecords.chunked(into: 500) {
+            await realmProvider.persistenceRealm?.asyncRefresh()
             try? await realmProvider.persistenceRealm?.asyncWrite {
                 for record in chunk {
                     if let syncedEntity = realmProvider.persistenceRealm?.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
@@ -1799,6 +1815,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         for recordID in deletedRecordIDs {
             guard let persistenceRealm = realmProvider.persistenceRealm else { return }
             if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName) {
+                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     if let record = syncedEntity.record {
                         persistenceRealm.delete(record)
@@ -1874,6 +1891,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         var serverToken: ServerToken! = persistenceRealm.objects(ServerToken.self).first
         
+        await persistenceRealm.asyncRefresh()
         try? await persistenceRealm.asyncWrite {
             if serverToken == nil {
                 serverToken = ServerToken()

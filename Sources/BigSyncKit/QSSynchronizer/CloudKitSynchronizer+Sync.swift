@@ -51,7 +51,7 @@ fileprivate class ChangeRequestProcessor {
     
     @BigSyncBackgroundActor
     private func processFetchedChangeRequests() async {
-        debugPrint("# processFetchedChangeRequests fetched change req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
+//        debugPrint("# processFetchedChangeRequests fetched change req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
  
         lastExecutionTime = DispatchTime.now().uptimeNanoseconds
         let batch = changeRequests
