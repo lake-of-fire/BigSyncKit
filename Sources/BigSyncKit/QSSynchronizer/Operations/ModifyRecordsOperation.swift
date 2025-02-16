@@ -42,10 +42,6 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
         }
         
         operation.modifyRecordsCompletionBlock = { saved, deleted, operationError in
-            if !self.recordIDsMissingOnServer.isEmpty {
-                print(operationError)
-                print("#")
-            }
             if let error = operationError as? CKError {
                 self.processCKError(error)
             }

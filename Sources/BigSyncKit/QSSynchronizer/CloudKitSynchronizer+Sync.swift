@@ -138,7 +138,7 @@ extension CloudKitSynchronizer {
             delegate?.synchronizerDidSync(self)
         }
         
-        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
+//        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
     }
 }
 
@@ -283,7 +283,6 @@ extension CloudKitSynchronizer {
         
         await fetchDatabaseChanges() { [weak self] token, error in
             guard let self else { return }
-            debugPrint("# fetchDatabaseChanges() callback...", error, "sync mode", syncMode)
             guard error == nil else {
                 await finishSynchronization(error: error)
                 return
@@ -301,9 +300,8 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async -> ()) async {
-        debugPrint("# fetchDatabaseChanges()", containerIdentifier, serverChangeToken)
+//        debugPrint("# fetchDatabaseChanges()", containerIdentifier, serverChangeToken)
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
-            debugPrint("# inside fetchDatabaseChanges callback")
             Task.detached(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
@@ -529,7 +527,7 @@ extension CloudKitSynchronizer {
         let records = adapter.recordsToUpload(limit: batchSize)
         let recordCount = records.count
         let requestedBatchSize = batchSize
-        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
+//        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { await completion(nil); return }
         
         if !didNotifyUpload.contains(adapter.recordZoneID) {
@@ -540,14 +538,13 @@ extension CloudKitSynchronizer {
         //Add metadata: device UUID and model version
         addMetadata(to: records)
         
-        debugPrint("# uploadRecords, make operation...")
         let modifyRecordsOperation = ModifyRecordsOperation(database: database,
                                                records: records,
                                                recordIDsToDelete: nil)
         { [weak self] (savedRecords, deleted, conflicted, recordIDsMissingOnServer, operationError) in
 //            debugPrint("# uploadRecords, inside operation callback...", records.count)
             Task(priority: .background) { [weak self] in
-                debugPrint("# uploadRecords, inside operation callback Task...", records.count, "saved", savedRecords?.count, "del", deleted?.count, "conflicted", conflicted.count, operationError)
+//                debugPrint("# uploadRecords, inside operation callback Task...", records.count, "saved", savedRecords?.count, "del", deleted?.count, "conflicted", conflicted.count, operationError)
                 guard let self = self else { return }
                 var conflicted = conflicted
                 if !(savedRecords?.isEmpty ?? true) {

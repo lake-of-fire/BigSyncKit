@@ -33,24 +33,22 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
     
     override func start() {
         super.start()
-
+        
         let databaseChangesOperation = CKFetchDatabaseChangesOperation(previousServerChangeToken: databaseToken)
         databaseChangesOperation.fetchAllChanges = true
-
+        
         // TODO: changeTokenUpdatedBlock
 //        databaseChangesOperation.changeTokenUpdatedBlock = { token in
 //        }
         
         databaseChangesOperation.recordZoneWithIDChangedBlock = { zoneID in
-            debugPrint("# changedZoneIDs append", zoneID)
             self.changedZoneIDs.append(zoneID)
         }
-
+        
         databaseChangesOperation.recordZoneWithIDWasDeletedBlock = { zoneID in
-            debugPrint("# deletedZoneIDs append", zoneID)
             self.deletedZoneIDs.append(zoneID)
         }
-
+        
         databaseChangesOperation.fetchDatabaseChangesCompletionBlock = { serverChangeToken, moreComing, operationError in
             if !moreComing {
                 if operationError == nil {
@@ -60,7 +58,7 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
                 self.finish(error: operationError)
             }
         }
-
+        
         internalOperation = databaseChangesOperation
         database.add(databaseChangesOperation)
     }

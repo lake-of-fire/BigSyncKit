@@ -253,9 +253,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     deinit {
         invalidateTokens()
-//        Task { @BigSyncBackgroundActor [invalidateRealmAndTokens] in
-//            await invalidateRealmAndTokens()
-//        }
     }
     
     @BigSyncBackgroundActor
@@ -275,17 +272,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         await setup()
     }
     
-//    @BigSyncBackgroundActor
     func invalidateTokens() {
-        debugPrint("# invalidateRealmAndTokens()")
+//        debugPrint("# invalidateRealmAndTokens()")
         for cancellable in cancellables {
             cancellable.cancel()
         }
         cancellables.removeAll()
-//        Task { @BigSyncBackgroundActor [realmProvider] in
-//            realmProvider?.persistenceRealm?.invalidate()
-////            realmProvider = nil
-//        }
     }
     
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
@@ -315,7 +307,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @BigSyncBackgroundActor
     func setup() async {
-        debugPrint("# setup() ...")
+//        debugPrint("# setup() ...")
         realmProvider = await RealmProvider(persistenceConfiguration: persistenceRealmConfiguration, targetConfiguration: targetRealmConfiguration)
         guard let realmProvider else { return }
         
@@ -1601,7 +1593,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let realmProvider = realmProvider else { return }
         guard !records.isEmpty else { return }
         
-        debugPrint("# To save from icloud:", records.map { $0.recordID.recordName })
+//        debugPrint("# To save from icloud:", records.map { $0.recordID.recordName })
         var recordsToSave: [(record: CKRecord, objectClass: RealmSwift.Object.Type, objectIdentifier: Any, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
         var syncedEntitiesToCreate: [SyncedEntity] = []
         
