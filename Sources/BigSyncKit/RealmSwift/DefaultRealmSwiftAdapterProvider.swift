@@ -28,7 +28,10 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         self.excludedClassNames = excludedClassNames
         self.zoneID = zoneID
         self.appGroup = appGroup
-        persistenceConfiguration = DefaultRealmSwiftAdapterProvider.createPersistenceConfiguration(suiteName: appGroup)
+        persistenceConfiguration = DefaultRealmSwiftAdapterProvider.createPersistenceConfiguration(
+            suiteName: appGroup,
+            zoneID: zoneID
+        )
         super.init()
         adapter = createAdapter()
     }
@@ -43,16 +46,25 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) async {
         let adapterHasSyncedBefore = adapter.serverChangeToken != nil
         if recordZoneID == zoneID && adapterHasSyncedBefore {
-            await adapter.deleteChangeTracking()
-            synchronizer.removeModelAdapter(adapter)
-            
-            adapter = createAdapter()
-            synchronizer.addModelAdapter(adapter)
+//            await adapter.deleteChangeTracking()
+//            synchronizer.removeModelAdapter(adapter)
+//            adapter = createAdapter()
+//            synchronizer.addModelAdapter(adapter)
+            do {
+                try await adapter.resetSyncCaches()
+            } catch {
+                print(error)
+            }
         }
     }
     
     fileprivate func createAdapter() -> RealmSwiftAdapter {
-        return RealmSwiftAdapter(persistenceRealmConfiguration: persistenceConfiguration, targetRealmConfiguration: targetConfiguration, excludedClassNames: excludedClassNames, recordZoneID: zoneID)
+        return RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfiguration: targetConfiguration,
+            excludedClassNames: excludedClassNames,
+            recordZoneID: zoneID
+        )
     }
     
     // MARK: - File directory
@@ -66,8 +78,11 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
      *  @return File path, in the shared container, where SyncKit will store its tracking database.
      */
     
-    public static func realmPath(appGroup: String?) -> String {
-        return applicationBackupRealmPath(suiteName: appGroup).appending("/" + realmFileName())
+    public static func realmPath(
+        appGroup: String?,
+        zoneID: CKRecordZone.ID
+    ) -> String {
+        return applicationBackupRealmPath(suiteName: appGroup).appending("/" + realmFileName(zoneID: zoneID))
     }
     
     fileprivate static func applicationBackupRealmPath(suiteName: String?) -> String! {
@@ -90,14 +105,17 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
 #endif
     }
     
-    fileprivate static func realmFileName() -> String {
-        return "BigSyncKitMetadata.realm"
+    fileprivate static func realmFileName(zoneID: CKRecordZone.ID) -> String {
+        return zoneID.zoneName + ".realm"
     }
     
-    fileprivate static func createPersistenceConfiguration(suiteName: String?) -> Realm.Configuration {
+    fileprivate static func createPersistenceConfiguration(
+        suiteName: String?,
+        zoneID: CKRecordZone.ID
+    ) -> Realm.Configuration {
         ensurePathAvailable(suiteName: suiteName)
         var configuration = RealmSwiftAdapter.defaultPersistenceConfiguration()
-        configuration.fileURL = URL(fileURLWithPath: realmPath(appGroup: suiteName))
+        configuration.fileURL = URL(fileURLWithPath: realmPath(appGroup: suiteName, zoneID: zoneID))
         return configuration
     }
     

@@ -157,7 +157,7 @@ public class CloudKitSynchronizer: NSObject {
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     
     /// Default number of records to send in an upload operation.
-    public static var defaultBatchSize = 1500
+    public static var defaultBatchSize = 400 // Apple's suggestion
     static let deviceUUIDKey = "QSCloudKitDeviceUUIDKey"
     static let modelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
     
@@ -169,12 +169,20 @@ public class CloudKitSynchronizer: NSObject {
     ///   - adapterProvider: `CloudKitSynchronizerAdapterProvider`
     ///   - keyValueStore: Object conforming to KeyValueStore (`UserDefaultsAdapter`, for example)
     /// - Returns: Initialized synchronizer or `nil` if no iCloud container can be found with the provided identifier.
-    public init(identifier: String, containerIdentifier: String? = nil, database: CloudKitDatabaseAdapter, adapterProvider: AdapterProvider, keyValueStore: KeyValueStore = UserDefaultsAdapter(userDefaults: UserDefaults.standard)) {
+    public init(
+        identifier: String,
+        containerIdentifier: String? = nil,
+        database: CloudKitDatabaseAdapter,
+        adapterProvider: AdapterProvider,
+        keyValueStore: KeyValueStore = UserDefaultsAdapter(userDefaults: UserDefaults.standard),
+        compatibilityVersion: Int = 0
+    ) {
         self.identifier = identifier
         self.containerIdentifier = containerIdentifier
         self.adapterProvider = adapterProvider
         self.database = database
         self.keyValueStore = keyValueStore
+        self.compatibilityVersion = compatibilityVersion
         super.init()
         
         BackupDetection.runBackupDetection { (result, error) in
@@ -201,14 +209,15 @@ public class CloudKitSynchronizer: NSObject {
     }
     
     @MainActor
-    public func resetSyncCaches() {
+    public func resetSyncCaches() async throws {
+        cancelSynchronization()
+        
         clearDeviceIdentifier()
         resetDatabaseToken()
         resetActiveTokens()
         
-        for adapter in
-                modelAdapters {
-            adapter.resetSyncCaches()
+        for adapter in modelAdapters {
+            try await adapter.resetSyncCaches()
         }
     }
     
@@ -257,25 +266,30 @@ public class CloudKitSynchronizer: NSObject {
         return activeZoneTokens[zoneID]
     }
     
-    /**
-    * Deletes saved database token and all local metadata used to track changes in models.
-    * The synchronizer should not be used after calling this function, create a new synchronizer instead if you need it.
-    */
-    @MainActor
-    @objc public func eraseLocalMetadata() {
-        cancelSynchronization()
-//        dispatchQueue.async {
-        Task { @MainActor [weak self] in
-            guard let self = self else { return }
-            storedDatabaseToken = nil
-            clearAllStoredSubscriptionIDs()
-            deviceUUID = nil
-            for modelAdapter in modelAdapters {
-                await modelAdapter.deleteChangeTracking()
-                removeModelAdapter(modelAdapter)
-            }
-        }
-    }
+//    /**
+//    * Deletes saved database token and all local metadata used to track changes in models.
+//    * The synchronizer should not be used after calling this function, create a new synchronizer instead if you need it.
+//    */
+//    @MainActor
+//    @objc public func eraseLocalMetadata(removeModelAdapters: Bool) {
+//        cancelSynchronization()
+//        
+////        dispatchQueue.async {
+//        Task { @MainActor [weak self] in
+//            guard let self = self else { return }
+//            storedDatabaseToken = nil
+//            clearAllStoredSubscriptionIDs()
+//            deviceUUID = nil
+//            for modelAdapter in modelAdapters {
+//                await modelAdapter.deleteChangeTracking()
+//                if removeModelAdapters {
+//                    removeModelAdapter(modelAdapter)
+////                } else {
+////                    await modelAdapter.saveToken(nil)
+//                }
+//            }
+//        }
+//    }
     
     /// Deletes the corresponding record zone on CloudKit, along with any data in it.
     /// - Parameters:
@@ -284,12 +298,15 @@ public class CloudKitSynchronizer: NSObject {
     @MainActor
     public func deleteRecordZone(for adapter: ModelAdapter, completion: ((Error?) -> ())?) {
         database.delete(withRecordZoneID: adapter.recordZoneID) { (zoneID, error) in
-            if let error = error {
-                debugPrint("CloudKitSynchronizer >> Error: \(error)")
-            } else {
-                debugPrint("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
+            Task { @BigSyncBackgroundActor in
+                await adapter.saveToken(nil)
+                if let error = error {
+                    debugPrint("CloudKitSynchronizer >> Error: \(error)")
+                } else {
+                    debugPrint("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
+                }
+                completion?(error)
             }
-            completion?(error)
         }
     }
     

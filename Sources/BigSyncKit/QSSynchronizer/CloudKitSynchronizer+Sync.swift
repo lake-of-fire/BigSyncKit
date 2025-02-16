@@ -25,7 +25,7 @@ fileprivate class ChangeRequestProcessor {
     
     @BigSyncBackgroundActor
     fileprivate func addFetchedChangeRequest(_ request: ChangeRequest) {
-//        debugPrint("!! addChangeReq", request.downloadedRecord?.recordID.recordName)
+//        debugPrint("# addChangeReq", request.downloadedRecord?.recordID.recordName)
         changeRequests.append(request)
 //        debugPrint("!! enq req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }))
         let currentTime = DispatchTime.now().uptimeNanoseconds
@@ -125,12 +125,9 @@ extension CloudKitSynchronizer {
             if let error = error as? CKError {
                 switch error.code {
                 case .changeTokenExpired:
+                    debugPrint("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
                     // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
                     self.resetDatabaseToken()
-                    for adapter in self.modelAdapters {
-                        await adapter.deleteChangeTracking()
-                        self.removeModelAdapter(adapter)
-                    }
                     await fetchChanges()
                 default:
                     break
@@ -141,7 +138,7 @@ extension CloudKitSynchronizer {
             delegate?.synchronizerDidSync(self)
         }
         
-//        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
+        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
     }
 }
 
@@ -267,6 +264,7 @@ extension CloudKitSynchronizer {
     }
     
     func needsZoneSetup(adapter: ModelAdapter) -> Bool {
+//        debugPrint("# needsZoneSetup?", adapter.recordZoneID, adapter.serverChangeToken)
         return adapter.serverChangeToken == nil
     }
 }
@@ -276,7 +274,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @MainActor
     func fetchChanges() async {
-        guard cancelSync == false else {
+        guard !cancelSync else {
             await finishSynchronization(error: SyncError.cancelled)
             return
         }
@@ -284,7 +282,8 @@ extension CloudKitSynchronizer {
         postNotification(.SynchronizerWillFetchChanges)
         
         await fetchDatabaseChanges() { [weak self] token, error in
-            guard let self = self else { return }
+            guard let self else { return }
+            debugPrint("# fetchDatabaseChanges() callback...", error, "sync mode", syncMode)
             guard error == nil else {
                 await finishSynchronization(error: error)
                 return
@@ -302,14 +301,16 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async -> ()) async {
+        debugPrint("# fetchDatabaseChanges()", containerIdentifier, serverChangeToken)
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
-//            debugPrint("!! inside fetchDatabaseChanges callback")
+            debugPrint("# inside fetchDatabaseChanges callback")
             Task.detached(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 
                 let zoneIDsToFetch = await loadTokens(for: changedZoneIDs, loadAdapters: true)
                 
+//                debugPrint("# zoneIDsToFetch", zoneIDsToFetch)
                 guard zoneIDsToFetch.count > 0 else {
                     await self.resetActiveTokens()
                     await completion(token, nil)
@@ -341,6 +342,7 @@ extension CloudKitSynchronizer {
     
     @MainActor
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async -> ()) {
+//        debugPrint("# fetchZoneChanges(...)", zoneIDs)
         let changeRequestProcessor = ChangeRequestProcessor()
         let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { [weak self] (downloadedRecord, deletedRecordID) in
             guard let self else { return }
@@ -423,8 +425,6 @@ extension CloudKitSynchronizer {
     @MainActor
     func mergeChangesIntoAdapter(_ adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
         await adapter.persistImportedChanges { @MainActor [weak self] error in
-            //            self.dispatchQueue.async {
-            //                autoreleasepool {
             guard let self = self else { return }
             guard error == nil else {
                 await completion(error)
@@ -443,6 +443,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @MainActor
     func uploadChanges() async {
+//        debugPrint("# uploadChanges()")
         guard !cancelSync else {
             await finishSynchronization(error: SyncError.cancelled)
             return
@@ -469,6 +470,7 @@ extension CloudKitSynchronizer {
     
     @MainActor
     func uploadChanges(completion: @escaping (Error?) async -> ()) async {
+//        debugPrint("# uploadChanges(completion)")
         await sequential(objects: modelAdapters, closure: setupZoneAndUploadRecords) { [weak self] (error) in
             guard error == nil else { await completion(error); return }
             guard let self = self else { return }
@@ -527,6 +529,7 @@ extension CloudKitSynchronizer {
         let records = adapter.recordsToUpload(limit: batchSize)
         let recordCount = records.count
         let requestedBatchSize = batchSize
+        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { await completion(nil); return }
         
         if !didNotifyUpload.contains(adapter.recordZoneID) {
@@ -537,11 +540,14 @@ extension CloudKitSynchronizer {
         //Add metadata: device UUID and model version
         addMetadata(to: records)
         
+        debugPrint("# uploadRecords, make operation...")
         let modifyRecordsOperation = ModifyRecordsOperation(database: database,
                                                records: records,
                                                recordIDsToDelete: nil)
-        { [weak self] (savedRecords, deleted, conflicted, operationError) in
+        { [weak self] (savedRecords, deleted, conflicted, recordIDsMissingOnServer, operationError) in
+//            debugPrint("# uploadRecords, inside operation callback...", records.count)
             Task(priority: .background) { [weak self] in
+                debugPrint("# uploadRecords, inside operation callback Task...", records.count, "saved", savedRecords?.count, "del", deleted?.count, "conflicted", conflicted.count, operationError)
                 guard let self = self else { return }
                 var conflicted = conflicted
                 if !(savedRecords?.isEmpty ?? true) {
@@ -568,6 +574,10 @@ extension CloudKitSynchronizer {
 //                            }
 //                        }
 //                    }
+                    
+                    if !recordIDsMissingOnServer.isEmpty {
+                        await adapter.deleteChangeTracking(forRecordIDs: Array(recordIDsMissingOnServer))
+                    }
                     
                     if self.isLimitExceededError(error) {
                         reduceBatchSize()

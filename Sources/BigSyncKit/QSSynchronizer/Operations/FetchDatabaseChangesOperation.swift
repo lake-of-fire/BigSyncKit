@@ -11,16 +11,23 @@ import CloudKit
 class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
     let database: CloudKitDatabaseAdapter
     let databaseToken: CKServerChangeToken?
+//    let changeTokenUpdated: (CKServerChangeToken) -> ()
     let completion: (CKServerChangeToken?, [CKRecordZone.ID], [CKRecordZone.ID]) -> ()
     
     var changedZoneIDs = [CKRecordZone.ID]()
     var deletedZoneIDs = [CKRecordZone.ID]()
     weak var internalOperation: CKFetchDatabaseChangesOperation?
     
-    init(database: CloudKitDatabaseAdapter, databaseToken: CKServerChangeToken?, completion: @escaping (CKServerChangeToken?, [CKRecordZone.ID], [CKRecordZone.ID]) -> ()) {
+    init(
+        database: CloudKitDatabaseAdapter,
+        databaseToken: CKServerChangeToken?,
+//        changeTokenUpdated: @escaping (CKServerChangeToken) -> (),
+        completion: @escaping (CKServerChangeToken?, [CKRecordZone.ID], [CKRecordZone.ID]) -> ()
+    ) {
         self.databaseToken = databaseToken
         self.database = database
         self.completion = completion
+//        self.changeTokenUpdated = changeTokenUpdated
         super.init()
     }
     
@@ -30,12 +37,17 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
         let databaseChangesOperation = CKFetchDatabaseChangesOperation(previousServerChangeToken: databaseToken)
         databaseChangesOperation.fetchAllChanges = true
 
+        // TODO: changeTokenUpdatedBlock
+//        databaseChangesOperation.changeTokenUpdatedBlock = { token in
+//        }
+        
         databaseChangesOperation.recordZoneWithIDChangedBlock = { zoneID in
-//            debugPrint("!! changedZoneIDs append", zoneID)
+            debugPrint("# changedZoneIDs append", zoneID)
             self.changedZoneIDs.append(zoneID)
         }
 
         databaseChangesOperation.recordZoneWithIDWasDeletedBlock = { zoneID in
+            debugPrint("# deletedZoneIDs append", zoneID)
             self.deletedZoneIDs.append(zoneID)
         }
 

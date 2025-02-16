@@ -11,14 +11,24 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let excludedClassNames: [String]
     let suiteName: String?
     let recordZoneID: CKRecordZone.ID?
+    let compatibilityVersion: Int
     
-    public init(synchronizerName: String, containerName: String, configuration: Realm.Configuration, excludedClassNames: [String], suiteName: String? = nil, recordZoneID: CKRecordZone.ID? = nil) {
+    public init(
+        synchronizerName: String,
+        containerName: String,
+        configuration: Realm.Configuration,
+        excludedClassNames: [String],
+        suiteName: String? = nil,
+        recordZoneID: CKRecordZone.ID? = nil,
+        compatibilityVersion: Int = 0
+    ) {
         self.synchronizerName = synchronizerName
         self.containerName = containerName
         self.configuration = configuration
         self.excludedClassNames = excludedClassNames
         self.suiteName = suiteName
         self.recordZoneID = recordZoneID
+        self.compatibilityVersion = compatibilityVersion
     }
 }
 
@@ -44,7 +54,8 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
                 configuration: config.configuration,
                 excludedClassNames: config.excludedClassNames,
                 suiteName: config.suiteName,
-                recordZoneID: config.recordZoneID
+                recordZoneID: config.recordZoneID,
+                compatibilityVersion: config.compatibilityVersion
             )
             
             (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
@@ -124,6 +135,7 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
                         print("Sync error: \(error.localizedDescription) Synchronization was manually cancelled.")
                     case .higherModelVersionFound:
                         print("Sync error: \(error.localizedDescription) A synchronizer with a higer `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here. This error can be detected to prompt the user to update the app to a newer version.")
+                        // TODO: Show this error inside settings view
                     case .recordNotFound:
                         print("Sync error: \(error.localizedDescription) A record for the provided object was not found, so the object cannot be shared on CloudKit.")
                     }

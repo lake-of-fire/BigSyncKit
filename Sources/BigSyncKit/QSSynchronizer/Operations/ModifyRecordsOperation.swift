@@ -13,9 +13,14 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     let records: [CKRecord]?
     let recordIDsToDelete: [CKRecord.ID]?
     
-    let completion: ([CKRecord]?, [CKRecord.ID]?, [CKRecord], Error?) -> ()
+    let completion: ([CKRecord]?, [CKRecord.ID]?, [CKRecord], Set<CKRecord.ID>, Error?) -> ()
     
-    init(database: CloudKitDatabaseAdapter, records: [CKRecord]?, recordIDsToDelete: [CKRecord.ID]?, completion: @escaping ([CKRecord]?, [CKRecord.ID]?, [CKRecord], Error?) -> ()) {
+    init(
+        database: CloudKitDatabaseAdapter,
+        records: [CKRecord]?,
+        recordIDsToDelete: [CKRecord.ID]?,
+        completion: @escaping ([CKRecord]?, [CKRecord.ID]?, [CKRecord], Set<CKRecord.ID>, Error?) -> ()
+    ) {
         self.database = database
         self.records = records
         self.recordIDsToDelete = recordIDsToDelete
@@ -23,7 +28,9 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     }
     
     private var conflictedRecords = [CKRecord]()
-    
+    private var conflictedRecordIDs = Set<CKRecord.ID>()
+    private var recordIDsMissingOnServer = Set<CKRecord.ID>()
+
 //    let dispatchQueue = DispatchQueue(label: "modifyRecordsDispatchQueue")
     weak var internalOperation: CKModifyRecordsOperation?
         
@@ -31,21 +38,55 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
         let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: recordIDsToDelete)
         
         operation.perRecordCompletionBlock = { record, error in
-//            debugPrint("!! perRecordCompletionBlock", error, (error as? NSError)?.code, CKRecordChangedErrorServerRecordKey, record.recordID, record.recordType)
-//            debugPrint("!! perRecordCompletionBlock ckerror", error as? CKError)
-            if let error = error as? CKError,
-                error.code == CKError.serverRecordChanged,
-                let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
-//                debugPrint("!! added conflicted record too")
-                self.conflictedRecords.append(serverRecord)
-            }
+            self.processError(error, recordID: record.recordID)
         }
+        
         operation.modifyRecordsCompletionBlock = { saved, deleted, operationError in
-            self.completion(saved, deleted, self.conflictedRecords, operationError)
+            if !self.recordIDsMissingOnServer.isEmpty {
+                print(operationError)
+                print("#")
+            }
+            if let error = operationError as? CKError {
+                self.processCKError(error)
+            }
+            self.completion(saved, deleted, self.conflictedRecords, self.recordIDsMissingOnServer, operationError)
         }
         
         internalOperation = operation
         database.add(operation)
+    }
+    
+    /// Handles errors from both perRecordCompletionBlock and modifyRecordsCompletionBlock
+    private func processError(_ error: Error?, recordID: CKRecord.ID) {
+        guard let error = error as? CKError else { return }
+        
+        switch error.code {
+        case .serverRecordChanged:
+            if let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
+                debugPrint("# added conflicted record", serverRecord.recordID.recordName)
+                let (inserted, _) = conflictedRecordIDs.insert(serverRecord.recordID)
+                if inserted {
+                    conflictedRecords.append(serverRecord)
+                }
+            }
+        case .unknownItem:
+            debugPrint("# Record not found in CloudKit (Unknown Item)", recordID.recordName)
+            recordIDsMissingOnServer.insert(recordID)
+        default:
+            break
+        }
+    }
+    
+    /// Processes CKError for batch errors (partial failures)
+    private func processCKError(_ error: CKError) {
+        if error.code == .partialFailure,
+           let errorsByItemID = error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] {
+            for (recordID, nsError) in errorsByItemID {
+                processError(nsError, recordID: recordID)
+            }
+        } else {
+            print(error)
+        }
     }
     
     override func cancel() {

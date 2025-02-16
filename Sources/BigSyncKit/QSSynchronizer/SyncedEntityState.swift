@@ -8,10 +8,9 @@
 import Foundation
 
 enum SyncedEntityState: Int {
-    @available(*, deprecated, message: "Use new or changed")
-    case newOrChanged = 1
-    case deleted = 2
-    case synced = 3
-    case new = 4
-    case changed = 5
+    // Order of the raw values is significant; see recordsToUpload and nextStateToSync
+    case new = 1
+    case changed = 2
+    case deleted = 3
+    case synced = 4
 }

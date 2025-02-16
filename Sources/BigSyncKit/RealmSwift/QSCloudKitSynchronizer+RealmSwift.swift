@@ -20,9 +20,22 @@ extension CloudKitSynchronizer {
      
      -Returns: A new CloudKit synchronizer for the given realm.
      */
-    public class func privateSynchronizer(synchronizerName: String = "DefaultRealmSwiftPrivateSynchronizer", containerName: String, configuration: Realm.Configuration, excludedClassNames: [String], suiteName: String? = nil, recordZoneID: CKRecordZone.ID? = nil) -> CloudKitSynchronizer {
+    public class func privateSynchronizer(
+        synchronizerName: String = "DefaultRealmSwiftPrivateSynchronizer",
+        containerName: String,
+        configuration: Realm.Configuration,
+        excludedClassNames: [String],
+        suiteName: String? = nil,
+        recordZoneID: CKRecordZone.ID? = nil,
+        compatibilityVersion: Int = 0
+    ) -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
-        let provider = DefaultRealmSwiftAdapterProvider(targetConfiguration: configuration, excludedClassNames: excludedClassNames, zoneID: zoneID, appGroup: suiteName)
+        let provider = DefaultRealmSwiftAdapterProvider(
+            targetConfiguration: configuration,
+            excludedClassNames: excludedClassNames,
+            zoneID: zoneID,
+            appGroup: suiteName
+        )
         let userDefaults = UserDefaults(suiteName: suiteName)!
         let userDefaultsAdapter = UserDefaultsAdapter(userDefaults: userDefaults)
         let container = CKContainer(identifier: containerName)
@@ -31,7 +44,8 @@ extension CloudKitSynchronizer {
             containerIdentifier: containerName,
             database: DefaultCloudKitDatabaseAdapter(database: container.privateCloudDatabase),
             adapterProvider: provider,
-            keyValueStore: userDefaultsAdapter
+            keyValueStore: userDefaultsAdapter,
+            compatibilityVersion: compatibilityVersion
         )
         provider.beforeInitialSetup = {
             synchronizer.clearDeviceIdentifier()

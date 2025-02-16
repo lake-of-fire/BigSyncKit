@@ -40,7 +40,7 @@ public protocol ModelAdapter: AnyObject {
     
     func cleanUp()
     
-    func resetSyncCaches()
+    func resetSyncCaches() async throws
     
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool
     
@@ -98,8 +98,10 @@ public protocol ModelAdapter: AnyObject {
      *  This adapter should not be used after calling this method, create a new adapter if you wish to synchronize
      *  the same model again.
      */
-    func deleteChangeTracking() async
+//    func deleteChangeTracking() async
     
+    func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async
+
     /// Merge policy in case of conflicts. Default is `server`.
     var mergePolicy: MergePolicy {get set}
     
