@@ -1,5 +1,5 @@
 # BigSyncKit
-**Available for hire:** If you need help adding iCloud sync to your RealmSwift project, or you're using SyncKit/IceCream already and need to fix the issues you'll face with those libraries, I'm available for custom integrating this library into your existing projects. Please contact me via alex dot ehlke at gmail.
+**Available for hire:** *If you need help adding iCloud sync to your RealmSwift project, or you're using SyncKit/IceCream already and need to fix the issues you'll face with those libraries, I'm available for custom integrating this library into your existing projects. Please contact me via alex dot ehlke at gmail.*
 
 CURRENT STATUS: Working reliably in production, but docs and code need cleanup. Test suite hasn't been updated.
 
