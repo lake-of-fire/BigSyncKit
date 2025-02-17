@@ -59,7 +59,7 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
         switch error.code {
         case .serverRecordChanged:
             if let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
-                debugPrint("# added conflicted record", serverRecord.recordID.recordName)
+//                debugPrint("# added conflicted record", serverRecord.recordID.recordName)
                 let (inserted, _) = conflictedRecordIDs.insert(serverRecord.recordID)
                 if inserted {
                     conflictedRecords.append(serverRecord)
