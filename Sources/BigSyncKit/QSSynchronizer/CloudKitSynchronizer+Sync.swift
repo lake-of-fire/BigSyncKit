@@ -61,7 +61,7 @@ fileprivate class ChangeRequestProcessor {
         do {
             let downloadedRecords = batch.compactMap { $0.downloadedRecord }
             if !downloadedRecords.isEmpty {
-                try await batch.first?.adapter.saveChanges(in: downloadedRecords)
+                try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
             }
             
             let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
@@ -524,9 +524,9 @@ extension CloudKitSynchronizer {
     
     @MainActor
     func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async -> ()) async {
-        let records = adapter.recordsToUpload(limit: batchSize)
-        let recordCount = records.count
         let requestedBatchSize = batchSize
+        let records = adapter.recordsToUpload(limit: requestedBatchSize)
+        let recordCount = records.count
 //        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { await completion(nil); return }
         
@@ -581,7 +581,7 @@ extension CloudKitSynchronizer {
                         await completion(error)
                     } else if !conflicted.isEmpty {
                         do {
-                            try await adapter.saveChanges(in: conflicted)
+                            try await adapter.saveChanges(in: conflicted, forceSave: true)
                         } catch {
                             await completion(error)
                             return

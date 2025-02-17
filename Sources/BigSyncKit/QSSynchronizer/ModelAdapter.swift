@@ -38,6 +38,8 @@ public protocol ModelAdapter: AnyObject {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
     
+    var initialSetupDelegate: RealmSwiftAdapterInitialSetupDelegate? { get set }
+    
     func cleanUp()
     
     func resetSyncCaches() async throws
@@ -46,7 +48,8 @@ public protocol ModelAdapter: AnyObject {
     
     /// Apply changes in the provided record to the local model objects and save the records.
     /// - Parameter records: Array of `CKRecord` that were obtained from CloudKit.
-    func saveChanges(in records: [CKRecord]) async throws
+    /// - Parameter forceSave: Use especially for saving conflicted CKRecords which may have a newer record change tag from the server regardless of whether they have changes.
+    func saveChanges(in records: [CKRecord], forceSave: Bool) async throws
     
     /// Delete the local model objects corresponding to the given record IDs.
     /// - Parameter recordIDs: Array of identifiers of records that were deleted on CloudKit.

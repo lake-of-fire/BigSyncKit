@@ -209,15 +209,17 @@ public class CloudKitSynchronizer: NSObject {
     }
     
     @MainActor
-    public func resetSyncCaches() async throws {
+    public func resetSyncCaches(includingAdapters: Bool = true) async throws {
         cancelSynchronization()
         
         clearDeviceIdentifier()
         resetDatabaseToken()
         resetActiveTokens()
         
-        for adapter in modelAdapters {
-            try await adapter.resetSyncCaches()
+        if includingAdapters {
+            for adapter in modelAdapters {
+                try await adapter.resetSyncCaches()
+            }
         }
     }
     
@@ -319,11 +321,18 @@ public class CloudKitSynchronizer: NSObject {
     /// - Parameter adapter: The adapter to be managed by this synchronizer.
     public func addModelAdapter(_ adapter: ModelAdapter) {
         modelAdapterDictionary[adapter.recordZoneID] = adapter
+        adapter.initialSetupDelegate = self
     }
     
     /// Removes the model adapter so data managed by it won't be synced with CloudKit any more.
     /// - Parameter adapter: Adapter to be removed from the synchronizer
     public func removeModelAdapter(_ adapter: ModelAdapter) {
         modelAdapterDictionary.removeValue(forKey: adapter.recordZoneID)
+    }
+}
+
+extension CloudKitSynchronizer: RealmSwiftAdapterInitialSetupDelegate {
+    public func needsInitialSetup() async throws {
+        try await resetSyncCaches(includingAdapters: false)
     }
 }
