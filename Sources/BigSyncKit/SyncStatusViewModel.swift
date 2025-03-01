@@ -90,7 +90,7 @@ public class SyncStatusViewModel: ObservableObject {
             .subscribe(on: DispatchQueue.main)
             .sink { [weak self] notification in
                 let userInfo = notification.userInfo
-                Task { @MainActor [weak self] in
+                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                     guard let self = self else { return }
                     var syncFailed = true
                     if let error = userInfo?[CloudKitSynchronizer.errorKey] as? Error {
@@ -126,7 +126,7 @@ public class SyncStatusViewModel: ObservableObject {
     
     private func syncBegan() {
 //        guard let currentDeviceID = currentDeviceID else { return }
-//        Task { @RealmBackgroundActor in
+//        Task(priority: .background) { @RealmBackgroundActor in
 //            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID, realmConfiguration: realmConfiguration)
 //            try await refreshLastSeenDevices()
 //        }
@@ -134,7 +134,7 @@ public class SyncStatusViewModel: ObservableObject {
     
     private func syncIsOver() {
 //        guard let currentDeviceID = currentDeviceID else { return }
-//        Task { @RealmBackgroundActor in
+//        Task(priority: .background) { @RealmBackgroundActor in
 //            try await SyncedDevice.updateLastSeenOnlineIfNeeded(forUUID: currentDeviceID, realmConfiguration: realmConfiguration)
 //            try await refreshLastSeenDevices()
 //        }

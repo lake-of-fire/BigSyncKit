@@ -65,7 +65,7 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
         }
 
         start { [weak self] in
-            Task { @MainActor [weak self] in
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 
                 for synchronizer in realmSynchronizers {
@@ -76,8 +76,9 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
                     }
                     
                     NotificationCenter.default.publisher(for: .ModelAdapterHasChangesNotification)
+                        .receive(on: bigSyncKitQueue)
                         .sink { [weak self] _ in
-                            Task { @MainActor [weak self] in
+                            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                                 await self?.synchronizeCloudKit()
                             }
                         }
@@ -103,21 +104,21 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
         }
     }
     
-    @MainActor
+    @BigSyncBackgroundActor
     public func synchronizeCloudKit() async {
         for synchronizer in realmSynchronizers {
             await synchronizeCloudKit(using: synchronizer)
         }
     }
     
-    @MainActor
+    @BigSyncBackgroundActor
     public func cancelSynchronization() {
         for synchronizer in realmSynchronizers {
             synchronizer.cancelSynchronization()
         }
     }
     
-    @MainActor
+    @BigSyncBackgroundActor
     public func synchronizeCloudKit(using synchronizer: CloudKitSynchronizer) async {
         guard !synchronizer.syncing else { return }
         

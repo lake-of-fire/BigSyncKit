@@ -36,15 +36,15 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         adapter = createAdapter()
     }
     
-    @MainActor
+    @BigSyncBackgroundActor
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID recordZoneID: CKRecordZone.ID) -> ModelAdapter? {
         guard recordZoneID == zoneID else { return nil }
         return adapter
     }
     
-    @MainActor
+    @BigSyncBackgroundActor
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) async {
-        let adapterHasSyncedBefore = adapter.serverChangeToken != nil
+        let adapterHasSyncedBefore = await adapter.serverChangeToken != nil
         if recordZoneID == zoneID && adapterHasSyncedBefore {
 //            await adapter.deleteChangeTracking()
 //            synchronizer.removeModelAdapter(adapter)

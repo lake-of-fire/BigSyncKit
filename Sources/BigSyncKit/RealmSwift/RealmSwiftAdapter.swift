@@ -111,8 +111,8 @@ struct SyncRealmProvider {
     
     init?(persistenceConfiguration: Realm.Configuration, targetConfiguration: Realm.Configuration) {
         guard (try? Realm(configuration: persistenceConfiguration)) != nil &&
-            (try? Realm(configuration: targetConfiguration)) != nil else {
-                return nil
+                (try? Realm(configuration: targetConfiguration)) != nil else {
+            return nil
         }
         
         self.persistenceConfiguration = persistenceConfiguration
@@ -186,6 +186,7 @@ actor RealmProvider {
             guard let realmBackgroundActorRealm = await RealmBackgroundActor.shared.cachedRealm(for: targetConfiguration) else { fatalError("No Realm for BigSyncKit targetWriterRealmObject") }
             targetWriterRealmObject = realmBackgroundActorRealm
         } catch {
+            print(error)
             return nil
         }
     }
@@ -197,8 +198,6 @@ struct ResultsChangeSet {
 }
 
 public class RealmSwiftAdapter: NSObject, ModelAdapter {
-    //    static let shareRelationshipKey = "com.syncKit.shareRelationship"
-    
     public let persistenceRealmConfiguration: Realm.Configuration
     public let targetRealmConfiguration: Realm.Configuration
     public let excludedClassNames: [String]
@@ -247,7 +246,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         super.init()
         
-        setupSynchronousRealm()
         setupTypeNamesLookup()
 
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -314,10 +312,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
-    func setupSynchronousRealm() {
-        syncRealmProvider = SyncRealmProvider(persistenceConfiguration: persistenceRealmConfiguration, targetConfiguration: targetRealmConfiguration)
-    }
-    
     @BigSyncBackgroundActor
     func setup() async {
 //        debugPrint("# setup() ...")
@@ -371,7 +365,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                 let identifier = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                                 modified.append(identifier)
                             }
-                            Task { @BigSyncBackgroundActor [weak self] in
+                            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                                 guard let self else { return }
                                 if !inserted.isEmpty {
                                     resultsChangeSet.insertions[schema.className, default: []].formUnion(inserted)
@@ -412,7 +406,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         updateHasChanges(realm: persistenceRealm)
 
         if hasChanges {
-            Task { @MainActor in
+            Task(priority: .background) { @BigSyncBackgroundActor in
                 NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
             }
         }
@@ -595,7 +589,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         resultsChangeSetPublisher
             .debounce(for: .seconds(2), scheduler: bigSyncKitQueue)
             .sink { [weak self] _ in
-                Task(priority: .background) { [weak self] in
+                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                     await self?.processEnqueuedChanges()
                 }
             }
@@ -689,7 +683,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let isNewChangeFinal = isNewChange
         if !hasChanges && isNewChangeFinal {
             hasChanges = true
-            Task(priority: .background) { @MainActor in
+            Task(priority: .background) { @BigSyncBackgroundActor in
                 NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
             }
         }
@@ -697,7 +691,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @BigSyncBackgroundActor
     func createMissingSyncedEntities() async {
-        guard let targetReaderRealm = realmProvider?.targetReaderRealm, let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else { return }
+        guard let targetReaderRealm = await realmProvider?.targetReaderRealm, let persistenceRealm = realmProvider?.persistenceRealm else { return }
         
         var missingEntities = [String: [String]]()
         for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
@@ -1312,8 +1306,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return SyncedEntityState(rawValue: state.rawValue + 1)!
     }
     
-    func recordsToUpload(withState state: SyncedEntityState, limit: Int, syncRealmProvider: SyncRealmProvider) -> [CKRecord] {
-        let results = syncRealmProvider.syncPersistenceRealm.objects(SyncedEntity.self).where { $0.state == state.rawValue }
+    @BigSyncBackgroundActor
+    func recordsToUpload(withState state: SyncedEntityState, limit: Int) async throws -> [CKRecord] {
+        guard let results = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == state.rawValue }) else { return [] }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
         for syncedEntity in results {
@@ -1328,7 +1323,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             var entity: SyncedEntity! = syncedEntity
             while entity != nil && entity.state == state.rawValue && !includedEntityIDs.contains(entity.identifier) {
                 var parentEntity: SyncedEntity? = nil
-                guard let record = recordToUpload(syncedEntity: entity, syncRealmProvider: syncRealmProvider, parentSyncedEntity: &parentEntity) else {
+                guard let record = try await recordToUpload(syncedEntity: entity, parentSyncedEntity: &parentEntity) else {
                     entity = nil
                     continue
                 }
@@ -1341,7 +1336,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return resultArray
     }
     
-    func recordToUpload(syncedEntity: SyncedEntity, syncRealmProvider: SyncRealmProvider, parentSyncedEntity: inout SyncedEntity?) -> CKRecord? {
+    @BigSyncBackgroundActor
+    func recordToUpload(syncedEntity: SyncedEntity, parentSyncedEntity: inout SyncedEntity?) async throws -> CKRecord? {
         if syncedEntity.identifier.isEmpty {
             
         }
@@ -1351,13 +1347,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             return nil
         }
         let objectIdentifier = getObjectIdentifier(for: syncedEntity)
-        let object = syncRealmProvider.syncTargetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
+        let object = realmProvider?.targetReaderRealmObject.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
         let entityState = syncedEntity.state
         
-        guard let object = object else {
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
+        guard let object else {
             // Object does not exist, but tracking syncedEntity thinks it does.
             // We mark it as deleted so the iCloud record will get deleted too
-            syncRealmProvider.syncPersistenceRealm.writeAsync {
+            try await persistenceRealm.asyncWrite {
                 syncedEntity.entityState = .deleted
             }
             return nil
@@ -1545,9 +1542,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
                 let identifier = object.objectSchema.className + "." + Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
                 let isSynced = {
-                    guard let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else {
-                        return false
-                    }
+                    guard let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else { return false }
                     guard let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) else {
                         debugPrint("Warning: No synced entity found for identifier", identifier)
                         return false
@@ -1560,7 +1555,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 return isSynced
             }
             
-            for chunk in Array(results).chunks(ofCount: 500) {
+            for chunk in results.chunks(ofCount: 500) {
                 try? targetWriterRealm.write {
                     for item in chunk {
                         targetWriterRealm.delete(item)
@@ -1568,20 +1563,20 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             }
             
-            didDelete(identifiers: identifiersToDelete)
+            try? didDelete(identifiers: identifiersToDelete)
         }
     }
     
     // MARK: - Children records
     
     @BigSyncBackgroundActor
-    func childrenRecords(for syncedEntity: SyncedEntity) async -> [CKRecord] {
+    func childrenRecords(for syncedEntity: SyncedEntity) async throws -> [CKRecord] {
         var records = [CKRecord]()
         var parent: SyncedEntity?
         
         // TODO: Should be an exception rather than silently error return a result
-        guard let syncRealmProvider = syncRealmProvider, let persistenceRealm = realmProvider?.persistenceRealm, let targetReaderRealm = realmProvider?.targetReaderRealm else { return [] }
-        guard let record = recordToUpload(syncedEntity: syncedEntity, syncRealmProvider: syncRealmProvider, parentSyncedEntity: &parent) else {
+        guard let persistenceRealm = realmProvider?.persistenceRealm, let targetReaderRealm = realmProvider?.targetReaderRealm else { return [] }
+        guard let record = try await recordToUpload(syncedEntity: syncedEntity, parentSyncedEntity: &parent) else {
             return []
         }
         records.append(record)
@@ -1602,7 +1597,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     
                     for child in children {
                         if let childEntity = self.syncedEntity(for: child, realm: persistenceRealm) {
-                            await records.append(contentsOf: childrenRecords(for: childEntity))
+                            try await records.append(contentsOf: childrenRecords(for: childEntity))
                         }
                     }
                 }
@@ -1672,9 +1667,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         if !recordsToSave.isEmpty {
             for chunk in recordsToSave.chunked(into: 1000) {
                 try await { @RealmBackgroundActor in
-                    guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
+                    guard let targetWriterRealm = realmProvider.targetWriterRealm else { return }
 //                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
-                    guard let targetWriterRealm = await realmProvider.targetWriterRealm else { return }
                     await targetWriterRealm.asyncRefresh()
                     try await targetWriterRealm.asyncWrite { [weak self] in
                         guard let self = self else { return }
@@ -1738,8 +1732,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
                 
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-                await realmProvider.persistenceRealm?.asyncRefresh()
-                try? await realmProvider.persistenceRealm?.asyncWrite {
+                await persistenceRealm.asyncRefresh()
+                try? await persistenceRealm.asyncWrite {
                     persistenceRealm.delete(syncedEntity)
                 }
             }
@@ -1752,34 +1746,34 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    public func persistImportedChanges(completion: @escaping ((Error?) async -> Void)) async {
+    public func persistImportedChanges(completion: @escaping ((Error?) async throws -> Void)) async throws {
         guard let realmProvider = realmProvider else {
-            await completion(nil)
+            try await completion(nil)
             return
         }
         
         do {
             try await applyPendingRelationships(realmProvider: realmProvider)
         } catch {
-            await completion(error)
+            try await completion(error)
             return
         }
-        await completion(nil)
+        try await completion(nil)
     }
     
-    public func recordsToUpload(limit: Int) -> [CKRecord] {
-        guard let syncRealmProvider else { return [] }
+    @BigSyncBackgroundActor
+    public func recordsToUpload(limit: Int) async throws -> [CKRecord] {
+        guard let realmProvider else { return [] }
         var recordsArray = [CKRecord]()
         let recordLimit = limit == 0 ? Int.max : limit
         var uploadingState = SyncedEntityState.new
         
         var innerLimit = recordLimit
         while recordsArray.count < recordLimit && uploadingState.rawValue < SyncedEntityState.deleted.rawValue {
-            recordsArray.append(
+            try await recordsArray.append(
                 contentsOf: self.recordsToUpload(
                     withState: uploadingState,
-                    limit: innerLimit,
-                    syncRealmProvider: syncRealmProvider
+                    limit: innerLimit
                 )
             )
             uploadingState = self.nextStateToSync(after: uploadingState)
@@ -1791,13 +1785,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @BigSyncBackgroundActor
     public func didUpload(savedRecords: [CKRecord]) async {
-        guard let realmProvider = realmProvider else { return }
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         
         for chunk in savedRecords.chunked(into: 500) {
-            await realmProvider.persistenceRealm?.asyncRefresh()
-            try? await realmProvider.persistenceRealm?.asyncWrite {
+            await persistenceRealm.asyncRefresh()
+            try? await persistenceRealm.asyncWrite {
                 for record in chunk {
-                    if let syncedEntity = realmProvider.persistenceRealm?.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
+                    if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
                         syncedEntity.state = SyncedEntityState.synced.rawValue
                     }
                 }
@@ -1806,12 +1800,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
-    public func recordIDsMarkedForDeletion(limit: Int) -> [CKRecord.ID] {
-        guard let syncRealmProvider = syncRealmProvider else { return [] }
-        
+    @BigSyncBackgroundActor
+    public func recordIDsMarkedForDeletion(limit: Int) async -> [CKRecord.ID] {
         var recordIDs = [CKRecord.ID]()
         
-        let deletedEntities = syncRealmProvider.syncPersistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deleted.rawValue }
+        guard let deletedEntities = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == SyncedEntityState.deleted.rawValue }) else { return [] }
         
         for syncedEntity in Array(deletedEntities) {
             if recordIDs.count >= limit {
@@ -1838,11 +1831,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
-    public func didDelete(identifiers: [String]) {
+    public func didDelete(identifiers: [String]) throws {
         guard let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else { return }
         for identifier in identifiers {
             if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: identifier) {
-                try? persistenceRealm.write {
+                try persistenceRealm.write {
                     persistenceRealm.delete(syncedEntity)
                 }
             }
@@ -1879,12 +1872,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 //    }
     
     @BigSyncBackgroundActor
-    public func deleteChangeTracking(forRecordIDs recordIDs: [CKRecord.ID]) async {
+    public func deleteChangeTracking(forRecordIDs recordIDs: [CKRecord.ID]) async throws {
 //        debugPrint("# deleteChangeTracking", recordIDs.map { $0.recordName })
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         
         for chunk in recordIDs.chunks(ofCount: 1000) {
-            try? persistenceRealm.write {
+            try await persistenceRealm.asyncWrite {
                 for recordID in chunk {
                     let identifier = recordID.recordName
                     guard let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) else { continue }
@@ -1902,15 +1895,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     public var serverChangeToken: CKServerChangeToken? {
-        get {
-            guard let syncRealmProvider = syncRealmProvider else { return nil }
-            
-            var token: CKServerChangeToken?
-            let serverToken = syncRealmProvider.syncPersistenceRealm.objects(ServerToken.self).first
-            if let tokenData = serverToken?.token {
-                token = NSKeyedUnarchiver.unarchiveObject(with: tokenData) as? CKServerChangeToken
-            }
-            return token
+        get async {
+            return await { @BigSyncBackgroundActor in
+                guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
+                var token: CKServerChangeToken?
+                let serverToken = persistenceRealm.objects(ServerToken.self).first
+                if let tokenData = serverToken?.token {
+                    token = NSKeyedUnarchiver.unarchiveObject(with: tokenData) as? CKServerChangeToken
+                }
+                return token
+            }()
         }
     }
     

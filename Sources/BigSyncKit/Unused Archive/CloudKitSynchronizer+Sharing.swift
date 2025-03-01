@@ -211,7 +211,7 @@
 //                    modelAdapter.didFinishImport(with: error)
 //                    
 ////                    DispatchQueue.main.async {
-////                    Task { @MainActor in
+////                    Task(priority: .background) { @BigSyncBackgroundActor in
 //                        self.syncing = false
 //                        completion?(error)
 ////                    }
@@ -221,7 +221,7 @@
 //            } else {
 //                
 ////                DispatchQueue.main.async {
-////                Task { @MainActor in
+////                Task(priority: .background) { @BigSyncBackgroundActor in
 //                    self.syncing = false
 //                    completion?(operationError)
 ////                }

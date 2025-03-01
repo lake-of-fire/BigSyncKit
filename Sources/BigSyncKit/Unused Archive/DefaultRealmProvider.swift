@@ -135,14 +135,14 @@
 //        
 //        adapterDictionary[recordZoneID] = adapter
 //        
-//        Task { @MainActor in
+//        Task(priority: .background) { @BigSyncBackgroundActor in
 //            NotificationCenter.default.post(name: .realmProviderDidAddAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
 //        }
 //        
 //        return adapter
 //    }
 //    
-//    @MainActor
+//    @BigSyncBackgroundActor
 //    public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) async {
 //        guard let adapter = adapterDictionary[recordZoneID],
 //            adapter.serverChangeToken != nil else {
@@ -160,7 +160,7 @@
 //        let folderURL = directoryURL.appendingPathComponent(folderName)
 //        try? FileManager.default.removeItem(at: folderURL)
 //        
-//        Task { @MainActor in
+//        Task(priority: .background) { @BigSyncBackgroundActor in
 //            NotificationCenter.default.post(name: .realmProviderDidRemoveAdapter, object: self, userInfo:["CKRecordZoneID": recordZoneID])
 //        }
 //    }

@@ -10,7 +10,7 @@ import IOKit
 fileprivate struct Device {
     static var current: Device { Device() }
     
-    @MainActor
+    @BigSyncBackgroundActor
     var localizedModel: String {
         return getHardwareModel() ?? "Mac"
     }
@@ -30,7 +30,7 @@ import UIKit
 fileprivate struct Device {
     static var current: UIDevice { UIDevice.current }
     
-    @MainActor
+    @BigSyncBackgroundActor
     var localizedModel: String { UIDevice.current.localizedModel }
 }
 #endif
@@ -58,7 +58,7 @@ public class SyncedDevice: Object, UnownedSyncableObject, ObjectKeyIdentifiable 
 //        let realm = try await Realm(configuration: realmConfiguration, actor: RealmBackgroundActor.shared)
 //        
 //        // Ensure the device name is fetched on the main actor
-//        let deviceName = await MainActor.run {
+//        let deviceName = await BigSyncBackgroundActor.run {
 //            Device.current.localizedModel
 //        }
 //        

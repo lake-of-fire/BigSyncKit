@@ -58,7 +58,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         for zone in zoneIDs {
             zoneResults[zone] = FetchZoneChangesOperationZoneResult()
         }
-        Task.detached { [weak self] in
+        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
             await performFetchOperation(with: zoneIDs)
         }
@@ -97,11 +97,11 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
             if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String {
                 if let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
                    self.modelVersion > 0 && version > self.modelVersion {
-                    Task {
+                    Task(priority: .background) { @BigSyncBackgroundActor in
                         await versionChecker.setHigherModelVersionFound()
                     }
                 } else {
-                    Task { @MainActor [weak self] in
+                    Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                         self?.zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
                         await onResult?(record, nil)
                     }
@@ -110,7 +110,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         }
         
         operation.recordWithIDWasDeletedBlock = { recordID, recordType in
-            Task { @MainActor [weak self] in
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 zoneResults[recordID.zoneID]?.deletedRecordIDs.append(recordID)
                 await onResult?(nil, recordID)
@@ -119,7 +119,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         
         operation.recordZoneFetchCompletionBlock = {
             zoneID, serverChangeToken, clientChangeTokenData, moreComing, recordZoneError in
-            Task { @MainActor [weak self] in
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 let results = zoneResults[zoneID]!
                 
@@ -135,7 +135,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         }
         
         operation.fetchRecordZoneChangesCompletionBlock = { operationError in
-            Task { @MainActor [weak self] in
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 if let error = operationError,
                    (error as NSError).code != CKError.partialFailure.rawValue { // Partial errors are returned per zone

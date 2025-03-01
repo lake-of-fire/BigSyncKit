@@ -57,12 +57,12 @@ public protocol ModelAdapter: AnyObject {
     
     /// Tells the model adapter to persist all downloaded changes in the current import operation.
     /// - Parameter completion: Block to be called after changes have been persisted.
-    func persistImportedChanges(completion: @escaping (Error?) async -> ()) async
+    func persistImportedChanges(completion: @escaping (Error?) async throws -> ()) async throws
     
     /// Provides an array of up to `limit` records with changes that need to be uploaded to CloudKit.
     /// - Parameter limit: Maximum number of records that should be provided.
     /// - Returns: Array of `CKRecord`.
-    func recordsToUpload(limit: Int) -> [CKRecord]
+    func recordsToUpload(limit: Int) async throws -> [CKRecord]
     
     /// Tells the model adapter that these records were uploaded successfully to CloudKit.
     /// - Parameter savedRecords: Records that were saved.
@@ -71,7 +71,7 @@ public protocol ModelAdapter: AnyObject {
     /// Provides an array of record IDs to be deleted on CloudKit, for model objects that were deleted locally.
     /// - Parameter limit: Maximum number of records that should be provided.
     /// - Returns: Array of `CKRecordID`.
-    func recordIDsMarkedForDeletion(limit: Int) -> [CKRecord.ID]
+    func recordIDsMarkedForDeletion(limit: Int) async -> [CKRecord.ID]
     
     /// Tells the model adapter that these record identifiers were deleted successfully from CloudKit.
     /// - Parameter recordIDs: Record IDs that were deleted on CloudKit.
@@ -90,7 +90,7 @@ public protocol ModelAdapter: AnyObject {
     var recordZoneID: CKRecordZone.ID { get }
     
     /// Latest `CKServerChangeToken` stored by this adapter, or `nil` if one does not exist.
-    var serverChangeToken: CKServerChangeToken? { get }
+    var serverChangeToken: CKServerChangeToken? { get async }
     
     /// Save given token for future use by this adapter.
     /// - Parameter token: `CKServerChangeToken`
@@ -103,7 +103,7 @@ public protocol ModelAdapter: AnyObject {
      */
 //    func deleteChangeTracking() async
     
-    func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async
+    func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async throws
 
     /// Merge policy in case of conflicts. Default is `server`.
     var mergePolicy: MergePolicy {get set}
