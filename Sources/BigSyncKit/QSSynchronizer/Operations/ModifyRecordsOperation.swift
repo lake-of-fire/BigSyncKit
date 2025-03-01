@@ -66,7 +66,7 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
                 }
             }
         case .unknownItem:
-            debugPrint("# Record not found in CloudKit (Unknown Item)", recordID.recordName)
+//            debugPrint("# Record not found in CloudKit (Unknown Item)", recordID.recordName)
             recordIDsMissingOnServer.insert(recordID)
         default:
             break
