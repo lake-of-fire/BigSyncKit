@@ -19,6 +19,7 @@ import Combine
 import RealmSwiftGaps
 import Algorithms
 import AsyncAlgorithms
+import Logging
 
 //extension Realm {
 //    public func safeWrite(_ block: (() throws -> Void)) throws {
@@ -210,6 +211,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     public var beforeInitialSetup: (() -> Void)?
     
+    private let logger: Logging.Logger
+    
     private lazy var tempFileManager: TempFileManager = {
         TempFileManager(identifier: "\(recordZoneID.ownerName).\(recordZoneID.zoneName).\(targetRealmConfiguration.fileURL?.lastPathComponent ?? UUID().uuidString).\(targetRealmConfiguration.schemaVersion)")
     }()
@@ -232,17 +235,24 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     private var realmPollTimer: AnyCancellable?
     private var appForegroundCancellable: AnyCancellable?
     private let immediateChecksSubject = PassthroughSubject<Void, Never>()
-
+    
     private var pendingRelationshipQueue = [PendingRelationshipRequest]()
     
     private var cancellables = Set<AnyCancellable>()
     
-    public init(persistenceRealmConfiguration: Realm.Configuration, targetRealmConfiguration: Realm.Configuration, excludedClassNames: [String], recordZoneID: CKRecordZone.ID) {
+    public init(
+        persistenceRealmConfiguration: Realm.Configuration,
+        targetRealmConfiguration: Realm.Configuration,
+        excludedClassNames: [String],
+        recordZoneID: CKRecordZone.ID,
+        logger: Logging.Logger
+    ) {
         
         self.persistenceRealmConfiguration = persistenceRealmConfiguration
         self.targetRealmConfiguration = targetRealmConfiguration
         self.excludedClassNames = excludedClassNames
         self.zoneID = recordZoneID
+        self.logger = logger
         
         super.init()
         
@@ -325,7 +335,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             do {
                 try await initialSetupDelegate?.needsInitialSetup()
             } catch {
-                print(error)
+//                print(error)
+                logger.error("\(error)")
             }
         }
         
@@ -490,7 +501,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
             return attrs[.modificationDate] as? Date
         } catch {
-            print("Could not read file attributes for \(url.path): \(error)")
+//            print("Could not read file attributes for \(url.path): \(error)")
+            logger.error("Could not read file attributes for \(url.path): \(error)")
             return nil
         }
     }
@@ -505,7 +517,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
               let targetReaderRealm = realmProvider.targetReaderRealm,
               let syncedEntityType = try? await getOrCreateSyncedEntityType(schemaName)
         else {
-            print("Could not get realms or syncedEntityType for \(schemaName)")
+//            print("Could not get realms or syncedEntityType for \(schemaName)")
+            logger.error("Could not get realms or syncedEntityType for \(schemaName)")
             return
         }
         
@@ -709,7 +722,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
         for (entityType, identifiers) in missingEntities {
-            debugPrint("Create", identifiers.count, "missing synced entities for", entityType)
+//            debugPrint("Create", identifiers.count, "missing synced entities for", entityType)
+            logger.info("Create \(identifiers.count) missing synced entities for \(entityType)")
             await createSyncedEntities(entityType: entityType, identifiers: identifiers)
         }
     }
@@ -1209,7 +1223,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
             } catch {
-                debugPrint("Error during persistPendingRelationships:", error)
+//                debugPrint("Error during persistPendingRelationships:", error)
+                logger.error("Error during persistPendingRelationships: \(error)")
                 break
             }
         }
@@ -1536,7 +1551,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             results = results.filter { object in
                 // TODO: Consolidate with syncedEntity(for ...)
                 guard let objectClass = self.realmObjectClass(name: object.objectSchema.className) else {
-                    debugPrint("Unexpectedly could not get realm object class for", object.objectSchema.className)
+//                    debugPrint("Unexpectedly could not get realm object class for", object.objectSchema.className)
+                    logger.error("Unexpectedly could not get realm object class for \(object.objectSchema.className)")
                     return false
                 }
                 let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
@@ -1544,7 +1560,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 let isSynced = {
                     guard let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else { return false }
                     guard let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) else {
-                        debugPrint("Warning: No synced entity found for identifier", identifier)
+//                        debugPrint("Warning: No synced entity found for identifier", identifier)
+                        logger.error("Warning: No synced entity found for identifier \(identifier)")
                         return false
                     }
                     return syncedEntity.entityState == .synced || syncedEntity.entityState == .new
@@ -1699,8 +1716,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func deleteRecords(with recordIDs: [CKRecord.ID]) async {
         guard let realmProvider = realmProvider else { return }
         guard recordIDs.count != 0 else { return }
-        debugPrint("Deleting records with record ids \(recordIDs.map { $0.recordName })")
-        
+//        debugPrint("Deleting records with record ids \(recordIDs.map { $0.recordName })")
+        logger.info("Deleting records with record ids \(recordIDs.map { $0.recordName })")
+
         var countDeleted = 0
         for recordID in recordIDs {
             guard let persistenceRealm = realmProvider.persistenceRealm else { return }

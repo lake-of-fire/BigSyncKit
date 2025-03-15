@@ -125,7 +125,8 @@ extension CloudKitSynchronizer {
             if let error = error as? CKError {
                 switch error.code {
                 case .changeTokenExpired:
-                    debugPrint("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
+//                    debugPrint("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
+                    logger.info("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
                     // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
                     self.resetDatabaseToken()
                     await fetchChanges()
@@ -374,10 +375,12 @@ extension CloudKitSynchronizer {
                 }).first
                 for (zoneID, zoneResult) in zoneResults {
                     if !zoneResult.downloadedRecords.isEmpty {
-                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
+//                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
+                        logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
                     }
                     if !zoneResult.deletedRecordIDs.isEmpty {
-                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
+//                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
+                        logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
                     }
                     do {
                         try await { @BigSyncBackgroundActor [weak self] in
@@ -510,9 +513,10 @@ extension CloudKitSynchronizer {
             guard let self = self else { return }
             if isZoneNotFoundOrDeletedError(error) {
                 let newZone = CKRecordZone(zoneID: zoneID)
-                database.save(zone: newZone, completionHandler: { (zone, error) in
+                database.save(zone: newZone, completionHandler: { [weak self] (zone, error) in
                     if error == nil && zone != nil {
-                        debugPrint("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
+//                        debugPrint("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
+                        self?.logger.info("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
                     }
                     Task(priority: .background) { @BigSyncBackgroundActor in
                         try await completion(error)
@@ -552,7 +556,8 @@ extension CloudKitSynchronizer {
                 guard let self = self else { return }
                 var conflicted = conflicted
                 if !(savedRecords?.isEmpty ?? true) {
-                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
+//                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
+                    logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                 }
                 await adapter.didUpload(savedRecords: savedRecords ?? [])
                 
@@ -624,8 +629,9 @@ extension CloudKitSynchronizer {
         let modifyRecordsOperation = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: recordIDs)
         modifyRecordsOperation.modifyRecordsCompletionBlock = { savedRecords, deletedRecordIDs, operationError in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self = self else { return }
-                debugPrint("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
+                guard let self else { return }
+//                debugPrint("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
+                logger.info("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
                 await adapter.didDelete(recordIDs: deletedRecordIDs ?? [])
                 
                 if let error = operationError {

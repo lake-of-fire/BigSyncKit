@@ -3,6 +3,7 @@ import CloudKit
 import Realm
 import RealmSwift
 import Combine
+import Logging
 
 public struct BigSyncBackgroundWorkerConfiguration {
     let synchronizerName: String
@@ -12,6 +13,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let suiteName: String?
     let recordZoneID: CKRecordZone.ID?
     let compatibilityVersion: Int
+    let logger: Logging.Logger
     
     public init(
         synchronizerName: String,
@@ -20,7 +22,8 @@ public struct BigSyncBackgroundWorkerConfiguration {
         excludedClassNames: [String],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
-        compatibilityVersion: Int = 0
+        compatibilityVersion: Int = 0,
+        logger: Logging.Logger
     ) {
         self.synchronizerName = synchronizerName
         self.containerName = containerName
@@ -29,6 +32,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.suiteName = suiteName
         self.recordZoneID = recordZoneID
         self.compatibilityVersion = compatibilityVersion
+        self.logger = logger
     }
 }
 
@@ -42,7 +46,10 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
     
 #warning("need to manually refresh() in bg threads (after write block) for notifs to work here (?)")
     
-    public init(configurations: [BigSyncBackgroundWorkerConfiguration], delegate: RealmSwiftAdapterDelegate? = nil) {
+    public init(
+        configurations: [BigSyncBackgroundWorkerConfiguration],
+        delegate: RealmSwiftAdapterDelegate? = nil
+    ) {
         synchronizerDelegate = delegate
         
         super.init()
@@ -55,7 +62,8 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
                 excludedClassNames: config.excludedClassNames,
                 suiteName: config.suiteName,
                 recordZoneID: config.recordZoneID,
-                compatibilityVersion: config.compatibilityVersion
+                compatibilityVersion: config.compatibilityVersion,
+                logger: config.logger
             )
             
             (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom

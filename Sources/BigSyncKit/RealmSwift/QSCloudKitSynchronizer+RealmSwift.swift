@@ -9,6 +9,7 @@
 import Foundation
 import RealmSwift
 import CloudKit
+import Logging
 
 extension CloudKitSynchronizer {
     /**
@@ -27,7 +28,8 @@ extension CloudKitSynchronizer {
         excludedClassNames: [String],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
-        compatibilityVersion: Int = 0
+        compatibilityVersion: Int = 0,
+        logger: Logging.Logger
     ) -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
         let provider = DefaultRealmSwiftAdapterProvider(
@@ -45,7 +47,8 @@ extension CloudKitSynchronizer {
             database: DefaultCloudKitDatabaseAdapter(database: container.privateCloudDatabase),
             adapterProvider: provider,
             keyValueStore: userDefaultsAdapter,
-            compatibilityVersion: compatibilityVersion
+            compatibilityVersion: compatibilityVersion,
+            logger: logger
         )
         provider.beforeInitialSetup = {
             synchronizer.clearDeviceIdentifier()

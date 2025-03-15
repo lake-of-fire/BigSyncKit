@@ -8,6 +8,7 @@
 import Foundation
 import CloudKit
 import RealmSwift
+import Logging
 
 public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let zoneID: CKRecordZone.ID
@@ -15,6 +16,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let targetConfiguration: Realm.Configuration
     let excludedClassNames: [String]
     let appGroup: String?
+    let logger: Logging.Logger
     public private(set) var adapter: RealmSwiftAdapter!
    
     public var beforeInitialSetup: (() -> Void)? {
@@ -23,11 +25,18 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         }
     }
     
-    public init(targetConfiguration: Realm.Configuration, excludedClassNames: [String], zoneID: CKRecordZone.ID, appGroup: String? = nil) {
+    public init(
+        targetConfiguration: Realm.Configuration,
+        excludedClassNames: [String],
+        zoneID: CKRecordZone.ID,
+        appGroup: String? = nil,
+        logger: Logging.Logger
+    ) {
         self.targetConfiguration = targetConfiguration
         self.excludedClassNames = excludedClassNames
         self.zoneID = zoneID
         self.appGroup = appGroup
+        self.logger = logger
         persistenceConfiguration = DefaultRealmSwiftAdapterProvider.createPersistenceConfiguration(
             suiteName: appGroup,
             zoneID: zoneID
@@ -63,7 +72,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
             persistenceRealmConfiguration: persistenceConfiguration,
             targetRealmConfiguration: targetConfiguration,
             excludedClassNames: excludedClassNames,
-            recordZoneID: zoneID
+            recordZoneID: zoneID,
+            logger: logger
         )
     }
     

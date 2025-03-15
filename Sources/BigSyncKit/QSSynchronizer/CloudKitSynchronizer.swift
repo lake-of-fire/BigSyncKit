@@ -7,6 +7,7 @@
 
 import Foundation
 import CloudKit
+import Logging
 
 // For Swift
 public extension Notification.Name {
@@ -156,6 +157,8 @@ public class CloudKitSynchronizer: NSObject {
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     
+    internal let logger: Logging.Logger
+    
     /// Default number of records to send in an upload operation.
     public static var defaultBatchSize = 400 // Apple's suggestion
     static let deviceUUIDKey = "QSCloudKitDeviceUUIDKey"
@@ -175,7 +178,8 @@ public class CloudKitSynchronizer: NSObject {
         database: CloudKitDatabaseAdapter,
         adapterProvider: AdapterProvider,
         keyValueStore: KeyValueStore = UserDefaultsAdapter(userDefaults: UserDefaults.standard),
-        compatibilityVersion: Int = 0
+        compatibilityVersion: Int = 0,
+        logger: Logging.Logger
     ) {
         self.identifier = identifier
         self.containerIdentifier = containerIdentifier
@@ -183,6 +187,7 @@ public class CloudKitSynchronizer: NSObject {
         self.database = database
         self.keyValueStore = keyValueStore
         self.compatibilityVersion = compatibilityVersion
+        self.logger = logger
         super.init()
         
         BackupDetection.runBackupDetection { (result, error) in
@@ -300,12 +305,14 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     public func deleteRecordZone(for adapter: ModelAdapter, completion: ((Error?) -> ())?) {
         database.delete(withRecordZoneID: adapter.recordZoneID) { (zoneID, error) in
-            Task(priority: .background) { @BigSyncBackgroundActor in
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 await adapter.saveToken(nil)
                 if let error = error {
-                    debugPrint("CloudKitSynchronizer >> Error: \(error)")
+//                    debugPrint("CloudKitSynchronizer >> Error: \(error)")
+                    self?.logger.error("CloudKitSynchronizer >> Error: \(error)")
                 } else {
-                    debugPrint("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
+//                    debugPrint("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
+                    self?.logger.error("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
                 }
                 completion?(error)
             }
