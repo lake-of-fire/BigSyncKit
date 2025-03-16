@@ -36,7 +36,8 @@ extension CloudKitSynchronizer {
             targetConfiguration: configuration,
             excludedClassNames: excludedClassNames,
             zoneID: zoneID,
-            appGroup: suiteName
+            appGroup: suiteName,
+            logger: logger
         )
         let userDefaults = UserDefaults(suiteName: suiteName)!
         let userDefaultsAdapter = UserDefaultsAdapter(userDefaults: userDefaults)
