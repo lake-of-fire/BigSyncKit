@@ -713,7 +713,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
             
             let objects = targetReaderRealm.objects(objectClass)
-            for object in objects {
+            for object in Array(objects) {
                 guard let (entityType, identifier) = syncedEntityTypeAndIdentifier(for: object) else { continue }
                 let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
                 if syncedEntity == nil {
@@ -1326,7 +1326,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let results = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == state.rawValue }) else { return [] }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
-        for syncedEntity in results {
+        for syncedEntity in Array(results) {
             if resultArray.count >= limit {
                 break
             }
@@ -1612,7 +1612,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     let predicate = NSPredicate(format: "%K == %@", relationship.childParentKey, object)
                     let children = targetReaderRealm.objects(childObjectClass.self).filter(predicate)
                     
-                    for child in children {
+                    for child in Array(children) {
                         if let childEntity = self.syncedEntity(for: child, realm: persistenceRealm) {
                             try await records.append(contentsOf: childrenRecords(for: childEntity))
                         }
@@ -1717,7 +1717,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let realmProvider = realmProvider else { return }
         guard recordIDs.count != 0 else { return }
 //        debugPrint("Deleting records with record ids \(recordIDs.map { $0.recordName })")
-        logger.info("Deleting records with record ids \(recordIDs.map { $0.recordName })")
 
         var countDeleted = 0
         for recordID in recordIDs {
@@ -1761,6 +1760,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try? await Task.sleep(nanoseconds: 20_000)
             }
         }
+        
+        logger.info("Deleted \(countDeleted) local records which were previously deleted from iCloud")
     }
     
     @BigSyncBackgroundActor
