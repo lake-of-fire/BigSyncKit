@@ -131,6 +131,7 @@ extension CloudKitSynchronizer {
                     self.resetDatabaseToken()
                     await fetchChanges()
                 default:
+                    logger.error("QSCloudKitSynchronizer >> Aborting due to error: \(error)")
                     break
                 }
             }
@@ -140,6 +141,7 @@ extension CloudKitSynchronizer {
         }
         
 //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
+//        logger.info("QSCloudKitSynchronizer >> Finishing synchronization")
     }
 }
 
