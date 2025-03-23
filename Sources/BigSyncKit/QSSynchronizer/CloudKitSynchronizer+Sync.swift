@@ -109,7 +109,7 @@ extension CloudKitSynchronizer {
         postNotification(.SynchronizerDidSynchronize)
         delegate?.synchronizerDidSync(self)
     }
-        
+    
     @BigSyncBackgroundActor
     func failSynchronization(error: Error) async {
         resetActiveTokens()
@@ -156,6 +156,9 @@ extension CloudKitSynchronizer {
                 break
             }
         }
+        
+        try? await Task.sleep(nanoseconds: 10_000_000_000)
+        beginSynchronization()
         
 //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
 //        logger.info("QSCloudKitSynchronizer >> Finishing synchronization")
@@ -224,7 +227,7 @@ extension CloudKitSynchronizer {
         if /*isServerRecordChangedError(error) ||*/ isLimitExceededError(error) {
             return uploadRetries < 5
         } else {
-            return false
+            return isServerRecordChangedError(error)
         }
     }
     
@@ -396,12 +399,12 @@ extension CloudKitSynchronizer {
                 }).first
                 for (zoneID, zoneResult) in zoneResults {
                     if !zoneResult.downloadedRecords.isEmpty {
-//                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
-                        logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
+                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
+                        logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records from zone \(zoneID.zoneName)")
                     }
                     if !zoneResult.deletedRecordIDs.isEmpty {
 //                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
-                        logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs >> from zone \(zoneID.zoneName)")
+                        logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs from zone \(zoneID.zoneName)")
                     }
                     do {
                         try await { @BigSyncBackgroundActor [weak self] in
@@ -557,7 +560,7 @@ extension CloudKitSynchronizer {
         let requestedBatchSize = batchSize
         let records = try await adapter.recordsToUpload(limit: requestedBatchSize)
         let recordCount = records.count
-        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
+//        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
@@ -569,7 +572,7 @@ extension CloudKitSynchronizer {
         
         //Add metadata: device UUID and model version
         addMetadata(to: records)
-        debugPrint("## Upload", records.map {($0.recordID, $0) })
+//        debugPrint("## Upload", records.map {($0.recordID, $0) })
         let modifyRecordsOperation = ModifyRecordsOperation(database: database,
                                                records: records,
                                                recordIDsToDelete: nil)
@@ -617,7 +620,7 @@ extension CloudKitSynchronizer {
                                 resolvedRecords.append(serverRecord)
                             }
                         }
-                        debugPrint("## Resolved Recos", resolvedRecords.map {($0.recordID, $0) })
+//                        debugPrint("## Resolved Recos", resolvedRecords.map {($0.recordID, $0) })
                         if !resolvedRecords.isEmpty {
                             do {
                                 try await adapter.saveChanges(in: resolvedRecords, forceSave: true)

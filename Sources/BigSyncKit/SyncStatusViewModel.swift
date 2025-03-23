@@ -67,7 +67,7 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerWillSynchronize)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                guard let self = self else { return }
+                guard let self else { return }
                 syncStatus = "Preparing to Synchronize"
                 syncFailed = false
                 syncBegan()
@@ -77,7 +77,7 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerWillFetchChanges)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                guard let self = self else { return }
+                guard let self else { return }
                 syncStatus = "Fetching Changes"
                 syncFailed = false
             }
@@ -86,7 +86,7 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerWillUploadChanges)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                guard let self = self else { return }
+                guard let self else { return }
                 syncStatus = "Uploading Changes"
                 syncFailed = false
             }
@@ -95,8 +95,12 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerDidSynchronize)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                guard let self = self else { return }
-                syncStatus = "Synchronization Completed"
+                guard let self else { return }
+                if changesRemainingToUpload ?? 0 > 0 {
+                    syncStatus = "Partial Synchronization Completed"
+                } else {
+                    syncStatus = "Synchronization Completed"
+                }
                 syncFailed = false
                 syncIsOver()
             }
