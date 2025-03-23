@@ -79,10 +79,6 @@ public protocol RealmSwiftAdapterRecordProcessing: AnyObject {
     func shouldProcessPropertyInDownload(propertyName: String, object: Object, record: CKRecord) -> Bool
 }
 
-public protocol RealmSwiftAdapterInitialSetupDelegate: AnyObject {
-    func needsInitialSetup() async throws
-}
-
 struct ChildRelationship {
     let parentEntityName: String
     let childEntityName: String
@@ -199,6 +195,7 @@ actor RealmProvider {
         
         do {
             persistenceRealmObject = try await Realm(configuration: persistenceConfiguration, actor: BigSyncBackgroundActor.shared)
+            debugPrint("# persistence realm", persistenceRealmObject.configuration.fileURL)
             
             var targetReaderRealmObjects = [Realm]()
             for targetConfiguration in targetConfigurations {
@@ -249,7 +246,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public var mergePolicy: MergePolicy = .server
     public weak var delegate: RealmSwiftAdapterDelegate?
     public weak var recordProcessingDelegate: RealmSwiftAdapterRecordProcessing?
-    public weak var initialSetupDelegate: RealmSwiftAdapterInitialSetupDelegate?
+    public weak var modelAdapterDelegate: ModelAdapterDelegate?
     public var forceDataTypeInsteadOfAsset: Bool = false
     
     public var beforeInitialSetup: (() -> Void)?
@@ -290,7 +287,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         recordZoneID: CKRecordZone.ID,
         logger: Logging.Logger
     ) {
-        
         self.persistenceRealmConfiguration = persistenceRealmConfiguration
         self.targetRealmConfigurations = targetRealmConfigurations
         self.excludedClassNames = excludedClassNames
@@ -381,7 +377,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         if needsInitialSetup {
             do {
-                try await initialSetupDelegate?.needsInitialSetup()
+                try await modelAdapterDelegate?.needsInitialSetup()
             } catch {
 //                print(error)
                 logger.error("\(error)")
@@ -461,18 +457,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         startPollingForChanges()
-
+        
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         updateHasChanges(realm: persistenceRealm)
 
-        if hasChanges {
-            Task(priority: .background) { @BigSyncBackgroundActor in
-                NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
-            }
-        }
-        
         await setupPublisherDebouncer()
         await setupChildrenRelationshipsLookup()
+        
+//        if hasChanges {
+//            Task { @BigSyncBackgroundActor in
+//                await modelAdapterDelegate?.hasChangesToUpload()
+//            }
+//        }
     }
     
     private func observeAppForegroundNotifications() {
@@ -648,6 +644,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             }
         }
+        
+        if hasChanges {
+            Task { @BigSyncBackgroundActor in
+                await modelAdapterDelegate?.hasChangesToUpload()
+            }
+        }
     }
     
     private func setupPublisherDebouncer() {
@@ -672,7 +674,15 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @BigSyncBackgroundActor
     func updateHasChanges(realm: Realm) {
         let results = realm.objects(SyncedEntity.self).where { $0.state != SyncedEntityState.synced.rawValue }
-        hasChanges = results.first != nil
+        let count = results.count
+        hasChanges = count > 0
+        Task(priority: .background) { @BigSyncBackgroundActor in
+            NotificationCenter.default.post(
+                name: .SynchronizerChangesRemainingToUpload,
+                object: nil,
+                userInfo: ["CloudKitSynchronizerChangesRemainingToUploadKey": count]
+            )
+        }
     }
     
     @BigSyncBackgroundActor
@@ -730,7 +740,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 isNewChange = true
             }
         } else if !inserted {
-            guard let syncedEntity = syncedEntity else {
+            guard let syncedEntity else {
                 return
             }
             
@@ -747,12 +757,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
         
-        let isNewChangeFinal = isNewChange
-        if !hasChanges && isNewChangeFinal {
+        if !hasChanges && isNewChange {
             hasChanges = true
-            Task(priority: .background) { @BigSyncBackgroundActor in
-                NotificationCenter.default.post(name: .ModelAdapterHasChangesNotification, object: self)
-            }
         }
     }
     
@@ -1882,6 +1888,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
+        
+        updateHasChanges(realm: persistenceRealm)
     }
     
     @BigSyncBackgroundActor
@@ -1932,7 +1940,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         tempFileManager.clearTempFiles()
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-        self.updateHasChanges(realm: persistenceRealm)
+        updateHasChanges(realm: persistenceRealm)
     }
     
 //    @BigSyncBackgroundActor

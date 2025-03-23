@@ -11,17 +11,18 @@ import Logging
 
 // For Swift
 public extension Notification.Name {
-    
     /// Sent when the synchronizer is going to start a sync with CloudKit.
     static let SynchronizerWillSynchronize = Notification.Name("QSCloudKitSynchronizerWillSynchronizeNotification")
     /// Sent when the synchronizer is going to start the fetch stage, where it downloads any new changes from CloudKit.
     static let SynchronizerWillFetchChanges = Notification.Name("QSCloudKitSynchronizerWillFetchChangesNotification")
     /// Sent when the synchronizer is going to start the upload stage, where it sends changes to CloudKit.
     static let SynchronizerWillUploadChanges = Notification.Name("QSCloudKitSynchronizerWillUploadChangesNotification")
-    /// Sent when the synchronizer finishes syncing.
+//    /// Sent when the synchronizer finishes syncing.
     static let SynchronizerDidSynchronize = Notification.Name("QSCloudKitSynchronizerDidSynchronizeNotification")
     /// Sent when the synchronizer encounters an error while syncing.
     static let SynchronizerDidFailToSynchronize = Notification.Name("QSCloudKitSynchronizerDidFailToSynchronizeNotification")
+    /// Reports remaining changes
+    static let SynchronizerChangesRemainingToUpload = Notification.Name("QSCloudKitSynchronizerChangesRemainingToUploadNotification")
 }
 
 // For Obj-C
@@ -87,7 +88,7 @@ public class CloudKitSynchronizer: NSObject {
         /**
          *  A record fot the provided object was not found, so the object cannot be shared on CloudKit.
          */
-        case recordNotFound = 2
+//        case recordNotFound = 2
         /**
          *  Synchronization was manually cancelled.
          */
@@ -151,7 +152,7 @@ public class CloudKitSynchronizer: NSObject {
     internal var serverChangeToken: CKServerChangeToken?
     internal var activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
     internal var cancelSync = false
-    internal var completion: ((Error?) -> ())?
+//    internal var onFailure: ((Error) -> ())?
     @BigSyncBackgroundActor
     internal weak var currentOperation: Operation?
     internal var uploadRetries = 0
@@ -234,18 +235,18 @@ public class CloudKitSynchronizer: NSObject {
     public static let metadataKeys: [String] = [CloudKitSynchronizer.deviceUUIDKey, CloudKitSynchronizer.modelCompatibilityVersionKey]
     
     /// Synchronize data with CloudKit.
-    /// - Parameter completion: Completion block that receives an optional error. Could be a `SyncError`, `CKError`, or any other error found during synchronization.
+    /// - Parameter onFailure: Block that receives an error if the synchronization stopped due to a failure. Could be a `SyncError`, `CKError`, or any other error found during synchronization.
     @BigSyncBackgroundActor
-    @objc public func synchronize(completion: ((Error?) -> ())?) {
+    @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
         guard !syncing else {
-            completion?(SyncError.alreadySyncing)
+//            onFailure?(SyncError.alreadySyncing)
             return
         }
         
 //        debugPrint("CloudKitSynchronizer >> Initiating synchronization", identifier, containerIdentifier)
         cancelSync = false
         syncing = true
-        self.completion = completion
+//        self.onFailure = onFailure
         
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             await self?.performSynchronization()
@@ -328,7 +329,7 @@ public class CloudKitSynchronizer: NSObject {
     /// - Parameter adapter: The adapter to be managed by this synchronizer.
     public func addModelAdapter(_ adapter: ModelAdapter) {
         modelAdapterDictionary[adapter.recordZoneID] = adapter
-        adapter.initialSetupDelegate = self
+        adapter.modelAdapterDelegate = self
     }
     
     /// Removes the model adapter so data managed by it won't be synced with CloudKit any more.
@@ -338,8 +339,12 @@ public class CloudKitSynchronizer: NSObject {
     }
 }
 
-extension CloudKitSynchronizer: RealmSwiftAdapterInitialSetupDelegate {
+extension CloudKitSynchronizer: ModelAdapterDelegate {
     public func needsInitialSetup() async throws {
         try await resetSyncCaches(includingAdapters: false)
+    }
+    
+    public func hasChangesToUpload() async {
+        await beginSynchronization() //onFailure: <#T##((any Error) -> ())?##((any Error) -> ())?##(any Error) -> ()#>)
     }
 }

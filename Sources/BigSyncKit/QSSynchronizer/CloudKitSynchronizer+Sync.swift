@@ -104,7 +104,14 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func finishSynchronization(error: Error?) async {
+    func broadcastDidSynchronize() async {
+        debugPrint("# broadcastDidSynchronize()")
+        postNotification(.SynchronizerDidSynchronize)
+        delegate?.synchronizerDidSync(self)
+    }
+        
+    @BigSyncBackgroundActor
+    func failSynchronization(error: Error) async {
         resetActiveTokens()
         
         uploadRetries = 0
@@ -115,29 +122,39 @@ extension CloudKitSynchronizer {
         
         syncing = false
         cancelSync = false
-        completion?(error)
-        completion = nil
+//        onFailure?(error)
+//        onFailure = nil
         
-        if let error = error {
             self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [CloudKitSynchronizer.errorKey: error])
             self.delegate?.synchronizerDidfailToSync(self, error: error)
             
-            if let error = error as? CKError {
-                switch error.code {
-                case .changeTokenExpired:
-//                    debugPrint("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
-                    logger.info("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
-                    // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
-                    self.resetDatabaseToken()
-                    await fetchChanges()
-                default:
-                    logger.error("QSCloudKitSynchronizer >> Aborting due to error: \(error)")
-                    break
-                }
+        if let error = error as? BigSyncKit.CloudKitSynchronizer.SyncError {
+            switch error {
+                //                    case .callFailed:
+                //                        print("Sync error: \(error.localizedDescription) This error could be returned by completion block when no success and no error were produced.")
+//            case .alreadySyncing:
+//                // Received when synchronize is called while there was an ongoing synchronization.
+//                break
+//            case .cancelled:
+//                print("Sync error: \(error.localizedDescription) Synchronization was manually cancelled.")
+            case .higherModelVersionFound:
+                // TODO: This error can be detected to prompt the user to update the app to a newer version.
+                // TODO: Show this error inside settings view
+                print("Sync error: \(error.localizedDescription) A synchronizer with a higher `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.")
+            default: break
             }
-        } else {
-            postNotification(.SynchronizerDidSynchronize)
-            delegate?.synchronizerDidSync(self)
+        } else if let error = error as? CKError {
+            switch error.code {
+            case .changeTokenExpired:
+                //                    debugPrint("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
+                logger.info("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
+                // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
+                self.resetDatabaseToken()
+                await fetchChanges()
+            default:
+                logger.error("QSCloudKitSynchronizer >> Aborting due to error: \(error)")
+                break
+            }
         }
         
 //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
@@ -160,7 +177,7 @@ extension CloudKitSynchronizer {
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
         operation.errorHandler = { [weak self] operation, error in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                await self?.finishSynchronization(error: error)
+                await self?.failSynchronization(error: error)
             }
         }
         currentOperation = operation
@@ -205,7 +222,7 @@ extension CloudKitSynchronizer {
     
     func shouldRetryUpload(for error: NSError) -> Bool {
         if isServerRecordChangedError(error) || isLimitExceededError(error) {
-            return uploadRetries < 2
+            return uploadRetries < 5
         } else {
             return false
         }
@@ -278,8 +295,9 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchChanges() async {
+        debugPrint("# fetchChanges")
         guard !cancelSync else {
-            await finishSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled)
             return
         }
         
@@ -287,8 +305,8 @@ extension CloudKitSynchronizer {
         
         await fetchDatabaseChanges() { [weak self] token, error in
             guard let self else { return }
-            guard error == nil else {
-                await finishSynchronization(error: error)
+            if let error {
+                await failSynchronization(error: error)
                 return
             }
             
@@ -297,14 +315,14 @@ extension CloudKitSynchronizer {
             if syncMode == .sync {
                 try await uploadChanges()
             } else {
-                await finishSynchronization(error: nil)
+                await broadcastDidSynchronize()
             }
         }
     }
     
     @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async throws -> ()) async {
-//        debugPrint("# fetchDatabaseChanges()", containerIdentifier, serverChangeToken)
+        debugPrint("# fetchDatabaseChanges()", containerIdentifier, serverChangeToken)
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
@@ -326,9 +344,10 @@ extension CloudKitSynchronizer {
                     }
                     
                     fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
+                        debugPrint("# fetchZoneChanges callback")
                         guard let self = self else { return }
-                        guard error == nil else {
-                            await finishSynchronization(error: error)
+                        if let error {
+                            await failSynchronization(error: error)
                             return
                         }
                         
@@ -411,8 +430,9 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func mergeChanges(completion: @escaping (Error?) async throws -> ()) async throws {
+        debugPrint("# mergeChanges()")
         guard cancelSync == false else {
-            await finishSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled)
             return
         }
         
@@ -447,9 +467,9 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func uploadChanges() async throws {
-//        debugPrint("# uploadChanges()")
+        debugPrint("# uploadChanges()")
         guard !cancelSync else {
-            await finishSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled)
             return
         }
         
@@ -463,7 +483,7 @@ extension CloudKitSynchronizer {
                     uploadRetries += 1
                         await fetchChanges()
                 } else {
-                    await finishSynchronization(error: error)
+                    await failSynchronization(error: error)
                 }
             } else {
                 increaseBatchSize()
@@ -474,7 +494,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func uploadChanges(completion: @escaping (Error?) async throws -> ()) async throws {
-//        debugPrint("# uploadChanges(completion)")
+        debugPrint("# uploadChanges(completion)")
         try await sequential(objects: modelAdapters, closure: setupZoneAndUploadRecords) { [weak self] (error) in
             guard error == nil else {
                 try await completion(error)
@@ -539,6 +559,8 @@ extension CloudKitSynchronizer {
         let recordCount = records.count
 //        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { try await completion(nil); return }
+        
+        logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
         
         if !didNotifyUpload.contains(adapter.recordZoneID) {
             didNotifyUpload.insert(adapter.recordZoneID)
@@ -671,11 +693,11 @@ extension CloudKitSynchronizer {
                             await performSynchronization()
                         } else {
                             storedDatabaseToken = databaseToken
-                            await finishSynchronization(error: nil)
+                            await broadcastDidSynchronize()
                         }
                     })
                 } else {
-                    await finishSynchronization(error: nil)
+                    await broadcastDidSynchronize()
                 }
             }
         }

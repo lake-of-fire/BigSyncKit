@@ -43,14 +43,26 @@ public class SyncStatusViewModel: ObservableObject {
 //    @Published public var syncStatusWithoutFailure: String = "Initializing"
     @Published public var syncFailed = false
     @Published public var currentDeviceID: UUID?
-    @Published public var lastSeenDevices: [LastSeenDevice]?
-    
+//    @Published public var lastSeenDevices: [LastSeenDevice]?
+    @Published public var changesRemainingToUpload: Int?
+
     public var bigSyncBackgroundWorker: BigSyncBackgroundWorker?
 
     private var cancellables = Set<AnyCancellable>()
     
     public init(realmConfiguration: Realm.Configuration) {
         self.realmConfiguration = realmConfiguration
+        
+        NotificationCenter.default.publisher(for: .SynchronizerChangesRemainingToUpload)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self = self else { return }
+                let userInfo = notification.userInfo
+                if let count = userInfo?["CloudKitSynchronizerChangesRemainingToUploadKey"] as? Int {
+                    changesRemainingToUpload = count
+                }
+            }
+            .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerWillSynchronize)
             .receive(on: RunLoop.main)

@@ -17,20 +17,16 @@ import RealmSwift
     case custom
 }
 
-public extension Notification.Name {
-    /// Sent by the model adapter when it detects changes to some objects. The notification is sent only once, if there were no changes before and new changes were detected.
-    static let ModelAdapterHasChangesNotification = Notification.Name("QSModelAdapterHasChangesNotification")
-}
-
-@objc public extension NSNotification {
-    /// /// Sent by the model adapter when it detects changes to some objects. The notification is sent only once, if there were no changes before and new changes were detected.
-    static let ModelAdapterHasChangesNotification: NSString = "QSModelAdapterHasChangesNotification"
-}
 //public protocol ModelAdapter: AnyObject {
 //    /// Tells the model adapter that these records were uploaded successfully to CloudKit.
 //    /// - Parameter savedRecords: Records that were saved.
 //    func didUpload(savedRecords: [CKRecord])
 //}
+
+public protocol ModelAdapterDelegate: AnyObject {
+    func needsInitialSetup() async throws
+    func hasChangesToUpload() async
+}
 
 /// An object conforming to `ModelAdapter` will track the local model, provide changes to upload to CloudKit and import downloaded changes.
 //@objc public protocol ModelAdapter: AnyObject {
@@ -38,7 +34,7 @@ public protocol ModelAdapter: AnyObject {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
     
-    var initialSetupDelegate: RealmSwiftAdapterInitialSetupDelegate? { get set }
+    var modelAdapterDelegate: ModelAdapterDelegate? { get set }
     
     func cleanUp()
     
