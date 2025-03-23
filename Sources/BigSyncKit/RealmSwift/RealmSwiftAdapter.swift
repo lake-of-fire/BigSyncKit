@@ -281,6 +281,15 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private var cancellables = Set<AnyCancellable>()
     
+    private let zstdDictData: Data? = {
+        guard let dictURL = Bundle.module.url(forResource: "ckrecordDictionary", withExtension: nil, subdirectory: "zstd"),
+              let data = try? Data(contentsOf: dictURL) else {
+            print("Error: Failed to load zstd dictionary during init")
+            return nil
+        }
+        return data
+    }()
+    
     public init(
         persistenceRealmConfiguration: Realm.Configuration,
         targetRealmConfigurations: [Realm.Configuration],
@@ -1397,13 +1406,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         archiver.finishEncoding()
         
-        guard let dictURL = Bundle.module.url(forResource: "ckrecordDictionary", withExtension: nil, subdirectory: "zstd"),
-              let dictData = try? Data(contentsOf: dictURL) else {
-            print("Error: Failed to load zstd dictionary")
+        guard let dictData = zstdDictData else {
+            print("Error: Zstd dictionary not loaded")
             return nil
         }
         
-        guard let compressed = zstdCompress(data: data as Data, dictionary: dictData, level: 5) else {
+        guard let compressed = zstdCompress(data: data as Data, dictionary: dictData, level: 1) else {
             print("Error: Zstd compression failed")
             return nil
         }
@@ -1412,17 +1420,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     func getRecord(for syncedEntity: SyncedEntity) -> CKRecord? {
-        var record: CKRecord?
-        if let recordData = syncedEntity.encodedRecord {
-            guard let dictURL = Bundle.module.url(forResource: "ckrecordDictionary", withExtension: nil, subdirectory: "zstd"),
-                  let dictData = try? Data(contentsOf: dictURL),
-                  let decompressed = zstdDecompress(data: recordData, dictionary: dictData) else {
-                return nil
-            }
-            guard let unarchiver = try? NSKeyedUnarchiver(forReadingWith: decompressed) else { return nil }
-            record = CKRecord(coder: unarchiver)
-            unarchiver.finishDecoding()
+        guard let recordData = syncedEntity.encodedRecord,
+              let dictData = zstdDictData,
+              let decompressed = zstdDecompress(data: recordData, dictionary: dictData),
+              let unarchiver = try? NSKeyedUnarchiver(forReadingWith: decompressed) else {
+            return nil
         }
+        let record = CKRecord(coder: unarchiver)
+        unarchiver.finishDecoding()
         return record
     }
     
