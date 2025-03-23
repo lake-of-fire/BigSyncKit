@@ -196,7 +196,7 @@ actor RealmProvider {
         
         do {
             persistenceRealmObject = try await Realm(configuration: persistenceConfiguration, actor: BigSyncBackgroundActor.shared)
-            debugPrint("# persistence realm", persistenceRealmObject.configuration.fileURL)
+//            debugPrint("# persistence realm", persistenceRealmObject.configuration.fileURL)
             
             var targetReaderRealmObjects = [Realm]()
             for targetConfiguration in targetConfigurations {

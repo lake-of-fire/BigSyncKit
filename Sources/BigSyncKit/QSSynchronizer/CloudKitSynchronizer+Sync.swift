@@ -105,7 +105,6 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func broadcastDidSynchronize() async {
-        debugPrint("# broadcastDidSynchronize()")
         postNotification(.SynchronizerDidSynchronize)
         delegate?.synchronizerDidSync(self)
     }
@@ -298,7 +297,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchChanges() async {
-        debugPrint("# fetchChanges")
+//        debugPrint("# fetchChanges")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -325,7 +324,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async throws -> ()) async {
-        debugPrint("# fetchDatabaseChanges()", containerIdentifier, serverChangeToken)
+//        debugPrint("# fetchDatabaseChanges()", containerIdentifier, serverChangeToken)
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
@@ -347,7 +346,7 @@ extension CloudKitSynchronizer {
                     }
                     
                     fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
-                        debugPrint("# fetchZoneChanges callback")
+//                        debugPrint("# fetchZoneChanges callback")
                         guard let self = self else { return }
                         if let error {
                             await failSynchronization(error: error)
@@ -433,7 +432,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func mergeChanges(completion: @escaping (Error?) async throws -> ()) async throws {
-        debugPrint("# mergeChanges()")
+//        debugPrint("# mergeChanges()")
         guard cancelSync == false else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -470,7 +469,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func uploadChanges() async throws {
-        debugPrint("# uploadChanges()")
+//        debugPrint("# uploadChanges()")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -497,7 +496,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func uploadChanges(completion: @escaping (Error?) async throws -> ()) async throws {
-        debugPrint("# uploadChanges(completion)")
+//        debugPrint("# uploadChanges(completion)")
         try await sequential(objects: modelAdapters, closure: setupZoneAndUploadRecords) { [weak self] (error) in
             guard error == nil else {
                 try await completion(error)
