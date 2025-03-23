@@ -621,16 +621,18 @@ extension CloudKitSynchronizer {
                         }
                         try await adapter.persistImportedChanges { (persistError) in
                             try await completion(persistError)
+                            return
                         }
                     } else {
                         try await completion(error)
+                        return
                     }
+                }
+                
+                if recordCount >= requestedBatchSize {
+                    try await uploadRecords(adapter: adapter, completion: completion)
                 } else {
-                    if recordCount >= requestedBatchSize {
-                        try await uploadRecords(adapter: adapter, completion: completion)
-                    } else {
-                        try await completion(nil)
-                    }
+                    try await completion(nil)
                 }
                 //                }
             }
