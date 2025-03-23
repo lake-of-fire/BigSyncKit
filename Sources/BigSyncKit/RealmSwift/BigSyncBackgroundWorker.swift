@@ -8,7 +8,7 @@ import Logging
 public struct BigSyncBackgroundWorkerConfiguration {
     let synchronizerName: String
     let containerName: String
-    let configuration: Realm.Configuration
+    let configurations: [Realm.Configuration]
     let excludedClassNames: [String]
     let suiteName: String?
     let recordZoneID: CKRecordZone.ID?
@@ -18,7 +18,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
     public init(
         synchronizerName: String,
         containerName: String,
-        configuration: Realm.Configuration,
+        configurations: [Realm.Configuration],
         excludedClassNames: [String],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
@@ -27,7 +27,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
     ) {
         self.synchronizerName = synchronizerName
         self.containerName = containerName
-        self.configuration = configuration
+        self.configurations = configurations
         self.excludedClassNames = excludedClassNames
         self.suiteName = suiteName
         self.recordZoneID = recordZoneID
@@ -37,7 +37,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
 }
 
 public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
-    public var realmSynchronizers: [CloudKitSynchronizer] = []
+    public var realmSynchronizer: CloudKitSynchronizer
     
     private weak var synchronizerDelegate: RealmSwiftAdapterDelegate?
     
@@ -47,56 +47,52 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
 #warning("need to manually refresh() in bg threads (after write block) for notifs to work here (?)")
     
     public init(
-        configurations: [BigSyncBackgroundWorkerConfiguration],
+        configuration: BigSyncBackgroundWorkerConfiguration,
         delegate: RealmSwiftAdapterDelegate? = nil
     ) {
         synchronizerDelegate = delegate
         
+        let synchronizer = CloudKitSynchronizer.privateSynchronizer(
+            synchronizerName: configuration.synchronizerName,
+            containerName: configuration.containerName,
+            configurations: configuration.configurations,
+            excludedClassNames: configuration.excludedClassNames,
+            suiteName: configuration.suiteName,
+            recordZoneID: configuration.recordZoneID,
+            compatibilityVersion: configuration.compatibilityVersion,
+            logger: configuration.logger
+        )
+        
+        (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
+        (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
+        synchronizer.compatibilityVersion = Int(configuration.configurations.map { $0.schemaVersion } .reduce(0, +))
+        realmSynchronizer = synchronizer
+
         super.init()
         
-        for config in configurations {
-            let synchronizer = CloudKitSynchronizer.privateSynchronizer(
-                synchronizerName: config.synchronizerName,
-                containerName: config.containerName,
-                configuration: config.configuration,
-                excludedClassNames: config.excludedClassNames,
-                suiteName: config.suiteName,
-                recordZoneID: config.recordZoneID,
-                compatibilityVersion: config.compatibilityVersion,
-                logger: config.logger
-            )
-            
-            (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
-            (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
-            synchronizer.compatibilityVersion = Int(config.configuration.schemaVersion)
-            self.realmSynchronizers.append(synchronizer)
-        }
-
         start { [weak self] in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 
-                for synchronizer in realmSynchronizers {
-                    if let containerIdentifier = synchronizer.containerIdentifier {
-                        for modelAdapter in synchronizer.modelAdapters {
-                            await CloudKitSynchronizer.transferOldServerChangeToken(to: modelAdapter, userDefaults: synchronizer.keyValueStore, containerName: containerIdentifier)
+                if let containerIdentifier = synchronizer.containerIdentifier {
+                    for modelAdapter in synchronizer.modelAdapters {
+                        await CloudKitSynchronizer.transferOldServerChangeToken(to: modelAdapter, userDefaults: synchronizer.keyValueStore, containerName: containerIdentifier)
+                    }
+                }
+                
+                NotificationCenter.default.publisher(for: .ModelAdapterHasChangesNotification)
+                    .receive(on: bigSyncKitQueue)
+                    .sink { [weak self] _ in
+                        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                            await self?.synchronizeCloudKit()
                         }
                     }
-                    
-                    NotificationCenter.default.publisher(for: .ModelAdapterHasChangesNotification)
-                        .receive(on: bigSyncKitQueue)
-                        .sink { [weak self] _ in
-                            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                                await self?.synchronizeCloudKit()
-                            }
-                        }
-                        .store(in: &self.subscriptions)
-                    
-                    synchronizer.subscribeForChangesInDatabase { error in
-                        if let error = error {
-                            print("Change in DB error: \(error)")
-                            return
-                        }
+                    .store(in: &self.subscriptions)
+                
+                synchronizer.subscribeForChangesInDatabase { error in
+                    if let error = error {
+                        print("Change in DB error: \(error)")
+                        return
                     }
                 }
             }
@@ -105,25 +101,19 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
     
     /// Call this on app start before accessing Realm to delete objects without invalidating them during use.
     public func cleanUp() {
-        for synchronizer in realmSynchronizers {
-            for adapter in synchronizer.modelAdapters {
-                adapter.cleanUp()
-            }
+        for adapter in realmSynchronizer.modelAdapters {
+            adapter.cleanUp()
         }
     }
     
     @BigSyncBackgroundActor
     public func synchronizeCloudKit() async {
-        for synchronizer in realmSynchronizers {
-            await synchronizeCloudKit(using: synchronizer)
-        }
+        await synchronizeCloudKit(using: realmSynchronizer)
     }
     
     @BigSyncBackgroundActor
     public func cancelSynchronization() {
-        for synchronizer in realmSynchronizers {
-            synchronizer.cancelSynchronization()
-        }
+        realmSynchronizer.cancelSynchronization()
     }
     
     @BigSyncBackgroundActor

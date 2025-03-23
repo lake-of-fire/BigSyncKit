@@ -13,7 +13,7 @@ import Logging
 public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let zoneID: CKRecordZone.ID
     let persistenceConfiguration: Realm.Configuration
-    let targetConfiguration: Realm.Configuration
+    let targetConfigurations: [Realm.Configuration]
     let excludedClassNames: [String]
     let appGroup: String?
     let logger: Logging.Logger
@@ -26,13 +26,13 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     }
     
     public init(
-        targetConfiguration: Realm.Configuration,
+        targetConfigurations: [Realm.Configuration],
         excludedClassNames: [String],
         zoneID: CKRecordZone.ID,
         appGroup: String? = nil,
         logger: Logging.Logger
     ) {
-        self.targetConfiguration = targetConfiguration
+        self.targetConfigurations = targetConfigurations
         self.excludedClassNames = excludedClassNames
         self.zoneID = zoneID
         self.appGroup = appGroup
@@ -70,7 +70,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     fileprivate func createAdapter() -> RealmSwiftAdapter {
         return RealmSwiftAdapter(
             persistenceRealmConfiguration: persistenceConfiguration,
-            targetRealmConfiguration: targetConfiguration,
+            targetRealmConfigurations: targetConfigurations,
             excludedClassNames: excludedClassNames,
             recordZoneID: zoneID,
             logger: logger
