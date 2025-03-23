@@ -152,7 +152,7 @@ extension CloudKitSynchronizer {
                 self.resetDatabaseToken()
                 await fetchChanges()
             default:
-                logger.error("QSCloudKitSynchronizer >> Aborting due to error: \(error)")
+                logger.error("QSCloudKitSynchronizer >> Error: \(error)")
                 break
             }
         }
@@ -221,7 +221,7 @@ extension CloudKitSynchronizer {
     }
     
     func shouldRetryUpload(for error: NSError) -> Bool {
-        if isServerRecordChangedError(error) || isLimitExceededError(error) {
+        if /*isServerRecordChangedError(error) ||*/ isLimitExceededError(error) {
             return uploadRetries < 5
         } else {
             return false
@@ -557,7 +557,7 @@ extension CloudKitSynchronizer {
         let requestedBatchSize = batchSize
         let records = try await adapter.recordsToUpload(limit: requestedBatchSize)
         let recordCount = records.count
-//        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
+        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
@@ -569,7 +569,7 @@ extension CloudKitSynchronizer {
         
         //Add metadata: device UUID and model version
         addMetadata(to: records)
-        
+        debugPrint("## Upload", records.map {($0.recordID, $0) })
         let modifyRecordsOperation = ModifyRecordsOperation(database: database,
                                                records: records,
                                                recordIDsToDelete: nil)
@@ -609,24 +609,36 @@ extension CloudKitSynchronizer {
                         try await adapter.deleteChangeTracking(forRecordIDs: Array(recordIDsMissingOnServer))
                     }
                     
+                    if let errorsByItemID = error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] {
+                        var resolvedRecords = [CKRecord]()
+                        for (_, itemError) in errorsByItemID {
+                            if itemError.code == CKError.serverRecordChanged.rawValue,
+                               let serverRecord = itemError.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
+                                resolvedRecords.append(serverRecord)
+                            }
+                        }
+                        debugPrint("## Resolved Recos", resolvedRecords.map {($0.recordID, $0) })
+                        if !resolvedRecords.isEmpty {
+                            do {
+                                try await adapter.saveChanges(in: resolvedRecords, forceSave: true)
+                            } catch {
+                                try await completion(error)
+                                return
+                            }
+                            try await adapter.persistImportedChanges { persistError in
+                                try await completion(persistError)
+                                return
+                            }
+                            
+                        }
+                    }
+                    
                     if self.isLimitExceededError(error) {
                         reduceBatchSize()
-                        try await completion(error)
-                    } else if !conflicted.isEmpty {
-                        do {
-                            try await adapter.saveChanges(in: conflicted, forceSave: true)
-                        } catch {
-                            try await completion(error)
-                            return
-                        }
-                        try await adapter.persistImportedChanges { (persistError) in
-                            try await completion(persistError)
-                            return
-                        }
-                    } else {
-                        try await completion(error)
-                        return
                     }
+                    
+                    try await completion(error)
+                    return
                 }
                 
                 if recordCount >= requestedBatchSize {

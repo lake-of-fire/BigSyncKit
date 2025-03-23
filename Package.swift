@@ -21,6 +21,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-algorithms.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-log.git", branch: "main"),
+        .package(url: "https://github.com/facebook/zstd.git", from: "1.5.7"),
     ],
     targets: [
         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
@@ -36,7 +37,12 @@ let package = Package(
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
                 .product(name: "Algorithms", package: "swift-algorithms"),
                 .product(name: "Logging", package: "swift-log"),
-            ]),
+                .product(name: "libzstd", package: "zstd"), // Only needed for iOS 15 Brotli (somehow missing in simulator at least)
+            ],
+            resources: [
+                .copy("Resources/zstd/"),
+            ]
+        ),
         .testTarget(
             name: "BigSyncKitTests",
             dependencies: ["BigSyncKit"]),
