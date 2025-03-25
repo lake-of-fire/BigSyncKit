@@ -267,7 +267,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     var childRelationships = [String: Array<ChildRelationship>]()
     var modelTypes = [String: Object.Type]()
     public private(set) var hasChanges = false
-    
+    public private(set) var hasChangesCount: Int?
+
     private var resultsChangeSet = ResultsChangeSet()
     private let resultsChangeSetPublisher = PassthroughSubject<Void, Never>()
     
@@ -684,6 +685,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     func updateHasChanges(realm: Realm) {
         let results = realm.objects(SyncedEntity.self).where { $0.state != SyncedEntityState.synced.rawValue }
         let count = results.count
+        if hasChangesCount != count {
+            logger.info("QSCloudKitSynchronizer >> \(count) changed records remaining to upload")
+        }
+        hasChangesCount = count
         hasChanges = count > 0
         Task(priority: .background) { @BigSyncBackgroundActor in
             NotificationCenter.default.post(

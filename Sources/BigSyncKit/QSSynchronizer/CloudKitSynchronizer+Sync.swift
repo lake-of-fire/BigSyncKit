@@ -181,8 +181,10 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
+        logger.info("QSCloudKitSynchronizer >> Starting operation: \(type(of: operation))")
         operation.errorHandler = { [weak self] operation, error in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                logger.error("QSCloudKitSynchronizer >> Operation error (\(type(of: operation))): \(error)")
                 await self?.failSynchronization(error: error)
             }
         }
