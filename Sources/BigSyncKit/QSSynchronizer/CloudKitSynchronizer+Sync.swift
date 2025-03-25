@@ -140,6 +140,7 @@ extension CloudKitSynchronizer {
                 // TODO: This error can be detected to prompt the user to update the app to a newer version.
                 // TODO: Show this error inside settings view
                 print("Sync error: \(error.localizedDescription) A synchronizer with a higher `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.")
+                return
             default: break
             }
         } else if let error = error as? CKError {
@@ -154,15 +155,19 @@ extension CloudKitSynchronizer {
                 logger.error("QSCloudKitSynchronizer >> Not Authenticated. Aborting sync")
                 // Don't retry...
                 return
+            case .serviceUnavailable, .requestRateLimited, .zoneBusy:
+                let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
+                logger.warning("QSCloudKitSynchronizer >> Error: \(error.localizedDescription). Retrying in \(retryAfter) seconds.")
+                try? await Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000))
             default:
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
+                try? await Task.sleep(nanoseconds: UInt64(10 * 1_000_000_000))
                 break
             }
         }
         
-        try? await Task.sleep(nanoseconds: 10_000_000_000)
-        beginSynchronization()
-        
+        await beginSynchronization()
+
         //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
         //        logger.info("QSCloudKitSynchronizer >> Finishing synchronization")
     }
