@@ -199,6 +199,10 @@ extension CloudKitSynchronizer {
         logger.info("QSCloudKitSynchronizer >> Starting operation: \(type(of: operation))")
         operation.errorHandler = { [weak self] operation, error in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                if let ckError = error as? CKError, ckError.code == .serverRecordChanged {
+                    // Conflict error: skip logging and failing synchronization
+                    return
+                }
                 logger.error("QSCloudKitSynchronizer >> Operation error (\(type(of: operation))): \(error)")
                 await self?.failSynchronization(error: error)
             }
