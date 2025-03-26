@@ -95,6 +95,7 @@ fileprivate func isZoneNotFoundOrDeletedError(_ error: Error?) -> Bool {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func performSynchronization() async {
+        logger.info("QSCloudKitSynchronizer >> Perform synchronization...")
         self.postNotification(.SynchronizerWillSynchronize)
         self.serverChangeToken = self.storedDatabaseToken
         self.uploadRetries = 0
@@ -284,6 +285,7 @@ extension CloudKitSynchronizer {
             return
         }
         
+//        debugPrint("# sequential closure(...)")
         try await closure(first) { [weak self] error in
             guard error == nil else {
                 try await final(error)

@@ -240,6 +240,7 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
         guard !syncing else {
+//            debugPrint("# already syncing")
 //            onFailure?(SyncError.alreadySyncing)
             return
         }
