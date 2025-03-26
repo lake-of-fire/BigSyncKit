@@ -105,9 +105,13 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func broadcastDidSynchronize() async {
+    func changesFinishedSynchronizing() async {
         postNotification(.SynchronizerDidSynchronize)
         delegate?.synchronizerDidSync(self)
+        
+        logger.info("QSCloudKitSynchronizer >> Finished synchronizing any changes")
+        syncing = false
+        cancelSync = false
     }
     
     @BigSyncBackgroundActor
@@ -141,7 +145,8 @@ extension CloudKitSynchronizer {
                 // TODO: This error can be detected to prompt the user to update the app to a newer version.
                 // TODO: Show this error inside settings view
                 print("Sync error: \(error.localizedDescription) A synchronizer with a higher `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.")
-            default: break
+            default:// break
+                logger.error("QSCloudKitSynchronizer >> Error: \(error)")
             }
         } else if let error = error as? CKError {
             switch error.code {
@@ -166,7 +171,7 @@ extension CloudKitSynchronizer {
                 logger.info("QSCloudKitSynchronizer >> Waited \(retryAfter) seconds.")
             default:
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
-                break
+//                break
             }
         }
         
@@ -334,7 +339,7 @@ extension CloudKitSynchronizer {
             if syncMode == .sync {
                 try await uploadChanges()
             } else {
-                await broadcastDidSynchronize()
+                await changesFinishedSynchronizing()
             }
         }
     }
@@ -726,11 +731,11 @@ extension CloudKitSynchronizer {
                             await performSynchronization()
                         } else {
                             storedDatabaseToken = databaseToken
-                            await broadcastDidSynchronize()
+                            await changesFinishedSynchronizing()
                         }
                     })
                 } else {
-                    await broadcastDidSynchronize()
+                    await changesFinishedSynchronizing()
                 }
             }
         }

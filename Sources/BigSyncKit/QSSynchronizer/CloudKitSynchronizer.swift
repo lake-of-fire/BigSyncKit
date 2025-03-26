@@ -347,7 +347,6 @@ extension CloudKitSynchronizer: ModelAdapterDelegate {
     }
     
     public func hasChangesToUpload() async {
-        debugPrint("# hasChangesToUpload !!!")
         await beginSynchronization()
     }
 }

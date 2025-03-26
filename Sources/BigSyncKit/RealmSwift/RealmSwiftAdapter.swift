@@ -1736,7 +1736,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var recordsToSave: [(record: CKRecord, objectClass: RealmSwift.Object.Type, objectIdentifier: Any, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
         var syncedEntitiesToCreate: [SyncedEntity] = []
         
-        for chunk in records.chunked(into: 2000) {
+        for chunk in records.chunked(into: 4000) {
             for record in chunk {
                 try Task.checkCancellation()
                 
@@ -1784,7 +1784,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         // TODO: Chunk based on target writer Realm
         if !recordsToSave.isEmpty {
-            for chunk in recordsToSave.chunked(into: 1000) {
+            for chunk in recordsToSave.chunked(into: 4000) {
                 //                await realmProvider.persistenceRealm?.asyncRefresh()
                 try await realmProvider.persistenceRealm?.asyncWrite { [weak self] in
                     guard let self = self else { return }
