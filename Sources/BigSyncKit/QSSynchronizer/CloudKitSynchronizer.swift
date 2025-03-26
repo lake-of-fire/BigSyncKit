@@ -131,7 +131,7 @@ public class CloudKitSynchronizer: NSObject {
     public internal(set) var syncing: Bool = false
     
     ///  Number of records that are sent in an upload operation.
-    public var batchSize: Int = CloudKitSynchronizer.defaultBatchSize
+    public var batchSize: Int = CloudKitSynchronizer.defaultInitialBatchSize
     
     /**
     *  When set, if the synchronizer finds records uploaded by a different device using a higher compatibility version,
@@ -161,7 +161,8 @@ public class CloudKitSynchronizer: NSObject {
     internal let logger: Logging.Logger
     
     /// Default number of records to send in an upload operation.
-    public static var defaultBatchSize = 400 // Apple's suggestion
+    public static var defaultInitialBatchSize = 50
+    public static var maxBatchSize = 400 // Apple's suggestion
     static let deviceUUIDKey = "QSCloudKitDeviceUUIDKey"
     static let modelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
     
@@ -345,6 +346,7 @@ extension CloudKitSynchronizer: ModelAdapterDelegate {
     }
     
     public func hasChangesToUpload() async {
-        await beginSynchronization() //onFailure: <#T##((any Error) -> ())?##((any Error) -> ())?##(any Error) -> ()#>)
+        debugPrint("# hasChangesToUpload !!!")
+        await beginSynchronization()
     }
 }

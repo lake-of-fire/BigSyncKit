@@ -664,6 +664,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private func setupPublisherDebouncer() {
         resultsChangeSetPublisher
+            .print("# PUB")
             .debounce(for: .seconds(2), scheduler: bigSyncKitQueue)
             .sink { [weak self] _ in
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -686,7 +687,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let results = realm.objects(SyncedEntity.self).where { $0.state != SyncedEntityState.synced.rawValue }
         let count = results.count
         if hasChangesCount != count {
-            logger.info("QSCloudKitSynchronizer >> \(count) changed records remaining to upload")
+            let syncedCount = realm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.synced.rawValue } .count
+            logger.info("QSCloudKitSynchronizer >> \(count) changed records remaining to upload. \(syncedCount) records already marked as synced.")
         }
         hasChangesCount = count
         hasChanges = count > 0

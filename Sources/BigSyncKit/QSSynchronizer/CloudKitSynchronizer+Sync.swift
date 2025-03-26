@@ -140,7 +140,6 @@ extension CloudKitSynchronizer {
                 // TODO: This error can be detected to prompt the user to update the app to a newer version.
                 // TODO: Show this error inside settings view
                 print("Sync error: \(error.localizedDescription) A synchronizer with a higher `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.")
-                return
             default: break
             }
         } else if let error = error as? CKError {
@@ -157,15 +156,20 @@ extension CloudKitSynchronizer {
                 return
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
-                logger.warning("QSCloudKitSynchronizer >> Error: \(error.localizedDescription). Retrying in \(retryAfter) seconds.")
-                try? await Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000))
+                logger.warning("QSCloudKitSynchronizer >> Warning: \(error.localizedDescription) ( \(error)). Retrying in \(retryAfter.rounded()) seconds.")
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000))
+                } catch {
+                    logger.error("QSCloudKitSynchronizer >> Error: \(error.localizedDescription).")
+                }
+                logger.info("QSCloudKitSynchronizer >> Waited \(retryAfter) seconds.")
             default:
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
-                try? await Task.sleep(nanoseconds: UInt64(10 * 1_000_000_000))
                 break
             }
         }
         
+        logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
         await beginSynchronization()
 
         //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
@@ -777,8 +781,8 @@ extension CloudKitSynchronizer {
     }
     
     func increaseBatchSize() {
-        if self.batchSize < CloudKitSynchronizer.defaultBatchSize {
-            self.batchSize = self.batchSize + 5
+        if self.batchSize < CloudKitSynchronizer.maxBatchSize {
+            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 10))
         }
     }
 }
