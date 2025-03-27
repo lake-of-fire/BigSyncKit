@@ -277,6 +277,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private var appForegroundCancellable: AnyCancellable?
     private let immediateChecksSubject = PassthroughSubject<Void, Never>()
+    private let realmChangesSubject = PassthroughSubject<Realm, Never>()
     
     private var pendingRelationshipQueue = [PendingRelationshipRequest]()
     
@@ -290,6 +291,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         return data
     }()
+    
+#if DEBUG
+    private var dummyRecordIdentifiers = Set<String>()
+#endif
     
     public init(
         persistenceRealmConfiguration: Realm.Configuration,
@@ -395,6 +400,37 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         guard let targetReaderRealms = realmProvider.targetReaderRealms else { return }
+        
+#if DEBUG
+        // Create a dummy record for each Realm type that has no data
+        for targetReaderRealm in targetReaderRealms {
+            for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
+                guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
+                let exists = targetReaderRealm.objects(objectClass).first != nil
+                if exists {
+                    try await { @RealmBackgroundActor in
+                        do {
+                            guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[schema.className] else { return }
+                            try await targetWriterRealm.asyncWrite {
+                                let dummy = objectClass.init()
+                                if let softDeletable = dummy as? SoftDeletable {
+                                    softDeletable.isDeleted = true
+                                }
+                                targetWriterRealm.add(dummy, update: .modified)
+                                print("🧪 Inserted dummy record for schema: \(schema.className)")
+                                let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
+                                let dummyID = "\(schema.className).\(Self.getTargetObjectStringIdentifier(for: dummy, usingPrimaryKey: primaryKey))"
+                                dummyRecordIdentifiers.insert(dummyID)
+                            }
+                        } catch {
+                            print("⚠️ Failed to create dummy for \(schema.className): \(error)")
+                        }
+                    }()
+                }
+            }
+        }
+#endif
+        
         for targetReaderRealm in targetReaderRealms {
             for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
                 guard let objectClass = self.realmObjectClass(name: schema.className) else {
@@ -512,20 +548,31 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     private func observeRealmChanges() {
         guard let targetReaderRealms = realmProvider?.targetReaderRealms else { return }
         
-        for targetReaderRealm in targetReaderRealms {
-            let token = targetReaderRealm.observe { [weak self] _, _ in
+        // Subscribe to the subject with a 6-second debounce
+        realmChangesSubject
+            .debounce(for: .seconds(6), scheduler: bigSyncKitQueue)
+            .sink { [weak self] changedRealm in
                 guard let self = self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                     guard let self = self else { return }
-                    for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
+                    for schema in changedRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
                         guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
                         guard objectClass.conforms(to: ChangeMetadataRecordable.self) else { continue }
                         await self.enqueueCreatedAndModified(
                             in: objectClass,
                             schemaName: schema.className,
-                            realmProvider: self.realmProvider!)
+                            realmProvider: self.realmProvider!
+                        )
                     }
                 }
+            }
+            .store(in: &cancellables)
+        
+        // For each realm, observe changes and send an event to the subject
+        for targetReaderRealm in targetReaderRealms {
+            let token = targetReaderRealm.observe { [weak self] _, _ in
+                guard let self else { return }
+                realmChangesSubject.send(targetReaderRealm)
             }
             cancellables.insert(AnyCancellable { token.invalidate() })
         }
@@ -1231,6 +1278,36 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             let separatorRange = recordName.range(of: ".")!
             let objectIdentifier = String(recordName[separatorRange.upperBound...])
             savePendingRelationshipAsync(name: key, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+        } else if property.isMap {
+            guard let value = value as? [NSArray], value.count == 2,
+                  let keyArray = value[0] as? [String], let valueArray = value[1] as? [Any],
+                  keyArray.count == valueArray.count else {
+                return
+            }
+            var result: [String: Any] = [:]
+            for (index, key) in keyArray.enumerated() {
+                switch property.type {
+                case .int:
+                    if let val = valueArray[index] as? Int { result[key] = val }
+                case .string:
+                    if let val = valueArray[index] as? String { result[key] = val }
+                case .bool:
+                    if let val = valueArray[index] as? Bool { result[key] = val }
+                case .float:
+                    if let val = valueArray[index] as? Float { result[key] = val }
+                case .double:
+                    if let val = valueArray[index] as? Double { result[key] = val }
+                case .date:
+                    if let val = valueArray[index] as? Date { result[key] = val }
+                case .UUID:
+                    if let val = valueArray[index] as? String, let uuid = UUID(uuidString: val) {
+                        result[key] = uuid
+                    }
+                default:
+                    break
+                }
+            }
+            object.setValue(result, forKey: key)
         } else if let asset = value as? CKAsset {
             if let fileURL = asset.fileURL,
                let data = NSData(contentsOf: fileURL) {
@@ -1479,6 +1556,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //        }
         
         for property in object.objectSchema.properties {
+//            if object.objectSchema.className == "HistoryRecord" && property.name == "content" && record.id == "6657C67E-95EC-479B-B5F5-9F7F44EAB1C5" {
+//                debugPrint(property)
+//            }
             if entityState == SyncedEntityState.new.rawValue || entityState == SyncedEntityState.changed.rawValue {
                 if let recordProcessingDelegate = recordProcessingDelegate,
                    !recordProcessingDelegate.shouldProcessPropertyBeforeUpload(propertyName: property.name, object: object, record: record) {
@@ -1545,6 +1625,22 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         // Other inner types of Set is not supported yet
                         break
                     }
+                } else if property.isMap {
+                    // CloudKit does not support native dictionary/map values
+                    // Convert to a 2-tuple: (keys: [String], values: [CKRecordValue])
+                    guard let dict = object.value(forKey: property.name) as? [String: Any] else { break }
+                    let keys = NSMutableArray()
+                    let values = NSMutableArray()
+                    for (key, value) in dict {
+                        keys.add(key)
+                        if let recordValue = value as? CKRecordValue {
+                            values.add(recordValue)
+                        } else {
+                            // Skip non-CKRecordValue-compatible entries
+                            continue
+                        }
+                    }
+                    record[property.name] = [keys, values] as CKRecordValue
                 } else if property.isArray {
                     // Array handling forked from IceCream: https://github.com/caiyue1993/IceCream/blob/b29dfe81e41cc929c8191c3266189a7070cb5bc5/IceCream/Classes/CKRecordConvertible.swift
                     let value = object.value(forKey: property.name)
@@ -1605,8 +1701,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     let value = object.value(forKey: property.name)
                     if property.type == PropertyType.data,
                        let data = value as? Data,
-                       forceDataTypeInsteadOfAsset == false {
-                        
+                       !forceDataTypeInsteadOfAsset {
                         let fileURL = self.tempFileManager.store(data: data)
                         let asset = CKAsset(fileURL: fileURL)
                         record[property.name] = asset
@@ -1616,8 +1711,85 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         record[property.name] = recordValue
                     }
                 }
+
             }
         }
+        
+#if DEBUG
+        if dummyRecordIdentifiers.contains(syncedEntity.identifier) {
+            for property in object.objectSchema.properties {
+                let isNil = record[property.name] == nil
+                let isEmptyArrayOrSet = (property.isArray || property.isSet) && ((record[property.name] as? [Any])?.isEmpty ?? false)
+                let isEmptyMap = property.isMap && ((record[property.name] as? [String: Any])?.isEmpty ?? false)
+                if isNil || isEmptyArrayOrSet || isEmptyMap {
+                    if property.isMap {
+                        // Store dummy map as 2-tuple: ([keys], [values])
+                        switch property.type {
+                        case .int:
+                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: 0)] as CKRecordValue
+                        case .string:
+                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: "dummy")] as CKRecordValue
+                        case .bool:
+                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: false)] as CKRecordValue
+                        case .float:
+                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: Float(0.0))] as CKRecordValue
+                        case .double:
+                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: Double(0.0))] as CKRecordValue
+                        case .date:
+                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: Date())] as CKRecordValue
+                        case .UUID:
+                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: UUID().uuidString)] as CKRecordValue
+                        default:
+                            fatalError("Unaccounted for property \(property)")
+                        }
+                    } else if property.isArray || property.isSet {
+                        switch property.type {
+                        case .int:
+                            record[property.name] = [0] as CKRecordValue
+                        case .string:
+                            record[property.name] = ["dummy"] as CKRecordValue
+                        case .bool:
+                            record[property.name] = [false] as CKRecordValue
+                        case .float:
+                            record[property.name] = [Float(0.0)] as CKRecordValue
+                        case .double:
+                            record[property.name] = [Double(0.0)] as CKRecordValue
+                        case .date:
+                            record[property.name] = [Date()] as CKRecordValue
+                        case .UUID:
+                            record[property.name] = [UUID().uuidString] as CKRecordValue
+                        default:
+                            fatalError("Unaccounted for property \(property)")
+                        }
+                    } else {
+                        switch property.type {
+                        case .string:
+                            record[property.name] = "dummy" as CKRecordValue
+                        case .int:
+                            record[property.name] = 0 as CKRecordValue
+                        case .bool:
+                            record[property.name] = false as CKRecordValue
+                        case .date:
+                            record[property.name] = Date() as CKRecordValue
+                        case .float:
+                            record[property.name] = Float(0.0) as CKRecordValue
+                        case .double:
+                            record[property.name] = Double(0.0) as CKRecordValue
+                        case .data:
+                            let dummyData = "dummy".data(using: .utf8)!
+                            let fileURL = self.tempFileManager.store(data: dummyData)
+                            let asset = CKAsset(fileURL: fileURL)
+                            record[property.name] = asset
+                        case .UUID:
+                            record[property.name] = UUID().uuidString as CKRecordValue
+                        default:
+                            fatalError("Unaccounted for property \(property)")
+                        }
+                    }
+                }
+            }
+        }
+#endif
         
         return record
     }
@@ -1645,6 +1817,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         return !result.needsSyncToServer
                     }
                 }
+#if DEBUG
+                results = results.filter { object in
+                    let objectClassName = object.objectSchema.className
+                    let primaryKey = (object.objectSchema.primaryKeyProperty?.name)!
+                    let identifier = "\(objectClassName).\(object.value(forKey: primaryKey)!)"
+                    return !dummyRecordIdentifiers.contains(identifier)
+                }
+#endif
                 var identifiersToDelete = [String]()
                 results = results.filter { object in
                     // TODO: Consolidate with syncedEntity(for ...)

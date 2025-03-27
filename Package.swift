@@ -14,8 +14,8 @@ let package = Package(
             targets: ["BigSyncKit"]),
     ],
     dependencies: [
-        //        .package(url: "https://github.com/lake-of-fire/RealmBinary.git", branch: "main"),
-        .package(url: "https://github.com/realm/realm-swift.git", from: "10.53.0"),
+                .package(url: "https://github.com/lake-of-fire/RealmBinary.git", branch: "main"),
+//        .package(url: "https://github.com/realm/realm-swift.git", from: "10.53.0"),
         .package(url: "https://github.com/lake-of-fire/RealmSwiftGaps.git", branch: "main"),
         //        .package(url: "https://github.com/lake-of-fire/Device.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
@@ -29,9 +29,8 @@ let package = Package(
         .target(
             name: "BigSyncKit",
             dependencies: [
-//                .product(name: "Realm", package: "RealmBinary"),
-//                .product(name: "RealmSwift", package: "RealmBinary"),
-                .product(name: "RealmSwift", package: "realm-swift"),
+                .product(name: "RealmSwift", package: "RealmBinary"),
+//                .product(name: "RealmSwift", package: "realm-swift"),
                 .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
 //                .product(name: "Device Library", package: "Device"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),

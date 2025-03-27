@@ -124,11 +124,6 @@ extension CloudKitSynchronizer {
             await adapter.didFinishImport(with: error)
         }
         
-        syncing = false
-        cancelSync = false
-        //        onFailure?(error)
-        //        onFailure = nil
-        
         self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [CloudKitSynchronizer.errorKey: error])
         self.delegate?.synchronizerDidfailToSync(self, error: error)
         
@@ -159,6 +154,8 @@ extension CloudKitSynchronizer {
             case .notAuthenticated:
                 logger.error("QSCloudKitSynchronizer >> Not Authenticated. Aborting sync")
                 // Don't retry...
+                syncing = false
+                cancelSync = false
                 return
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
@@ -176,6 +173,8 @@ extension CloudKitSynchronizer {
         }
         
         logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
+        syncing = false
+        cancelSync = false
         await beginSynchronization()
 
         //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")

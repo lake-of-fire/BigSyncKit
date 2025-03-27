@@ -38,12 +38,12 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
         let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: recordIDsToDelete)
         
         operation.perRecordCompletionBlock = { record, error in
-            print("# One record completed", record.recordID, error)
+//            print("# One record completed", record.recordID, error)
             self.processError(error, recordID: record.recordID)
         }
         
         operation.modifyRecordsCompletionBlock = { saved, deleted, operationError in
-            print("# Completion block", saved?.count, deleted?.count, operationError)
+//            print("# Completion block", saved?.count, deleted?.count, operationError)
             if let error = operationError as? CKError {
                 self.processCKError(error)
             }
