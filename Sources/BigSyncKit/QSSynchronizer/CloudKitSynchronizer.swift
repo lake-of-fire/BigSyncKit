@@ -163,8 +163,8 @@ public class CloudKitSynchronizer: NSObject {
     internal let logger: Logging.Logger
     
     /// Default number of records to send in an upload operation.
-    public static var defaultInitialBatchSize = 50
-    public static var maxBatchSize = 400 // Apple's suggestion
+    public static var defaultInitialBatchSize = 200
+    public static var maxBatchSize = 400 // Apple's suggestion is 400
     static let deviceUUIDKey = "QSCloudKitDeviceUUIDKey"
     static let modelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
     

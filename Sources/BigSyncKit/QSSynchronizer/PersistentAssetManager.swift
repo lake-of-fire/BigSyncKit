@@ -1,5 +1,5 @@
 //
-//  TempFileManager.swift
+//  PersistentAssetManager.swift
 //  Pods-CoreDataExample
 //
 //  Created by Manuel Entrena on 25/04/2019.
@@ -7,17 +7,19 @@
 
 import Foundation
 
-class TempFileManager {
-    
+class PersistentAssetManager {
     let identifier: String
     init(identifier: String) {
         self.identifier = identifier
     }
     
     private lazy var assetDirectory: URL = {
-        let directoryURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("com.mentrena.QSTempFileManager").appendingPathComponent(identifier)
+        let appSupportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let directoryURL = appSupportURL
+            .appendingPathComponent("CloudKitAssets")
+            .appendingPathComponent(identifier)
         
-        if FileManager.default.fileExists(atPath: directoryURL.path) == false {
+        if !FileManager.default.fileExists(atPath: directoryURL.path) {
             try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
         }
         
@@ -32,8 +34,7 @@ class TempFileManager {
         return url
     }
     
-    func clearTempFiles() {
-        
+    func clearAssetFiles() {
         guard let fileURLs = try? FileManager.default.contentsOfDirectory(at: assetDirectory, includingPropertiesForKeys: nil, options: []) else {
             return
         }
@@ -42,4 +43,8 @@ class TempFileManager {
             try? FileManager.default.removeItem(at: fileURL)
         }
     }
+}
+
+func delete(fileAt url: URL) {
+    try? FileManager.default.removeItem(at: url)
 }

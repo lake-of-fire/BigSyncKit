@@ -106,6 +106,14 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func changesFinishedSynchronizing() async {
+        resetActiveTokens()
+        
+        uploadRetries = 0
+        
+        for adapter in modelAdapters {
+            await adapter.didFinishImport(with: nil)
+        }
+
         postNotification(.SynchronizerDidSynchronize)
         delegate?.synchronizerDidSync(self)
         
@@ -813,7 +821,7 @@ extension CloudKitSynchronizer {
     }
     
     func reduceBatchSize() {
-        self.batchSize = self.batchSize / 2
+        self.batchSize = Int((Double(self.batchSize) / 1.5).rounded())
     }
     
     func increaseBatchSize() {

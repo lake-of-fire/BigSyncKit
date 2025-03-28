@@ -254,8 +254,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private let logger: Logging.Logger
     
-    private lazy var tempFileManager: TempFileManager = {
-        TempFileManager(identifier: "\(recordZoneID.ownerName).\(recordZoneID.zoneName).\(targetRealmConfigurations.map { $0.fileURL?.lastPathComponent ?? UUID().uuidString } .joined(separator: "-")).\(targetRealmConfigurations.map { $0.schemaVersion } .reduce(0, +))")
+    private lazy var persistentAssetManager: PersistentAssetManager = {
+        PersistentAssetManager(identifier: "\(recordZoneID.ownerName).\(recordZoneID.zoneName).\(targetRealmConfigurations.map { $0.fileURL?.lastPathComponent ?? UUID().uuidString } .joined(separator: "-")).\(targetRealmConfigurations.map { $0.schemaVersion } .reduce(0, +))")
     }()
     
     var syncRealmProvider: SyncRealmProvider?
@@ -1502,7 +1502,26 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let results = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == state.rawValue }) else { return [] }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
-        for syncedEntity in Array(results) {
+        
+#if DEBUG
+        // Ensure dummy records are uploaded first
+        let resultsToUpload = Array(results).sorted {
+            let isFirstDummy = dummyRecordIdentifiers.contains($0.identifier)
+            let isSecondDummy = dummyRecordIdentifiers.contains($1.identifier)
+            
+            if isFirstDummy && !isSecondDummy {
+                return true
+            } else if !isFirstDummy && isSecondDummy {
+                return false
+            } else {
+                return $0.identifier < $1.identifier // fallback sort
+            }
+        }
+#else
+        let resultsToUpload = Array(results)
+#endif
+        
+        for syncedEntity in resultsToUpload {
             if resultArray.count >= limit {
                 break
             }
@@ -1556,9 +1575,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //        }
         
         for property in object.objectSchema.properties {
-//            if object.objectSchema.className == "HistoryRecord" && property.name == "content" && record.id == "6657C67E-95EC-479B-B5F5-9F7F44EAB1C5" {
-//                debugPrint(property)
-//            }
+            //            if object.objectSchema.className == "HistoryRecord" && property.name == "content" && record.id == "6657C67E-95EC-479B-B5F5-9F7F44EAB1C5" {
+            //                debugPrint(property)
+            //            }
             if entityState == SyncedEntityState.new.rawValue || entityState == SyncedEntityState.changed.rawValue {
                 if let recordProcessingDelegate = recordProcessingDelegate,
                    !recordProcessingDelegate.shouldProcessPropertyBeforeUpload(propertyName: property.name, object: object, record: record) {
@@ -1702,7 +1721,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     if property.type == PropertyType.data,
                        let data = value as? Data,
                        !forceDataTypeInsteadOfAsset {
-                        let fileURL = self.tempFileManager.store(data: data)
+                        let fileURL = self.persistentAssetManager.store(data: data)
                         let asset = CKAsset(fileURL: fileURL)
                         record[property.name] = asset
                     } else if value == nil {
@@ -1711,7 +1730,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         record[property.name] = recordValue
                     }
                 }
-
+                
             }
         }
         
@@ -1777,7 +1796,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             record[property.name] = Double(0.0) as CKRecordValue
                         case .data:
                             let dummyData = "dummy".data(using: .utf8)!
-                            let fileURL = self.tempFileManager.store(data: dummyData)
+                            let fileURL = self.persistentAssetManager.store(data: dummyData)
                             let asset = CKAsset(fileURL: fileURL)
                             record[property.name] = asset
                         case .UUID:
@@ -2169,7 +2188,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func didFinishImport(with error: Error?) async {
         guard let realmProvider else { return }
         
-        tempFileManager.clearTempFiles()
+        persistentAssetManager.clearAssetFiles()
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         updateHasChanges(realm: persistenceRealm)
     }
