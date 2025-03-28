@@ -27,7 +27,6 @@ class PersistentAssetManager {
     }()
     
     func store(data: Data) -> URL {
-        
         let fileName = ProcessInfo.processInfo.globallyUniqueString
         let url = assetDirectory.appendingPathComponent(fileName)
         try? data.write(to: url, options: .atomicWrite)
@@ -45,6 +44,3 @@ class PersistentAssetManager {
     }
 }
 
-func delete(fileAt url: URL) {
-    try? FileManager.default.removeItem(at: url)
-}

@@ -55,6 +55,8 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     }
     
     override func start() {
+        logStart()
+        
         for zone in zoneIDs {
             zoneResults[zone] = FetchZoneChangesOperationZoneResult()
         }

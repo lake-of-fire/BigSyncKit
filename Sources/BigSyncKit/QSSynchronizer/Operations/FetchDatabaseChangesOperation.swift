@@ -32,7 +32,9 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
     }
     
     override func start() {
-        super.start()
+        logStart()
+        
+//        super.start()
         
         let databaseChangesOperation = CKFetchDatabaseChangesOperation(previousServerChangeToken: databaseToken)
         databaseChangesOperation.fetchAllChanges = true

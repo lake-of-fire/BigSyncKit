@@ -204,7 +204,16 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
-        logger.info("QSCloudKitSynchronizer >> Starting operation: \(type(of: operation))")
+//        if let currentOp = currentOperation, !currentOp.isFinished {
+//            logger.warning("QSCloudKitSynchronizer >> Skipping new operation \(type(of: operation)) because current operation \(type(of: currentOp)) is still running")
+//            Task { @BigSyncBackgroundActor in
+//                await failSynchronization(error: SyncError.alreadySyncing)
+//            }
+//            return
+//        }
+        
+        logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
+        operation.logger = logger
         operation.errorHandler = { [weak self] operation, error in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 if let ckError = error as? CKError, ckError.code == .serverRecordChanged {
@@ -331,7 +340,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchChanges() async {
-        //        debugPrint("# fetchChanges")
+//        debugPrint("# fetchChanges()")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -380,7 +389,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async throws -> ()) async {
-        //        debugPrint("# fetchDatabaseChanges()", containerIdentifier, serverChangeToken)
+//        debugPrint("# fetchDatabaseChanges() (calls FetchDatabaseChangesOperation)") //, containerIdentifier, serverChangeToken)
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
@@ -526,7 +535,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func uploadChanges() async throws {
-        //        debugPrint("# uploadChanges()")
+//        debugPrint("# uploadChanges()")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -539,11 +548,13 @@ extension CloudKitSynchronizer {
             if let error = error as? NSError {
 #warning("FIXME: handle zone not found...")
                 if shouldRetryUpload(for: error) {
+//                    print("# uploadChanges() failed, retrying via fetchChanges()")
                     uploadRetries += 1
                     await fetchChanges()
                 } else {
                     await failSynchronization(error: error)
                 }
+            } else {
                 updateTokens()
             }
         }
@@ -570,6 +581,7 @@ extension CloudKitSynchronizer {
                 try await completion(error)
                 return
             }
+//            debugPrint("# uploadRecords from setupZoneAndUploadRecords")
             try await uploadRecords(adapter: adapter, completion: { [weak self] (error) in
                 if error == nil {
                     self?.increaseBatchSize()
@@ -703,6 +715,7 @@ extension CloudKitSynchronizer {
                 
                 if recordCount >= requestedBatchSize {
                     increaseBatchSize()
+//                    debugPrint("# uploadRecords from inside uploadRecords")
                     try await uploadRecords(adapter: adapter, completion: completion)
                 } else {
                     try await completion(nil)
@@ -756,6 +769,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func updateTokens() {
+//        debugPrint("# updateTokens() (calls FetchDatabaseChangesOperation)")
         let operation = FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (databaseToken, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
@@ -826,7 +840,7 @@ extension CloudKitSynchronizer {
     
     func increaseBatchSize() {
         if self.batchSize < CloudKitSynchronizer.maxBatchSize {
-            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 10))
+            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 5))
         }
     }
 }

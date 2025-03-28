@@ -128,6 +128,7 @@ public class CloudKitSynchronizer: NSObject {
     public let keyValueStore: KeyValueStore
     
     /// Indicates whether the instance is currently synchronizing data.
+    @BigSyncBackgroundActor
     public internal(set) var syncing: Bool = false
     
     ///  Number of records that are sent in an upload operation.
@@ -147,10 +148,15 @@ public class CloudKitSynchronizer: NSObject {
     
 //    internal let dispatchQueue = DispatchQueue(label: "QSCloudKitSynchronizer")
     @BigSyncBackgroundActor
-    internal let operationQueue = OperationQueue()
+    internal let operationQueue: OperationQueue = {
+        let queue = OperationQueue()
+//        queue.maxConcurrentOperationCount = 1
+        return queue
+    }()
     internal var modelAdapterDictionary = [CKRecordZone.ID: ModelAdapter]()
     internal var serverChangeToken: CKServerChangeToken?
     internal var activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
+    @BigSyncBackgroundActor
     internal var cancelSync = false
 //    internal var onFailure: ((Error) -> ())?
     @BigSyncBackgroundActor
@@ -241,18 +247,18 @@ public class CloudKitSynchronizer: NSObject {
     /// - Parameter onFailure: Block that receives an error if the synchronization stopped due to a failure. Could be a `SyncError`, `CKError`, or any other error found during synchronization.
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
-        guard !syncing else {
-//            debugPrint("# already syncing")
-//            onFailure?(SyncError.alreadySyncing)
-            return
-        }
-        
-//        debugPrint("CloudKitSynchronizer >> Initiating synchronization", identifier, containerIdentifier)
-        cancelSync = false
-        syncing = true
-//        self.onFailure = onFailure
-        
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+            guard !syncing else {
+                //            debugPrint("# already syncing")
+                //            onFailure?(SyncError.alreadySyncing)
+                return
+            }
+            
+            //        debugPrint("CloudKitSynchronizer >> Initiating synchronization", identifier, containerIdentifier)
+            cancelSync = false
+            syncing = true
+            //        self.onFailure = onFailure
+            
             await self?.performSynchronization()
         }
     }

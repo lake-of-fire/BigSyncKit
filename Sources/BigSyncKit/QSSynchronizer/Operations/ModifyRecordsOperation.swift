@@ -35,6 +35,7 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     weak var internalOperation: CKModifyRecordsOperation?
         
     override func start() {
+        logStart()
         let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: recordIDsToDelete)
         
         operation.perRecordCompletionBlock = { record, error in

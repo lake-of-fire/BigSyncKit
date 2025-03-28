@@ -1722,6 +1722,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                        let data = value as? Data,
                        !forceDataTypeInsteadOfAsset {
                         let fileURL = self.persistentAssetManager.store(data: data)
+                        logger.info("QSCloudKitSynchronizer >> Stored CKAsset data at \(fileURL) for \(property.name) of \(syncedEntity.identifier)")
                         let asset = CKAsset(fileURL: fileURL)
                         record[property.name] = asset
                     } else if value == nil {
@@ -2188,6 +2189,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func didFinishImport(with error: Error?) async {
         guard let realmProvider else { return }
         
+        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
         persistentAssetManager.clearAssetFiles()
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         updateHasChanges(realm: persistenceRealm)

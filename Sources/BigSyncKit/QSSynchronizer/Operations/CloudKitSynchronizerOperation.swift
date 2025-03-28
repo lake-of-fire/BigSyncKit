@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Logging
 
 class CloudKitSynchronizerOperation: Operation {
     override var isAsynchronous: Bool { return true }
@@ -13,6 +14,8 @@ class CloudKitSynchronizerOperation: Operation {
     override var isFinished: Bool { return state == .finished }
     @objc var errorHandler: ((CloudKitSynchronizerOperation, Error) -> ())?
     
+    internal var logger: Logging.Logger?
+
     var state = State.ready {
         willSet {
             willChangeValue(forKey: state.keyPath)
@@ -47,7 +50,13 @@ class CloudKitSynchronizerOperation: Operation {
     func finish(error: Error?) {
         if let error = error {
             errorHandler?(self, error)
+        } else {
+            logger?.info("QSCloudKitSynchronizer >> Operation succeeded: \(type(of: self))")
         }
         state = .finished
     }
+    
+    internal func logStart() {
+         logger?.info("QSCloudKitSynchronizer >> Starting operation: \(type(of: self))")
+   }
 }
