@@ -160,15 +160,16 @@ extension CloudKitSynchronizer {
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
                 logger.warning("QSCloudKitSynchronizer >> Warning: \(error.localizedDescription) ( \(error)). Retrying in \(retryAfter.rounded()) seconds.")
+                reduceBatchSize()
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000) + 1_000_000_000)
                 } catch {
                     logger.error("QSCloudKitSynchronizer >> Error: \(error.localizedDescription).")
                 }
                 logger.info("QSCloudKitSynchronizer >> Waited \(retryAfter) seconds.")
             default:
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
-//                break
+                //                break
             }
         }
         
@@ -176,7 +177,7 @@ extension CloudKitSynchronizer {
         syncing = false
         cancelSync = false
         await beginSynchronization()
-
+        
         //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
         //        logger.info("QSCloudKitSynchronizer >> Finishing synchronization")
     }
@@ -293,7 +294,7 @@ extension CloudKitSynchronizer {
             return
         }
         
-//        debugPrint("# sequential closure(...)")
+        //        debugPrint("# sequential closure(...)")
         try await closure(first) { [weak self] error in
             guard error == nil else {
                 try await final(error)
@@ -328,6 +329,28 @@ extension CloudKitSynchronizer {
             return
         }
         
+        do {
+            if let lastEmpty = lastEmptyFetchTime,
+               Date().timeIntervalSince(lastEmpty) < 15 * 60 {
+                var hasPendingUploads = false
+                for adapter in modelAdapters {
+                    let records = try await adapter.recordsToUpload(limit: 1)
+                    if !records.isEmpty {
+                        hasPendingUploads = true
+                        break
+                    }
+                }
+                if hasPendingUploads {
+                    logger.info("QSCloudKitSynchronizer >> Skipping CloudKit fetch: last was empty and uploads are pending")
+                    try await uploadChanges()
+                    return
+                }
+            }
+        } catch {
+            await failSynchronization(error: error)
+            return
+        }
+        
         postNotification(.SynchronizerWillFetchChanges)
         
         await fetchDatabaseChanges() { [weak self] token, error in
@@ -359,6 +382,7 @@ extension CloudKitSynchronizer {
                 
                 //                debugPrint("# zoneIDsToFetch", zoneIDsToFetch)
                 guard zoneIDsToFetch.count > 0 else {
+                    self.lastEmptyFetchTime = Date()
                     await self.resetActiveTokens()
                     try await completion(token, nil)
                     return
@@ -512,8 +536,6 @@ extension CloudKitSynchronizer {
                 } else {
                     await failSynchronization(error: error)
                 }
-            } else {
-                increaseBatchSize()
                 updateTokens()
             }
         }
@@ -540,7 +562,10 @@ extension CloudKitSynchronizer {
                 try await completion(error)
                 return
             }
-            try await uploadRecords(adapter: adapter, completion: { (error) in
+            try await uploadRecords(adapter: adapter, completion: { [weak self] (error) in
+                if error == nil {
+                    self?.increaseBatchSize()
+                }
                 try await completion(error)
             })
         }
@@ -669,6 +694,7 @@ extension CloudKitSynchronizer {
                 }
                 
                 if recordCount >= requestedBatchSize {
+                    increaseBatchSize()
                     try await uploadRecords(adapter: adapter, completion: completion)
                 } else {
                     try await completion(nil)

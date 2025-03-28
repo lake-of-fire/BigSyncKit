@@ -158,6 +158,8 @@ public class CloudKitSynchronizer: NSObject {
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     
+    internal var lastEmptyFetchTime: Date?
+    
     internal let logger: Logging.Logger
     
     /// Default number of records to send in an upload operation.
