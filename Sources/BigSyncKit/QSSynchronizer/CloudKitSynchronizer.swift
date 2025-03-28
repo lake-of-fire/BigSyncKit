@@ -17,7 +17,7 @@ public extension Notification.Name {
     static let SynchronizerWillFetchChanges = Notification.Name("QSCloudKitSynchronizerWillFetchChangesNotification")
     /// Sent when the synchronizer is going to start the upload stage, where it sends changes to CloudKit.
     static let SynchronizerWillUploadChanges = Notification.Name("QSCloudKitSynchronizerWillUploadChangesNotification")
-//    /// Sent when the synchronizer finishes syncing.
+    //    /// Sent when the synchronizer finishes syncing.
     static let SynchronizerDidSynchronize = Notification.Name("QSCloudKitSynchronizerDidSynchronizeNotification")
     /// Sent when the synchronizer encounters an error while syncing.
     static let SynchronizerDidFailToSynchronize = Notification.Name("QSCloudKitSynchronizerDidFailToSynchronizeNotification")
@@ -42,14 +42,14 @@ public extension Notification.Name {
 /// An `AdapterProvider` gets requested for new model adapters when a `CloudKitSynchronizer` encounters a new `CKRecordZone` that does not already correspond to an existing model adapter.
 //@objc public protocol AdapterProvider {
 public protocol AdapterProvider {
-
+    
     /// The `CloudKitSynchronizer` requests a new model adapter for the given record zone.
     /// - Parameters:
     ///   - synchronizer: `QSCloudKitSynchronizer` asking for the adapter.
     ///   - zoneID: `CKRecordZoneID` that the model adapter will be used for.
     /// - Returns: `ModelAdapter` correctly configured to sync changes in the given record zone.
     func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID zoneID: CKRecordZone.ID) -> ModelAdapter?
-
+    
     /// The `CloudKitSynchronizer` informs the provider that a record zone was deleted so it can clean up any associated data.
     /// - Parameters:
     ///   - synchronizer: `QSCloudKitSynchronizer` that found the deleted record zone.
@@ -88,7 +88,7 @@ public class CloudKitSynchronizer: NSObject {
         /**
          *  A record fot the provided object was not found, so the object cannot be shared on CloudKit.
          */
-//        case recordNotFound = 2
+        //        case recordNotFound = 2
         /**
          *  Synchronization was manually cancelled.
          */
@@ -135,9 +135,9 @@ public class CloudKitSynchronizer: NSObject {
     public var batchSize: Int = CloudKitSynchronizer.defaultInitialBatchSize
     
     /**
-    *  When set, if the synchronizer finds records uploaded by a different device using a higher compatibility version,
-    *   it will end synchronization with a `higherModelVersionFound` error.
-    */
+     *  When set, if the synchronizer finds records uploaded by a different device using a higher compatibility version,
+     *   it will end synchronization with a `higherModelVersionFound` error.
+     */
     public var compatibilityVersion: Int = 0
     
     /// Whether the synchronizer will only download data or also upload any local changes.
@@ -146,11 +146,11 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     public var delegate: CloudKitSynchronizerDelegate?
     
-//    internal let dispatchQueue = DispatchQueue(label: "QSCloudKitSynchronizer")
+    //    internal let dispatchQueue = DispatchQueue(label: "QSCloudKitSynchronizer")
     @BigSyncBackgroundActor
     internal let operationQueue: OperationQueue = {
         let queue = OperationQueue()
-//        queue.maxConcurrentOperationCount = 1
+        //        queue.maxConcurrentOperationCount = 1
         return queue
     }()
     internal var modelAdapterDictionary = [CKRecordZone.ID: ModelAdapter]()
@@ -158,9 +158,9 @@ public class CloudKitSynchronizer: NSObject {
     internal var activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
     @BigSyncBackgroundActor
     internal var cancelSync = false
-//    internal var onFailure: ((Error) -> ())?
+    //    internal var onFailure: ((Error) -> ())?
     @BigSyncBackgroundActor
-    internal weak var currentOperation: Operation?
+    internal var currentOperations = [Operation]()
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     
@@ -269,13 +269,13 @@ public class CloudKitSynchronizer: NSObject {
         guard syncing, !cancelSync else { return }
         
         cancelSync = true
-        currentOperation?.cancel()
+        currentOperations.forEach { $0.cancel() }
     }
     
     /**
-    *  Deletes saved database token, so next synchronization will include changes in all record zones in the database.
-    * This does not reset tokens stored by model adapters.
-    */
+     *  Deletes saved database token, so next synchronization will include changes in all record zones in the database.
+     * This does not reset tokens stored by model adapters.
+     */
     @objc public func resetDatabaseToken() {
         storedDatabaseToken = nil
     }
@@ -284,30 +284,30 @@ public class CloudKitSynchronizer: NSObject {
         return activeZoneTokens[zoneID]
     }
     
-//    /**
-//    * Deletes saved database token and all local metadata used to track changes in models.
-//    * The synchronizer should not be used after calling this function, create a new synchronizer instead if you need it.
-//    */
-//    @BigSyncBackgroundActor
-//    @objc public func eraseLocalMetadata(removeModelAdapters: Bool) {
-//        cancelSynchronization()
-//        
-////        dispatchQueue.async {
-//        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-//            guard let self = self else { return }
-//            storedDatabaseToken = nil
-//            clearAllStoredSubscriptionIDs()
-//            deviceUUID = nil
-//            for modelAdapter in modelAdapters {
-//                await modelAdapter.deleteChangeTracking()
-//                if removeModelAdapters {
-//                    removeModelAdapter(modelAdapter)
-////                } else {
-////                    await modelAdapter.saveToken(nil)
-//                }
-//            }
-//        }
-//    }
+    //    /**
+    //    * Deletes saved database token and all local metadata used to track changes in models.
+    //    * The synchronizer should not be used after calling this function, create a new synchronizer instead if you need it.
+    //    */
+    //    @BigSyncBackgroundActor
+    //    @objc public func eraseLocalMetadata(removeModelAdapters: Bool) {
+    //        cancelSynchronization()
+    //        
+    ////        dispatchQueue.async {
+    //        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+    //            guard let self = self else { return }
+    //            storedDatabaseToken = nil
+    //            clearAllStoredSubscriptionIDs()
+    //            deviceUUID = nil
+    //            for modelAdapter in modelAdapters {
+    //                await modelAdapter.deleteChangeTracking()
+    //                if removeModelAdapters {
+    //                    removeModelAdapter(modelAdapter)
+    ////                } else {
+    ////                    await modelAdapter.saveToken(nil)
+    //                }
+    //            }
+    //        }
+    //    }
     
     /// Deletes the corresponding record zone on CloudKit, along with any data in it.
     /// - Parameters:
@@ -319,10 +319,10 @@ public class CloudKitSynchronizer: NSObject {
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 await adapter.saveToken(nil)
                 if let error = error {
-//                    debugPrint("CloudKitSynchronizer >> Error: \(error)")
+                    //                    debugPrint("CloudKitSynchronizer >> Error: \(error)")
                     self?.logger.error("CloudKitSynchronizer >> Error: \(error)")
                 } else {
-//                    debugPrint("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
+                    //                    debugPrint("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
                     self?.logger.error("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
                 }
                 completion?(error)

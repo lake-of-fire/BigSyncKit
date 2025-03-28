@@ -15,7 +15,7 @@ class CloudKitSynchronizerOperation: Operation {
     @objc var errorHandler: ((CloudKitSynchronizerOperation, Error) -> ())?
     
     internal var logger: Logging.Logger?
-
+    
     var state = State.ready {
         willSet {
             willChangeValue(forKey: state.keyPath)
@@ -53,10 +53,15 @@ class CloudKitSynchronizerOperation: Operation {
         } else {
             logger?.info("QSCloudKitSynchronizer >> Operation succeeded: \(type(of: self))")
         }
+        if let synchronizer = self as? CloudKitSynchronizer {
+            Task { @BigSyncBackgroundActor in
+                synchronizer.currentOperations.removeAll { $0.isFinished }
+            }
+        }
         state = .finished
     }
     
     internal func logStart() {
-         logger?.info("QSCloudKitSynchronizer >> Starting operation: \(type(of: self))")
-   }
+        logger?.info("QSCloudKitSynchronizer >> Starting operation: \(type(of: self))")
+    }
 }

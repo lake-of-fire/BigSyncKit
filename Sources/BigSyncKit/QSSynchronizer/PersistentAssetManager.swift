@@ -26,20 +26,32 @@ class PersistentAssetManager {
         return directoryURL
     }()
     
-    func store(data: Data) -> URL {
-        let fileName = ProcessInfo.processInfo.globallyUniqueString
+    func store(data: Data, forRecordID recordID: String? = nil) -> URL {
+        let unique = ProcessInfo.processInfo.globallyUniqueString
+        let fileName: String
+        if let recordID = recordID {
+            fileName = "\(recordID)_\(unique)"
+        } else {
+            fileName = unique
+        }
         let url = assetDirectory.appendingPathComponent(fileName)
         try? data.write(to: url, options: .atomicWrite)
         return url
     }
     
-    func clearAssetFiles() {
+    func clearAssetFiles(forSyncedEntityIDs ids: [String]) {
         guard let fileURLs = try? FileManager.default.contentsOfDirectory(at: assetDirectory, includingPropertiesForKeys: nil, options: []) else {
             return
         }
         
         for fileURL in fileURLs {
-            try? FileManager.default.removeItem(at: fileURL)
+            let fileName = fileURL.lastPathComponent
+            for id in ids {
+                if fileName.hasPrefix(id) {
+                    try? FileManager.default.removeItem(at: fileURL)
+                    break
+                }
+            }
         }
     }
 }

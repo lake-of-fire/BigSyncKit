@@ -106,6 +106,8 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func changesFinishedSynchronizing() async {
+        logger.info("QSCloudKitSynchronizer >> Finishing synchronization batch...")
+        
         resetActiveTokens()
         
         uploadRetries = 0
@@ -113,17 +115,19 @@ extension CloudKitSynchronizer {
         for adapter in modelAdapters {
             await adapter.didFinishImport(with: nil)
         }
-
+        
         postNotification(.SynchronizerDidSynchronize)
         delegate?.synchronizerDidSync(self)
         
-        logger.info("QSCloudKitSynchronizer >> Finished synchronizing any changes")
+        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
         syncing = false
         cancelSync = false
     }
     
     @BigSyncBackgroundActor
     func failSynchronization(error: Error) async {
+        logger.info("QSCloudKitSynchronizer >> Failing or backing off synchronization...")
+        
         resetActiveTokens()
         
         uploadRetries = 0
@@ -204,13 +208,13 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
-//        if let currentOp = currentOperation, !currentOp.isFinished {
-//            logger.warning("QSCloudKitSynchronizer >> Skipping new operation \(type(of: operation)) because current operation \(type(of: currentOp)) is still running")
-//            Task { @BigSyncBackgroundActor in
-//                await failSynchronization(error: SyncError.alreadySyncing)
-//            }
-//            return
-//        }
+        //        if let currentOp = currentOperation, !currentOp.isFinished {
+        //            logger.warning("QSCloudKitSynchronizer >> Skipping new operation \(type(of: operation)) because current operation \(type(of: currentOp)) is still running")
+        //            Task { @BigSyncBackgroundActor in
+        //                await failSynchronization(error: SyncError.alreadySyncing)
+        //            }
+        //            return
+        //        }
         
         logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
         operation.logger = logger
@@ -224,7 +228,8 @@ extension CloudKitSynchronizer {
                 await self?.failSynchronization(error: error)
             }
         }
-        currentOperation = operation
+        currentOperations.removeAll { $0.isFinished }
+        currentOperations.append(operation)
         operationQueue.addOperation(operation)
     }
     
@@ -340,7 +345,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchChanges() async {
-//        debugPrint("# fetchChanges()")
+        //        debugPrint("# fetchChanges()")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -389,7 +394,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async throws -> ()) async {
-//        debugPrint("# fetchDatabaseChanges() (calls FetchDatabaseChangesOperation)") //, containerIdentifier, serverChangeToken)
+        //        debugPrint("# fetchDatabaseChanges() (calls FetchDatabaseChangesOperation)") //, containerIdentifier, serverChangeToken)
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
@@ -535,7 +540,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func uploadChanges() async throws {
-//        debugPrint("# uploadChanges()")
+        //        debugPrint("# uploadChanges()")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -548,7 +553,7 @@ extension CloudKitSynchronizer {
             if let error = error as? NSError {
 #warning("FIXME: handle zone not found...")
                 if shouldRetryUpload(for: error) {
-//                    print("# uploadChanges() failed, retrying via fetchChanges()")
+                    //                    print("# uploadChanges() failed, retrying via fetchChanges()")
                     uploadRetries += 1
                     await fetchChanges()
                 } else {
@@ -581,7 +586,7 @@ extension CloudKitSynchronizer {
                 try await completion(error)
                 return
             }
-//            debugPrint("# uploadRecords from setupZoneAndUploadRecords")
+            //            debugPrint("# uploadRecords from setupZoneAndUploadRecords")
             try await uploadRecords(adapter: adapter, completion: { [weak self] (error) in
                 if error == nil {
                     self?.increaseBatchSize()
@@ -715,7 +720,7 @@ extension CloudKitSynchronizer {
                 
                 if recordCount >= requestedBatchSize {
                     increaseBatchSize()
-//                    debugPrint("# uploadRecords from inside uploadRecords")
+                    //                    debugPrint("# uploadRecords from inside uploadRecords")
                     try await uploadRecords(adapter: adapter, completion: completion)
                 } else {
                     try await completion(nil)
@@ -769,7 +774,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func updateTokens() {
-//        debugPrint("# updateTokens() (calls FetchDatabaseChangesOperation)")
+        //        debugPrint("# updateTokens() (calls FetchDatabaseChangesOperation)")
         let operation = FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (databaseToken, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
