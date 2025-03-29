@@ -439,7 +439,14 @@ extension CloudKitSynchronizer {
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async throws -> ()) {
         //        debugPrint("# fetchZoneChanges(...)", zoneIDs)
         let changeRequestProcessor = ChangeRequestProcessor()
-        let operation = FetchZoneChangesOperation(database: database, zoneIDs: zoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: nil) { [weak self] (downloadedRecord, deletedRecordID) in
+        let operation = FetchZoneChangesOperation(
+            database: database,
+            zoneIDs: zoneIDs,
+            zoneChangeTokens: activeZoneTokens,
+            modelVersion: compatibilityVersion,
+            ignoreDeviceIdentifier: deviceIdentifier,
+            desiredKeys: nil
+        ) { [weak self] (downloadedRecord, deletedRecordID) in
             guard let self else { return }
             guard let zoneID = downloadedRecord?.recordID.zoneID ?? deletedRecordID?.zoneID else {
                 debugPrint("Unexpectedly found no downloaded record or deleted record ID")
@@ -448,7 +455,11 @@ extension CloudKitSynchronizer {
             
             let adapter = await modelAdapterDictionary[zoneID]
             if let adapter {
-                let changeRequest = ChangeRequest(downloadedRecord: downloadedRecord, deletedRecordID: deletedRecordID, adapter: adapter)
+                let changeRequest = ChangeRequest(
+                    downloadedRecord: downloadedRecord,
+                    deletedRecordID: deletedRecordID,
+                    adapter: adapter
+                )
                 await changeRequestProcessor.addFetchedChangeRequest(changeRequest)
             }
         } completion: { [weak self] zoneResults in
@@ -812,7 +823,17 @@ extension CloudKitSynchronizer {
             return
         }
         
-        let operation = FetchZoneChangesOperation(database: database, zoneIDs: recordZoneIDs, zoneChangeTokens: activeZoneTokens, modelVersion: compatibilityVersion, ignoreDeviceIdentifier: deviceIdentifier, desiredKeys: ["recordID", CloudKitSynchronizer.deviceUUIDKey]) { @BigSyncBackgroundActor [weak self] zoneResults in
+        let operation = FetchZoneChangesOperation(
+            database: database,
+            zoneIDs: recordZoneIDs,
+            zoneChangeTokens: activeZoneTokens,
+            modelVersion: compatibilityVersion,
+            ignoreDeviceIdentifier: deviceIdentifier,
+            desiredKeys: [
+                "recordID",
+                CloudKitSynchronizer.deviceUUIDKey
+            ]
+        ) { @BigSyncBackgroundActor [weak self] zoneResults in
             guard let self = self else { return }
             //            var pendingZones = [CKRecordZone.ID]()
             var needsToRefetch = false

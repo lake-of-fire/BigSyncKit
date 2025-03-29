@@ -277,7 +277,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private var lastRealmCheckDates: [URL: Date] = [:]
     private var lastRealmFileModDates: [URL: Date] = [:]
-    
+    private var recentlyFetchedRecordModifiedAts = [String: Date]()
+
     private var appForegroundCancellable: AnyCancellable?
     private let immediateChecksSubject = PassthroughSubject<Void, Never>()
     private let realmChangesSubject = PassthroughSubject<Realm, Never>()
@@ -452,57 +453,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 guard objectClass.conforms(to: SoftDeletable.self) else {
                     fatalError("\(objectClass.className()) must conform to SoftDeletable in order to sync with iCloud via BigSyncKit")
                 }
-                
-                let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
-                let results = targetReaderRealm.objects(objectClass)
-                
-                // Register for collection notifications
-                // TODO: Optimize by changing to a collection publisher! Requires modifiedAt on syncable protocol
-                
-                if !objectClass.conforms(to: ChangeMetadataRecordable.self) {
-                    //                debugPrint("# RES PUB", schema.className)
-                    results.changesetPublisher
-                        .subscribe(on: bigSyncKitQueue)
-                        .receive(on: bigSyncKitQueue)
-                        .sink(receiveValue: { [weak self] collectionChange in
-                            guard let self = self else { return }
-                            switch collectionChange {
-                            case .update(let results, _, let insertions, let modifications):
-                                var inserted = [String]()
-                                var modified = [String]()
-                                for index in insertions {
-                                    let object = results[index]
-                                    let identifier = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                                    inserted.append(identifier)
-                                }
-                                for index in modifications {
-                                    let object = results[index]
-                                    let identifier = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                                    modified.append(identifier)
-                                }
-                                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                                    guard let self else { return }
-                                    if !inserted.isEmpty {
-                                        resultsChangeSet.insertions[schema.className, default: []].formUnion(inserted)
-                                    }
-                                    if !modified.isEmpty {
-                                        resultsChangeSet.modifications[schema.className, default: []].formUnion(modified)
-                                    }
-                                }
-                                //                            if !insertions.isEmpty {                            debugPrint("# INSERT RECS", insertions.compactMap { results[$0].description.prefix(50) })                        }
-                                //                            if !modifications.isEmpty {                            debugPrint("# MODIFY RECS", modifications.compactMap { results[$0].description.prefix(50) })                        }
-                                self.resultsChangeSetPublisher.send(())
-                            default: break
-                            }
-                        })
-                        .store(in: &cancellables)
+                guard objectClass.conforms(to: ChangeMetadataRecordable.self) else {
+                    fatalError("\(objectClass.className()) must conform to ChangeMetadataRecordable in order to sync with iCloud via BigSyncKit")
                 }
-                
+
                 if needsInitialSetup {
                     beforeInitialSetup?()
                     
                     let results = targetReaderRealm.objects(objectClass)
                     let entityTypePrefix = schema.className + "."
+                    let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
                     let identifiers = Array(results).map {
                         entityTypePrefix + Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
                     }
@@ -622,12 +582,33 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt ?? .distantPast
         let createdPredicate = NSPredicate(format: "createdAt > %@", lastTrackedChangesAt as NSDate)
         let modifiedPredicate = NSPredicate(format: "modifiedAt > %@", lastTrackedChangesAt as NSDate)
-        let nextTrackedChangesAt = Date()
         
         let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate))
         let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate))
         
         let primaryKey = objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name ?? ""
+        
+        let filteredCreated = created.filter { object in
+            let id = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+            guard let fetchedModified = recentlyFetchedRecordModifiedAts["\(schemaName).\(id)"],
+                  let objectModified = object.value(forKey: "modifiedAt") as? Date else {
+                return true
+            }
+            return objectModified != fetchedModified
+        }
+        
+        let filteredModified = modified.filter { object in
+            let id = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+            guard let fetchedModified = recentlyFetchedRecordModifiedAts["\(schemaName).\(id)"],
+                  let objectModified = object.value(forKey: "modifiedAt") as? Date else {
+                return true
+            }
+            return objectModified != fetchedModified
+        }
+        
+        let maxCreatedAt = created.compactMap { $0.value(forKey: "createdAt") as? Date }.max()
+        let maxModifiedAt = modified.compactMap { $0.value(forKey: "modifiedAt") as? Date }.max()
+        let nextTrackedChangesAt = max(maxCreatedAt ?? .distantPast, maxModifiedAt ?? .distantPast)
         
         //        if created.isEmpty && modified.isEmpty {
         //            let (maxCreatedAt, maxModifiedAt) =  (
@@ -639,13 +620,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //            debugPrint("Warning: enueueCreatedAndModified called without any matching records to enqueue as created or modified. Object class:", objectClass, "Last tracked changes at:", lastTrackedChangesAt, "Last created at:", maxCreatedAt, "Last modified at:", maxModifiedAt)
         //        }
         
-        if !created.isEmpty {
+        if !filteredCreated.isEmpty {
             resultsChangeSet.insertions[schemaName, default: []]
-                .formUnion(created.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+                .formUnion(filteredCreated.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
         }
-        if !modified.isEmpty {
+        if !filteredModified.isEmpty {
             resultsChangeSet.modifications[schemaName, default: []]
-                .formUnion(modified.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+                .formUnion(filteredModified.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
         }
         
         // Persist the new lastTrackedChangesAt
@@ -653,6 +634,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         if !created.isEmpty || !modified.isEmpty {
             try? await persistenceRealm.asyncWrite {
                 syncedEntityType.lastTrackedChangesAt = nextTrackedChangesAt
+            }
+            
+            let processedIDs = filteredCreated.map { "\(schemaName).\($0.value(forKey: primaryKey)!)" } +
+            filteredModified.map { "\(schemaName).\($0.value(forKey: primaryKey)!)" }
+            for id in processedIDs {
+                self.recentlyFetchedRecordModifiedAts.removeValue(forKey: id)
             }
             
             //            debugPrint("# created or modified non-empty, resultsChangeSetPublisher send...", created.count, modified.count, resultsChangeSet.insertions, resultsChangeSet.modifications)
@@ -1850,7 +1837,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         guard let result = result as? (any SyncableBase) else {
                             fatalError("SyncableBase object class unexpectedly had non-SyncableBase element")
                         }
-                        return !result.needsSyncToServer
+                        // Don't delete before the application server received the deletion.
+                        return !result.needsSyncToAppServer
                     }
                 }
 #if DEBUG
@@ -1956,7 +1944,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             for record in chunk {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-
+                
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                 var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm)
                 if syncedEntity == nil {
@@ -2009,6 +1997,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     guard let self = self else { return }
                     
                     for (record, _, _, syncedEntityID, syncedEntityState, _) in chunk {
+                        if let remoteModified = record["modifiedAt"] as? Date {
+                            self.recentlyFetchedRecordModifiedAts[syncedEntityID] = remoteModified
+                        }
                         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                         if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: syncedEntityID) {
                             self.save(record: record, for: syncedEntity)
@@ -2048,7 +2039,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 try? await persistPendingRelationships()
                 
-                try? await Task.sleep(nanoseconds: 20_000_000)
+                try? await Task.sleep(nanoseconds: 10_000_000)
             }
             
             logger.info("QSCloudKitSynchronizer >> Persisted \(recordsToSave.count) downloaded records")
