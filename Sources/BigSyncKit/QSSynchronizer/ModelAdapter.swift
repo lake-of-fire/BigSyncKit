@@ -62,7 +62,7 @@ public protocol ModelAdapter: AnyObject {
     
     /// Tells the model adapter that these records were uploaded successfully to CloudKit.
     /// - Parameter savedRecords: Records that were saved.
-    func didUpload(savedRecords: [CKRecord]) async
+    func didUpload(savedRecords: [CKRecord]) async throws
     
     /// Provides an array of record IDs to be deleted on CloudKit, for model objects that were deleted locally.
     /// - Parameter limit: Maximum number of records that should be provided.
@@ -104,6 +104,9 @@ public protocol ModelAdapter: AnyObject {
     /// Merge policy in case of conflicts. Default is `server`.
     var mergePolicy: MergePolicy {get set}
     
+    func cancelSynchronization() async
+    func unsetCancellation() async
+        
     /// Returns corresponding `CKRecord` for the given model object.
     /// - Parameter object: Model object.
 //    func record(for object: AnyObject) -> CKRecord?

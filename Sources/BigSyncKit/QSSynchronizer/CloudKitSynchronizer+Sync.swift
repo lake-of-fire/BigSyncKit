@@ -60,14 +60,15 @@ fileprivate class ChangeRequestProcessor {
         
         do {
             let downloadedRecords = batch.compactMap { $0.downloadedRecord }
-            if !downloadedRecords.isEmpty {
-                try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
-            }
+            try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
             
             let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
             if !deletedRecordIDs.isEmpty {
                 try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
             }
+        } catch is CancellationError {
+            // Requeue the batch so we can retry it next sync
+            changeRequests.insert(contentsOf: batch, at: 0)
         } catch {
             localErrors.append(error)
         }
@@ -469,7 +470,6 @@ extension CloudKitSynchronizer {
                 }).first
                 for (zoneID, zoneResult) in zoneResults {
                     if !zoneResult.downloadedRecords.isEmpty {
-                        debugPrint("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records >> from zone \(zoneID.zoneName)")
                         logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records from zone \(zoneID.zoneName)")
                     }
                     if !zoneResult.deletedRecordIDs.isEmpty {
@@ -654,13 +654,13 @@ extension CloudKitSynchronizer {
             //            debugPrint("# uploadRecords, inside operation callback...", records.count)
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 //                debugPrint("# uploadRecords, inside operation callback Task...", records.count, "saved", savedRecords?.count, "del", deleted?.count, "conflicted", conflicted.count, operationError)
-                guard let self = self else { return }
+                guard let self else { return }
                 var conflicted = conflicted
                 if !(savedRecords?.isEmpty ?? true) {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                     logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                 }
-                await adapter.didUpload(savedRecords: savedRecords ?? [])
+                try await adapter.didUpload(savedRecords: savedRecords ?? [])
                 
                 if let error = operationError as? NSError {
                     //                    if error.code == CKError.partialFailure.rawValue,
@@ -766,7 +766,7 @@ extension CloudKitSynchronizer {
             }
         }
         
-        currentOperation = modifyRecordsOperation
+        currentOperations.append(modifyRecordsOperation)
         database.add(modifyRecordsOperation)
     }
     

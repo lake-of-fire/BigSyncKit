@@ -157,7 +157,19 @@ public class CloudKitSynchronizer: NSObject {
     internal var serverChangeToken: CKServerChangeToken?
     internal var activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
     @BigSyncBackgroundActor
-    internal var cancelSync = false
+    internal var cancelSync = false {
+        didSet {
+            for adapter in modelAdapters {
+                Task { @BigSyncBackgroundActor in
+                    if cancelSync {
+                        await adapter.cancelSynchronization()
+                    } else {
+                        await adapter.unsetCancellation()
+                    }
+                }
+            }
+        }
+    }
     //    internal var onFailure: ((Error) -> ())?
     @BigSyncBackgroundActor
     internal var currentOperations = [Operation]()
@@ -291,7 +303,7 @@ public class CloudKitSynchronizer: NSObject {
     //    @BigSyncBackgroundActor
     //    @objc public func eraseLocalMetadata(removeModelAdapters: Bool) {
     //        cancelSynchronization()
-    //        
+    //
     ////        dispatchQueue.async {
     //        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
     //            guard let self = self else { return }
