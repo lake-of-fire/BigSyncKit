@@ -278,7 +278,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     private var lastRealmCheckDates: [URL: Date] = [:]
     private var lastRealmFileModDates: [URL: Date] = [:]
     private var recentlyFetchedRecordModifiedAts = [String: Date]()
-
+    
     private var appForegroundCancellable: AnyCancellable?
     private let immediateChecksSubject = PassthroughSubject<Void, Never>()
     private let realmChangesSubject = PassthroughSubject<Realm, Never>()
@@ -456,7 +456,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 guard objectClass.conforms(to: ChangeMetadataRecordable.self) else {
                     fatalError("\(objectClass.className()) must conform to ChangeMetadataRecordable in order to sync with iCloud via BigSyncKit")
                 }
-
+                
                 if needsInitialSetup {
                     beforeInitialSetup?()
                     
@@ -1104,10 +1104,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 #else
                         guard adapter.hasRealmObjectClass(name: String(describing: type(of: object))) else { return false }
 #endif
-                        if let remoteChangeAt = changes["modifiedAt"] as? Date, let localChangeAt = object.value(forKey: "modifiedAt") as? Date, remoteChangeAt <= localChangeAt {
-                            return false
+                        let remoteRevisionCount = changes["syncableRevisionCount"] as? Int ?? 0
+                        let localRevisionCount = object.value(forKey: "syncableRevisionCount") as? Int ?? 0
+                        if remoteRevisionCount > localRevisionCount {
+                            return true
+                        } else if remoteRevisionCount == localRevisionCount {
+                            let remoteModifiedAt = changes["modifiedAt"] as? Date ?? .distantPast
+                            let localModifiedAt = object.value(forKey: "modifiedAt") as? Date ?? .distantPast
+                            return remoteModifiedAt > localModifiedAt
                         }
-                        return true
+                        return false
                     }(self, recordChanges, object)
                 }
                 
