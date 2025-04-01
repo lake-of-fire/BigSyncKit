@@ -431,7 +431,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                     softDeletable.isDeleted = true
                                 }
                                 targetWriterRealm.add(dummy, update: .modified)
-                                print("🧪 Inserted dummy record for schema: \(schema.className)")
+                                print("[Debug] Inserted dummy record for schema: \(schema.className)")
                                 let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
                                 let dummyID = "\(schema.className).\(Self.getTargetObjectStringIdentifier(for: dummy, usingPrimaryKey: primaryKey))"
                                 dummyRecordIdentifiers.insert(dummyID)
