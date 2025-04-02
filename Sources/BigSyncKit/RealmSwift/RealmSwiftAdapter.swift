@@ -1990,12 +1990,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 syncedEntitiesToCreate.removeAll()
             }
             
+            guard !cancelSync else { throw CancellationError() }
             try? await Task.sleep(nanoseconds: 50_000_000)
+            guard !cancelSync else { throw CancellationError() }
         }
         
         // TODO: Chunk based on target writer Realm
         if !recordsToSave.isEmpty {
-            for chunk in recordsToSave.chunked(into: 500) {
+            for chunk in recordsToSave.chunked(into: 200) {
                 guard !cancelSync else { throw CancellationError() }
                 
                 //                await realmProvider.persistenceRealm?.asyncRefresh()
@@ -2003,6 +2005,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     guard let self = self else { return }
                     
                     for (record, _, _, syncedEntityID, syncedEntityState, _) in chunk {
+                        guard !cancelSync else { throw CancellationError() }
+                        
                         if let remoteModified = record["modifiedAt"] as? Date {
                             self.recentlyFetchedRecordModifiedAts[syncedEntityID] = remoteModified
                         }
@@ -2018,6 +2022,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     for targetWriterRealm in targetWriterRealms {
                         //                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
                         await targetWriterRealm.asyncRefresh()
+                        guard await !cancelSync else { throw CancellationError() }
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
                             for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk where realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration {
@@ -2045,7 +2050,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 try? await persistPendingRelationships()
                 
-                try? await Task.sleep(nanoseconds: 10_000_000)
+                try? await Task.sleep(nanoseconds: 5_000_000)
             }
             
             logger.info("QSCloudKitSynchronizer >> Persisted \(recordsToSave.count) downloaded records")
@@ -2150,6 +2155,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             try? await persistenceRealm.asyncWrite {
                 for record in chunk {
                     guard !cancelSync else { throw CancellationError() }
+                    
                     if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
                         syncedEntity.state = SyncedEntityState.synced.rawValue
                         save(record: record, for: syncedEntity)
