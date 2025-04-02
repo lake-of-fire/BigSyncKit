@@ -11,13 +11,15 @@ import RealmSwift
 @objc public protocol ChangeMetadataRecordable: SoftDeletable {
     var createdAt: Date { get }
     var modifiedAt: Date { get set }
-    var syncableRevisionCount: Int { get set }
+    var explicitlyModifiedAt: Date? { get set }
 }
 
 public extension ChangeMetadataRecordable {
-    func refreshChangeMetadata() {
+    func refreshChangeMetadata(explicitlyModified: Bool) {
         modifiedAt = Date()
-        syncableRevisionCount += 1
+        if explicitlyModified {
+            explicitlyModifiedAt = Date()
+        }
     }
 }
 

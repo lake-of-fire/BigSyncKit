@@ -39,7 +39,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
 public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
     public var realmSynchronizer: CloudKitSynchronizer
     
-    private weak var synchronizerDelegate: RealmSwiftAdapterDelegate?
+//    private weak var synchronizerDelegate: RealmSwiftAdapterDelegate?
     
     let logger: Logging.Logger
 
@@ -49,10 +49,10 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
 #warning("need to manually refresh() in bg threads (after write block) for notifs to work here (?)")
     
     public init(
-        configuration: BigSyncBackgroundWorkerConfiguration,
-        delegate: RealmSwiftAdapterDelegate? = nil
+        configuration: BigSyncBackgroundWorkerConfiguration//,
+//        delegate: RealmSwiftAdapterDelegate? = nil // If we start using this, ensure acceptRemoveChange / realmSwiftAdapter gotChanges delegate method gets implemented per RealmSwiftAdapter's conflict resolution!
     ) {
-        synchronizerDelegate = delegate
+//        synchronizerDelegate = delegate
         
         let synchronizer = CloudKitSynchronizer.privateSynchronizer(
             synchronizerName: configuration.synchronizerName,
@@ -68,7 +68,7 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
         self.logger = configuration.logger
         
         (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
-        (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
+//        (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
         synchronizer.compatibilityVersion = Int(configuration.configurations.map { $0.schemaVersion } .reduce(0, +))
         realmSynchronizer = synchronizer
 

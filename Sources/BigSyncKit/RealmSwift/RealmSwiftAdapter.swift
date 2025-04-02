@@ -244,7 +244,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public let targetRealmConfigurations: [Realm.Configuration]
     public let excludedClassNames: [String]
     public let zoneID: CKRecordZone.ID
-    public var mergePolicy: MergePolicy = .server
+    public var mergePolicy: MergePolicy = .custom
     public weak var delegate: RealmSwiftAdapterDelegate?
     public weak var recordProcessingDelegate: RealmSwiftAdapterRecordProcessing?
     public weak var modelAdapterDelegate: ModelAdapterDelegate?
@@ -1104,16 +1104,22 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 #else
                         guard adapter.hasRealmObjectClass(name: String(describing: type(of: object))) else { return false }
 #endif
-                        let remoteRevisionCount = changes["syncableRevisionCount"] as? Int ?? 0
-                        let localRevisionCount = object.value(forKey: "syncableRevisionCount") as? Int ?? 0
-                        if remoteRevisionCount > localRevisionCount {
-                            return true
-                        } else if remoteRevisionCount == localRevisionCount {
+                        let remoteExplicitlyModifiedAt = changes["explicitlyModifiedAt"] as? Date ?? .distantPast
+                        let localExplicitlyModifiedAt = object.value(forKey: "explicitlyModifiedAt") as? Date ?? .distantPast
+                        let result: Bool
+                        if remoteExplicitlyModifiedAt > localExplicitlyModifiedAt {
+                            result = true
+                        } else if remoteExplicitlyModifiedAt == localExplicitlyModifiedAt {
                             let remoteModifiedAt = changes["modifiedAt"] as? Date ?? .distantPast
                             let localModifiedAt = object.value(forKey: "modifiedAt") as? Date ?? .distantPast
-                            return remoteModifiedAt > localModifiedAt
+                            result = remoteModifiedAt > localModifiedAt
+                        } else {
+                            result = false
                         }
-                        return false
+                        logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
+//                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
+//                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
+                        return result
                     }(self, recordChanges, object)
                 }
                 
@@ -1806,7 +1812,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             record[property.name] = Double(0.0) as CKRecordValue
                         case .data:
                             let dummyData = "dummy".data(using: .utf8)!
-                            let fileURL = self.persistentAssetManager.store(data: dummyData)
+                            let fileURL = self.persistentAssetManager.store(data: dummyData, forRecordID: "Dummy.123")
                             let asset = CKAsset(fileURL: fileURL)
                             record[property.name] = asset
                         case .UUID:
@@ -2215,11 +2221,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let realmProvider, let persistenceRealm = realmProvider.persistenceRealm else { return }
         
         //        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
-        let syncedEntities = persistenceRealm.objects(SyncedEntity.self).where({ $0.state == SyncedEntityState.synced.rawValue })
-        let recordIDs = Array(syncedEntities.map { $0.identifier })
-        if !recordIDs.isEmpty {
-            persistentAssetManager.clearAssetFiles(forSyncedEntityIDs: recordIDs)
-        }
+        let pendingEntities = persistenceRealm.objects(SyncedEntity.self).where({ $0.state.in([SyncedEntityState.new.rawValue, SyncedEntityState.changed.rawValue]) })
+        let pendingRecordIDs = Set(pendingEntities.map { $0.identifier })
+        persistentAssetManager.clearAssetFiles(excludingSyncedEntityIDs: pendingRecordIDs)
         updateHasChanges(realm: persistenceRealm)
     }
     

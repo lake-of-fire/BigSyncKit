@@ -26,33 +26,32 @@ class PersistentAssetManager {
         return directoryURL
     }()
     
-    func store(data: Data, forRecordID recordID: String? = nil) -> URL {
+    func store(data: Data, forRecordID recordID: String) -> URL {
         let unique = ProcessInfo.processInfo.globallyUniqueString
-        let fileName: String
-        if let recordID = recordID {
-            fileName = "\(recordID)_\(unique)"
-        } else {
-            fileName = unique
-        }
+        let fileName = "\(recordID)_\(unique)"
         let url = assetDirectory.appendingPathComponent(fileName)
         try? data.write(to: url, options: .atomicWrite)
         return url
     }
     
-    func clearAssetFiles(forSyncedEntityIDs ids: [String]) {
+    func clearAssetFiles(excludingSyncedEntityIDs ids: Set<String>) {
         guard let fileURLs = try? FileManager.default.contentsOfDirectory(at: assetDirectory, includingPropertiesForKeys: nil, options: []) else {
             return
         }
         
         for fileURL in fileURLs {
             let fileName = fileURL.lastPathComponent
-            for id in ids {
-                if fileName.hasPrefix(id) {
+            // Find the last underscore in the file name
+            if let underscoreIndex = fileName.lastIndex(of: "_") {
+                // Extract the substring from the beginning to the underscore
+                let recordID = String(fileName[..<underscoreIndex])
+                if !ids.contains(recordID) {
                     try? FileManager.default.removeItem(at: fileURL)
-                    break
                 }
+            } else {
+                print("Invalid file detected by PersistentAssetManager - deleting:", fileURL)
+                try? FileManager.default.removeItem(at: fileURL)
             }
         }
     }
 }
-

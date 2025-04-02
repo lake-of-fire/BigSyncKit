@@ -102,7 +102,7 @@ public protocol ModelAdapter: AnyObject {
     func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async throws
 
     /// Merge policy in case of conflicts. Default is `server`.
-    var mergePolicy: MergePolicy {get set}
+    var mergePolicy: MergePolicy { get set }
     
     func cancelSynchronization() async
     func unsetCancellation() async
