@@ -1293,6 +1293,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             let separatorRange = recordName.range(of: ".")!
             let objectIdentifier = String(recordName[separatorRange.upperBound...])
             savePendingRelationshipAsync(name: key, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+        } else if property.type == .UUID {
+            if let uuidString = record.value(forKey: key) as? String,
+               let uuid = UUID(uuidString: uuidString) {
+                object.setValue(uuid, forKey: key)
+            }
         } else if property.isMap {
             guard let value = value as? [NSArray], value.count == 2,
                   let keyArray = value[0] as? [String], let valueArray = value[1] as? [Any],
@@ -1742,6 +1747,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         record[property.name] = asset
                     } else if value == nil {
                         record[property.name] = nil
+                    } else if property.type == PropertyType.UUID, let uuid = value as? UUID {
+                        record[property.name] = uuid.uuidString as CKRecordValue
                     } else if let recordValue = value as? CKRecordValue {
                         record[property.name] = recordValue
                     }
