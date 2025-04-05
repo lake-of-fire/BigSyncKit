@@ -1671,6 +1671,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         record[property.name] = array as CKRecordValue
                     default:
                         // Other inner types of Set is not supported yet
+                        debugPrint("Warning: Unsupported recordToUpload set property type \(property.type) for \(String(describing: type(of: object)))")
                         break
                     }
                 } else if property.isMap {
@@ -1681,12 +1682,25 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     let values = NSMutableArray()
                     for (key, value) in dict {
                         keys.add(key)
-                        if let recordValue = value as? CKRecordValue {
-                            values.add(recordValue)
-                        } else if let uuid = value as? UUID {
-                            values.add(uuid.uuidString as CKRecordValue)
+                        switch property.type {
+                        case .int:
+                            if let val = value as? Int { values.add(val as CKRecordValue) }
+                        case .string:
+                            if let val = value as? String { values.add(val as CKRecordValue) }
+                        case .bool:
+                            if let val = value as? Bool { values.add(val as CKRecordValue) }
+                        case .float:
+                            if let val = value as? Float { values.add(val as CKRecordValue) }
+                        case .double:
+                            if let val = value as? Double { values.add(val as CKRecordValue) }
+                        case .date:
+                            if let val = value as? Date { values.add(val as CKRecordValue) }
+                        case .UUID:
+                            if let val = value as? UUID { values.add(val.uuidString as CKRecordValue) }
+                        default:
+                            debugPrint("Warning: Unsupported recordToUpload map property type \(property.type) for \(String(describing: type(of: object)))")
+                            break
                         }
-                        // Skip non-CKRecordValue-compatible entries
                     }
                     record[property.name] = [keys, values] as CKRecordValue
                 } else if property.isArray {
@@ -1744,6 +1758,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         record[property.name] = array as CKRecordValue
                     default:
                         // Other inner types of List is not supported yet
+                        debugPrint("Warning: Unsupported recordToUpload array property type \(property.type) for \(String(describing: type(of: object)))")
                         break
                     }
                 } else if (
