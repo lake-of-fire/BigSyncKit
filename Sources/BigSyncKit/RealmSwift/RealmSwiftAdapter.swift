@@ -1200,6 +1200,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 var set = Set<Date>()
                 value.forEach { set.insert($0) }
                 recordValue = set
+            case .UUID:
+                if let stringArray = value as? [String] {
+                    let set = Set(stringArray.compactMap(UUID.init(uuidString:)))
+                    object.setValue(set, forKey: key)
+                }
             case .object:
                 // Save relationship to be applied after all records have been downloaded and persisted
                 // to ensure target of the relationship has already been created
@@ -1660,6 +1665,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         guard let set = value as? Set<Date>, !set.isEmpty else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
+                    case .UUID:
+                        guard let set = value as? Set<UUID>, !set.isEmpty else { break }
+                        let array = set.map { $0.uuidString }
+                        record[property.name] = array as CKRecordValue
                     default:
                         // Other inner types of Set is not supported yet
                         break
@@ -1674,10 +1683,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         keys.add(key)
                         if let recordValue = value as? CKRecordValue {
                             values.add(recordValue)
-                        } else {
-                            // Skip non-CKRecordValue-compatible entries
-                            continue
+                        } else if let uuid = value as? UUID {
+                            values.add(uuid.uuidString as CKRecordValue)
                         }
+                        // Skip non-CKRecordValue-compatible entries
                     }
                     record[property.name] = [keys, values] as CKRecordValue
                 } else if property.isArray {
@@ -1728,6 +1737,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     case .date:
                         guard let list = value as? List<Date>, !list.isEmpty else { break }
                         let array = Array(list)
+                        record[property.name] = array as CKRecordValue
+                    case .UUID:
+                        guard let list = value as? List<UUID>, !list.isEmpty else { break }
+                        let array = Array(list.map { $0.uuidString })
                         record[property.name] = array as CKRecordValue
                     default:
                         // Other inner types of List is not supported yet
