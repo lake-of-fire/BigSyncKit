@@ -1117,8 +1117,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             result = false
                         }
                         logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
-                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
-                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
+//                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
+//                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
                         return result
                     }(self, recordChanges, object)
                 }
