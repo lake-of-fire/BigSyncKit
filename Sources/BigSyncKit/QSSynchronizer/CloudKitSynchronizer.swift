@@ -278,8 +278,9 @@ public class CloudKitSynchronizer: NSObject {
     /// Cancel synchronization. It will cause a current synchronization to end with a `cancelled` error.
     @BigSyncBackgroundActor
     @objc public func cancelSynchronization() {
-        guard syncing, !cancelSync else { return }
-        
+//        guard syncing, !cancelSync else { return }
+        guard !cancelSync else { return }
+
         cancelSync = true
         currentOperations.forEach { $0.cancel() }
     }

@@ -122,7 +122,6 @@ extension CloudKitSynchronizer {
         
         logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
         syncing = false
-        cancelSync = false
     }
     
     @BigSyncBackgroundActor
@@ -155,6 +154,7 @@ extension CloudKitSynchronizer {
                 print("Sync error: \(error.localizedDescription) A synchronizer with a higher `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.")
             default:// break
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
+                print("# ")
             }
         } else if let error = error as? CKError {
             switch error.code {
@@ -182,14 +182,19 @@ extension CloudKitSynchronizer {
                 logger.info("QSCloudKitSynchronizer >> Waited \(retryAfter) seconds.")
             default:
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
+                print("# ")
                 //                break
             }
         }
         
-        logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
-        syncing = false
-        cancelSync = false
-        await beginSynchronization()
+        if cancelSync {
+            logger.info("QSCloudKitSynchronizer >> Synchronization canceled, not retrying")
+        } else {
+            logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
+            syncing = false
+            //        cancelSync = false
+            await beginSynchronization()
+        }
         
         //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
         //        logger.info("QSCloudKitSynchronizer >> Finishing synchronization")
@@ -217,7 +222,7 @@ extension CloudKitSynchronizer {
         //            return
         //        }
         
-        logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
+//        logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
         operation.logger = logger
         operation.errorHandler = { [weak self] operation, error in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in

@@ -580,8 +580,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         // TODO: Optimize by not checking records that we just fetched which triggered this to be called
         let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt ?? .distantPast
-        let createdPredicate = NSPredicate(format: "createdAt > %@", lastTrackedChangesAt as NSDate)
-        let modifiedPredicate = NSPredicate(format: "modifiedAt > %@", lastTrackedChangesAt as NSDate)
+        let createdPredicate = NSPredicate(format: "createdAt > %@ AND explicitlyModifiedAt != nil", lastTrackedChangesAt as NSDate)
+        let modifiedPredicate = NSPredicate(format: "explicitlyModifiedAt > %@ AND createdAt <= %@", lastTrackedChangesAt as NSDate, lastTrackedChangesAt as NSDate)
         
         let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate))
         let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate))
@@ -1539,7 +1539,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             } else if !isFirstDummy && isSecondDummy {
                 return false
             } else {
-                return $0.identifier < $1.identifier // fallback sort
+                return $0.identifier > $1.identifier // fallback sort
             }
         }
 #else
@@ -2192,6 +2192,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         
         for chunk in savedRecords.chunked(into: 500) {
+            guard !cancelSync else { throw CancellationError() }
+            
             //            await persistenceRealm.asyncRefresh()
             try? await persistenceRealm.asyncWrite {
                 for record in chunk {
