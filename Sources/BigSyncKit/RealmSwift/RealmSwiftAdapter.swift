@@ -471,9 +471,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
         
-        if !needsInitialSetup {
-            try await createMissingSyncedEntities()
-        }
+//        if !needsInitialSetup {
+        try await createMissingSyncedEntities()
+//        }
         
         // Removed startPollingForChanges() call
         
@@ -830,7 +830,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         for (entityType, identifiers) in missingEntities {
             //            debugPrint("Create", identifiers.count, "missing synced entities for", entityType)
-            logger.info("Create \(identifiers.count) missing synced entities for \(entityType)")
+            logger.info("QSCloudKitSynchronizer >> Create \(identifiers.count) missing synced entities for \(entityType)")
             try await createSyncedEntities(entityType: entityType, identifiers: identifiers)
         }
     }
@@ -838,10 +838,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @BigSyncBackgroundActor
     @discardableResult
     func createSyncedEntities(entityType: String, identifiers: [String]) async throws {
-        //        debugPrint("Create synced entities", entityType, identifiers.count)
+//                debugPrint("Create synced entities", entityType, identifiers.count)
+        logger.info("QSCloudKitSynchronizer >> Creating \(identifiers.count) SyncedEntity records for \(entityType)…")
         for chunk in identifiers.chunked(into: 500) {
             guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
-            try? await persistenceRealm.asyncWrite {
+            try await persistenceRealm.asyncWrite {
                 for identifier in chunk {
                     guard !cancelSync else { throw CancellationError() }
                     let syncedEntity = SyncedEntity(entityType: entityType, identifier: identifier, state: SyncedEntityState.new.rawValue)
@@ -851,6 +852,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             try? await Task.sleep(nanoseconds: 20_000_000)
             //            await persistenceRealm.asyncRefresh()
         }
+        logger.info("QSCloudKitSynchronizer >> Created \(identifiers.count) SyncedEntity records for \(entityType)")
     }
     
     @BigSyncBackgroundActor

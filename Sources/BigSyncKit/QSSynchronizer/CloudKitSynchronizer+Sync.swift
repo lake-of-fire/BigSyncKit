@@ -154,7 +154,7 @@ extension CloudKitSynchronizer {
                 print("Sync error: \(error.localizedDescription) A synchronizer with a higher `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.")
             default:// break
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
-                print("# ")
+//                print("# ")
             }
         } else if let error = error as? CKError {
             switch error.code {
@@ -182,7 +182,7 @@ extension CloudKitSynchronizer {
                 logger.info("QSCloudKitSynchronizer >> Waited \(retryAfter) seconds.")
             default:
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
-                print("# ")
+//                print("# ")
                 //                break
             }
         }

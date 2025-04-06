@@ -236,8 +236,10 @@ public class CloudKitSynchronizer: NSObject {
     }
     
     @BigSyncBackgroundActor
-    public func resetSyncCaches(includingAdapters: Bool = true) async throws {
-        cancelSynchronization()
+    public func resetSyncCaches(cancelSynchronization: Bool, includingAdapters: Bool = true) async throws {
+        if cancelSynchronization {
+            self.cancelSynchronization()
+        }
         
         clearDeviceIdentifier()
         resetDatabaseToken()
@@ -364,7 +366,7 @@ public class CloudKitSynchronizer: NSObject {
 
 extension CloudKitSynchronizer: ModelAdapterDelegate {
     public func needsInitialSetup() async throws {
-        try await resetSyncCaches(includingAdapters: false)
+        try await resetSyncCaches(cancelSynchronization: false, includingAdapters: false)
     }
     
     public func hasChangesToUpload() async {
