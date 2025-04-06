@@ -384,11 +384,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @BigSyncBackgroundActor
     public func cancelSynchronization() async {
+        debugPrint("# cancel")
         cancelSync = true
     }
     
     @BigSyncBackgroundActor
     public func unsetCancellation() async {
+        debugPrint("# unset cancel")
         cancelSync = false
     }
     

@@ -245,9 +245,11 @@ public class CloudKitSynchronizer: NSObject {
         resetDatabaseToken()
         resetActiveTokens()
         
+//        try? await Task.sleep(nanoseconds: 300_000_000) // Allow cancellations to catch up...
         if includingAdapters {
             for adapter in modelAdapters {
-                try await adapter.resetSyncCaches()
+                await adapter.unsetCancellation()
+                try? await adapter.resetSyncCaches()
             }
         }
     }
@@ -262,8 +264,9 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+            debugPrint("# beginSync...")
             guard !syncing else {
-                //            debugPrint("# already syncing")
+                            debugPrint("# already syncing")
                 //            onFailure?(SyncError.alreadySyncing)
                 return
             }
@@ -284,6 +287,7 @@ public class CloudKitSynchronizer: NSObject {
         guard !cancelSync else { return }
 
         cancelSync = true
+        syncing = false // TODO: This might be buggy to set eagerly?!
         currentOperations.forEach { $0.cancel() }
     }
     
