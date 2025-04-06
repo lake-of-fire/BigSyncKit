@@ -31,6 +31,7 @@ class PersistentAssetManager {
         let fileName = "\(recordID)_\(unique)"
         let url = assetDirectory.appendingPathComponent(fileName)
         try? data.write(to: url, options: .atomicWrite)
+        debugPrint("# wrote:", url.lastPathComponent)
         return url
     }
     
@@ -47,6 +48,7 @@ class PersistentAssetManager {
                 let recordID = String(fileName[..<underscoreIndex])
                 if !ids.contains(recordID) {
                     try? FileManager.default.removeItem(at: fileURL)
+                    debugPrint("# deleted:", fileURL)
                 }
             } else {
                 print("Invalid file detected by PersistentAssetManager - deleting:", fileURL)

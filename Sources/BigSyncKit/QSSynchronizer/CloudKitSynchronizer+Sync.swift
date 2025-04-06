@@ -345,6 +345,22 @@ extension CloudKitSynchronizer {
 
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
+    func shouldDeferFetches() async throws -> Bool {
+        guard syncMode == .sync else { return false }
+        if let lastEmpty = lastEmptyFetchTime,
+           Date().timeIntervalSince(lastEmpty) < 45 * 60 {
+            for adapter in modelAdapters {
+                let records = try await adapter.recordsToUpload(limit: 1)
+                if !records.isEmpty {
+                    logger.info("QSCloudKitSynchronizer >> Skipping CloudKit token update: last fetch was empty and recent and uploads are pending")
+                    return true
+                }
+            }
+        }
+        return false
+    }
+    
+    @BigSyncBackgroundActor
     func fetchChanges() async {
         //        debugPrint("# fetchChanges()")
         guard !cancelSync else {
@@ -353,21 +369,9 @@ extension CloudKitSynchronizer {
         }
         
         do {
-            if let lastEmpty = lastEmptyFetchTime,
-               Date().timeIntervalSince(lastEmpty) < 15 * 60 {
-                var hasPendingUploads = false
-                for adapter in modelAdapters {
-                    let records = try await adapter.recordsToUpload(limit: 1)
-                    if !records.isEmpty {
-                        hasPendingUploads = true
-                        break
-                    }
-                }
-                if hasPendingUploads {
-                    logger.info("QSCloudKitSynchronizer >> Skipping CloudKit fetch: last was empty and uploads are pending")
-                    try await uploadChanges()
-                    return
-                }
+            if try await shouldDeferFetches() {
+                try await uploadChanges()
+                return
             }
         } catch {
             await failSynchronization(error: error)
@@ -571,7 +575,11 @@ extension CloudKitSynchronizer {
                     await failSynchronization(error: error)
                 }
             } else {
-                updateTokens()
+                if try await shouldDeferFetches() {
+                    await changesFinishedSynchronizing()
+                } else {
+                    updateTokens()
+                }
             }
         }
     }
@@ -707,6 +715,7 @@ extension CloudKitSynchronizer {
                         }
                         //                        debugPrint("## Resolved Recos", resolvedRecords.map {($0.recordID, $0) })
                         if !resolvedRecords.isEmpty {
+                            // TODO: This seems to get called every time I make changes in the app that trigger upload syncs, while a backlog of queued uploads is still processing while bypassing fetches (shouldDeferFetches). Maybe we need to do some of the updateTokens() work in the case that we are uploading fresh changes? Unsure why conflicted records happen seemingly reliably in that situation. Actually it seems this happens anyway if idling during a backlog of queued uploads...
                             do {
                                 try await adapter.saveChanges(in: resolvedRecords, forceSave: true)
                             } catch {
