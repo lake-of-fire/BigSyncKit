@@ -1072,9 +1072,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     func applyChanges(in record: CKRecord, to object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String) {
         let objectProperties = object.objectSchema.properties
         
+        let skippedKeys: Set<String>
+        if let skippable = object as? SyncSkippablePropertiesModel {
+            skippedKeys = skippable.skipSyncingProperties() ?? []
+        } else {
+            skippedKeys = []
+        }
+        
         if syncedEntityState == .new || syncedEntityState == .changed {
             if mergePolicy == .server {
-                for property in objectProperties {
+                for property in objectProperties where !skippedKeys.contains(property.name) {
                     if shouldIgnore(key: property.name) {
                         continue
                     }
@@ -1085,7 +1092,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             } else if mergePolicy == .custom {
                 var recordChanges = [String: Any]()
-                for property in objectProperties {
+                for property in objectProperties where !skippedKeys.contains(property.name) {
                     if property.type == .linkingObjects {
                         continue
                     }
@@ -1128,7 +1135,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
                 
                 if acceptRemoteChange {
-                    for property in objectProperties {
+                    for property in objectProperties where !skippedKeys.contains(property.name) {
                         if shouldIgnore(key: property.name) {
                             continue
                         }
@@ -1140,7 +1147,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             }
         } else {
-            for property in objectProperties {
+            for property in objectProperties where !skippedKeys.contains(property.name) {
                 if shouldIgnore(key: property.name) {
                     continue
                 }
@@ -1596,6 +1603,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             return nil
         }
         
+        let skippedKeys: Set<String>
+        if let skippable = object as? SyncSkippablePropertiesModel {
+            skippedKeys = Set(await skippable.skipSyncingProperties() ?? [])
+        } else {
+            skippedKeys = []
+        }
+        let defaultObject: Object? = skippedKeys.isEmpty ? nil : type(of: object).init()
+        
         //        let changedKeys = (syncedEntity.changedKeys ?? "").components(separatedBy: ",")
         
         //        var parentKey: String?
@@ -1608,6 +1623,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             //                debugPrint(property)
             //            }
             if entityState == SyncedEntityState.new.rawValue || entityState == SyncedEntityState.changed.rawValue {
+                if skippedKeys.contains(property.name) {
+                    let defaultValue = defaultObject?.value(forKey: property.name)
+                    if let ckValue = defaultValue as? CKRecordValue {
+                        record[property.name] = ckValue
+                    } else {
+                        record[property.name] = nil
+                    }
+                    continue
+                }
+                
                 if let recordProcessingDelegate = recordProcessingDelegate,
                    !recordProcessingDelegate.shouldProcessPropertyBeforeUpload(propertyName: property.name, object: object, record: record) {
                     continue

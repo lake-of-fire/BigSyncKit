@@ -27,7 +27,13 @@ public extension ChangeMetadataRecordable {
     var isDeleted: Bool { get set }
 }
 
+@objc public protocol SyncSkippablePropertiesModel {
+    func skipSyncingProperties() -> Set<String>?
+}
+
+/// Used for syncing with app servers, not just CloudKit.
 public protocol SyncableBase: ChangeMetadataRecordable, RealmSwift.Object, Identifiable, SoftDeletable, Codable {
+    /// Used in BigSyncKit to avoid hard-deleting after soft deletion before it has been synced to other application servers.
     var needsSyncToAppServer: Bool { get }
 }
 
