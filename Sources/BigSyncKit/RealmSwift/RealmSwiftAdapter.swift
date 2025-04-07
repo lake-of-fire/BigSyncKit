@@ -2042,7 +2042,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         // TODO: Chunk based on target writer Realm
         if !recordsToSave.isEmpty {
-            for chunk in recordsToSave.chunked(into: 200) {
+            for chunk in recordsToSave.chunked(into: 20) {
                 guard !cancelSync else { throw CancellationError() }
                 
                 //                await realmProvider.persistenceRealm?.asyncRefresh()
@@ -2062,12 +2062,15 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
                 
+                guard !cancelSync else { throw CancellationError() }
+                
                 try await { @RealmBackgroundActor in
                     guard let targetWriterRealms = realmProvider.targetWriterRealms else { return }
                     for targetWriterRealm in targetWriterRealms {
                         //                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
                         await targetWriterRealm.asyncRefresh()
                         guard await !cancelSync else { throw CancellationError() }
+                        
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
                             for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk where realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration {
@@ -2095,7 +2098,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 try? await persistPendingRelationships()
                 
-                try? await Task.sleep(nanoseconds: 5_000_000)
+                try? await Task.sleep(nanoseconds: 1_000_000)
             }
             
             logger.info("QSCloudKitSynchronizer >> Persisted \(recordsToSave.count) downloaded records")
@@ -2178,6 +2181,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         var innerLimit = recordLimit
         while recordsArray.count < recordLimit && uploadingState.rawValue < SyncedEntityState.deleted.rawValue {
+            guard !cancelSync else { throw CancellationError() }
+            
             try await recordsArray.append(
                 contentsOf: self.recordsToUpload(
                     withState: uploadingState,
@@ -2216,12 +2221,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    public func recordIDsMarkedForDeletion(limit: Int) async -> [CKRecord.ID] {
+    public func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID] {
         var recordIDs = [CKRecord.ID]()
         
         guard let deletedEntities = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == SyncedEntityState.deleted.rawValue }) else { return [] }
         
         for syncedEntity in Array(deletedEntities) {
+            guard !cancelSync else { throw CancellationError() }
+            
             if recordIDs.count >= limit {
                 break
             }

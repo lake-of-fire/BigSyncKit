@@ -67,7 +67,7 @@ public protocol ModelAdapter: AnyObject {
     /// Provides an array of record IDs to be deleted on CloudKit, for model objects that were deleted locally.
     /// - Parameter limit: Maximum number of records that should be provided.
     /// - Returns: Array of `CKRecordID`.
-    func recordIDsMarkedForDeletion(limit: Int) async -> [CKRecord.ID]
+    func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID]
     
     /// Tells the model adapter that these record identifiers were deleted successfully from CloudKit.
     /// - Parameter recordIDs: Record IDs that were deleted on CloudKit.
