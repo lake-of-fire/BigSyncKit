@@ -176,7 +176,7 @@ public class CloudKitSynchronizer: NSObject {
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     
-    internal var lastEmptyFetchTime: Date?
+    internal var lastFetchEmptyAt: Date?
     
     internal let logger: Logging.Logger
     

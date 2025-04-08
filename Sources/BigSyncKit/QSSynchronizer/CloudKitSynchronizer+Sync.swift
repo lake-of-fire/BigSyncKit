@@ -352,7 +352,7 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func shouldDeferFetches() async throws -> Bool {
         guard syncMode == .sync else { return false }
-        if let lastEmpty = lastEmptyFetchTime,
+        if let lastEmpty = lastFetchEmptyAt,
            Date().timeIntervalSince(lastEmpty) < 45 * 60 {
             for adapter in modelAdapters {
                 let records = try await adapter.recordsToUpload(limit: 1)
@@ -414,11 +414,13 @@ extension CloudKitSynchronizer {
                 
                 //                debugPrint("# zoneIDsToFetch", zoneIDsToFetch)
                 guard zoneIDsToFetch.count > 0 else {
-                    self.lastEmptyFetchTime = Date()
+                    self.lastFetchEmptyAt = Date()
                     await self.resetActiveTokens()
                     try await completion(token, nil)
                     return
                 }
+                
+                lastFetchEmptyAt = nil
                 
                 try await { @BigSyncBackgroundActor [weak self] in
                     guard let self = self else { return }
