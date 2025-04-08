@@ -204,10 +204,9 @@ actor RealmProvider {
             }
             self.targetReaderRealmObjects = targetReaderRealmObjects
             
-            
             var targetWriterRealmObjects = [Realm]()
             for targetConfiguration in targetConfigurations {
-                guard let realmBackgroundActorRealm = await RealmBackgroundActor.shared.cachedRealm(for: targetConfiguration) else { fatalError("No Realm for BigSyncKit targetWriterRealmObject") }
+                let realmBackgroundActorRealm = try await RealmBackgroundActor.shared.cachedRealm(for: targetConfiguration) 
                 targetWriterRealmObjects.append(realmBackgroundActorRealm)
             }
             self.targetWriterRealmObjects = targetWriterRealmObjects
