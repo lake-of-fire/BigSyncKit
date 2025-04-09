@@ -175,7 +175,9 @@ public class CloudKitSynchronizer: NSObject {
     internal var currentOperations = [Operation]()
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
-    
+    @BigSyncBackgroundActor
+    internal var synchronizationTask: Task<Void, Never>?
+
     internal var lastFetchEmptyAt: Date?
     
     internal let logger: Logging.Logger
@@ -283,6 +285,9 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     @objc public func cancelSynchronization() {
 //        guard syncing, !cancelSync else { return }
+        
+        synchronizationTask?.cancel()
+        
         guard !cancelSync else { return }
         logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
 

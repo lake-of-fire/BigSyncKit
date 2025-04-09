@@ -102,7 +102,12 @@ extension CloudKitSynchronizer {
         self.uploadRetries = 0
         self.didNotifyUpload = Set<CKRecordZone.ID>()
         
-        await fetchChanges()
+        synchronizationTask?.cancel()
+        synchronizationTask = Task { @BigSyncBackgroundActor [weak self] in
+            await self?.fetchChanges()
+        }
+        await synchronizationTask?.value
+        synchronizationTask = nil
     }
     
     @BigSyncBackgroundActor
@@ -187,7 +192,7 @@ extension CloudKitSynchronizer {
             }
         }
         
-        if cancelSync {
+        if cancelSync || error is CancellationError {
             logger.info("QSCloudKitSynchronizer >> Synchronization canceled, not retrying")
         } else {
             logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
@@ -378,10 +383,14 @@ extension CloudKitSynchronizer {
         }
         
         do {
+            try Task.checkCancellation()
+            
             if try await shouldDeferFetches() {
                 try await uploadChanges()
                 return
             }
+            
+            try Task.checkCancellation()
         } catch {
             await failSynchronization(error: error)
             return
@@ -572,10 +581,13 @@ extension CloudKitSynchronizer {
             await failSynchronization(error: SyncError.cancelled)
             return
         }
-        
+        try Task.checkCancellation()
+
         postNotification(.SynchronizerWillUploadChanges)
         
         try await uploadChanges() { [weak self] (error) in
+            try Task.checkCancellation()
+            
             guard let self = self else { return }
             if let error = error as? NSError {
 #warning("FIXME: handle zone not found...")

@@ -1622,6 +1622,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //        }
         
         for property in object.objectSchema.properties {
+            guard !cancelSync else { throw CancellationError() }
+            
             //            if object.objectSchema.className == "HistoryRecord" && property.name == "content" && record.id == "6657C67E-95EC-479B-B5F5-9F7F44EAB1C5" {
             //                debugPrint(property)
             //            }
@@ -1802,6 +1804,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                        let data = value as? Data,
                        !forceDataTypeInsteadOfAsset {
                         let fileURL = self.persistentAssetManager.store(data: data, forRecordID: syncedEntity.identifier)
+                        guard !cancelSync else { throw CancellationError() }
+                        
                         //                        logger.info("QSCloudKitSynchronizer >> Stored CKAsset data at \(fileURL) for \(property.name) of \(syncedEntity.identifier)")
                         let asset = CKAsset(fileURL: fileURL)
                         record[property.name] = asset
@@ -2070,7 +2074,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         // TODO: Chunk based on target writer Realm
         if !recordsToSave.isEmpty {
-            for chunk in recordsToSave.chunked(into: 20) {
+            for chunk in recordsToSave.chunked(into: 4) {
                 guard !cancelSync else { throw CancellationError() }
                 
                 //                await realmProvider.persistenceRealm?.asyncRefresh()
@@ -2091,6 +2095,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
                 
                 guard !cancelSync else { throw CancellationError() }
+                try Task.checkCancellation()
                 
                 try await { @RealmBackgroundActor in
                     guard let targetWriterRealms = realmProvider.targetWriterRealms else { return }
@@ -2102,6 +2107,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
                             for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk where realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration {
+                                try Task.checkCancellation()
+                                
                                 var object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier)
                                 if object == nil {
                                     object = objectType.init()
@@ -2126,7 +2133,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 try? await persistPendingRelationships()
                 
-                try? await Task.sleep(nanoseconds: 1_000_000)
+                try? await Task.sleep(nanoseconds: 100_000)
             }
             
             logger.info("QSCloudKitSynchronizer >> Persisted \(recordsToSave.count) downloaded records")
