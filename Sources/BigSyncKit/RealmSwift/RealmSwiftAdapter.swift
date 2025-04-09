@@ -476,7 +476,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         updateHasChanges(realm: persistenceRealm)
         
         await setupPublisherDebouncer()
-        await setupChildrenRelationshipsLookup()
         observeRealmChanges()
         
         //        if hasChanges {
@@ -1098,78 +1097,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             skippedKeys = []
         }
         
-        if syncedEntityState == .new || syncedEntityState == .changed {
-            if mergePolicy == .server {
-                for property in objectProperties where !skippedKeys.contains(property.name) {
-                    if shouldIgnore(key: property.name) {
-                        continue
-                    }
-                    if property.type == .linkingObjects {
-                        continue
-                    }
-                    applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
-                }
-            } else if mergePolicy == .custom {
-                var recordChanges = [String: Any]()
-                for property in objectProperties where !skippedKeys.contains(property.name) {
-                    if property.type == .linkingObjects {
-                        continue
-                    }
-                    if !shouldIgnore(key: property.name) {
-                        if let asset = record[property.name] as? CKAsset {
-                            recordChanges[property.name] = asset.fileURL != nil ? NSData(contentsOf: asset.fileURL!) : NSNull()
-                        } else {
-                            recordChanges[property.name] = record[property.name] ?? NSNull()
-                        }
-                    }
-                }
-                
-                let acceptRemoteChange: Bool
-                if let delegate {
-                    acceptRemoteChange = delegate.realmSwiftAdapter(self, gotChanges: recordChanges, object: object)
-                } else {
-                    acceptRemoteChange = { adapter, changes, object in
-#if os(macOS)
-                        guard adapter.hasRealmObjectClass(name: object.className) else { return false }
-#else
-                        guard adapter.hasRealmObjectClass(name: String(describing: type(of: object))) else { return false }
-#endif
-                        let remoteExplicitlyModifiedAt = changes["explicitlyModifiedAt"] as? Date ?? .distantPast
-                        let localExplicitlyModifiedAt = object.value(forKey: "explicitlyModifiedAt") as? Date ?? .distantPast
-                        let result: Bool
-                        if remoteExplicitlyModifiedAt > localExplicitlyModifiedAt {
-                            result = true
-                        } else if remoteExplicitlyModifiedAt == localExplicitlyModifiedAt {
-                            let remoteModifiedAt = changes["modifiedAt"] as? Date ?? .distantPast
-                            let localModifiedAt = object.value(forKey: "modifiedAt") as? Date ?? .distantPast
-                            result = remoteModifiedAt > localModifiedAt
-                        } else {
-                            result = false
-                        }
-                        logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
-//                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
-//                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
-                        return result
-                    }(self, recordChanges, object)
-                }
-                
-                if acceptRemoteChange {
-                    for property in objectProperties where !skippedKeys.contains(property.name) {
-                        if shouldIgnore(key: property.name) {
-                            continue
-                        }
-                        if property.type == .linkingObjects {
-                            continue
-                        }
-                        applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
-                    }
-                }
-            }
-        } else {
-            if let remoteExplicitlyModifiedAt = record["explicitlyModifiedAt"] as? Date, let localExplicitlyModifiedAt = (object as? ChangeMetadataRecordable)?.explicitlyModifiedAt, remoteExplicitlyModifiedAt < localExplicitlyModifiedAt {
-                logger.warning("QSCloudKitSynchronizer >> WARNING: Applying changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date), syncedEntityState=\(syncedEntityState.rawValue)")
-            }
-            
+        func applyChanges() {
+            //                logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
             for property in objectProperties where !skippedKeys.contains(property.name) {
                 if shouldIgnore(key: property.name) {
                     continue
@@ -1177,9 +1106,62 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 if property.type == .linkingObjects {
                     continue
                 }
-                
-//                logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
                 applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
+            }
+        }
+        
+        if mergePolicy == .server {
+            applyChanges()
+        } else if mergePolicy == .custom {
+            var recordChanges = [String: Any]()
+            for property in objectProperties where !skippedKeys.contains(property.name) {
+                if property.type == .linkingObjects {
+                    continue
+                }
+                if !shouldIgnore(key: property.name) {
+                    if let asset = record[property.name] as? CKAsset {
+                        recordChanges[property.name] = asset.fileURL != nil ? NSData(contentsOf: asset.fileURL!) : NSNull()
+                    } else {
+                        recordChanges[property.name] = record[property.name] ?? NSNull()
+                    }
+                }
+            }
+            
+            let acceptRemoteChange: Bool
+            if let delegate {
+                acceptRemoteChange = delegate.realmSwiftAdapter(self, gotChanges: recordChanges, object: object)
+            } else {
+                acceptRemoteChange = { adapter, changes, object in
+#if os(macOS)
+                    guard adapter.hasRealmObjectClass(name: object.className) else { return false }
+#else
+                    guard adapter.hasRealmObjectClass(name: String(describing: type(of: object))) else { return false }
+#endif
+                    let remoteExplicitlyModifiedAt = changes["explicitlyModifiedAt"] as? Date ?? .distantPast
+                    let localExplicitlyModifiedAt = object.value(forKey: "explicitlyModifiedAt") as? Date ?? .distantPast
+                    let result: Bool
+                    if remoteExplicitlyModifiedAt > localExplicitlyModifiedAt {
+                        result = true
+                    } else if remoteExplicitlyModifiedAt == localExplicitlyModifiedAt {
+                        let remoteModifiedAt = changes["modifiedAt"] as? Date ?? .distantPast
+                        let localModifiedAt = object.value(forKey: "modifiedAt") as? Date ?? .distantPast
+                        result = remoteModifiedAt > localModifiedAt
+                    } else {
+                        result = false
+                    }
+                    logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
+                    //                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
+                    //                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
+                    return result
+                }(self, recordChanges, object)
+            }
+            
+            if acceptRemoteChange {
+                if let remoteExplicitlyModifiedAt = record["explicitlyModifiedAt"] as? Date, let localExplicitlyModifiedAt = (object as? ChangeMetadataRecordable)?.explicitlyModifiedAt, remoteExplicitlyModifiedAt < localExplicitlyModifiedAt {
+                    logger.warning("QSCloudKitSynchronizer >> WARNING: Applying changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date), syncedEntityState=\(syncedEntityState.rawValue)")
+                }
+                
+                applyChanges()
             }
         }
     }
