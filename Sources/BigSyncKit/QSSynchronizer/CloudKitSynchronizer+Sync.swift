@@ -194,7 +194,9 @@ extension CloudKitSynchronizer {
 //            syncing = false
             //        cancelSync = false
 //            await beginSynchronization(force: true)
-            await performSynchronization()
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                await performSynchronization()
+            }
         }
         
         //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
