@@ -2256,6 +2256,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let realmProvider, let persistenceRealm = realmProvider.persistenceRealm else { return }
         
         //        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
+        try? await updateCreatedAndModified()
         let pendingEntities = persistenceRealm.objects(SyncedEntity.self).where({ $0.state.in([SyncedEntityState.new.rawValue, SyncedEntityState.changed.rawValue]) })
         let pendingRecordIDs = Set(pendingEntities.map { $0.identifier })
         persistentAssetManager.clearAssetFiles(excludingSyncedEntityIDs: pendingRecordIDs)
