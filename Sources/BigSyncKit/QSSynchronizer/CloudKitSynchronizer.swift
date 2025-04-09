@@ -263,6 +263,7 @@ public class CloudKitSynchronizer: NSObject {
     /// - Parameter onFailure: Block that receives an error if the synchronization stopped due to a failure. Could be a `SyncError`, `CKError`, or any other error found during synchronization.
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
+        logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard !syncing else {
                 //            onFailure?(SyncError.alreadySyncing)
@@ -283,6 +284,7 @@ public class CloudKitSynchronizer: NSObject {
     @objc public func cancelSynchronization() {
 //        guard syncing, !cancelSync else { return }
         guard !cancelSync else { return }
+        logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
 
         cancelSync = true
         syncing = false // TODO: This might be buggy to set eagerly?!

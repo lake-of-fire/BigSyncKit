@@ -191,9 +191,10 @@ extension CloudKitSynchronizer {
             logger.info("QSCloudKitSynchronizer >> Synchronization canceled, not retrying")
         } else {
             logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
-            syncing = false
+//            syncing = false
             //        cancelSync = false
-            await beginSynchronization()
+//            await beginSynchronization(force: true)
+            await performSynchronization()
         }
         
         //        debugPrint("QSCloudKitSynchronizer >> Finishing synchronization")
@@ -368,6 +369,7 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchChanges() async {
         //        debugPrint("# fetchChanges()")
+        logger.info("QSCloudKitSynchronizer >> Fetch changes?")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -562,6 +564,7 @@ extension CloudKitSynchronizer {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func uploadChanges() async throws {
+        logger.info("QSCloudKitSynchronizer >> Upload changes...")
         //        debugPrint("# uploadChanges()")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
@@ -577,13 +580,14 @@ extension CloudKitSynchronizer {
                 if shouldRetryUpload(for: error) {
                     //                    print("# uploadChanges() failed, retrying via fetchChanges()")
                     uploadRetries += 1
+                    logger.info("QSCloudKitSynchronizer >> Retrying upload, beginning with fetching changes...")
                     await fetchChanges()
                 } else {
                     await failSynchronization(error: error)
                 }
             } else {
                 if try await shouldDeferFetches() {
-                    await changesFinishedSynchronizing()
+                    await performSynchronization()
                 } else {
                     updateTokens()
                 }
