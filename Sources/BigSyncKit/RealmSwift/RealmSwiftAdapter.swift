@@ -80,12 +80,6 @@ public protocol RealmSwiftAdapterRecordProcessing: AnyObject {
     func shouldProcessPropertyInDownload(propertyName: String, object: Object, record: CKRecord) -> Bool
 }
 
-struct ChildRelationship {
-    let parentEntityName: String
-    let childEntityName: String
-    let childParentKey: String
-}
-
 fileprivate struct PendingRelationshipRequest {
     let name: String
     let syncedEntityID: String
@@ -234,8 +228,8 @@ actor RealmProvider {
 }
 
 struct ResultsChangeSet {
-    var insertions: [String: Set<String>] = [:] // schemaName -> Set of insertions
-    var modifications: [String: Set<String>] = [:] // schemaName -> Set of modifications
+    var insertions: [String: (Set<String>, Date?)] = [:] // schemaName -> Set of insertions and latests explicitlyModifiedAt
+    var modifications: [String: (Set<String>, Date?)] = [:] // schemaName -> Set of modification and latests explicitlyModifiedAts
 }
 
 public class RealmSwiftAdapter: NSObject, ModelAdapter {
@@ -266,7 +260,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     //    var collectionNotificationTokens = [NotificationToken]()
     //    var collectionNotificationTokens = Set<AnyCancellable>()
     //    var pendingTrackingUpdates = [ObjectUpdate]()
-    var childRelationships = [String: Array<ChildRelationship>]()
     var modelTypes = [String: Object.Type]()
     public private(set) var hasChanges = false
     public private(set) var hasChangesCount: Int?
@@ -530,15 +523,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 guard let self = self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                     guard let self = self else { return }
-                    for schema in changedRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
-                        guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
-                        guard objectClass.conforms(to: ChangeMetadataRecordable.self) else { continue }
-                        await self.enqueueCreatedAndModified(
-                            in: objectClass,
-                            schemaName: schema.className,
-                            realmProvider: self.realmProvider!
-                        )
-                    }
+                    await enqueueCreatedAndModified(in: changedRealm)
                 }
             }
             .store(in: &cancellables)
@@ -564,15 +549,40 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
-    // TODO: This can crash in background for not finishing up its work fast enough... inside the Array calls below
+    /// Immediately updates.
+    @BigSyncBackgroundActor
+    private func updateCreatedAndModified() async throws {
+        await enqueueCreatedAndModified()
+        try await processEnqueuedChanges()
+    }
+    
+    @BigSyncBackgroundActor
+    private func enqueueCreatedAndModified(in realm: Realm? = nil) async {
+        let realms: [Realm]
+        if let realm {
+            realms = [realm]
+        } else {
+            realms = realmProvider?.targetReaderRealmObjects ?? []
+        }
+        for targetReaderRealm in realms {
+            for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
+                guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
+                guard objectClass.conforms(to: ChangeMetadataRecordable.self) else { continue }
+                await self.enqueueCreatedAndModified(
+                    in: objectClass,
+                    schemaName: schema.className
+                )
+            }
+        }
+    }
+    
     @BigSyncBackgroundActor
     private func enqueueCreatedAndModified(
         in objectClass: Object.Type,
-        schemaName: String,
-        realmProvider: RealmProvider
+        schemaName: String
     ) async {
-        guard let persistenceRealm = realmProvider.persistenceRealm,
-              let targetReaderRealm = realmProvider.targetReaderRealmPerSchemaName[schemaName],
+        guard let persistenceRealm = realmProvider?.persistenceRealm,
+              let targetReaderRealm = realmProvider?.targetReaderRealmPerSchemaName[schemaName],
               let syncedEntityType = try? await getOrCreateSyncedEntityType(schemaName)
         else {
             //            print("Could not get realms or syncedEntityType for \(schemaName)")
@@ -608,10 +618,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             return objectModified != fetchedModified
         }
         
-        let maxCreatedAt = created.compactMap { $0.value(forKey: "createdAt") as? Date }.max()
-        let maxModifiedAt = modified.compactMap { $0.value(forKey: "modifiedAt") as? Date }.max()
-        let nextTrackedChangesAt = max(maxCreatedAt ?? .distantPast, maxModifiedAt ?? .distantPast)
-        
         //        if created.isEmpty && modified.isEmpty {
         //            let (maxCreatedAt, maxModifiedAt) =  (
         //                targetReaderRealm.objects(objectClass as! Object.Type)
@@ -623,21 +629,29 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //        }
         
         if !filteredCreated.isEmpty {
-            resultsChangeSet.insertions[schemaName, default: []]
-                .formUnion(filteredCreated.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+            let insertions = resultsChangeSet.insertions[schemaName, default: ([], nil)]
+            let latestCreatedExplicitlyModifiedAt = filteredCreated.compactMap { ($0 as? ChangeMetadataRecordable)?.explicitlyModifiedAt } .max()
+            let updatedInsertions: (Set<String>, Date?) = (
+                insertions.0.union(filteredCreated.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
+                    }),
+                latestCreatedExplicitlyModifiedAt
+            )
+            resultsChangeSet.insertions[schemaName] = updatedInsertions
         }
         if !filteredModified.isEmpty {
-            resultsChangeSet.modifications[schemaName, default: []]
-                .formUnion(filteredModified.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey) })
+            let modifications = resultsChangeSet.modifications[schemaName, default: ([], nil)]
+            let latestModifiedExplicitlyModifiedAt = filteredModified.compactMap { ($0 as? ChangeMetadataRecordable)?.explicitlyModifiedAt } .max()
+            let updatedModifications: (Set<String>, Date?) = (
+                modifications.0.union(filteredModified.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
+                }),
+                latestModifiedExplicitlyModifiedAt
+            )
+            resultsChangeSet.modifications[schemaName] = updatedModifications
         }
         
         // Persist the new lastTrackedChangesAt
         //        await persistenceRealm.asyncRefresh()
         if !created.isEmpty || !modified.isEmpty {
-            try? await persistenceRealm.asyncWrite {
-                syncedEntityType.lastTrackedChangesAt = nextTrackedChangesAt
-            }
-            
             let processedIDs = filteredCreated.map { "\(schemaName).\($0.value(forKey: primaryKey)!)" } +
             filteredModified.map { "\(schemaName).\($0.value(forKey: primaryKey)!)" }
             for id in processedIDs {
@@ -652,6 +666,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @BigSyncBackgroundActor
     private func processEnqueuedChanges() async throws {
         guard let realmProvider = realmProvider else { return }
+        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         let currentChangeSet: ResultsChangeSet
         currentChangeSet = self.resultsChangeSet
         self.resultsChangeSet = ResultsChangeSet() // Reset for next batch
@@ -659,27 +674,54 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //        if !currentChangeSet.insertions.isEmpty {                            debugPrint("# processEnqueuedChanges INSERT RECS", currentChangeSet.insertions.compactMap { $0 })                        }
         //        if !currentChangeSet.modifications.isEmpty {                            debugPrint("# processEnqueuedChanges MODIFY RECS", currentChangeSet.modifications.values.compactMap { $0 })                        }
         
-        for (schema, identifiers) in currentChangeSet.insertions {
+        for (schema, identifiers) in currentChangeSet.insertions.mapValues(\.0) {
+            guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
+            
             for chunk in Array(identifiers).chunked(into: 500) {
-                guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                 //                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     for identifier in chunk {
                         guard !cancelSync else { throw CancellationError() }
-                        self.updateTracking(objectIdentifier: identifier, entityName: schema, inserted: true, modified: false, deleted: false, persistenceRealm: persistenceRealm)
+                        self.updateTracking(
+                            objectIdentifier: identifier,
+                            entityName: schema,
+                            inserted: true,
+                            modified: false,
+                            deleted: false,
+                            persistenceRealm: persistenceRealm
+                        )
                     }
                 }
             }
         }
         
-        for (schema, identifiers) in currentChangeSet.modifications {
+        for (schema, identifiers) in currentChangeSet.modifications.mapValues(\.0) {
+            guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
+            
             for chunk in Array(identifiers).chunked(into: 500) {
-                guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                 //                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     for identifier in chunk {
                         guard !cancelSync else { throw CancellationError() }
-                        self.updateTracking(objectIdentifier: identifier, entityName: schema, inserted: false, modified: true, deleted: false, persistenceRealm: persistenceRealm)
+                        self.updateTracking(
+                            objectIdentifier: identifier,
+                            entityName: schema,
+                            inserted: false,
+                            modified: true,
+                            deleted: false,
+                            persistenceRealm: persistenceRealm
+                        )
+                    }
+                }
+            }
+        }
+        
+        for changeSet in [currentChangeSet.insertions, currentChangeSet.modifications] {
+            for (schema, latestExplicitlyModifiedAt) in changeSet.map({ ($0.key, $0.value.1) }) {
+                guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { continue }
+                if let latestExplicitlyModifiedAt {
+                    try? await persistenceRealm.asyncWrite {
+                        syncedEntityType.lastTrackedChangesAt = latestExplicitlyModifiedAt
                     }
                 }
             }
@@ -729,35 +771,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    func setupChildrenRelationshipsLookup() async {
-        childRelationships.removeAll()
-        
-        guard let targetReaderRealms = realmProvider?.targetReaderRealms else { return }
-        for targetReaderRealm in targetReaderRealms {
-            for objectSchema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(objectSchema.className) {
-                guard let objectClass = self.realmObjectClass(name: objectSchema.className) else {
-                    continue
-                }
-                guard objectClass.conforms(to: SoftDeletable.self) else {
-                    fatalError("\(objectClass.className()) must conform to SoftDeletable in order to sync")
-                }
-                if let parentClass = objectClass.self as? ParentKey.Type {
-                    let parentKey = parentClass.parentKey()
-                    let parentProperty = objectSchema.properties.first { $0.name == parentKey }
-                    
-                    let parentClassName = parentProperty!.objectClassName!
-                    let relationship = ChildRelationship(parentEntityName: parentClassName, childEntityName: objectSchema.className, childParentKey: parentKey)
-                    if childRelationships[parentClassName] == nil {
-                        childRelationships[parentClassName] = Array<ChildRelationship>()
-                    }
-                    childRelationships[parentClassName]!.append(relationship)
-                }
-            }
-        }
-    }
-    
-    @BigSyncBackgroundActor
-    func updateTracking(objectIdentifier: String, entityName: String, inserted: Bool, modified: Bool, deleted: Bool, persistenceRealm: Realm) {
+    func updateTracking(
+        objectIdentifier: String,
+        entityName: String,
+        inserted: Bool,
+        modified: Bool,
+        deleted: Bool,
+        persistenceRealm: Realm
+    ) {
         let identifier = entityName + "." + objectIdentifier
         var isNewChange = false
         
@@ -1969,48 +1990,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try? didDelete(identifiers: identifiersToDelete)
             }
         }
-    }
-    
-    // MARK: - Children records
-    
-    @BigSyncBackgroundActor
-    func childrenRecords(for syncedEntity: SyncedEntity) async throws -> [CKRecord] {
-        var records = [CKRecord]()
-        var parent: SyncedEntity?
-        
-        // TODO: Should be an exception rather than silently error return a result
-        guard let persistenceRealm = realmProvider?.persistenceRealm, let realmProvider = realmProvider else { return [] }
-        guard let record = try await recordToUpload(syncedEntity: syncedEntity, parentSyncedEntity: &parent) else {
-            return []
-        }
-        records.append(record)
-        
-        if let relationships = childRelationships[syncedEntity.entityType] {
-            for relationship in relationships {
-                let objectID = getObjectIdentifier(for: syncedEntity)
-                guard let objectClass = realmObjectClass(name: syncedEntity.entityType) else {
-                    continue
-                }
-                if let object = realmProvider.targetReaderRealmPerSchemaName[objectClass.className()]?.object(ofType: (objectClass as Object.Type).self, forPrimaryKey: objectID) {
-                    // Get children
-                    guard let childObjectClass = realmObjectClass(name: relationship.childEntityName) else {
-                        continue
-                    }
-                    let predicate = NSPredicate(format: "%K == %@", relationship.childParentKey, object)
-                    guard let children = realmProvider.targetReaderRealmPerSchemaName[childObjectClass.className()]?.objects(childObjectClass.self).filter(predicate) else {
-                        continue
-                    }
-                    
-                    for child in Array(children) {
-                        if let childEntity = self.syncedEntity(for: child, realm: persistenceRealm) {
-                            try await records.append(contentsOf: childrenRecords(for: childEntity))
-                        }
-                    }
-                }
-            }
-        }
-        
-        return records
     }
     
     // MARK: - QSModelAdapter
