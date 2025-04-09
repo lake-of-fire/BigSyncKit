@@ -545,17 +545,17 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func mergeChangesIntoAdapter(_ adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
-        try await adapter.persistImportedChanges { @BigSyncBackgroundActor [weak self] error in
-            guard let self = self else { return }
-            guard error == nil else {
-                try await completion(error)
-                return
-            }
-            if let token = activeZoneToken(zoneID: adapter.recordZoneID) {
-                await adapter.saveToken(token)
-            }
-            try await completion(nil)
+        do {
+            try await adapter.persistImportedChanges()
+        } catch {
+            try await completion(error)
+            return
         }
+        
+        if let token = activeZoneToken(zoneID: adapter.recordZoneID) {
+            await adapter.saveToken(token)
+        }
+        try await completion(nil)
     }
 }
 
@@ -580,13 +580,14 @@ extension CloudKitSynchronizer {
                 if shouldRetryUpload(for: error) {
                     //                    print("# uploadChanges() failed, retrying via fetchChanges()")
                     uploadRetries += 1
-                    logger.info("QSCloudKitSynchronizer >> Retrying upload, beginning with fetching changes...")
+                    logger.info("QSCloudKitSynchronizer >> Retrying upload due to error \(error.description.prefix(200)), beginning with fetching changes...")
                     await fetchChanges()
                 } else {
                     await failSynchronization(error: error)
                 }
             } else {
                 if try await shouldDeferFetches() {
+                    debugPrint("# USED TO STOP HERE, NOw LOOPIN!")
                     await performSynchronization()
                 } else {
                     updateTokens()
@@ -661,6 +662,8 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
+        guard !cancelSync else { throw CancellationError() }
+
         let requestedBatchSize = batchSize
         let records = try await adapter.recordsToUpload(limit: requestedBatchSize)
         let recordCount = records.count
@@ -668,6 +671,8 @@ extension CloudKitSynchronizer {
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
+        
+        guard !cancelSync else { throw CancellationError() }
         
         if !didNotifyUpload.contains(adapter.recordZoneID) {
             didNotifyUpload.insert(adapter.recordZoneID)
@@ -729,25 +734,24 @@ extension CloudKitSynchronizer {
                             // TODO: This seems to get called every time I make changes in the app that trigger upload syncs, while a backlog of queued uploads is still processing while bypassing fetches (shouldDeferFetches). Maybe we need to do some of the updateTokens() work in the case that we are uploading fresh changes? Unsure why conflicted records happen seemingly reliably in that situation. Actually it seems this happens anyway if idling during a backlog of queued uploads...
                             do {
                                 try await adapter.saveChanges(in: resolvedRecords, forceSave: true)
+                                try await adapter.persistImportedChanges()
                             } catch {
+                                logger.info("QSCloudKitSynchronizer >> WARNING: Failed to save changes to resolved conflicted record: \(error)")
                                 try await completion(error)
                                 return
                             }
-                            try await adapter.persistImportedChanges { persistError in
-                                try await completion(persistError)
-                                return
-                            }
-                            
                         }
+                    } else {
+                        if self.isLimitExceededError(error) {
+                            reduceBatchSize()
+                        }
+                        
+                        try await completion(error)
+                        return
                     }
-                    
-                    if self.isLimitExceededError(error) {
-                        reduceBatchSize()
-                    }
-                    
-                    try await completion(error)
-                    return
                 }
+                
+                try? await Task.sleep(nanoseconds: 1_000_000_000) // Try to avoid rate limits...
                 
                 if recordCount >= requestedBatchSize {
                     increaseBatchSize()

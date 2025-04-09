@@ -1124,7 +1124,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         } else {
                             result = false
                         }
-                        logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
+                        logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
 //                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
 //                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
                         return result
@@ -1151,6 +1151,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 if property.type == .linkingObjects {
                     continue
                 }
+                
+//                logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
+                if let remoteExplicitlyModifiedAt = record["explicitlyModifiedAt"] as? Date, let localExplicitlyModifiedAt = (object as? ChangeMetadataRecordable)?.explicitlyModifiedAt, remoteExplicitlyModifiedAt < localExplicitlyModifiedAt {
+                    logger.warning("QSCloudKitSynchronizer >> WARNING: Applying changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
+                }
+
                 applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
             }
         }
@@ -2179,19 +2185,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    public func persistImportedChanges(completion: @escaping ((Error?) async throws -> Void)) async throws {
-        guard let realmProvider = realmProvider else {
-            try await completion(nil)
-            return
-        }
-        
-        do {
-            try await applyPendingRelationships(realmProvider: realmProvider)
-        } catch {
-            try await completion(error)
-            return
-        }
-        try await completion(nil)
+    public func persistImportedChanges() async throws {
+        guard let realmProvider else { return }
+        try await applyPendingRelationships(realmProvider: realmProvider)
     }
     
     @BigSyncBackgroundActor

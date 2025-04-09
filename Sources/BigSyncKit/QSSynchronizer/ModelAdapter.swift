@@ -52,8 +52,7 @@ public protocol ModelAdapter: AnyObject {
     func deleteRecords(with recordIDs: [CKRecord.ID]) async
     
     /// Tells the model adapter to persist all downloaded changes in the current import operation.
-    /// - Parameter completion: Block to be called after changes have been persisted.
-    func persistImportedChanges(completion: @escaping (Error?) async throws -> ()) async throws
+    func persistImportedChanges() async throws
     
     /// Provides an array of up to `limit` records with changes that need to be uploaded to CloudKit.
     /// - Parameter limit: Maximum number of records that should be provided.
