@@ -148,15 +148,14 @@ extension CloudKitSynchronizer {
             switch error {
                 //                    case .callFailed:
                 //                        print("Sync error: \(error.localizedDescription) This error could be returned by completion block when no success and no error were produced.")
-                //            case .alreadySyncing:
-                //                // Received when synchronize is called while there was an ongoing synchronization.
-                //                break
-                //            case .cancelled:
-                //                print("Sync error: \(error.localizedDescription) Synchronization was manually cancelled.")
+            case .cancelled:
+                logger.info("QSCloudKitSynchronizer >> Synchronization canceled, not retrying")
+                return
             case .higherModelVersionFound:
                 // TODO: This error can be detected to prompt the user to update the app to a newer version.
                 // TODO: Show this error inside settings view
                 print("Sync error: \(error.localizedDescription) A synchronizer with a higher `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.")
+                return
             default:// break
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
 //                print("# ")
@@ -174,6 +173,9 @@ extension CloudKitSynchronizer {
                 // Don't retry...
                 syncing = false
                 cancelSync = false
+                for adapter in modelAdapters {
+                    adapter.unsetCancellation()
+                }
                 return
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
@@ -222,14 +224,6 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
-        //        if let currentOp = currentOperation, !currentOp.isFinished {
-        //            logger.warning("QSCloudKitSynchronizer >> Skipping new operation \(type(of: operation)) because current operation \(type(of: currentOp)) is still running")
-        //            Task { @BigSyncBackgroundActor in
-        //                await failSynchronization(error: SyncError.alreadySyncing)
-        //            }
-        //            return
-        //        }
-        
 //        logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
         operation.logger = logger
         operation.errorHandler = { [weak self] operation, error in
@@ -681,7 +675,7 @@ extension CloudKitSynchronizer {
         let requestedBatchSize = batchSize
         let records = try await adapter.recordsToUpload(limit: requestedBatchSize)
         let recordCount = records.count
-        //        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
+        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
@@ -701,9 +695,12 @@ extension CloudKitSynchronizer {
                                                             recordIDsToDelete: nil)
         { [weak self] (savedRecords, deleted, conflicted, recordIDsMissingOnServer, operationError) in
             //            debugPrint("# uploadRecords, inside operation callback...", records.count)
-            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+            guard let self else { return }
+            modifyRecordsTask?.cancel()
+            modifyRecordsTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 //                debugPrint("# uploadRecords, inside operation callback Task...", records.count, "saved", savedRecords?.count, "del", deleted?.count, "conflicted", conflicted.count, operationError)
                 guard let self else { return }
+                try Task.checkCancellation()
                 var conflicted = conflicted
                 if !(savedRecords?.isEmpty ?? true) {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
@@ -711,6 +708,7 @@ extension CloudKitSynchronizer {
                 }
                 try await adapter.didUpload(savedRecords: savedRecords ?? [])
                 
+                try Task.checkCancellation()
                 if let error = operationError as? NSError {
                     //                    if error.code == CKError.partialFailure.rawValue,
                     //                       let errorsByItemID = error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] {
@@ -745,7 +743,7 @@ extension CloudKitSynchronizer {
                         }
                         //                        debugPrint("## Resolved Recos", resolvedRecords.map {($0.recordID, $0) })
                         if !resolvedRecords.isEmpty {
-                            // TODO: This seems to get called every time I make changes in the app that trigger upload syncs, while a backlog of queued uploads is still processing while bypassing fetches (shouldDeferFetches). Maybe we need to do some of the updateTokens() work in the case that we are uploading fresh changes? Unsure why conflicted records happen seemingly reliably in that situation. Actually it seems this happens anyway if idling during a backlog of queued uploads...
+                            try Task.checkCancellation()
                             do {
                                 try await adapter.saveChanges(in: resolvedRecords, forceSave: true)
                                 try await adapter.persistImportedChanges()
@@ -760,17 +758,21 @@ extension CloudKitSynchronizer {
                             reduceBatchSize()
                         }
                         
+                        try Task.checkCancellation()
                         try await completion(error)
                         return
                     }
                 }
                 
                 try? await Task.sleep(nanoseconds: 1_000_000_000) // Try to avoid rate limits...
+                try Task.checkCancellation()
                 
                 if recordCount >= requestedBatchSize {
                     increaseBatchSize()
                     //                    debugPrint("# uploadRecords from inside uploadRecords")
-                    try await uploadRecords(adapter: adapter, completion: completion)
+                    Task.detached { @BigSyncBackgroundActor [weak self] in
+                        try await self?.uploadRecords(adapter: adapter, completion: completion)
+                    }
                 } else {
                     try await completion(nil)
                 }
@@ -827,6 +829,12 @@ extension CloudKitSynchronizer {
         let operation = FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (databaseToken, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
+                
+                guard !cancelSync else {
+                    await failSynchronization(error: SyncError.cancelled)
+                    return
+                }
+                
                 await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 if changedZoneIDs.count > 0 {
                     let zoneIDs = try await loadTokens(for: changedZoneIDs, loadAdapters: false)
@@ -873,6 +881,12 @@ extension CloudKitSynchronizer {
             ]
         ) { @BigSyncBackgroundActor [weak self] zoneResults in
             guard let self = self else { return }
+            
+            guard !cancelSync else {
+                await failSynchronization(error: SyncError.cancelled)
+                return
+            }
+            
             //            var pendingZones = [CKRecordZone.ID]()
             var needsToRefetch = false
             

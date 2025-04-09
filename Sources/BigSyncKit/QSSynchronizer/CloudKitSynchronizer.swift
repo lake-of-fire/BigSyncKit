@@ -77,10 +77,6 @@ public class CloudKitSynchronizer: NSObject {
     /// SyncError
     public enum SyncError: Int, Error {
         /**
-         *  Received when synchronize is called while there was an ongoing synchronization.
-         */
-        case alreadySyncing = 0
-        /**
          *  A synchronizer with a higer `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.
          *  This error can be detected to prompt the user to update the app to a newer version.
          */
@@ -157,26 +153,16 @@ public class CloudKitSynchronizer: NSObject {
     internal var serverChangeToken: CKServerChangeToken?
     internal var activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
     @BigSyncBackgroundActor
-    internal var cancelSync = false {
-        didSet {
-            for adapter in modelAdapters {
-                Task { @BigSyncBackgroundActor in
-                    if cancelSync {
-                        await adapter.cancelSynchronization()
-                    } else {
-                        await adapter.unsetCancellation()
-                    }
-                }
-            }
-        }
-    }
-    //    internal var onFailure: ((Error) -> ())?
+    internal var cancelSync = false
+    
     @BigSyncBackgroundActor
     internal var currentOperations = [Operation]()
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     @BigSyncBackgroundActor
     internal var synchronizationTask: Task<Void, Never>?
+    @BigSyncBackgroundActor
+    internal var modifyRecordsTask: Task<Void, Error>?
 
     internal var lastFetchEmptyAt: Date?
     
@@ -259,7 +245,10 @@ public class CloudKitSynchronizer: NSObject {
     // MARK: - Public
     
     ///  These keys will be added to CKRecords uploaded to CloudKit and are used by SyncKit internally.
-    public static let metadataKeys: [String] = [CloudKitSynchronizer.deviceUUIDKey, CloudKitSynchronizer.modelCompatibilityVersionKey]
+    public static let metadataKeys: [String] = [
+        CloudKitSynchronizer.deviceUUIDKey,
+        CloudKitSynchronizer.modelCompatibilityVersionKey,
+    ]
     
     /// Synchronize data with CloudKit.
     /// - Parameter onFailure: Block that receives an error if the synchronization stopped due to a failure. Could be a `SyncError`, `CKError`, or any other error found during synchronization.
@@ -268,7 +257,6 @@ public class CloudKitSynchronizer: NSObject {
         logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard !syncing else {
-                //            onFailure?(SyncError.alreadySyncing)
                 return
             }
             
@@ -276,6 +264,10 @@ public class CloudKitSynchronizer: NSObject {
             cancelSync = false
             syncing = true
             //        self.onFailure = onFailure
+            
+            for adapter in modelAdapters {
+                adapter.unsetCancellation()
+            }
             
             await self?.performSynchronization()
         }
@@ -287,6 +279,7 @@ public class CloudKitSynchronizer: NSObject {
 //        guard syncing, !cancelSync else { return }
         
         synchronizationTask?.cancel()
+        modifyRecordsTask?.cancel()
         
         guard !cancelSync else { return }
         logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
@@ -294,6 +287,10 @@ public class CloudKitSynchronizer: NSObject {
         cancelSync = true
         syncing = false // TODO: This might be buggy to set eagerly?!
         currentOperations.forEach { $0.cancel() }
+        
+        for adapter in modelAdapters {
+            adapter.cancelSynchronization()
+        }
     }
     
     /**

@@ -103,8 +103,8 @@ public protocol ModelAdapter: AnyObject {
     /// Merge policy in case of conflicts. Default is `server`.
     var mergePolicy: MergePolicy { get set }
     
-    func cancelSynchronization() async
-    func unsetCancellation() async
+    func cancelSynchronization()
+    func unsetCancellation()
         
     /// Returns corresponding `CKRecord` for the given model object.
     /// - Parameter object: Model object.

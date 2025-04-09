@@ -116,30 +116,5 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
     @BigSyncBackgroundActor
     public func synchronizeCloudKit(using synchronizer: CloudKitSynchronizer) {
         synchronizer.beginSynchronization()
-//        await withCheckedContinuation { continuation in
-//            synchronizer.beginSynchronization { [weak self] error in
-//                if let error = error as? BigSyncKit.CloudKitSynchronizer.SyncError {
-//#warning("Tell user about this error")
-//                    switch error {
-//                        //                    case .callFailed:
-//                        //                        print("Sync error: \(error.localizedDescription) This error could be returned by completion block when no success and no error were produced.")
-//                    case .alreadySyncing:
-//                        // Received when synchronize is called while there was an ongoing synchronization.
-//                        break
-//                    case .cancelled:
-//                        print("Sync error: \(error.localizedDescription) Synchronization was manually cancelled.")
-//                    case .higherModelVersionFound:
-//                        // TODO: This error can be detected to prompt the user to update the app to a newer version.
-//                        // TODO: Show this error inside settings view
-//                        print("Sync error: \(error.localizedDescription) A synchronizer with a higher `compatibilityVersion` value uploaded changes to CloudKit, so those changes won't be imported here.")
-////                    case .recordNotFound:
-////                        print("Sync error: \(error.localizedDescription) A record for the provided object was not found, so the object cannot be shared on CloudKit.")
-//                    }
-//                } else if let error = error as? NSError {
-//                    self?.logger.error("CloudKit stopped due to sync error: \(error.localizedDescription) \(error)")
-//                }
-//                continuation.resume()
-//            }
-//        }
     }
 }

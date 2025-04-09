@@ -382,19 +382,20 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    public func cancelSynchronization() async {
+    public func cancelSynchronization() {
 //        debugPrint("# cancel")
         cancelSync = true
     }
     
     @BigSyncBackgroundActor
-    public func unsetCancellation() async {
+    public func unsetCancellation() {
 //        debugPrint("# unset cancel")
         cancelSync = false
     }
     
     @BigSyncBackgroundActor
     func setup() async throws {
+        logger.info("QSCloudKitSynchronizer >> Setup yynchronization...")
         //        debugPrint("# setup() ...")
         realmProvider = await RealmProvider(
             persistenceConfiguration: persistenceRealmConfiguration,
@@ -1144,6 +1145,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             }
         } else {
+            if let remoteExplicitlyModifiedAt = record["explicitlyModifiedAt"] as? Date, let localExplicitlyModifiedAt = (object as? ChangeMetadataRecordable)?.explicitlyModifiedAt, remoteExplicitlyModifiedAt < localExplicitlyModifiedAt {
+                logger.warning("QSCloudKitSynchronizer >> WARNING: Applying changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date), syncedEntityState=\(syncedEntityState.rawValue)")
+            }
+            
             for property in objectProperties where !skippedKeys.contains(property.name) {
                 if shouldIgnore(key: property.name) {
                     continue
@@ -1153,10 +1158,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
                 
 //                logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
-                if let remoteExplicitlyModifiedAt = record["explicitlyModifiedAt"] as? Date, let localExplicitlyModifiedAt = (object as? ChangeMetadataRecordable)?.explicitlyModifiedAt, remoteExplicitlyModifiedAt < localExplicitlyModifiedAt {
-                    logger.warning("QSCloudKitSynchronizer >> WARNING: Applying changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
-                }
-
                 applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
             }
         }
