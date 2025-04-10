@@ -10,78 +10,6 @@ import CloudKit
 import AsyncAlgorithms
 import Combine
 
-fileprivate struct ChangeRequest {
-    let downloadedRecord: CKRecord?
-    let deletedRecordID: CKRecord.ID?
-    let adapter: ModelAdapter
-}
-
-fileprivate class ChangeRequestProcessor {
-    init() {
-        changeSubject
-            .debounce(for: .seconds(2), scheduler: DispatchQueue.global())
-            .sink { [weak self] _ in
-                self?.runProcessFetchedChangeRequests()
-            }
-            .store(in: &cancellables)
-    }
-    
-    @BigSyncBackgroundActor
-    private var changeRequests = [ChangeRequest]()
-    private var changeSubject = PassthroughSubject<Void, Never>()
-    private var cancellables = Set<AnyCancellable>()
-    private var localErrors: [Error] = []
-    private var processTask: Task<Void, Error>? = nil
-
-    @BigSyncBackgroundActor
-    fileprivate func addFetchedChangeRequest(_ request: ChangeRequest) {
-        //        debugPrint("# addChangeReq", request.downloadedRecord?.recordID.recordName)
-        changeRequests.append(request)
-        changeSubject.send()
-    }
-    
-    private func runProcessFetchedChangeRequests() {
-        processTask?.cancel()
-        processTask = Task { @BigSyncBackgroundActor [weak self] in
-            try await self?.processFetchedChangeRequests()
-            self?.processTask = nil
-        }
-    }
-    
-    @BigSyncBackgroundActor
-    private func processFetchedChangeRequests() async throws {
-        try Task.checkCancellation()
-        debugPrint("# processFetchedChangeRequests fetched change req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
-        
-        let batch = changeRequests
-        guard !batch.isEmpty else { return }
-        changeRequests.removeAll()
-        
-        do {
-            let downloadedRecords = batch.compactMap { $0.downloadedRecord }
-            try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
-            
-            let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
-            if !deletedRecordIDs.isEmpty {
-                try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
-            }
-        } catch is CancellationError {
-            // Requeue the batch so we can retry it next sync
-            changeRequests.insert(contentsOf: batch, at: 0)
-        } catch {
-            localErrors.append(error)
-        }
-    }
-    
-    func getErrors() -> [Error] {
-        return localErrors
-    }
-    
-    func finishProcessing() async {
-        runProcessFetchedChangeRequests()
-    }
-}
-
 fileprivate func isZoneNotFoundOrDeletedError(_ error: Error?) -> Bool {
     if let error = error {
         let nserror = error as NSError
@@ -322,6 +250,11 @@ extension CloudKitSynchronizer {
             return
         }
         
+        guard await !cancelSync else {
+            try await final(SyncError.cancelled)
+            return
+        }
+        
         //        debugPrint("# sequential closure(...)")
         try await closure(first) { [weak self] error in
             guard error == nil else {
@@ -413,6 +346,12 @@ extension CloudKitSynchronizer {
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
+                
+                guard !cancelSync else {
+                    await failSynchronization(error: SyncError.cancelled)
+                    return
+                }
+                
                 await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 
                 let zoneIDsToFetch = try await loadTokens(for: changedZoneIDs, loadAdapters: true)
@@ -427,8 +366,18 @@ extension CloudKitSynchronizer {
                 
                 lastFetchEmptyAt = nil
                 
+                guard !cancelSync else {
+                    await failSynchronization(error: SyncError.cancelled)
+                    return
+                }
+                
                 try await { @BigSyncBackgroundActor [weak self] in
                     guard let self = self else { return }
+                    guard !cancelSync else {
+                        await failSynchronization(error: SyncError.cancelled)
+                        return
+                    }
+                    
                     zoneIDsToFetch.forEach {
                         self.delegate?.synchronizerWillFetchChanges(self, in: $0)
                     }
@@ -440,7 +389,11 @@ extension CloudKitSynchronizer {
                             await failSynchronization(error: error)
                             return
                         }
-                        
+                        guard !cancelSync else {
+                            await failSynchronization(error: SyncError.cancelled)
+                            return
+                        }
+
                         try await mergeChanges() { error in
                             try await completion(token, error)
                         }
@@ -454,7 +407,7 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async throws -> ()) {
         //        debugPrint("# fetchZoneChanges(...)", zoneIDs)
-        let changeRequestProcessor = ChangeRequestProcessor()
+        let changeRequestProcessor = ChangeRequestProcessor.shared
         let operation = FetchZoneChangesOperation(
             database: database,
             zoneIDs: zoneIDs,
@@ -531,7 +484,7 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func mergeChanges(completion: @escaping (Error?) async throws -> ()) async throws {
         //        debugPrint("# mergeChanges()")
-        guard cancelSync == false else {
+        guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
         }
@@ -699,6 +652,7 @@ extension CloudKitSynchronizer {
                 //                debugPrint("# uploadRecords, inside operation callback Task...", records.count, "saved", savedRecords?.count, "del", deleted?.count, "conflicted", conflicted.count, operationError)
                 guard let self else { return }
                 try Task.checkCancellation()
+                guard !cancelSync else { throw CancellationError() }
                 var conflicted = conflicted
                 if !(savedRecords?.isEmpty ?? true) {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
@@ -757,19 +711,24 @@ extension CloudKitSynchronizer {
                         }
                         
                         try Task.checkCancellation()
+                        guard !cancelSync else { throw CancellationError() }
                         try await completion(error)
                         return
                     }
                 }
                 
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // Try to avoid rate limits...
+                guard !cancelSync else { throw CancellationError() }
+                try? await Task.sleep(nanoseconds: 600_000_000) // Try to avoid rate limits...
                 try Task.checkCancellation()
-                
+                guard !cancelSync else { throw CancellationError() }
+
                 if recordCount >= requestedBatchSize {
                     increaseBatchSize()
                     //                    debugPrint("# uploadRecords from inside uploadRecords")
                     Task.detached { @BigSyncBackgroundActor [weak self] in
-                        try await self?.uploadRecords(adapter: adapter, completion: completion)
+                        guard let self else { return }
+                        guard !cancelSync else { throw CancellationError() }
+                        try await uploadRecords(adapter: adapter, completion: completion)
                     }
                 } else {
                     try await completion(nil)

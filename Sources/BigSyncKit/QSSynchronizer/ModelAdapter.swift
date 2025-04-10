@@ -49,7 +49,7 @@ public protocol ModelAdapter: AnyObject {
     
     /// Delete the local model objects corresponding to the given record IDs.
     /// - Parameter recordIDs: Array of identifiers of records that were deleted on CloudKit.
-    func deleteRecords(with recordIDs: [CKRecord.ID]) async
+    func deleteRecords(with recordIDs: [CKRecord.ID]) async throws
     
     /// Tells the model adapter to persist all downloaded changes in the current import operation.
     func persistImportedChanges() async throws

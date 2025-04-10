@@ -8,6 +8,7 @@
 import Foundation
 import CloudKit
 import Logging
+import Combine
 
 // For Swift
 public extension Notification.Name {
@@ -65,6 +66,81 @@ public protocol CloudKitSynchronizerDelegate: AnyObject {
     func synchronizerDidfailToSync(_ synchronizer: CloudKitSynchronizer, error: Error)
     func synchronizer(_ synchronizer: CloudKitSynchronizer, didAddAdapter adapter: ModelAdapter, forRecordZoneID zoneID: CKRecordZone.ID)
     func synchronizer(_ synchronizer: CloudKitSynchronizer, zoneIDWasDeleted zoneID: CKRecordZone.ID)
+}
+
+internal struct ChangeRequest {
+    let downloadedRecord: CKRecord?
+    let deletedRecordID: CKRecord.ID?
+    let adapter: ModelAdapter
+}
+
+internal class ChangeRequestProcessor {
+    static let shared = ChangeRequestProcessor()
+    
+    init() {
+        changeSubject
+            .debounce(for: .seconds(2), scheduler: DispatchQueue.global())
+            .sink { [weak self] _ in
+                self?.runProcessFetchedChangeRequests()
+            }
+            .store(in: &cancellables)
+    }
+    
+    @BigSyncBackgroundActor
+    private var changeRequests = [ChangeRequest]()
+    private var changeSubject = PassthroughSubject<Void, Never>()
+    private var cancellables = Set<AnyCancellable>()
+    private var localErrors: [Error] = []
+    internal var processTask: Task<Void, Error>? = nil
+    
+    @BigSyncBackgroundActor
+    internal func addFetchedChangeRequest(_ request: ChangeRequest) {
+        //        debugPrint("# addChangeReq", request.downloadedRecord?.recordID.recordName)
+        changeRequests.append(request)
+        changeSubject.send()
+    }
+    
+    private func runProcessFetchedChangeRequests() {
+        processTask?.cancel()
+        processTask = Task { @BigSyncBackgroundActor [weak self] in
+            try await self?.processFetchedChangeRequests()
+            self?.processTask = nil
+        }
+    }
+    
+    @BigSyncBackgroundActor
+    private func processFetchedChangeRequests() async throws {
+        try Task.checkCancellation()
+        //        debugPrint("# processFetchedChangeRequests fetched change req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
+        
+        let batch = changeRequests
+        guard !batch.isEmpty else { return }
+        changeRequests.removeAll()
+        
+        do {
+            let downloadedRecords = batch.compactMap { $0.downloadedRecord }
+            try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
+            
+            try Task.checkCancellation()
+            let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
+            if !deletedRecordIDs.isEmpty {
+                try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
+            }
+        } catch is CancellationError {
+            // Requeue the batch so we can retry it next sync
+            changeRequests.insert(contentsOf: batch, at: 0)
+        } catch {
+            localErrors.append(error)
+        }
+    }
+    
+    func getErrors() -> [Error] {
+        return localErrors
+    }
+    
+    func finishProcessing() async {
+        runProcessFetchedChangeRequests()
+    }
 }
 
 /**
@@ -278,6 +354,7 @@ public class CloudKitSynchronizer: NSObject {
     @objc public func cancelSynchronization() {
 //        guard syncing, !cancelSync else { return }
         
+        ChangeRequestProcessor.shared.processTask?.cancel()
         synchronizationTask?.cancel()
         modifyRecordsTask?.cancel()
         
