@@ -595,7 +595,7 @@ extension CloudKitSynchronizer {
                 }
             } else {
                 if try await shouldDeferFetches() {
-                    debugPrint("# USED TO STOP HERE, NOw LOOPIN!")
+//                    debugPrint("# USED TO STOP HERE, NOw LOOPIN!")
                     await performSynchronization()
                 } else {
                     updateTokens()
