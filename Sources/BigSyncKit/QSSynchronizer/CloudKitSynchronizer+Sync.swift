@@ -8,6 +8,7 @@
 import Foundation
 import CloudKit
 import AsyncAlgorithms
+import Combine
 
 fileprivate struct ChangeRequest {
     let downloadedRecord: CKRecord?
@@ -16,44 +17,42 @@ fileprivate struct ChangeRequest {
 }
 
 fileprivate class ChangeRequestProcessor {
+    init() {
+        changeSubject
+            .debounce(for: .seconds(2), scheduler: DispatchQueue.global())
+            .sink { [weak self] _ in
+                self?.runProcessFetchedChangeRequests()
+            }
+            .store(in: &cancellables)
+    }
+    
     @BigSyncBackgroundActor
     private var changeRequests = [ChangeRequest]()
-    private let debounceInterval: UInt64 = 3_000_000_000 // 2 seconds in nanoseconds
-    private var lastExecutionTime: UInt64 = 0
-    private var debounceTask: Task<Void, Never>?
+    private var changeSubject = PassthroughSubject<Void, Never>()
+    private var cancellables = Set<AnyCancellable>()
     private var localErrors: [Error] = []
-    
+    private var processTask: Task<Void, Error>? = nil
+
     @BigSyncBackgroundActor
     fileprivate func addFetchedChangeRequest(_ request: ChangeRequest) {
         //        debugPrint("# addChangeReq", request.downloadedRecord?.recordID.recordName)
         changeRequests.append(request)
-        //        debugPrint("!! enq req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }))
-        let currentTime = DispatchTime.now().uptimeNanoseconds
-        
-        if lastExecutionTime == 0 || currentTime >= lastExecutionTime + debounceInterval {
-            debounceTask?.cancel()
-            Task(priority: .background) {
-                await processFetchedChangeRequests()
-            }
-        } else {
-            debounceTask?.cancel()
-            debounceTask = Task(priority: .background) { @BigSyncBackgroundActor in
-                let timeSinceLastExecution = currentTime >= lastExecutionTime ? currentTime - lastExecutionTime : 0
-                let remainingTime = debounceInterval > timeSinceLastExecution ? debounceInterval - timeSinceLastExecution : 0
-                try? await Task.sleep(nanoseconds: remainingTime)
-                do {
-                    try Task.checkCancellation()
-                    await processFetchedChangeRequests()
-                } catch { }
-            }
+        changeSubject.send()
+    }
+    
+    private func runProcessFetchedChangeRequests() {
+        processTask?.cancel()
+        processTask = Task { @BigSyncBackgroundActor [weak self] in
+            try await self?.processFetchedChangeRequests()
+            self?.processTask = nil
         }
     }
     
     @BigSyncBackgroundActor
-    private func processFetchedChangeRequests() async {
-        //        debugPrint("# processFetchedChangeRequests fetched change req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
+    private func processFetchedChangeRequests() async throws {
+        try Task.checkCancellation()
+        debugPrint("# processFetchedChangeRequests fetched change req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
         
-        lastExecutionTime = DispatchTime.now().uptimeNanoseconds
         let batch = changeRequests
         guard !batch.isEmpty else { return }
         changeRequests.removeAll()
@@ -79,8 +78,7 @@ fileprivate class ChangeRequestProcessor {
     }
     
     func finishProcessing() async {
-        debounceTask?.cancel()
-        await processFetchedChangeRequests()
+        runProcessFetchedChangeRequests()
     }
 }
 
