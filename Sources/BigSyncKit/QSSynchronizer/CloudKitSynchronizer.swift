@@ -77,6 +77,8 @@ internal struct ChangeRequest {
 internal class ChangeRequestProcessor {
     static let shared = ChangeRequestProcessor()
     
+    internal var logger: Logging.Logger?
+
     init() {
         changeSubject
             .debounce(for: .seconds(2), scheduler: DispatchQueue.global())
@@ -92,6 +94,7 @@ internal class ChangeRequestProcessor {
     private var cancellables = Set<AnyCancellable>()
     private var localErrors: [Error] = []
     internal var processTask: Task<Void, Error>? = nil
+    private let batchSize = 100
     
     @BigSyncBackgroundActor
     internal func addFetchedChangeRequest(_ request: ChangeRequest) {
@@ -111,26 +114,34 @@ internal class ChangeRequestProcessor {
     @BigSyncBackgroundActor
     private func processFetchedChangeRequests() async throws {
         try Task.checkCancellation()
-        //        debugPrint("# processFetchedChangeRequests fetched change req, current batch size", changeRequests.count, "dl reqs", changeRequests.count(where: { $0.downloadedRecord != nil }), "ids", changeRequests.map { $0.downloadedRecord?.recordID.recordName })
         
-        let batch = changeRequests
-        guard !batch.isEmpty else { return }
-        changeRequests.removeAll()
-        
-        do {
-            let downloadedRecords = batch.compactMap { $0.downloadedRecord }
-            try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
+        while !changeRequests.isEmpty {
+            let batch = changeRequests.prefix(batchSize)
+            changeRequests.removeFirst(batch.count)
             
-            try Task.checkCancellation()
-            let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
-            if !deletedRecordIDs.isEmpty {
-                try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
+            do {
+                logger?.info("QSCloudKitSynchronizer >> Processing remote records for local merge: \(batch.compactMap { $0.downloadedRecord?.recordID.recordName } .joined(separator: " "))")
+                
+                let downloadedRecords = batch.compactMap { $0.downloadedRecord }
+                try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
+                
+                try Task.checkCancellation()
+                
+                let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
+                if !deletedRecordIDs.isEmpty {
+                    try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
+                }
+            } catch is CancellationError {
+                // On cancellation, reinsert the batch and break
+                changeRequests.insert(contentsOf: batch, at: 0)
+                break
+            } catch {
+                localErrors.append(error)
+                changeRequests.insert(contentsOf: batch, at: 0)
+                break
             }
-        } catch is CancellationError {
-            // Requeue the batch so we can retry it next sync
-            changeRequests.insert(contentsOf: batch, at: 0)
-        } catch {
-            localErrors.append(error)
+            
+            await Task.yield()
         }
     }
     
@@ -239,7 +250,7 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationTask: Task<Void, Never>?
     @BigSyncBackgroundActor
     internal var modifyRecordsTask: Task<Void, Error>?
-
+    
     internal var lastFetchEmptyAt: Date?
     
     internal let logger: Logging.Logger
@@ -281,6 +292,8 @@ public class CloudKitSynchronizer: NSObject {
                 self.clearDeviceIdentifier()
             }
         }
+        
+        ChangeRequestProcessor.shared.logger = logger
     }
     
     fileprivate var _deviceIdentifier: String!
@@ -308,8 +321,9 @@ public class CloudKitSynchronizer: NSObject {
         clearDeviceIdentifier()
         resetDatabaseToken()
         resetActiveTokens()
+        lastFetchEmptyAt = nil
         
-//        try? await Task.sleep(nanoseconds: 300_000_000) // Allow cancellations to catch up...
+        //        try? await Task.sleep(nanoseconds: 300_000_000) // Allow cancellations to catch up...
         if includingAdapters {
             for adapter in modelAdapters {
                 await adapter.unsetCancellation()
@@ -330,12 +344,13 @@ public class CloudKitSynchronizer: NSObject {
     /// - Parameter onFailure: Block that receives an error if the synchronization stopped due to a failure. Could be a `SyncError`, `CKError`, or any other error found during synchronization.
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
-        logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard !syncing else {
                 return
             }
             
+            logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
+   
             //        debugPrint("CloudKitSynchronizer >> Initiating synchronization", identifier, containerIdentifier)
             cancelSync = false
             syncing = true
@@ -352,7 +367,7 @@ public class CloudKitSynchronizer: NSObject {
     /// Cancel synchronization. It will cause a current synchronization to end with a `cancelled` error.
     @BigSyncBackgroundActor
     @objc public func cancelSynchronization() {
-//        guard syncing, !cancelSync else { return }
+        //        guard syncing, !cancelSync else { return }
         
         ChangeRequestProcessor.shared.processTask?.cancel()
         synchronizationTask?.cancel()
@@ -360,7 +375,7 @@ public class CloudKitSynchronizer: NSObject {
         
         guard !cancelSync else { return }
         logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
-
+        
         cancelSync = true
         syncing = false // TODO: This might be buggy to set eagerly?!
         currentOperations.forEach { $0.cancel() }

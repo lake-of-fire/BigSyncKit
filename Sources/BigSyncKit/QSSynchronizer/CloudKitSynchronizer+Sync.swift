@@ -99,9 +99,6 @@ extension CloudKitSynchronizer {
                 // Don't retry...
                 syncing = false
                 cancelSync = false
-                for adapter in modelAdapters {
-                    adapter.unsetCancellation()
-                }
                 return
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
@@ -429,6 +426,7 @@ extension CloudKitSynchronizer {
                     deletedRecordID: deletedRecordID,
                     adapter: adapter
                 )
+                logger.info("QSCloudKitSynchronizer >> Enqueueing remote record for local merge: \(downloadedRecord?.recordID.recordName)")
                 await changeRequestProcessor.addFetchedChangeRequest(changeRequest)
             }
         } completion: { [weak self] zoneResults in
@@ -532,8 +530,8 @@ extension CloudKitSynchronizer {
         
         try await uploadChanges() { [weak self] (error) in
             try Task.checkCancellation()
+            guard let self else { return }
             
-            guard let self = self else { return }
             if let error = error as? NSError {
 #warning("FIXME: handle zone not found...")
                 if shouldRetryUpload(for: error) {
@@ -626,11 +624,13 @@ extension CloudKitSynchronizer {
         let requestedBatchSize = batchSize
         let records = try await adapter.recordsToUpload(limit: requestedBatchSize)
         let recordCount = records.count
-        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
+//        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
+        logger.info("QSCloudKitSynchronizer >> Setup synchronization...")
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
-        
+        logger.info("QSCloudKitSynchronizer >> Uploading records: \(records.map { $0.recordID.recordName } .joined(separator: " "))")
+
         guard !cancelSync else { throw CancellationError() }
         
         if !didNotifyUpload.contains(adapter.recordZoneID) {

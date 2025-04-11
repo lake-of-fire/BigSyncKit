@@ -388,7 +388,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @BigSyncBackgroundActor
     func setup() async throws {
-        logger.info("QSCloudKitSynchronizer >> Setup yynchronization...")
+        logger.info("QSCloudKitSynchronizer >> Setup synchronization...")
         //        debugPrint("# setup() ...")
         realmProvider = await RealmProvider(
             persistenceConfiguration: persistenceRealmConfiguration,
@@ -985,7 +985,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func hasChanges(record: CKRecord, object: Object) -> Bool {
         let objectProperties = object.objectSchema.properties
         
-        for property in objectProperties {
+        let skippedKeys: Set<String>
+        if let skippable = object as? SyncSkippablePropertiesModel {
+            skippedKeys = skippable.skipSyncingProperties() ?? []
+        } else {
+            skippedKeys = []
+        }
+        
+        for property in objectProperties where !skippedKeys.contains(property.name) {
             let key = property.name
             
             // Skip the primary key
@@ -996,98 +1003,193 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             let newValue = record[key]
             let existingValue = object.value(forKey: key)
             
-            if let newValue = newValue as? CKRecord.Reference {
-                let recordName = newValue.recordID.recordName
-                let separatorRange = recordName.range(of: ".")!
-                let newObjectIdentifier = String(recordName[separatorRange.upperBound...])
+            let propertyChanged = {
+                // Handle one side being nil first
+                guard !(newValue == nil && existingValue == nil) else {
+                    return false
+                }
+                if (newValue == nil && existingValue != nil) || (newValue != nil && existingValue == nil) {
+                    return true
+                }
                 
-                if let existingValue = existingValue as? String {
-                    if existingValue != newObjectIdentifier {
-                        return true
+                if let newValue = newValue as? CKRecord.Reference {
+                    let recordName = newValue.recordID.recordName
+                    let separatorRange = recordName.range(of: ".")!
+                    let newObjectIdentifier = String(recordName[separatorRange.upperBound...])
+                    
+                    if let existingValue = existingValue as? String {
+                        return existingValue != newObjectIdentifier
+                    }
+                } else if let newValue = newValue as? CKAsset {
+                    if let fileURL = newValue.fileURL,
+                       let newData = NSData(contentsOf: fileURL),
+                       let existingData = existingValue as? NSData {
+                        return newData != existingData
                     }
                 }
-            } else if let newValue = newValue as? CKAsset {
-                if let fileURL = newValue.fileURL,
-                   let newData = NSData(contentsOf: fileURL),
-                   let existingData = existingValue as? NSData {
-                    if newData != existingData {
+                
+                if property.isSet {
+                    switch property.type {
+                    case .int:
+                        guard let newValue = newValue as? [Int], let existingValue = existingValue as? RealmSwift.MutableSet<Int> else { return true }
+                        return Set(newValue) != Set(existingValue)
+                    case .string:
+                        guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.MutableSet<String> else { return true }
+                        return Set(newValue) != Set(existingValue)
+                    case .bool:
+                        guard let newValue = newValue as? [Bool], let existingValue = existingValue as? RealmSwift.MutableSet<Bool> else { return true }
+                        return Set(newValue) != Set(existingValue)
+                    case .float:
+                        guard let newValue = newValue as? [Float], let existingValue = existingValue as? RealmSwift.MutableSet<Float> else { return true }
+                        return Set(newValue) != Set(existingValue)
+                    case .double:
+                        guard let newValue = newValue as? [Double], let existingValue = existingValue as? RealmSwift.MutableSet<Double> else { return true }
+                        return Set(newValue) != Set(existingValue)
+                    case .data:
+                        guard let newValue = newValue as? [Data], let existingValue = existingValue as? RealmSwift.MutableSet<Data> else { return true }
+                        return Set(newValue) != Set(existingValue)
+                    case .date:
+                        guard let newValue = newValue as? [Date], let existingValue = existingValue as? RealmSwift.MutableSet<Date> else { return true }
+                        return Set(newValue) != Set(existingValue)
+                    case .UUID:
+                        guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.MutableSet<UUID> else { return true }
+                        return Set(newValue) != Set(Array(existingValue).map { $0.uuidString })
+                    default:
+                        break
+                    }
+                } else if property.isArray {
+                    switch property.type {
+                    case .int:
+                        guard let newValue = newValue as? [Int], let existingValue = existingValue as? RealmSwift.List<Int> else { return true }
+                        return newValue != Array(existingValue)
+                    case .string:
+                        guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.List<String> else { return true }
+                        return newValue != Array(existingValue)
+                    case .bool:
+                        guard let newValue = newValue as? [Bool], let existingValue = existingValue as? RealmSwift.List<Bool> else { return true }
+                        return newValue != Array(existingValue)
+                    case .float:
+                        guard let newValue = newValue as? [Float], let existingValue = existingValue as? RealmSwift.List<Float> else { return true }
+                        return newValue != Array(existingValue)
+                    case .double:
+                        guard let newValue = newValue as? [Double], let existingValue = existingValue as? RealmSwift.List<Double> else { return true }
+                        return newValue != Array(existingValue)
+                    case .data:
+                        guard let newValue = newValue as? [Data], let existingValue = existingValue as? RealmSwift.List<Data> else { return true }
+                        return newValue != Array(existingValue)
+                    case .date:
+                        guard let newValue = newValue as? [Date], let existingValue = existingValue as? RealmSwift.List<Date> else { return true }
+                        return newValue != Array(existingValue)
+                    case .UUID:
+                        guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.List<UUID> else { return true }
+                        return newValue != Array(existingValue).map { $0.uuidString }
+                    default:
+                        break
+                    }
+                } else if property.isMap {
+                    guard let newValue = newValue as? [NSArray], newValue.count == 2,
+                          let keyArray = newValue[0] as? [String], let valueArray = newValue[1] as? [Any],
+                          keyArray.count == valueArray.count else {
+                        logger.warning("QSCloudKitSynchronizer >> Found unexpected property value: \(newValue)")
                         return true
                     }
-                }
-            } else if let newValue = newValue as? [Int], let existingValue = existingValue as? Set<Int> {
-                if Set(newValue) != existingValue {
-                    return true
-                }
-            } else if let newValue = newValue as? [String], let existingValue = existingValue as? Set<String> {
-                if Set(newValue) != existingValue {
-                    return true
-                }
-            } else if let newValue = newValue as? [Bool], let existingValue = existingValue as? Set<Bool> {
-                if Set(newValue) != existingValue {
-                    return true
-                }
-            } else if let newValue = newValue as? [Float], let existingValue = existingValue as? Set<Float> {
-                if Set(newValue) != existingValue {
-                    return true
-                }
-            } else if let newValue = newValue as? [Double], let existingValue = existingValue as? Set<Double> {
-                if Set(newValue) != existingValue {
-                    return true
-                }
-            } else if let newValue = newValue as? [Data], let existingValue = existingValue as? Set<Data> {
-                if Set(newValue) != existingValue {
-                    return true
-                }
-            } else if let newValue = newValue as? [Date], let existingValue = existingValue as? Set<Date> {
-                if Set(newValue) != existingValue {
-                    return true
-                }
-            } else if let newValue = newValue as? [Int], let existingValue = existingValue as? RealmSwift.List<Int> {
-                if !newValue.elementsEqual(existingValue) {
-                    return true
-                }
-            } else if let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.List<String> {
-                if !newValue.elementsEqual(existingValue) {
-                    return true
-                }
-            } else if let newValue = newValue as? [Bool], let existingValue = existingValue as? RealmSwift.List<Bool> {
-                if !newValue.elementsEqual(existingValue) {
-                    return true
-                }
-            } else if let newValue = newValue as? [Float], let existingValue = existingValue as? RealmSwift.List<Float> {
-                if !newValue.elementsEqual(existingValue) {
-                    return true
-                }
-            } else if let newValue = newValue as? [Double], let existingValue = existingValue as? RealmSwift.List<Double> {
-                if !newValue.elementsEqual(existingValue) {
-                    return true
-                }
-            } else if let newValue = newValue as? [Data], let existingValue = existingValue as? RealmSwift.List<Data> {
-                if !newValue.elementsEqual(existingValue) {
-                    return true
-                }
-            } else if let newValue = newValue as? [Date], let existingValue = existingValue as? RealmSwift.List<Date> {
-                if !newValue.elementsEqual(existingValue) {
-                    return true
-                }
-            } else {
-                if let newValue = newValue, let existingValue = existingValue {
-                    if !(newValue as AnyObject).isEqual(existingValue) {
-                        return true
+                    var result: [String: Any] = [:]
+                    for (index, key) in keyArray.enumerated() {
+                        switch property.type {
+                        case .int:
+                            if let val = valueArray[index] as? Int { result[key] = val }
+                        case .string:
+                            if let val = valueArray[index] as? String { result[key] = val }
+                        case .bool:
+                            if let val = valueArray[index] as? Bool { result[key] = val }
+                        case .float:
+                            if let val = valueArray[index] as? Float { result[key] = val }
+                        case .double:
+                            if let val = valueArray[index] as? Double { result[key] = val }
+                        case .date:
+                            if let val = valueArray[index] as? Date { result[key] = val }
+                        case .UUID:
+                            if let val = valueArray[index] as? String, let uuid = UUID(uuidString: val) {
+                                result[key] = uuid
+                            }
+                        default:
+                            break
+                        }
                     }
-                } else if newValue == nil && existingValue == nil {
-                    continue
+                    switch property.type {
+                    case .int:
+                        guard let newValue = result as? [String: Int], let existingValue = existingValue as? RealmSwift.Map<String, Int> else { return true }
+                        return newValue != existingValue.reduce(into: [String: Int]()) { $0[$1.key] = $1.value }
+                    case .string:
+                        guard let newValue = result as? [String: String], let existingValue = existingValue as? RealmSwift.Map<String, String> else { return true }
+                        return newValue != existingValue.reduce(into: [String: String]()) { $0[$1.key] = $1.value }
+                    case .bool:
+                        guard let newValue = result as? [String: Bool], let existingValue = existingValue as? RealmSwift.Map<String, Bool> else { return true }
+                        return newValue != existingValue.reduce(into: [String: Bool]()) { $0[$1.key] = $1.value }
+                    case .float:
+                        guard let newValue = result as? [String: Float], let existingValue = existingValue as? RealmSwift.Map<String, Float> else { return true }
+                        return newValue != existingValue.reduce(into: [String: Float]()) { $0[$1.key] = $1.value }
+                    case .double:
+                        guard let newValue = result as? [String: Double], let existingValue = existingValue as? RealmSwift.Map<String, Double> else { return true }
+                        return newValue != existingValue.reduce(into: [String: Double]()) { $0[$1.key] = $1.value }
+                    case .date:
+                        guard let newValue = result as? [String: Date], let existingValue = existingValue as? RealmSwift.Map<String, Date> else { return true }
+                        return newValue != existingValue.reduce(into: [String: Date]()) { $0[$1.key] = $1.value }
+                    case .UUID:
+                        guard let newValue = result as? [String: UUID], let existingValue = existingValue as? RealmSwift.Map<String, UUID> else { return true }
+                        return newValue != existingValue.reduce(into: [String: UUID]()) { $0[$1.key] = $1.value }
+                    default:
+                        break
+                    }
                 } else {
-                    return true
+                    switch property.type {
+                    case .int:
+                        guard let newValue = newValue as? Int, let existingValue = existingValue as? Int else { return true }
+                        return newValue != existingValue
+                    case .string:
+                        guard let newValue = newValue as? String, let existingValue = existingValue as? String else { return true }
+                        return newValue != existingValue
+                    case .bool:
+                        guard let newValue = newValue as? Bool, let existingValue = existingValue as? Bool else { return true }
+                        return newValue != existingValue
+                    case .float:
+                        guard let newValue = newValue as? Float, let existingValue = existingValue as? Float else { return true }
+                        return newValue != existingValue
+                    case .double:
+                        guard let newValue = newValue as? Double, let existingValue = existingValue as? Double else { return true }
+                        return newValue != existingValue
+                    case .data:
+                        guard let newValue = newValue as? Data, let existingValue = existingValue as? Data else { return true }
+                        return newValue != existingValue
+                    case .date:
+                        guard let newValue = newValue as? Date, let existingValue = existingValue as? Date else { return true }
+                        return newValue != existingValue
+                    case .UUID:
+                        guard let newValue = newValue as? String, let newUUID = UUID(uuidString: newValue), let existingValue = existingValue as? UUID else { return true }
+                        return newUUID != existingValue
+                    default:
+                        break
+                    }
                 }
+                
+                logger.warning("QSCloudKitSynchronizer >> Found unexpected property value: \(newValue)")
+                return true
+            }()
+            if propertyChanged {
+                return true
             }
         }
-        
         return false
     }
     
     @RealmBackgroundActor
-    func applyChanges(in record: CKRecord, to object: Object, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String) {
+    func applyChanges(
+        in record: CKRecord,
+        to object: Object,
+        syncedEntityID: String,
+        syncedEntityState: SyncedEntityState,
+        entityType: String
+    ) {
         let objectProperties = object.objectSchema.properties
         
         let skippedKeys: Set<String>
@@ -1286,6 +1388,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 let list = List<Date>()
                 list.append(objectsIn: value)
                 recordValue = list
+            case .UUID:
+                guard let value = record.value(forKey: property.name) as? [String] else { break }
+                let list = List<UUID>()
+                list.append(objectsIn: value.compactMap { UUID(uuidString: $0) })
+                recordValue = list
             case .object:
                 // Save relationship to be applied after all records have been downloaded and persisted
                 // to ensure target of the relationship has already been created
@@ -1307,25 +1414,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 break
             }
             object.setValue(recordValue, forKey: property.name)
-        } else if let reference = value as? CKRecord.Reference {
-            // Save relationship to be applied after all records have been downloaded and persisted
-            // to ensure target of the relationship has already been created
-            let recordName = reference.recordID.recordName
-            let separatorRange = recordName.range(of: ".")!
-            let objectIdentifier = String(recordName[separatorRange.upperBound...])
-            savePendingRelationshipAsync(name: key, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
-        } else if property.type == .object {
-            // Save relationship to be applied after all records have been downloaded and persisted
-            // to ensure target of the relationship has already been created
-            guard let recordName = record.value(forKey: property.name) as? String else { return }
-            let separatorRange = recordName.range(of: ".")!
-            let objectIdentifier = String(recordName[separatorRange.upperBound...])
-            savePendingRelationshipAsync(name: key, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
-        } else if property.type == .UUID {
-            if let uuidString = record.value(forKey: key) as? String,
-               let uuid = UUID(uuidString: uuidString) {
-                object.setValue(uuid, forKey: key)
-            }
         } else if property.isMap {
             guard let value = value as? [NSArray], value.count == 2,
                   let keyArray = value[0] as? [String], let valueArray = value[1] as? [Any],
@@ -1347,6 +1435,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     if let val = valueArray[index] as? Double { result[key] = val }
                 case .date:
                     if let val = valueArray[index] as? Date { result[key] = val }
+                case .data:
+                    if let val = valueArray[index] as? Data { result[key] = val }
                 case .UUID:
                     if let val = valueArray[index] as? String, let uuid = UUID(uuidString: val) {
                         result[key] = uuid
@@ -1356,6 +1446,25 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
             }
             object.setValue(result, forKey: key)
+        } else if let reference = value as? CKRecord.Reference {
+            // Save relationship to be applied after all records have been downloaded and persisted
+            // to ensure target of the relationship has already been created
+            let recordName = reference.recordID.recordName
+            let separatorRange = recordName.range(of: ".")!
+            let objectIdentifier = String(recordName[separatorRange.upperBound...])
+            savePendingRelationshipAsync(name: key, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+        } else if property.type == .object {
+            // Save relationship to be applied after all records have been downloaded and persisted
+            // to ensure target of the relationship has already been created
+            guard let recordName = record.value(forKey: property.name) as? String else { return }
+            let separatorRange = recordName.range(of: ".")!
+            let objectIdentifier = String(recordName[separatorRange.upperBound...])
+            savePendingRelationshipAsync(name: key, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+        } else if property.type == .UUID {
+            if let uuidString = record.value(forKey: key) as? String,
+               let uuid = UUID(uuidString: uuidString) {
+                object.setValue(uuid, forKey: key)
+            }
         } else if let asset = value as? CKAsset {
             if let fileURL = asset.fileURL,
                let data = NSData(contentsOf: fileURL) {
@@ -1990,7 +2099,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var recordsToSave: [(record: CKRecord, objectClass: RealmSwift.Object.Type, objectIdentifier: Any, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
         var syncedEntitiesToCreate: [SyncedEntity] = []
         
-        for chunk in records.chunked(into: 500) {
+        for chunk in records.chunked(into: 100) {
             for record in chunk {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
@@ -2037,7 +2146,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            try? await Task.sleep(nanoseconds: 10_000_000)
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
         }

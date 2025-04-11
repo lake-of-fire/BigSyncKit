@@ -15,7 +15,7 @@ class CloudKitSynchronizerOperation: Operation {
     @objc var errorHandler: ((CloudKitSynchronizerOperation, Error) -> ())?
     
     internal var logger: Logging.Logger?
-    
+
     var state = State.ready {
         willSet {
             willChangeValue(forKey: state.keyPath)
