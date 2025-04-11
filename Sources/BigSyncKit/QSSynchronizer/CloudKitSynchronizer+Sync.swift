@@ -93,7 +93,9 @@ extension CloudKitSynchronizer {
                 logger.info("QSCloudKitSynchronizer >> Database change token expired, resetting and re-fetching changes...")
                 // See: https://github.com/mentrena/SyncKit/issues/92#issuecomment-541362433
                 self.resetDatabaseToken()
-                await fetchChanges()
+                for adapter in modelAdapters {
+                    await adapter.saveToken(nil)
+                }
             case .notAuthenticated:
                 logger.error("QSCloudKitSynchronizer >> Not Authenticated. Aborting sync")
                 // Don't retry...
@@ -282,11 +284,10 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func shouldDeferFetches() async throws -> Bool {
         guard syncMode == .sync else { return false }
-        if let lastEmpty = lastFetchEmptyAt,
+        if let lastEmpty = lastDatabaseChangesEmptyAt,
            Date().timeIntervalSince(lastEmpty) < 45 * 60 {
             for adapter in modelAdapters {
-                let records = try await adapter.recordsToUpload(limit: 1)
-                if !records.isEmpty {
+                if adapter.hasChanges {
                     logger.info("QSCloudKitSynchronizer >> Skipping CloudKit token update: last fetch was empty and recent and uploads are pending")
                     return true
                 }
@@ -355,13 +356,13 @@ extension CloudKitSynchronizer {
                 
                 //                debugPrint("# zoneIDsToFetch", zoneIDsToFetch)
                 guard zoneIDsToFetch.count > 0 else {
-                    self.lastFetchEmptyAt = Date()
+                    self.lastDatabaseChangesEmptyAt = Date()
                     await self.resetActiveTokens()
                     try await completion(token, nil)
                     return
                 }
                 
-                lastFetchEmptyAt = nil
+                lastDatabaseChangesEmptyAt = nil
                 
                 guard !cancelSync else {
                     await failSynchronization(error: SyncError.cancelled)
@@ -625,7 +626,6 @@ extension CloudKitSynchronizer {
         let records = try await adapter.recordsToUpload(limit: requestedBatchSize)
         let recordCount = records.count
 //        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
-        logger.info("QSCloudKitSynchronizer >> Setup synchronization...")
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
@@ -657,6 +657,7 @@ extension CloudKitSynchronizer {
                 if !(savedRecords?.isEmpty ?? true) {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                     logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
+                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
                 }
                 try await adapter.didUpload(savedRecords: savedRecords ?? [])
                 
@@ -825,6 +826,8 @@ extension CloudKitSynchronizer {
             await completion(true)
             return
         }
+        
+        logger.info("QSCloudKitSynchronizer >> Update server token....")
         
         let operation = FetchZoneChangesOperation(
             database: database,

@@ -200,7 +200,7 @@ actor RealmProvider {
             
             var targetWriterRealmObjects = [Realm]()
             for targetConfiguration in targetConfigurations {
-                let realmBackgroundActorRealm = try await RealmBackgroundActor.shared.cachedRealm(for: targetConfiguration) 
+                let realmBackgroundActorRealm = try await RealmBackgroundActor.shared.cachedRealm(for: targetConfiguration)
                 targetWriterRealmObjects.append(realmBackgroundActorRealm)
             }
             self.targetWriterRealmObjects = targetWriterRealmObjects
@@ -346,7 +346,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 5
+        configuration.schemaVersion = 6
         configuration.shouldCompactOnLaunch = { totalBytes, usedBytes in
             // totalBytes refers to the size of the file on disk in bytes (data + free space)
             // usedBytes refers to the number of bytes used by data in the file
@@ -376,13 +376,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     @BigSyncBackgroundActor
     public func cancelSynchronization() {
-//        debugPrint("# cancel")
+        //        debugPrint("# cancel")
         cancelSync = true
     }
     
     @BigSyncBackgroundActor
     public func unsetCancellation() {
-//        debugPrint("# unset cancel")
+        //        debugPrint("# unset cancel")
         cancelSync = false
     }
     
@@ -466,9 +466,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
         
-//        if !needsInitialSetup {
+        //        if !needsInitialSetup {
         try await createMissingSyncedEntities()
-//        }
+        //        }
         
         // Removed startPollingForChanges() call
         
@@ -573,6 +573,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 )
             }
         }
+        
+        if let persistenceRealm = realmProvider?.persistenceRealm {
+            updateHasChanges(realm: persistenceRealm)
+        }
     }
     
     @BigSyncBackgroundActor
@@ -632,7 +636,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             let latestCreatedExplicitlyModifiedAt = filteredCreated.compactMap { ($0 as? ChangeMetadataRecordable)?.explicitlyModifiedAt } .max()
             let updatedInsertions: (Set<String>, Date?) = (
                 insertions.0.union(filteredCreated.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
-                    }),
+                }),
                 latestCreatedExplicitlyModifiedAt
             )
             resultsChangeSet.insertions[schemaName] = updatedInsertions
@@ -715,13 +719,26 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
         
+        try? await Task.sleep(nanoseconds: 10_000_000)
+        await persistenceRealm.asyncRefresh()
+        
+        var lastTrackedChangesAtUpdates: [(String, Date)] = []
         for changeSet in [currentChangeSet.insertions, currentChangeSet.modifications] {
             for (schema, latestExplicitlyModifiedAt) in changeSet.map({ ($0.key, $0.value.1) }) {
+                guard !cancelSync else { throw CancellationError() }
                 guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { continue }
-                if let latestExplicitlyModifiedAt {
-                    try? await persistenceRealm.asyncWrite {
-                        syncedEntityType.lastTrackedChangesAt = latestExplicitlyModifiedAt
-                    }
+                guard !cancelSync else { throw CancellationError() }
+                
+                if let latestExplicitlyModifiedAt, syncedEntityType.lastTrackedChangesAt != latestExplicitlyModifiedAt {
+                    lastTrackedChangesAtUpdates.append((syncedEntityType.entityType, latestExplicitlyModifiedAt))
+                }
+            }
+        }
+        guard !cancelSync else { throw CancellationError() }
+        if !lastTrackedChangesAtUpdates.isEmpty {
+            try? await persistenceRealm.asyncWrite {
+                for (syncedEntityType, latestExplicitlyModifiedAt) in lastTrackedChangesAtUpdates {
+                    persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: syncedEntityType)?.lastTrackedChangesAt = latestExplicitlyModifiedAt
                 }
             }
         }
@@ -858,7 +875,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @BigSyncBackgroundActor
     @discardableResult
     func createSyncedEntities(entityType: String, identifiers: [String]) async throws {
-//                debugPrint("Create synced entities", entityType, identifiers.count)
+        //                debugPrint("Create synced entities", entityType, identifiers.count)
         logger.info("QSCloudKitSynchronizer >> Creating \(identifiers.count) SyncedEntity records for \(entityType)…")
         for chunk in identifiers.chunked(into: 500) {
             guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
@@ -2153,7 +2170,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         // TODO: Chunk based on target writer Realm
         if !recordsToSave.isEmpty {
-            for chunk in recordsToSave.chunked(into: 4) {
+            for chunk in recordsToSave.chunked(into: 100) {
                 guard !cancelSync else { throw CancellationError() }
                 
                 //                await realmProvider.persistenceRealm?.asyncRefresh()
@@ -2176,17 +2193,25 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-
+                
                 try await { @RealmBackgroundActor in
                     guard let targetWriterRealms = realmProvider.targetWriterRealms else { return }
+                    
+                    // Group the chunk by the configuration from the associated target writer realm
+                    let groupedChunk = Dictionary(grouping: chunk) { (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) -> AnyHashable? in
+                        return realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration as? AnyHashable
+                    }
+                    
                     for targetWriterRealm in targetWriterRealms {
-                        //                    debugPrint("!! save changes to record types", Set(chunk.map { $0.record.recordID.recordName.split(separator: ".").first! }), "total count", chunk.count, chunk.map { $0.record.recordID.recordName.split(separator: ".").last! })
                         await targetWriterRealm.asyncRefresh()
                         guard await !cancelSync else { throw CancellationError() }
                         
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
-                            for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk where realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration {
+                            // Get the group for the current target writer realm's configuration
+                            let group = groupedChunk[targetWriterRealm.configuration as? AnyHashable] ?? []
+   
+                            for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in group {
                                 try Task.checkCancellation()
                                 
                                 var object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier)
@@ -2221,6 +2246,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
             
             logger.info("QSCloudKitSynchronizer >> Persisted \(recordsToSave.count) downloaded records")
+            let savedRecordNames = Set(recordsToSave.map { $0.record.recordID.recordName })
+            let skipped = records.map { $0.recordID.recordName } .filter { !savedRecordNames.contains($0) } .joined(separator: " ")
+            if !skipped.isEmpty {
+                logger.info("QSCloudKitSynchronizer >> Skipped downloaded records for having no changes: \(skipped)")
+            }
+            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(savedRecordNames.joined(separator: " "))")
         }
     }
     
@@ -2237,7 +2268,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             guard let persistenceRealm = realmProvider.persistenceRealm else { return }
             if let syncedEntity = Self.getSyncedEntity(objectIdentifier: recordID.recordName, realm: persistenceRealm) {
                 try Task.checkCancellation()
-
+                
                 if syncedEntity.entityType != "CKShare" {
                     guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
                         //                                    continue

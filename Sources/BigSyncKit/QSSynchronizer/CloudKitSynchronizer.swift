@@ -120,7 +120,7 @@ internal class ChangeRequestProcessor {
             changeRequests.removeFirst(batch.count)
             
             do {
-                logger?.info("QSCloudKitSynchronizer >> Processing remote records for local merge: \(batch.compactMap { $0.downloadedRecord?.recordID.recordName } .joined(separator: " "))")
+                logger?.info("QSCloudKitSynchronizer >> Processing \(batch.count) remote records for local merge: \(batch.compactMap { $0.downloadedRecord?.recordID.recordName } .joined(separator: " ")) (\(changeRequests.count) more remaining)")
                 
                 let downloadedRecords = batch.compactMap { $0.downloadedRecord }
                 try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
@@ -251,8 +251,9 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     internal var modifyRecordsTask: Task<Void, Error>?
     
-    internal var lastFetchEmptyAt: Date?
-    
+    internal var lastDatabaseChangesEmptyAt: Date?
+    internal var lastZoneChangesEmptyAt: Date?
+ 
     internal let logger: Logging.Logger
     
     /// Default number of records to send in an upload operation.
@@ -321,7 +322,7 @@ public class CloudKitSynchronizer: NSObject {
         clearDeviceIdentifier()
         resetDatabaseToken()
         resetActiveTokens()
-        lastFetchEmptyAt = nil
+        lastDatabaseChangesEmptyAt = nil
         
         //        try? await Task.sleep(nanoseconds: 300_000_000) // Allow cancellations to catch up...
         if includingAdapters {
