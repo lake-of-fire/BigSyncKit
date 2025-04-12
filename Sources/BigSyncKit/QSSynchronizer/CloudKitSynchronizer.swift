@@ -214,6 +214,10 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     public internal(set) var syncing: Bool = false
     
+    /// Indicates whether it failed to synchronize due to the user being unauthenticated. May not auto-recover.
+    @BigSyncBackgroundActor
+    public internal(set) var cancelledDueToUnauthentication = false
+
     ///  Number of records that are sent in an upload operation.
     public var batchSize: Int = CloudKitSynchronizer.defaultInitialBatchSize
     
@@ -345,6 +349,8 @@ public class CloudKitSynchronizer: NSObject {
     /// - Parameter onFailure: Block that receives an error if the synchronization stopped due to a failure. Could be a `SyncError`, `CKError`, or any other error found during synchronization.
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
+        guard !cancelledDueToUnauthentication else { return }
+        
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard !syncing else {
                 return

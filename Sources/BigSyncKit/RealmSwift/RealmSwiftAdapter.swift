@@ -2171,6 +2171,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         // TODO: Chunk based on target writer Realm
         if !recordsToSave.isEmpty {
             for chunk in recordsToSave.chunked(into: 100) {
+                try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 
                 //                await realmProvider.persistenceRealm?.asyncRefresh()
@@ -2197,21 +2198,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try await { @RealmBackgroundActor in
                     guard let targetWriterRealms = realmProvider.targetWriterRealms else { return }
                     
-                    // Group the chunk by the configuration from the associated target writer realm
-                    let groupedChunk = Dictionary(grouping: chunk) { (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) -> AnyHashable? in
-                        return realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration as? AnyHashable
-                    }
-                    
                     for targetWriterRealm in targetWriterRealms {
                         await targetWriterRealm.asyncRefresh()
                         guard await !cancelSync else { throw CancellationError() }
                         
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
-                            // Get the group for the current target writer realm's configuration
-                            let group = groupedChunk[targetWriterRealm.configuration as? AnyHashable] ?? []
-   
-                            for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in group {
+                            for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk where realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration {
                                 try Task.checkCancellation()
                                 
                                 var object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier)
@@ -2241,8 +2234,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try? await persistPendingRelationships()
                 
                 try Task.checkCancellation()
+                guard !cancelSync else { throw CancellationError() }
                 try? await Task.sleep(nanoseconds: 100_000)
-                try Task.checkCancellation()
             }
             
             logger.info("QSCloudKitSynchronizer >> Persisted \(recordsToSave.count) downloaded records")

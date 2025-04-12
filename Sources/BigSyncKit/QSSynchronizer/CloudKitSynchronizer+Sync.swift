@@ -101,6 +101,7 @@ extension CloudKitSynchronizer {
                 // Don't retry...
                 syncing = false
                 cancelSync = false
+                cancelledDueToUnauthentication = true
                 return
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
