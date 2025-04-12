@@ -428,7 +428,7 @@ extension CloudKitSynchronizer {
                     deletedRecordID: deletedRecordID,
                     adapter: adapter
                 )
-                logger.info("QSCloudKitSynchronizer >> Enqueueing remote record for local merge: \(downloadedRecord?.recordID.recordName)")
+//                logger.info("QSCloudKitSynchronizer >> Enqueueing remote record for local merge: \(downloadedRecord?.recordID.recordName)")
                 await changeRequestProcessor.addFetchedChangeRequest(changeRequest)
             }
         } completion: { [weak self] zoneResults in
