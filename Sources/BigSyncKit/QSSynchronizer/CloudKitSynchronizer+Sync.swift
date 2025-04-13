@@ -22,6 +22,19 @@ fileprivate func isZoneNotFoundOrDeletedError(_ error: Error?) -> Bool {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func performSynchronization() async {
+        if let sleepUntil = self.retrySleepUntil {
+            let remainingTime = sleepUntil.timeIntervalSinceNow
+            if remainingTime > 0 {
+                logger.info("QSCloudKitSynchronizer >> Sleeping until retry date: \(sleepUntil) (for \(remainingTime) seconds)")
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(remainingTime * 1_000_000_000) + 1_000_000_000)
+                    retrySleepUntil = nil
+                } catch {
+                    logger.error("QSCloudKitSynchronizer >> Error during sleep: \(error.localizedDescription).")
+                }
+            }
+        }
+        
         logger.info("QSCloudKitSynchronizer >> Perform synchronization...")
         self.postNotification(.SynchronizerWillSynchronize)
         self.serverChangeToken = self.storedDatabaseToken
@@ -107,10 +120,16 @@ extension CloudKitSynchronizer {
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
                 logger.warning("QSCloudKitSynchronizer >> Warning: \(error.localizedDescription) ( \(error)). Retrying in \(retryAfter.rounded()) seconds.")
                 reduceBatchSize()
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000) + 1_000_000_000)
-                } catch {
-                    logger.error("QSCloudKitSynchronizer >> Error: \(error.localizedDescription).")
+                let sleepUntil = Date().addingTimeInterval(retryAfter)
+                retrySleepUntil = sleepUntil
+                let delay = sleepUntil.timeIntervalSinceNow
+                if delay > 0 {
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 1_000_000_000)
+                        retrySleepUntil = nil
+                    } catch {
+                        logger.error("QSCloudKitSynchronizer >> Error during sleep: \(error.localizedDescription).")
+                    }
                 }
                 logger.info("QSCloudKitSynchronizer >> Waited \(retryAfter) seconds.")
             default:

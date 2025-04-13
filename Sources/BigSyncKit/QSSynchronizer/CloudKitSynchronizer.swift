@@ -245,6 +245,8 @@ public class CloudKitSynchronizer: NSObject {
     internal var activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
     @BigSyncBackgroundActor
     internal var cancelSync = false
+    @BigSyncBackgroundActor
+    internal var retrySleepUntil: Date?
     
     @BigSyncBackgroundActor
     internal var currentOperations = [Operation]()
