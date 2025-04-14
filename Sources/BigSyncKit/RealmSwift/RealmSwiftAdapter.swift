@@ -517,7 +517,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         // Subscribe to the subject with a 6-second debounce
         realmChangesSubject
-            .delay(for: .seconds(6), scheduler: bigSyncKitQueue)
+            .delay(for: .seconds(4), scheduler: bigSyncKitQueue)
             .debounce(for: .seconds(10), scheduler: bigSyncKitQueue)
             .sink { [weak self] changedRealm in
                 guard let self = self else { return }
