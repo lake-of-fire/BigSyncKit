@@ -27,7 +27,7 @@ extension CloudKitSynchronizer {
             if remainingTime > 0 {
                 logger.info("QSCloudKitSynchronizer >> Sleeping until retry date: \(sleepUntil) (for \(remainingTime) seconds)")
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(remainingTime * 1_000_000_000) + 500_000_000)
+                    try await Task.sleep(nanoseconds: UInt64(remainingTime * 1_000_000_000) + 100_000_000)
                     retrySleepUntil = nil
                 } catch {
                     logger.error("QSCloudKitSynchronizer >> Error during sleep: \(error.localizedDescription).")
@@ -119,13 +119,13 @@ extension CloudKitSynchronizer {
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
                 logger.warning("QSCloudKitSynchronizer >> Warning: \(error.localizedDescription) ( \(error)). Retrying in \(retryAfter.rounded()) seconds.")
-//                reduceBatchSize()
+                reduceBatchSize()
                 let sleepUntil = Date().addingTimeInterval(retryAfter)
                 retrySleepUntil = sleepUntil
                 let delay = sleepUntil.timeIntervalSinceNow
                 if delay > 0 {
                     do {
-                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 500_000_000)
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 100_000_000)
                         retrySleepUntil = nil
                     } catch {
                         logger.error("QSCloudKitSynchronizer >> Error during sleep: \(error.localizedDescription).")
@@ -893,12 +893,13 @@ extension CloudKitSynchronizer {
     }
     
     func reduceBatchSize() {
-        self.batchSize = Int((Double(self.batchSize) / 1.5).rounded())
+        self.batchSize = Int((Double(self.batchSize) / 2.5).rounded())
     }
     
     func increaseBatchSize() {
         if self.batchSize < CloudKitSynchronizer.maxBatchSize {
-            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 5))
+//            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 5))
+            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, max(batchSize + 1, Int((Double(self.batchSize) * 1.15).rounded())))
         }
     }
 }
