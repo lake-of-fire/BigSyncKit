@@ -1252,11 +1252,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 acceptRemoteChange = delegate.realmSwiftAdapter(self, gotChanges: recordChanges, object: object)
             } else {
                 acceptRemoteChange = { adapter, changes, object in
-#if os(macOS)
-                    guard adapter.hasRealmObjectClass(name: object.className) else { return false }
-#else
-                    guard adapter.hasRealmObjectClass(name: String(describing: type(of: object))) else { return false }
-#endif
+                    guard adapter.hasRealmObjectClass(name: object.objectSchema.className) else {
+                        logger.warning("QSCloudKitSynchronizer >> No object class found for '\(object.objectSchema.className)' in adapter")
+                        return false
+                    }
                     let remoteExplicitlyModifiedAt = changes["explicitlyModifiedAt"] as? Date ?? .distantPast
                     let localExplicitlyModifiedAt = object.value(forKey: "explicitlyModifiedAt") as? Date ?? .distantPast
                     let result: Bool
@@ -2245,7 +2244,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if !skipped.isEmpty {
                 logger.info("QSCloudKitSynchronizer >> Skipped downloaded records for having no changes: \(skipped)")
             }
-            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(savedRecordNames.joined(separator: " "))")
+//            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(savedRecordNames.joined(separator: " "))")
         }
     }
     

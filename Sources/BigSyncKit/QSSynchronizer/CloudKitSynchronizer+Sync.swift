@@ -649,7 +649,7 @@ extension CloudKitSynchronizer {
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
-        logger.info("QSCloudKitSynchronizer >> Uploading records: \(records.map { $0.recordID.recordName } .joined(separator: " "))")
+//        logger.info("QSCloudKitSynchronizer >> Uploading records: \(records.map { $0.recordID.recordName } .joined(separator: " "))")
 
         guard !cancelSync else { throw CancellationError() }
         
@@ -677,7 +677,7 @@ extension CloudKitSynchronizer {
                 if !(savedRecords?.isEmpty ?? true) {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                     logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
-                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
+//                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
                 }
                 try await adapter.didUpload(savedRecords: savedRecords ?? [])
                 
