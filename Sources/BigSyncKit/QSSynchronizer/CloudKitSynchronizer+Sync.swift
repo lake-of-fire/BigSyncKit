@@ -27,7 +27,7 @@ extension CloudKitSynchronizer {
             if remainingTime > 0 {
                 logger.info("QSCloudKitSynchronizer >> Sleeping until retry date: \(sleepUntil) (for \(remainingTime) seconds)")
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(remainingTime * 1_000_000_000) + 1_000_000_000)
+                    try await Task.sleep(nanoseconds: UInt64(remainingTime * 1_000_000_000) + 500_000_000)
                     retrySleepUntil = nil
                 } catch {
                     logger.error("QSCloudKitSynchronizer >> Error during sleep: \(error.localizedDescription).")
@@ -119,13 +119,13 @@ extension CloudKitSynchronizer {
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
                 let retryAfter = (error.userInfo[CKErrorRetryAfterKey] as? Double) ?? 10.0
                 logger.warning("QSCloudKitSynchronizer >> Warning: \(error.localizedDescription) ( \(error)). Retrying in \(retryAfter.rounded()) seconds.")
-                reduceBatchSize()
+//                reduceBatchSize()
                 let sleepUntil = Date().addingTimeInterval(retryAfter)
                 retrySleepUntil = sleepUntil
                 let delay = sleepUntil.timeIntervalSinceNow
                 if delay > 0 {
                     do {
-                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 1_000_000_000)
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 500_000_000)
                         retrySleepUntil = nil
                     } catch {
                         logger.error("QSCloudKitSynchronizer >> Error during sleep: \(error.localizedDescription).")

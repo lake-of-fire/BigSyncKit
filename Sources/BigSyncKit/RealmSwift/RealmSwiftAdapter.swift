@@ -416,7 +416,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
                 guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
                 let exists = targetReaderRealm.objects(objectClass).first != nil
-                if exists {
+                if !exists {
                     try await { @RealmBackgroundActor in
                         do {
                             guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[schema.className] else { return }
