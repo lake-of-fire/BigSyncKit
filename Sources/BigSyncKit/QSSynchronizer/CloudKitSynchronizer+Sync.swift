@@ -27,7 +27,7 @@ extension CloudKitSynchronizer {
             if remainingTime > 0 {
                 logger.info("QSCloudKitSynchronizer >> Sleeping until retry date: \(sleepUntil) (for \(remainingTime) seconds)")
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(remainingTime * 1_000_000_000) + 100_000_000)
+                    try await Task.sleep(nanoseconds: UInt64(remainingTime * 1_000_000_000))
                     retrySleepUntil = nil
                 } catch {
                     logger.error("QSCloudKitSynchronizer >> Error during sleep: \(error.localizedDescription).")
@@ -125,7 +125,7 @@ extension CloudKitSynchronizer {
                 let delay = sleepUntil.timeIntervalSinceNow
                 if delay > 0 {
                     do {
-                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 100_000_000)
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                         retrySleepUntil = nil
                     } catch {
                         logger.error("QSCloudKitSynchronizer >> Error during sleep: \(error.localizedDescription).")
@@ -754,7 +754,6 @@ extension CloudKitSynchronizer {
                 }
                 
                 guard !cancelSync else { throw CancellationError() }
-                try? await Task.sleep(nanoseconds: 600_000_000) // Try to avoid rate limits...
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
 
