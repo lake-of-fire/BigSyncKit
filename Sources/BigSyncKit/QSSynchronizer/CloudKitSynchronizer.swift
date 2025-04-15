@@ -256,7 +256,13 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationTask: Task<Void, Never>?
     @BigSyncBackgroundActor
     internal var modifyRecordsTask: Task<Void, Error>?
-    
+    @BigSyncBackgroundActor
+    internal var fetchDatabaseChangesTask: Task<Void, Error>?
+    @BigSyncBackgroundActor
+    internal var fetchZoneChangesTask: Task<Void, Error>?
+    @BigSyncBackgroundActor
+    internal var mergeChangesTask: Task<Void, Error>?
+
     internal var lastDatabaseChangesEmptyAt: Date?
     internal var lastZoneChangesEmptyAt: Date?
  
@@ -381,7 +387,10 @@ public class CloudKitSynchronizer: NSObject {
         ChangeRequestProcessor.shared.processTask?.cancel()
         synchronizationTask?.cancel()
         modifyRecordsTask?.cancel()
-        
+        fetchDatabaseChangesTask?.cancel()
+        fetchZoneChangesTask?.cancel()
+        mergeChangesTask?.cancel()
+
         guard !cancelSync else { return }
         logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
         

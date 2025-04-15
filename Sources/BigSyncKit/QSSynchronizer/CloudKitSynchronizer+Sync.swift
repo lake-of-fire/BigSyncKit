@@ -361,10 +361,13 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async throws -> ()) async {
         //        debugPrint("# fetchDatabaseChanges() (calls FetchDatabaseChangesOperation)") //, containerIdentifier, serverChangeToken)
-        let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (token, changedZoneIDs, deletedZoneIDs) in
-            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self = self else { return }
+        let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { [weak self] (token, changedZoneIDs, deletedZoneIDs) in
+            guard let self else { return }
+            fetchDatabaseChangesTask?.cancel()
+            fetchDatabaseChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
                 
+                try Task.checkCancellation()
                 guard !cancelSync else {
                     await failSynchronization(error: SyncError.cancelled)
                     return
@@ -384,13 +387,14 @@ extension CloudKitSynchronizer {
                 
                 lastDatabaseChangesEmptyAt = nil
                 
+                try Task.checkCancellation()
                 guard !cancelSync else {
                     await failSynchronization(error: SyncError.cancelled)
                     return
                 }
                 
                 try await { @BigSyncBackgroundActor [weak self] in
-                    guard let self = self else { return }
+                    guard let self else { return }
                     guard !cancelSync else {
                         await failSynchronization(error: SyncError.cancelled)
                         return
@@ -401,19 +405,30 @@ extension CloudKitSynchronizer {
                     }
                     
                     fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
-                        //                        debugPrint("# fetchZoneChanges callback")
-                        guard let self = self else { return }
-                        if let error {
-                            await failSynchronization(error: error)
-                            return
-                        }
-                        guard !cancelSync else {
-                            await failSynchronization(error: SyncError.cancelled)
-                            return
-                        }
-
-                        try await mergeChanges() { error in
-                            try await completion(token, error)
+                        guard let self else { return }
+                        fetchZoneChangesTask?.cancel()
+                        fetchZoneChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                            //                        debugPrint("# fetchZoneChanges callback")
+                            guard let self else { return }
+                            try Task.checkCancellation()
+                            if let error {
+                                await failSynchronization(error: error)
+                                return
+                            }
+                            try Task.checkCancellation()
+                            guard !cancelSync else {
+                                await failSynchronization(error: SyncError.cancelled)
+                                return
+                            }
+                            
+                            try await mergeChanges() { [weak self] error in
+                                guard let self else { return }
+                                mergeChangesTask?.cancel()
+                                mergeChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                                    try Task.checkCancellation()
+                                    try await completion(token, error)
+                                }
+                            }
                         }
                     }
                 }()

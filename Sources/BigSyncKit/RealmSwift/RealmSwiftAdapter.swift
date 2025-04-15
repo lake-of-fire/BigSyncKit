@@ -1627,27 +1627,30 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    func save(record: CKRecord, for syncedEntity: SyncedEntity) {
-        syncedEntity.encodedRecord = encodedRecord(record, onlySystemFields: true)
+    func save(record: CKRecord, for syncedEntity: SyncedEntity) throws {
+        try syncedEntity.encodedRecord = encodedRecord(record, onlySystemFields: true)
     }
     
     @BigSyncBackgroundActor
-    func encodedRecord(_ record: CKRecord, onlySystemFields: Bool) -> Data? {
+    func encodedRecord(_ record: CKRecord, onlySystemFields: Bool) throws -> Data? {
         let data = NSMutableData()
         let archiver = NSKeyedArchiver(forWritingWith: data)
+        try Task.checkCancellation()
         if onlySystemFields {
             record.encodeSystemFields(with: archiver)
         } else {
             record.encode(with: archiver)
         }
+        try Task.checkCancellation()
         archiver.finishEncoding()
-        
+        try Task.checkCancellation()
+
         guard let dictData = zstdDictData else {
             print("Error: Zstd dictionary not loaded")
             return nil
         }
         
-        guard let compressed = zstdCompress(data: data as Data, dictionary: dictData, level: 1) else {
+        guard let compressed = try zstdCompress(data: data as Data, dictionary: dictData, level: 1) else {
             print("Error: Zstd compression failed")
             return nil
         }
@@ -2134,15 +2137,20 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             continue
                         }
                         let objectIdentifier = getObjectIdentifier(for: syncedEntity)
-                        
-                        let recordToSave = (record, objectClass, objectIdentifier, syncedEntity.identifier, syncedEntity.entityState, syncedEntity.entityType)
-                        
                         try Task.checkCancellation()
+                        guard !cancelSync else { throw CancellationError() }
+
+                        let recordToSave = (record, objectClass, objectIdentifier, syncedEntity.identifier, syncedEntity.entityState, syncedEntity.entityType)
+                        guard !cancelSync else { throw CancellationError() }
+                        try Task.checkCancellation()
+                        
                         guard let object = realmProvider.targetReaderRealmPerSchemaName[objectClass.className()]?.object(ofType: objectClass, forPrimaryKey: objectIdentifier) else {
                             recordsToSave.append(recordToSave)
                             continue
                         }
-                        
+                        guard !cancelSync else { throw CancellationError() }
+                        try Task.checkCancellation()
+
                         if forceSave || hasChanges(record: record, object: object) {
                             recordsToSave.append(recordToSave)
                             //                        } else {
@@ -2176,18 +2184,19 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 //                await realmProvider.persistenceRealm?.asyncRefresh()
                 try await realmProvider.persistenceRealm?.asyncWrite { [weak self] in
-                    guard let self = self else { return }
+                    guard let self else { return }
                     
                     for (record, _, _, syncedEntityID, syncedEntityState, _) in chunk {
                         guard !cancelSync else { throw CancellationError() }
                         
                         if let remoteModified = record["modifiedAt"] as? Date {
-                            self.recentlyFetchedRecordModifiedAts[syncedEntityID] = remoteModified
+                            recentlyFetchedRecordModifiedAts[syncedEntityID] = remoteModified
                         }
                         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                         if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: syncedEntityID) {
                             guard !cancelSync else { throw CancellationError() }
-                            self.save(record: record, for: syncedEntity)
+                            try Task.checkCancellation()
+                            try save(record: record, for: syncedEntity)
                         }
                     }
                 }
@@ -2351,7 +2360,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     
                     if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
                         syncedEntity.state = SyncedEntityState.synced.rawValue
-                        save(record: record, for: syncedEntity)
+                        try Task.checkCancellation()
+                        try save(record: record, for: syncedEntity)
                     }
                 }
             }
@@ -2495,32 +2505,35 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
 }
 
-private func zstdCompress(data: Data, dictionary: Data, level: Int) -> Data? {
-    guard let cdict = dictionary.withUnsafeBytes({
-        ZSTD_createCDict($0.baseAddress, dictionary.count, Int32(level))
+private func zstdCompress(data: Data, dictionary: Data, level: Int) throws -> Data? {
+    guard let cdict = try dictionary.withUnsafeBytes({
+        try Task.checkCancellation()
+        return ZSTD_createCDict($0.baseAddress, dictionary.count, Int32(level))
     }) else { return nil }
+    defer { ZSTD_freeCDict(cdict) }
+    
     guard let cctx = ZSTD_createCCtx() else {
-        ZSTD_freeCDict(cdict)
         return nil
     }
+    defer { ZSTD_freeCCtx(cctx) }
     
     let bound = ZSTD_compressBound(data.count)
+    try Task.checkCancellation()
     let dstBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bound)
     defer { dstBuffer.deallocate() }
+    try Task.checkCancellation()
     
-    let compressedSize = data.withUnsafeBytes {
-        ZSTD_compress_usingCDict(cctx, dstBuffer, bound, $0.baseAddress, data.count, cdict)
+    let compressedSize = try data.withUnsafeBytes {
+        try Task.checkCancellation()
+        return ZSTD_compress_usingCDict(cctx, dstBuffer, bound, $0.baseAddress, data.count, cdict)
     }
     
     if ZSTD_isError(compressedSize) != 0 {
         print("Zstd compression error: \(String(cString: ZSTD_getErrorName(compressedSize)))")
-        ZSTD_freeCDict(cdict)
-        ZSTD_freeCCtx(cctx)
         return nil
     }
     
-    ZSTD_freeCDict(cdict)
-    ZSTD_freeCCtx(cctx)
+    try Task.checkCancellation()
     return Data(bytes: dstBuffer, count: compressedSize)
 }
 
