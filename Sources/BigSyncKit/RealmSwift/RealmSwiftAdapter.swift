@@ -279,15 +279,6 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     private var cancellables = Set<AnyCancellable>()
     
-    private let zstdDictData: Data? = {
-        guard let dictURL = Bundle.module.url(forResource: "ckrecordDictionary", withExtension: nil, subdirectory: "zstd"),
-              let data = try? Data(contentsOf: dictURL) else {
-            print("Error: Failed to load zstd dictionary during init")
-            return nil
-        }
-        return data
-    }()
-    
 #if DEBUG
     private var dummyRecordIdentifiers = Set<String>()
 #endif
@@ -1649,13 +1640,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         try Task.checkCancellation()
         archiver.finishEncoding()
         try Task.checkCancellation()
-
-        guard let dictData = zstdDictData else {
-            print("Error: Zstd dictionary not loaded")
-            return nil
-        }
         
-        guard let compressed = try zstdCompress(data: data as Data, dictionary: dictData, level: 1) else {
+        guard let compressed = try ZSTDCompressor.shared.compress(data: data as Data) else {
             print("Error: Zstd compression failed")
             return nil
         }
@@ -1665,8 +1651,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     func getRecord(for syncedEntity: SyncedEntity) -> CKRecord? {
         guard let recordData = syncedEntity.encodedRecord,
-              let dictData = zstdDictData,
-              let decompressed = zstdDecompress(data: recordData, dictionary: dictData),
+              let decompressed = ZSTDCompressor.shared.decompress(data: recordData),
               let unarchiver = try? NSKeyedUnarchiver(forReadingWith: decompressed) else {
             return nil
         }
@@ -2511,69 +2496,111 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
 }
 
-private func zstdCompress(data: Data, dictionary: Data, level: Int) throws -> Data? {
-    guard let cdict = try dictionary.withUnsafeBytes({
+final class ZSTDCompressor {
+    /// A single shared compressor instance for the entire app.
+    static let shared = ZSTDCompressor()
+        
+    private let cdict: OpaquePointer?
+    
+    /// By default, we load the same dictionary data once.
+    /// Adjust as desired for different compression levels or dictionary.
+    private init() {
+        // This example references the same global zstdDictData that your code was using before.
+        // If you store it differently, replace accordingly:
+        
+        guard let dictURL = Bundle.module.url(forResource: "ckrecordDictionary", withExtension: nil, subdirectory: "zstd"),
+              let data = try? Data(contentsOf: dictURL) else {
+            fatalError("Error: Failed to load zstd dictionary during init")
+        }
+        
+        let level: Int32 = 1
+        
+        let tempCDict = data.withUnsafeBytes {
+            ZSTD_createCDict($0.baseAddress, data.count, level)
+        }
+        
+        if tempCDict == nil {
+            fatalError("Failed to create ZSTD dictionaries.")
+        }
+        
+        self.cdict = tempCDict
+    }
+    
+    deinit {
+        if let cdict {
+            ZSTD_freeCDict(cdict)
+        }
+    }
+    
+    /// Compress the provided data using the cached dictionary.
+    func compress(data: Data) throws -> Data? {
+        guard let cdict else {
+            return nil
+        }
+        // Create a new compression context for each call.
+        guard let cctx = ZSTD_createCCtx() else {
+            return nil
+        }
+        defer { ZSTD_freeCCtx(cctx) }
+        
+        let bound = ZSTD_compressBound(data.count)
         try Task.checkCancellation()
-        return ZSTD_createCDict($0.baseAddress, dictionary.count, Int32(level))
-    }) else { return nil }
-    defer { ZSTD_freeCDict(cdict) }
-    
-    guard let cctx = ZSTD_createCCtx() else {
-        return nil
-    }
-    defer { ZSTD_freeCCtx(cctx) }
-    
-    let bound = ZSTD_compressBound(data.count)
-    try Task.checkCancellation()
-    let dstBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bound)
-    defer { dstBuffer.deallocate() }
-    try Task.checkCancellation()
-    
-    let compressedSize = try data.withUnsafeBytes {
+        let dstBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bound)
+        defer { dstBuffer.deallocate() }
         try Task.checkCancellation()
-        return ZSTD_compress_usingCDict(cctx, dstBuffer, bound, $0.baseAddress, data.count, cdict)
+        
+        let compressedSize = try data.withUnsafeBytes {
+            try Task.checkCancellation()
+            return ZSTD_compress_usingCDict(cctx,
+                                            dstBuffer,
+                                            bound,
+                                            $0.baseAddress,
+                                            data.count,
+                                            cdict)
+        }
+        
+        if ZSTD_isError(compressedSize) != 0 {
+            print("Zstd compression error: \(String(cString: ZSTD_getErrorName(compressedSize)))")
+            return nil
+        }
+        
+        try Task.checkCancellation()
+        return Data(bytes: dstBuffer, count: compressedSize)
     }
     
-    if ZSTD_isError(compressedSize) != 0 {
-        print("Zstd compression error: \(String(cString: ZSTD_getErrorName(compressedSize)))")
-        return nil
+    /// Decompress data using the cached dictionary.
+    func decompress(data: Data) -> Data? {
+        guard let cdict else {
+            return nil
+        }
+        // Create a new decompression context each time.
+        guard let dctx = ZSTD_createDCtx() else {
+            return nil
+        }
+        defer { ZSTD_freeDCtx(dctx) }
+        
+        let expectedSize = ZSTD_getFrameContentSize(data.withUnsafeBytes { $0.baseAddress }, data.count)
+        guard expectedSize != ZSTD_CONTENTSIZE_ERROR && expectedSize != ZSTD_CONTENTSIZE_UNKNOWN else {
+            return nil
+        }
+        
+        let dstBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(expectedSize))
+        defer { dstBuffer.deallocate() }
+        
+        let actualSize = data.withUnsafeBytes {
+            ZSTD_decompress_usingDDict(dctx,
+                                       dstBuffer,
+                                       Int(expectedSize),
+                                       $0.baseAddress,
+                                       data.count,
+                                       cdict)
+        }
+        
+        if ZSTD_isError(actualSize) != 0 {
+            print("Zstd decompression error: \(String(cString: ZSTD_getErrorName(actualSize)))")
+            return nil
+        }
+        
+        return Data(bytes: dstBuffer, count: actualSize)
     }
-    
-    try Task.checkCancellation()
-    return Data(bytes: dstBuffer, count: compressedSize)
-}
-
-private func zstdDecompress(data: Data, dictionary: Data) -> Data? {
-    guard let ddict = dictionary.withUnsafeBytes({
-        ZSTD_createDDict($0.baseAddress, dictionary.count)
-    }) else { return nil }
-    guard let dctx = ZSTD_createDCtx() else {
-        ZSTD_freeDDict(ddict)
-        return nil
-    }
-    
-    let expectedSize = ZSTD_getFrameContentSize(data.withUnsafeBytes { $0.baseAddress }, data.count)
-    guard expectedSize != ZSTD_CONTENTSIZE_ERROR && expectedSize != ZSTD_CONTENTSIZE_UNKNOWN else {
-        ZSTD_freeDDict(ddict)
-        ZSTD_freeDCtx(dctx)
-        return nil
-    }
-    
-    let dstBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(expectedSize))
-    defer { dstBuffer.deallocate() }
-    
-    let actualSize = data.withUnsafeBytes {
-        ZSTD_decompress_usingDDict(dctx, dstBuffer, Int(expectedSize), $0.baseAddress, data.count, ddict)
-    }
-    
-    if ZSTD_isError(actualSize) != 0 {
-        print("Zstd decompression error: \(String(cString: ZSTD_getErrorName(actualSize)))")
-        ZSTD_freeDDict(ddict)
-        ZSTD_freeDCtx(dctx)
-        return nil
-    }
-    
-    ZSTD_freeDDict(ddict)
-    ZSTD_freeDCtx(dctx)
-    return Data(bytes: dstBuffer, count: actualSize)
 }
