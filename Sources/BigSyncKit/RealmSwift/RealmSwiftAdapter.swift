@@ -517,8 +517,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         // Subscribe to the subject with a 6-second debounce
         realmChangesSubject
+#if DEBUG
+            .debounce(for: .seconds(2), scheduler: bigSyncKitQueue)
+#else
             .delay(for: .seconds(4), scheduler: bigSyncKitQueue)
             .debounce(for: .seconds(10), scheduler: bigSyncKitQueue)
+#endif
             .sink { [weak self] changedRealm in
                 guard let self = self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -1218,7 +1222,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         func applyChanges() {
-            //                logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
+            logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
+            logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict), local object: \(object.debugDescription) – remote object: \(record.debugDescription)")
             for property in objectProperties where !skippedKeys.contains(property.name) {
                 if shouldIgnore(key: property.name) {
                     continue
@@ -2253,7 +2258,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if !skipped.isEmpty {
                 logger.info("QSCloudKitSynchronizer >> Skipped downloaded records for having no changes: \(skipped)")
             }
-//            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(savedRecordNames.joined(separator: " "))")
+            logger.info("QSCloudKitSynchronizer >> Persisted downloaded record names: \(savedRecordNames.joined(separator: " "))")
+            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(recordsToSave.map { ($0.record.recordID.recordName, $0.record.debugDescription) })")
         }
     }
     
