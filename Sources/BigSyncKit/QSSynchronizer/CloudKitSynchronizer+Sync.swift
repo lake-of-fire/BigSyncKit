@@ -482,6 +482,10 @@ extension CloudKitSynchronizer {
                     }
                     return nil
                 }).first
+                
+                // Process any remaining change requests before saving server change tokens
+                try await changeRequestProcessor.finishProcessing()
+
                 for (zoneID, zoneResult) in zoneResults {
                     if !zoneResult.downloadedRecords.isEmpty {
                         logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records from zone \(zoneID.zoneName)")
@@ -500,9 +504,6 @@ extension CloudKitSynchronizer {
                         return
                     }
                 }
-                
-                // Process any remaining change requests
-                await changeRequestProcessor.finishProcessing()
                 
                 // Collect any errors from the processor
                 if let firstError = changeRequestProcessor.getErrors().first {

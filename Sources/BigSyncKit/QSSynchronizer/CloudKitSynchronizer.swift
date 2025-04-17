@@ -83,7 +83,9 @@ internal class ChangeRequestProcessor {
         changeSubject
             .debounce(for: .seconds(2), scheduler: DispatchQueue.global())
             .sink { [weak self] _ in
-                self?.runProcessFetchedChangeRequests()
+                Task { @BigSyncBackgroundActor [weak self] in
+                    try await self?.runProcessFetchedChangeRequests()
+                }
             }
             .store(in: &cancellables)
     }
@@ -103,12 +105,14 @@ internal class ChangeRequestProcessor {
         changeSubject.send()
     }
     
-    private func runProcessFetchedChangeRequests() {
+    @BigSyncBackgroundActor
+    private func runProcessFetchedChangeRequests() async throws {
         processTask?.cancel()
         processTask = Task { @BigSyncBackgroundActor [weak self] in
             try await self?.processFetchedChangeRequests()
             self?.processTask = nil
         }
+        try await processTask?.value
     }
     
     @BigSyncBackgroundActor
@@ -149,8 +153,9 @@ internal class ChangeRequestProcessor {
         return localErrors
     }
     
-    func finishProcessing() async {
-        runProcessFetchedChangeRequests()
+    @BigSyncBackgroundActor
+    func finishProcessing() async throws {
+        try await runProcessFetchedChangeRequests()
     }
 }
 
