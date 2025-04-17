@@ -97,7 +97,7 @@ extension CloudKitSynchronizer {
                 return
             default:// break
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
-//                print("# ")
+                //                print("# ")
             }
         } else if let error = error as? CKError {
             switch error.code {
@@ -134,7 +134,7 @@ extension CloudKitSynchronizer {
                 logger.info("QSCloudKitSynchronizer >> Waited \(retryAfter) seconds.")
             default:
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
-//                print("# ")
+                //                print("# ")
                 //                break
             }
         }
@@ -143,9 +143,9 @@ extension CloudKitSynchronizer {
             logger.info("QSCloudKitSynchronizer >> Synchronization canceled, not retrying")
         } else {
             logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
-//            syncing = false
+            //            syncing = false
             //        cancelSync = false
-//            await beginSynchronization(force: true)
+            //            await beginSynchronization(force: true)
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 await performSynchronization()
             }
@@ -169,7 +169,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
-//        logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
+        //        logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
         operation.logger = logger
         operation.errorHandler = { [weak self] operation, error in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -462,7 +462,7 @@ extension CloudKitSynchronizer {
                     deletedRecordID: deletedRecordID,
                     adapter: adapter
                 )
-//                logger.info("QSCloudKitSynchronizer >> Enqueueing remote record for local merge: \(downloadedRecord?.recordID.recordName)")
+                //                logger.info("QSCloudKitSynchronizer >> Enqueueing remote record for local merge: \(downloadedRecord?.recordID.recordName)")
                 await changeRequestProcessor.addFetchedChangeRequest(changeRequest)
             }
         } completion: { [weak self] zoneResults in
@@ -561,7 +561,7 @@ extension CloudKitSynchronizer {
             return
         }
         try Task.checkCancellation()
-
+        
         postNotification(.SynchronizerWillUploadChanges)
         
         try await uploadChanges() { [weak self] (error) in
@@ -580,7 +580,7 @@ extension CloudKitSynchronizer {
                 }
             } else {
                 if try await shouldDeferFetches() {
-//                    debugPrint("# USED TO STOP HERE, NOw LOOPIN!")
+                    //                    debugPrint("# USED TO STOP HERE, NOw LOOPIN!")
                     await performSynchronization()
                 } else {
                     updateTokens()
@@ -656,16 +656,16 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
         guard !cancelSync else { throw CancellationError() }
-
+        
         let requestedBatchSize = batchSize
         let records = try await adapter.recordsToUpload(limit: requestedBatchSize)
         let recordCount = records.count
-//        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
+        //        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
         logger.info("QSCloudKitSynchronizer >> Uploading records: \(records.map { $0.recordID.recordName } .joined(separator: " "))")
-
+        
         guard !cancelSync else { throw CancellationError() }
         
         if !didNotifyUpload.contains(adapter.recordZoneID) {
@@ -676,10 +676,11 @@ extension CloudKitSynchronizer {
         //Add metadata: device UUID and model version
         addMetadata(to: records)
         //        debugPrint("## Upload", records.map {($0.recordID, $0) })
-        let modifyRecordsOperation = ModifyRecordsOperation(database: database,
-                                                            records: records,
-                                                            recordIDsToDelete: nil)
-        { [weak self] (savedRecords, deleted, conflicted, recordIDsMissingOnServer, operationError) in
+        let modifyRecordsOperation = ModifyRecordsOperation(
+            database: database,
+            records: records,
+            recordIDsToDelete: nil
+        ) { [weak self] (savedRecords, deleted, conflicted, recordIDsMissingOnServer, operationError) in
             //            debugPrint("# uploadRecords, inside operation callback...", records.count)
             guard let self else { return }
             modifyRecordsTask?.cancel()
@@ -689,15 +690,14 @@ extension CloudKitSynchronizer {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 var conflicted = conflicted
-                if !(savedRecords?.isEmpty ?? true) {
+                if let savedRecords, !savedRecords.isEmpty {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
-                    logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
-                    if let savedRecords {
-                        logger.info("QSCloudKitSynchronizer >> Uploaded records: \(savedRecords.map { ($0.recordID.recordName, $0.debugDescription) })")
-                    }
-//                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
+                    logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords.count) records")
+                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \(savedRecords.map { ($0.recordID.recordName, $0.debugDescription) })")
+                    //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
+                    
+                    try await adapter.didUpload(savedRecords: savedRecords)
                 }
-                try await adapter.didUpload(savedRecords: savedRecords ?? [])
                 
                 try Task.checkCancellation()
                 if let error = operationError as? NSError {
@@ -738,11 +738,18 @@ extension CloudKitSynchronizer {
                             do {
                                 try await adapter.saveChanges(in: resolvedRecords, forceSave: true)
                                 try await adapter.persistImportedChanges()
+                                increaseBatchSize()
+                                // Proceed to upload remaining records after resolving conflicts
+                                Task.detached { @BigSyncBackgroundActor [weak self] in
+                                    guard let self else { return }
+                                    guard !cancelSync else { throw CancellationError() }
+                                    try await uploadRecords(adapter: adapter, completion: completion)
+                                }
                             } catch {
                                 logger.info("QSCloudKitSynchronizer >> WARNING: Failed to save changes to resolved conflicted record: \(error)")
                                 try await completion(error)
-                                return
                             }
+                            return
                         }
                     } else {
                         if self.isLimitExceededError(error) {
@@ -759,7 +766,7 @@ extension CloudKitSynchronizer {
                 guard !cancelSync else { throw CancellationError() }
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-
+                
                 if recordCount >= requestedBatchSize {
                     increaseBatchSize()
                     //                    debugPrint("# uploadRecords from inside uploadRecords")
@@ -915,7 +922,7 @@ extension CloudKitSynchronizer {
     
     func increaseBatchSize() {
         if self.batchSize < CloudKitSynchronizer.maxBatchSize {
-//            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 5))
+            //            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 5))
             self.batchSize = min(CloudKitSynchronizer.maxBatchSize, max(batchSize + 1, Int((Double(self.batchSize) * 1.15).rounded())))
         }
     }

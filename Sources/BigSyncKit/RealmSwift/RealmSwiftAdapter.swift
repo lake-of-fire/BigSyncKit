@@ -300,6 +300,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         setupTypeNamesLookup()
         
+        syncRealmProvider = SyncRealmProvider(
+            persistenceConfiguration: persistenceRealmConfiguration,
+            targetConfigurations: targetRealmConfigurations
+        )
+        
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard let self = self else { return }
             try await setup()
@@ -592,6 +597,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         // TODO: Optimize by not checking records that we just fetched which triggered this to be called
         let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt ?? .distantPast
         let createdPredicate = NSPredicate(format: "createdAt > %@ AND explicitlyModifiedAt != nil", lastTrackedChangesAt as NSDate)
+        // TODO: Slightly possible for this to miss records that are created with the same explicitlyModifiedAt as the last enqueueing but that didn't exist yet the last time it was called
         let modifiedPredicate = NSPredicate(format: "explicitlyModifiedAt > %@ AND createdAt <= %@", lastTrackedChangesAt as NSDate, lastTrackedChangesAt as NSDate)
         
         let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate))
@@ -676,10 +682,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         for (schema, identifiers) in currentChangeSet.insertions.mapValues(\.0) {
             guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
             
-            for chunk in Array(identifiers).chunked(into: 500) {
+            for chunk in Array(identifiers).chunked(into: 2000) {
                 //                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     for identifier in chunk {
+                        try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
                         self.updateTracking(
                             objectIdentifier: identifier,
@@ -697,10 +704,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         for (schema, identifiers) in currentChangeSet.modifications.mapValues(\.0) {
             guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
             
-            for chunk in Array(identifiers).chunked(into: 500) {
+            for chunk in Array(identifiers).chunked(into: 2000) {
                 //                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     for identifier in chunk {
+                        try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
                         self.updateTracking(
                             objectIdentifier: identifier,
@@ -815,11 +823,18 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if inserted {
                 isNewChange = true
             }
-        } else if !inserted {
-            guard let syncedEntity else {
-                return
-            }
+        } else if inserted {
+            guard let syncedEntity else { return }
+            isNewChange = true
             
+            if syncedEntity.state != SyncedEntityState.new.rawValue {
+                // Hack to avoid crashing issue: https://github.com/realm/realm-swift/issues/8333
+                if let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm), syncedEntity.state != SyncedEntityState.new.rawValue {
+                    syncedEntity.state = SyncedEntityState.new.rawValue
+                }
+            }
+        } else {
+            guard let syncedEntity else { return }
             isNewChange = true
             
             if syncedEntity.state == SyncedEntityState.synced.rawValue && modified {
@@ -1260,13 +1275,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     } else if remoteExplicitlyModifiedAt == localExplicitlyModifiedAt {
                         let remoteModifiedAt = changes["modifiedAt"] as? Date ?? .distantPast
                         let localModifiedAt = object.value(forKey: "modifiedAt") as? Date ?? .distantPast
-                        result = remoteModifiedAt > localModifiedAt
+                        result = remoteModifiedAt >= localModifiedAt
                     } else {
                         result = false
                     }
                     logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
-                    //                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
-                    //                        logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
+                    logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
+                    logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
                     return result
                 }(self, recordChanges, object)
             }
@@ -2030,7 +2045,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     /// Deletes soft-deleted objects.
     public func cleanUp() {
-        guard let targetWriterRealms = syncRealmProvider?.syncTargetRealms else { return }
+        // FIXME: To do
+        return ;
+        guard let targetWriterRealms = syncRealmProvider?.syncTargetRealms else {
+            print("WARNING: No sync target realms found.")
+            return
+        }
         
         for targetWriterRealm in targetWriterRealms {
             for schema in targetWriterRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
@@ -2056,7 +2076,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 results = results.filter { object in
                     let objectClassName = object.objectSchema.className
                     let primaryKey = (object.objectSchema.primaryKeyProperty?.name)!
-                    let identifier = "\(objectClassName).\(object.value(forKey: primaryKey)!)"
+                    let identifier = objectClassName + ".\(object.value(forKey: primaryKey)!)"
                     return !dummyRecordIdentifiers.contains(identifier)
                 }
 #endif
@@ -2275,7 +2295,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         let object = targetWriterRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
                         
                         if let object {
-                            await targetWriterRealm.asyncRefresh()
+//                            await targetWriterRealm.asyncRefresh()
                             try Task.checkCancellation()
                             try? await targetWriterRealm.asyncWrite {
                                 try Task.checkCancellation()
@@ -2501,34 +2521,38 @@ final class ZSTDCompressor {
     static let shared = ZSTDCompressor()
         
     private let cdict: OpaquePointer?
-    
-    /// By default, we load the same dictionary data once.
-    /// Adjust as desired for different compression levels or dictionary.
+    private let ddict: OpaquePointer?
+
     private init() {
-        // This example references the same global zstdDictData that your code was using before.
-        // If you store it differently, replace accordingly:
-        
         guard let dictURL = Bundle.module.url(forResource: "ckrecordDictionary", withExtension: nil, subdirectory: "zstd"),
               let data = try? Data(contentsOf: dictURL) else {
             fatalError("Error: Failed to load zstd dictionary during init")
         }
         
         let level: Int32 = 1
-        
         let tempCDict = data.withUnsafeBytes {
             ZSTD_createCDict($0.baseAddress, data.count, level)
         }
-        
         if tempCDict == nil {
             fatalError("Failed to create ZSTD dictionaries.")
         }
-        
         self.cdict = tempCDict
+        
+        let tempDDict = data.withUnsafeBytes {
+            ZSTD_createDDict($0.baseAddress, data.count)
+        }
+        if tempDDict == nil {
+            fatalError("Failed to create ZSTD dictionaries.")
+        }
+        self.ddict = tempDDict
     }
     
     deinit {
         if let cdict {
             ZSTD_freeCDict(cdict)
+        }
+        if let ddict {
+            ZSTD_freeDDict(ddict)
         }
     }
     
@@ -2551,12 +2575,14 @@ final class ZSTDCompressor {
         
         let compressedSize = try data.withUnsafeBytes {
             try Task.checkCancellation()
-            return ZSTD_compress_usingCDict(cctx,
-                                            dstBuffer,
-                                            bound,
-                                            $0.baseAddress,
-                                            data.count,
-                                            cdict)
+            return ZSTD_compress_usingCDict(
+                cctx,
+                dstBuffer,
+                bound,
+                $0.baseAddress,
+                data.count,
+                cdict
+            )
         }
         
         if ZSTD_isError(compressedSize) != 0 {
@@ -2570,7 +2596,7 @@ final class ZSTDCompressor {
     
     /// Decompress data using the cached dictionary.
     func decompress(data: Data) -> Data? {
-        guard let cdict else {
+        guard let ddict else {
             return nil
         }
         // Create a new decompression context each time.
@@ -2588,12 +2614,14 @@ final class ZSTDCompressor {
         defer { dstBuffer.deallocate() }
         
         let actualSize = data.withUnsafeBytes {
-            ZSTD_decompress_usingDDict(dctx,
-                                       dstBuffer,
-                                       Int(expectedSize),
-                                       $0.baseAddress,
-                                       data.count,
-                                       cdict)
+            ZSTD_decompress_usingDDict(
+                dctx,
+                dstBuffer,
+                Int(expectedSize),
+                $0.baseAddress,
+                data.count,
+                ddict
+            )
         }
         
         if ZSTD_isError(actualSize) != 0 {
