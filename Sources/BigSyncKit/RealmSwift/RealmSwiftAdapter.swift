@@ -90,6 +90,8 @@ struct SyncRealmProvider {
     let persistenceConfiguration: Realm.Configuration
     let targetConfigurations: [Realm.Configuration]
     
+    let targetWriterRealmPerSchemaName: [String: Realm]
+    
     var syncPersistenceRealm: Realm {
         get {
             return try! Realm(configuration: persistenceConfiguration)
@@ -111,6 +113,14 @@ struct SyncRealmProvider {
         
         self.persistenceConfiguration = persistenceConfiguration
         self.targetConfigurations = targetConfigurations
+        
+        var targetWriterRealmPerSchemaName = [String: Realm]()
+        for targetWriterRealmObject in syncTargetRealms {
+            for objectType in targetWriterRealmObject.configuration.objectTypes ?? [] {
+                targetWriterRealmPerSchemaName[objectType.className()] = targetWriterRealmObject
+            }
+        }
+        self.targetWriterRealmPerSchemaName = targetWriterRealmPerSchemaName
         
         guard syncTargetRealms.count == targetConfigurations.count else {
             return nil
@@ -810,7 +820,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             if let syncedEntity = syncedEntity {
                 //                try? realmProvider.persistenceRealm.safeWrite {
-                syncedEntity.state = SyncedEntityState.deleted.rawValue
+                syncedEntity.state = SyncedEntityState.deletedLocally.rawValue
             }
         } else if syncedEntity == nil {
             Self.createSyncedEntity(
@@ -1581,7 +1591,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             let entity = relationship.forSyncedEntity
             
             guard let syncedEntity = entity,
-                  syncedEntity.entityState != .deleted else { continue }
+                  syncedEntity.entityState != .deletedLocally && syncedEntity.entityState != .deletedRemotely else { continue }
             
             guard let originObjectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
                 continue
@@ -1744,7 +1754,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             // Object does not exist, but tracking syncedEntity thinks it does.
             // We mark it as deleted so the iCloud record will get deleted too
             try await persistenceRealm.asyncWrite {
-                syncedEntity.entityState = .deleted
+                syncedEntity.entityState = .deletedLocally
             }
             return nil
         }
@@ -2045,75 +2055,60 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     
     /// Deletes soft-deleted objects.
     public func cleanUp() {
-        // FIXME: To do
-        return ;
-        guard let targetWriterRealms = syncRealmProvider?.syncTargetRealms else {
-            print("WARNING: No sync target realms found.")
+        guard let targetWriterRealmPerSchemaName = syncRealmProvider?.targetWriterRealmPerSchemaName, let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else {
+            print("WARNING: No sync realms found.")
             return
         }
         
-        for targetWriterRealm in targetWriterRealms {
-            for schema in targetWriterRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
-                guard let objectClass = self.realmObjectClass(name: schema.className) else {
-                    continue
-                }
-                let predicate = NSPredicate(format: "isDeleted == %@", NSNumber(booleanLiteral: true))
-                let lazyResults = targetWriterRealm.objects(objectClass).filter(predicate)
-                var results = Array(lazyResults)
-                if results.isEmpty {
-                    continue
-                }
-                if objectClass.self is any SyncableBase.Type {
-                    results = results.filter { result in
-                        guard let result = result as? (any SyncableBase) else {
-                            fatalError("SyncableBase object class unexpectedly had non-SyncableBase element")
-                        }
-                        // Don't delete before the application server received the deletion.
-                        return !result.needsSyncToAppServer
-                    }
-                }
-#if DEBUG
-                results = results.filter { object in
-                    let objectClassName = object.objectSchema.className
-                    let primaryKey = (object.objectSchema.primaryKeyProperty?.name)!
-                    let identifier = objectClassName + ".\(object.value(forKey: primaryKey)!)"
-                    return !dummyRecordIdentifiers.contains(identifier)
-                }
-#endif
-                var identifiersToDelete = [String]()
-                results = results.filter { object in
-                    // TODO: Consolidate with syncedEntity(for ...)
-                    guard let objectClass = self.realmObjectClass(name: object.objectSchema.className) else {
-                        //                    debugPrint("Unexpectedly could not get realm object class for", object.objectSchema.className)
-                        logger.error("Unexpectedly could not get realm object class for \(object.objectSchema.className)")
-                        return false
-                    }
-                    let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
-                    let identifier = object.objectSchema.className + "." + Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-                    let isSynced = {
-                        guard let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else { return false }
-                        guard let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) else {
-                            //                        debugPrint("Warning: No synced entity found for identifier", identifier)
-                            logger.error("Warning: No synced entity found for identifier \(identifier)")
-                            return false
-                        }
-                        return syncedEntity.entityState == .synced || syncedEntity.entityState == .new
-                    }()
-                    if isSynced {
-                        identifiersToDelete.append(identifier)
-                    }
-                    return isSynced
-                }
-                
-                for chunk in results.chunks(ofCount: 500) {
-                    try? targetWriterRealm.write {
-                        for item in chunk {
-                            targetWriterRealm.delete(item)
+        let remotelyDeletedEntities = Dictionary(
+            grouping: persistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deletedRemotely.rawValue },
+            by: { $0.entityType }
+        ).filter { !excludedClassNames.contains($0.key) }
+        
+        // TODO: Group by target writer realms instead of write transaction per class name, for speed
+        for className in remotelyDeletedEntities.keys {
+            guard let targetWriterRealm = targetWriterRealmPerSchemaName[className] else { return }
+            guard let objectClass = self.realmObjectClass(name: className) else {
+                logger.warning("QSCloudKitSynchronizer >> Clean Up: No Realm object class found for \(className)")
+                continue
+            }
+ 
+            do {
+                var skippedIdentifiers = Set<String>()
+                try targetWriterRealm.write {
+                    for syncedEntity in remotelyDeletedEntities[className] ?? [] {
+                        let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
+                        if let object = targetWriterRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) {
+                            if let object = object as? SoftDeletable {
+                                guard object.isDeleted else {
+                                    logger.warning("QSCloudKitSynchronizer >> Clean Up: Object \(objectIdentifier) of type \(className) is not marked as deleted locally, skipping deletion")
+                                    skippedIdentifiers.insert(syncedEntity.identifier)
+                                    continue
+                                }
+                            }
+                            
+                            if let object = object as? any SyncableBase, object.needsSyncToAppServer {
+                                // Don't hard-delete before the application server received the deletion.
+                                skippedIdentifiers.insert(syncedEntity.identifier)
+                                continue
+                            }
+                            
+                            targetWriterRealm.delete(object)
+                            logger.warning("QSCloudKitSynchronizer >> Clean Up: Hard-deleted local object \(objectIdentifier) of type \(className)")
+                        } else {
+                            logger.warning("QSCloudKitSynchronizer >> Clean Up: Object \(objectIdentifier) of type \(className) not found for deletion")
                         }
                     }
                 }
                 
-                try? didDelete(identifiers: identifiersToDelete)
+                try persistenceRealm.write {
+                    for syncedEntity in remotelyDeletedEntities[className] ?? [] where !skippedIdentifiers.contains(syncedEntity.identifier) {
+                        logger.warning("QSCloudKitSynchronizer >> Clean Up: Deleting tracking of object \(syncedEntity.identifier)")
+                        persistenceRealm.delete(syncedEntity)
+                    }
+                }
+            } catch {
+                logger.error("\(error)")
             }
         }
     }
@@ -2142,7 +2137,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     syncedEntity = newSyncedEntity
                 }
                 if let syncedEntity {
-                    if syncedEntity.entityState != .deleted && syncedEntity.entityType != "CKShare" {
+                    if syncedEntity.entityState != .deletedLocally && syncedEntity.entityState != .deletedRemotely && syncedEntity.entityType != "CKShare" {
                         guard let objectClass = self.realmObjectClass(name: record.recordType) else {
                             continue
                         }
@@ -2313,7 +2308,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 //                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     try Task.checkCancellation()
-                    persistenceRealm.delete(syncedEntity)
+                    syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
+//                    persistenceRealm.delete(syncedEntity)
                 }
             }
             
@@ -2341,7 +2337,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var uploadingState = SyncedEntityState.new
         
         var innerLimit = recordLimit
-        while recordsArray.count < recordLimit && uploadingState.rawValue < SyncedEntityState.deleted.rawValue {
+        while recordsArray.count < recordLimit && uploadingState.rawValue < SyncedEntityState.deletedLocally.rawValue {
             guard !cancelSync else { throw CancellationError() }
             
             try await recordsArray.append(
@@ -2386,7 +2382,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     public func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID] {
         var recordIDs = [CKRecord.ID]()
         
-        guard let deletedEntities = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == SyncedEntityState.deleted.rawValue }) else { return [] }
+        guard let deletedEntities = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == SyncedEntityState.deletedLocally.rawValue }) else { return [] }
         
         for syncedEntity in Array(deletedEntities) {
             guard !cancelSync else { throw CancellationError() }
@@ -2409,7 +2405,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName) {
                 //                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
-                    persistenceRealm.delete(syncedEntity)
+                    syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
+//                    persistenceRealm.delete(syncedEntity)
                 }
             }
         }

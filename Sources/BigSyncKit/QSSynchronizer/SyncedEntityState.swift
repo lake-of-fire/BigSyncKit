@@ -11,6 +11,7 @@ enum SyncedEntityState: Int {
     // Order of the raw values is significant; see recordsToUpload and nextStateToSync
     case new = 1
     case changed = 2
-    case deleted = 3
+    case deletedLocally = 3
     case synced = 4
+    case deletedRemotely = 5
 }

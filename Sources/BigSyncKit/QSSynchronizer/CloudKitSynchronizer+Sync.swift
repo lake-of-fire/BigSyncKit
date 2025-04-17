@@ -917,7 +917,7 @@ extension CloudKitSynchronizer {
     }
     
     func reduceBatchSize() {
-        self.batchSize = Int((Double(self.batchSize) / 2.5).rounded())
+        self.batchSize = max(1, Int((Double(self.batchSize) / 2.5).rounded()))
     }
     
     func increaseBatchSize() {
