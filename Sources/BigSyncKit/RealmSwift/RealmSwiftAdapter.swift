@@ -115,7 +115,7 @@ struct SyncRealmProvider {
         self.targetConfigurations = targetConfigurations
         
         var targetWriterRealmPerSchemaName = [String: Realm]()
-        for targetWriterRealmObject in syncTargetRealms {
+        for targetWriterRealmObject in targetConfigurations.map({ try! Realm(configuration: $0) }) {
             for objectType in targetWriterRealmObject.configuration.objectTypes ?? [] {
                 targetWriterRealmPerSchemaName[objectType.className()] = targetWriterRealmObject
             }
@@ -595,18 +595,16 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         in objectClass: Object.Type,
         schemaName: String
     ) async {
-        guard let persistenceRealm = realmProvider?.persistenceRealm,
-              let targetReaderRealm = realmProvider?.targetReaderRealmPerSchemaName[schemaName],
-              let syncedEntityType = try? await getOrCreateSyncedEntityType(schemaName)
-        else {
+        guard let targetReaderRealm = realmProvider?.targetReaderRealmPerSchemaName[schemaName] else {
             //            print("Could not get realms or syncedEntityType for \(schemaName)")
             logger.error("Could not get realms or syncedEntityType for \(schemaName)")
             return
         }
         
         // TODO: Optimize by not checking records that we just fetched which triggered this to be called
-        let lastTrackedChangesAt = syncedEntityType.lastTrackedChangesAt ?? .distantPast
-        let createdPredicate = NSPredicate(format: "createdAt > %@ AND explicitlyModifiedAt != nil", lastTrackedChangesAt as NSDate)
+        
+        let lastTrackedChangesAt = await getLastTrackedChangesAt(forEntityType: schemaName) ?? .distantPast
+        let createdPredicate = NSPredicate(format: "createdAt > %@ AND explicitlyModifiedAt > %@", lastTrackedChangesAt as NSDate, lastTrackedChangesAt as NSDate)
         // TODO: Slightly possible for this to miss records that are created with the same explicitlyModifiedAt as the last enqueueing but that didn't exist yet the last time it was called
         let modifiedPredicate = NSPredicate(format: "explicitlyModifiedAt > %@ AND createdAt <= %@", lastTrackedChangesAt as NSDate, lastTrackedChangesAt as NSDate)
         
@@ -617,7 +615,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         let filteredCreated = created.filter { object in
             let id = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-            guard let fetchedModified = recentlyFetchedRecordModifiedAts["\(schemaName).\(id)"],
+            guard let fetchedModified = recentlyFetchedRecordModifiedAts[schemaName + "." + id],
                   let objectModified = object.value(forKey: "modifiedAt") as? Date else {
                 return true
             }
@@ -626,7 +624,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         let filteredModified = modified.filter { object in
             let id = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-            guard let fetchedModified = recentlyFetchedRecordModifiedAts["\(schemaName).\(id)"],
+            guard let fetchedModified = recentlyFetchedRecordModifiedAts[schemaName + "." + id],
                   let objectModified = object.value(forKey: "modifiedAt") as? Date else {
                 return true
             }
@@ -1016,6 +1014,14 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return syncedEntityType
     }
     
+    @BigSyncBackgroundActor
+    func getLastTrackedChangesAt(forEntityType entityType: String) async -> Date? {
+        guard let persistenceRealm = await realmProvider?.persistenceRealm else { return nil }
+        
+        let syncedEntityType = persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: entityType)
+        return syncedEntityType?.lastTrackedChangesAt
+    }
+
     func shouldIgnore(key: String) -> Bool {
         return CloudKitSynchronizer.metadataKeys.contains(key)
     }
@@ -2123,7 +2129,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         //        debugPrint("# To save from icloud:", records.map { $0.recordID.recordName })
         var recordsToSave: [(record: CKRecord, objectClass: RealmSwift.Object.Type, objectIdentifier: Any, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
         var syncedEntitiesToCreate: [SyncedEntity] = []
-        
+        try Task.checkCancellation()
+
         for chunk in records.chunked(into: 100) {
             for record in chunk {
                 try Task.checkCancellation()
@@ -2136,6 +2143,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     syncedEntitiesToCreate.append(newSyncedEntity)
                     syncedEntity = newSyncedEntity
                 }
+                try Task.checkCancellation()
+                
                 if let syncedEntity {
                     if syncedEntity.entityState != .deletedLocally && syncedEntity.entityState != .deletedRemotely && syncedEntity.entityType != "CKShare" {
                         guard let objectClass = self.realmObjectClass(name: record.recordType) else {
@@ -2187,11 +2196,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 
-                //                await realmProvider.persistenceRealm?.asyncRefresh()
+//                                await realmProvider.persistenceRealm?.asyncRefresh()
                 try await realmProvider.persistenceRealm?.asyncWrite { [weak self] in
                     guard let self else { return }
                     
                     for (record, _, _, syncedEntityID, syncedEntityState, _) in chunk {
+                        try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
                         
                         if let remoteModified = record["modifiedAt"] as? Date {
@@ -2213,17 +2223,23 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     guard let targetWriterRealms = realmProvider.targetWriterRealms else { return }
                     
                     for targetWriterRealm in targetWriterRealms {
-                        await targetWriterRealm.asyncRefresh()
+                        try Task.checkCancellation()
                         guard await !cancelSync else { throw CancellationError() }
-                        
+                        await targetWriterRealm.asyncRefresh()
+                        try Task.checkCancellation()
+
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
                             for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk where realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration {
                                 try Task.checkCancellation()
                                 
                                 var object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier)
+                                try Task.checkCancellation()
+                                
                                 if object == nil {
                                     object = objectType.init()
+                                    try Task.checkCancellation()
+                                    
                                     if let object {
                                         object.setValue(objectIdentifier, forKey: (objectType.primaryKey() ?? objectType.sharedSchema()?.primaryKeyProperty?.name)!)
                                         targetWriterRealm.add(object, update: .modified)

@@ -454,7 +454,8 @@ extension CloudKitSynchronizer {
                 debugPrint("Unexpectedly found no downloaded record or deleted record ID")
                 return
             }
-            
+            guard !cancelSync else { return }
+
             let adapter = await modelAdapterDictionary[zoneID]
             if let adapter {
                 let changeRequest = ChangeRequest(
@@ -463,13 +464,23 @@ extension CloudKitSynchronizer {
                     adapter: adapter
                 )
                 //                logger.info("QSCloudKitSynchronizer >> Enqueueing remote record for local merge: \(downloadedRecord?.recordID.recordName)")
+                guard !cancelSync else { return }
                 await changeRequestProcessor.addFetchedChangeRequest(changeRequest)
             }
         } completion: { [weak self] zoneResults in
-            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+            guard let self else { return }
+            fetchZoneChangesCompletionTask?.cancel()
+            fetchZoneChangesCompletionTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
+                
+                defer {
+                    changeRequestProcessor.clearErrors()
+                }
+                
+                try Task.checkCancellation()
                 let error: Error? = try? zoneResults.lazy.compactMap({ [weak self] (zoneID, zoneResult) -> Error? in
                     guard let self = self else { return nil }
+                    try Task.checkCancellation()
                     if let error = zoneResult.error {
                         if isZoneNotFoundOrDeletedError(error) {
                             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -485,7 +496,8 @@ extension CloudKitSynchronizer {
                 
                 // Process any remaining change requests before saving server change tokens
                 try await changeRequestProcessor.finishProcessing()
-
+                try Task.checkCancellation()
+                
                 for (zoneID, zoneResult) in zoneResults {
                     if !zoneResult.downloadedRecords.isEmpty {
                         logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records from zone \(zoneID.zoneName)")
@@ -740,12 +752,12 @@ extension CloudKitSynchronizer {
                                 try await adapter.saveChanges(in: resolvedRecords, forceSave: true)
                                 try await adapter.persistImportedChanges()
                                 increaseBatchSize()
+                                
+                                try Task.checkCancellation()
+                                guard !cancelSync else { throw CancellationError() }
+                                
                                 // Proceed to upload remaining records after resolving conflicts
-                                Task.detached { @BigSyncBackgroundActor [weak self] in
-                                    guard let self else { return }
-                                    guard !cancelSync else { throw CancellationError() }
-                                    try await uploadRecords(adapter: adapter, completion: completion)
-                                }
+                                try await uploadRecords(adapter: adapter, completion: completion)
                             } catch {
                                 logger.info("QSCloudKitSynchronizer >> WARNING: Failed to save changes to resolved conflicted record: \(error)")
                                 try await completion(error)
@@ -771,11 +783,11 @@ extension CloudKitSynchronizer {
                 if recordCount >= requestedBatchSize {
                     increaseBatchSize()
                     //                    debugPrint("# uploadRecords from inside uploadRecords")
-                    Task.detached { @BigSyncBackgroundActor [weak self] in
-                        guard let self else { return }
-                        guard !cancelSync else { throw CancellationError() }
-                        try await uploadRecords(adapter: adapter, completion: completion)
-                    }
+                    
+                    try Task.checkCancellation()
+                    guard !cancelSync else { throw CancellationError() }
+                    
+                    try await uploadRecords(adapter: adapter, completion: completion)
                 } else {
                     try await completion(nil)
                 }
@@ -892,7 +904,7 @@ extension CloudKitSynchronizer {
                 return
             }
             
-            //            var pendingZones = [CKRecordZone.ID]()
+            var pendingZones = [CKRecordZone.ID]()
             var needsToRefetch = false
             
             for (zoneID, result) in zoneResults {
@@ -903,28 +915,29 @@ extension CloudKitSynchronizer {
                     activeZoneTokens[zoneID] = result.serverChangeToken
                     await adapter?.saveToken(result.serverChangeToken)
                 }
-                //                if result.moreComing {
-                //                    pendingZones.append(zoneID)
-                //                }
+                
+                if result.moreComing {
+                    pendingZones.append(zoneID)
+                }
             }
             
-            //            if pendingZones.count > 0 && !needsToRefetch {
-            //                await updateServerToken(for: pendingZones, completion: completion)
-            //            } else {
-            await completion(needsToRefetch)
-            //            }
+            if pendingZones.count > 0 && !needsToRefetch {
+                await updateServerToken(for: pendingZones, completion: completion)
+            } else {
+                await completion(needsToRefetch)
+            }
         }
         runOperation(operation)
     }
     
     func reduceBatchSize() {
-        self.batchSize = max(1, Int((Double(self.batchSize) / 2.5).rounded()))
+        self.batchSize = max(1, Int((Double(self.batchSize) / 2.75).rounded()))
     }
     
     func increaseBatchSize() {
         if self.batchSize < CloudKitSynchronizer.maxBatchSize {
             //            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 5))
-            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, max(batchSize + 1, Int((Double(self.batchSize) * 1.15).rounded())))
+            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, max(batchSize + 1, Int((Double(self.batchSize) * 1.12).rounded())))
         }
     }
 }

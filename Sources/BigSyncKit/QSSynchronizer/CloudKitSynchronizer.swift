@@ -107,16 +107,20 @@ internal class ChangeRequestProcessor {
     
     @BigSyncBackgroundActor
     private func runProcessFetchedChangeRequests() async throws {
+//        debugPrint("# runProcessFetchedChangeRequests START")
         processTask?.cancel()
         processTask = Task { @BigSyncBackgroundActor [weak self] in
             try await self?.processFetchedChangeRequests()
+//            debugPrint("# runProcessFetchedChangeRequests ENDING")
             self?.processTask = nil
         }
         try await processTask?.value
+//        debugPrint("# runProcessFetchedChangeRequests END")
     }
     
     @BigSyncBackgroundActor
     private func processFetchedChangeRequests() async throws {
+//        debugPrint("# processFetchedChangeRequests() inner")
         try Task.checkCancellation()
         
         while !changeRequests.isEmpty {
@@ -126,7 +130,10 @@ internal class ChangeRequestProcessor {
             do {
                 logger?.info("QSCloudKitSynchronizer >> Processing \(batch.count) remote records for local merge: \(batch.compactMap { $0.downloadedRecord?.recordID.recordName } .joined(separator: " ")) (\(changeRequests.count) more remaining)")
                 
-                let downloadedRecords = batch.compactMap { $0.downloadedRecord }
+                let downloadedRecords = try batch.compactMap {
+                    try Task.checkCancellation()
+                    return $0.downloadedRecord
+                }
                 try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
                 
                 try Task.checkCancellation()
@@ -153,8 +160,13 @@ internal class ChangeRequestProcessor {
         return localErrors
     }
     
+    func clearErrors() {
+        localErrors.removeAll()
+    }
+    
     @BigSyncBackgroundActor
     func finishProcessing() async throws {
+        try Task.checkCancellation()
         try await runProcessFetchedChangeRequests()
     }
 }
@@ -257,16 +269,12 @@ public class CloudKitSynchronizer: NSObject {
     internal var currentOperations = [Operation]()
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
-    @BigSyncBackgroundActor
     internal var synchronizationTask: Task<Void, Never>?
-    @BigSyncBackgroundActor
     internal var modifyRecordsTask: Task<Void, Error>?
-    @BigSyncBackgroundActor
     internal var fetchDatabaseChangesTask: Task<Void, Error>?
-    @BigSyncBackgroundActor
     internal var fetchZoneChangesTask: Task<Void, Error>?
-    @BigSyncBackgroundActor
     internal var mergeChangesTask: Task<Void, Error>?
+    internal var fetchZoneChangesCompletionTask: Task<Void, Error>? = nil
 
     internal var lastDatabaseChangesEmptyAt: Date?
     internal var lastZoneChangesEmptyAt: Date?
@@ -395,6 +403,7 @@ public class CloudKitSynchronizer: NSObject {
         fetchDatabaseChangesTask?.cancel()
         fetchZoneChangesTask?.cancel()
         mergeChangesTask?.cancel()
+        fetchZoneChangesCompletionTask?.cancel()
 
         guard !cancelSync else { return }
         logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
