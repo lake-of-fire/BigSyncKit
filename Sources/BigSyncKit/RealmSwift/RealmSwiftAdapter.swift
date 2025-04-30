@@ -1233,7 +1233,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         syncedEntityID: String,
         syncedEntityState: SyncedEntityState,
         entityType: String
-    ) {
+    ) throws {
         let objectProperties = object.objectSchema.properties
         
         let skippedKeys: Set<String>
@@ -1243,10 +1243,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             skippedKeys = []
         }
         
-        func applyChanges() {
+        func applyChanges() throws {
             logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
             logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict), local object: \(object.debugDescription) – remote object: \(record.debugDescription)")
             for property in objectProperties where !skippedKeys.contains(property.name) {
+                try Task.checkCancellation()
                 if shouldIgnore(key: property.name) {
                     continue
                 }
@@ -1258,10 +1259,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         if mergePolicy == .server {
-            applyChanges()
+            try applyChanges()
         } else if mergePolicy == .custom {
             var recordChanges = [String: Any]()
             for property in objectProperties where !skippedKeys.contains(property.name) {
+                try Task.checkCancellation()
                 if property.type == .linkingObjects {
                     continue
                 }
@@ -1278,7 +1280,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if let delegate {
                 acceptRemoteChange = delegate.realmSwiftAdapter(self, gotChanges: recordChanges, object: object)
             } else {
-                acceptRemoteChange = { adapter, changes, object in
+                acceptRemoteChange = try { adapter, changes, object in
                     guard adapter.hasRealmObjectClass(name: object.objectSchema.className) else {
                         logger.warning("QSCloudKitSynchronizer >> No object class found for '\(object.objectSchema.className)' in adapter")
                         return false
@@ -1295,8 +1297,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     } else {
                         result = false
                     }
+                    try Task.checkCancellation()
                     logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
+                    try Task.checkCancellation()
                     logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
+                    try Task.checkCancellation()
                     logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
                     return result
                 }(self, recordChanges, object)
@@ -1307,7 +1312,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     logger.warning("QSCloudKitSynchronizer >> WARNING: Applying changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date), syncedEntityState=\(syncedEntityState.rawValue)")
                 }
                 
-                applyChanges()
+                try applyChanges()
             } else {
                 if let remoteExplicitlyModifiedAt = record["explicitlyModifiedAt"] as? Date, let localExplicitlyModifiedAt = (object as? ChangeMetadataRecordable)?.explicitlyModifiedAt, remoteExplicitlyModifiedAt < localExplicitlyModifiedAt {
                     logger.info("QSCloudKitSynchronizer >> Rejecting remote changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date), syncedEntityState=\(syncedEntityState.rawValue)")
@@ -2248,7 +2253,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                 
                                 try Task.checkCancellation()
                                 if let object {
-                                    self.applyChanges(
+                                    try self.applyChanges(
                                         in: record,
                                         to: object,
                                         syncedEntityID: syncedEntityID,
