@@ -12,7 +12,6 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let excludedClassNames: [String]
     let suiteName: String?
     let recordZoneID: CKRecordZone.ID?
-    let compatibilityVersion: Int
     let logger: Logging.Logger
     
     public init(
@@ -22,7 +21,6 @@ public struct BigSyncBackgroundWorkerConfiguration {
         excludedClassNames: [String],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
-        compatibilityVersion: Int = 0,
         logger: Logging.Logger
     ) {
         self.synchronizerName = synchronizerName
@@ -31,7 +29,6 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.excludedClassNames = excludedClassNames
         self.suiteName = suiteName
         self.recordZoneID = recordZoneID
-        self.compatibilityVersion = compatibilityVersion
         self.logger = logger
     }
 }
@@ -61,17 +58,18 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
             excludedClassNames: configuration.excludedClassNames,
             suiteName: configuration.suiteName,
             recordZoneID: configuration.recordZoneID,
-            compatibilityVersion: configuration.compatibilityVersion,
+            compatibilityVersion: Int(configuration.configurations.map { $0.schemaVersion } .reduce(0, +)),
             logger: configuration.logger
         )
         
-        self.logger = configuration.logger
+        logger = configuration.logger
         
         (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
 //        (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.delegate = self.synchronizerDelegate
-        synchronizer.compatibilityVersion = Int(configuration.configurations.map { $0.schemaVersion } .reduce(0, +))
         realmSynchronizer = synchronizer
 
+        logger.info("QSCloudKitSynchronizer >> Local compatibility version: \(synchronizer.compatibilityVersion)")
+        
         super.init()
         
         start { [weak self] in

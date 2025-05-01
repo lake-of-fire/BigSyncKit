@@ -93,12 +93,14 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         let operation = CKFetchRecordZoneChangesOperation(recordZoneIDs: zones, optionsByRecordZoneID: zoneOptions)
         operation.fetchAllChanges = true
         
-        operation.recordChangedBlock = { record in
-            let ignoreDeviceIdentifier: String = self.ignoreDeviceIdentifier ?? " "
+        operation.recordChangedBlock = { [weak self] record in
+            guard let self else { return }
+            let ignoreDeviceIdentifier: String = ignoreDeviceIdentifier ?? " "
             
             if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String {
                 if let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
                    self.modelVersion > 0 && version > self.modelVersion {
+                    logger?.warning("QSCloudKitSynchronizer >> Warning: Ignoring record '\(record.recordID.recordName)' because it has a higher model version (\(version)) than the one this synchronizer is configured to support (\(self.modelVersion))")
                     Task(priority: .background) { @BigSyncBackgroundActor in
                         await versionChecker.setHigherModelVersionFound()
                     }
