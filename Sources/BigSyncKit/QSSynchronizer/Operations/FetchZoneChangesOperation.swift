@@ -41,7 +41,6 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         onResult: ((CKRecord?, CKRecord.ID?) async -> ())? = nil,
         completion: @escaping ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async -> ()
     ) {
-        
         self.database = database
         self.zoneIDs = zoneIDs
         self.zoneChangeTokens = zoneChangeTokens

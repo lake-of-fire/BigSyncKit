@@ -1494,7 +1494,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     break
                 }
             }
-            object.setValue(result, forKey: key)
+            object.setValue(result, forKey: property.name)
         } else if let reference = value as? CKRecord.Reference {
             // Save relationship to be applied after all records have been downloaded and persisted
             // to ensure target of the relationship has already been created
@@ -1836,40 +1836,40 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         }
                         record[property.name] = referenceArray as CKRecordValue
                     case .int:
-                        guard let set = value as? Set<Int>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Int>, !set.isEmpty else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .string:
-                        guard let set = value as? Set<String>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<String>, !set.isEmpty else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .bool:
-                        guard let set = value as? Set<Bool>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Bool>, !set.isEmpty else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .float:
-                        guard let set = value as? Set<Float>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Float>, !set.isEmpty else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .double:
-                        guard let set = value as? Set<Double>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Double>, !set.isEmpty else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .data:
-                        guard let set = value as? Set<Data>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Data>, !set.isEmpty else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .date:
-                        guard let set = value as? Set<Date>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Date>, !set.isEmpty else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .UUID:
-                        guard let set = value as? Set<UUID>, !set.isEmpty else { break }
-                        let array = set.map { $0.uuidString }
+                        guard let set = value as? MutableSet<UUID>, !set.isEmpty else { break }
+                        let array = Array(set.map { $0.uuidString })
                         record[property.name] = array as CKRecordValue
                     default:
                         // Other inner types of Set is not supported yet
-                        debugPrint("Warning: Unsupported recordToUpload set property type \(property.type) for \(String(describing: type(of: object)))")
+                        logger.warning("Warning: Unsupported recordToUpload set property type \(property.type) for \(String(describing: type(of: object)))")
                         break
                     }
                 } else if property.isMap {
@@ -1896,7 +1896,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         case .UUID:
                             if let val = value as? UUID { values.add(val.uuidString as CKRecordValue) }
                         default:
-                            debugPrint("Warning: Unsupported recordToUpload map property type \(property.type) for \(String(describing: type(of: object)))")
+                            logger.warning("Warning: Unsupported recordToUpload map property type \(property.type) for \(String(describing: type(of: object)))")
                             break
                         }
                     }
@@ -1956,7 +1956,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         record[property.name] = array as CKRecordValue
                     default:
                         // Other inner types of List is not supported yet
-                        debugPrint("Warning: Unsupported recordToUpload array property type \(property.type) for \(String(describing: type(of: object)))")
+                        logger.warning("Warning: Unsupported recordToUpload array property type \(property.type) for \(String(describing: type(of: object)))")
                         break
                     }
                 } else if (

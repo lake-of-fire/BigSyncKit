@@ -455,7 +455,7 @@ extension CloudKitSynchronizer {
                 return
             }
             guard !cancelSync else { return }
-
+            
             let adapter = await modelAdapterDictionary[zoneID]
             if let adapter {
                 let changeRequest = ChangeRequest(
