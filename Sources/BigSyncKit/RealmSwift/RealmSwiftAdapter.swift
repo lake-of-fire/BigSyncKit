@@ -1453,6 +1453,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
                     for reference in value {
+                        // TODO: (If used anymore?) Maybe recordName should be let recordName = reference.recordID.recordName instead - GPT thought so... See elsewhere too
                         guard let recordName = reference.value(forKey: property.name) as? String else { return }
                         let separatorRange = recordName.range(of: ".")!
                         let objectIdentifier = String(recordName[separatorRange.upperBound...])
