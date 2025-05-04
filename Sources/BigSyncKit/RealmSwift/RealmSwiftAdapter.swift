@@ -1245,7 +1245,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
         func applyChanges() throws {
             logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
+#if DEBUG
             logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict), local object: \(object.debugDescription) – remote object: \(record.debugDescription)")
+#endif
             for property in objectProperties where !skippedKeys.contains(property.name) {
                 try Task.checkCancellation()
                 if shouldIgnore(key: property.name) {
@@ -1299,10 +1301,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                     try Task.checkCancellation()
                     logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
+#if DEBUG
                     try Task.checkCancellation()
                     logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
                     try Task.checkCancellation()
                     logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
+#endif
                     return result
                 }(self, recordChanges, object)
             }
@@ -2062,6 +2066,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
 #endif
         
+//        debugPrint("# TO UPLOAD:", record.debugDescription)
         return record
     }
     
@@ -2281,7 +2286,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 logger.info("QSCloudKitSynchronizer >> Skipped downloaded records for having no changes: \(skipped)")
             }
             logger.info("QSCloudKitSynchronizer >> Persisted downloaded record names: \(savedRecordNames.joined(separator: " "))")
+#if DEBUG
             logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(recordsToSave.map { ($0.record.recordID.recordName, $0.record.debugDescription) })")
+#endif
         }
     }
     
