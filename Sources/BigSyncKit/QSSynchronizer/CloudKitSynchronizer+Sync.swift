@@ -706,7 +706,7 @@ extension CloudKitSynchronizer {
                 if let savedRecords, !savedRecords.isEmpty {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                     logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords.count) records")
-                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \(savedRecords.map { ($0.recordID.recordName, $0.debugDescription) })")
+//                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \(savedRecords.map { ($0.recordID.recordName, $0.debugDescription) })")
                     //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
                     
                     try await adapter.didUpload(savedRecords: savedRecords)
