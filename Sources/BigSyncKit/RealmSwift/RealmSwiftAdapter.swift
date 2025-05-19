@@ -1256,7 +1256,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 if property.type == .linkingObjects {
                     continue
                 }
-                applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
+                try applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
             }
         }
         
@@ -1326,7 +1326,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
-    func applyChange(property: Property, record: CKRecord, object: Object, syncedEntityIdentifier: String) {
+    func applyChange(property: Property, record: CKRecord, object: Object, syncedEntityIdentifier: String) throws {
         let key = property.name
         if key == object.objectSchema.primaryKeyProperty!.name {
             return
@@ -1346,41 +1346,65 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             case .int:
                 guard let value = record.value(forKey: property.name) as? [Int] else { break }
                 var set = Set<Int>()
-                value.forEach { set.insert($0) }
+                try value.forEach {
+                    try Task.checkCancellation()
+                    set.insert($0)
+                }
                 recordValue = set
             case .string:
                 guard let value = record.value(forKey: property.name) as? [String] else { break }
                 var set = Set<String>()
-                value.forEach { set.insert($0) }
+                try value.forEach {
+                    try Task.checkCancellation()
+                    set.insert($0)
+                }
                 recordValue = set
             case .bool:
                 guard let value = record.value(forKey: property.name) as? [Bool] else { break }
                 var set = Set<Bool>()
-                value.forEach { set.insert($0) }
+                try value.forEach {
+                    try Task.checkCancellation()
+                    set.insert($0)
+                }
                 recordValue = set
             case .float:
                 guard let value = record.value(forKey: property.name) as? [Float] else { break }
                 var set = Set<Float>()
-                value.forEach { set.insert($0) }
+                try value.forEach {
+                    try Task.checkCancellation()
+                    set.insert($0)
+                }
                 recordValue = set
             case .double:
                 guard let value = record.value(forKey: property.name) as? [Double] else { break }
                 var set = Set<Double>()
-                value.forEach { set.insert($0) }
+                try value.forEach {
+                    try Task.checkCancellation()
+                    set.insert($0)
+                }
                 recordValue = set
             case .data:
                 guard let value = record.value(forKey: property.name) as? [Data] else { break }
                 var set = Set<Data>()
-                value.forEach { set.insert($0) }
+                try value.forEach {
+                    try Task.checkCancellation()
+                    set.insert($0)
+                }
                 recordValue = set
             case .date:
                 guard let value = record.value(forKey: property.name) as? [Date] else { break }
                 var set = Set<Date>()
-                value.forEach { set.insert($0) }
+                try value.forEach {
+                    try Task.checkCancellation()
+                    set.insert($0)
+                }
                 recordValue = set
             case .UUID:
                 if let stringArray = value as? [String] {
-                    let set = Set(stringArray.compactMap(UUID.init(uuidString:)))
+                    let set = try Set(stringArray.compactMap {
+                        try Task.checkCancellation()
+                        return UUID.init(uuidString: $0)
+                    })
                     object.setValue(set, forKey: key)
                 }
             case .object:
@@ -1388,75 +1412,107 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 // to ensure target of the relationship has already been created
                 if let value = record.value(forKey: property.name) as? [String] {
                     for recordName in value {
+                        try Task.checkCancellation()
                         let separatorRange = recordName.range(of: ".")!
                         let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        try Task.checkCancellation()
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
                 } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
                     for reference in value {
+                        try Task.checkCancellation()
                         guard let recordName = reference.value(forKey: property.name) as? String else { return }
                         let separatorRange = recordName.range(of: ".")!
                         let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        try Task.checkCancellation()
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
                 }
             default:
                 break
             }
+            try Task.checkCancellation()
             object.setValue(recordValue, forKey: property.name)
         } else if property.isArray {
             switch property.type {
             case .int:
                 guard let value = record.value(forKey: property.name) as? [Int] else { break }
                 let list = List<Int>()
-                list.append(objectsIn: value)
+                for item in value {
+                    try Task.checkCancellation()
+                    list.append(item)
+                }
                 recordValue = list
             case .string:
                 guard let value = record.value(forKey: property.name) as? [String] else { break }
                 let list = List<String>()
-                list.append(objectsIn: value)
+                for item in value {
+                    try Task.checkCancellation()
+                    list.append(item)
+                }
                 recordValue = list
             case .bool:
                 guard let value = record.value(forKey: property.name) as? [Bool] else { break }
                 let list = List<Bool>()
-                list.append(objectsIn: value)
+                for item in value {
+                    try Task.checkCancellation()
+                    list.append(item)
+                }
                 recordValue = list
             case .float:
                 guard let value = record.value(forKey: property.name) as? [Float] else { break }
                 let list = List<Float>()
-                list.append(objectsIn: value)
+                for item in value {
+                    try Task.checkCancellation()
+                    list.append(item)
+                }
                 recordValue = list
             case .double:
                 guard let value = record.value(forKey: property.name) as? [Double] else { break }
                 let list = List<Double>()
-                list.append(objectsIn: value)
+                for item in value {
+                    try Task.checkCancellation()
+                    list.append(item)
+                }
                 recordValue = list
             case .data:
                 guard let value = record.value(forKey: property.name) as? [Data] else { break }
                 let list = List<Data>()
-                list.append(objectsIn: value)
+                for item in value {
+                    try Task.checkCancellation()
+                    list.append(item)
+                }
                 recordValue = list
             case .date:
                 guard let value = record.value(forKey: property.name) as? [Date] else { break }
                 let list = List<Date>()
-                list.append(objectsIn: value)
+                for item in value {
+                    try Task.checkCancellation()
+                    list.append(item)
+                }
                 recordValue = list
             case .UUID:
                 guard let value = record.value(forKey: property.name) as? [String] else { break }
                 let list = List<UUID>()
-                list.append(objectsIn: value.compactMap { UUID(uuidString: $0) })
+                let newValues = try value.compactMap {
+                    try Task.checkCancellation()
+                    return UUID(uuidString: $0)
+                }
+                list.append(objectsIn: newValues)
                 recordValue = list
             case .object:
                 // Save relationship to be applied after all records have been downloaded and persisted
                 // to ensure target of the relationship has already been created
                 if let value = record.value(forKey: property.name) as? [String] {
                     for recordName in value {
+                        try Task.checkCancellation()
                         let separatorRange = recordName.range(of: ".")!
                         let objectIdentifier = String(recordName[separatorRange.upperBound...])
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
                 } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
                     for reference in value {
+                        try Task.checkCancellation()
                         // TODO: (If used anymore?) Maybe recordName should be let recordName = reference.recordID.recordName instead - GPT thought so... See elsewhere too
                         guard let recordName = reference.value(forKey: property.name) as? String else { return }
                         let separatorRange = recordName.range(of: ".")!
@@ -1467,6 +1523,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             default:
                 break
             }
+            try Task.checkCancellation()
             object.setValue(recordValue, forKey: property.name)
         } else if property.isMap {
             guard let value = value as? [NSArray], value.count == 2,
@@ -1476,6 +1533,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
             var result: [String: Any] = [:]
             for (index, key) in keyArray.enumerated() {
+                try Task.checkCancellation()
                 switch property.type {
                 case .int:
                     if let val = valueArray[index] as? Int { result[key] = val }
@@ -1499,6 +1557,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     break
                 }
             }
+            try Task.checkCancellation()
             object.setValue(result, forKey: property.name)
         } else if let reference = value as? CKRecord.Reference {
             // Save relationship to be applied after all records have been downloaded and persisted
@@ -1517,11 +1576,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         } else if property.type == .UUID {
             if let uuidString = record.value(forKey: key) as? String,
                let uuid = UUID(uuidString: uuidString) {
+                try Task.checkCancellation()
                 object.setValue(uuid, forKey: key)
             }
         } else if let asset = value as? CKAsset {
             if let fileURL = asset.fileURL,
                let data = NSData(contentsOf: fileURL) {
+                try Task.checkCancellation()
                 object.setValue(data, forKey: key)
             }
         } else if value != nil || property.isOptional == true {
@@ -1530,6 +1591,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             // when extending an object model with a new non-optional property, when an old record is applied to the object.
             //            let ref = ThreadSafeReference(to: object)
             //            debugPrint("!! applyChange", type(of: object), key, value.debugDescription.prefix(100))
+            try Task.checkCancellation()
             object.setValue(value, forKey: key)
         }
     }
@@ -1641,8 +1703,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[originObjectClass.className()] else { return false }
                 if let originObject = targetWriterRealm.resolve(originRef) {
-                    await targetWriterRealm.asyncRefresh()
+//                    await targetWriterRealm.asyncRefresh()
                     try await targetWriterRealm.asyncWrite {
+                        try Task.checkCancellation()
                         originObject.setValue(targetObject, forKey: relationshipName)
                     }
                 }
@@ -2241,8 +2304,11 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
-                            for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk where realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration {
+                            for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk {
                                 try Task.checkCancellation()
+                                guard realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration else {
+                                    continue
+                                }
                                 
                                 var object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier)
                                 try Task.checkCancellation()
