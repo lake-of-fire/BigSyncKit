@@ -79,11 +79,23 @@ internal class ChangeRequestProcessor {
     
     internal var logger: Logging.Logger?
 
+    @BigSyncBackgroundActor
+    internal var cancelSync = false {
+        didSet {
+            if !cancelSync && oldValue {
+                Task { @BigSyncBackgroundActor [weak self] in
+                    try await self?.runProcessFetchedChangeRequests()
+                }
+            }
+        }
+    }
+    
     init() {
         changeSubject
-            .debounce(for: .seconds(2), scheduler: DispatchQueue.global())
+            .debounce(for: .seconds(3), scheduler: DispatchQueue.global())
             .sink { [weak self] _ in
                 Task { @BigSyncBackgroundActor [weak self] in
+                    guard !cancelSync else { return }
                     try await self?.runProcessFetchedChangeRequests()
                 }
             }
@@ -109,6 +121,7 @@ internal class ChangeRequestProcessor {
     private func runProcessFetchedChangeRequests() async throws {
 //        debugPrint("# runProcessFetchedChangeRequests START")
         processTask?.cancel()
+        _ = try? await processTask?.value
         processTask = Task { @BigSyncBackgroundActor [weak self] in
             try await self?.processFetchedChangeRequests()
 //            debugPrint("# runProcessFetchedChangeRequests ENDING")
@@ -124,6 +137,7 @@ internal class ChangeRequestProcessor {
         try Task.checkCancellation()
         
         while !changeRequests.isEmpty {
+            try Task.checkCancellation()
             let batch = changeRequests.prefix(batchSize)
             changeRequests.removeFirst(batch.count)
             
@@ -135,7 +149,6 @@ internal class ChangeRequestProcessor {
                     return $0.downloadedRecord
                 }
                 try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
-                
                 try Task.checkCancellation()
                 
                 let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
@@ -143,13 +156,12 @@ internal class ChangeRequestProcessor {
                     try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
                 }
             } catch is CancellationError {
-                // On cancellation, reinsert the batch and break
                 changeRequests.insert(contentsOf: batch, at: 0)
-                break
+                return
             } catch {
                 localErrors.append(error)
                 changeRequests.insert(contentsOf: batch, at: 0)
-                break
+                return
             }
             
             await Task.yield()
@@ -381,6 +393,7 @@ public class CloudKitSynchronizer: NSObject {
    
             //        debugPrint("CloudKitSynchronizer >> Initiating synchronization", identifier, containerIdentifier)
             cancelSync = false
+            ChangeRequestProcessor.shared.cancelSync = true
             syncing = true
             //        self.onFailure = onFailure
             
@@ -397,6 +410,7 @@ public class CloudKitSynchronizer: NSObject {
     @objc public func cancelSynchronization() {
         //        guard syncing, !cancelSync else { return }
         
+        ChangeRequestProcessor.shared.cancelSync = true
         ChangeRequestProcessor.shared.processTask?.cancel()
         synchronizationTask?.cancel()
         modifyRecordsTask?.cancel()

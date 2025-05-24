@@ -114,6 +114,7 @@ extension CloudKitSynchronizer {
                 // Don't retry...
                 syncing = false
                 cancelSync = false
+                ChangeRequestProcessor.shared.cancelSync = true
                 cancelledDueToUnauthentication = true
                 return
             case .serviceUnavailable, .requestRateLimited, .zoneBusy:
@@ -274,6 +275,13 @@ extension CloudKitSynchronizer {
             return
         }
         
+        do {
+            try Task.checkCancellation()
+        } catch {
+            try await final(error)
+            return
+        }
+        
         //        debugPrint("# sequential closure(...)")
         try await closure(first) { [weak self] error in
             guard error == nil else {
@@ -282,9 +290,14 @@ extension CloudKitSynchronizer {
             }
             
             // For lowering CPU priority gently
-            await Task.yield()
-            try? await Task.sleep(nanoseconds: 20_000)
-            
+            try? await Task.sleep(nanoseconds: 10_000)
+            do {
+                try Task.checkCancellation()
+            } catch {
+                try await final(error)
+                return
+            }
+
             var remaining = objects
             remaining.removeFirst()
             try await self?.sequential(objects: remaining, closure: closure, final: final)

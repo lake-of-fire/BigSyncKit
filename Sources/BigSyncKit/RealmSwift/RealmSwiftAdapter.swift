@@ -1271,6 +1271,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 }
                 if !shouldIgnore(key: property.name) {
                     if let asset = record[property.name] as? CKAsset {
+                        try Task.checkCancellation()
                         recordChanges[property.name] = asset.fileURL != nil ? NSData(contentsOf: asset.fileURL!) : NSNull()
                     } else {
                         recordChanges[property.name] = record[property.name] ?? NSNull()
@@ -2282,6 +2283,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                             recentlyFetchedRecordModifiedAts[syncedEntityID] = remoteModified
                         }
                         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+                        try Task.checkCancellation()
+                        
                         if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: syncedEntityID) {
                             guard !cancelSync else { throw CancellationError() }
                             try Task.checkCancellation()
@@ -2309,7 +2312,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                 guard realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration else {
                                     continue
                                 }
-                                
+                                try Task.checkCancellation()
+
                                 var object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier)
                                 try Task.checkCancellation()
                                 
