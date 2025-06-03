@@ -119,16 +119,13 @@ internal class ChangeRequestProcessor {
     
     @BigSyncBackgroundActor
     private func runProcessFetchedChangeRequests() async throws {
-//        debugPrint("# runProcessFetchedChangeRequests START")
         processTask?.cancel()
         _ = try? await processTask?.value
         processTask = Task { @BigSyncBackgroundActor [weak self] in
             try await self?.processFetchedChangeRequests()
-//            debugPrint("# runProcessFetchedChangeRequests ENDING")
             self?.processTask = nil
         }
         try await processTask?.value
-//        debugPrint("# runProcessFetchedChangeRequests END")
     }
     
     @BigSyncBackgroundActor
@@ -142,7 +139,7 @@ internal class ChangeRequestProcessor {
             changeRequests.removeFirst(batch.count)
             
             do {
-                logger?.info("QSCloudKitSynchronizer >> Processing \(batch.count) remote records for local merge: \(batch.compactMap { $0.downloadedRecord?.recordID.recordName } .joined(separator: " ")) (\(changeRequests.count) more remaining)")
+//                logger?.info("QSCloudKitSynchronizer >> Processing \(batch.count) remote records for local merge: \(batch.compactMap { $0.downloadedRecord?.recordID.recordName } .joined(separator: " ")) (\(changeRequests.count) more remaining)")
                 
                 let downloadedRecords = try batch.compactMap {
                     try Task.checkCancellation()
@@ -151,7 +148,10 @@ internal class ChangeRequestProcessor {
                 try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
                 try Task.checkCancellation()
                 
-                let deletedRecordIDs = batch.compactMap { $0.deletedRecordID }
+                let deletedRecordIDs = try batch.compactMap {
+                    try Task.checkCancellation()
+                    return $0.deletedRecordID
+                }
                 if !deletedRecordIDs.isEmpty {
                     try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
                 }
@@ -164,7 +164,7 @@ internal class ChangeRequestProcessor {
                 return
             }
             
-            await Task.yield()
+            try await Task.sleep(nanoseconds: 500_000)
         }
     }
     
@@ -364,7 +364,7 @@ public class CloudKitSynchronizer: NSObject {
         //        try? await Task.sleep(nanoseconds: 300_000_000) // Allow cancellations to catch up...
         if includingAdapters {
             for adapter in modelAdapters {
-                await adapter.unsetCancellation()
+                try? await adapter.unsetCancellation()
                 try? await adapter.resetSyncCaches()
             }
         }
@@ -398,7 +398,7 @@ public class CloudKitSynchronizer: NSObject {
             //        self.onFailure = onFailure
             
             for adapter in modelAdapters {
-                adapter.unsetCancellation()
+                try await adapter.unsetCancellation()
             }
             
             await self?.performSynchronization()

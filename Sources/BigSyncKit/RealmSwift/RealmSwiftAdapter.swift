@@ -293,6 +293,8 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     private var dummyRecordIdentifiers = Set<String>()
 #endif
     
+    private var isSetupInterrupted: Bool = false
+    
     public init(
         persistenceRealmConfiguration: Realm.Configuration,
         targetRealmConfigurations: [Realm.Configuration],
@@ -387,15 +389,19 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    public func unsetCancellation() {
+    public func unsetCancellation() async throws {
         //        debugPrint("# unset cancel")
         cancelSync = false
+        if isSetupInterrupted {
+            try await setup()
+        }
     }
     
     @BigSyncBackgroundActor
     func setup() async throws {
         logger.info("QSCloudKitSynchronizer >> Setup synchronization...")
         //        debugPrint("# setup() ...")
+        isSetupInterrupted = false
         realmProvider = await RealmProvider(
             persistenceConfiguration: persistenceRealmConfiguration,
             targetConfigurations: targetRealmConfigurations
@@ -467,13 +473,29 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     let identifiers = Array(results).map {
                         entityTypePrefix + Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
                     }
-                    try await createSyncedEntities(entityType: schema.className, identifiers: identifiers)
+                    do {
+                        try await createSyncedEntities(entityType: schema.className, identifiers: identifiers)
+                    } catch is CancellationError {
+                        isSetupInterrupted = true
+                        return
+                    } catch {
+                        isSetupInterrupted = true
+                        throw error
+                    }
                 }
             }
         }
         
         //        if !needsInitialSetup {
-        try await createMissingSyncedEntities()
+        do {
+            try await createMissingSyncedEntities()
+        } catch is CancellationError {
+            isSetupInterrupted = true
+            return
+        } catch {
+            isSetupInterrupted = true
+            throw error
+        }
         //        }
         
         // Removed startPollingForChanges() call
@@ -875,6 +897,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 let objects = targetReaderRealm.objects(objectClass)
                 for object in Array(objects) {
+                    guard !cancelSync else {
+                        throw CancellationError()
+                    }
+
                     guard let (entityType, identifier) = syncedEntityTypeAndIdentifier(for: object) else { continue }
                     let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
                     if syncedEntity == nil {
@@ -895,20 +921,22 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     @discardableResult
     func createSyncedEntities(entityType: String, identifiers: [String]) async throws {
         //                debugPrint("Create synced entities", entityType, identifiers.count)
-        logger.info("QSCloudKitSynchronizer >> Creating \(identifiers.count) SyncedEntity records for \(entityType)…")
+        //        logger.info("QSCloudKitSynchronizer >> Creating \(identifiers.count) SyncedEntity records for \(entityType)…")
         for chunk in identifiers.chunked(into: 500) {
             guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
             try await persistenceRealm.asyncWrite {
                 for identifier in chunk {
-                    guard !cancelSync else { throw CancellationError() }
+                    guard !cancelSync else {
+                        throw CancellationError()
+                    }
                     let syncedEntity = SyncedEntity(entityType: entityType, identifier: identifier, state: SyncedEntityState.new.rawValue)
                     persistenceRealm.add(syncedEntity, update: .modified)
                 }
             }
-            try? await Task.sleep(nanoseconds: 20_000_000)
-            //            await persistenceRealm.asyncRefresh()
+            try await Task.sleep(nanoseconds: 20_000_000)
+                //            await persistenceRealm.asyncRefresh()
         }
-        logger.info("QSCloudKitSynchronizer >> Created \(identifiers.count) SyncedEntity records for \(entityType)")
+        //        logger.info("QSCloudKitSynchronizer >> Created \(identifiers.count) SyncedEntity records for \(entityType)")
     }
     
     @BigSyncBackgroundActor
@@ -1021,7 +1049,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         let syncedEntityType = persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: entityType)
         return syncedEntityType?.lastTrackedChangesAt
     }
-
+    
     func shouldIgnore(key: String) -> Bool {
         return CloudKitSynchronizer.metadataKeys.contains(key)
     }
@@ -1244,10 +1272,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
         func applyChanges() throws {
-            logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
-#if DEBUG
-            logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict), local object: \(object.debugDescription) – remote object: \(record.debugDescription)")
-#endif
+            //            logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict): \(object.objectSchema.className) – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date)")
+            //#if DEBUG
+            //            logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict), local object: \(object.debugDescription) – remote object: \(record.debugDescription)")
+            //#endif
             for property in objectProperties where !skippedKeys.contains(property.name) {
                 try Task.checkCancellation()
                 if shouldIgnore(key: property.name) {
@@ -1301,13 +1329,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         result = false
                     }
                     try Task.checkCancellation()
-                    logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
-#if DEBUG
-                    try Task.checkCancellation()
-                    logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
-                    try Task.checkCancellation()
-                    logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
-#endif
+                    //                    logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
+                    //#if DEBUG
+                    //                    try Task.checkCancellation()
+                    //                    logger.info("QSCloudKitSynchronizer >> Conflict resolution object - local: \(object.description.prefix(5000))")
+                    //                    try Task.checkCancellation()
+                    //                    logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
+                    //#endif
                     return result
                 }(self, recordChanges, object)
             }
@@ -1320,7 +1348,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try applyChanges()
             } else {
                 if let remoteExplicitlyModifiedAt = record["explicitlyModifiedAt"] as? Date, let localExplicitlyModifiedAt = (object as? ChangeMetadataRecordable)?.explicitlyModifiedAt, remoteExplicitlyModifiedAt < localExplicitlyModifiedAt {
-                    logger.info("QSCloudKitSynchronizer >> Rejecting remote changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date), syncedEntityState=\(syncedEntityState.rawValue)")
+                    //                    logger.info("QSCloudKitSynchronizer >> Rejecting remote changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date), syncedEntityState=\(syncedEntityState.rawValue)")
                 }
                 // TODO: Ensure this local object is pending upload...
             }
@@ -1499,7 +1527,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     try Task.checkCancellation()
                     return UUID(uuidString: $0)
                 }
-                list.append(objectsIn: newValues)
+                for item in newValues {
+                    try Task.checkCancellation()
+                    list.append(item)
+                }
                 recordValue = list
             case .object:
                 // Save relationship to be applied after all records have been downloaded and persisted
@@ -1704,7 +1735,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[originObjectClass.className()] else { return false }
                 if let originObject = targetWriterRealm.resolve(originRef) {
-//                    await targetWriterRealm.asyncRefresh()
+                    //                    await targetWriterRealm.asyncRefresh()
                     try await targetWriterRealm.asyncWrite {
                         try Task.checkCancellation()
                         originObject.setValue(targetObject, forKey: relationshipName)
@@ -2130,7 +2161,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
 #endif
         
-//        debugPrint("# TO UPLOAD:", record.debugDescription)
+        //        debugPrint("# TO UPLOAD:", record.debugDescription)
         return record
     }
     
@@ -2153,7 +2184,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 logger.warning("QSCloudKitSynchronizer >> Clean Up: No Realm object class found for \(className)")
                 continue
             }
- 
+            
             do {
                 var skippedIdentifiers = Set<String>()
                 try targetWriterRealm.write {
@@ -2205,7 +2236,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var recordsToSave: [(record: CKRecord, objectClass: RealmSwift.Object.Type, objectIdentifier: Any, syncedEntityID: String, syncedEntityState: SyncedEntityState, entityType: String)] = []
         var syncedEntitiesToCreate: [SyncedEntity] = []
         try Task.checkCancellation()
-
+        
         for chunk in records.chunked(into: 100) {
             for record in chunk {
                 try Task.checkCancellation()
@@ -2228,7 +2259,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         let objectIdentifier = getObjectIdentifier(for: syncedEntity)
                         try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
-
+                        
                         let recordToSave = (record, objectClass, objectIdentifier, syncedEntity.identifier, syncedEntity.entityState, syncedEntity.entityType)
                         guard !cancelSync else { throw CancellationError() }
                         try Task.checkCancellation()
@@ -2239,7 +2270,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         }
                         guard !cancelSync else { throw CancellationError() }
                         try Task.checkCancellation()
-
+                        
                         if forceSave || hasChanges(record: record, object: object) {
                             recordsToSave.append(recordToSave)
                             //                        } else {
@@ -2271,7 +2302,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 
-//                                await realmProvider.persistenceRealm?.asyncRefresh()
+                //                                await realmProvider.persistenceRealm?.asyncRefresh()
                 try await realmProvider.persistenceRealm?.asyncWrite { [weak self] in
                     guard let self else { return }
                     
@@ -2304,7 +2335,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         guard await !cancelSync else { throw CancellationError() }
                         await targetWriterRealm.asyncRefresh()
                         try Task.checkCancellation()
-
+                        
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
                             for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk {
@@ -2313,7 +2344,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                                     continue
                                 }
                                 try Task.checkCancellation()
-
+                                
                                 var object = targetWriterRealm.object(ofType: objectType, forPrimaryKey: objectIdentifier)
                                 try Task.checkCancellation()
                                 
@@ -2389,7 +2420,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         let object = targetWriterRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
                         
                         if let object {
-//                            await targetWriterRealm.asyncRefresh()
+                            //                            await targetWriterRealm.asyncRefresh()
                             try Task.checkCancellation()
                             try? await targetWriterRealm.asyncWrite {
                                 try Task.checkCancellation()
@@ -2408,7 +2439,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try? await persistenceRealm.asyncWrite {
                     try Task.checkCancellation()
                     syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
-//                    persistenceRealm.delete(syncedEntity)
+                    //                    persistenceRealm.delete(syncedEntity)
                 }
             }
             
@@ -2505,7 +2536,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 //                await persistenceRealm.asyncRefresh()
                 try? await persistenceRealm.asyncWrite {
                     syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
-//                    persistenceRealm.delete(syncedEntity)
+                    //                    persistenceRealm.delete(syncedEntity)
                 }
             }
         }
@@ -2615,10 +2646,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
 final class ZSTDCompressor {
     /// A single shared compressor instance for the entire app.
     static let shared = ZSTDCompressor()
-        
+    
     private let cdict: OpaquePointer?
     private let ddict: OpaquePointer?
-
+    
     private init() {
         guard let dictURL = Bundle.module.url(forResource: "ckrecordDictionary", withExtension: nil, subdirectory: "zstd"),
               let data = try? Data(contentsOf: dictURL) else {

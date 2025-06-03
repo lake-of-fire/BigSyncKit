@@ -51,7 +51,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func changesFinishedSynchronizing() async {
-        logger.info("QSCloudKitSynchronizer >> Finishing synchronization batch...")
+//        logger.info("QSCloudKitSynchronizer >> Finishing synchronization batch...")
         
         resetActiveTokens()
         
@@ -64,7 +64,7 @@ extension CloudKitSynchronizer {
         postNotification(.SynchronizerDidSynchronize)
         delegate?.synchronizerDidSync(self)
         
-        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
+//        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
         syncing = false
     }
     
@@ -320,8 +320,9 @@ extension CloudKitSynchronizer {
         if let lastEmpty = lastDatabaseChangesEmptyAt,
            Date().timeIntervalSince(lastEmpty) < 45 * 60 {
             for adapter in modelAdapters {
+                try Task.checkCancellation()
                 if adapter.hasChanges {
-                    logger.info("QSCloudKitSynchronizer >> Skipping CloudKit token update: last fetch was empty and recent and uploads are pending")
+//                    logger.info("QSCloudKitSynchronizer >> Skipping CloudKit token update: last fetch was empty and recent and uploads are pending")
                     return true
                 }
             }
@@ -332,7 +333,7 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchChanges() async {
         //        debugPrint("# fetchChanges()")
-        logger.info("QSCloudKitSynchronizer >> Fetch changes?")
+//        logger.info("QSCloudKitSynchronizer >> Fetch changes?")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
@@ -542,7 +543,9 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func mergeChanges(completion: @escaping (Error?) async throws -> ()) async throws {
+    func mergeChanges(
+        completion: @escaping (Error?) async throws -> ()
+    ) async throws {
         //        debugPrint("# mergeChanges()")
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
@@ -556,7 +559,11 @@ extension CloudKitSynchronizer {
             }
         }
         
-        try await sequential(objects: adapterSet, closure: mergeChangesIntoAdapter, final: completion)
+        try await sequential(
+            objects: adapterSet,
+            closure: mergeChangesIntoAdapter,
+            final: completion
+        )
     }
     
     @BigSyncBackgroundActor
@@ -897,7 +904,7 @@ extension CloudKitSynchronizer {
             return
         }
         
-        logger.info("QSCloudKitSynchronizer >> Update server token....")
+//        logger.info("QSCloudKitSynchronizer >> Update server token....")
         
         let operation = FetchZoneChangesOperation(
             database: database,

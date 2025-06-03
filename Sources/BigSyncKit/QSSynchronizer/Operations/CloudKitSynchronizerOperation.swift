@@ -51,7 +51,7 @@ class CloudKitSynchronizerOperation: Operation {
         if let error = error {
             errorHandler?(self, error)
         } else {
-            logger?.info("QSCloudKitSynchronizer >> Operation succeeded: \(type(of: self))")
+//            logger?.info("QSCloudKitSynchronizer >> Operation succeeded: \(type(of: self))")
         }
         if let synchronizer = self as? CloudKitSynchronizer {
             Task { @BigSyncBackgroundActor in
@@ -62,6 +62,6 @@ class CloudKitSynchronizerOperation: Operation {
     }
     
     internal func logStart() {
-        logger?.info("QSCloudKitSynchronizer >> Starting operation: \(type(of: self))")
+//        logger?.info("QSCloudKitSynchronizer >> Starting operation: \(type(of: self))")
     }
 }
