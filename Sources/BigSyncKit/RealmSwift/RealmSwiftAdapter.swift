@@ -2386,10 +2386,10 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             if !skipped.isEmpty {
                 logger.info("QSCloudKitSynchronizer >> Skipped downloaded records for having no changes: \(skipped)")
             }
-            logger.info("QSCloudKitSynchronizer >> Persisted downloaded record names: \(savedRecordNames.joined(separator: " "))")
-#if DEBUG
-            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(recordsToSave.map { ($0.record.recordID.recordName, $0.record.debugDescription) })")
-#endif
+//            logger.info("QSCloudKitSynchronizer >> Persisted downloaded record names: \(savedRecordNames.joined(separator: " "))")
+//#if DEBUG
+//            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(recordsToSave.map { ($0.record.recordID.recordName, $0.record.debugDescription) })")
+//#endif
         }
     }
     
