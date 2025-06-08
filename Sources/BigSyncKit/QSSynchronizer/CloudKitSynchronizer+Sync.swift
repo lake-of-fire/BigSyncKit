@@ -284,6 +284,7 @@ extension CloudKitSynchronizer {
         
         //        debugPrint("# sequential closure(...)")
         try await closure(first) { [weak self] error in
+            guard let self else { return }
             guard error == nil else {
                 try await final(error)
                 return
@@ -293,6 +294,7 @@ extension CloudKitSynchronizer {
             try? await Task.sleep(nanoseconds: 10_000)
             do {
                 try Task.checkCancellation()
+                guard await !cancelSync else { throw CancellationError() }
             } catch {
                 try await final(error)
                 return
@@ -300,7 +302,7 @@ extension CloudKitSynchronizer {
 
             var remaining = objects
             remaining.removeFirst()
-            try await self?.sequential(objects: remaining, closure: closure, final: final)
+            try await sequential(objects: remaining, closure: closure, final: final)
         }
     }
     
@@ -630,8 +632,9 @@ extension CloudKitSynchronizer {
                 try await completion(error)
                 return
             }
-            guard let self = self else { return }
-            
+            guard let self else { return }
+            guard !cancelSync else { throw CancellationError() }
+
             try await sequential(objects: modelAdapters, closure: uploadDeletions, final: completion)
         }
     }
@@ -639,10 +642,11 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func setupZoneAndUploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
         try await setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
-            guard let self = self, error == nil else {
+            guard let self, error == nil else {
                 try await completion(error)
                 return
             }
+            guard !cancelSync else { throw CancellationError() }
             //            debugPrint("# uploadRecords from setupZoneAndUploadRecords")
             try await uploadRecords(adapter: adapter, completion: { [weak self] (error) in
                 if error == nil {

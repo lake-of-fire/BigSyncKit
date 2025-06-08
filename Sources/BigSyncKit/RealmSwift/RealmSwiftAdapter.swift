@@ -2237,7 +2237,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var syncedEntitiesToCreate: [SyncedEntity] = []
         try Task.checkCancellation()
         
-        for chunk in records.chunked(into: 100) {
+        for chunk in records.chunked(into: 200) {
             for record in chunk {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }

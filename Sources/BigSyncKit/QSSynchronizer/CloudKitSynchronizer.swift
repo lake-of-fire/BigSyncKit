@@ -135,6 +135,7 @@ internal class ChangeRequestProcessor {
         
         while !changeRequests.isEmpty {
             try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
             let batch = changeRequests.prefix(batchSize)
             changeRequests.removeFirst(batch.count)
             
@@ -145,6 +146,7 @@ internal class ChangeRequestProcessor {
                     try Task.checkCancellation()
                     return $0.downloadedRecord
                 }
+                
                 try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
                 try Task.checkCancellation()
                 
