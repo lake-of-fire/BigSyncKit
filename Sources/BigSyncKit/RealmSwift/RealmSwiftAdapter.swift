@@ -753,25 +753,30 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             }
         }
         
-        try? await Task.sleep(nanoseconds: 10_000_000)
+        try await Task.sleep(nanoseconds: 10_000_000)
         await persistenceRealm.asyncRefresh()
         
         var lastTrackedChangesAtUpdates: [(String, Date)] = []
         for changeSet in [currentChangeSet.insertions, currentChangeSet.modifications] {
             for (schema, latestExplicitlyModifiedAt) in changeSet.map({ ($0.key, $0.value.1) }) {
+                try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { continue }
                 guard !cancelSync else { throw CancellationError() }
-                
+
                 if let latestExplicitlyModifiedAt, syncedEntityType.lastTrackedChangesAt != latestExplicitlyModifiedAt {
                     lastTrackedChangesAtUpdates.append((syncedEntityType.entityType, latestExplicitlyModifiedAt))
                 }
             }
         }
+        try Task.checkCancellation()
         guard !cancelSync else { throw CancellationError() }
+
         if !lastTrackedChangesAtUpdates.isEmpty {
-            try? await persistenceRealm.asyncWrite {
+            try await persistenceRealm.asyncWrite {
                 for (syncedEntityType, latestExplicitlyModifiedAt) in lastTrackedChangesAtUpdates {
+                    try Task.checkCancellation()
+                    guard !cancelSync else { throw CancellationError() }
                     persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: syncedEntityType)?.lastTrackedChangesAt = latestExplicitlyModifiedAt
                 }
             }
