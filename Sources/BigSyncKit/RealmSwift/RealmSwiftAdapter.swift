@@ -521,7 +521,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 .publisher(for: UIApplication.didBecomeActiveNotification)
             )
             .sink { [weak self] _ in
-                self?.immediateChecksSubject.send(())
+                Task { @MainActor [weak self] in
+                    self?.immediateChecksSubject.send(())
+                }
             }
             .store(in: &cancellables)
 #endif
@@ -552,7 +554,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             .debounce(for: .seconds(10), scheduler: bigSyncKitQueue)
 #endif
             .sink { [weak self] changedRealm in
-                guard let self = self else { return }
+                guard let self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                     guard let self = self else { return }
                     await enqueueCreatedAndModified(in: changedRealm)
