@@ -714,7 +714,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             for chunk in Array(identifiers).chunked(into: 2000) {
                 //                await persistenceRealm.asyncRefresh()
-                try? await persistenceRealm.asyncWrite {
+                try await persistenceRealm.asyncWrite {
                     for identifier in chunk {
                         try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
@@ -736,7 +736,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             for chunk in Array(identifiers).chunked(into: 2000) {
                 //                await persistenceRealm.asyncRefresh()
-                try? await persistenceRealm.asyncWrite {
+                try await persistenceRealm.asyncWrite {
                     for identifier in chunk {
                         try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
@@ -2296,7 +2296,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
-            try? await Task.sleep(nanoseconds: 10_000_000)
+            try await Task.sleep(nanoseconds: 10_000_000)
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
         }
@@ -2382,7 +2382,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-                try? await Task.sleep(nanoseconds: 100_000)
+                try await Task.sleep(nanoseconds: 100_000)
             }
             
             logger.info("QSCloudKitSynchronizer >> Persisted \(recordsToSave.count) downloaded records")
@@ -2419,7 +2419,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                     let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
                     
-                    try? await { @RealmBackgroundActor in
+                    try await { @RealmBackgroundActor in
                         try Task.checkCancellation()
                         guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[objectClass.className()] else { return }
                         let object = targetWriterRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
@@ -2441,7 +2441,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                 //                await persistenceRealm.asyncRefresh()
-                try? await persistenceRealm.asyncWrite {
+                try await persistenceRealm.asyncWrite {
                     try Task.checkCancellation()
                     syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
                     //                    persistenceRealm.delete(syncedEntity)
@@ -2450,7 +2450,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
             
             countDeleted += 1
             if countDeleted % 20 == 0 {
-                try? await Task.sleep(nanoseconds: 20_000)
+                try await Task.sleep(nanoseconds: 20_000)
                 try Task.checkCancellation()
             }
         }
@@ -2493,11 +2493,13 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         
         for chunk in savedRecords.chunked(into: 500) {
+            try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
             
             //            await persistenceRealm.asyncRefresh()
-            try? await persistenceRealm.asyncWrite {
+            try await persistenceRealm.asyncWrite {
                 for record in chunk {
+                    try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
                     
                     if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
@@ -2507,7 +2509,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                     }
                 }
             }
-            try? await Task.sleep(nanoseconds: 20_000_000)
+            try await Task.sleep(nanoseconds: 20_000_000)
         }
         
         updateHasChanges(realm: persistenceRealm)

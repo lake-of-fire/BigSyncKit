@@ -36,6 +36,7 @@ public struct LastSeenDevice: Identifiable {
     }
 }
 
+@MainActor
 public class SyncStatusViewModel: ObservableObject {
     public let realmConfiguration: Realm.Configuration
     
