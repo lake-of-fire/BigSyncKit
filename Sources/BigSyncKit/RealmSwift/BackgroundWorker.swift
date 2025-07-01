@@ -29,6 +29,7 @@ public class BigSyncBackgroundWorkerBase: NSObject {
                 Thread.exit()
             }
             thread?.name = "\(String(describing: self))-\(UUID().uuidString)"
+            thread?.qualityOfService = .background
             thread?.start()
         }
         
