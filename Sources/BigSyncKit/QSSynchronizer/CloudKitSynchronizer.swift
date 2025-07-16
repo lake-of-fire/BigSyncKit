@@ -395,7 +395,7 @@ public class CloudKitSynchronizer: NSObject {
    
             //        debugPrint("CloudKitSynchronizer >> Initiating synchronization", identifier, containerIdentifier)
             cancelSync = false
-            ChangeRequestProcessor.shared.cancelSync = true
+            ChangeRequestProcessor.shared.cancelSync = false
             syncing = true
             //        self.onFailure = onFailure
             

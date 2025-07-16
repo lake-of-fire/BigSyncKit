@@ -48,7 +48,8 @@ class CloudKitSynchronizerOperation: Operation {
     }
     
     func finish(error: Error?) {
-        if let error = error {
+        if let error {
+//            logger?.info("QSCloudKitSynchronizer >> Operation failed: \(error)")
             errorHandler?(self, error)
         } else {
 //            logger?.info("QSCloudKitSynchronizer >> Operation succeeded: \(type(of: self))")

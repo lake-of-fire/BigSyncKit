@@ -509,7 +509,8 @@ extension CloudKitSynchronizer {
                     }
                     return nil
                 }).first
-                
+                try Task.checkCancellation()
+
                 // Process any remaining change requests before saving server change tokens
                 try await changeRequestProcessor.finishProcessing()
                 try Task.checkCancellation()
