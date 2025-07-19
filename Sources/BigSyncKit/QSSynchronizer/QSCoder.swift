@@ -8,7 +8,7 @@
 import Foundation
 import CloudKit
 
-class QSCoder {
+final class QSCoder: Sendable {
     
     static let shared = QSCoder()
     

@@ -33,6 +33,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
     }
 }
 
+@BigSyncBackgroundActor
 public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
     public var realmSynchronizer: CloudKitSynchronizer
     
@@ -73,12 +74,17 @@ public class BigSyncBackgroundWorker: BigSyncBackgroundWorkerBase {
         super.init()
         
         start { [weak self] in
+            guard let self else { return }
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self = self else { return }
+                guard let self else { return }
                 
                 if let containerIdentifier = synchronizer.containerIdentifier {
                     for modelAdapter in synchronizer.modelAdapters {
-                        await CloudKitSynchronizer.transferOldServerChangeToken(to: modelAdapter, userDefaults: synchronizer.keyValueStore, containerName: containerIdentifier)
+                        await CloudKitSynchronizer.transferOldServerChangeToken(
+                            to: modelAdapter,
+                            userDefaults: synchronizer.keyValueStore,
+                            containerName: containerIdentifier
+                        )
                     }
                 }
                 

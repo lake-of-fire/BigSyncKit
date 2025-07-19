@@ -11,6 +11,8 @@ import RealmSwift
 import CloudKit
 import Logging
 
+extension Realm.Configuration: @unchecked Sendable { }
+
 extension CloudKitSynchronizer {
     /**
      *  Creates a new `QSCloudKitSynchronizer` prepared to work with a Realm model and the SyncKit default record zone in the private database.

@@ -10,7 +10,7 @@ import CloudKit
 import RealmSwift
 
 /// The merge policy to resolve change conflicts. Default value is `server`
-@objc public enum MergePolicy: Int {
+@objc public enum MergePolicy: Int, Sendable {
     /// Downloaded changes have preference.
     case server
     /// Delegate can resolve changes manually.
@@ -30,7 +30,7 @@ public protocol ModelAdapterDelegate: AnyObject {
 
 /// An object conforming to `ModelAdapter` will track the local model, provide changes to upload to CloudKit and import downloaded changes.
 //@objc public protocol ModelAdapter: AnyObject {
-public protocol ModelAdapter: AnyObject {
+public protocol ModelAdapter: AnyObject, Sendable {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
     

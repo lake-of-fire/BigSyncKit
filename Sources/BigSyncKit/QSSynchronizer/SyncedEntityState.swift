@@ -7,7 +7,7 @@
 
 import Foundation
 
-enum SyncedEntityState: Int {
+enum SyncedEntityState: Int, Sendable {
     // Order of the raw values is significant; see recordsToUpload and nextStateToSync
     case new = 1
     case changed = 2

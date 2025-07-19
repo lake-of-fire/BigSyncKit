@@ -34,6 +34,9 @@ import libzstd
 
 let bigSyncKitQueue = DispatchQueue(label: "BigSyncKit")
 
+extension Realm: @unchecked Sendable { }
+extension CKRecord: @unchecked Sendable { }
+
 extension Array {
     func chunked(into size: Int) -> [[Element]] {
         return stride(from: 0, to: count, by: size).map {
@@ -199,12 +202,12 @@ actor RealmProvider {
         self.targetConfigurations = targetConfigurations
         
         do {
-            persistenceRealmObject = try await Realm(configuration: persistenceConfiguration, actor: BigSyncBackgroundActor.shared)
+            persistenceRealmObject = try await Realm.open(configuration: persistenceConfiguration)
             //            debugPrint("# persistence realm", persistenceRealmObject.configuration.fileURL)
             
             var targetReaderRealmObjects = [Realm]()
             for targetConfiguration in targetConfigurations {
-                try await targetReaderRealmObjects.append(Realm(configuration: targetConfiguration, actor: BigSyncBackgroundActor.shared))
+                try await targetReaderRealmObjects.append(Realm.open(configuration: targetConfiguration))
             }
             self.targetReaderRealmObjects = targetReaderRealmObjects
             
@@ -242,7 +245,9 @@ struct ResultsChangeSet {
     var modifications: [String: (Set<String>, Date?)] = [:] // schemaName -> Set of modification and latests explicitlyModifiedAts
 }
 
-public class RealmSwiftAdapter: NSObject, ModelAdapter {
+extension RealmSwiftAdapter: @unchecked Sendable { }
+
+public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     public let persistenceRealmConfiguration: Realm.Configuration
     public let targetRealmConfigurations: [Realm.Configuration]
     public let excludedClassNames: [String]
@@ -290,6 +295,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     private var cancellables = Set<AnyCancellable>()
     
 #if DEBUG
+    @RealmBackgroundActor
     private var dummyRecordIdentifiers = Set<String>()
 #endif
     
@@ -324,7 +330,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
     
     deinit {
-        invalidateTokens()
+        Task { [weak self] in
+            await self?.invalidateTokens()
+        }
     }
     
     @BigSyncBackgroundActor
@@ -1291,7 +1299,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 if property.type == .linkingObjects {
                     continue
                 }
-                try applyChange(property: property, record: record, object: object, syncedEntityIdentifier: syncedEntityID)
+                try applyChange(
+                    property: property,
+                    record: record,
+                    object: object,
+                    syncedEntityIdentifier: syncedEntityID
+                )
             }
         }
         
@@ -1362,7 +1375,12 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
     }
     
-    func applyChange(property: Property, record: CKRecord, object: Object, syncedEntityIdentifier: String) throws {
+    func applyChange(
+        property: Property,
+        record: CKRecord,
+        object: Object,
+        syncedEntityIdentifier: String
+    ) throws {
         let key = property.name
         if key == object.objectSchema.primaryKeyProperty!.name {
             return
@@ -1792,6 +1810,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         return compressed
     }
     
+    @BigSyncBackgroundActor
     func getRecord(for syncedEntity: SyncedEntity) -> CKRecord? {
         guard let recordData = syncedEntity.encodedRecord,
               let decompressed = ZSTDCompressor.shared.decompress(data: recordData),
@@ -1815,6 +1834,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         
 #if DEBUG
         // Ensure dummy records are uploaded first
+        let dummyRecordIdentifiers = await dummyRecordIdentifiers
         let resultsToUpload = Array(results).sorted {
             let isFirstDummy = dummyRecordIdentifiers.contains($0.identifier)
             let isSecondDummy = dummyRecordIdentifiers.contains($1.identifier)
@@ -2093,7 +2113,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         }
         
 #if DEBUG
-        if dummyRecordIdentifiers.contains(syncedEntity.identifier) {
+        if await dummyRecordIdentifiers.contains(syncedEntity.identifier) {
             for property in object.objectSchema.properties {
                 let isNil = record[property.name] == nil
                 let isEmptyArrayOrSet = (property.isArray || property.isSet) && ((record[property.name] as? [Any])?.isEmpty ?? false)
@@ -2244,7 +2264,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
         var syncedEntitiesToCreate: [SyncedEntity] = []
         try Task.checkCancellation()
         
-        for chunk in records.chunked(into: 200) {
+        for chunk in records.chunks(ofCount: 200) {
             for record in chunk {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
@@ -2334,6 +2354,9 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 
+                let safeChunk: [(CKRecord, Object.Type, any Sendable, String, SyncedEntityState, String)] = chunk.map {
+                    ($0.record, $0.objectClass, $0.objectIdentifier as! any Sendable, $0.syncedEntityID, $0.syncedEntityState, $0.entityType)
+                }
                 try await { @RealmBackgroundActor in
                     guard let targetWriterRealms = realmProvider.targetWriterRealms else { return }
                     
@@ -2345,7 +2368,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
                         
                         try await targetWriterRealm.asyncWrite { [weak self] in
                             guard let self else { return }
-                            for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in chunk {
+                            for (record, objectType, objectIdentifier, syncedEntityID, syncedEntityState, entityType) in safeChunk {
                                 try Task.checkCancellation()
                                 guard realmProvider.targetWriterRealmPerSchemaName[objectType.className()]?.configuration == targetWriterRealm.configuration else {
                                     continue
@@ -2652,6 +2675,7 @@ public class RealmSwiftAdapter: NSObject, ModelAdapter {
     }
 }
 
+@BigSyncBackgroundActor
 final class ZSTDCompressor {
     /// A single shared compressor instance for the entire app.
     static let shared = ZSTDCompressor()
@@ -2683,14 +2707,14 @@ final class ZSTDCompressor {
         self.ddict = tempDDict
     }
     
-    deinit {
-        if let cdict {
-            ZSTD_freeCDict(cdict)
-        }
-        if let ddict {
-            ZSTD_freeDDict(ddict)
-        }
-    }
+//    func close() {
+//        if let cdict {
+//            ZSTD_freeCDict(cdict)
+//        }
+//        if let ddict {
+//            ZSTD_freeDDict(ddict)
+//        }
+//    }
     
     /// Compress the provided data using the cached dictionary.
     func compress(data: Data) throws -> Data? {

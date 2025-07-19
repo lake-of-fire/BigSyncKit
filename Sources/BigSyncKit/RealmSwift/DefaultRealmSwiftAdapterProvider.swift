@@ -45,8 +45,10 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         adapter = createAdapter()
     }
     
-    @BigSyncBackgroundActor
-    public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID recordZoneID: CKRecordZone.ID) -> ModelAdapter? {
+    public func cloudKitSynchronizer(
+        _ synchronizer: CloudKitSynchronizer,
+        modelAdapterForRecordZoneID recordZoneID: CKRecordZone.ID
+    ) -> ModelAdapter? {
         guard recordZoneID == zoneID else { return nil }
         return adapter
     }

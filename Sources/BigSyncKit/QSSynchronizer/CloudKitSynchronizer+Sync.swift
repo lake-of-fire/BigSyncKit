@@ -148,6 +148,7 @@ extension CloudKitSynchronizer {
             //        cancelSync = false
             //            await beginSynchronization(force: true)
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
                 await performSynchronization()
             }
         }
@@ -173,13 +174,15 @@ extension CloudKitSynchronizer {
         //        logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
         operation.logger = logger
         operation.errorHandler = { [weak self] operation, error in
+            guard let self else { return }
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
                 if let ckError = error as? CKError, ckError.code == .serverRecordChanged {
                     // Conflict error: skip logging and failing synchronization
                     return
                 }
                 logger.error("QSCloudKitSynchronizer >> Operation error (\(type(of: operation))): \(error)")
-                await self?.failSynchronization(error: error)
+                await failSynchronization(error: error)
             }
         }
         currentOperations.removeAll { $0.isFinished }
@@ -257,7 +260,12 @@ extension CloudKitSynchronizer {
         return error.code == CKError.limitExceeded.rawValue
     }
     
-    func sequential<T>(objects: [T], closure: @escaping (T, @escaping (Error?) async throws -> ()) async throws -> (), final: @escaping (Error?) async throws -> ()) async throws {
+    @BigSyncBackgroundActor
+    func sequential<T>(
+        objects: [T],
+        closure: @Sendable @BigSyncBackgroundActor @escaping (T, @BigSyncBackgroundActor @escaping (Error?) async throws -> ()) async throws -> (),
+        final: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
+    ) async throws {
         guard let first = objects.first else {
             try await final(nil)
             return
@@ -454,7 +462,10 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID], completion: @escaping (Error?) async throws -> ()) {
+    func fetchZoneChanges(
+        _ zoneIDs: [CKRecordZone.ID],
+        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
+    ) {
         //        debugPrint("# fetchZoneChanges(...)", zoneIDs)
         let changeRequestProcessor = ChangeRequestProcessor.shared
         let operation = FetchZoneChangesOperation(
@@ -547,7 +558,7 @@ extension CloudKitSynchronizer {
     
     @BigSyncBackgroundActor
     func mergeChanges(
-        completion: @escaping (Error?) async throws -> ()
+        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
         //        debugPrint("# mergeChanges()")
         guard !cancelSync else {
@@ -564,13 +575,19 @@ extension CloudKitSynchronizer {
         
         try await sequential(
             objects: adapterSet,
-            closure: mergeChangesIntoAdapter,
+            closure: { [weak self] adapter, completion in
+                guard let self else { return }
+                try await mergeChangesIntoAdapter(adapter, completion: completion)
+            },
             final: completion
         )
     }
     
     @BigSyncBackgroundActor
-    func mergeChangesIntoAdapter(_ adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
+    func mergeChangesIntoAdapter(
+        _ adapter: ModelAdapter,
+        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
+    ) async throws {
         do {
             try await adapter.persistImportedChanges()
         } catch {
@@ -626,9 +643,17 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func uploadChanges(completion: @escaping (Error?) async throws -> ()) async throws {
+    func uploadChanges(
+        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
+    ) async throws {
         //        debugPrint("# uploadChanges(completion)")
-        try await sequential(objects: modelAdapters, closure: setupZoneAndUploadRecords) { [weak self] (error) in
+        try await sequential(
+            objects: modelAdapters,
+            closure: { [weak self] adapter, completion in
+                guard let self else { return }
+                try await setupZoneAndUploadRecords(adapter: adapter, completion: completion)
+            }
+        ) { [weak self] (error) in
             guard error == nil else {
                 try await completion(error)
                 return
@@ -636,12 +661,22 @@ extension CloudKitSynchronizer {
             guard let self else { return }
             guard !cancelSync else { throw CancellationError() }
 
-            try await sequential(objects: modelAdapters, closure: uploadDeletions, final: completion)
+            try await sequential(
+                objects: modelAdapters,
+                closure: { [weak self] adapter, completion in
+                    guard let self else { return }
+                    try await uploadDeletions(adapter: adapter, completion: completion)
+                },
+                final: completion
+            )
         }
     }
     
     @BigSyncBackgroundActor
-    func setupZoneAndUploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
+    func setupZoneAndUploadRecords(
+        adapter: ModelAdapter,
+        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
+    ) async throws {
         try await setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
             guard let self, error == nil else {
                 try await completion(error)
@@ -659,7 +694,10 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func setupRecordZoneIfNeeded(adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
+    func setupRecordZoneIfNeeded(
+        adapter: ModelAdapter,
+        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
+    ) async throws {
         guard try await needsZoneSetup(adapter: adapter) else {
             try await completion(nil)
             return
@@ -669,7 +707,10 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func setupRecordZoneID(_ zoneID: CKRecordZone.ID, completion: @escaping (Error?) async throws -> ()) {
+    func setupRecordZoneID(
+        _ zoneID: CKRecordZone.ID,
+        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
+    ) {
         database.fetch(withRecordZoneID: zoneID) { [weak self] (zone, error) in
             guard let self = self else { return }
             if isZoneNotFoundOrDeletedError(error) {
@@ -824,7 +865,10 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func uploadDeletions(adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
+    func uploadDeletions(
+        adapter: ModelAdapter,
+        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
+    ) async throws {
         let recordIDs = try await adapter.recordIDsMarkedForDeletion(limit: batchSize)
         let recordCount = recordIDs.count
         let requestedBatchSize = batchSize
@@ -955,10 +999,12 @@ extension CloudKitSynchronizer {
         runOperation(operation)
     }
     
+    @BigSyncBackgroundActor
     func reduceBatchSize() {
         self.batchSize = max(1, Int((Double(self.batchSize) / 2.75).rounded()))
     }
     
+    @BigSyncBackgroundActor
     func increaseBatchSize() {
         if self.batchSize < CloudKitSynchronizer.maxBatchSize {
             //            self.batchSize = min(CloudKitSynchronizer.maxBatchSize, self.batchSize + ((CloudKitSynchronizer.maxBatchSize - CloudKitSynchronizer.defaultInitialBatchSize) / 5))

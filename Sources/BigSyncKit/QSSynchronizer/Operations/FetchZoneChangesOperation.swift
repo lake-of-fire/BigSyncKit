@@ -105,7 +105,8 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
                     }
                 } else {
                     Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                        self?.zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
+                        guard let self else { return }
+                        zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
                         await onResult?(record, nil)
                     }
                 }

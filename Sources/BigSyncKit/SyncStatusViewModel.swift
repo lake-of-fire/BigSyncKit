@@ -57,6 +57,7 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerChangesRemainingToUpload)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
+                guard let self else { return }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let userInfo = notification.userInfo
@@ -70,6 +71,7 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerWillSynchronize)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
+                guard let self else { return }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     syncStatus = "Preparing to Synchronize"
@@ -82,6 +84,7 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerWillFetchChanges)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
+                guard let self else { return }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     syncStatus = "Fetching Changes"
@@ -93,6 +96,7 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerWillUploadChanges)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
+                guard let self else { return }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     syncStatus = "Uploading Changes"
@@ -106,6 +110,7 @@ public class SyncStatusViewModel: ObservableObject {
             .sink { [weak self] _ in
                 guard let self else { return }
                 Task { @MainActor [weak self] in
+                    guard let self else { return }
                     if changesRemainingToUpload ?? 0 > 0 {
                         syncStatus = "Partial Synchronization Completed"
                     } else {
@@ -120,9 +125,10 @@ public class SyncStatusViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .SynchronizerDidFailToSynchronize)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
+                guard let self else { return }
                 Task { @MainActor [weak self] in
                     let userInfo = notification.userInfo
-                    guard let self = self else { return }
+                    guard let self else { return }
                     var syncFailed = true
                     if let error = userInfo?[CloudKitSynchronizer.errorKey] as? Error {
                         if let error = error as? CKError {

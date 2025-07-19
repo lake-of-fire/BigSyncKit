@@ -9,6 +9,7 @@ import Foundation
 import CloudKit
 import Logging
 import Combine
+import RealmSwiftGaps
 
 // For Swift
 public extension Notification.Name {
@@ -29,14 +30,19 @@ public extension Notification.Name {
 // For Obj-C
 @objc public extension NSNotification {
     /// Sent when the synchronizer is going to start a sync with CloudKit.
+    @MainActor
     static let CloudKitSynchronizerWillSynchronizeNotification: NSString = "QSCloudKitSynchronizerWillSynchronizeNotification"
     /// Sent when the synchronizer is going to start the fetch stage, where it downloads any new changes from CloudKit.
+    @MainActor
     static let CloudKitSynchronizerWillFetchChangesNotification: NSString = "QSCloudKitSynchronizerWillFetchChangesNotification"
     /// Sent when the synchronizer is going to start the upload stage, where it sends changes to CloudKit.
+    @MainActor
     static let CloudKitSynchronizerWillUploadChangesNotification: NSString = "QSCloudKitSynchronizerWillUploadChangesNotification"
     /// Sent when the synchronizer finishes syncing.
+    @MainActor
     static let CloudKitSynchronizerDidSynchronizeNotification: NSString = "QSCloudKitSynchronizerDidSynchronizeNotification"
     /// Sent when the synchronizer encounters an error while syncing.
+    @MainActor
     static let CloudKitSynchronizerDidFailToSynchronizeNotification: NSString = "QSCloudKitSynchronizerDidFailToSynchronizeNotification"
 }
 
@@ -49,12 +55,14 @@ public protocol AdapterProvider {
     ///   - synchronizer: `QSCloudKitSynchronizer` asking for the adapter.
     ///   - zoneID: `CKRecordZoneID` that the model adapter will be used for.
     /// - Returns: `ModelAdapter` correctly configured to sync changes in the given record zone.
+    @BigSyncBackgroundActor
     func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID zoneID: CKRecordZone.ID) -> ModelAdapter?
     
     /// The `CloudKitSynchronizer` informs the provider that a record zone was deleted so it can clean up any associated data.
     /// - Parameters:
     ///   - synchronizer: `QSCloudKitSynchronizer` that found the deleted record zone.
     ///   - zoneID: `CKRecordZoneID` of the record zone that was deleted.
+    @BigSyncBackgroundActor
     func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async
 }
 
@@ -68,18 +76,18 @@ public protocol CloudKitSynchronizerDelegate: AnyObject {
     func synchronizer(_ synchronizer: CloudKitSynchronizer, zoneIDWasDeleted zoneID: CKRecordZone.ID)
 }
 
-internal struct ChangeRequest {
+internal struct ChangeRequest: Sendable {
     let downloadedRecord: CKRecord?
     let deletedRecordID: CKRecord.ID?
     let adapter: ModelAdapter
 }
 
+@BigSyncBackgroundActor
 internal class ChangeRequestProcessor {
     static let shared = ChangeRequestProcessor()
     
-    internal var logger: Logging.Logger?
+//    internal var logger: Logging.Logger?
 
-    @BigSyncBackgroundActor
     internal var cancelSync = false {
         didSet {
             if !cancelSync && oldValue {
@@ -94,15 +102,16 @@ internal class ChangeRequestProcessor {
         changeSubject
             .debounce(for: .seconds(3), scheduler: DispatchQueue.global())
             .sink { [weak self] _ in
+                guard let self else { return }
                 Task { @BigSyncBackgroundActor [weak self] in
+                    guard let self else { return }
                     guard !cancelSync else { return }
-                    try await self?.runProcessFetchedChangeRequests()
+                    try await runProcessFetchedChangeRequests()
                 }
             }
             .store(in: &cancellables)
     }
     
-    @BigSyncBackgroundActor
     private var changeRequests = [ChangeRequest]()
     private var changeSubject = PassthroughSubject<Void, Never>()
     private var cancellables = Set<AnyCancellable>()
@@ -110,14 +119,12 @@ internal class ChangeRequestProcessor {
     internal var processTask: Task<Void, Error>? = nil
     private let batchSize = 100
     
-    @BigSyncBackgroundActor
     internal func addFetchedChangeRequest(_ request: ChangeRequest) {
         //        debugPrint("# addChangeReq", request.downloadedRecord?.recordID.recordName)
         changeRequests.append(request)
         changeSubject.send()
     }
     
-    @BigSyncBackgroundActor
     private func runProcessFetchedChangeRequests() async throws {
         processTask?.cancel()
         _ = try? await processTask?.value
@@ -128,7 +135,6 @@ internal class ChangeRequestProcessor {
         try await processTask?.value
     }
     
-    @BigSyncBackgroundActor
     private func processFetchedChangeRequests() async throws {
 //        debugPrint("# processFetchedChangeRequests() inner")
         try Task.checkCancellation()
@@ -230,15 +236,13 @@ public class CloudKitSynchronizer: NSObject {
     public let containerIdentifier: String?
     
     /// Adapter wrapping a `CKDatabase`. The synchronizer will run CloudKit operations on the given database.
-    @BigSyncBackgroundActor
+//    @BigSyncBackgroundActor
     public let database: CloudKitDatabaseAdapter
     
     /// Provides the model adapter to the synchronizer.
-    @BigSyncBackgroundActor
     public let adapterProvider: AdapterProvider
     
     /// Required by the synchronizer to persist some state. `UserDefaults` can be used via `UserDefaultsAdapter`.
-    @BigSyncBackgroundActor
     public let keyValueStore: KeyValueStore
     
     /// Indicates whether the instance is currently synchronizing data.
@@ -250,6 +254,7 @@ public class CloudKitSynchronizer: NSObject {
     public internal(set) var cancelledDueToUnauthentication = false
 
     ///  Number of records that are sent in an upload operation.
+    @BigSyncBackgroundActor
     public var batchSize: Int = CloudKitSynchronizer.defaultInitialBatchSize
     
     /**
@@ -279,7 +284,6 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     internal var retrySleepUntil: Date?
     
-    @BigSyncBackgroundActor
     internal var currentOperations = [Operation]()
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
@@ -296,8 +300,8 @@ public class CloudKitSynchronizer: NSObject {
     internal let logger: Logging.Logger
     
     /// Default number of records to send in an upload operation.
-    public static var defaultInitialBatchSize = 300
-    public static var maxBatchSize = 400 // Apple's suggestion is 400
+    public static let defaultInitialBatchSize = 300
+    public static let maxBatchSize = 400 // Apple's suggestion is 400
     static let deviceUUIDKey = "QSCloudKitDeviceUUIDKey"
     static let modelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
     
@@ -327,16 +331,20 @@ public class CloudKitSynchronizer: NSObject {
         self.logger = logger
         super.init()
         
-        BackupDetection.runBackupDetection { (result, error) in
+        BackupDetection.runBackupDetection { [weak self] (result, error) in
+            guard let self else { return }
             if result == .restoredFromBackup {
-                self.clearDeviceIdentifier()
+                clearDeviceIdentifier()
             }
         }
         
-        ChangeRequestProcessor.shared.logger = logger
+//        Task {
+//            ChangeRequestProcessor.shared.logger = logger
+//        }
     }
     
     fileprivate var _deviceIdentifier: String!
+    @BigSyncBackgroundActor
     var deviceIdentifier: String {
         if _deviceIdentifier == nil {
             _deviceIdentifier = deviceUUID
@@ -387,6 +395,7 @@ public class CloudKitSynchronizer: NSObject {
         guard !cancelledDueToUnauthentication else { return }
         
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+            guard let self else { return }
             guard !syncing else {
                 return
             }
@@ -403,7 +412,7 @@ public class CloudKitSynchronizer: NSObject {
                 try await adapter.unsetCancellation()
             }
             
-            await self?.performSynchronization()
+            await performSynchronization()
         }
     }
     
@@ -437,6 +446,7 @@ public class CloudKitSynchronizer: NSObject {
      *  Deletes saved database token, so next synchronization will include changes in all record zones in the database.
      * This does not reset tokens stored by model adapters.
      */
+    @BigSyncBackgroundActor
     @objc public func resetDatabaseToken() {
         storedDatabaseToken = nil
     }

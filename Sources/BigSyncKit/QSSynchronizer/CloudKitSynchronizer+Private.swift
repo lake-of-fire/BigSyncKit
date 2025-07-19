@@ -19,6 +19,7 @@ extension CloudKitSynchronizer {
         return CKRecordZone.ID(zoneName: customZoneName, ownerName: CKCurrentUserDefaultName)
     }
     
+//    @BigSyncBackgroundActor
     var deviceUUID: String? {
         get {
             return keyValueStore.object(forKey: userDefaultsKey(for: storedDeviceUUIDKey)) as? String
@@ -33,6 +34,7 @@ extension CloudKitSynchronizer {
         }
     }
     
+    @BigSyncBackgroundActor
     var storedDatabaseToken: CKServerChangeToken? {
         get {
             guard let encodedToken = keyValueStore.object(forKey: userDefaultsKey(for: databaseServerChangeTokenKey)) as? Data else {
@@ -52,6 +54,7 @@ extension CloudKitSynchronizer {
         }
     }
     
+    @BigSyncBackgroundActor
     var databaseSubscriptionID: String? {
         get {
             return getStoredSubscriptionIDsDictionary()?[storeKey(for: database)]
@@ -66,10 +69,12 @@ extension CloudKitSynchronizer {
         }
     }
     
+    @BigSyncBackgroundActor
     func getStoredSubscriptionID(for recordZoneID: CKRecordZone.ID) -> String? {
         return getStoredSubscriptionIDsDictionary()?[storeKey(for: recordZoneID)]
     }
     
+    @BigSyncBackgroundActor
     func storeSubscriptionID(_ subscriptionID: String, for recordZoneID: CKRecordZone.ID) {
         var dictionary: [String: String]! = getStoredSubscriptionIDsDictionary()
         if dictionary == nil {
@@ -79,16 +84,19 @@ extension CloudKitSynchronizer {
         setStoredSubscriptionIDsDictionary(dictionary)
     }
     
+    @BigSyncBackgroundActor
     func clearSubscriptionID(_ subscriptionID: String) {
         var dictionary: [String: String]? = getStoredSubscriptionIDsDictionary()
         dictionary = dictionary?.filter { $0.value != subscriptionID}
         setStoredSubscriptionIDsDictionary(dictionary)
     }
     
+    @BigSyncBackgroundActor
     func clearAllStoredSubscriptionIDs() {
         setStoredSubscriptionIDsDictionary(nil)
     }
     
+    @BigSyncBackgroundActor
     func addMetadata(to records: [CKRecord]) {
         records.forEach {
             $0[CloudKitSynchronizer.deviceUUIDKey] = self.deviceIdentifier
@@ -98,10 +106,12 @@ extension CloudKitSynchronizer {
         }
     }
     
+    @BigSyncBackgroundActor
     fileprivate func getStoredSubscriptionIDsDictionary() -> [String: String]? {
         return keyValueStore.object(forKey: userDefaultsKey(for: subscriptionIdentifierKey)) as? [String: String]
     }
     
+    @BigSyncBackgroundActor
     fileprivate func setStoredSubscriptionIDsDictionary(_ dict: [String: String]?) {
         let key = userDefaultsKey(for: subscriptionIdentifierKey)
         if dict != nil {
