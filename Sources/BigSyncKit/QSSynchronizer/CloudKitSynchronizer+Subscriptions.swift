@@ -35,7 +35,7 @@ import CloudKit
     /// Creates a new database subscription with CloudKit so the application can receive notifications when new changes happen. The application is responsible for registering for remote notifications and initiating synchronization when a notification is received. @see `CKSubscription`
     /// - Parameter completion: Block that will be called after subscription is created, with an optional error.
     @BigSyncBackgroundActor
-    @objc func subscribeForChangesInDatabase(completion: ((Error?)->())?) {
+    @objc func subscribeForChangesInDatabase(completion: ((Error?) -> ())?) {
         guard subscriptionIDForDatabaseSubscription() == nil else {
             completion?(nil)
             return

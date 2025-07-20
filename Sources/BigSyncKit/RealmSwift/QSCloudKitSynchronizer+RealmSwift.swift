@@ -93,6 +93,7 @@ extension CloudKitSynchronizer {
 //    }
     
     /// Must call this after initializing synchronizer.
+    @BigSyncBackgroundActor
     internal class func transferOldServerChangeToken(to adapter: ModelAdapter, userDefaults: KeyValueStore, containerName: String) async {
         let key = containerName.appending("QSCloudKitFetchChangesServerTokenKey")
         if let encodedToken = userDefaults.object(forKey: key) as? Data {

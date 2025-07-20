@@ -47,9 +47,6 @@ public class SyncStatusViewModel: ObservableObject {
 //    @Published public var lastSeenDevices: [LastSeenDevice]?
     @Published public var changesRemainingToUpload: Int?
 
-    @BigSyncBackgroundActor
-    public var bigSyncBackgroundWorker: BigSyncBackgroundWorker?
-
     private var cancellables = Set<AnyCancellable>()
     
     public init(realmConfiguration: Realm.Configuration) {
