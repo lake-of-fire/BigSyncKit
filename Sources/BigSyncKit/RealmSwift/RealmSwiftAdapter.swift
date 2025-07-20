@@ -288,10 +288,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     
     private var appForegroundCancellable: AnyCancellable?
     private let immediateChecksSubject = PassthroughSubject<Void, Never>()
-    private let realmChangesSubject = PassthroughSubject<Realm, Never>()
+    @BigSyncBackgroundActor
+    private let realmChangesSubject = PassthroughSubject<Int, Never>()
     
     private var pendingRelationshipQueue = [PendingRelationshipRequest]()
     
+    @BigSyncBackgroundActor
     private var cancellables = Set<AnyCancellable>()
     
 #if DEBUG
@@ -352,6 +354,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         try await setup()
     }
     
+    @BigSyncBackgroundActor
     func invalidateTokens() {
         //        debugPrint("# invalidateRealmAndTokens()")
         for cancellable in cancellables {
@@ -521,6 +524,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         //        }
     }
     
+    @BigSyncBackgroundActor
     private func observeAppForegroundNotifications() {
 #if canImport(UIKit)
         NotificationCenter.default
@@ -561,20 +565,25 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
             .delay(for: .seconds(4), scheduler: bigSyncKitQueue)
             .debounce(for: .seconds(10), scheduler: bigSyncKitQueue)
 #endif
-            .sink { [weak self] changedRealm in
+            .sink { @Sendable [weak self] idx in
                 guard let self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                    guard let self = self else { return }
-                    await enqueueCreatedAndModified(in: changedRealm)
+                    guard let self else { return }
+                    guard let targetReaderRealms = self.realmProvider?.targetReaderRealms, idx < targetReaderRealms.count else { return }
+                    let changedRealm = targetReaderRealms[idx]
+                    await self.enqueueCreatedAndModified(in: changedRealm)
                 }
             }
             .store(in: &cancellables)
         
         // For each realm, observe changes and send an event to the subject
-        for targetReaderRealm in targetReaderRealms {
+        for (idx, targetReaderRealm) in targetReaderRealms.enumerated() {
             let token = targetReaderRealm.observe { [weak self] _, _ in
                 guard let self else { return }
-                realmChangesSubject.send(targetReaderRealm)
+                Task { @BigSyncBackgroundActor [weak self] in
+                    guard let self else { return }
+                    realmChangesSubject.send(idx)
+                }
             }
             cancellables.insert(AnyCancellable { token.invalidate() })
         }
@@ -608,6 +617,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         }
         for targetReaderRealm in realms {
             for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
+                
                 guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
                 guard objectClass.conforms(to: ChangeMetadataRecordable.self) else { continue }
                 await self.enqueueCreatedAndModified(
@@ -773,7 +783,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
                 guard !cancelSync else { throw CancellationError() }
                 guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { continue }
                 guard !cancelSync else { throw CancellationError() }
-
+                
                 if let latestExplicitlyModifiedAt, syncedEntityType.lastTrackedChangesAt != latestExplicitlyModifiedAt {
                     lastTrackedChangesAtUpdates.append((syncedEntityType.entityType, latestExplicitlyModifiedAt))
                 }
@@ -781,7 +791,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         }
         try Task.checkCancellation()
         guard !cancelSync else { throw CancellationError() }
-
+        
         if !lastTrackedChangesAtUpdates.isEmpty {
             try await persistenceRealm.asyncWrite {
                 for (syncedEntityType, latestExplicitlyModifiedAt) in lastTrackedChangesAtUpdates {
@@ -797,6 +807,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         }
     }
     
+    @BigSyncBackgroundActor
     private func setupPublisherDebouncer() {
         resultsChangeSetPublisher
             .debounce(for: .seconds(6), scheduler: bigSyncKitQueue)
@@ -915,7 +926,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
                     guard !cancelSync else {
                         throw CancellationError()
                     }
-
+                    
                     guard let (entityType, identifier) = syncedEntityTypeAndIdentifier(for: object) else { continue }
                     let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
                     if syncedEntity == nil {
@@ -949,7 +960,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
                 }
             }
             try await Task.sleep(nanoseconds: 20_000_000)
-                //            await persistenceRealm.asyncRefresh()
+            //            await persistenceRealm.asyncRefresh()
         }
         //        logger.info("QSCloudKitSynchronizer >> Created \(identifiers.count) SyncedEntity records for \(entityType)")
     }
@@ -1066,7 +1077,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     }
     
     func shouldIgnore(key: String) -> Bool {
-        return CloudKitSynchronizer.metadataKeys.contains(key)
+        return cloudKitSynchronizerMetadataKeys.contains(key)
     }
     
     public func hasChanges(record: CKRecord, object: Object) -> Bool {
@@ -2416,10 +2427,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
             if !skipped.isEmpty {
                 logger.info("QSCloudKitSynchronizer >> Skipped downloaded records for having no changes: \(skipped)")
             }
-//            logger.info("QSCloudKitSynchronizer >> Persisted downloaded record names: \(savedRecordNames.joined(separator: " "))")
-//#if DEBUG
-//            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(recordsToSave.map { ($0.record.recordID.recordName, $0.record.debugDescription) })")
-//#endif
+            //            logger.info("QSCloudKitSynchronizer >> Persisted downloaded record names: \(savedRecordNames.joined(separator: " "))")
+            //#if DEBUG
+            //            logger.info("QSCloudKitSynchronizer >> Persisted downloaded records: \(recordsToSave.map { ($0.record.recordID.recordName, $0.record.debugDescription) })")
+            //#endif
         }
     }
     
@@ -2586,7 +2597,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    public func didFinishImport(with error: Error?) async {
+    public func didFinishImport() async {
         guard let realmProvider, let persistenceRealm = realmProvider.persistenceRealm else { return }
         
         //        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
@@ -2707,14 +2718,14 @@ final class ZSTDCompressor {
         self.ddict = tempDDict
     }
     
-//    func close() {
-//        if let cdict {
-//            ZSTD_freeCDict(cdict)
-//        }
-//        if let ddict {
-//            ZSTD_freeDDict(ddict)
-//        }
-//    }
+    //    func close() {
+    //        if let cdict {
+    //            ZSTD_freeCDict(cdict)
+    //        }
+    //        if let ddict {
+    //            ZSTD_freeDDict(ddict)
+    //        }
+    //    }
     
     /// Compress the provided data using the cached dictionary.
     func compress(data: Data) throws -> Data? {

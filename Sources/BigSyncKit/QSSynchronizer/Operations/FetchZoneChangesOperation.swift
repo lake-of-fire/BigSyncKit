@@ -54,7 +54,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     }
     
     override func start() {
-        logStart()
+        super.start()
         
         for zone in zoneIDs {
             zoneResults[zone] = FetchZoneChangesOperationZoneResult()
@@ -92,28 +92,31 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         let operation = CKFetchRecordZoneChangesOperation(recordZoneIDs: zones, optionsByRecordZoneID: zoneOptions)
         operation.fetchAllChanges = true
         
-        operation.recordChangedBlock = { [weak self] record in
+        operation.recordChangedBlock = { @Sendable [weak self] record in
             guard let self else { return }
-            let ignoreDeviceIdentifier: String = ignoreDeviceIdentifier ?? " "
-            
-            if ignoreDeviceIdentifier != record[CloudKitSynchronizer.deviceUUIDKey] as? String {
-                if let version = record[CloudKitSynchronizer.modelCompatibilityVersionKey] as? Int,
-                   self.modelVersion > 0 && version > self.modelVersion {
-                    logger?.warning("QSCloudKitSynchronizer >> Warning: Ignoring record '\(record.recordID.recordName)' because it has a higher model version (\(version)) than the one this synchronizer is configured to support (\(self.modelVersion))")
-                    Task(priority: .background) { @BigSyncBackgroundActor in
-                        await versionChecker.setHigherModelVersionFound()
-                    }
-                } else {
-                    Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                        guard let self else { return }
-                        zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
-                        await onResult?(record, nil)
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
+                let ignoreDeviceIdentifier: String = ignoreDeviceIdentifier ?? " "
+                
+                if ignoreDeviceIdentifier != record[cloudKitSynchronizerDeviceUUIDKey] as? String {
+                    if let version = record[cloudKitSynchronizerModelCompatibilityVersionKey] as? Int,
+                       self.modelVersion > 0 && version > self.modelVersion {
+                        logger?.warning("QSCloudKitSynchronizer >> Warning: Ignoring record '\(record.recordID.recordName)' because it has a higher model version (\(version)) than the one this synchronizer is configured to support (\(self.modelVersion))")
+                        Task(priority: .background) { @BigSyncBackgroundActor in
+                            await versionChecker.setHigherModelVersionFound()
+                        }
+                    } else {
+                        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                            guard let self else { return }
+                            zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
+                            await onResult?(record, nil)
+                        }
                     }
                 }
             }
         }
         
-        operation.recordWithIDWasDeletedBlock = { recordID, recordType in
+        operation.recordWithIDWasDeletedBlock = { @Sendable recordID, recordType in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 zoneResults[recordID.zoneID]?.deletedRecordIDs.append(recordID)
@@ -121,7 +124,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
             }
         }
         
-        operation.recordZoneFetchCompletionBlock = {
+        operation.recordZoneFetchCompletionBlock = { @Sendable
             zoneID, serverChangeToken, clientChangeTokenData, moreComing, recordZoneError in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
@@ -138,7 +141,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
             }
         }
         
-        operation.fetchRecordZoneChangesCompletionBlock = { operationError in
+        operation.fetchRecordZoneChangesCompletionBlock = { @Sendable operationError in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
                 if let error = operationError,

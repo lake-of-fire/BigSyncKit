@@ -99,9 +99,9 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func addMetadata(to records: [CKRecord]) {
         records.forEach {
-            $0[CloudKitSynchronizer.deviceUUIDKey] = self.deviceIdentifier
+            $0[cloudKitSynchronizerDeviceUUIDKey] = self.deviceIdentifier
             if self.compatibilityVersion > 0 {
-                $0[CloudKitSynchronizer.modelCompatibilityVersionKey] = self.compatibilityVersion
+                $0[cloudKitSynchronizerModelCompatibilityVersionKey] = self.compatibilityVersion
             }
         }
     }

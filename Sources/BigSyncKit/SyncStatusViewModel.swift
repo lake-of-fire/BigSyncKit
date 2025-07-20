@@ -128,7 +128,7 @@ public class SyncStatusViewModel: ObservableObject {
                     let userInfo = notification.userInfo
                     guard let self else { return }
                     var syncFailed = true
-                    if let error = userInfo?[CloudKitSynchronizer.errorKey] as? Error {
+                    if let error = await userInfo?[CloudKitSynchronizer.errorKey] as? Error {
                         if let error = error as? CKError {
                             switch error.code {
                             case .changeTokenExpired:

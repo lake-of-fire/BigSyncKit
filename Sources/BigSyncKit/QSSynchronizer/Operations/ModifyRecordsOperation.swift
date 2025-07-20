@@ -35,20 +35,24 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     weak var internalOperation: CKModifyRecordsOperation?
         
     override func start() {
-        logStart()
+        super.start()
         let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: recordIDsToDelete)
         
-        operation.perRecordCompletionBlock = { record, error in
+        operation.perRecordCompletionBlock = { @Sendable record, error in
 //            print("# One record completed", record.recordID, error)
             self.processError(error, recordID: record.recordID)
         }
         
-        operation.modifyRecordsCompletionBlock = { saved, deleted, operationError in
-//            print("# Completion block", saved?.count, deleted?.count, operationError)
-            if let error = operationError as? CKError {
-                self.processCKError(error)
+        operation.modifyRecordsCompletionBlock = { @Sendable [weak self] saved, deleted, operationError in
+            guard let self else { return }
+            Task { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
+                //            print("# Completion block", saved?.count, deleted?.count, operationError)
+                if let error = operationError as? CKError {
+                    self.processCKError(error)
+                }
+                self.completion(saved, deleted, self.conflictedRecords, self.recordIDsMissingOnServer, operationError)
             }
-            self.completion(saved, deleted, self.conflictedRecords, self.recordIDsMissingOnServer, operationError)
         }
         
         internalOperation = operation

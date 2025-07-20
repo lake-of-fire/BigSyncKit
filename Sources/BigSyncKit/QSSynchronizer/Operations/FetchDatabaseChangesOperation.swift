@@ -32,9 +32,7 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
     }
     
     override func start() {
-        logStart()
-        
-//        super.start()
+        super.start()
         
         let databaseChangesOperation = CKFetchDatabaseChangesOperation(previousServerChangeToken: databaseToken)
         databaseChangesOperation.fetchAllChanges = true
@@ -43,21 +41,25 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
 //        databaseChangesOperation.changeTokenUpdatedBlock = { token in
 //        }
         
-        databaseChangesOperation.recordZoneWithIDChangedBlock = { zoneID in
+        databaseChangesOperation.recordZoneWithIDChangedBlock = { @Sendable zoneID in
             self.changedZoneIDs.append(zoneID)
         }
         
-        databaseChangesOperation.recordZoneWithIDWasDeletedBlock = { zoneID in
+        databaseChangesOperation.recordZoneWithIDWasDeletedBlock = { @Sendable zoneID in
             self.deletedZoneIDs.append(zoneID)
         }
         
-        databaseChangesOperation.fetchDatabaseChangesCompletionBlock = { serverChangeToken, moreComing, operationError in
-            if !moreComing {
-                if operationError == nil {
-                    self.completion(serverChangeToken, self.changedZoneIDs, self.deletedZoneIDs)
+        databaseChangesOperation.fetchDatabaseChangesCompletionBlock = { @Sendable [weak self] serverChangeToken, moreComing, operationError in
+            guard let self else { return }
+            Task { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
+                if !moreComing {
+                    if operationError == nil {
+                        self.completion(serverChangeToken, self.changedZoneIDs, self.deletedZoneIDs)
+                    }
+                    
+                    self.finish(error: operationError)
                 }
-
-                self.finish(error: operationError)
             }
         }
         

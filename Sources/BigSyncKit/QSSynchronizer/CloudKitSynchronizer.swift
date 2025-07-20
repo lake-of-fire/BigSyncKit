@@ -191,12 +191,22 @@ internal class ChangeRequestProcessor {
     }
 }
 
+let cloudKitSynchronizerDeviceUUIDKey = "QSCloudKitDeviceUUIDKey"
+let cloudKitSynchronizerModelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
+
+///  These keys will be added to CKRecords uploaded to CloudKit and are used by SyncKit internally.
+public let cloudKitSynchronizerMetadataKeys: [String] = [
+    cloudKitSynchronizerDeviceUUIDKey,
+    cloudKitSynchronizerModelCompatibilityVersionKey,
+]
+
 /**
  A `CloudKitSynchronizer` object takes care of making all the required calls to CloudKit to keep your model synchronized, using the provided
  `ModelAdapter` to interact with it.
  
  `CloudKitSynchronizer` will post notifications at different steps of the synchronization process.
  */
+@BigSyncBackgroundActor
 public class CloudKitSynchronizer: NSObject {
     /// SyncError
     public enum SyncError: Int, Error {
@@ -266,11 +276,11 @@ public class CloudKitSynchronizer: NSObject {
     /// Whether the synchronizer will only download data or also upload any local changes.
     public var syncMode: SynchronizeMode = .sync
     
-    @BigSyncBackgroundActor
+//    @BigSyncBackgroundActor
     public var delegate: CloudKitSynchronizerDelegate?
     
     //    internal let dispatchQueue = DispatchQueue(label: "QSCloudKitSynchronizer")
-    @BigSyncBackgroundActor
+//    @BigSyncBackgroundActor
     internal let operationQueue: OperationQueue = {
         let queue = OperationQueue()
         //        queue.maxConcurrentOperationCount = 1
@@ -302,8 +312,6 @@ public class CloudKitSynchronizer: NSObject {
     /// Default number of records to send in an upload operation.
     public static let defaultInitialBatchSize = 300
     public static let maxBatchSize = 400 // Apple's suggestion is 400
-    static let deviceUUIDKey = "QSCloudKitDeviceUUIDKey"
-    static let modelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
     
     /// Initializes a newly allocated synchronizer.
     /// - Parameters:
@@ -381,12 +389,6 @@ public class CloudKitSynchronizer: NSObject {
     }
     
     // MARK: - Public
-    
-    ///  These keys will be added to CKRecords uploaded to CloudKit and are used by SyncKit internally.
-    public static let metadataKeys: [String] = [
-        CloudKitSynchronizer.deviceUUIDKey,
-        CloudKitSynchronizer.modelCompatibilityVersionKey,
-    ]
     
     /// Synchronize data with CloudKit.
     /// - Parameter onFailure: Block that receives an error if the synchronization stopped due to a failure. Could be a `SyncError`, `CKError`, or any other error found during synchronization.

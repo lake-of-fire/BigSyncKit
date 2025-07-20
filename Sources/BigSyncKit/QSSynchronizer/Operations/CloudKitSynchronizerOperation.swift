@@ -38,6 +38,7 @@ class CloudKitSynchronizerOperation: Operation {
         if self.isCancelled {
             state = .finished
         } else {
+            logStart()
             state = .ready
             main()
         }
