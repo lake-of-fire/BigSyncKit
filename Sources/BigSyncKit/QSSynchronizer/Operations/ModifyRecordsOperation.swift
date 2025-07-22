@@ -38,9 +38,13 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
         super.start()
         let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: recordIDsToDelete)
         
-        operation.perRecordCompletionBlock = { @Sendable record, error in
+        operation.perRecordCompletionBlock = { @Sendable [weak self] record, error in
 //            print("# One record completed", record.recordID, error)
-            self.processError(error, recordID: record.recordID)
+            guard let self else { return }
+            Task { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
+                self.processError(error, recordID: record.recordID)
+            }
         }
         
         operation.modifyRecordsCompletionBlock = { @Sendable [weak self] saved, deleted, operationError in

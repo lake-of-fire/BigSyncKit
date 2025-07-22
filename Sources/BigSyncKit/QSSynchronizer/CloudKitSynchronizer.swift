@@ -101,7 +101,7 @@ internal class ChangeRequestProcessor {
     init() {
         changeSubject
             .debounce(for: .seconds(3), scheduler: DispatchQueue.global())
-            .sink { [weak self] _ in
+            .sink { @Sendable [weak self] _ in
                 guard let self else { return }
                 Task { @BigSyncBackgroundActor [weak self] in
                     guard let self else { return }
@@ -193,6 +193,8 @@ internal class ChangeRequestProcessor {
 
 let cloudKitSynchronizerDeviceUUIDKey = "QSCloudKitDeviceUUIDKey"
 let cloudKitSynchronizerModelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
+public let cloudKitSynchronizerErrorDomain = "CloudKitSynchronizerErrorDomain"
+public let cloudKitSynchronizerErrorKey = "CloudKitSynchronizerErrorKey"
 
 ///  These keys will be added to CKRecords uploaded to CloudKit and are used by SyncKit internally.
 public let cloudKitSynchronizerMetadataKeys: [String] = [
@@ -232,9 +234,6 @@ public class CloudKitSynchronizer: NSObject {
         /// Only download changes
         case downloadOnly
     }
-    
-    public static let errorDomain = "CloudKitSynchronizerErrorDomain"
-    public static let errorKey = "CloudKitSynchronizerErrorKey"
     
     /**
      More than one `CloudKitSynchronizer` may be created in an app.

@@ -54,107 +54,89 @@ public class SyncStatusViewModel: ObservableObject {
         
         NotificationCenter.default.publisher(for: .SynchronizerChangesRemainingToUpload)
             .receive(on: RunLoop.main)
-            .sink { [weak self] notification in
+            .sink { @Sendable @MainActor [weak self] notification in
                 guard let self else { return }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    let userInfo = notification.userInfo
-                    if let count = userInfo?["CloudKitSynchronizerChangesRemainingToUploadKey"] as? Int {
-                        changesRemainingToUpload = count
-                    }
+                let userInfo = notification.userInfo
+                if let count = userInfo?["CloudKitSynchronizerChangesRemainingToUploadKey"] as? Int {
+                    changesRemainingToUpload = count
                 }
             }
             .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerWillSynchronize)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
+            .sink { @Sendable @MainActor [weak self] _ in
                 guard let self else { return }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    syncStatus = "Preparing to Synchronize"
-                    syncFailed = false
-                    syncBegan()
-                }
+                syncStatus = "Preparing to Synchronize"
+                syncFailed = false
+                syncBegan()
             }
             .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerWillFetchChanges)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
+            .sink { @Sendable @MainActor [weak self] _ in
                 guard let self else { return }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    syncStatus = "Fetching Changes"
-                    syncFailed = false
-                }
+                syncStatus = "Fetching Changes"
+                syncFailed = false
             }
             .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerWillUploadChanges)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
+            .sink { @Sendable @MainActor [weak self] _ in
                 guard let self else { return }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    syncStatus = "Uploading Changes"
-                    syncFailed = false
-                }
+                syncStatus = "Uploading Changes"
+                syncFailed = false
             }
             .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerDidSynchronize)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
+            .sink { @Sendable @MainActor [weak self] _ in
                 guard let self else { return }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    if changesRemainingToUpload ?? 0 > 0 {
-                        syncStatus = "Partial Synchronization Completed"
-                    } else {
-                        syncStatus = "Synchronization Completed"
-                    }
-                    syncFailed = false
-                    syncIsOver()
+                if changesRemainingToUpload ?? 0 > 0 {
+                    syncStatus = "Partial Synchronization Completed"
+                } else {
+                    syncStatus = "Synchronization Completed"
                 }
+                syncFailed = false
+                syncIsOver()
             }
             .store(in: &cancellables)
         
         NotificationCenter.default.publisher(for: .SynchronizerDidFailToSynchronize)
             .receive(on: RunLoop.main)
-            .sink { [weak self] notification in
+            .sink { @Sendable @MainActor [weak self] notification in
                 guard let self else { return }
-                Task { @MainActor [weak self] in
-                    let userInfo = notification.userInfo
-                    guard let self else { return }
-                    var syncFailed = true
-                    if let error = await userInfo?[CloudKitSynchronizer.errorKey] as? Error {
-                        if let error = error as? CKError {
-                            switch error.code {
-                            case .changeTokenExpired:
-                                syncStatus = "Reloading Synchronization"
-                                syncFailed = false
-                            case .accountTemporarilyUnavailable:
-                                syncStatus = "Account Temporarily Unavailable"
-                            case .constraintViolation:
-                                syncStatus = "Synchronization Failed: Constraint Violation"
-                            case .limitExceeded:
-                                // It restarts...
-                                syncFailed = false
-                            default:
-                                syncStatus = "Synchronization Failed: \(String(describing: error).prefix(150))"
-                            }
-                        } else if let cancellationError = error as? CancellationError {
+                let userInfo = notification.userInfo
+                var syncFailed = true
+                if let error = userInfo?[cloudKitSynchronizerErrorKey] as? Error {
+                    if let error = error as? CKError {
+                        switch error.code {
+                        case .changeTokenExpired:
+                            syncStatus = "Reloading Synchronization"
                             syncFailed = false
-                        } else {
-                            syncStatus = "Synchronization Failed: \(error.localizedDescription)"
+                        case .accountTemporarilyUnavailable:
+                            syncStatus = "Account Temporarily Unavailable"
+                        case .constraintViolation:
+                            syncStatus = "Synchronization Failed: Constraint Violation"
+                        case .limitExceeded:
+                            // It restarts...
+                            syncFailed = false
+                        default:
+                            syncStatus = "Synchronization Failed: \(String(describing: error).prefix(150))"
                         }
+                    } else if let cancellationError = error as? CancellationError {
+                        syncFailed = false
                     } else {
-                        syncStatus = "Synchronization Failed: Unknown Error"
+                        syncStatus = "Synchronization Failed: \(error.localizedDescription)"
                     }
-                    self.syncFailed = syncFailed
-                    syncIsOver()
+                } else {
+                    syncStatus = "Synchronization Failed: Unknown Error"
                 }
+                self.syncFailed = syncFailed
+                syncIsOver()
             }
             .store(in: &cancellables)
     }

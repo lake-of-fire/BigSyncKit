@@ -532,9 +532,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
             .merge(with: NotificationCenter.default
                 .publisher(for: UIApplication.didBecomeActiveNotification)
             )
-            .sink { [weak self] _ in
+            .sink { @Sendable [weak self] _ in
+                guard let self else { return }
                 Task { @MainActor [weak self] in
-                    self?.immediateChecksSubject.send(())
+                    guard let self else { return }
+                    immediateChecksSubject.send(())
                 }
             }
             .store(in: &cancellables)
@@ -542,8 +544,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         
         appForegroundCancellable = immediateChecksSubject
             .debounce(for: .seconds(6), scheduler: bigSyncKitQueue)
-            .sink { [weak self] _ in
-                guard let self = self else { return }
+            .sink { @Sendable [weak self] _ in
+                guard let self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                     guard let self, let persistenceRealm = self.realmProvider?.persistenceRealm else { return }
                     updateHasChanges(realm: persistenceRealm)
@@ -811,9 +813,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     private func setupPublisherDebouncer() {
         resultsChangeSetPublisher
             .debounce(for: .seconds(6), scheduler: bigSyncKitQueue)
-            .sink { [weak self] _ in
+            .sink { @Sendable [weak self] _ in
+                guard let self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                    try await self?.processEnqueuedChanges()
+                    guard let self else { return }
+                    try await processEnqueuedChanges()
                 }
             }
             .store(in: &cancellables)

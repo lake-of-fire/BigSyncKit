@@ -80,7 +80,7 @@ extension CloudKitSynchronizer {
             await adapter.didFinishImport()
         }
         
-        self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [CloudKitSynchronizer.errorKey: error])
+        self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [cloudKitSynchronizerErrorKey: error])
         self.delegate?.synchronizerDidfailToSync(self, error: error)
         
         if let error = error as? BigSyncKit.CloudKitSynchronizer.SyncError {
@@ -885,7 +885,8 @@ extension CloudKitSynchronizer {
         }
         
         let modifyRecordsOperation = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: recordIDs)
-        modifyRecordsOperation.modifyRecordsCompletionBlock = { savedRecords, deletedRecordIDs, operationError in
+        modifyRecordsOperation.modifyRecordsCompletionBlock = { @Sendable [weak self] savedRecords, deletedRecordIDs, operationError in
+            guard let self else { return }
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
                 //                debugPrint("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
