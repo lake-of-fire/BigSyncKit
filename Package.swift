@@ -31,7 +31,7 @@ let package = Package(
             dependencies: [
                 //.product(name: "RealmSwift", package: "RealmBinary"),
                 .product(name: "RealmSwift", package: "realm-swift"),
-//                .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
+                .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
 //                .product(name: "Device Library", package: "Device"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
                 .product(name: "Algorithms", package: "swift-algorithms"),
