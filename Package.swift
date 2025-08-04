@@ -29,7 +29,7 @@ let package = Package(
         .target(
             name: "BigSyncKit",
             dependencies: [
-                .product(name: "RealmSwift", package: "RealmBinary"),
+                //.product(name: "RealmSwift", package: "RealmBinary"),
                 .product(name: "RealmSwift", package: "realm-swift"),
 //                .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
 //                .product(name: "Device Library", package: "Device"),
