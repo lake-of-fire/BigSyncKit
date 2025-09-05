@@ -10,6 +10,7 @@ import CloudKit
 import Logging
 import Combine
 import RealmSwiftGaps
+import SwiftUtilities
 
 // For Swift
 public extension Notification.Name {
@@ -100,7 +101,7 @@ internal class ChangeRequestProcessor {
     
     init() {
         changeSubject
-            .debounce(for: .seconds(3), scheduler: DispatchQueue.global())
+            .debounceLeadingTrailing(for: .seconds(3), scheduler: DispatchQueue.global())
             .sink { @Sendable [weak self] _ in
                 guard let self else { return }
                 Task { @BigSyncBackgroundActor [weak self] in

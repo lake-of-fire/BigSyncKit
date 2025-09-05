@@ -17,6 +17,7 @@ import RealmSwift
 import Realm
 import Combine
 import RealmSwiftGaps
+import SwiftUtilities
 import Algorithms
 import AsyncAlgorithms
 import Logging
@@ -543,7 +544,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
 #endif
         
         appForegroundCancellable = immediateChecksSubject
-            .debounce(for: .seconds(6), scheduler: bigSyncKitQueue)
+            .debounceLeadingTrailing(for: .seconds(6), scheduler: bigSyncKitQueue)
             .sink { @Sendable [weak self] _ in
                 guard let self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -562,10 +563,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         // Subscribe to the subject with a 6-second debounce
         realmChangesSubject
 #if DEBUG
-            .debounce(for: .seconds(2), scheduler: bigSyncKitQueue)
+            .debounceLeadingTrailing(for: .seconds(2), scheduler: bigSyncKitQueue)
 #else
             .delay(for: .seconds(4), scheduler: bigSyncKitQueue)
-            .debounce(for: .seconds(10), scheduler: bigSyncKitQueue)
+            .debounceLeadingTrailing(for: .seconds(10), scheduler: bigSyncKitQueue)
 #endif
             .sink { @Sendable [weak self] idx in
                 guard let self else { return }
@@ -812,7 +813,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     @BigSyncBackgroundActor
     private func setupPublisherDebouncer() {
         resultsChangeSetPublisher
-            .debounce(for: .seconds(6), scheduler: bigSyncKitQueue)
+            .debounceLeadingTrailing(for: .seconds(6), scheduler: bigSyncKitQueue)
             .sink { @Sendable [weak self] _ in
                 guard let self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in

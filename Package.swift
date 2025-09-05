@@ -20,6 +20,7 @@ let package = Package(
         //        .package(url: "https://github.com/lake-of-fire/Device.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-algorithms.git", branch: "main"),
+        .package(url: "https://github.com/lake-of-fire/SwiftUtilities.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-log.git", branch: "main"),
         .package(url: "https://github.com/facebook/zstd.git", from: "1.5.7"),
     ],
@@ -34,6 +35,7 @@ let package = Package(
                 .product(name: "RealmSwiftGaps", package: "RealmSwiftGaps"),
 //                .product(name: "Device Library", package: "Device"),
                 .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+                .product(name: "SwiftUtilities", package: "SwiftUtilities"),
                 .product(name: "Algorithms", package: "swift-algorithms"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "libzstd", package: "zstd"), // Only needed for iOS 15 Brotli (somehow missing in simulator at least)
