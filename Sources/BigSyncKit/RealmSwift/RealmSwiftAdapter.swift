@@ -441,7 +441,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
                 guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
                 let exists = targetReaderRealm.objects(objectClass).first != nil
                 if !exists {
-                    try await { @RealmBackgroundActor in
+                    await { @RealmBackgroundActor in
                         do {
                             guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[schema.className] else { return }
                             try await targetWriterRealm.asyncWrite {
@@ -916,33 +916,71 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     
     @BigSyncBackgroundActor
     func createMissingSyncedEntities() async throws {
-        guard let targetReaderRealms = await realmProvider?.targetReaderRealms, let persistenceRealm = realmProvider?.persistenceRealm else { return }
+        guard let targetReaderRealms = realmProvider?.targetReaderRealms, let persistenceRealm = realmProvider?.persistenceRealm else { return }
         
-        var missingEntities = [String: [String]]()
-        
+        var identifiersPerEntityType = [String: Set<String>]()
+
         for targetReaderRealm in targetReaderRealms {
             for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
                 guard let objectClass = self.realmObjectClass(name: schema.className) else {
                     continue
                 }
-                
+
+                guard let primaryKeyName = objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name else {
+                    continue
+                }
+
                 let objects = targetReaderRealm.objects(objectClass)
-                for object in Array(objects) {
+                if objects.isEmpty {
+                    continue
+                }
+
+                var identifierSet = identifiersPerEntityType[schema.className] ?? Set<String>()
+                for object in objects {
                     guard !cancelSync else {
                         throw CancellationError()
                     }
-                    
-                    guard let (entityType, identifier) = syncedEntityTypeAndIdentifier(for: object) else { continue }
-                    let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
-                    if syncedEntity == nil {
-                        missingEntities[entityType, default: []].append(identifier)
-                    }
+
+                    let identifierSuffix = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKeyName)
+                    identifierSet.insert(schema.className + "." + identifierSuffix)
                 }
+                identifiersPerEntityType[schema.className] = identifierSet
             }
         }
-        
+
+        guard !identifiersPerEntityType.isEmpty else { return }
+
+        let syncedEntities = persistenceRealm.objects(SyncedEntity.self)
+        var missingEntities = [String: [String]]()
+
+        for (entityType, identifierSet) in identifiersPerEntityType {
+            var missingIdentifiers = Set(identifierSet)
+            let identifierArray = Array(identifierSet)
+
+            for chunk in identifierArray.chunked(into: 500) {
+                guard !chunk.isEmpty else { continue }
+                guard !cancelSync else {
+                    throw CancellationError()
+                }
+
+                let existingIdentifiers = Set(
+                    syncedEntities
+                        .where { $0.identifier.in(chunk) }
+                        .map(\.identifier)
+                )
+                missingIdentifiers.subtract(existingIdentifiers)
+
+                if missingIdentifiers.isEmpty {
+                    break
+                }
+            }
+
+            if !missingIdentifiers.isEmpty {
+                missingEntities[entityType] = Array(missingIdentifiers)
+            }
+        }
+
         for (entityType, identifiers) in missingEntities {
-            //            debugPrint("Create", identifiers.count, "missing synced entities for", entityType)
             logger.info("QSCloudKitSynchronizer >> Create \(identifiers.count) missing synced entities for \(entityType)")
             try await createSyncedEntities(entityType: entityType, identifiers: identifiers)
         }
@@ -1058,7 +1096,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     
     @BigSyncBackgroundActor
     func getOrCreateSyncedEntityType(_ entityType: String) async throws -> SyncedEntityType? {
-        guard let persistenceRealm = await realmProvider?.persistenceRealm else { return nil }
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
         
         if let syncedEntityType = persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: entityType) {
             return syncedEntityType
@@ -1075,7 +1113,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     
     @BigSyncBackgroundActor
     func getLastTrackedChangesAt(forEntityType entityType: String) async -> Date? {
-        guard let persistenceRealm = await realmProvider?.persistenceRealm else { return nil }
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
         
         let syncedEntityType = persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: entityType)
         return syncedEntityType?.lastTrackedChangesAt
@@ -1680,7 +1718,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
             let chunk = Array(pendingRelationshipQueue.prefix(5000))
             try Task.checkCancellation()
             
-            guard let persistenceRealm = await realmProvider?.persistenceRealm else { break }
+            guard let persistenceRealm = realmProvider?.persistenceRealm else { break }
             
             do {
                 //                await persistenceRealm.asyncRefresh()
@@ -2507,7 +2545,6 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     
     @BigSyncBackgroundActor
     public func recordsToUpload(limit: Int) async throws -> [CKRecord] {
-        guard let realmProvider else { return [] }
         var recordsArray = [CKRecord]()
         let recordLimit = limit == 0 ? Int.max : limit
         var uploadingState = SyncedEntityState.new
