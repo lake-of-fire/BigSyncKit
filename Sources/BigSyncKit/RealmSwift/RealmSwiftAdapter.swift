@@ -653,27 +653,37 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         // TODO: Slightly possible for this to miss records that are created with the same explicitlyModifiedAt as the last enqueueing but that didn't exist yet the last time it was called
         let modifiedPredicate = NSPredicate(format: "explicitlyModifiedAt > %@ AND createdAt <= %@", lastTrackedChangesAt as NSDate, lastTrackedChangesAt as NSDate)
         
-        let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate))
-        let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate))
-        
         let primaryKey = objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name ?? ""
         
-        let filteredCreated = created.filter { object in
-            let id = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-            guard let fetchedModified = recentlyFetchedRecordModifiedAts[schemaName + "." + id],
-                  let objectModified = object.value(forKey: "modifiedAt") as? Date else {
+        let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate).map {
+            (
+                Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
+                $0.value(forKey: "modifiedAt") as? Date,
+                $0.value(forKey: "explicitlyModifiedAt") as? Date,
+            )
+        })
+        let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate).map {
+            (
+                Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
+                $0.value(forKey: "modifiedAt") as? Date,
+                $0.value(forKey: "explicitlyModifiedAt") as? Date,
+            )
+        })
+
+        let filteredCreated = created.filter { objectID, modifiedAt, _ in
+            guard let fetchedModified = recentlyFetchedRecordModifiedAts[schemaName + "." + objectID],
+                  let modifiedAt else {
                 return true
             }
-            return objectModified != fetchedModified
+            return modifiedAt != fetchedModified
         }
         
-        let filteredModified = modified.filter { object in
-            let id = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
-            guard let fetchedModified = recentlyFetchedRecordModifiedAts[schemaName + "." + id],
-                  let objectModified = object.value(forKey: "modifiedAt") as? Date else {
+        let filteredModified = modified.filter { objectID, modifiedAt, _ in
+            guard let fetchedModified = recentlyFetchedRecordModifiedAts[schemaName + "." + objectID],
+                  let modifiedAt else {
                 return true
             }
-            return objectModified != fetchedModified
+            return modifiedAt != fetchedModified
         }
         
         //        if created.isEmpty && modified.isEmpty {
@@ -690,8 +700,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
             let insertions = resultsChangeSet.insertions[schemaName, default: ([], nil)]
             let latestCreatedExplicitlyModifiedAt = filteredCreated.compactMap { ($0 as? ChangeMetadataRecordable)?.explicitlyModifiedAt } .max()
             let updatedInsertions: (Set<String>, Date?) = (
-                insertions.0.union(filteredCreated.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
-                }),
+                insertions.0.union(filteredCreated.map { $0.0 }),
                 latestCreatedExplicitlyModifiedAt
             )
             resultsChangeSet.insertions[schemaName] = updatedInsertions
@@ -700,8 +709,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
             let modifications = resultsChangeSet.modifications[schemaName, default: ([], nil)]
             let latestModifiedExplicitlyModifiedAt = filteredModified.compactMap { ($0 as? ChangeMetadataRecordable)?.explicitlyModifiedAt } .max()
             let updatedModifications: (Set<String>, Date?) = (
-                modifications.0.union(filteredModified.map { Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
-                }),
+                modifications.0.union(filteredModified.map { $0.0 }),
                 latestModifiedExplicitlyModifiedAt
             )
             resultsChangeSet.modifications[schemaName] = updatedModifications
@@ -710,8 +718,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         // Persist the new lastTrackedChangesAt
         //        await persistenceRealm.asyncRefresh()
         if !created.isEmpty || !modified.isEmpty {
-            let processedIDs = filteredCreated.map { "\(schemaName).\($0.value(forKey: primaryKey)!)" } +
-            filteredModified.map { "\(schemaName).\($0.value(forKey: primaryKey)!)" }
+            let prefix = schemaName + "."
+            let processedIDs = filteredCreated.map { prefix + $0.0 } + filteredModified.map { prefix + $0.0 }
             for id in processedIDs {
                 self.recentlyFetchedRecordModifiedAts.removeValue(forKey: id)
             }
@@ -735,7 +743,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         for (schema, identifiers) in currentChangeSet.insertions.mapValues(\.0) {
             guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
             
-            for chunk in Array(identifiers).chunked(into: 2000) {
+            for chunk in Array(identifiers).chunks(ofCount: 2000) {
                 //                await persistenceRealm.asyncRefresh()
                 try await persistenceRealm.asyncWrite {
                     for identifier in chunk {
@@ -757,7 +765,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         for (schema, identifiers) in currentChangeSet.modifications.mapValues(\.0) {
             guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
             
-            for chunk in Array(identifiers).chunked(into: 2000) {
+            for chunk in Array(identifiers).chunks(ofCount: 2000) {
                 //                await persistenceRealm.asyncRefresh()
                 try await persistenceRealm.asyncWrite {
                     for identifier in chunk {
@@ -957,7 +965,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
             var missingIdentifiers = Set(identifierSet)
             let identifierArray = Array(identifierSet)
 
-            for chunk in identifierArray.chunked(into: 500) {
+            for chunk in identifierArray.chunks(ofCount: 500) {
                 guard !chunk.isEmpty else { continue }
                 guard !cancelSync else {
                     throw CancellationError()
@@ -965,7 +973,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
 
                 let existingIdentifiers = Set(
                     syncedEntities
-                        .where { $0.identifier.in(chunk) }
+                        .where { $0.identifier.in(Array(chunk)) }
                         .map(\.identifier)
                 )
                 missingIdentifiers.subtract(existingIdentifiers)
@@ -991,7 +999,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     func createSyncedEntities(entityType: String, identifiers: [String]) async throws {
         //                debugPrint("Create synced entities", entityType, identifiers.count)
         //        logger.info("QSCloudKitSynchronizer >> Creating \(identifiers.count) SyncedEntity records for \(entityType)…")
-        for chunk in identifiers.chunked(into: 500) {
+        for chunk in identifiers.chunks(ofCount: 500) {
             guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
             try await persistenceRealm.asyncWrite {
                 for identifier in chunk {
@@ -1073,7 +1081,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         return (entityType, identifier)
     }
     
-    @inlinable
+    @inline(__always)
     static func getTargetObjectStringIdentifier(for object: Object, usingPrimaryKey key: String) -> String {
         let objectId = object.value(forKey: key)
         let identifier: String
@@ -2379,7 +2387,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         
         // TODO: Chunk based on target writer Realm
         if !recordsToSave.isEmpty {
-            for chunk in recordsToSave.chunked(into: 100) {
+            for chunk in recordsToSave.chunks(ofCount: 100) {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 
@@ -2570,7 +2578,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     public func didUpload(savedRecords: [CKRecord]) async throws {
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         
-        for chunk in savedRecords.chunked(into: 500) {
+        for chunk in savedRecords.chunks(ofCount: 500) {
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
             
