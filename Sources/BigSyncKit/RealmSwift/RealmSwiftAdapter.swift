@@ -2156,7 +2156,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
                     if property.type == PropertyType.data,
                        let data = value as? Data,
                        !forceDataTypeInsteadOfAsset {
-                        let fileURL = self.persistentAssetManager.store(data: data, forRecordID: syncedEntity.identifier)
+                        let fileURL = self.persistentAssetManager.store(
+                            data: data,
+                            forRecordID: syncedEntity.identifier,
+                            propertyName: property.name
+                        )
                         guard !cancelSync else { throw CancellationError() }
                         
                         //                        logger.info("QSCloudKitSynchronizer >> Stored CKAsset data at \(fileURL) for \(property.name) of \(syncedEntity.identifier)")
@@ -2236,7 +2240,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
                             record[property.name] = Double(0.0) as CKRecordValue
                         case .data:
                             let dummyData = "dummy".data(using: .utf8)!
-                            let fileURL = self.persistentAssetManager.store(data: dummyData, forRecordID: "Dummy.123")
+                            let fileURL = self.persistentAssetManager.store(
+                                data: dummyData,
+                                forRecordID: "Dummy.123",
+                                propertyName: property.name
+                            )
                             let asset = CKAsset(fileURL: fileURL)
                             record[property.name] = asset
                         case .UUID:
@@ -2553,6 +2561,15 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     
     @BigSyncBackgroundActor
     public func recordsToUpload(limit: Int) async throws -> [CKRecord] {
+        if !hasChanges {
+            if let persistenceRealm = realmProvider?.persistenceRealm {
+                updateHasChanges(realm: persistenceRealm)
+            }
+            if !hasChanges {
+                return []
+            }
+        }
+
         var recordsArray = [CKRecord]()
         let recordLimit = limit == 0 ? Int.max : limit
         var uploadingState = SyncedEntityState.new
