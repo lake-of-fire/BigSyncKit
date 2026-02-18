@@ -435,31 +435,43 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         guard let targetReaderRealms = realmProvider.targetReaderRealms else { return }
         
 #if DEBUG
-        // Create a dummy record for each Realm type that has no data
+        // Create a dummy record for each Realm type that has no data.
+        // Check and write against the same writer realm, and only process each schema once.
+        var processedDummySchemas = Set<String>()
         for targetReaderRealm in targetReaderRealms {
             for schema in targetReaderRealm.schema.objectSchema where !excludedClassNames.contains(schema.className) {
+                guard !processedDummySchemas.contains(schema.className) else { continue }
+                processedDummySchemas.insert(schema.className)
                 guard let objectClass = self.realmObjectClass(name: schema.className) else { continue }
-                let exists = targetReaderRealm.objects(objectClass).first != nil
-                if !exists {
-                    await { @RealmBackgroundActor in
-                        do {
-                            guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[schema.className] else { return }
+                await { @RealmBackgroundActor in
+                    do {
+                        guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[schema.className] else { return }
+                        let writerURL = targetWriterRealm.configuration.fileURL?.path ?? "nil"
+                        let writerTypedCount = targetWriterRealm.objects(objectClass).count
+                        if writerTypedCount == 0 {
                             try await targetWriterRealm.asyncWrite {
                                 let dummy = objectClass.init()
                                 if let softDeletable = dummy as? SoftDeletable {
                                     softDeletable.isDeleted = true
                                 }
                                 targetWriterRealm.add(dummy, update: .modified)
-                                print("[Debug] Inserted dummy record for schema: \(schema.className)")
-                                let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
-                                let dummyID = "\(schema.className).\(Self.getTargetObjectStringIdentifier(for: dummy, usingPrimaryKey: primaryKey))"
-                                dummyRecordIdentifiers.insert(dummyID)
+                                let primaryKey = objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name
+                                if let primaryKey {
+                                    let dummyID = "\(schema.className).\(Self.getTargetObjectStringIdentifier(for: dummy, usingPrimaryKey: primaryKey))"
+                                    dummyRecordIdentifiers.insert(dummyID)
+                                    print("# BIGSYNCDUMMY inserted schema=\(schema.className) primaryKey=\(primaryKey) dummyID=\(dummyID)")
+                                } else {
+                                    print("# BIGSYNCDUMMY inserted schema=\(schema.className) primaryKey=nil")
+                                }
+                                let writerTypedCountAfter = targetWriterRealm.objects(objectClass).count
+                                let writerDynamicCountAfter = targetWriterRealm.dynamicObjects(schema.className).count
+                                print("# BIGSYNCDUMMY writer-after schema=\(schema.className) writerURL=\(writerURL) typedCount=\(writerTypedCountAfter) dynamicCount=\(writerDynamicCountAfter)")
                             }
-                        } catch {
-                            print("⚠️ Failed to create dummy for \(schema.className): \(error)")
                         }
-                    }()
-                }
+                    } catch {
+                        print("# BIGSYNCDUMMY error schema=\(schema.className) error=\(error)")
+                    }
+                }()
             }
         }
 #endif
