@@ -20,7 +20,7 @@ let package = Package(
         //        .package(url: "https://github.com/lake-of-fire/Device.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-async-algorithms", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-algorithms.git", branch: "main"),
-        .package(url: "https://github.com/lake-of-fire/SwiftUtilities.git", branch: "main"),
+        .package(path: "../SwiftUtilities"),
         .package(url: "https://github.com/apple/swift-log.git", branch: "main"),
         .package(url: "https://github.com/facebook/zstd.git", from: "1.5.7"),
     ],
