@@ -249,6 +249,14 @@ struct ResultsChangeSet {
 extension RealmSwiftAdapter: @unchecked Sendable { }
 
 public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
+    private static var shouldSkipDebugDummySetup: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["MANABI_UI_TEST_BYPASS_PASTEBOARD"] == "1" { return true }
+        if environment["TEST_RUNNER_MANABI_TEST_USE_YOMITAN"] == "1" { return true }
+        if environment["XCTestConfigurationFilePath"] != nil { return true }
+        return false
+    }
+
     public let persistenceRealmConfiguration: Realm.Configuration
     public let targetRealmConfigurations: [Realm.Configuration]
     public let excludedClassNames: [String]
@@ -435,6 +443,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         guard let targetReaderRealms = realmProvider.targetReaderRealms else { return }
         
 #if DEBUG
+        if !Self.shouldSkipDebugDummySetup {
         // Create a dummy record for each Realm type that has no data.
         // Check and write against the same writer realm, and only process each schema once.
         var processedDummySchemas = Set<String>()
@@ -473,6 +482,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
                     }
                 }()
             }
+        }
         }
 #endif
         
