@@ -28,6 +28,7 @@ extension CloudKitSynchronizer {
         containerName: String,
         configurations: [Realm.Configuration],
         excludedClassNames: [String],
+        priorityClassNames: [String] = [],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
         compatibilityVersion: Int = 0,
@@ -37,6 +38,7 @@ extension CloudKitSynchronizer {
         let provider = DefaultRealmSwiftAdapterProvider(
             targetConfigurations: configurations,
             excludedClassNames: excludedClassNames,
+            priorityClassNames: priorityClassNames,
             zoneID: zoneID,
             appGroup: suiteName,
             logger: logger

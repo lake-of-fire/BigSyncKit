@@ -125,6 +125,40 @@ internal class ChangeRequestProcessor {
         changeRequests.append(request)
         changeSubject.send()
     }
+
+    private func entityType(for request: ChangeRequest) -> String? {
+        if let recordType = request.downloadedRecord?.recordType {
+            return recordType
+        }
+        guard let recordName = request.deletedRecordID?.recordName else { return nil }
+        return recordName.split(separator: ".", maxSplits: 1).first.map(String.init)
+    }
+
+    private func dequeueBatch() -> [ChangeRequest] {
+        guard let adapter = changeRequests.first?.adapter else {
+            return []
+        }
+        let prioritizedEntityType = adapter.priorityEntityTypeNames.first { priorityEntityType in
+            changeRequests.contains { entityType(for: $0) == priorityEntityType }
+        }
+        guard let prioritizedEntityType else {
+            let batch = Array(changeRequests.prefix(batchSize))
+            changeRequests.removeFirst(batch.count)
+            return batch
+        }
+
+        var batch = [ChangeRequest]()
+        var remainingRequests = [ChangeRequest]()
+        for request in changeRequests {
+            if batch.count < batchSize && entityType(for: request) == prioritizedEntityType {
+                batch.append(request)
+            } else {
+                remainingRequests.append(request)
+            }
+        }
+        changeRequests = remainingRequests
+        return batch
+    }
     
     private func runProcessFetchedChangeRequests() async throws {
         processTask?.cancel()
@@ -143,8 +177,7 @@ internal class ChangeRequestProcessor {
         while !changeRequests.isEmpty {
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
-            let batch = changeRequests.prefix(batchSize)
-            changeRequests.removeFirst(batch.count)
+            let batch = dequeueBatch()
             
             do {
 //                logger?.info("QSCloudKitSynchronizer >> Processing \(batch.count) remote records for local merge: \(batch.compactMap { $0.downloadedRecord?.recordID.recordName } .joined(separator: " ")) (\(changeRequests.count) more remaining)")

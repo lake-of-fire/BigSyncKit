@@ -33,6 +33,9 @@ public protocol ModelAdapterDelegate: AnyObject {
 public protocol ModelAdapter: AnyObject, Sendable {
     /// Whether the model has any changes
     var hasChanges: Bool { get }
+
+    /// Entity types that should be synced ahead of the default order.
+    var priorityEntityTypeNames: [String] { get }
     
     var modelAdapterDelegate: ModelAdapterDelegate? { get set }
     
@@ -121,5 +124,9 @@ public protocol ModelAdapter: AnyObject, Sendable {
     
     /// Delete existing `CKShare` for given model object.
     /// - Parameter object: Model object.
-//    @available(iOS 10.0, OSX 10.12, *) func deleteShare(for object: AnyObject)
+    //    @available(iOS 10.0, OSX 10.12, *) func deleteShare(for object: AnyObject)
+}
+
+public extension ModelAdapter {
+    var priorityEntityTypeNames: [String] { [] }
 }

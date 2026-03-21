@@ -15,6 +15,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let persistenceConfiguration: Realm.Configuration
     let targetConfigurations: [Realm.Configuration]
     let excludedClassNames: [String]
+    let priorityClassNames: [String]
     let appGroup: String?
     let logger: Logging.Logger
     public private(set) var adapter: RealmSwiftAdapter!
@@ -28,12 +29,14 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     public init(
         targetConfigurations: [Realm.Configuration],
         excludedClassNames: [String],
+        priorityClassNames: [String] = [],
         zoneID: CKRecordZone.ID,
         appGroup: String? = nil,
         logger: Logging.Logger
     ) {
         self.targetConfigurations = targetConfigurations
         self.excludedClassNames = excludedClassNames
+        self.priorityClassNames = priorityClassNames
         self.zoneID = zoneID
         self.appGroup = appGroup
         self.logger = logger
@@ -74,6 +77,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
             persistenceRealmConfiguration: persistenceConfiguration,
             targetRealmConfigurations: targetConfigurations,
             excludedClassNames: excludedClassNames,
+            priorityEntityTypeNames: priorityClassNames,
             recordZoneID: zoneID,
             logger: logger
         )

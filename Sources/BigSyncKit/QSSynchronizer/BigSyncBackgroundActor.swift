@@ -9,6 +9,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let containerName: String
     let configurations: [Realm.Configuration]
     let excludedClassNames: [String]
+    let priorityClassNames: [String]
     let suiteName: String?
     let recordZoneID: CKRecordZone.ID?
     let logger: Logging.Logger
@@ -18,6 +19,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
         containerName: String,
         configurations: [Realm.Configuration],
         excludedClassNames: [String],
+        priorityObjectTypes: [RealmSwift.Object.Type] = [],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
         logger: Logging.Logger
@@ -26,6 +28,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.containerName = containerName
         self.configurations = configurations
         self.excludedClassNames = excludedClassNames
+        self.priorityClassNames = priorityObjectTypes.map { $0.className() }
         self.suiteName = suiteName
         self.recordZoneID = recordZoneID
         self.logger = logger
@@ -54,6 +57,7 @@ public actor BigSyncBackgroundActor {
             containerName: configuration.containerName,
             configurations: configuration.configurations,
             excludedClassNames: configuration.excludedClassNames,
+            priorityClassNames: configuration.priorityClassNames,
             suiteName: configuration.suiteName,
             recordZoneID: configuration.recordZoneID,
             compatibilityVersion: Int(configuration.configurations.map { $0.schemaVersion } .reduce(0, +)),
