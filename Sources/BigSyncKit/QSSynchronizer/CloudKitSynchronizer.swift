@@ -8,7 +8,6 @@
 import Foundation
 import CloudKit
 import Logging
-import Combine
 import RealmSwiftGaps
 import SwiftUtilities
 
@@ -93,37 +92,21 @@ internal class ChangeRequestProcessor {
         didSet {
             if !cancelSync && oldValue {
                 Task { @BigSyncBackgroundActor [weak self] in
-                    try await self?.runProcessFetchedChangeRequests()
+                    try await self?.finishProcessing()
                 }
             }
         }
     }
     
-    init() {
-        changeSubject
-            .debounceLeadingTrailing(for: .seconds(3), scheduler: DispatchQueue.global())
-            .sink { @Sendable [weak self] _ in
-                guard let self else { return }
-                Task { @BigSyncBackgroundActor [weak self] in
-                    guard let self else { return }
-                    guard !cancelSync else { return }
-                    try await runProcessFetchedChangeRequests()
-                }
-            }
-            .store(in: &cancellables)
-    }
+    init() {}
     
     private var changeRequests = [ChangeRequest]()
-    private var changeSubject = PassthroughSubject<Void, Never>()
-    private var cancellables = Set<AnyCancellable>()
     private var localErrors: [Error] = []
     internal var processTask: Task<Void, Error>? = nil
     private let batchSize = 100
     
     internal func addFetchedChangeRequest(_ request: ChangeRequest) {
-        //        debugPrint("# addChangeReq", request.downloadedRecord?.recordID.recordName)
         changeRequests.append(request)
-        changeSubject.send()
     }
 
     private func entityType(for request: ChangeRequest) -> String? {
@@ -134,23 +117,16 @@ internal class ChangeRequestProcessor {
         return recordName.split(separator: ".", maxSplits: 1).first.map(String.init)
     }
 
-    private func dequeueBatch() -> [ChangeRequest] {
-        guard let adapter = changeRequests.first?.adapter else {
-            return []
-        }
-        let prioritizedEntityType = adapter.priorityEntityTypeNames.first { priorityEntityType in
-            changeRequests.contains { entityType(for: $0) == priorityEntityType }
-        }
-        guard let prioritizedEntityType else {
-            let batch = Array(changeRequests.prefix(batchSize))
-            changeRequests.removeFirst(batch.count)
-            return batch
-        }
-
+    private func dequeueBatch(
+        for adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String?
+    ) -> [ChangeRequest] {
         var batch = [ChangeRequest]()
         var remainingRequests = [ChangeRequest]()
         for request in changeRequests {
-            if batch.count < batchSize && entityType(for: request) == prioritizedEntityType {
+            let isMatchingAdapter = request.adapter.recordZoneID == adapter.recordZoneID
+            let isMatchingRestriction = restrictedEntityType == nil || entityType(for: request) == restrictedEntityType
+            if batch.count < batchSize && isMatchingAdapter && isMatchingRestriction {
                 batch.append(request)
             } else {
                 remainingRequests.append(request)
@@ -160,35 +136,43 @@ internal class ChangeRequestProcessor {
         return batch
     }
     
-    private func runProcessFetchedChangeRequests() async throws {
+    private func runProcessFetchedChangeRequests(
+        for adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String?
+    ) async throws {
         processTask?.cancel()
         _ = try? await processTask?.value
         processTask = Task { @BigSyncBackgroundActor [weak self] in
-            try await self?.processFetchedChangeRequests()
+            try await self?.processFetchedChangeRequests(
+                for: adapter,
+                restrictedToEntityType: restrictedEntityType
+            )
             self?.processTask = nil
         }
         try await processTask?.value
     }
     
-    private func processFetchedChangeRequests() async throws {
-//        debugPrint("# processFetchedChangeRequests() inner")
+    private func processFetchedChangeRequests(
+        for adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String?
+    ) async throws {
         try Task.checkCancellation()
         
-        while !changeRequests.isEmpty {
+        while hasPendingChangeRequests(for: adapter, restrictedToEntityType: restrictedEntityType) {
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
-            let batch = dequeueBatch()
+            let batch = dequeueBatch(for: adapter, restrictedToEntityType: restrictedEntityType)
             
             do {
-//                logger?.info("QSCloudKitSynchronizer >> Processing \(batch.count) remote records for local merge: \(batch.compactMap { $0.downloadedRecord?.recordID.recordName } .joined(separator: " ")) (\(changeRequests.count) more remaining)")
-                
                 let downloadedRecords = try batch.compactMap {
                     try Task.checkCancellation()
                     return $0.downloadedRecord
                 }
                 
-                try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
-                try Task.checkCancellation()
+                if !downloadedRecords.isEmpty {
+                    try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
+                    try Task.checkCancellation()
+                }
                 
                 let deletedRecordIDs = try batch.compactMap {
                     try Task.checkCancellation()
@@ -219,9 +203,36 @@ internal class ChangeRequestProcessor {
     }
     
     @BigSyncBackgroundActor
-    func finishProcessing() async throws {
+    func hasPendingChangeRequests(
+        for adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String? = nil
+    ) -> Bool {
+        changeRequests.contains { request in
+            request.adapter.recordZoneID == adapter.recordZoneID &&
+            (restrictedEntityType == nil || entityType(for: request) == restrictedEntityType)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func finishProcessing(
+        for adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String? = nil
+    ) async throws {
         try Task.checkCancellation()
-        try await runProcessFetchedChangeRequests()
+        guard hasPendingChangeRequests(for: adapter, restrictedToEntityType: restrictedEntityType) else {
+            return
+        }
+        try await runProcessFetchedChangeRequests(
+            for: adapter,
+            restrictedToEntityType: restrictedEntityType
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func finishProcessing() async throws {
+        while let adapter = changeRequests.first?.adapter {
+            try await finishProcessing(for: adapter)
+        }
     }
 }
 

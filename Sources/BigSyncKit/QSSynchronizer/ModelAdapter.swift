@@ -130,3 +130,11 @@ public protocol ModelAdapter: AnyObject, Sendable {
 public extension ModelAdapter {
     var priorityEntityTypeNames: [String] { [] }
 }
+
+internal protocol PrioritySyncCapableModelAdapter: ModelAdapter {
+    @BigSyncBackgroundActor
+    func recordsToUpload(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord]
+
+    @BigSyncBackgroundActor
+    func recordIDsMarkedForDeletion(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord.ID]
+}

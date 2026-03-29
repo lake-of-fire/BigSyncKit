@@ -385,7 +385,12 @@ extension CloudKitSynchronizer {
             if syncMode == .sync {
                 try await uploadChanges()
             } else {
-                await changesFinishedSynchronizing()
+                do {
+                    try await processFetchedChanges()
+                    await changesFinishedSynchronizing()
+                } catch {
+                    await failSynchronization(error: error)
+                }
             }
         }
     }
@@ -433,7 +438,6 @@ extension CloudKitSynchronizer {
                     guard let self else { return }
                     fetchZoneChangesTask?.cancel()
                     fetchZoneChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                        //                        debugPrint("# fetchZoneChanges callback")
                         guard let self else { return }
                         try Task.checkCancellation()
                         if let error {
@@ -445,15 +449,8 @@ extension CloudKitSynchronizer {
                             await failSynchronization(error: SyncError.cancelled)
                             return
                         }
-                        
-                        try await mergeChanges() { [weak self] error in
-                            guard let self else { return }
-                            mergeChangesTask?.cancel()
-                            mergeChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                                try Task.checkCancellation()
-                                try await completion(token, error)
-                            }
-                        }
+
+                        try await completion(token, nil)
                     }
                 }
             }
@@ -527,10 +524,6 @@ extension CloudKitSynchronizer {
                     }).first
                     try Task.checkCancellation()
                     
-                    // Process any remaining change requests before saving server change tokens
-                    try await changeRequestProcessor.finishProcessing()
-                    try Task.checkCancellation()
-                    
                     for (zoneID, zoneResult) in zoneResults {
                         if !zoneResult.downloadedRecords.isEmpty {
                             logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records from zone \(zoneID.zoneName)")
@@ -549,13 +542,8 @@ extension CloudKitSynchronizer {
                             return
                         }
                     }
-                    
-                    // Collect any errors from the processor
-                    if let firstError = changeRequestProcessor.getErrors().first {
-                        try await completion(firstError)
-                    } else {
-                        try await completion(error)
-                    }
+
+                    try await completion(error)
                 }
             }
         }
@@ -563,48 +551,17 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func mergeChanges(
-        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
-    ) async throws {
-        //        debugPrint("# mergeChanges()")
+    func processFetchedChanges() async throws {
         guard !cancelSync else {
             await failSynchronization(error: SyncError.cancelled)
             return
         }
         
-        var adapterSet = [ModelAdapter]()
-        activeZoneTokens.keys.forEach {
-            if let adapter = self.modelAdapterDictionary[$0] {
-                adapterSet.append(adapter)
-            }
+        for adapter in modelAdapters {
+            try Task.checkCancellation()
+            try await runFetchedChangesPhase(for: adapter, restrictedToEntityType: nil)
+            try await saveActiveTokenIfNeeded(for: adapter)
         }
-        
-        try await sequential(
-            objects: adapterSet,
-            closure: { [weak self] adapter, completion in
-                guard let self else { return }
-                try await mergeChangesIntoAdapter(adapter, completion: completion)
-            },
-            final: completion
-        )
-    }
-    
-    @BigSyncBackgroundActor
-    func mergeChangesIntoAdapter(
-        _ adapter: ModelAdapter,
-        completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
-    ) async throws {
-        do {
-            try await adapter.persistImportedChanges()
-        } catch {
-            try await completion(error)
-            return
-        }
-        
-        if let token = activeZoneToken(zoneID: adapter.recordZoneID) {
-            await adapter.saveToken(token)
-        }
-        try await completion(nil)
     }
 }
 
@@ -652,35 +609,21 @@ extension CloudKitSynchronizer {
     func uploadChanges(
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
-        //        debugPrint("# uploadChanges(completion)")
-        try await sequential(
-            objects: modelAdapters,
-            closure: { [weak self] adapter, completion in
-                guard let self else { return }
-                try await setupZoneAndUploadRecords(adapter: adapter, completion: completion)
+        do {
+            for adapter in modelAdapters {
+                try Task.checkCancellation()
+                try await synchronizeAdapter(adapter)
             }
-        ) { [weak self] (error) in
-            guard error == nil else {
-                try await completion(error)
-                return
-            }
-            guard let self else { return }
-            guard !cancelSync else { throw CancellationError() }
-
-            try await sequential(
-                objects: modelAdapters,
-                closure: { [weak self] adapter, completion in
-                    guard let self else { return }
-                    try await uploadDeletions(adapter: adapter, completion: completion)
-                },
-                final: completion
-            )
+            try await completion(nil)
+        } catch {
+            try await completion(error)
         }
     }
     
     @BigSyncBackgroundActor
     func setupZoneAndUploadRecords(
         adapter: ModelAdapter,
+        restrictedToEntityType: String? = nil,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
         try await setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
@@ -689,8 +632,10 @@ extension CloudKitSynchronizer {
                 return
             }
             guard !cancelSync else { throw CancellationError() }
-            //            debugPrint("# uploadRecords from setupZoneAndUploadRecords")
-            try await uploadRecords(adapter: adapter, completion: { [weak self] (error) in
+            try await uploadRecords(
+                adapter: adapter,
+                restrictedToEntityType: restrictedToEntityType,
+                completion: { [weak self] (error) in
                 if error == nil {
                     self?.increaseBatchSize()
                 }
@@ -739,13 +684,24 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func uploadRecords(adapter: ModelAdapter, completion: @escaping (Error?) async throws -> ()) async throws {
+    func uploadRecords(
+        adapter: ModelAdapter,
+        restrictedToEntityType: String? = nil,
+        completion: @escaping (Error?) async throws -> ()
+    ) async throws {
         guard !cancelSync else { throw CancellationError() }
         
         let requestedBatchSize = batchSize
-        let records = try await adapter.recordsToUpload(limit: requestedBatchSize)
+        let records: [CKRecord]
+        if let restrictedAdapter = adapter as? PrioritySyncCapableModelAdapter {
+            records = try await restrictedAdapter.recordsToUpload(
+                limit: requestedBatchSize,
+                restrictedToEntityType: restrictedToEntityType
+            )
+        } else {
+            records = try await adapter.recordsToUpload(limit: requestedBatchSize)
+        }
         let recordCount = records.count
-        //        debugPrint("# uploadRecords", adapter.recordZoneID, "count", records.count, records.map { $0.recordID.recordName })
         guard recordCount > 0 else { try await completion(nil); return }
         
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
@@ -829,7 +785,11 @@ extension CloudKitSynchronizer {
                                 guard !cancelSync else { throw CancellationError() }
                                 
                                 // Proceed to upload remaining records after resolving conflicts
-                                try await uploadRecords(adapter: adapter, completion: completion)
+                                try await uploadRecords(
+                                    adapter: adapter,
+                                    restrictedToEntityType: restrictedToEntityType,
+                                    completion: completion
+                                )
                             } catch {
                                 logger.info("QSCloudKitSynchronizer >> WARNING: Failed to save changes to resolved conflicted record: \(error)")
                                 try await completion(error)
@@ -859,7 +819,11 @@ extension CloudKitSynchronizer {
                     try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
                     
-                    try await uploadRecords(adapter: adapter, completion: completion)
+                    try await uploadRecords(
+                        adapter: adapter,
+                        restrictedToEntityType: restrictedToEntityType,
+                        completion: completion
+                    )
                 } else {
                     try await completion(nil)
                 }
@@ -873,9 +837,18 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func uploadDeletions(
         adapter: ModelAdapter,
+        restrictedToEntityType: String? = nil,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
-        let recordIDs = try await adapter.recordIDsMarkedForDeletion(limit: batchSize)
+        let recordIDs: [CKRecord.ID]
+        if let restrictedAdapter = adapter as? PrioritySyncCapableModelAdapter {
+            recordIDs = try await restrictedAdapter.recordIDsMarkedForDeletion(
+                limit: batchSize,
+                restrictedToEntityType: restrictedToEntityType
+            )
+        } else {
+            recordIDs = try await adapter.recordIDsMarkedForDeletion(limit: batchSize)
+        }
         let recordCount = recordIDs.count
         let requestedBatchSize = batchSize
         
@@ -900,7 +873,11 @@ extension CloudKitSynchronizer {
                     try await completion(error)
                 } else {
                     if recordCount >= requestedBatchSize {
-                        try await uploadDeletions(adapter: adapter, completion: completion)
+                        try await uploadDeletions(
+                            adapter: adapter,
+                            restrictedToEntityType: restrictedToEntityType,
+                            completion: completion
+                        )
                     } else {
                         try await completion(nil)
                     }
@@ -910,6 +887,118 @@ extension CloudKitSynchronizer {
         
         currentOperations.append(modifyRecordsOperation)
         database.add(modifyRecordsOperation)
+    }
+
+    @BigSyncBackgroundActor
+    func synchronizeAdapter(_ adapter: ModelAdapter) async throws {
+        for priorityEntityType in adapter.priorityEntityTypeNames {
+            try Task.checkCancellation()
+            try await runSyncPhase(for: adapter, restrictedToEntityType: priorityEntityType)
+        }
+
+        try Task.checkCancellation()
+        try await runFetchedChangesPhase(for: adapter, restrictedToEntityType: nil)
+        try await saveActiveTokenIfNeeded(for: adapter)
+        try await uploadRecordsIfNeeded(adapter: adapter, restrictedToEntityType: nil)
+        try await uploadDeletionsIfNeeded(adapter: adapter, restrictedToEntityType: nil)
+    }
+
+    @BigSyncBackgroundActor
+    func runSyncPhase(
+        for adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String?
+    ) async throws {
+        try await runFetchedChangesPhase(for: adapter, restrictedToEntityType: restrictedEntityType)
+        try await uploadRecordsIfNeeded(adapter: adapter, restrictedToEntityType: restrictedEntityType)
+        try await uploadDeletionsIfNeeded(adapter: adapter, restrictedToEntityType: restrictedEntityType)
+    }
+
+    @BigSyncBackgroundActor
+    func runFetchedChangesPhase(
+        for adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String?
+    ) async throws {
+        let changeRequestProcessor = ChangeRequestProcessor.shared
+        try await changeRequestProcessor.finishProcessing(
+            for: adapter,
+            restrictedToEntityType: restrictedEntityType
+        )
+        if let firstError = changeRequestProcessor.getErrors().first {
+            changeRequestProcessor.clearErrors()
+            throw firstError
+        }
+        do {
+            try await adapter.persistImportedChanges()
+        } catch {
+            changeRequestProcessor.clearErrors()
+            throw error
+        }
+        changeRequestProcessor.clearErrors()
+    }
+
+    @BigSyncBackgroundActor
+    func saveActiveTokenIfNeeded(for adapter: ModelAdapter) async throws {
+        if let token = activeZoneToken(zoneID: adapter.recordZoneID) {
+            await adapter.saveToken(token)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func uploadRecordsIfNeeded(
+        adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String?
+    ) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            Task { @BigSyncBackgroundActor [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                do {
+                    try await setupZoneAndUploadRecords(
+                        adapter: adapter,
+                        restrictedToEntityType: restrictedEntityType
+                    ) { error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func uploadDeletionsIfNeeded(
+        adapter: ModelAdapter,
+        restrictedToEntityType restrictedEntityType: String?
+    ) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            Task { @BigSyncBackgroundActor [weak self] in
+                guard let self else {
+                    continuation.resume()
+                    return
+                }
+                do {
+                    try await uploadDeletions(
+                        adapter: adapter,
+                        restrictedToEntityType: restrictedEntityType
+                    ) { error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
     
     // MARK: -

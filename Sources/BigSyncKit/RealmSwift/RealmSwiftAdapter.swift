@@ -248,7 +248,7 @@ struct ResultsChangeSet {
 
 extension RealmSwiftAdapter: @unchecked Sendable { }
 
-public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
+public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapableModelAdapter {
     private static var shouldSkipDebugDummySetup: Bool {
         let environment = ProcessInfo.processInfo.environment
         if environment["MANABI_UI_TEST_BYPASS_PASTEBOARD"] == "1" { return true }
@@ -2618,7 +2618,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    public func recordsToUpload(limit: Int) async throws -> [CKRecord] {
+    func recordsToUpload(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord] {
         if !hasChanges {
             if let persistenceRealm = realmProvider?.persistenceRealm {
                 updateHasChanges(realm: persistenceRealm)
@@ -2631,7 +2631,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         var recordsArray = [CKRecord]()
         let recordLimit = limit == 0 ? Int.max : limit
         var uploadingState = SyncedEntityState.new
-        let prioritizedEntityType = prioritizedEntityTypeWithPendingUploadOrDeletion()
+        let targetEntityType = restrictedToEntityType ?? prioritizedEntityTypeWithPendingUploadOrDeletion()
         
         var innerLimit = recordLimit
         while recordsArray.count < recordLimit && uploadingState.rawValue < SyncedEntityState.deletedLocally.rawValue {
@@ -2641,7 +2641,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
                 contentsOf: self.recordsToUpload(
                     withState: uploadingState,
                     limit: innerLimit,
-                    restrictedToEntityType: prioritizedEntityType
+                    restrictedToEntityType: targetEntityType
                 )
             )
             uploadingState = self.nextStateToSync(after: uploadingState)
@@ -2649,6 +2649,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         }
         
         return recordsArray
+    }
+
+    @BigSyncBackgroundActor
+    public func recordsToUpload(limit: Int) async throws -> [CKRecord] {
+        try await recordsToUpload(limit: limit, restrictedToEntityType: nil)
     }
     
     @BigSyncBackgroundActor
@@ -2679,15 +2684,15 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
     }
     
     @BigSyncBackgroundActor
-    public func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID] {
+    func recordIDsMarkedForDeletion(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord.ID] {
         var recordIDs = [CKRecord.ID]()
         
         guard let deletedEntities = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == SyncedEntityState.deletedLocally.rawValue }) else { return [] }
-        let prioritizedEntityType = prioritizedEntityTypeWithPendingUploadOrDeletion()
+        let targetEntityType = restrictedToEntityType ?? prioritizedEntityTypeWithPendingUploadOrDeletion()
         
         for syncedEntity in Array(deletedEntities) {
             guard !cancelSync else { throw CancellationError() }
-            if let prioritizedEntityType, syncedEntity.entityType != prioritizedEntityType {
+            if let targetEntityType, syncedEntity.entityType != targetEntityType {
                 continue
             }
             
@@ -2698,6 +2703,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency ModelAdapter {
         }
         
         return recordIDs
+    }
+
+    @BigSyncBackgroundActor
+    public func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID] {
+        try await recordIDsMarkedForDeletion(limit: limit, restrictedToEntityType: nil)
     }
     
     @BigSyncBackgroundActor
