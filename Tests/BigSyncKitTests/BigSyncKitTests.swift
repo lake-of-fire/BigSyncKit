@@ -72,6 +72,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     var mergePolicy: MergePolicy = .server
 
     private(set) var events = [String]()
+    private(set) var savedBatchSizes = [Int]()
     private var uploadedByEntity: [String: [CKRecord]]
     private var deletedByEntity: [String: [CKRecord.ID]]
     private var storedServerChangeToken: CKServerChangeToken?
@@ -98,6 +99,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool { true }
 
     func saveChanges(in records: [CKRecord], forceSave: Bool) async throws {
+        savedBatchSizes.append(records.count)
         let recordTypes = records.map { $0.recordType }.joined(separator: ",")
         events.append("save:\(recordTypes)")
     }
@@ -334,6 +336,33 @@ final class BigSyncKitTests: XCTestCase {
         )
         let recordIDs = try await adapter.recordIDsMarkedForDeletion(limit: 10)
         XCTAssertEqual(recordIDs.map(\.recordName), ["Article.1"])
+    }
+
+    @BigSyncBackgroundActor
+    func testFetchedChangeProcessorUsesLargerBatchWithoutRepeatedHundredRecordSplits() async throws {
+        let zoneID = CKRecordZone.ID(zoneName: "batch-zone", ownerName: CKCurrentUserDefaultName)
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        let synchronizer = makeSynchronizer()
+        synchronizer.addModelAdapter(adapter)
+
+        let processor = ChangeRequestProcessor.shared
+        processor.clearErrors()
+        processor.fetchedChangeBatchSize = 300
+
+        for index in 0..<250 {
+            processor.addFetchedChangeRequest(
+                ChangeRequest(
+                    downloadedRecord: makeRecord(type: "Article", id: "\(index)", zoneID: zoneID),
+                    deletedRecordID: nil,
+                    adapter: adapter
+                )
+            )
+        }
+
+        try await synchronizer.synchronizeAdapter(adapter)
+
+        XCTAssertEqual(adapter.savedBatchSizes, [250])
+        XCTAssertEqual(adapter.events.filter { $0 == "persist" }.count, 1)
     }
 
     @BigSyncBackgroundActor

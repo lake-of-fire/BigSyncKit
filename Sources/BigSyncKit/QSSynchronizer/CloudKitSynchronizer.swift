@@ -85,6 +85,7 @@ internal struct ChangeRequest: Sendable {
 @BigSyncBackgroundActor
 internal class ChangeRequestProcessor {
     static let shared = ChangeRequestProcessor()
+    static let defaultFetchedChangeBatchSize = 300
     
 //    internal var logger: Logging.Logger?
 
@@ -103,7 +104,7 @@ internal class ChangeRequestProcessor {
     private var changeRequests = [ChangeRequest]()
     private var localErrors: [Error] = []
     internal var processTask: Task<Void, Error>? = nil
-    private let batchSize = 100
+    internal var fetchedChangeBatchSize = ChangeRequestProcessor.defaultFetchedChangeBatchSize
     
     internal func addFetchedChangeRequest(_ request: ChangeRequest) {
         changeRequests.append(request)
@@ -122,17 +123,20 @@ internal class ChangeRequestProcessor {
         restrictedToEntityType restrictedEntityType: String?
     ) -> [ChangeRequest] {
         var batch = [ChangeRequest]()
-        var remainingRequests = [ChangeRequest]()
-        for request in changeRequests {
+        batch.reserveCapacity(fetchedChangeBatchSize)
+
+        var index = 0
+        while index < changeRequests.count && batch.count < fetchedChangeBatchSize {
+            let request = changeRequests[index]
             let isMatchingAdapter = request.adapter.recordZoneID == adapter.recordZoneID
             let isMatchingRestriction = restrictedEntityType == nil || entityType(for: request) == restrictedEntityType
-            if batch.count < batchSize && isMatchingAdapter && isMatchingRestriction {
-                batch.append(request)
+            if isMatchingAdapter && isMatchingRestriction {
+                batch.append(changeRequests.remove(at: index))
             } else {
-                remainingRequests.append(request)
+                index += 1
             }
         }
-        changeRequests = remainingRequests
+
         return batch
     }
     
@@ -158,10 +162,11 @@ internal class ChangeRequestProcessor {
     ) async throws {
         try Task.checkCancellation()
         
-        while hasPendingChangeRequests(for: adapter, restrictedToEntityType: restrictedEntityType) {
+        while true {
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
             let batch = dequeueBatch(for: adapter, restrictedToEntityType: restrictedEntityType)
+            guard !batch.isEmpty else { return }
             
             do {
                 let downloadedRecords = try batch.compactMap {
@@ -219,9 +224,6 @@ internal class ChangeRequestProcessor {
         restrictedToEntityType restrictedEntityType: String? = nil
     ) async throws {
         try Task.checkCancellation()
-        guard hasPendingChangeRequests(for: adapter, restrictedToEntityType: restrictedEntityType) else {
-            return
-        }
         try await runProcessFetchedChangeRequests(
             for: adapter,
             restrictedToEntityType: restrictedEntityType
