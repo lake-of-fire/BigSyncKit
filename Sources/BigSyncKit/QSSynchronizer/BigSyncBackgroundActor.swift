@@ -42,9 +42,9 @@ public actor BigSyncBackgroundActor {
     private weak var synchronizerDelegate: RealmSwiftAdapterDelegate?
     
     @BigSyncBackgroundActor
-    public var realmSynchronizer: CloudKitSynchronizer!
+    public private(set) var realmSynchronizer: CloudKitSynchronizer?
     @BigSyncBackgroundActor
-    public var logger: Logging.Logger!
+    public private(set) var logger: Logging.Logger?
     
     public init() { }
     
@@ -69,7 +69,7 @@ public actor BigSyncBackgroundActor {
         (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
         
         let compatibilityVersion = synchronizer.compatibilityVersion
-        logger.info("QSCloudKitSynchronizer >> Local compatibility version: \(compatibilityVersion)")
+        configuration.logger.info("QSCloudKitSynchronizer >> Local compatibility version: \(compatibilityVersion)")
         
         Task { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
@@ -96,17 +96,36 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     public func cleanUp() async {
-        await cancelSynchronization()
+        guard let realmSynchronizer else {
+            logger?.warning("QSCloudKitSynchronizer >> Cleanup requested before background synchronizer configuration completed")
+            return
+        }
+
+        realmSynchronizer.cancelSynchronization()
+
+        for modelAdapter in realmSynchronizer.modelAdapters {
+            modelAdapter.cleanUp()
+        }
     }
     
     @BigSyncBackgroundActor
     public func synchronizeCloudKit() async {
+        guard let realmSynchronizer else {
+            logger?.warning("QSCloudKitSynchronizer >> Synchronization requested before background synchronizer configuration completed")
+            return
+        }
+
         await realmSynchronizer.beginSynchronization()
     }
     
     @BigSyncBackgroundActor
     public func cancelSynchronization() async {
-        await realmSynchronizer.cancelSynchronization()
+        guard let realmSynchronizer else {
+            logger?.warning("QSCloudKitSynchronizer >> Cancellation requested before background synchronizer configuration completed")
+            return
+        }
+
+        realmSynchronizer.cancelSynchronization()
     }
     
     public func synchronizeCloudKit(using configuration: BigSyncBackgroundWorkerConfiguration) async {
