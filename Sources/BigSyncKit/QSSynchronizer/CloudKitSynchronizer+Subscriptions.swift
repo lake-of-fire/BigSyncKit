@@ -9,19 +9,19 @@ import Foundation
 import CloudKit
 
 @available(iOS 10.0, macOS 10.12, watchOS 6.0, *)
-@objc public extension CloudKitSynchronizer {
+public extension CloudKitSynchronizer {
     /// Returns identifier for a registered `CKSubscription` to track changes.
     /// - Parameter zoneID: `CKRecordZoneID` that is being tracked with the subscription.
     /// - Returns: Identifier of an existing `CKSubscription` for the record zone, if there is one.
     @BigSyncBackgroundActor
-    @objc func subscriptionID(forRecordZoneID zoneID: CKRecordZone.ID) -> String? {
+    func subscriptionID(forRecordZoneID zoneID: CKRecordZone.ID) -> String? {
         return getStoredSubscriptionID(for: zoneID)
     }
     
     /// Returns identifier for a registered `CKSubscription` to track changes in the synchronizer's database.
     /// - Returns: Identifier of an existing `CKSubscription` for this database, if there is one.
     @BigSyncBackgroundActor
-    @objc func subscriptionIDForDatabaseSubscription() -> String? {
+    func subscriptionIDForDatabaseSubscription() -> String? {
         return self.databaseSubscriptionID
     }
     
@@ -35,7 +35,7 @@ import CloudKit
     /// Creates a new database subscription with CloudKit so the application can receive notifications when new changes happen. The application is responsible for registering for remote notifications and initiating synchronization when a notification is received. @see `CKSubscription`
     /// - Parameter completion: Block that will be called after subscription is created, with an optional error.
     @BigSyncBackgroundActor
-    @objc func subscribeForChangesInDatabase(completion: ((Error?) -> ())?) {
+    func subscribeForChangesInDatabase(completion: ((Error?) -> ())?) {
         guard subscriptionIDForDatabaseSubscription() == nil else {
             completion?(nil)
             return
@@ -87,7 +87,7 @@ import CloudKit
     ///   - zoneID: `CKRecordZoneID` to track for changes
     ///   - completion: Block that will be called after subscription is created, with an optional error.
     @BigSyncBackgroundActor
-    @objc func subscribeForChanges(in zoneID: CKRecordZone.ID, completion: ((Error?)->())?) {
+    func subscribeForChanges(in zoneID: CKRecordZone.ID, completion: ((Error?)->())?) {
         guard subscriptionID(forRecordZoneID: zoneID) == nil else {
             completion?(nil)
             return
