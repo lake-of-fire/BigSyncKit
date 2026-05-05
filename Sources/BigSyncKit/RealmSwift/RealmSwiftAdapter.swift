@@ -461,7 +461,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         let writerURL = targetWriterRealm.configuration.fileURL?.path ?? "nil"
                         let writerTypedCount = targetWriterRealm.objects(objectClass).count
                         if writerTypedCount == 0 {
-                            try await targetWriterRealm.asyncWrite {
+                            try targetWriterRealm.write {
                                 let dummy = objectClass.init()
                                 if let softDeletable = dummy as? SoftDeletable {
                                     softDeletable.isDeleted = true
