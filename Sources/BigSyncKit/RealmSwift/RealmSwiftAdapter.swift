@@ -683,15 +683,15 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate).map {
             (
                 Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
-                $0.value(forKey: "modifiedAt") as? Date,
-                $0.value(forKey: "explicitlyModifiedAt") as? Date,
+                $0["modifiedAt"] as? Date,
+                $0["explicitlyModifiedAt"] as? Date,
             )
         })
         let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate).map {
             (
                 Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
-                $0.value(forKey: "modifiedAt") as? Date,
-                $0.value(forKey: "explicitlyModifiedAt") as? Date,
+                $0["modifiedAt"] as? Date,
+                $0["explicitlyModifiedAt"] as? Date,
             )
         })
 
@@ -987,26 +987,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         var missingEntities = [String: [String]]()
 
         for (entityType, identifierSet) in identifiersPerEntityType {
-            var missingIdentifiers = Set(identifierSet)
-            let identifierArray = Array(identifierSet)
-
-            for chunk in identifierArray.chunks(ofCount: 500) {
-                guard !chunk.isEmpty else { continue }
-                guard !cancelSync else {
-                    throw CancellationError()
-                }
-
-                let existingIdentifiers = Set(
-                    syncedEntities
-                        .where { $0.identifier.in(Array(chunk)) }
-                        .map(\.identifier)
-                )
-                missingIdentifiers.subtract(existingIdentifiers)
-
-                if missingIdentifiers.isEmpty {
-                    break
-                }
+            guard !cancelSync else {
+                throw CancellationError()
             }
+
+            let existingIdentifiers = Set(
+                syncedEntities
+                    .where { $0.entityType == entityType }
+                    .map(\.identifier)
+            )
+            let missingIdentifiers = identifierSet.subtracting(existingIdentifiers)
 
             if !missingIdentifiers.isEmpty {
                 missingEntities[entityType] = Array(missingIdentifiers)
@@ -1108,13 +1098,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @inline(__always)
     static func getTargetObjectStringIdentifier(for object: Object, usingPrimaryKey key: String) -> String {
-        let objectId = object.value(forKey: key)
+        let objectId = object[key]
         let identifier: String
         if let value = objectId as? String {
             identifier = value
         } else if let value = objectId as? CustomStringConvertible {
             identifier = String(describing: value)
         } else {
+            assertionFailure("Expected primary key \(key) on \(object.objectSchema.className) to be string-convertible")
             identifier = objectId as! String
         }
         //        guard identifier.count <= 255 else {
@@ -1175,7 +1166,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
             
             let newValue = record[key]
-            let existingValue = object.value(forKey: key)
+            let existingValue = object[key]
             
             let propertyChanged = {
                 // Handle one side being nil first
@@ -1424,13 +1415,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         return false
                     }
                     let remoteExplicitlyModifiedAt = changes["explicitlyModifiedAt"] as? Date ?? .distantPast
-                    let localExplicitlyModifiedAt = object.value(forKey: "explicitlyModifiedAt") as? Date ?? .distantPast
+                    let localExplicitlyModifiedAt = object["explicitlyModifiedAt"] as? Date ?? .distantPast
                     let result: Bool
                     if remoteExplicitlyModifiedAt > localExplicitlyModifiedAt {
                         result = true
                     } else if remoteExplicitlyModifiedAt == localExplicitlyModifiedAt {
                         let remoteModifiedAt = changes["modifiedAt"] as? Date ?? .distantPast
-                        let localModifiedAt = object.value(forKey: "modifiedAt") as? Date ?? .distantPast
+                        let localModifiedAt = object["modifiedAt"] as? Date ?? .distantPast
                         result = remoteModifiedAt >= localModifiedAt
                     } else {
                         result = false
@@ -2040,7 +2031,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             //            }
             if entityState == SyncedEntityState.new.rawValue || entityState == SyncedEntityState.changed.rawValue {
                 if skippedKeys.contains(property.name) {
-                    let defaultValue = defaultObject?.value(forKey: property.name)
+                    let defaultValue = defaultObject?[property.name]
                     if let ckValue = defaultValue as? CKRecordValue {
                         record[property.name] = ckValue
                     } else {
@@ -2055,7 +2046,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 
                 if property.type == PropertyType.object {
-                    if let target = object.value(forKey: property.name) as? Object {
+                    if let target = object[property.name] as? Object {
                         let targetPrimaryKey = (type(of: target).primaryKey() ?? target.objectSchema.primaryKeyProperty?.name)!
                         let targetIdentifier = Self.getTargetObjectStringIdentifier(for: target, usingPrimaryKey: targetPrimaryKey)
                         let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
@@ -2063,7 +2054,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         record[property.name] = recordID.recordName as CKRecordValue
                     }
                 } else if property.isSet {
-                    let value = object.value(forKey: property.name)
+                    let value = object[property.name]
                     switch property.type {
                     case .object:
                         /// We may get MutableSet<Cat> here
@@ -2122,7 +2113,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 } else if property.isMap {
                     // CloudKit does not support native dictionary/map values
                     // Convert to a 2-tuple: (keys: [String], values: [CKRecordValue])
-                    guard let dict = object.value(forKey: property.name) as? [String: Any] else { break }
+                    guard let dict = object[property.name] as? [String: Any] else { break }
                     let keys = NSMutableArray()
                     let values = NSMutableArray()
                     for (key, value) in dict {
@@ -2150,7 +2141,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     record[property.name] = [keys, values] as CKRecordValue
                 } else if property.isArray {
                     // Array handling forked from IceCream: https://github.com/caiyue1993/IceCream/blob/b29dfe81e41cc929c8191c3266189a7070cb5bc5/IceCream/Classes/CKRecordConvertible.swift
-                    let value = object.value(forKey: property.name)
+                    let value = object[property.name]
                     switch property.type {
                     case .object:
                         /// We may get List<Cat> here
@@ -2210,7 +2201,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     property.type != PropertyType.linkingObjects &&
                     !(property.name == (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!)
                 ) {
-                    let value = object.value(forKey: property.name)
+                    let value = object[property.name]
                     if property.type == PropertyType.data,
                        let data = value as? Data,
                        !forceDataTypeInsteadOfAsset {
