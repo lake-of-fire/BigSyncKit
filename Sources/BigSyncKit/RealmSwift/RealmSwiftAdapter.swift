@@ -251,6 +251,7 @@ extension RealmSwiftAdapter: @unchecked Sendable { }
 public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapableModelAdapter {
     private static var shouldSkipDebugDummySetup: Bool {
         let environment = ProcessInfo.processInfo.environment
+        guard environment["MANABI_BIGSYNC_DEBUG_DUMMY_RECORDS"] == "1" else { return true }
         if environment["MANABI_UI_TEST_BYPASS_PASTEBOARD"] == "1" { return true }
         if environment["TEST_RUNNER_MANABI_TEST_USE_YOMITAN"] == "1" { return true }
         if environment["XCTestConfigurationFilePath"] != nil { return true }
@@ -1943,17 +1944,22 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 #if DEBUG
         // Ensure dummy records are uploaded first
         let dummyRecordIdentifiers = await dummyRecordIdentifiers
-        let resultsToUpload = Array(results).sorted {
-            let isFirstDummy = dummyRecordIdentifiers.contains($0.identifier)
-            let isSecondDummy = dummyRecordIdentifiers.contains($1.identifier)
-            
-            if isFirstDummy && !isSecondDummy {
-                return true
-            } else if !isFirstDummy && isSecondDummy {
-                return false
-            } else {
-                return $0.identifier > $1.identifier // fallback sort
+        let resultsToUpload: [SyncedEntity]
+        if dummyRecordIdentifiers.isEmpty {
+            resultsToUpload = Array(results)
+        } else {
+            var dummyResults = [SyncedEntity]()
+            var regularResults = [SyncedEntity]()
+            dummyResults.reserveCapacity(dummyRecordIdentifiers.count)
+            regularResults.reserveCapacity(results.count)
+            for result in results {
+                if dummyRecordIdentifiers.contains(result.identifier) {
+                    dummyResults.append(result)
+                } else {
+                    regularResults.append(result)
+                }
             }
+            resultsToUpload = dummyResults + regularResults
         }
 #else
         let resultsToUpload = Array(results)
