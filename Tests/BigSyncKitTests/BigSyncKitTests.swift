@@ -176,6 +176,23 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     }
 }
 
+@objc(BigSyncTrackedObject)
+private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
+    @Persisted(primaryKey: true) var id: String
+    @Persisted var createdAt: Date
+    @Persisted var modifiedAt: Date
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+
+    convenience init(id: String, createdAt: Date, modifiedAt: Date, explicitlyModifiedAt: Date?) {
+        self.init()
+        self.id = id
+        self.createdAt = createdAt
+        self.modifiedAt = modifiedAt
+        self.explicitlyModifiedAt = explicitlyModifiedAt
+    }
+}
+
 final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testPrioritizedRemoteChangesAreProcessedInConfiguredOrderBeforeUnprioritized() async throws {
@@ -366,6 +383,69 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testEnqueuedLocalChangeAdvancesLastTrackedChangesAtFromProjectedTupleTimestamp() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let explicitDate = Date(timeIntervalSinceReferenceDate: 10_000)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(BigSyncTrackedObject(
+                id: "local",
+                createdAt: explicitDate,
+                modifiedAt: explicitDate,
+                explicitlyModifiedAt: explicitDate
+            ))
+        }
+
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
+
+        let syncedEntityType = try XCTUnwrap(
+            fixture.persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: BigSyncTrackedObject.className())
+        )
+        XCTAssertEqual(syncedEntityType.lastTrackedChangesAt, explicitDate)
+        XCTAssertNotNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".local"
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRemoteFetchedChangeStillAdvancesLastTrackedChangesAtWhenFilteredFromUploadQueue() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let explicitDate = Date(timeIntervalSinceReferenceDate: 20_000)
+        let modifiedDate = Date(timeIntervalSinceReferenceDate: 20_001)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(BigSyncTrackedObject(
+                id: "remote",
+                createdAt: explicitDate,
+                modifiedAt: modifiedDate,
+                explicitlyModifiedAt: explicitDate
+            ))
+        }
+        let storedModifiedDate = try XCTUnwrap(
+            fixture.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "remote")?["modifiedAt"] as? Date
+        )
+        fixture.adapter._test_markRecentlyFetchedRecord(
+            entityType: BigSyncTrackedObject.className(),
+            identifier: "remote",
+            modifiedAt: storedModifiedDate
+        )
+
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
+
+        let syncedEntityType = try XCTUnwrap(
+            fixture.persistenceRealm.object(ofType: SyncedEntityType.self, forPrimaryKey: BigSyncTrackedObject.className())
+        )
+        XCTAssertEqual(syncedEntityType.lastTrackedChangesAt, explicitDate)
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".remote"
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
     private func makeSynchronizer() -> CloudKitSynchronizer {
         CloudKitSynchronizer(
             identifier: UUID().uuidString,
@@ -379,5 +459,35 @@ final class BigSyncKitTests: XCTestCase {
 
     private func makeRecord(type: String, id: String, zoneID: CKRecordZone.ID) -> CKRecord {
         CKRecord(recordType: type, recordID: CKRecord.ID(recordName: "\(type).\(id)", zoneID: zoneID))
+    }
+
+    @BigSyncBackgroundActor
+    private func makeRealmAdapterFixture() async throws -> (
+        adapter: RealmSwiftAdapter,
+        persistenceRealm: Realm,
+        targetRealm: Realm
+    ) {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier = "persistence-\(identifier)"
+
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier = "target-\(identifier)"
+        targetConfiguration.objectTypes = [BigSyncTrackedObject.self]
+
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(zoneName: "realm-adapter-zone", ownerName: CKCurrentUserDefaultName),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        try await adapter.resetSyncCaches()
+        adapter.invalidateTokens()
+
+        let persistenceRealm = try await Realm.open(configuration: persistenceConfiguration)
+        let targetRealm = try await Realm.open(configuration: targetConfiguration)
+        return (adapter, persistenceRealm, targetRealm)
     }
 }

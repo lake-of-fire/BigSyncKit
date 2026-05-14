@@ -244,6 +244,30 @@ actor RealmProvider {
 struct ResultsChangeSet {
     var insertions: [String: (Set<String>, Date?)] = [:] // schemaName -> Set of insertions and latests explicitlyModifiedAt
     var modifications: [String: (Set<String>, Date?)] = [:] // schemaName -> Set of modification and latests explicitlyModifiedAts
+    var trackedChangeHighWatermarks: [String: Date] = [:]
+}
+
+private struct PendingObjectChange {
+    let objectID: String
+    let modifiedAt: Date?
+    let explicitlyModifiedAt: Date?
+}
+
+private func latestExplicitlyModifiedAt(in changes: [PendingObjectChange]) -> Date? {
+    changes.compactMap(\.explicitlyModifiedAt).max()
+}
+
+private func maxDate(_ lhs: Date?, _ rhs: Date?) -> Date? {
+    switch (lhs, rhs) {
+    case let (lhs?, rhs?):
+        return max(lhs, rhs)
+    case let (lhs?, nil):
+        return lhs
+    case let (nil, rhs?):
+        return rhs
+    case (nil, nil):
+        return nil
+    }
 }
 
 extension RealmSwiftAdapter: @unchecked Sendable { }
@@ -320,7 +344,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         excludedClassNames: [String],
         priorityEntityTypeNames: [String] = [],
         recordZoneID: CKRecordZone.ID,
-        logger: Logging.Logger
+        logger: Logging.Logger,
+        startSetupTask: Bool = true
     ) {
         self.persistenceRealmConfiguration = persistenceRealmConfiguration
         self.targetRealmConfigurations = targetRealmConfigurations
@@ -338,15 +363,17 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             targetConfigurations: targetRealmConfigurations
         )
         
-        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-            guard let self = self else { return }
-            try await setup()
+        if startSetupTask {
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                guard let self = self else { return }
+                try await setup()
+            }
         }
     }
     
     deinit {
-        Task { [weak self] in
-            await self?.invalidateTokens()
+        for cancellable in cancellables {
+            cancellable.cancel()
         }
     }
     
@@ -682,34 +709,44 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         let primaryKey = objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name ?? ""
         
         let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate).map {
-            (
-                Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
-                $0["modifiedAt"] as? Date,
-                $0["explicitlyModifiedAt"] as? Date,
+            PendingObjectChange(
+                objectID: Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
+                modifiedAt: $0["modifiedAt"] as? Date,
+                explicitlyModifiedAt: $0["explicitlyModifiedAt"] as? Date
             )
         })
         let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate).map {
-            (
-                Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
-                $0["modifiedAt"] as? Date,
-                $0["explicitlyModifiedAt"] as? Date,
+            PendingObjectChange(
+                objectID: Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
+                modifiedAt: $0["modifiedAt"] as? Date,
+                explicitlyModifiedAt: $0["explicitlyModifiedAt"] as? Date
             )
         })
 
-        let filteredCreated = created.filter { objectID, modifiedAt, _ in
-            guard let fetchedModified = recentlyFetchedRecordModifiedAts[schemaName + "." + objectID],
-                  let modifiedAt else {
+        let prefix = schemaName + "."
+        let filteredCreated = created.filter { change in
+            guard let fetchedModified = recentlyFetchedRecordModifiedAts[prefix + change.objectID],
+                  let modifiedAt = change.modifiedAt else {
                 return true
             }
             return modifiedAt != fetchedModified
         }
         
-        let filteredModified = modified.filter { objectID, modifiedAt, _ in
-            guard let fetchedModified = recentlyFetchedRecordModifiedAts[schemaName + "." + objectID],
-                  let modifiedAt else {
+        let filteredModified = modified.filter { change in
+            guard let fetchedModified = recentlyFetchedRecordModifiedAts[prefix + change.objectID],
+                  let modifiedAt = change.modifiedAt else {
                 return true
             }
             return modifiedAt != fetchedModified
+        }
+        if let latestObservedExplicitlyModifiedAt = maxDate(
+            latestExplicitlyModifiedAt(in: created),
+            latestExplicitlyModifiedAt(in: modified)
+        ) {
+            resultsChangeSet.trackedChangeHighWatermarks[schemaName] = max(
+                resultsChangeSet.trackedChangeHighWatermarks[schemaName] ?? .distantPast,
+                latestObservedExplicitlyModifiedAt
+            )
         }
         
         //        if created.isEmpty && modified.isEmpty {
@@ -724,19 +761,17 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         
         if !filteredCreated.isEmpty {
             let insertions = resultsChangeSet.insertions[schemaName, default: ([], nil)]
-            let latestCreatedExplicitlyModifiedAt = filteredCreated.compactMap { ($0 as? ChangeMetadataRecordable)?.explicitlyModifiedAt } .max()
             let updatedInsertions: (Set<String>, Date?) = (
-                insertions.0.union(filteredCreated.map { $0.0 }),
-                latestCreatedExplicitlyModifiedAt
+                insertions.0.union(filteredCreated.map(\.objectID)),
+                maxDate(insertions.1, latestExplicitlyModifiedAt(in: filteredCreated))
             )
             resultsChangeSet.insertions[schemaName] = updatedInsertions
         }
         if !filteredModified.isEmpty {
             let modifications = resultsChangeSet.modifications[schemaName, default: ([], nil)]
-            let latestModifiedExplicitlyModifiedAt = filteredModified.compactMap { ($0 as? ChangeMetadataRecordable)?.explicitlyModifiedAt } .max()
             let updatedModifications: (Set<String>, Date?) = (
-                modifications.0.union(filteredModified.map { $0.0 }),
-                latestModifiedExplicitlyModifiedAt
+                modifications.0.union(filteredModified.map(\.objectID)),
+                maxDate(modifications.1, latestExplicitlyModifiedAt(in: filteredModified))
             )
             resultsChangeSet.modifications[schemaName] = updatedModifications
         }
@@ -744,16 +779,30 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         // Persist the new lastTrackedChangesAt
         //        await persistenceRealm.asyncRefresh()
         if !created.isEmpty || !modified.isEmpty {
-            let prefix = schemaName + "."
-            let processedIDs = filteredCreated.map { prefix + $0.0 } + filteredModified.map { prefix + $0.0 }
-            for id in processedIDs {
-                self.recentlyFetchedRecordModifiedAts.removeValue(forKey: id)
+            for change in filteredCreated {
+                recentlyFetchedRecordModifiedAts.removeValue(forKey: prefix + change.objectID)
+            }
+            for change in filteredModified {
+                recentlyFetchedRecordModifiedAts.removeValue(forKey: prefix + change.objectID)
             }
             
             //            debugPrint("# created or modified non-empty, resultsChangeSetPublisher send...", created.count, modified.count, resultsChangeSet.insertions, resultsChangeSet.modifications)
             resultsChangeSetPublisher.send(())
         }
     }
+
+#if DEBUG
+    @BigSyncBackgroundActor
+    func _test_enqueueCreatedAndModifiedAndProcess(in realm: Realm) async throws {
+        await enqueueCreatedAndModified(in: realm)
+        try await processEnqueuedChanges()
+    }
+
+    @BigSyncBackgroundActor
+    func _test_markRecentlyFetchedRecord(entityType: String, identifier: String, modifiedAt: Date) {
+        recentlyFetchedRecordModifiedAts[entityType + "." + identifier] = modifiedAt
+    }
+#endif
     
     @BigSyncBackgroundActor
     private func processEnqueuedChanges() async throws {
@@ -814,16 +863,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         await persistenceRealm.asyncRefresh()
         
         var lastTrackedChangesAtUpdates: [(String, Date)] = []
-        for changeSet in [currentChangeSet.insertions, currentChangeSet.modifications] {
-            for (schema, latestExplicitlyModifiedAt) in changeSet.map({ ($0.key, $0.value.1) }) {
-                try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
-                guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { continue }
-                guard !cancelSync else { throw CancellationError() }
-                
-                if let latestExplicitlyModifiedAt, syncedEntityType.lastTrackedChangesAt != latestExplicitlyModifiedAt {
-                    lastTrackedChangesAtUpdates.append((syncedEntityType.entityType, latestExplicitlyModifiedAt))
-                }
+        for (schema, latestExplicitlyModifiedAt) in currentChangeSet.trackedChangeHighWatermarks {
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
+            guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { continue }
+            guard !cancelSync else { throw CancellationError() }
+
+            if latestExplicitlyModifiedAt > (syncedEntityType.lastTrackedChangesAt ?? .distantPast) {
+                lastTrackedChangesAtUpdates.append((syncedEntityType.entityType, latestExplicitlyModifiedAt))
             }
         }
         try Task.checkCancellation()
