@@ -535,8 +535,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     let results = targetReaderRealm.objects(objectClass)
                     let entityTypePrefix = schema.className + "."
                     let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
-                    let identifiers = Array(results).map {
-                        entityTypePrefix + Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey)
+                    var identifiers: [String] = []
+                    identifiers.reserveCapacity(results.count)
+                    for result in results {
+                        identifiers.append(entityTypePrefix + Self.getTargetObjectStringIdentifier(for: result, usingPrimaryKey: primaryKey))
                     }
                     do {
                         try await createSyncedEntities(entityType: schema.className, identifiers: identifiers)
@@ -708,40 +710,39 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         
         let primaryKey = objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name ?? ""
         
-        let created = Array(targetReaderRealm.objects(objectClass).filter(createdPredicate).map {
-            PendingObjectChange(
-                objectID: Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
-                modifiedAt: $0["modifiedAt"] as? Date,
-                explicitlyModifiedAt: $0["explicitlyModifiedAt"] as? Date
-            )
-        })
-        let modified = Array(targetReaderRealm.objects(objectClass).filter(modifiedPredicate).map {
-            PendingObjectChange(
-                objectID: Self.getTargetObjectStringIdentifier(for: $0, usingPrimaryKey: primaryKey),
-                modifiedAt: $0["modifiedAt"] as? Date,
-                explicitlyModifiedAt: $0["explicitlyModifiedAt"] as? Date
-            )
-        })
-
         let prefix = schemaName + "."
-        let filteredCreated = created.filter { change in
-            guard let fetchedModified = recentlyFetchedRecordModifiedAts[prefix + change.objectID],
-                  let modifiedAt = change.modifiedAt else {
-                return true
+        func pendingChanges(
+            matching predicate: NSPredicate
+        ) -> (changes: [PendingObjectChange], latestExplicitlyModifiedAt: Date?) {
+            var changes: [PendingObjectChange] = []
+            var latestExplicitlyModifiedAt: Date?
+            for object in targetReaderRealm.objects(objectClass).filter(predicate) {
+                let change = PendingObjectChange(
+                    objectID: Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey),
+                    modifiedAt: object["modifiedAt"] as? Date,
+                    explicitlyModifiedAt: object["explicitlyModifiedAt"] as? Date
+                )
+                latestExplicitlyModifiedAt = maxDate(latestExplicitlyModifiedAt, change.explicitlyModifiedAt)
+                guard let fetchedModified = recentlyFetchedRecordModifiedAts[prefix + change.objectID],
+                      let modifiedAt = change.modifiedAt else {
+                    changes.append(change)
+                    continue
+                }
+                if modifiedAt != fetchedModified {
+                    changes.append(change)
+                }
             }
-            return modifiedAt != fetchedModified
+            return (changes, latestExplicitlyModifiedAt)
         }
         
-        let filteredModified = modified.filter { change in
-            guard let fetchedModified = recentlyFetchedRecordModifiedAts[prefix + change.objectID],
-                  let modifiedAt = change.modifiedAt else {
-                return true
-            }
-            return modifiedAt != fetchedModified
-        }
+        let created = pendingChanges(matching: createdPredicate)
+        let modified = pendingChanges(matching: modifiedPredicate)
+        let filteredCreated = created.changes
+        let filteredModified = modified.changes
+        let observedCreatedOrModified = created.latestExplicitlyModifiedAt != nil || modified.latestExplicitlyModifiedAt != nil
         if let latestObservedExplicitlyModifiedAt = maxDate(
-            latestExplicitlyModifiedAt(in: created),
-            latestExplicitlyModifiedAt(in: modified)
+            created.latestExplicitlyModifiedAt,
+            modified.latestExplicitlyModifiedAt
         ) {
             resultsChangeSet.trackedChangeHighWatermarks[schemaName] = max(
                 resultsChangeSet.trackedChangeHighWatermarks[schemaName] ?? .distantPast,
@@ -778,7 +779,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         
         // Persist the new lastTrackedChangesAt
         //        await persistenceRealm.asyncRefresh()
-        if !created.isEmpty || !modified.isEmpty {
+        if observedCreatedOrModified {
             for change in filteredCreated {
                 recentlyFetchedRecordModifiedAts.removeValue(forKey: prefix + change.objectID)
             }
@@ -818,7 +819,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         for (schema, identifiers) in currentChangeSet.insertions.mapValues(\.0) {
             guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
             
-            for chunk in Array(identifiers).chunks(ofCount: 2000) {
+            for chunk in identifiers.chunks(ofCount: 2000) {
                 //                await persistenceRealm.asyncRefresh()
                 try await persistenceRealm.asyncWrite {
                     for identifier in chunk {
@@ -840,7 +841,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         for (schema, identifiers) in currentChangeSet.modifications.mapValues(\.0) {
             guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
             
-            for chunk in Array(identifiers).chunks(ofCount: 2000) {
+            for chunk in identifiers.chunks(ofCount: 2000) {
                 //                await persistenceRealm.asyncRefresh()
                 try await persistenceRealm.asyncWrite {
                     for identifier in chunk {
@@ -1987,45 +1988,35 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         guard let results = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == state.rawValue }) else { return [] }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
-        
-#if DEBUG
-        // Ensure dummy records are uploaded first
-        let dummyRecordIdentifiers = await dummyRecordIdentifiers
-        let resultsToUpload: [SyncedEntity]
-        if dummyRecordIdentifiers.isEmpty {
-            resultsToUpload = Array(results)
-        } else {
-            var dummyResults = [SyncedEntity]()
-            var regularResults = [SyncedEntity]()
-            dummyResults.reserveCapacity(dummyRecordIdentifiers.count)
-            regularResults.reserveCapacity(results.count)
-            for result in results {
-                if dummyRecordIdentifiers.contains(result.identifier) {
-                    dummyResults.append(result)
-                } else {
-                    regularResults.append(result)
+
+        func appendUploadRecords<S: Sequence<SyncedEntity>>(
+            from entities: S
+        ) async throws {
+            for syncedEntity in entities {
+                if resultArray.count >= limit {
+                    return
                 }
+                try await appendUploadRecords(startingAt: syncedEntity)
             }
-            resultsToUpload = dummyResults + regularResults
         }
-#else
-        let resultsToUpload = Array(results)
-#endif
-        
-        for syncedEntity in resultsToUpload {
+
+        func appendUploadRecords(startingAt syncedEntity: SyncedEntity) async throws {
             if let restrictedEntityType, syncedEntity.entityType != restrictedEntityType {
-                continue
+                return
             }
             if resultArray.count >= limit {
-                break
+                return
             }
             
             if !hasRealmObjectClass(name: syncedEntity.entityType) {
-                continue
+                return
             }
             
             var entity: SyncedEntity! = syncedEntity
-            while entity != nil && entity.state == state.rawValue && !includedEntityIDs.contains(entity.identifier) {
+            while entity != nil,
+                  entity.state == state.rawValue,
+                  !includedEntityIDs.contains(entity.identifier),
+                  resultArray.count < limit {
                 var parentEntity: SyncedEntity? = nil
                 guard let record = try await recordToUpload(syncedEntity: entity, parentSyncedEntity: &parentEntity) else {
                     entity = nil
@@ -2036,6 +2027,21 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 entity = parentEntity
             }
         }
+
+#if DEBUG
+        // Ensure dummy records are uploaded first.
+        let dummyRecordIdentifiers = await dummyRecordIdentifiers
+        if dummyRecordIdentifiers.isEmpty {
+            try await appendUploadRecords(from: results)
+        } else {
+            try await appendUploadRecords(from: results.filter { dummyRecordIdentifiers.contains($0.identifier) })
+            if resultArray.count < limit {
+                try await appendUploadRecords(from: results.filter { !dummyRecordIdentifiers.contains($0.identifier) })
+            }
+        }
+#else
+        try await appendUploadRecords(from: results)
+#endif
         
         return resultArray
     }
