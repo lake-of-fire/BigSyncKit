@@ -1985,16 +1985,20 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         limit: Int,
         restrictedToEntityType restrictedEntityType: String? = nil
     ) async throws -> [CKRecord] {
-        guard let results = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == state.rawValue }) else { return [] }
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return [] }
+        let results = persistenceRealm.objects(SyncedEntity.self).where { $0.state == state.rawValue }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
 
-        func appendUploadRecords<S: Sequence<SyncedEntity>>(
-            from entities: S
+        func appendUploadRecords(
+            from identifiers: [String]
         ) async throws {
-            for syncedEntity in entities {
+            for identifier in identifiers {
                 if resultArray.count >= limit {
                     return
+                }
+                guard let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) else {
+                    continue
                 }
                 try await appendUploadRecords(startingAt: syncedEntity)
             }
@@ -2031,16 +2035,17 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 #if DEBUG
         // Ensure dummy records are uploaded first.
         let dummyRecordIdentifiers = await dummyRecordIdentifiers
+        let resultIdentifiers = results.map(\.identifier)
         if dummyRecordIdentifiers.isEmpty {
-            try await appendUploadRecords(from: results)
+            try await appendUploadRecords(from: Array(resultIdentifiers))
         } else {
-            try await appendUploadRecords(from: results.filter { dummyRecordIdentifiers.contains($0.identifier) })
+            try await appendUploadRecords(from: resultIdentifiers.filter { dummyRecordIdentifiers.contains($0) })
             if resultArray.count < limit {
-                try await appendUploadRecords(from: results.filter { !dummyRecordIdentifiers.contains($0.identifier) })
+                try await appendUploadRecords(from: resultIdentifiers.filter { !dummyRecordIdentifiers.contains($0) })
             }
         }
 #else
-        try await appendUploadRecords(from: results)
+        try await appendUploadRecords(from: Array(results.map(\.identifier)))
 #endif
         
         return resultArray
