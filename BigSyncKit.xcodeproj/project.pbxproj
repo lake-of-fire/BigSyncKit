@@ -36,6 +36,7 @@
 		AB10CAD55E6330E005A2D7E2 /* libzstd.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = BBDD02968D432F5E6B3EFC72 /* libzstd.framework */; };
 		C2306533B62251C4BB84AA59 /* ModelAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31F48253723925F072D7A193 /* ModelAdapter.swift */; };
 		C43E4575AE89BC887B3C72E1 /* CloudKitSynchronizer+Private.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4917EC7D9AF2D7867807C196 /* CloudKitSynchronizer+Private.swift */; };
+		C57E722A1349DEBD0932E8B1 /* CloudKitAccountAvailabilityGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57073F22EFD596BFE2391A92 /* CloudKitAccountAvailabilityGate.swift */; };
 		CB4B1BEF0C9DF43CD17867AA /* SyncedDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 519B578D9E23C6ED68EE4C36 /* SyncedDevice.swift */; };
 		CE4CDE06370BD24A2B72AF77 /* CloudKitDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF4BAFDCBEC068C8D560EFFC /* CloudKitDatabase.swift */; };
 		D1076D33C1CCFA003ACD1332 /* DefaultRealmSwiftAdapterProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD495927486A1B40B2B8DBA3 /* DefaultRealmSwiftAdapterProvider.swift */; };
@@ -89,6 +90,7 @@
 		404173218AABA19A4C08DC5C /* SyncStatusViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncStatusViewModel.swift; sourceTree = "<group>"; };
 		4917EC7D9AF2D7867807C196 /* CloudKitSynchronizer+Private.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudKitSynchronizer+Private.swift"; sourceTree = "<group>"; };
 		519B578D9E23C6ED68EE4C36 /* SyncedDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedDevice.swift; sourceTree = "<group>"; };
+		57073F22EFD596BFE2391A92 /* CloudKitAccountAvailabilityGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitAccountAvailabilityGate.swift; sourceTree = "<group>"; };
 		58CDB4D39314DDAFE352E728 /* QSCloudKitSynchronizer+RealmSwift.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "QSCloudKitSynchronizer+RealmSwift.swift"; sourceTree = "<group>"; };
 		58D570E7392F6EF23738E4F4 /* KeyValueStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyValueStore.swift; sourceTree = "<group>"; };
 		5900E8EA44C1DBD7E8733C77 /* SyncedEntityState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedEntityState.swift; sourceTree = "<group>"; };
@@ -184,6 +186,7 @@
 				4D79575F12AADEB7D095ECDF /* Operations */,
 				2EECD71DF78701438239CEC2 /* BackupDetection.swift */,
 				1443977751818BA283E53F9C /* BigSyncBackgroundActor.swift */,
+				57073F22EFD596BFE2391A92 /* CloudKitAccountAvailabilityGate.swift */,
 				FF4BAFDCBEC068C8D560EFFC /* CloudKitDatabase.swift */,
 				9E200B95C5A241D0E2E6A036 /* CloudKitSynchronizer.swift */,
 				4917EC7D9AF2D7867807C196 /* CloudKitSynchronizer+Private.swift */,
@@ -350,6 +353,7 @@
 				0F7AFD763CDA892F5630A9EC /* TuistBundle+BigSyncKit.swift in Sources */,
 				FBAEA35B01423A405C392D19 /* BackupDetection.swift in Sources */,
 				EB49133DA3EC81E917AE20D6 /* BigSyncBackgroundActor.swift in Sources */,
+				C57E722A1349DEBD0932E8B1 /* CloudKitAccountAvailabilityGate.swift in Sources */,
 				CE4CDE06370BD24A2B72AF77 /* CloudKitDatabase.swift in Sources */,
 				C43E4575AE89BC887B3C72E1 /* CloudKitSynchronizer+Private.swift in Sources */,
 				5A6D8A0DC6ABB060CABE7AD7 /* CloudKitSynchronizer+Subscriptions.swift in Sources */,
