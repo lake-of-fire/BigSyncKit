@@ -203,12 +203,20 @@ actor RealmProvider {
         self.targetConfigurations = targetConfigurations
         
         do {
-            persistenceRealmObject = try await Realm.open(configuration: persistenceConfiguration)
+            persistenceRealmObject = try await Realm(
+                configuration: persistenceConfiguration,
+                actor: BigSyncBackgroundActor.shared
+            )
             //            debugPrint("# persistence realm", persistenceRealmObject.configuration.fileURL)
             
             var targetReaderRealmObjects = [Realm]()
             for targetConfiguration in targetConfigurations {
-                try await targetReaderRealmObjects.append(Realm.open(configuration: targetConfiguration))
+                try await targetReaderRealmObjects.append(
+                    Realm(
+                        configuration: targetConfiguration,
+                        actor: BigSyncBackgroundActor.shared
+                    )
+                )
             }
             self.targetReaderRealmObjects = targetReaderRealmObjects
             
@@ -1987,17 +1995,23 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     ) async throws -> [CKRecord] {
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return [] }
         let results = persistenceRealm.objects(SyncedEntity.self).where { $0.state == state.rawValue }
+        let uploadCandidates = Array(results.map { syncedEntity in
+            (identifier: syncedEntity.identifier, entityType: syncedEntity.entityType)
+        })
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
 
         func appendUploadRecords(
-            from identifiers: [String]
+            from candidates: [(identifier: String, entityType: String)]
         ) async throws {
-            for identifier in identifiers {
+            for candidate in candidates {
                 if resultArray.count >= limit {
                     return
                 }
-                guard let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) else {
+                guard let syncedEntity = persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: candidate.identifier
+                ) else {
                     continue
                 }
                 try await appendUploadRecords(startingAt: syncedEntity)
@@ -2035,17 +2049,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 #if DEBUG
         // Ensure dummy records are uploaded first.
         let dummyRecordIdentifiers = await dummyRecordIdentifiers
-        let resultIdentifiers = results.map(\.identifier)
         if dummyRecordIdentifiers.isEmpty {
-            try await appendUploadRecords(from: Array(resultIdentifiers))
+            try await appendUploadRecords(from: uploadCandidates)
         } else {
-            try await appendUploadRecords(from: resultIdentifiers.filter { dummyRecordIdentifiers.contains($0) })
+            try await appendUploadRecords(from: uploadCandidates.filter { dummyRecordIdentifiers.contains($0.identifier) })
             if resultArray.count < limit {
-                try await appendUploadRecords(from: resultIdentifiers.filter { !dummyRecordIdentifiers.contains($0) })
+                try await appendUploadRecords(from: uploadCandidates.filter { !dummyRecordIdentifiers.contains($0.identifier) })
             }
         }
 #else
-        try await appendUploadRecords(from: Array(results.map(\.identifier)))
+        try await appendUploadRecords(from: uploadCandidates)
 #endif
         
         return resultArray
