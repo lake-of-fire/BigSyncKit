@@ -507,17 +507,17 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                                 if let primaryKey {
                                     let dummyID = "\(schema.className).\(Self.getTargetObjectStringIdentifier(for: dummy, usingPrimaryKey: primaryKey))"
                                     dummyRecordIdentifiers.insert(dummyID)
-                                    print("# BIGSYNCDUMMY inserted schema=\(schema.className) primaryKey=\(primaryKey) dummyID=\(dummyID)")
+                                    ()
                                 } else {
-                                    print("# BIGSYNCDUMMY inserted schema=\(schema.className) primaryKey=nil")
+                                    ()
                                 }
                                 let writerTypedCountAfter = targetWriterRealm.objects(objectClass).count
                                 let writerDynamicCountAfter = targetWriterRealm.dynamicObjects(schema.className).count
-                                print("# BIGSYNCDUMMY writer-after schema=\(schema.className) writerURL=\(writerURL) typedCount=\(writerTypedCountAfter) dynamicCount=\(writerDynamicCountAfter)")
+                                ()
                             }
                         }
                     } catch {
-                        print("# BIGSYNCDUMMY error schema=\(schema.className) error=\(error)")
+                        ()
                     }
                 }()
             }
