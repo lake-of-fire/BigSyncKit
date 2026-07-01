@@ -38,6 +38,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
 @globalActor
 public actor BigSyncBackgroundActor {
     public static let shared = BigSyncBackgroundActor()
+    private static let initialSynchronizationDelayNanoseconds: UInt64 = 10_000_000_000
     
     private weak var synchronizerDelegate: RealmSwiftAdapterDelegate?
     
@@ -71,8 +72,18 @@ public actor BigSyncBackgroundActor {
         let compatibilityVersion = synchronizer.compatibilityVersion
         configuration.logger.info("QSCloudKitSynchronizer >> Local compatibility version: \(compatibilityVersion)")
         
-        Task { @BigSyncBackgroundActor [weak self] in
+        Task(priority: .utility) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
+            do {
+                try await Task.sleep(nanoseconds: Self.initialSynchronizationDelayNanoseconds)
+            } catch {
+                return
+            }
+            guard await self.canStartCloudKitSynchronization(for: configuration.containerName) else {
+                synchronizer.cancelledDueToUnauthentication = true
+                configuration.logger.info("QSCloudKitSynchronizer >> Initial synchronization skipped because iCloud account is unavailable")
+                return
+            }
             if let containerIdentifier = synchronizer.containerIdentifier {
                 for modelAdapter in synchronizer.modelAdapters {
                     await CloudKitSynchronizer.transferOldServerChangeToken(
@@ -91,6 +102,20 @@ public actor BigSyncBackgroundActor {
             }
             
             await self.synchronizeCloudKit()
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func canStartCloudKitSynchronization(for containerIdentifier: String) async -> Bool {
+        let container = CKContainer(identifier: containerIdentifier)
+        return await withCheckedContinuation { continuation in
+            container.accountStatus { status, error in
+                if error != nil {
+                    continuation.resume(returning: false)
+                    return
+                }
+                continuation.resume(returning: status == .available)
+            }
         }
     }
 
