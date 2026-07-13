@@ -194,6 +194,44 @@ private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
 }
 
 final class BigSyncKitTests: XCTestCase {
+    func testCloudKitAccountAvailabilityGateStartsImmediatelyWhenAvailable() async {
+        let gate = CloudKitAccountAvailabilityGate { identifier in
+            XCTAssertEqual(identifier, "iCloud.test")
+            return .available
+        }
+
+        let availability = await gate.availability(for: "iCloud.test")
+        XCTAssertEqual(availability, .available)
+    }
+
+    func testCloudKitAccountAvailabilityGateDefersUnavailableAndFailedStatuses() async {
+        let unavailableGate = CloudKitAccountAvailabilityGate { _ in .unavailable(.noAccount) }
+        let failedGate = CloudKitAccountAvailabilityGate { _ in .failed }
+
+        let unavailable = await unavailableGate.availability(for: "iCloud.test")
+        let failed = await failedGate.availability(for: "iCloud.test")
+        XCTAssertEqual(unavailable, .unavailable(.noAccount))
+        XCTAssertEqual(failed, .failed)
+    }
+
+    func testCloudKitAccountAvailabilityGateReevaluatesEveryRequest() async {
+        actor StatusSequence {
+            var statuses: [CloudKitAccountAvailability] = [.unavailable(.couldNotDetermine), .available]
+
+            func next() -> CloudKitAccountAvailability {
+                statuses.removeFirst()
+            }
+        }
+
+        let statuses = StatusSequence()
+        let gate = CloudKitAccountAvailabilityGate { _ in await statuses.next() }
+
+        let initiallyUnavailable = await gate.availability(for: "iCloud.test")
+        let subsequentlyAvailable = await gate.availability(for: "iCloud.test")
+        XCTAssertEqual(initiallyUnavailable, .unavailable(.couldNotDetermine))
+        XCTAssertEqual(subsequentlyAvailable, .available)
+    }
+
     @BigSyncBackgroundActor
     func testPrioritizedRemoteChangesAreProcessedInConfiguredOrderBeforeUnprioritized() async throws {
         let zoneID = CKRecordZone.ID(zoneName: "priority-zone", ownerName: CKCurrentUserDefaultName)
