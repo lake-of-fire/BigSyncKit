@@ -429,8 +429,8 @@ public class CloudKitSynchronizer: NSObject {
         //        try? await Task.sleep(nanoseconds: 300_000_000) // Allow cancellations to catch up...
         if includingAdapters {
             for adapter in modelAdapters {
-                try? await adapter.unsetCancellation()
-                try? await adapter.resetSyncCaches()
+                try await adapter.unsetCancellation()
+                try await adapter.resetSyncCaches()
             }
         }
     }
@@ -545,6 +545,55 @@ public class CloudKitSynchronizer: NSObject {
                     self?.logger.error("CloudKitSynchronizer >> Deleted zone: \(zoneID?.debugDescription ?? "")")
                 }
                 completion?(error)
+            }
+        }
+    }
+
+    /// Deletes every custom record zone managed by this synchronizer and rebuilds
+    /// local adapter metadata so all current local objects are uploaded again.
+    ///
+    /// The operation is safe to retry: a missing/deleted zone is treated as
+    /// success, and local metadata is only reset after every zone deletion has
+    /// either succeeded or reported that the zone is already absent.
+    @BigSyncBackgroundActor
+    public func deleteRecordZonesAndResetSyncCachesForReupload() async throws {
+        let activeSynchronizationTask = synchronizationTask
+        cancelSynchronization()
+        await activeSynchronizationTask?.value
+
+        let adapters = modelAdapters
+        for zoneID in Set(adapters.map(\.recordZoneID)) {
+            do {
+                try await deleteRecordZone(zoneID)
+            } catch {
+                let nsError = error as NSError
+                let missingZoneCodes = [
+                    CKError.zoneNotFound.rawValue,
+                    CKError.userDeletedZone.rawValue,
+                ]
+                guard nsError.domain == CKErrorDomain,
+                      missingZoneCodes.contains(nsError.code) else {
+                    throw error
+                }
+            }
+        }
+
+        try await resetSyncCaches(
+            cancelSynchronization: false,
+            includingAdapters: true
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func deleteRecordZone(_ zoneID: CKRecordZone.ID) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            database.delete(withRecordZoneID: zoneID) { _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
             }
         }
     }

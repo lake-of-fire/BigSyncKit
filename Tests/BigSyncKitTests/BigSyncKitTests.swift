@@ -21,6 +21,8 @@ private final class NoopAdapterProvider: NSObject, AdapterProvider {
 
 private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @unchecked Sendable {
     var databaseScope: CKDatabase.Scope { .private }
+    var deleteZoneError: Error?
+    private(set) var deletedZoneIDs = [CKRecordZone.ID]()
 
     func add(_ operation: CKDatabaseOperation) {
         if let modifyOperation = operation as? CKModifyRecordsOperation {
@@ -46,7 +48,8 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     }
 
     func delete(withRecordZoneID zoneID: CKRecordZone.ID, completionHandler: @escaping (CKRecordZone.ID?, Error?) -> Void) {
-        completionHandler(zoneID, nil)
+        deletedZoneIDs.append(zoneID)
+        completionHandler(deleteZoneError == nil ? zoneID : nil, deleteZoneError)
     }
 
     @available(iOS 10.0, macOS 10.12, watchOS 6.0, *)
@@ -95,7 +98,9 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     }
 
     func cleanUp() {}
-    func resetSyncCaches() async throws {}
+    func resetSyncCaches() async throws {
+        events.append("resetSyncCaches")
+    }
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool { true }
 
     func saveChanges(in records: [CKRecord], forceSave: Bool) async throws {
@@ -163,7 +168,9 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async throws {}
     func didFinishImport() async {}
     func cancelSynchronization() {}
-    func unsetCancellation() async throws {}
+    func unsetCancellation() async throws {
+        events.append("unsetCancellation")
+    }
 
     private func nextEntityTypeWithPendingUploads() -> String? {
         priorityEntityTypeNames.first(where: { !(uploadedByEntity[$0] ?? []).isEmpty }) ??
@@ -197,6 +204,73 @@ private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
 }
 
 final class BigSyncKitTests: XCTestCase {
+    @BigSyncBackgroundActor
+    func testZoneResetDeletesManagedZoneThenRebuildsLocalTracking() async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(database: database)
+        let zoneID = CKRecordZone.ID(
+            zoneName: "reset-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        synchronizer.addModelAdapter(adapter)
+
+        try await synchronizer.deleteRecordZonesAndResetSyncCachesForReupload()
+
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+        XCTAssertEqual(
+            adapter.events.suffix(2),
+            ["unsetCancellation", "resetSyncCaches"]
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testZoneResetTreatsAlreadyDeletedZoneAsSuccess() async throws {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneError = NSError(
+            domain: CKErrorDomain,
+            code: CKError.zoneNotFound.rawValue
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(
+                zoneName: "missing-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        try await synchronizer.deleteRecordZonesAndResetSyncCachesForReupload()
+
+        XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
+    }
+
+    @BigSyncBackgroundActor
+    func testZoneResetDoesNotClearLocalTrackingWhenDeletionFails() async {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneError = NSError(
+            domain: CKErrorDomain,
+            code: CKError.networkFailure.rawValue
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(
+                zoneName: "failed-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            try await synchronizer.deleteRecordZonesAndResetSyncCachesForReupload()
+            XCTFail("Expected zone deletion to fail")
+        } catch {
+            XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
+        }
+    }
+
     func testCloudKitAccountAvailabilityGateStartsImmediatelyWhenAvailable() async {
         let gate = CloudKitAccountAvailabilityGate { identifier in
             XCTAssertEqual(identifier, "iCloud.test")
@@ -723,11 +797,13 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    private func makeSynchronizer() -> CloudKitSynchronizer {
+    private func makeSynchronizer(
+        database: CloudKitDatabaseAdapter = FakeCloudKitDatabase()
+    ) -> CloudKitSynchronizer {
         CloudKitSynchronizer(
             identifier: UUID().uuidString,
             containerIdentifier: "iCloud.test",
-            database: FakeCloudKitDatabase(),
+            database: database,
             adapterProvider: NoopAdapterProvider(),
             keyValueStore: DictionaryKeyValueStore(),
             logger: Logger(label: "BigSyncKitTests")
