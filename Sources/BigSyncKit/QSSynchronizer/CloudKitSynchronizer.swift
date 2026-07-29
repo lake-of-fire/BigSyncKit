@@ -699,7 +699,7 @@ public class CloudKitSynchronizer: NSObject {
         markerRecordType: String,
         markerOwnerField: String,
         markerLeaseDateField: String,
-        leaseDuration: TimeInterval = 60 * 60
+        leaseDuration: TimeInterval = 15 * 60
     ) async throws -> OneOffRecordZoneResetResult {
         let markerPrefix = "BigSyncKitMigration.\(String(migrationIdentifier.prefix(120)))"
         let claimRecordID = CKRecord.ID(recordName: "\(markerPrefix).claim")
