@@ -31,6 +31,7 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     private var conflictedRecordIDs = Set<CKRecord.ID>()
     private var recordIDsMissingOnServer = Set<CKRecord.ID>()
     private let resultLock = NSLock()
+    private var completionDelivered = false
 
 //    let dispatchQueue = DispatchQueue(label: "modifyRecordsDispatchQueue")
     weak var internalOperation: CKModifyRecordsOperation?
@@ -57,7 +58,13 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
                     }
                     return (self.conflictedRecords, self.recordIDsMissingOnServer)
                 }
-                self.completion(saved, deleted, results.0, results.1, operationError)
+                self.deliverCompletion(
+                    saved: saved,
+                    deleted: deleted,
+                    conflicted: results.0,
+                    missing: results.1,
+                    error: operationError
+                )
                 self.finish(error: nil)
             }
         }
@@ -96,9 +103,32 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
             }
         }
     }
+
+    private func deliverCompletion(
+        saved: [CKRecord]?,
+        deleted: [CKRecord.ID]?,
+        conflicted: [CKRecord],
+        missing: Set<CKRecord.ID>,
+        error: Error?
+    ) {
+        let shouldDeliver = resultLock.withLock {
+            guard !completionDelivered else { return false }
+            completionDelivered = true
+            return true
+        }
+        guard shouldDeliver else { return }
+        completion(saved, deleted, conflicted, missing, error)
+    }
     
     override func cancel() {
         internalOperation?.cancel()
+        deliverCompletion(
+            saved: nil,
+            deleted: nil,
+            conflicted: [],
+            missing: [],
+            error: CancellationError()
+        )
         super.cancel()
     }
 }

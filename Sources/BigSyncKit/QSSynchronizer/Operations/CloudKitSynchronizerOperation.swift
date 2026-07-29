@@ -45,7 +45,7 @@ class CloudKitSynchronizerOperation: Operation {
     
     override func start() {
         if self.isCancelled {
-            transition(to: .finished)
+            finish(error: nil)
         } else {
             logStart()
             main()
@@ -64,11 +64,11 @@ class CloudKitSynchronizerOperation: Operation {
         } else {
 //            logger?.info("QSCloudKitSynchronizer >> Operation succeeded: \(type(of: self))")
         }
-        if let synchronizer = self as? CloudKitSynchronizer {
-            Task { @BigSyncBackgroundActor in
-                synchronizer.currentOperations.removeAll { $0.isFinished }
-            }
-        }
+    }
+
+    override func cancel() {
+        super.cancel()
+        finish(error: nil)
     }
     
     internal func logStart() {

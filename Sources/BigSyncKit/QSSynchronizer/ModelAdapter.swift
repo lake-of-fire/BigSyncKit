@@ -144,6 +144,11 @@ internal struct PreparedRecordUpload {
     let generation: String?
 }
 
+internal struct PreparedRecordDeletion {
+    let recordID: CKRecord.ID
+    let generation: String?
+}
+
 internal protocol UploadGenerationTrackingModelAdapter: ModelAdapter {
     @BigSyncBackgroundActor
     func preparedRecordsToUpload(
@@ -154,6 +159,18 @@ internal protocol UploadGenerationTrackingModelAdapter: ModelAdapter {
     @BigSyncBackgroundActor
     func didUpload(
         savedRecords: [CKRecord],
+        matchingGenerations: [String: String]
+    ) async throws
+
+    @BigSyncBackgroundActor
+    func preparedRecordDeletions(
+        limit: Int,
+        restrictedToEntityType: String?
+    ) async throws -> [PreparedRecordDeletion]
+
+    @BigSyncBackgroundActor
+    func didDelete(
+        recordIDs: [CKRecord.ID],
         matchingGenerations: [String: String]
     ) async throws
 }

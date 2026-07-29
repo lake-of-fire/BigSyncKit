@@ -22,12 +22,37 @@ private final class NoopAdapterProvider: NSObject, AdapterProvider {
 private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @unchecked Sendable {
     var databaseScope: CKDatabase.Scope { .private }
     var deleteZoneError: Error?
+    var completesModifyOperations = true
+    var reportsDeletedRecordsAsUnknownItems = false
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
 
     func add(_ operation: CKDatabaseOperation) {
         if let modifyOperation = operation as? CKModifyRecordsOperation {
+            guard completesModifyOperations else { return }
             let savedRecords = modifyOperation.recordsToSave ?? []
             let deletedRecordIDs = modifyOperation.recordIDsToDelete ?? []
+            if reportsDeletedRecordsAsUnknownItems, !deletedRecordIDs.isEmpty {
+                let partialErrors = Dictionary(
+                    uniqueKeysWithValues: deletedRecordIDs.map {
+                        (
+                            $0,
+                            NSError(
+                                domain: CKErrorDomain,
+                                code: CKError.unknownItem.rawValue
+                            )
+                        )
+                    }
+                )
+                modifyOperation.modifyRecordsCompletionBlock?(
+                    [],
+                    [],
+                    CKError(
+                        .partialFailure,
+                        userInfo: [CKPartialErrorsByItemIDKey: partialErrors]
+                    )
+                )
+                return
+            }
             for record in savedRecords {
                 modifyOperation.perRecordCompletionBlock?(record, nil)
             }
@@ -204,6 +229,30 @@ private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
 }
 
 final class BigSyncKitTests: XCTestCase {
+    func testCancellingModifyOperationFinishesAndCompletesExactlyOnce() {
+        let database = FakeCloudKitDatabase()
+        database.completesModifyOperations = false
+        let completed = expectation(description: "completion")
+        completed.expectedFulfillmentCount = 1
+        var completionCount = 0
+        let operation = ModifyRecordsOperation(
+            database: database,
+            records: [],
+            recordIDsToDelete: []
+        ) { _, _, _, _, error in
+            completionCount += 1
+            XCTAssertTrue(error is CancellationError)
+            completed.fulfill()
+        }
+
+        operation.start()
+        operation.cancel()
+
+        wait(for: [completed], timeout: 1)
+        XCTAssertTrue(operation.isFinished)
+        XCTAssertEqual(completionCount, 1)
+    }
+
     @BigSyncBackgroundActor
     func testZoneResetDeletesManagedZoneThenRebuildsLocalTracking() async throws {
         let database = FakeCloudKitDatabase()
@@ -279,6 +328,31 @@ final class BigSyncKitTests: XCTestCase {
 
         let availability = await gate.availability(for: "iCloud.test")
         XCTAssertEqual(availability, .available)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletingUnknownCloudKitItemIsAcknowledgedAsAlreadyDeleted() async throws {
+        let database = FakeCloudKitDatabase()
+        database.reportsDeletedRecordsAsUnknownItems = true
+        let zoneID = CKRecordZone.ID(
+            zoneName: "unknown-deletion-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let recordID = CKRecord.ID(
+            recordName: "Bookmark.missing",
+            zoneID: zoneID
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: ["Bookmark"],
+            deletedByEntity: ["Bookmark": [recordID]]
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(adapter)
+
+        try await synchronizer.synchronizeAdapter(adapter)
+
+        XCTAssertTrue(adapter.events.contains("didDelete:Bookmark.missing"))
     }
 
     func testCloudKitAccountAvailabilityGateDefersUnavailableAndFailedStatuses() async {
@@ -757,6 +831,72 @@ final class BigSyncKitTests: XCTestCase {
             fixture.targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: initialRecord.recordID.recordName
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionAcknowledgesOnlyTheGenerationThatWasPrepared() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "deletion-generation",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let initialRecords = try await fixture.adapter.recordsToUpload(limit: 1)
+        let initialRecord = try XCTUnwrap(initialRecords.first)
+        try await fixture.adapter.didUpload(savedRecords: [initialRecord])
+
+        let recordName = initialRecord.recordID.recordName
+        let deletionGeneration = UUID().uuidString
+        try await fixture.persistenceRealm.asyncWrite {
+            let tracking = try XCTUnwrap(
+                fixture.persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: recordName
+                )
+            )
+            tracking.entityState = .deletedLocally
+            tracking.pendingGeneration = deletionGeneration
+        }
+
+        let newerGeneration = UUID().uuidString
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(
+                BigSyncPendingMutation(
+                    recordName: recordName,
+                    entityType: BigSyncTrackedObject.className(),
+                    objectIdentifier: object.id,
+                    generation: newerGeneration
+                ),
+                update: .modified
+            )
+        }
+
+        try await fixture.adapter.didDelete(
+            recordIDs: [initialRecord.recordID],
+            matchingGenerations: [recordName: deletionGeneration]
+        )
+
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertEqual(tracking.entityState, .new)
+        XCTAssertEqual(tracking.pendingGeneration, newerGeneration)
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
             )
         )
     }

@@ -676,7 +676,7 @@ extension CloudKitSynchronizer {
             database: database,
             records: records,
             recordIDsToDelete: nil
-        ) { [weak self] (savedRecords, deleted, conflicted, recordIDsMissingOnServer, operationError) in
+        ) { [weak self] (savedRecords, _, _, recordIDsMissingOnServer, operationError) in
             //            debugPrint("# uploadRecords, inside operation callback...", records.count)
             guard let self else { return }
             modifyRecordsTask?.cancel()
@@ -685,13 +685,12 @@ extension CloudKitSynchronizer {
                 guard let self else { return }
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-                var conflicted = conflicted
                 if let savedRecords, !savedRecords.isEmpty {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                     logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords.count) records")
 //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \(savedRecords.map { ($0.recordID.recordName, $0.debugDescription) })")
                     //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
-                    
+
                     if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
                         try await generationTrackingAdapter.didUpload(
                             savedRecords: savedRecords,
@@ -802,14 +801,31 @@ extension CloudKitSynchronizer {
         restrictedToEntityType: String? = nil,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
+        let preparedDeletions: [PreparedRecordDeletion]
         let recordIDs: [CKRecord.ID]
-        if let restrictedAdapter = adapter as? PrioritySyncCapableModelAdapter {
+        if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
+            preparedDeletions = try await generationTrackingAdapter.preparedRecordDeletions(
+                limit: batchSize,
+                restrictedToEntityType: restrictedToEntityType
+            )
+            recordIDs = preparedDeletions.map(\.recordID)
+        } else if let restrictedAdapter = adapter as? PrioritySyncCapableModelAdapter {
             recordIDs = try await restrictedAdapter.recordIDsMarkedForDeletion(
                 limit: batchSize,
                 restrictedToEntityType: restrictedToEntityType
             )
+            preparedDeletions = recordIDs.map {
+                PreparedRecordDeletion(recordID: $0, generation: nil)
+            }
         } else {
             recordIDs = try await adapter.recordIDsMarkedForDeletion(limit: batchSize)
+            preparedDeletions = recordIDs.map {
+                PreparedRecordDeletion(recordID: $0, generation: nil)
+            }
+        }
+        let deletionGenerations = preparedDeletions.reduce(into: [String: String]()) {
+            guard let generation = $1.generation else { return }
+            $0[$1.recordID.recordName] = generation
         }
         let recordCount = recordIDs.count
         let requestedBatchSize = batchSize
@@ -819,16 +835,38 @@ extension CloudKitSynchronizer {
             return
         }
         
-        let modifyRecordsOperation = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: recordIDs)
-        modifyRecordsOperation.modifyRecordsCompletionBlock = { @Sendable [weak self] savedRecords, deletedRecordIDs, operationError in
+        let modifyRecordsOperation = ModifyRecordsOperation(
+            database: database,
+            records: nil,
+            recordIDsToDelete: recordIDs
+        ) { @Sendable [weak self] _, deletedRecordIDs, _, recordIDsMissingOnServer, operationError in
             guard let self else { return }
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
-                //                debugPrint("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
-                logger.info("QSCloudKitSynchronizer >> Deleted \(recordCount) records")
-                await adapter.didDelete(recordIDs: deletedRecordIDs ?? [])
-                
-                if let error = operationError {
+                let acknowledgedRecordIDSet = Set(deletedRecordIDs ?? [])
+                    .union(recordIDsMissingOnServer)
+                let acknowledgedRecordIDs = recordIDs.filter {
+                    acknowledgedRecordIDSet.contains($0)
+                }
+                logger.info(
+                    "QSCloudKitSynchronizer >> Deleted or confirmed absent \(acknowledgedRecordIDs.count) records"
+                )
+                do {
+                    if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
+                        try await generationTrackingAdapter.didDelete(
+                            recordIDs: acknowledgedRecordIDs,
+                            matchingGenerations: deletionGenerations
+                        )
+                    } else {
+                        await adapter.didDelete(recordIDs: acknowledgedRecordIDs)
+                    }
+                } catch {
+                    try await completion(error)
+                    return
+                }
+
+                let allDeletionsAcknowledged = acknowledgedRecordIDs.count == recordCount
+                if let error = operationError, !allDeletionsAcknowledged {
                     if isLimitExceededError(error as NSError) {
                         reduceBatchSize()
                     }
@@ -847,8 +885,7 @@ extension CloudKitSynchronizer {
             }
         }
         
-        currentOperations.append(modifyRecordsOperation)
-        database.add(modifyRecordsOperation)
+        runOperation(modifyRecordsOperation)
     }
 
     @BigSyncBackgroundActor

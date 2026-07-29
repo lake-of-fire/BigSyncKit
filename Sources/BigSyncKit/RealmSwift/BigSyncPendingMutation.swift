@@ -105,4 +105,10 @@ enum BigSyncMutationTrackingRegistry {
             unboundMutations.removeValue(forKey: recordName)
         }
     }
+
+    static func removeUnbound(recordName: String) {
+        lock.withLock {
+            unboundMutations.removeValue(forKey: recordName)
+        }
+    }
 }

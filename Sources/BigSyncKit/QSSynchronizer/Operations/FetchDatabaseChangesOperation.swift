@@ -16,6 +16,7 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
     
     var changedZoneIDs = [CKRecordZone.ID]()
     var deletedZoneIDs = [CKRecordZone.ID]()
+    private let resultLock = NSLock()
     weak var internalOperation: CKFetchDatabaseChangesOperation?
     
     init(
@@ -33,6 +34,7 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
     
     override func start() {
         super.start()
+        guard !isFinished else { return }
         
         let databaseChangesOperation = CKFetchDatabaseChangesOperation(previousServerChangeToken: databaseToken)
         databaseChangesOperation.fetchAllChanges = true
@@ -42,20 +44,27 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
 //        }
         
         databaseChangesOperation.recordZoneWithIDChangedBlock = { @Sendable zoneID in
-            self.changedZoneIDs.append(zoneID)
+            self.resultLock.withLock {
+                self.changedZoneIDs.append(zoneID)
+            }
         }
         
         databaseChangesOperation.recordZoneWithIDWasDeletedBlock = { @Sendable zoneID in
-            self.deletedZoneIDs.append(zoneID)
+            self.resultLock.withLock {
+                self.deletedZoneIDs.append(zoneID)
+            }
         }
         
         databaseChangesOperation.fetchDatabaseChangesCompletionBlock = { @Sendable [weak self] serverChangeToken, moreComing, operationError in
             guard let self else { return }
             Task { @BigSyncBackgroundActor [weak self] in
-                guard let self else { return }
+                guard let self, !self.isFinished else { return }
                 if !moreComing {
                     if operationError == nil {
-                        self.completion(serverChangeToken, self.changedZoneIDs, self.deletedZoneIDs)
+                        let zoneIDs = self.resultLock.withLock {
+                            (self.changedZoneIDs, self.deletedZoneIDs)
+                        }
+                        self.completion(serverChangeToken, zoneIDs.0, zoneIDs.1)
                     }
                     
                     self.finish(error: operationError)
