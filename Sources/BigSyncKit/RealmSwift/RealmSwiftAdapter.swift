@@ -316,6 +316,10 @@ private func encodedCloudKitMap(_ value: [String: Any]) throws -> Data {
 extension RealmSwiftAdapter: @unchecked Sendable { }
 
 public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapableModelAdapter, UploadGenerationTrackingModelAdapter {
+    private static let mutationJournalRecoveryEntityType =
+        "__BigSyncKitMutationJournalRecovery"
+    private static let mutationJournalRecoveryVersion = 1
+
     private static var shouldSkipDebugDummySetup: Bool {
         let environment = ProcessInfo.processInfo.environment
         guard environment["MANABI_BIGSYNC_DEBUG_DUMMY_RECORDS"] == "1" else { return true }
@@ -454,7 +458,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 7
+        configuration.schemaVersion = 8
         configuration.shouldCompactOnLaunch = { totalBytes, usedBytes in
             // totalBytes refers to the size of the file on disk in bytes (data + free space)
             // usedBytes refers to the number of bytes used by data in the file
@@ -501,6 +505,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     func setup() async throws {
         logger.info("QSCloudKitSynchronizer >> Setup synchronization...")
         //        debugPrint("# setup() ...")
+        // Setup can be retried after cancellation or a cache reset. Tear down any
+        // prior notification graph so retries never accumulate duplicate Realm
+        // observers or debounced processors.
+        invalidateTokens()
         isSetupInterrupted = false
         realmProvider = await RealmProvider(
             persistenceConfiguration: persistenceRealmConfiguration,
@@ -525,8 +533,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
         
-        guard let syncEmpty = realmProvider.persistenceRealm?.objects(SyncedEntity.self).isEmpty else { return }
-        let needsInitialSetup = syncEmpty
+        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+        let syncEmpty = persistenceRealm.objects(SyncedEntity.self).isEmpty
+        // An empty user Realm is still initialized. Without this durable marker,
+        // empty databases repeated the full initial scan on every launch.
+        let needsInitialSetup =
+            syncEmpty && needsMutationJournalRecovery(in: persistenceRealm)
         
         if needsInitialSetup {
             do {
@@ -619,39 +631,66 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
         
-        //        if !needsInitialSetup {
-        do {
-            try await createMissingSyncedEntities()
-        } catch is CancellationError {
-            isSetupInterrupted = true
-            return
-        } catch {
-            isSetupInterrupted = true
-            throw error
-        }
-        //        }
-        
-        // Removed startPollingForChanges() call
-        
-        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-        updateHasChanges(realm: persistenceRealm)
-
-        // One timestamp-based recovery pass covers writes made by older builds,
-        // unmanaged-object call sites, or a crash before the journal schema was
-        // available. Normal Realm notifications use the changed-ID journal.
-        if !needsInitialSetup {
-            await enqueueCreatedAndModified()
-            try await processEnqueuedChanges()
-        }
-        
+        // Install observation before the final journal drain. Writes do not depend
+        // on the observer for durability, but this ordering avoids adding debounce
+        // latency to a mutation committed while setup is finishing.
         await setupPublisherDebouncer()
         observeRealmChanges()
+
+        if needsInitialSetup {
+            try await updateCreatedAndModified()
+            try await markMutationJournalRecoveryComplete(in: persistenceRealm)
+        } else if needsMutationJournalRecovery(in: persistenceRealm) {
+            // This is the only broad scan for clients that carry the journal
+            // schema. It recovers changes made by older builds and records that
+            // predate durable changed-ID tracking.
+            do {
+                try await createMissingSyncedEntities()
+            } catch is CancellationError {
+                isSetupInterrupted = true
+                return
+            } catch {
+                isSetupInterrupted = true
+                throw error
+            }
+            await enqueueCreatedAndModified()
+            try await processEnqueuedChanges()
+            try await updateCreatedAndModified()
+            try await markMutationJournalRecoveryComplete(in: persistenceRealm)
+        } else {
+            // Normal launches touch only durable changed IDs. Target Realms that
+            // have not adopted BigSyncPendingMutation retain the timestamp fallback
+            // inside updateCreatedAndModified().
+            try await updateCreatedAndModified()
+        }
+
+        updateHasChanges(realm: persistenceRealm)
         
         //        if hasChanges {
         //            Task { @BigSyncBackgroundActor in
         //                await modelAdapterDelegate?.hasChangesToUpload()
         //            }
         //        }
+    }
+
+    @BigSyncBackgroundActor
+    private func needsMutationJournalRecovery(in persistenceRealm: Realm) -> Bool {
+        persistenceRealm.object(
+            ofType: SyncedEntityType.self,
+            forPrimaryKey: Self.mutationJournalRecoveryEntityType
+        )?.recoveryVersion != Self.mutationJournalRecoveryVersion
+    }
+
+    @BigSyncBackgroundActor
+    private func markMutationJournalRecoveryComplete(in persistenceRealm: Realm) async throws {
+        try await persistenceRealm.asyncWrite {
+            let state = persistenceRealm.object(
+                ofType: SyncedEntityType.self,
+                forPrimaryKey: Self.mutationJournalRecoveryEntityType
+            ) ?? SyncedEntityType(entityType: Self.mutationJournalRecoveryEntityType)
+            state.recoveryVersion = Self.mutationJournalRecoveryVersion
+            persistenceRealm.add(state, update: .modified)
+        }
     }
     
     @BigSyncBackgroundActor
@@ -1000,6 +1039,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     func _test_forwardPendingMutations(in realm: Realm) async throws -> Int {
         try await forwardPendingMutations(in: realm)
     }
+
+    @BigSyncBackgroundActor
+    func _test_setup() async throws {
+        try await setup()
+    }
 #endif
     
     @BigSyncBackgroundActor
@@ -1009,6 +1053,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         let currentChangeSet: ResultsChangeSet
         currentChangeSet = self.resultsChangeSet
         self.resultsChangeSet = ResultsChangeSet() // Reset for next batch
+        guard !currentChangeSet.insertions.isEmpty
+                || !currentChangeSet.modifications.isEmpty
+                || !currentChangeSet.trackedChangeHighWatermarks.isEmpty else {
+            return
+        }
         
         //        if !currentChangeSet.insertions.isEmpty {                            debugPrint("# processEnqueuedChanges INSERT RECS", currentChangeSet.insertions.compactMap { $0 })                        }
         //        if !currentChangeSet.modifications.isEmpty {                            debugPrint("# processEnqueuedChanges MODIFY RECS", currentChangeSet.modifications.values.compactMap { $0 })                        }
@@ -1714,8 +1763,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         let value = record[key]
         if (property.isSet || property.isArray || property.isMap),
            !record.allKeys().contains(key) {
-            // A collection added in a newer schema is absent from older records.
-            // Preserve the local/default value instead of assigning nil to Realm.
+            // Full zone-change fetches use desiredKeys == nil, so an absent
+            // collection field is the CloudKit representation of an empty
+            // collection. Realm collections cannot be assigned nil.
+            clearCollection(property: property, on: object)
             return
         }
         
@@ -1960,6 +2011,55 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             //            debugPrint("!! applyChange", type(of: object), key, value.debugDescription.prefix(100))
             try Task.checkCancellation()
             object.setValue(value, forKey: key)
+        }
+    }
+
+    private func clearCollection(property: Property, on object: Object) {
+        let key = property.name
+        if property.isSet {
+            switch property.type {
+            case .int:
+                object.setValue(Set<Int>(), forKey: key)
+            case .string:
+                object.setValue(Set<String>(), forKey: key)
+            case .bool:
+                object.setValue(Set<Bool>(), forKey: key)
+            case .float:
+                object.setValue(Set<Float>(), forKey: key)
+            case .double:
+                object.setValue(Set<Double>(), forKey: key)
+            case .data:
+                object.setValue(Set<Data>(), forKey: key)
+            case .date:
+                object.setValue(Set<Date>(), forKey: key)
+            case .UUID:
+                object.setValue(Set<UUID>(), forKey: key)
+            default:
+                object.setValue([], forKey: key)
+            }
+        } else if property.isArray {
+            switch property.type {
+            case .int:
+                object.setValue(List<Int>(), forKey: key)
+            case .string:
+                object.setValue(List<String>(), forKey: key)
+            case .bool:
+                object.setValue(List<Bool>(), forKey: key)
+            case .float:
+                object.setValue(List<Float>(), forKey: key)
+            case .double:
+                object.setValue(List<Double>(), forKey: key)
+            case .data:
+                object.setValue(List<Data>(), forKey: key)
+            case .date:
+                object.setValue(List<Date>(), forKey: key)
+            case .UUID:
+                object.setValue(List<UUID>(), forKey: key)
+            default:
+                object.setValue([], forKey: key)
+            }
+        } else if property.isMap {
+            object.setValue([String: Any](), forKey: key)
         }
     }
     
@@ -2344,39 +2444,41 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                             referenceArray.append(recordID.recordName)
                         }
-                        record[property.name] = referenceArray as CKRecordValue
+                        record[property.name] = referenceArray.isEmpty
+                            ? nil
+                            : referenceArray as CKRecordValue
                     case .int:
                         guard let set = value as? MutableSet<Int> else { break }
                         let array = Array(set)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .string:
                         guard let set = value as? MutableSet<String> else { break }
                         let array = Array(set)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .bool:
                         guard let set = value as? MutableSet<Bool> else { break }
                         let array = Array(set)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .float:
                         guard let set = value as? MutableSet<Float> else { break }
                         let array = Array(set)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .double:
                         guard let set = value as? MutableSet<Double> else { break }
                         let array = Array(set)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .data:
                         guard let set = value as? MutableSet<Data> else { break }
                         let array = Array(set)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .date:
                         guard let set = value as? MutableSet<Date> else { break }
                         let array = Array(set)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .UUID:
                         guard let set = value as? MutableSet<UUID> else { break }
                         let array = Array(set.map { $0.uuidString })
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     default:
                         // Other inner types of Set is not supported yet
                         logger.warning("Warning: Unsupported recordToUpload set property type \(property.type) for \(String(describing: type(of: object)))")
@@ -2449,39 +2551,41 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                             referenceArray.append(recordID.recordName)
                         }
-                        record[property.name] = referenceArray as CKRecordValue
+                        record[property.name] = referenceArray.isEmpty
+                            ? nil
+                            : referenceArray as CKRecordValue
                     case .int:
                         guard let list = value as? List<Int> else { break }
                         let array = Array(list)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .string:
                         guard let list = value as? List<String> else { break }
                         let array = Array(list)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .bool:
                         guard let list = value as? List<Bool> else { break }
                         let array = Array(list)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .float:
                         guard let list = value as? List<Float> else { break }
                         let array = Array(list)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .double:
                         guard let list = value as? List<Double> else { break }
                         let array = Array(list)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .data:
                         guard let list = value as? List<Data> else { break }
                         let array = Array(list)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .date:
                         guard let list = value as? List<Date> else { break }
                         let array = Array(list)
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .UUID:
                         guard let list = value as? List<UUID> else { break }
                         let array = Array(list.map { $0.uuidString })
-                        record[property.name] = array as CKRecordValue
+                        record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     default:
                         // Other inner types of List is not supported yet
                         logger.warning("Warning: Unsupported recordToUpload array property type \(property.type) for \(String(describing: type(of: object)))")

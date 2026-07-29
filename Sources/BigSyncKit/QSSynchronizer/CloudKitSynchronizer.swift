@@ -89,11 +89,17 @@ public enum OneOffRecordZoneResetResult: Sendable, Equatable {
 
 public enum OneOffRecordZoneResetError: LocalizedError {
     case migrationInProgress
+    case cloudKitAccountChanged
+    case cloudKitAccountUnavailable
 
     public var errorDescription: String? {
         switch self {
         case .migrationInProgress:
             return "Another device is currently resetting this CloudKit database"
+        case .cloudKitAccountChanged:
+            return "The iCloud account changed during the CloudKit reset"
+        case .cloudKitAccountUnavailable:
+            return "The current iCloud account could not be identified"
         }
     }
 }
@@ -273,6 +279,7 @@ public let cloudKitSynchronizerMetadataKeys: [String] = [
  */
 @BigSyncBackgroundActor
 public class CloudKitSynchronizer: NSObject {
+    public typealias AccountIdentifierProvider = @Sendable () async throws -> String
     /// SyncError
     public enum SyncError: Int, Error {
         /**
@@ -316,6 +323,12 @@ public class CloudKitSynchronizer: NSObject {
     
     /// Required by the synchronizer to persist some state. `UserDefaults` can be used via `UserDefaultsAdapter`.
     public let keyValueStore: KeyValueStore
+    private let accountIdentifierProvider: AccountIdentifierProvider
+    private var cloudKitAccountIdentifierKey: String {
+        "\(identifier).BigSyncKitCloudKitAccountIdentifier"
+    }
+    private var accountValidationRequired = true
+    private var accountChangeObserver: NSObjectProtocol?
     
     /// Indicates whether the instance is currently synchronizing data.
     @BigSyncBackgroundActor
@@ -390,6 +403,7 @@ public class CloudKitSynchronizer: NSObject {
         adapterProvider: AdapterProvider,
         keyValueStore: KeyValueStore = UserDefaultsAdapter(userDefaults: UserDefaults.standard),
         compatibilityVersion: Int = 0,
+        accountIdentifierProvider: AccountIdentifierProvider? = nil,
         logger: Logging.Logger
     ) {
         self.identifier = identifier
@@ -398,8 +412,43 @@ public class CloudKitSynchronizer: NSObject {
         self.database = database
         self.keyValueStore = keyValueStore
         self.compatibilityVersion = compatibilityVersion
+        if let accountIdentifierProvider {
+            self.accountIdentifierProvider = accountIdentifierProvider
+        } else {
+            self.accountIdentifierProvider = {
+                guard let containerIdentifier else {
+                    throw OneOffRecordZoneResetError.cloudKitAccountUnavailable
+                }
+                let container = CKContainer(identifier: containerIdentifier)
+                return try await withCheckedThrowingContinuation { continuation in
+                    container.fetchUserRecordID { recordID, error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else if let recordID {
+                            continuation.resume(returning: recordID.recordName)
+                        } else {
+                            continuation.resume(
+                                throwing: OneOffRecordZoneResetError.cloudKitAccountUnavailable
+                            )
+                        }
+                    }
+                }
+            }
+        }
         self.logger = logger
         super.init()
+
+        accountChangeObserver = NotificationCenter.default.addObserver(
+            forName: .CKAccountChanged,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @BigSyncBackgroundActor [weak self] in
+                guard let self else { return }
+                accountValidationRequired = true
+                cancelSynchronization()
+            }
+        }
         
         BackupDetection.runBackupDetection { [weak self] (result, error) in
             guard let self else { return }
@@ -411,6 +460,12 @@ public class CloudKitSynchronizer: NSObject {
 //        Task {
 //            ChangeRequestProcessor.shared.logger = logger
 //        }
+    }
+
+    deinit {
+        if let accountChangeObserver {
+            NotificationCenter.default.removeObserver(accountChangeObserver)
+        }
     }
     
     fileprivate var _deviceIdentifier: String!
@@ -469,6 +524,7 @@ public class CloudKitSynchronizer: NSObject {
         synchronizationTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
             do {
+                try await validateSynchronizationAccount()
                 for adapter in modelAdapters {
                     try await adapter.unsetCancellation()
                 }
@@ -479,6 +535,32 @@ public class CloudKitSynchronizer: NSObject {
             }
         }
     }
+
+    @BigSyncBackgroundActor
+    private func validateSynchronizationAccount() async throws {
+        guard accountValidationRequired else { return }
+        let currentAccountIdentifier = try await accountIdentifierProvider()
+        if let previousAccountIdentifier =
+            keyValueStore.object(forKey: cloudKitAccountIdentifierKey) as? String,
+           previousAccountIdentifier != currentAccountIdentifier {
+            ChangeRequestProcessor.shared.cancelSync = true
+            cancelSync = true
+            cancelledDueToUnauthentication = true
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
+        }
+        keyValueStore.set(
+            value: currentAccountIdentifier,
+            forKey: cloudKitAccountIdentifierKey
+        )
+        accountValidationRequired = false
+    }
+
+#if DEBUG
+    @BigSyncBackgroundActor
+    func _test_validateSynchronizationAccount() async throws {
+        try await validateSynchronizationAccount()
+    }
+#endif
     
     /// Cancel synchronization. It will cause a current synchronization to end with a `cancelled` error.
     @BigSyncBackgroundActor
@@ -609,73 +691,194 @@ public class CloudKitSynchronizer: NSObject {
     /// still rebuilds its local tracking once, but only the device that wins the
     /// claim deletes the shared custom zone.
     ///
-    /// `markerRecordType` must be an existing record type in the production
-    /// CloudKit schema. Marker records do not add any fields to that type.
+    /// `markerRecordType`, `markerOwnerField`, and `markerLeaseDateField` must
+    /// already exist with String and Date types in the production CloudKit schema.
     @BigSyncBackgroundActor
     public func performOneOffRecordZoneResetAndReupload(
         migrationIdentifier: String,
-        markerRecordType: String
+        markerRecordType: String,
+        markerOwnerField: String,
+        markerLeaseDateField: String,
+        leaseDuration: TimeInterval = 60 * 60
     ) async throws -> OneOffRecordZoneResetResult {
         let markerPrefix = "BigSyncKitMigration.\(String(migrationIdentifier.prefix(120)))"
         let claimRecordID = CKRecord.ID(recordName: "\(markerPrefix).claim")
         let completionRecordID = CKRecord.ID(recordName: "\(markerPrefix).completed")
-        let localClaimKey = "\(identifier).\(markerPrefix).ownsClaim"
+        let accountIdentifier = try await accountIdentifierProvider()
+        let accountKey = Data(accountIdentifier.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+        let localKeyPrefix = "\(identifier).\(markerPrefix).\(accountKey)"
+        let localClaimTokenKey = "\(localKeyPrefix).claimToken"
+        let localCompletionKey = "\(localKeyPrefix).completed"
 
-        if try await fetchRecord(completionRecordID) != nil {
-            let activeSynchronizationTask = synchronizationTask
-            cancelSynchronization()
-            await activeSynchronizationTask?.value
-            try await resetSyncCaches(
-                cancelSynchronization: false,
-                includingAdapters: true
+        if keyValueStore.bool(forKey: localCompletionKey) {
+            keyValueStore.set(
+                value: accountIdentifier,
+                forKey: cloudKitAccountIdentifierKey
             )
-            cancelSync = false
-            ChangeRequestProcessor.shared.cancelSync = false
-            keyValueStore.removeObject(forKey: localClaimKey)
+            accountValidationRequired = false
             return .cloudResetAlreadyCompleted
         }
 
-        var ownsClaim = keyValueStore.bool(forKey: localClaimKey)
-        if !ownsClaim {
-            if let existingClaim = try await fetchRecord(claimRecordID) {
-                let claimAge = existingClaim.creationDate.map {
-                    Date().timeIntervalSince($0)
-                } ?? 0
-                guard claimAge >= 15 * 60 else {
-                    throw OneOffRecordZoneResetError.migrationInProgress
-                }
-                try await deleteRecord(claimRecordID)
-            }
-
-            do {
-                try await saveMigrationMarker(
-                    CKRecord(recordType: markerRecordType, recordID: claimRecordID)
-                )
-                keyValueStore.set(boolValue: true, forKey: localClaimKey)
-                ownsClaim = true
-            } catch {
-                if isServerRecordChanged(error) {
-                    throw OneOffRecordZoneResetError.migrationInProgress
-                }
-                throw error
-            }
-        }
-
-        guard ownsClaim else {
-            throw OneOffRecordZoneResetError.migrationInProgress
-        }
-
-        try await deleteRecordZonesAndResetSyncCachesForReupload()
-        do {
-            try await saveMigrationMarker(
-                CKRecord(recordType: markerRecordType, recordID: completionRecordID)
+        if try await fetchRecord(completionRecordID) != nil {
+            try await rebuildLocalSyncCachesAfterCompletedReset()
+            keyValueStore.set(boolValue: true, forKey: localCompletionKey)
+            keyValueStore.set(
+                value: accountIdentifier,
+                forKey: cloudKitAccountIdentifierKey
             )
+            accountValidationRequired = false
+            keyValueStore.removeObject(forKey: localClaimTokenKey)
+            return .cloudResetAlreadyCompleted
+        }
+
+        let claimToken =
+            keyValueStore.object(forKey: localClaimTokenKey) as? String
+            ?? UUID().uuidString
+        do {
+            try await acquireOrRenewResetClaim(
+                recordID: claimRecordID,
+                recordType: markerRecordType,
+                ownerField: markerOwnerField,
+                leaseDateField: markerLeaseDateField,
+                claimToken: claimToken,
+                leaseDuration: leaseDuration
+            )
+            keyValueStore.set(value: claimToken, forKey: localClaimTokenKey)
+        } catch {
+            if isServerRecordChanged(error) {
+                throw OneOffRecordZoneResetError.migrationInProgress
+            }
+            throw error
+        }
+
+        let activeSynchronizationTask = synchronizationTask
+        cancelSynchronization()
+        await activeSynchronizationTask?.value
+
+        try await ensureCurrentAccount(accountIdentifier)
+        for zoneID in Set(modelAdapters.map(\.recordZoneID)) {
+            try await acquireOrRenewResetClaim(
+                recordID: claimRecordID,
+                recordType: markerRecordType,
+                ownerField: markerOwnerField,
+                leaseDateField: markerLeaseDateField,
+                claimToken: claimToken,
+                leaseDuration: leaseDuration
+            )
+            do {
+                try await deleteRecordZone(zoneID)
+            } catch {
+                let nsError = error as NSError
+                let missingZoneCodes = [
+                    CKError.zoneNotFound.rawValue,
+                    CKError.userDeletedZone.rawValue,
+                ]
+                guard nsError.domain == CKErrorDomain,
+                      missingZoneCodes.contains(nsError.code) else {
+                    throw error
+                }
+            }
+        }
+        try await acquireOrRenewResetClaim(
+            recordID: claimRecordID,
+            recordType: markerRecordType,
+            ownerField: markerOwnerField,
+            leaseDateField: markerLeaseDateField,
+            claimToken: claimToken,
+            leaseDuration: leaseDuration
+        )
+        try await resetSyncCaches(
+            cancelSynchronization: false,
+            includingAdapters: true
+        )
+
+        try await acquireOrRenewResetClaim(
+            recordID: claimRecordID,
+            recordType: markerRecordType,
+            ownerField: markerOwnerField,
+            leaseDateField: markerLeaseDateField,
+            claimToken: claimToken,
+            leaseDuration: leaseDuration
+        )
+        try await ensureCurrentAccount(accountIdentifier)
+        do {
+            let completionRecord = CKRecord(
+                recordType: markerRecordType,
+                recordID: completionRecordID
+            )
+            completionRecord[markerOwnerField] = claimToken as CKRecordValue
+            completionRecord[markerLeaseDateField] = Date() as CKRecordValue
+            _ = try await saveMigrationMarker(completionRecord)
         } catch {
             guard isServerRecordChanged(error) else { throw error }
         }
-        keyValueStore.removeObject(forKey: localClaimKey)
+        keyValueStore.set(boolValue: true, forKey: localCompletionKey)
+        keyValueStore.set(
+            value: accountIdentifier,
+            forKey: cloudKitAccountIdentifierKey
+        )
+        accountValidationRequired = false
+        keyValueStore.removeObject(forKey: localClaimTokenKey)
         try? await deleteRecord(claimRecordID)
+        cancelSync = false
+        ChangeRequestProcessor.shared.cancelSync = false
+        cancelledDueToUnauthentication = false
         return .performedCloudReset
+    }
+
+    @BigSyncBackgroundActor
+    private func rebuildLocalSyncCachesAfterCompletedReset() async throws {
+        let activeSynchronizationTask = synchronizationTask
+        cancelSynchronization()
+        await activeSynchronizationTask?.value
+        try await resetSyncCaches(
+            cancelSynchronization: false,
+            includingAdapters: true
+        )
+        cancelSync = false
+        ChangeRequestProcessor.shared.cancelSync = false
+    }
+
+    @BigSyncBackgroundActor
+    private func acquireOrRenewResetClaim(
+        recordID: CKRecord.ID,
+        recordType: String,
+        ownerField: String,
+        leaseDateField: String,
+        claimToken: String,
+        leaseDuration: TimeInterval
+    ) async throws {
+        let now = Date()
+        if let claim = try await fetchRecord(recordID) {
+            let existingOwner = claim[ownerField] as? String
+            let leaseDate =
+                claim[leaseDateField] as? Date
+                ?? claim.modificationDate
+                ?? claim.creationDate
+                ?? .distantPast
+            guard existingOwner == claimToken
+                    || now.timeIntervalSince(leaseDate) >= leaseDuration else {
+                throw OneOffRecordZoneResetError.migrationInProgress
+            }
+            claim[ownerField] = claimToken as CKRecordValue
+            claim[leaseDateField] = now as CKRecordValue
+            _ = try await saveMigrationMarker(claim)
+        } else {
+            let claim = CKRecord(recordType: recordType, recordID: recordID)
+            claim[ownerField] = claimToken as CKRecordValue
+            claim[leaseDateField] = now as CKRecordValue
+            _ = try await saveMigrationMarker(claim)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func ensureCurrentAccount(_ expectedIdentifier: String) async throws {
+        guard try await accountIdentifierProvider() == expectedIdentifier else {
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
+        }
     }
 
     @BigSyncBackgroundActor
@@ -713,17 +916,21 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     @BigSyncBackgroundActor
-    private func saveMigrationMarker(_ record: CKRecord) async throws {
-        try await modifyMigrationMarkers(
+    private func saveMigrationMarker(_ record: CKRecord) async throws -> CKRecord {
+        let result = try await modifyMigrationMarkers(
             recordsToSave: [record],
             recordIDsToDelete: nil
         )
+        guard let savedRecord = result.savedRecords.first else {
+            throw CKError(.internalError)
+        }
+        return savedRecord
     }
 
     @BigSyncBackgroundActor
     private func deleteRecord(_ recordID: CKRecord.ID) async throws {
         do {
-            try await modifyMigrationMarkers(
+            _ = try await modifyMigrationMarkers(
                 recordsToSave: nil,
                 recordIDsToDelete: [recordID]
             )
@@ -740,20 +947,22 @@ public class CloudKitSynchronizer: NSObject {
     private func modifyMigrationMarkers(
         recordsToSave: [CKRecord]?,
         recordIDsToDelete: [CKRecord.ID]?
-    ) async throws {
+    ) async throws -> (savedRecords: [CKRecord], deletedRecordIDs: [CKRecord.ID]) {
         try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+            (continuation: CheckedContinuation<([CKRecord], [CKRecord.ID]), Error>) in
             let operation = CKModifyRecordsOperation(
                 recordsToSave: recordsToSave,
                 recordIDsToDelete: recordIDsToDelete
             )
             operation.savePolicy = .ifServerRecordUnchanged
             operation.isAtomic = true
-            operation.modifyRecordsCompletionBlock = { _, _, error in
+            operation.modifyRecordsCompletionBlock = { savedRecords, deletedRecordIDs, error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
-                    continuation.resume()
+                    continuation.resume(
+                        returning: (savedRecords ?? [], deletedRecordIDs ?? [])
+                    )
                 }
             }
             database.add(operation)

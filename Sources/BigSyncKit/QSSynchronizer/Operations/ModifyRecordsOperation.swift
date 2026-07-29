@@ -34,7 +34,7 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     private var completionDelivered = false
 
 //    let dispatchQueue = DispatchQueue(label: "modifyRecordsDispatchQueue")
-    weak var internalOperation: CKModifyRecordsOperation?
+    private var internalOperation: CKModifyRecordsOperation?
         
     override func start() {
         super.start()
@@ -53,6 +53,7 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
             Task { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
                 let results = self.resultLock.withLock { () -> ([CKRecord], Set<CKRecord.ID>) in
+                    self.internalOperation = nil
                     if let error = operationError as? CKError {
                         self.processCKErrorWithoutLock(error)
                     }
@@ -69,7 +70,13 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
             }
         }
         
-        internalOperation = operation
+        let shouldCancel = resultLock.withLock {
+            internalOperation = operation
+            return isCancelled || isFinished
+        }
+        if shouldCancel {
+            operation.cancel()
+        }
         database.add(operation)
     }
     
@@ -121,7 +128,8 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     }
     
     override func cancel() {
-        internalOperation?.cancel()
+        let operation = resultLock.withLock { internalOperation }
+        operation?.cancel()
         deliverCompletion(
             saved: nil,
             deleted: nil,

@@ -357,12 +357,12 @@ extension CloudKitSynchronizer {
             }
             
             serverChangeToken = token
-            storedDatabaseToken = token
             if syncMode == .sync {
                 try await uploadChanges()
             } else {
                 do {
                     try await processFetchedChanges()
+                    storedDatabaseToken = token
                     await changesFinishedSynchronizing()
                 } catch {
                     await failSynchronization(error: error)
@@ -533,6 +533,10 @@ extension CloudKitSynchronizer {
                     await failSynchronization(error: error)
                 }
             } else {
+                // The database token is a commit barrier for the zone changes it
+                // announced. Persist it only after every downloaded zone change
+                // has been applied and its zone token has been saved.
+                storedDatabaseToken = serverChangeToken
                 if try await shouldDeferFetches() {
                     //                    debugPrint("# USED TO STOP HERE, NOw LOOPIN!")
                     await performSynchronization()
@@ -676,7 +680,7 @@ extension CloudKitSynchronizer {
             database: database,
             records: records,
             recordIDsToDelete: nil
-        ) { [weak self] (savedRecords, _, _, recordIDsMissingOnServer, operationError) in
+        ) { [weak self] (savedRecords, _, conflictedRecords, recordIDsMissingOnServer, operationError) in
             //            debugPrint("# uploadRecords, inside operation callback...", records.count)
             guard let self else { return }
             modifyRecordsTask?.cancel()
@@ -703,65 +707,66 @@ extension CloudKitSynchronizer {
                 
                 try Task.checkCancellation()
                 if let error = operationError as? NSError {
-                    //                    if error.code == CKError.partialFailure.rawValue,
-                    //                       let errorsByItemID = error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] {
-                    //                        for (recordID, error) in errorsByItemID where error.code == CKError.serverRecordChanged.rawValue {
-                    //                            if let serverRecord = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
-                    //                                // Handle the server record changed error
-                    //                                if let serverMessage = error.userInfo[NSLocalizedDescriptionKey] as? String,
-                    //                                   serverMessage.contains("record to insert already exists") {
-                    //                                    if !conflicted.contains(where: { $0.recordID == serverRecord.recordID }) {
-                    ////                                        conflicted.append(serverRecord)
-                    //                                        print("!! WAS GONNA ADD ::")
-                    //                                    }
-                    //                                    // Handle the specific case where the record already exists
-                    //                                    print("!! Record \(recordID) already exists on the server.")
-                    //                                    //serverRecord/
-                    //                                }
-                    //                            }
-                    //                        }
-                    //                    }
-                    
                     if !recordIDsMissingOnServer.isEmpty {
                         try await adapter.deleteChangeTracking(forRecordIDs: Array(recordIDsMissingOnServer))
                     }
-                    
-                    if let errorsByItemID = error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] {
-                        var resolvedRecords = [CKRecord]()
-                        for (_, itemError) in errorsByItemID {
-                            if itemError.code == CKError.serverRecordChanged.rawValue,
-                               let serverRecord = itemError.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
-                                resolvedRecords.append(serverRecord)
-                            }
+
+                    let errorsByItemID =
+                        error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] ?? [:]
+                    var resolvedRecordsByID = Dictionary(
+                        uniqueKeysWithValues: conflictedRecords.map { ($0.recordID, $0) }
+                    )
+                    for (recordID, itemError) in errorsByItemID
+                    where itemError.code == CKError.serverRecordChanged.rawValue {
+                        if let serverRecord =
+                            itemError.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord {
+                            resolvedRecordsByID[recordID] = serverRecord
                         }
-                        //                        debugPrint("## Resolved Recos", resolvedRecords.map {($0.recordID, $0) })
-                        if !resolvedRecords.isEmpty {
-                            try Task.checkCancellation()
-                            do {
-                                try await adapter.saveChanges(in: resolvedRecords, forceSave: true)
-                                try await adapter.persistImportedChanges()
-                                increaseBatchSize()
-                                
-                                try Task.checkCancellation()
-                                guard !cancelSync else { throw CancellationError() }
-                                
-                                // Proceed to upload remaining records after resolving conflicts
-                                try await uploadRecords(
-                                    adapter: adapter,
-                                    restrictedToEntityType: restrictedToEntityType,
-                                    completion: completion
-                                )
-                            } catch {
-                                logger.info("QSCloudKitSynchronizer >> WARNING: Failed to save changes to resolved conflicted record: \(error)")
-                                try await completion(error)
-                            }
+                    }
+
+                    let handledRecordIDs = recordIDsMissingOnServer
+                        .union(resolvedRecordsByID.keys)
+                    let unresolvedItemErrors = errorsByItemID.filter {
+                        !handledRecordIDs.contains($0.key)
+                    }
+
+                    guard unresolvedItemErrors.isEmpty else {
+                        if self.isLimitExceededError(error) {
+                            reduceBatchSize()
+                        }
+                        try await completion(error)
+                        return
+                    }
+
+                    if !resolvedRecordsByID.isEmpty {
+                        do {
+                            try await adapter.saveChanges(
+                                in: Array(resolvedRecordsByID.values),
+                                forceSave: true
+                            )
+                            try await adapter.persistImportedChanges()
+                        } catch {
+                            logger.warning(
+                                "QSCloudKitSynchronizer >> Failed to resolve conflicted records: \(error)"
+                            )
+                            try await completion(error)
                             return
                         }
+                    }
+
+                    if !handledRecordIDs.isEmpty {
+                        try Task.checkCancellation()
+                        guard !cancelSync else { throw CancellationError() }
+                        try await uploadRecords(
+                            adapter: adapter,
+                            restrictedToEntityType: restrictedToEntityType,
+                            completion: completion
+                        )
+                        return
                     } else {
                         if self.isLimitExceededError(error) {
                             reduceBatchSize()
                         }
-                        
                         try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
                         try await completion(error)

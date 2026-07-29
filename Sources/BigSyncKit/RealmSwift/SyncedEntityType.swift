@@ -4,6 +4,7 @@ import RealmSwift
 class SyncedEntityType: Object {
     @objc dynamic var entityType: String = ""
     @objc dynamic var lastTrackedChangesAt: Date?
+    @objc dynamic var recoveryVersion: Int = 0
     
     convenience init(entityType: String, lastTrackedChangesAt: Date? = nil) {
         self.init()

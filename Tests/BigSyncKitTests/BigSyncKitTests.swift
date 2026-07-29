@@ -24,14 +24,42 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var deleteZoneError: Error?
     var completesModifyOperations = true
     var reportsDeletedRecordsAsUnknownItems = false
+    var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
+    var accountIdentifier = "test-account"
+    var accountIdentifierAfterNextZoneDeletion: String?
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
     private var records = [CKRecord.ID: CKRecord]()
+    private var conditionallyFetchedRecordIDs = Set<CKRecord.ID>()
 
     func add(_ operation: CKDatabaseOperation) {
         if let modifyOperation = operation as? CKModifyRecordsOperation {
             guard completesModifyOperations else { return }
             let savedRecords = modifyOperation.recordsToSave ?? []
             let deletedRecordIDs = modifyOperation.recordIDsToDelete ?? []
+            let partialSaveErrors = partialSaveErrorsByRecordID.filter {
+                savedRecords.map(\.recordID).contains($0.key)
+            }
+            if !partialSaveErrors.isEmpty {
+                var successfullySaved = [CKRecord]()
+                for record in savedRecords {
+                    if let error = partialSaveErrors[record.recordID] {
+                        modifyOperation.perRecordCompletionBlock?(record, error)
+                    } else {
+                        records[record.recordID] = record
+                        successfullySaved.append(record)
+                        modifyOperation.perRecordCompletionBlock?(record, nil)
+                    }
+                }
+                modifyOperation.modifyRecordsCompletionBlock?(
+                    successfullySaved,
+                    [],
+                    CKError(
+                        .partialFailure,
+                        userInfo: [CKPartialErrorsByItemIDKey: partialSaveErrors]
+                    )
+                )
+                return
+            }
             if reportsDeletedRecordsAsUnknownItems, !deletedRecordIDs.isEmpty {
                 let partialErrors = Dictionary(
                     uniqueKeysWithValues: deletedRecordIDs.map {
@@ -57,6 +85,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             if modifyOperation.savePolicy == .ifServerRecordUnchanged,
                let duplicateRecord = savedRecords.first(where: {
                    records[$0.recordID] != nil
+                    && !conditionallyFetchedRecordIDs.contains($0.recordID)
                }) {
                 let itemError = NSError(
                     domain: CKErrorDomain,
@@ -78,6 +107,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             }
             for record in savedRecords {
                 records[record.recordID] = record
+                conditionallyFetchedRecordIDs.remove(record.recordID)
                 modifyOperation.perRecordCompletionBlock?(record, nil)
             }
             for recordID in deletedRecordIDs {
@@ -96,11 +126,26 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     }
 
     func fetch(withRecordID recordID: CKRecord.ID, completionHandler: @escaping (CKRecord?, Error?) -> Void) {
+        if records[recordID] != nil {
+            conditionallyFetchedRecordIDs.insert(recordID)
+        }
         completionHandler(records[recordID], nil)
+    }
+
+    func setDate(_ date: Date, field: String, for recordID: CKRecord.ID) {
+        records[recordID]?[field] = date as CKRecordValue
+    }
+
+    func seed(_ record: CKRecord) {
+        records[record.recordID] = record
     }
 
     func delete(withRecordZoneID zoneID: CKRecordZone.ID, completionHandler: @escaping (CKRecordZone.ID?, Error?) -> Void) {
         deletedZoneIDs.append(zoneID)
+        if let nextAccountIdentifier = accountIdentifierAfterNextZoneDeletion {
+            accountIdentifier = nextAccountIdentifier
+            accountIdentifierAfterNextZoneDeletion = nil
+        }
         completionHandler(deleteZoneError == nil ? zoneID : nil, deleteZoneError)
     }
 
@@ -217,7 +262,10 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
         events.append("saveToken")
     }
 
-    func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async throws {}
+    func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async throws {
+        let recordNames = forRecordIDs.map(\.recordName).joined(separator: ",")
+        events.append("deleteTracking:\(recordNames)")
+    }
     func didFinishImport() async {}
     func cancelSynchronization() {}
     func unsetCancellation() async throws {
@@ -361,7 +409,9 @@ final class BigSyncKitTests: XCTestCase {
         let firstResult = try await firstSynchronizer
             .performOneOffRecordZoneResetAndReupload(
                 migrationIdentifier: "test-v1",
-                markerRecordType: "ExistingRecordType"
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
             )
 
         let secondSynchronizer = makeSynchronizer(database: database)
@@ -370,7 +420,9 @@ final class BigSyncKitTests: XCTestCase {
         let secondResult = try await secondSynchronizer
             .performOneOffRecordZoneResetAndReupload(
                 migrationIdentifier: "test-v1",
-                markerRecordType: "ExistingRecordType"
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
             )
 
         XCTAssertEqual(firstResult, .performedCloudReset)
@@ -400,7 +452,9 @@ final class BigSyncKitTests: XCTestCase {
         do {
             _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
                 migrationIdentifier: "retry-v1",
-                markerRecordType: "ExistingRecordType"
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
             )
             XCTFail("Expected the first zone deletion to fail")
         } catch {
@@ -411,11 +465,133 @@ final class BigSyncKitTests: XCTestCase {
         let result = try await synchronizer
             .performOneOffRecordZoneResetAndReupload(
                 migrationIdentifier: "retry-v1",
-                markerRecordType: "ExistingRecordType"
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
             )
 
         XCTAssertEqual(result, .performedCloudReset)
         XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetDoesNotStealAnActiveClaim() async throws {
+        let database = FakeCloudKitDatabase()
+        let claimID = CKRecord.ID(
+            recordName: "BigSyncKitMigration.active-lease-v1.claim"
+        )
+        let claim = CKRecord(recordType: "ExistingRecordType", recordID: claimID)
+        claim["owner"] = "another-device" as CKRecordValue
+        claim["lease"] = Date() as CKRecordValue
+        database.seed(claim)
+
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(
+                zoneID: CKRecordZone.ID(
+                    zoneName: "active-lease-zone",
+                    ownerName: CKCurrentUserDefaultName
+                ),
+                priorities: []
+            )
+        )
+
+        do {
+            _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "active-lease-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease",
+                leaseDuration: 60
+            )
+            XCTFail("Expected the active claim to block this device")
+        } catch OneOffRecordZoneResetError.migrationInProgress {
+            XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetTakesOverAnExpiredClaimWithoutDeletingItFirst() async throws {
+        let database = FakeCloudKitDatabase()
+        let claimID = CKRecord.ID(
+            recordName: "BigSyncKitMigration.expired-lease-v1.claim"
+        )
+        let claim = CKRecord(recordType: "ExistingRecordType", recordID: claimID)
+        claim["owner"] = "offline-device" as CKRecordValue
+        claim["lease"] = Date(timeIntervalSinceNow: -300) as CKRecordValue
+        database.seed(claim)
+
+        let zoneID = CKRecordZone.ID(
+            zoneName: "expired-lease-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+
+        let result = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+            migrationIdentifier: "expired-lease-v1",
+            markerRecordType: "ExistingRecordType",
+            markerOwnerField: "owner",
+            markerLeaseDateField: "lease",
+            leaseDuration: 60
+        )
+
+        XCTAssertEqual(result, .performedCloudReset)
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetStopsWhenCloudKitAccountChangesMidMigration() async throws {
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-a"
+        database.accountIdentifierAfterNextZoneDeletion = "account-b"
+        let zoneID = CKRecordZone.ID(
+            zoneName: "account-change-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+
+        do {
+            _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "account-change-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+            XCTFail("Expected the account fence to stop the migration")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+            XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testSynchronizationAccountFenceRejectsRuntimeAccountSwitch() async throws {
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-a"
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+
+        try await synchronizer._test_validateSynchronizationAccount()
+        database.accountIdentifier = "account-b"
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        await Task.yield()
+
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected the synchronization account fence to reject the switch")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+            XCTAssertTrue(synchronizer.cancelledDueToUnauthentication)
+        }
     }
 
     func testCloudKitAccountAvailabilityGateStartsImmediatelyWhenAvailable() async {
@@ -451,6 +627,76 @@ final class BigSyncKitTests: XCTestCase {
         try await synchronizer.synchronizeAdapter(adapter)
 
         XCTAssertTrue(adapter.events.contains("didDelete:Bookmark.missing"))
+    }
+
+    @BigSyncBackgroundActor
+    func testMixedPartialUploadFailureDoesNotDiscardTheUnresolvedError() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(
+            zoneName: "mixed-partial-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let missing = makeRecord(type: "Bookmark", id: "missing", zoneID: zoneID)
+        let unavailable = makeRecord(type: "Bookmark", id: "unavailable", zoneID: zoneID)
+        database.partialSaveErrorsByRecordID = [
+            missing.recordID: NSError(
+                domain: CKErrorDomain,
+                code: CKError.unknownItem.rawValue
+            ),
+            unavailable.recordID: NSError(
+                domain: CKErrorDomain,
+                code: CKError.networkFailure.rawValue
+            ),
+        ]
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: ["Bookmark"],
+            uploadedByEntity: ["Bookmark": [missing, unavailable]]
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            try await synchronizer.synchronizeAdapter(adapter)
+            XCTFail("Expected the unresolved per-record failure to propagate")
+        } catch {
+            XCTAssertTrue(
+                adapter.events.contains("deleteTracking:Bookmark.missing")
+            )
+            XCTAssertFalse(
+                adapter.events.contains(where: { $0.hasPrefix("didUpload:") })
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testServerConflictIsImportedBeforeUploadRetry() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(
+            zoneName: "conflict-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let clientRecord = makeRecord(type: "Bookmark", id: "conflict", zoneID: zoneID)
+        let serverRecord = makeRecord(type: "Bookmark", id: "conflict", zoneID: zoneID)
+        database.partialSaveErrorsByRecordID = [
+            clientRecord.recordID: NSError(
+                domain: CKErrorDomain,
+                code: CKError.serverRecordChanged.rawValue,
+                userInfo: [CKRecordChangedErrorServerRecordKey: serverRecord]
+            )
+        ]
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: ["Bookmark"],
+            uploadedByEntity: ["Bookmark": [clientRecord]]
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(adapter)
+
+        try await synchronizer.synchronizeAdapter(adapter)
+
+        XCTAssertTrue(adapter.events.contains("save:Bookmark"))
+        XCTAssertTrue(adapter.events.contains("persist"))
     }
 
     func testCloudKitAccountAvailabilityGateDefersUnavailableAndFailedStatuses() async {
@@ -733,7 +979,7 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testEmptyRealmCollectionsAreEncodedAsExplicitEmptyCloudKitValues() async throws {
+    func testEmptyRealmCollectionsRemoveCloudKitArrayFields() async throws {
         let fixture = try await makeRealmAdapterFixture()
         try await fixture.targetRealm.asyncWrite {
             fixture.targetRealm.add(BigSyncTrackedObject(
@@ -750,8 +996,10 @@ final class BigSyncKitTests: XCTestCase {
             $0.recordID.recordName == BigSyncTrackedObject.className() + ".empty-collections"
         })
 
-        XCTAssertEqual(record["tags"] as? [String], [])
-        XCTAssertEqual(record["scores"] as? [Int], [])
+        XCTAssertNil(record["tags"])
+        XCTAssertNil(record["scores"])
+        XCTAssertFalse(record.allKeys().contains("tags"))
+        XCTAssertFalse(record.allKeys().contains("scores"))
         let encodedMap = try XCTUnwrap(record["attributes"] as? Data)
         let decodedMap = try XCTUnwrap(
             PropertyListSerialization.propertyList(
@@ -795,7 +1043,7 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testMissingRemoteCollectionFieldPreservesLocalCollection() async throws {
+    func testMissingRemoteCollectionFieldClearsLocalCollection() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
             id: "existing",
@@ -823,7 +1071,7 @@ final class BigSyncKitTests: XCTestCase {
             )
         }
 
-        XCTAssertEqual(Array(object.tags), ["keep"])
+        XCTAssertTrue(object.tags.isEmpty)
     }
 
     @BigSyncBackgroundActor
@@ -1035,15 +1283,97 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testVersionedRecoveryFindsPreJournalObjects() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let date = Date(timeIntervalSinceReferenceDate: 20_000)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(
+                BigSyncTrackedObject(
+                    id: "pre-journal",
+                    createdAt: date,
+                    modifiedAt: date,
+                    explicitlyModifiedAt: date
+                )
+            )
+        }
+        try await fixture.persistenceRealm.asyncWrite {
+            let recovery = fixture.persistenceRealm.object(
+                ofType: SyncedEntityType.self,
+                forPrimaryKey: "__BigSyncKitMutationJournalRecovery"
+            )
+            recovery?.recoveryVersion = 0
+        }
+
+        try await fixture.adapter._test_setup()
+
+        XCTAssertNotNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".pre-journal"
+            )
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntityType.self,
+                forPrimaryKey: "__BigSyncKitMutationJournalRecovery"
+            )?.recoveryVersion,
+            1
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testNormalSetupDrainsJournalWithoutRepeatingBroadTimestampRecovery() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let date = Date(timeIntervalSinceReferenceDate: 30_000)
+        let journaled = BigSyncTrackedObject(
+            id: "journaled",
+            createdAt: date,
+            modifiedAt: date,
+            explicitlyModifiedAt: nil
+        )
+        let unjournaled = BigSyncTrackedObject(
+            id: "unjournaled",
+            createdAt: date,
+            modifiedAt: date,
+            explicitlyModifiedAt: date
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(journaled)
+            journaled.refreshChangeMetadata(explicitlyModified: true)
+            fixture.targetRealm.add(unjournaled)
+        }
+
+        try await fixture.adapter._test_setup()
+
+        XCTAssertNotNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".journaled"
+            )
+        )
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".unjournaled"
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
     private func makeSynchronizer(
-        database: CloudKitDatabaseAdapter = FakeCloudKitDatabase()
+        database: CloudKitDatabaseAdapter = FakeCloudKitDatabase(),
+        keyValueStore: KeyValueStore = DictionaryKeyValueStore(),
+        accountIdentifierProvider: @escaping CloudKitSynchronizer.AccountIdentifierProvider = {
+            "test-account"
+        }
     ) -> CloudKitSynchronizer {
         CloudKitSynchronizer(
             identifier: UUID().uuidString,
             containerIdentifier: "iCloud.test",
             database: database,
             adapterProvider: NoopAdapterProvider(),
-            keyValueStore: DictionaryKeyValueStore(),
+            keyValueStore: keyValueStore,
+            accountIdentifierProvider: accountIdentifierProvider,
             logger: Logger(label: "BigSyncKitTests")
         )
     }

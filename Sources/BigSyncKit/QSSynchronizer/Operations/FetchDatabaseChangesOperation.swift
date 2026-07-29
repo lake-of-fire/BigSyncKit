@@ -17,7 +17,7 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
     var changedZoneIDs = [CKRecordZone.ID]()
     var deletedZoneIDs = [CKRecordZone.ID]()
     private let resultLock = NSLock()
-    weak var internalOperation: CKFetchDatabaseChangesOperation?
+    private var internalOperation: CKFetchDatabaseChangesOperation?
     
     init(
         database: CloudKitDatabaseAdapter,
@@ -43,13 +43,15 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
 //        databaseChangesOperation.changeTokenUpdatedBlock = { token in
 //        }
         
-        databaseChangesOperation.recordZoneWithIDChangedBlock = { @Sendable zoneID in
+        databaseChangesOperation.recordZoneWithIDChangedBlock = { @Sendable [weak self] zoneID in
+            guard let self else { return }
             self.resultLock.withLock {
                 self.changedZoneIDs.append(zoneID)
             }
         }
         
-        databaseChangesOperation.recordZoneWithIDWasDeletedBlock = { @Sendable zoneID in
+        databaseChangesOperation.recordZoneWithIDWasDeletedBlock = { @Sendable [weak self] zoneID in
+            guard let self else { return }
             self.resultLock.withLock {
                 self.deletedZoneIDs.append(zoneID)
             }
@@ -62,9 +64,14 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
                 if !moreComing {
                     if operationError == nil {
                         let zoneIDs = self.resultLock.withLock {
-                            (self.changedZoneIDs, self.deletedZoneIDs)
+                            self.internalOperation = nil
+                            return (self.changedZoneIDs, self.deletedZoneIDs)
                         }
                         self.completion(serverChangeToken, zoneIDs.0, zoneIDs.1)
+                    } else {
+                        self.resultLock.withLock {
+                            self.internalOperation = nil
+                        }
                     }
                     
                     self.finish(error: operationError)
@@ -72,12 +79,19 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
             }
         }
         
-        internalOperation = databaseChangesOperation
+        let shouldCancel = resultLock.withLock {
+            internalOperation = databaseChangesOperation
+            return isCancelled || isFinished
+        }
+        if shouldCancel {
+            databaseChangesOperation.cancel()
+        }
         database.add(databaseChangesOperation)
     }
     
     override func cancel() {
-        internalOperation?.cancel()
+        let operation = resultLock.withLock { internalOperation }
+        operation?.cancel()
         super.cancel()
     }
 }

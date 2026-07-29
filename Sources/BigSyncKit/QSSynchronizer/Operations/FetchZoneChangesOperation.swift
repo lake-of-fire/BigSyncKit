@@ -30,7 +30,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     private var higherModelVersionFound = false
     
 //    let dispatchQueue = DispatchQueue(label: "fetchZoneChangesDispatchQueue")
-    weak var internalOperation: CKFetchRecordZoneChangesOperation?
+    private var internalOperation: CKFetchRecordZoneChangesOperation?
     
     init(
         database: CloudKitDatabaseAdapter,
@@ -69,6 +69,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     
     @BigSyncBackgroundActor
     func performFetchOperation(with zones: [CKRecordZone.ID]) {
+        guard !isCancelled, !isFinished else { return }
         var zoneOptions = [CKRecordZone.ID: CKFetchRecordZoneChangesOperation.ZoneOptions]()
         
         for zoneID in zones {
@@ -123,6 +124,9 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         operation.fetchRecordZoneChangesCompletionBlock = { @Sendable operationError in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
+                self.resultLock.withLock {
+                    self.internalOperation = nil
+                }
                 if let error = operationError,
                    (error as NSError).code != CKError.partialFailure.rawValue { // Partial errors are returned per zone
                     self.finish(error: error)
@@ -142,12 +146,19 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
             }
         }
         
-        internalOperation = operation
+        let shouldCancel = resultLock.withLock {
+            internalOperation = operation
+            return isCancelled || isFinished
+        }
+        if shouldCancel {
+            operation.cancel()
+        }
         self.database.add(operation)
     }
     
     override func cancel() {
-        internalOperation?.cancel()
+        let operation = resultLock.withLock { internalOperation }
+        operation?.cancel()
         super.cancel()
     }
 }
