@@ -138,3 +138,22 @@ internal protocol PrioritySyncCapableModelAdapter: ModelAdapter {
     @BigSyncBackgroundActor
     func recordIDsMarkedForDeletion(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord.ID]
 }
+
+internal struct PreparedRecordUpload {
+    let record: CKRecord
+    let generation: String?
+}
+
+internal protocol UploadGenerationTrackingModelAdapter: ModelAdapter {
+    @BigSyncBackgroundActor
+    func preparedRecordsToUpload(
+        limit: Int,
+        restrictedToEntityType: String?
+    ) async throws -> [PreparedRecordUpload]
+
+    @BigSyncBackgroundActor
+    func didUpload(
+        savedRecords: [CKRecord],
+        matchingGenerations: [String: String]
+    ) async throws
+}

@@ -614,6 +614,115 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testUploadAcknowledgesOnlyTheGenerationThatWasPrepared() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "generation",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
+        let initialRecords = try await fixture.adapter.recordsToUpload(limit: 10)
+        let initialRecord = try XCTUnwrap(initialRecords.first)
+        try await fixture.adapter.didUpload(savedRecords: [initialRecord])
+
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("first-edit")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let firstMutation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".generation"
+            )
+        )
+        let firstGeneration = firstMutation.generation
+        let forwardedCount = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        XCTAssertEqual(forwardedCount, 1)
+
+        let inFlightTracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: initialRecord.recordID.recordName
+            )
+        )
+        XCTAssertEqual(inFlightTracking.pendingGeneration, firstGeneration)
+
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("second-edit")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let secondGeneration = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: initialRecord.recordID.recordName
+            )?.generation
+        )
+        XCTAssertNotEqual(secondGeneration, firstGeneration)
+
+        try await fixture.adapter.didUpload(
+            savedRecords: [initialRecord],
+            matchingGenerations: [initialRecord.recordID.recordName: firstGeneration]
+        )
+
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: initialRecord.recordID.recordName
+            )
+        )
+        XCTAssertEqual(tracking.entityState, .changed)
+        XCTAssertEqual(tracking.pendingGeneration, secondGeneration)
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: initialRecord.recordID.recordName
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testUnmanagedRefreshIsJournaledAfterObjectIsAdded() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "unmanaged",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        object.refreshChangeMetadata(explicitlyModified: true)
+
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+
+        let forwardedCount = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        XCTAssertEqual(forwardedCount, 1)
+        let recordName = BigSyncTrackedObject.className() + ".unmanaged"
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.entityState,
+            .new
+        )
+    }
+
+    @BigSyncBackgroundActor
     private func makeSynchronizer() -> CloudKitSynchronizer {
         CloudKitSynchronizer(
             identifier: UUID().uuidString,
@@ -641,7 +750,10 @@ final class BigSyncKitTests: XCTestCase {
 
         var targetConfiguration = Realm.Configuration()
         targetConfiguration.inMemoryIdentifier = "target-\(identifier)"
-        targetConfiguration.objectTypes = [BigSyncTrackedObject.self]
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
 
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistenceConfiguration,
@@ -654,8 +766,14 @@ final class BigSyncKitTests: XCTestCase {
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
 
-        let persistenceRealm = try await Realm.open(configuration: persistenceConfiguration)
-        let targetRealm = try await Realm.open(configuration: targetConfiguration)
+        guard let persistenceRealm = adapter.realmProvider?.persistenceRealm,
+              let targetRealm = adapter.realmProvider?.targetReaderRealms?.first else {
+            throw NSError(
+                domain: "BigSyncKitTests",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Adapter Realm provider was not initialized"]
+            )
+        }
         return (adapter, persistenceRealm, targetRealm)
     }
 }

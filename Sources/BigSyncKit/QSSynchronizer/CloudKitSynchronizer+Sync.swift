@@ -630,14 +630,31 @@ extension CloudKitSynchronizer {
         guard !cancelSync else { throw CancellationError() }
         
         let requestedBatchSize = batchSize
+        let preparedUploads: [PreparedRecordUpload]
         let records: [CKRecord]
-        if let restrictedAdapter = adapter as? PrioritySyncCapableModelAdapter {
+        if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
+            preparedUploads = try await generationTrackingAdapter.preparedRecordsToUpload(
+                limit: requestedBatchSize,
+                restrictedToEntityType: restrictedToEntityType
+            )
+            records = preparedUploads.map(\.record)
+        } else if let restrictedAdapter = adapter as? PrioritySyncCapableModelAdapter {
             records = try await restrictedAdapter.recordsToUpload(
                 limit: requestedBatchSize,
                 restrictedToEntityType: restrictedToEntityType
             )
+            preparedUploads = records.map {
+                PreparedRecordUpload(record: $0, generation: nil)
+            }
         } else {
             records = try await adapter.recordsToUpload(limit: requestedBatchSize)
+            preparedUploads = records.map {
+                PreparedRecordUpload(record: $0, generation: nil)
+            }
+        }
+        let uploadGenerations = preparedUploads.reduce(into: [String: String]()) {
+            guard let generation = $1.generation else { return }
+            $0[$1.record.recordID.recordName] = generation
         }
         let recordCount = records.count
         guard recordCount > 0 else { try await completion(nil); return }
@@ -675,7 +692,14 @@ extension CloudKitSynchronizer {
 //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \(savedRecords.map { ($0.recordID.recordName, $0.debugDescription) })")
                     //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
                     
-                    try await adapter.didUpload(savedRecords: savedRecords)
+                    if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
+                        try await generationTrackingAdapter.didUpload(
+                            savedRecords: savedRecords,
+                            matchingGenerations: uploadGenerations
+                        )
+                    } else {
+                        try await adapter.didUpload(savedRecords: savedRecords)
+                    }
                 }
                 
                 try Task.checkCancellation()

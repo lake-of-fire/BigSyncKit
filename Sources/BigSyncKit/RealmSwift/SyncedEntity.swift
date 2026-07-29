@@ -16,6 +16,7 @@ class SyncedEntity: Object {
     @objc dynamic var updated: Date? // TODO: Remove, unused (or start using for sorting recordsToUpload)
     @objc dynamic var share: SyncedEntity?
     @objc dynamic var encodedRecord: Data?
+    @objc dynamic var pendingGeneration: String?
 
     convenience init(entityType: String, identifier: String, state: Int) {
         self.init()
@@ -27,6 +28,10 @@ class SyncedEntity: Object {
     
     override static func primaryKey() -> String? {
         return "identifier"
+    }
+
+    override static func indexedProperties() -> [String] {
+        ["state", "entityType"]
     }
     
     var entityState: SyncedEntityState {

@@ -16,10 +16,60 @@ import RealmSwift
 
 public extension ChangeMetadataRecordable {
     func refreshChangeMetadata(explicitlyModified: Bool) {
-        modifiedAt = Date()
+        let timestamp = Date()
+        modifiedAt = timestamp
         if explicitlyModified {
-            explicitlyModifiedAt = Date()
+            explicitlyModifiedAt = timestamp
+            recordBigSyncMutation(at: timestamp)
         }
+    }
+
+    private func recordBigSyncMutation(at timestamp: Date) {
+        guard let object = self as? Object,
+              let primaryKey = object.objectSchema.primaryKeyProperty?.name else {
+            return
+        }
+
+        let objectIdentifier = RealmSwiftAdapter.getTargetObjectStringIdentifier(
+            for: object,
+            usingPrimaryKey: primaryKey
+        )
+        let entityType = object.objectSchema.className
+        let recordName = entityType + "." + objectIdentifier
+        let generation = UUID().uuidString
+
+        guard let realm = object.realm else {
+            guard BigSyncMutationTrackingRegistry.tracks(className: entityType) else { return }
+            BigSyncMutationTrackingRegistry.enqueueUnbound(
+                BigSyncPendingMutationSnapshot(
+                    recordName: recordName,
+                    entityType: entityType,
+                    objectIdentifier: objectIdentifier,
+                    generation: generation,
+                    changedAt: timestamp
+                )
+            )
+            return
+        }
+        guard realm.isInWriteTransaction,
+              BigSyncMutationTrackingRegistry.tracks(className: entityType, in: realm),
+              realm.schema.objectSchema.contains(where: {
+                  $0.className == BigSyncPendingMutation.className()
+              }) else {
+            return
+        }
+
+        let mutation = realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ) ?? BigSyncPendingMutation(
+            recordName: recordName,
+            entityType: entityType,
+            objectIdentifier: objectIdentifier
+        )
+        mutation.generation = generation
+        mutation.changedAt = timestamp
+        realm.add(mutation, update: .modified)
     }
 }
 
