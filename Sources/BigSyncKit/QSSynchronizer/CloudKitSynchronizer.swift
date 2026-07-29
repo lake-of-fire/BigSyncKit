@@ -412,6 +412,7 @@ public class CloudKitSynchronizer: NSObject {
     
     internal func clearDeviceIdentifier() {
         deviceUUID = nil
+        _deviceIdentifier = nil
     }
     
     @BigSyncBackgroundActor

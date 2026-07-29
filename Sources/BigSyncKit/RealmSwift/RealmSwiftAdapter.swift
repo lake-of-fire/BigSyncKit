@@ -278,6 +278,35 @@ private func maxDate(_ lhs: Date?, _ rhs: Date?) -> Date? {
     }
 }
 
+private func decodedCloudKitMap(_ value: Any?) -> [String: Any]? {
+    if let data = value as? Data,
+       let propertyList = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+       ) as? [String: Any] {
+        return propertyList
+    }
+
+    // Read compatibility for records produced by early BigSyncKit builds.
+    if let arrays = value as? [NSArray],
+       arrays.count == 2,
+       let keys = arrays[0] as? [String],
+       let values = arrays[1] as? [Any],
+       keys.count == values.count {
+        return Dictionary(uniqueKeysWithValues: zip(keys, values))
+    }
+    return nil
+}
+
+private func encodedCloudKitMap(_ value: [String: Any]) throws -> Data {
+    try PropertyListSerialization.data(
+        fromPropertyList: value,
+        format: .binary,
+        options: 0
+    )
+}
+
 extension RealmSwiftAdapter: @unchecked Sendable { }
 
 public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapableModelAdapter {
@@ -924,7 +953,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @BigSyncBackgroundActor
     func updateHasChanges(realm: Realm) {
-        let results = realm.objects(SyncedEntity.self).where { $0.state != SyncedEntityState.synced.rawValue }
+        let pendingStates = [
+            SyncedEntityState.new.rawValue,
+            SyncedEntityState.changed.rawValue,
+            SyncedEntityState.deletedLocally.rawValue,
+        ]
+        let results = realm.objects(SyncedEntity.self).where { $0.state.in(pendingStates) }
         let count = results.count
         if hasChangesCount != count {
             let syncedCount = realm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.synced.rawValue } .count
@@ -1309,34 +1343,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         break
                     }
                 } else if property.isMap {
-                    guard let newValue = newValue as? [NSArray], newValue.count == 2,
-                          let keyArray = newValue[0] as? [String], let valueArray = newValue[1] as? [Any],
-                          keyArray.count == valueArray.count else {
+                    guard let result = decodedCloudKitMap(newValue) else {
                         logger.warning("QSCloudKitSynchronizer >> Found unexpected property value: \(newValue)")
                         return true
-                    }
-                    var result: [String: Any] = [:]
-                    for (index, key) in keyArray.enumerated() {
-                        switch property.type {
-                        case .int:
-                            if let val = valueArray[index] as? Int { result[key] = val }
-                        case .string:
-                            if let val = valueArray[index] as? String { result[key] = val }
-                        case .bool:
-                            if let val = valueArray[index] as? Bool { result[key] = val }
-                        case .float:
-                            if let val = valueArray[index] as? Float { result[key] = val }
-                        case .double:
-                            if let val = valueArray[index] as? Double { result[key] = val }
-                        case .date:
-                            if let val = valueArray[index] as? Date { result[key] = val }
-                        case .UUID:
-                            if let val = valueArray[index] as? String, let uuid = UUID(uuidString: val) {
-                                result[key] = uuid
-                            }
-                        default:
-                            break
-                        }
                     }
                     switch property.type {
                     case .int:
@@ -1527,6 +1536,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
         
         let value = record[key]
+        if (property.isSet || property.isArray || property.isMap),
+           !record.allKeys().contains(key) {
+            // A collection added in a newer schema is absent from older records.
+            // Preserve the local/default value instead of assigning nil to Realm.
+            return
+        }
         
         // List/Set support forked from IceCream: https://github.com/caiyue1993/IceCream/blob/master/IceCream/Classes/CKRecordRecoverable.swift
         var recordValue: Any?
@@ -1596,6 +1611,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     })
                     object.setValue(set, forKey: key)
                 }
+                return
             case .object:
                 // Save relationship to be applied after all records have been downloaded and persisted
                 // to ensure target of the relationship has already been created
@@ -1617,11 +1633,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
                 }
+                return
             default:
                 break
             }
             try Task.checkCancellation()
-            object.setValue(recordValue, forKey: property.name)
+            if let recordValue {
+                object.setValue(recordValue, forKey: property.name)
+            }
         } else if property.isArray {
             switch property.type {
             case .int:
@@ -1712,41 +1731,21 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
                 }
+                return
             default:
                 break
             }
             try Task.checkCancellation()
-            object.setValue(recordValue, forKey: property.name)
-        } else if property.isMap {
-            guard let value = value as? [NSArray], value.count == 2,
-                  let keyArray = value[0] as? [String], let valueArray = value[1] as? [Any],
-                  keyArray.count == valueArray.count else {
-                return
+            if let recordValue {
+                object.setValue(recordValue, forKey: property.name)
             }
-            var result: [String: Any] = [:]
-            for (index, key) in keyArray.enumerated() {
-                try Task.checkCancellation()
-                switch property.type {
-                case .int:
-                    if let val = valueArray[index] as? Int { result[key] = val }
-                case .string:
-                    if let val = valueArray[index] as? String { result[key] = val }
-                case .bool:
-                    if let val = valueArray[index] as? Bool { result[key] = val }
-                case .float:
-                    if let val = valueArray[index] as? Float { result[key] = val }
-                case .double:
-                    if let val = valueArray[index] as? Double { result[key] = val }
-                case .date:
-                    if let val = valueArray[index] as? Date { result[key] = val }
-                case .data:
-                    if let val = valueArray[index] as? Data { result[key] = val }
-                case .UUID:
-                    if let val = valueArray[index] as? String, let uuid = UUID(uuidString: val) {
-                        result[key] = uuid
+        } else if property.isMap {
+            guard var result = decodedCloudKitMap(value) else { return }
+            if property.type == .UUID {
+                result = result.reduce(into: [:]) { converted, entry in
+                    if let string = entry.value as? String, let uuid = UUID(uuidString: string) {
+                        converted[entry.key] = uuid
                     }
-                default:
-                    break
                 }
             }
             try Task.checkCancellation()
@@ -1981,10 +1980,15 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             SyncedEntityState.changed.rawValue,
             SyncedEntityState.deletedLocally.rawValue,
         ]
-        let pendingEntityTypes = persistenceRealm.objects(SyncedEntity.self)
-            .where { $0.state.in(pendingStates) }
-            .map(\.entityType)
-        return prioritizedEntityType(from: pendingEntityTypes)
+        let pendingEntities = persistenceRealm.objects(SyncedEntity.self)
+        for entityType in priorityEntityTypeNames {
+            if pendingEntities.where({
+                $0.state.in(pendingStates) && $0.entityType == entityType
+            }).first != nil {
+                return entityType
+            }
+        }
+        return nil
     }
     
     @BigSyncBackgroundActor
@@ -1994,17 +1998,22 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         restrictedToEntityType restrictedEntityType: String? = nil
     ) async throws -> [CKRecord] {
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return [] }
-        let results = persistenceRealm.objects(SyncedEntity.self).where { $0.state == state.rawValue }
-        let uploadCandidates = Array(results.map { syncedEntity in
-            (identifier: syncedEntity.identifier, entityType: syncedEntity.entityType)
-        })
+        let allResults = persistenceRealm.objects(SyncedEntity.self)
+        let results: Results<SyncedEntity>
+        if let restrictedEntityType {
+            results = allResults.where {
+                $0.state == state.rawValue && $0.entityType == restrictedEntityType
+            }
+        } else {
+            results = allResults.where { $0.state == state.rawValue }
+        }
         var resultArray = [CKRecord]()
         var includedEntityIDs = Set<String>()
 
         func appendUploadRecords(
-            from candidates: [(identifier: String, entityType: String)]
+            matching include: (SyncedEntity) -> Bool
         ) async throws {
-            for candidate in candidates {
+            for candidate in results where include(candidate) {
                 if resultArray.count >= limit {
                     return
                 }
@@ -2050,15 +2059,15 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         // Ensure dummy records are uploaded first.
         let dummyRecordIdentifiers = await dummyRecordIdentifiers
         if dummyRecordIdentifiers.isEmpty {
-            try await appendUploadRecords(from: uploadCandidates)
+            try await appendUploadRecords { _ in true }
         } else {
-            try await appendUploadRecords(from: uploadCandidates.filter { dummyRecordIdentifiers.contains($0.identifier) })
+            try await appendUploadRecords { dummyRecordIdentifiers.contains($0.identifier) }
             if resultArray.count < limit {
-                try await appendUploadRecords(from: uploadCandidates.filter { !dummyRecordIdentifiers.contains($0.identifier) })
+                try await appendUploadRecords { !dummyRecordIdentifiers.contains($0.identifier) }
             }
         }
 #else
-        try await appendUploadRecords(from: uploadCandidates)
+        try await appendUploadRecords { _ in true }
 #endif
         
         return resultArray
@@ -2129,6 +2138,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
                         let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                         record[property.name] = recordID.recordName as CKRecordValue
+                    } else {
+                        record[property.name] = nil
                     }
                 } else if property.isSet {
                     let value = object[property.name]
@@ -2138,12 +2149,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         /// The item cannot be casted as MutableSet<Object>
                         /// It can be casted at a low-level type `SetBase`
                         /// Updated -- see: https://github.com/caiyue1993/IceCream/pull/256#issuecomment-1034336992
-                        guard let set = value as? RLMSwiftCollectionBase, set._rlmCollection.count > 0 else { break }
+                        guard let set = value as? RLMSwiftCollectionBase else { break }
                         var referenceArray = [String]()
                         let wrappedSet = set._rlmCollection
                         for index in 0..<wrappedSet.count {
-                            guard let object = wrappedSet[index] as? Object, let targetPrimaryKey = (type(of: object).primaryKey() ?? object.objectSchema.primaryKeyProperty?.name) else { continue }
-#warning("Confirm here that isDeleted is false before referencing, as icecream does (link above)")
+                            guard let object = wrappedSet[index] as? Object,
+                                  let targetPrimaryKey = (type(of: object).primaryKey() ?? object.objectSchema.primaryKeyProperty?.name) else { continue }
+                            if (object as? SoftDeletable)?.isDeleted == true { continue }
                             let targetIdentifier = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: targetPrimaryKey)
                             let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
                             let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
@@ -2151,35 +2163,35 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         }
                         record[property.name] = referenceArray as CKRecordValue
                     case .int:
-                        guard let set = value as? MutableSet<Int>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Int> else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .string:
-                        guard let set = value as? MutableSet<String>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<String> else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .bool:
-                        guard let set = value as? MutableSet<Bool>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Bool> else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .float:
-                        guard let set = value as? MutableSet<Float>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Float> else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .double:
-                        guard let set = value as? MutableSet<Double>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Double> else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .data:
-                        guard let set = value as? MutableSet<Data>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Data> else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .date:
-                        guard let set = value as? MutableSet<Date>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<Date> else { break }
                         let array = Array(set)
                         record[property.name] = array as CKRecordValue
                     case .UUID:
-                        guard let set = value as? MutableSet<UUID>, !set.isEmpty else { break }
+                        guard let set = value as? MutableSet<UUID> else { break }
                         let array = Array(set.map { $0.uuidString })
                         record[property.name] = array as CKRecordValue
                     default:
@@ -2188,34 +2200,51 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         break
                     }
                 } else if property.isMap {
-                    // CloudKit does not support native dictionary/map values
-                    // Convert to a 2-tuple: (keys: [String], values: [CKRecordValue])
-                    guard let dict = object[property.name] as? [String: Any] else { break }
-                    let keys = NSMutableArray()
-                    let values = NSMutableArray()
-                    for (key, value) in dict {
-                        keys.add(key)
-                        switch property.type {
-                        case .int:
-                            if let val = value as? Int { values.add(val as CKRecordValue) }
-                        case .string:
-                            if let val = value as? String { values.add(val as CKRecordValue) }
-                        case .bool:
-                            if let val = value as? Bool { values.add(val as CKRecordValue) }
-                        case .float:
-                            if let val = value as? Float { values.add(val as CKRecordValue) }
-                        case .double:
-                            if let val = value as? Double { values.add(val as CKRecordValue) }
-                        case .date:
-                            if let val = value as? Date { values.add(val as CKRecordValue) }
-                        case .UUID:
-                            if let val = value as? UUID { values.add(val.uuidString as CKRecordValue) }
-                        default:
-                            logger.warning("Warning: Unsupported recordToUpload map property type \(property.type) for \(String(describing: type(of: object)))")
-                            break
+                    // CloudKit rejects nested arrays and has no native dictionary
+                    // value. A binary property list preserves supported Realm
+                    // scalar map values in one CloudKit Data field.
+                    let mapValue: [String: Any]?
+                    switch property.type {
+                    case .int:
+                        mapValue = (object[property.name] as? Map<String, Int>).map { realmMap in
+                            realmMap.reduce(into: [:]) { $0[$1.key] = $1.value }
                         }
+                    case .string:
+                        mapValue = (object[property.name] as? Map<String, String>).map { realmMap in
+                            realmMap.reduce(into: [:]) { $0[$1.key] = $1.value }
+                        }
+                    case .bool:
+                        mapValue = (object[property.name] as? Map<String, Bool>).map { realmMap in
+                            realmMap.reduce(into: [:]) { $0[$1.key] = $1.value }
+                        }
+                    case .float:
+                        mapValue = (object[property.name] as? Map<String, Float>).map { realmMap in
+                            realmMap.reduce(into: [:]) { $0[$1.key] = $1.value }
+                        }
+                    case .double:
+                        mapValue = (object[property.name] as? Map<String, Double>).map { realmMap in
+                            realmMap.reduce(into: [:]) { $0[$1.key] = $1.value }
+                        }
+                    case .date:
+                        mapValue = (object[property.name] as? Map<String, Date>).map { realmMap in
+                            realmMap.reduce(into: [:]) { $0[$1.key] = $1.value }
+                        }
+                    case .data:
+                        mapValue = (object[property.name] as? Map<String, Data>).map { realmMap in
+                            realmMap.reduce(into: [:]) { $0[$1.key] = $1.value }
+                        }
+                    case .UUID:
+                        mapValue = (object[property.name] as? Map<String, UUID>).map { realmMap in
+                            realmMap.reduce(into: [:]) { $0[$1.key] = $1.value.uuidString }
+                        }
+                    default:
+                        mapValue = nil
                     }
-                    record[property.name] = [keys, values] as CKRecordValue
+                    if let mapValue {
+                        record[property.name] = try encodedCloudKitMap(mapValue) as CKRecordValue
+                    } else {
+                        logger.warning("Warning: Unsupported recordToUpload map property type \(property.type) for \(String(describing: type(of: object)))")
+                    }
                 } else if property.isArray {
                     // Array handling forked from IceCream: https://github.com/caiyue1993/IceCream/blob/b29dfe81e41cc929c8191c3266189a7070cb5bc5/IceCream/Classes/CKRecordConvertible.swift
                     let value = object[property.name]
@@ -2225,12 +2254,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         /// The item cannot be casted as List<Object>
                         /// It can be casted at a low-level type `ListBase`
                         /// Updated -- see: https://github.com/caiyue1993/IceCream/pull/256#issuecomment-1034336992
-                        guard let list = value as? RLMSwiftCollectionBase, list._rlmCollection.count > 0 else { break }
+                        guard let list = value as? RLMSwiftCollectionBase else { break }
                         var referenceArray = [String]()
                         let wrappedArray = list._rlmCollection
                         for index in 0..<wrappedArray.count {
-                            guard let object = wrappedArray[index] as? Object, let targetPrimaryKey = (type(of: object).primaryKey() ?? object.objectSchema.primaryKeyProperty?.name) else { continue }
-#warning("Confirm here that isDeleted is false before referencing, as icecream does (link above)")
+                            guard let object = wrappedArray[index] as? Object,
+                                  let targetPrimaryKey = (type(of: object).primaryKey() ?? object.objectSchema.primaryKeyProperty?.name) else { continue }
+                            if (object as? SoftDeletable)?.isDeleted == true { continue }
                             let targetIdentifier = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: targetPrimaryKey)
                             let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
                             let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
@@ -2238,35 +2268,35 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         }
                         record[property.name] = referenceArray as CKRecordValue
                     case .int:
-                        guard let list = value as? List<Int>, !list.isEmpty else { break }
+                        guard let list = value as? List<Int> else { break }
                         let array = Array(list)
                         record[property.name] = array as CKRecordValue
                     case .string:
-                        guard let list = value as? List<String>, !list.isEmpty else { break }
+                        guard let list = value as? List<String> else { break }
                         let array = Array(list)
                         record[property.name] = array as CKRecordValue
                     case .bool:
-                        guard let list = value as? List<Bool>, !list.isEmpty else { break }
+                        guard let list = value as? List<Bool> else { break }
                         let array = Array(list)
                         record[property.name] = array as CKRecordValue
                     case .float:
-                        guard let list = value as? List<Float>, !list.isEmpty else { break }
+                        guard let list = value as? List<Float> else { break }
                         let array = Array(list)
                         record[property.name] = array as CKRecordValue
                     case .double:
-                        guard let list = value as? List<Double>, !list.isEmpty else { break }
+                        guard let list = value as? List<Double> else { break }
                         let array = Array(list)
                         record[property.name] = array as CKRecordValue
                     case .data:
-                        guard let list = value as? List<Data>, !list.isEmpty else { break }
+                        guard let list = value as? List<Data> else { break }
                         let array = Array(list)
                         record[property.name] = array as CKRecordValue
                     case .date:
-                        guard let list = value as? List<Date>, !list.isEmpty else { break }
+                        guard let list = value as? List<Date> else { break }
                         let array = Array(list)
                         record[property.name] = array as CKRecordValue
                     case .UUID:
-                        guard let list = value as? List<UUID>, !list.isEmpty else { break }
+                        guard let list = value as? List<UUID> else { break }
                         let array = Array(list.map { $0.uuidString })
                         record[property.name] = array as CKRecordValue
                     default:
@@ -2315,19 +2345,19 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         // Store dummy map as 2-tuple: ([keys], [values])
                         switch property.type {
                         case .int:
-                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: 0)] as CKRecordValue
+                            record[property.name] = try encodedCloudKitMap(["dummyKey": 0]) as CKRecordValue
                         case .string:
-                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: "dummy")] as CKRecordValue
+                            record[property.name] = try encodedCloudKitMap(["dummyKey": "dummy"]) as CKRecordValue
                         case .bool:
-                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: false)] as CKRecordValue
+                            record[property.name] = try encodedCloudKitMap(["dummyKey": false]) as CKRecordValue
                         case .float:
-                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: Float(0.0))] as CKRecordValue
+                            record[property.name] = try encodedCloudKitMap(["dummyKey": Float(0.0)]) as CKRecordValue
                         case .double:
-                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: Double(0.0))] as CKRecordValue
+                            record[property.name] = try encodedCloudKitMap(["dummyKey": Double(0.0)]) as CKRecordValue
                         case .date:
-                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: Date())] as CKRecordValue
+                            record[property.name] = try encodedCloudKitMap(["dummyKey": Date()]) as CKRecordValue
                         case .UUID:
-                            record[property.name] = [NSArray(object: "dummyKey"), NSArray(object: UUID().uuidString)] as CKRecordValue
+                            record[property.name] = try encodedCloudKitMap(["dummyKey": UUID().uuidString]) as CKRecordValue
                         default:
                             fatalError("Unaccounted for property \(property)")
                         }
@@ -2755,15 +2785,23 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     func recordIDsMarkedForDeletion(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord.ID] {
         var recordIDs = [CKRecord.ID]()
         
-        guard let deletedEntities = realmProvider?.persistenceRealm?.objects(SyncedEntity.self).where({ $0.state == SyncedEntityState.deletedLocally.rawValue }) else { return [] }
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return [] }
         let targetEntityType = restrictedToEntityType ?? prioritizedEntityTypeWithPendingUploadOrDeletion()
-        
-        for syncedEntity in Array(deletedEntities) {
-            guard !cancelSync else { throw CancellationError() }
-            if let targetEntityType, syncedEntity.entityType != targetEntityType {
-                continue
+        let allEntities = persistenceRealm.objects(SyncedEntity.self)
+        let deletedEntities: Results<SyncedEntity>
+        if let targetEntityType {
+            deletedEntities = allEntities.where {
+                $0.state == SyncedEntityState.deletedLocally.rawValue &&
+                $0.entityType == targetEntityType
             }
-            
+        } else {
+            deletedEntities = allEntities.where {
+                $0.state == SyncedEntityState.deletedLocally.rawValue
+            }
+        }
+        
+        for syncedEntity in deletedEntities {
+            guard !cancelSync else { throw CancellationError() }
             if recordIDs.count >= limit {
                 break
             }
@@ -2780,15 +2818,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @BigSyncBackgroundActor
     public func didDelete(recordIDs deletedRecordIDs: [CKRecord.ID]) async {
-        guard let realmProvider = realmProvider else { return }
-        
-        for recordID in deletedRecordIDs {
-            guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-            if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName) {
-                //                await persistenceRealm.asyncRefresh()
-                try? await persistenceRealm.asyncWrite {
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
+
+        for chunk in deletedRecordIDs.chunks(ofCount: 1000) {
+            try? await persistenceRealm.asyncWrite {
+                for recordID in chunk {
+                    guard let syncedEntity = persistenceRealm.object(
+                        ofType: SyncedEntity.self,
+                        forPrimaryKey: recordID.recordName
+                    ) else { continue }
                     syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
-                    //                    persistenceRealm.delete(syncedEntity)
                 }
             }
         }
@@ -2839,18 +2878,18 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @BigSyncBackgroundActor
     public func deleteChangeTracking(forRecordIDs recordIDs: [CKRecord.ID]) async throws {
-        //        debugPrint("# deleteChangeTracking", recordIDs.map { $0.recordName })
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         
         for chunk in recordIDs.chunks(ofCount: 1000) {
             try await persistenceRealm.asyncWrite {
                 for recordID in chunk {
                     let identifier = recordID.recordName
-                    guard let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm) else { continue }
-                    
-                    if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: identifier) {
-                        persistenceRealm.delete(syncedEntity)
-                    }
+                    guard let syncedEntity = Self.getSyncedEntity(
+                        objectIdentifier: identifier,
+                        realm: persistenceRealm
+                    ) else { continue }
+                    syncedEntity.entityState = .new
+                    syncedEntity.encodedRecord = nil
                 }
             }
         }

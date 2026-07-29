@@ -183,6 +183,9 @@ private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
     @Persisted var modifiedAt: Date
     @Persisted var explicitlyModifiedAt: Date?
     @Persisted var isDeleted = false
+    @Persisted var tags: List<String>
+    @Persisted var scores: MutableSet<Int>
+    @Persisted var attributes: Map<String, String>
 
     convenience init(id: String, createdAt: Date, modifiedAt: Date, explicitlyModifiedAt: Date?) {
         self.init()
@@ -481,6 +484,133 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: BigSyncTrackedObject.className() + ".remote"
             )
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testEmptyRealmCollectionsAreEncodedAsExplicitEmptyCloudKitValues() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(BigSyncTrackedObject(
+                id: "empty-collections",
+                createdAt: Date(),
+                modifiedAt: Date(),
+                explicitlyModifiedAt: Date()
+            ))
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
+
+        let records = try await fixture.adapter.recordsToUpload(limit: 10)
+        let record = try XCTUnwrap(records.first {
+            $0.recordID.recordName == BigSyncTrackedObject.className() + ".empty-collections"
+        })
+
+        XCTAssertEqual(record["tags"] as? [String], [])
+        XCTAssertEqual(record["scores"] as? [Int], [])
+        let encodedMap = try XCTUnwrap(record["attributes"] as? Data)
+        let decodedMap = try XCTUnwrap(
+            PropertyListSerialization.propertyList(
+                from: encodedMap,
+                options: [],
+                format: nil
+            ) as? [String: String]
+        )
+        XCTAssertEqual(decodedMap, [:])
+    }
+
+    @BigSyncBackgroundActor
+    func testRealmMapEncodingUsesCloudKitCompatibleBinaryPropertyList() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "map",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        object.attributes["z"] = "last"
+        object.attributes["a"] = "first"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
+
+        let records = try await fixture.adapter.recordsToUpload(limit: 10)
+        let record = try XCTUnwrap(records.first {
+            $0.recordID.recordName == BigSyncTrackedObject.className() + ".map"
+        })
+        let encodedMap = try XCTUnwrap(record["attributes"] as? Data)
+        let decodedMap = try XCTUnwrap(
+            PropertyListSerialization.propertyList(
+                from: encodedMap,
+                options: [],
+                format: nil
+            ) as? [String: String]
+        )
+        XCTAssertEqual(decodedMap, ["a": "first", "z": "last"])
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingRemoteCollectionFieldPreservesLocalCollection() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "existing",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        object.tags.append("keep")
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        let property = try XCTUnwrap(object.objectSchema.properties.first { $0.name == "tags" })
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "existing",
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        try await fixture.targetRealm.asyncWrite {
+            try fixture.adapter.applyChange(
+                property: property,
+                record: record,
+                object: object,
+                syncedEntityIdentifier: record.recordID.recordName
+            )
+        }
+
+        XCTAssertEqual(Array(object.tags), ["keep"])
+    }
+
+    @BigSyncBackgroundActor
+    func testUnknownCloudKitItemIsRequeuedAsNewInsteadOfLosingTracking() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "missing-on-server",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
+        let recordName = BigSyncTrackedObject.className() + ".missing-on-server"
+        let tracked = try XCTUnwrap(
+            fixture.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordName)
+        )
+        try await fixture.persistenceRealm.asyncWrite {
+            tracked.entityState = .changed
+            tracked.encodedRecord = Data([1, 2, 3])
+        }
+
+        try await fixture.adapter.deleteChangeTracking(
+            forRecordIDs: [CKRecord.ID(recordName: recordName, zoneID: fixture.adapter.recordZoneID)]
+        )
+
+        let requeued = try XCTUnwrap(
+            fixture.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordName)
+        )
+        XCTAssertEqual(requeued.entityState, .new)
+        XCTAssertNil(requeued.encodedRecord)
     }
 
     @BigSyncBackgroundActor
