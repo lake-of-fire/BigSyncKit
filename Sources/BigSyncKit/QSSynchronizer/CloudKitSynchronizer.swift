@@ -82,6 +82,22 @@ internal struct ChangeRequest: Sendable {
     let adapter: ModelAdapter
 }
 
+public enum OneOffRecordZoneResetResult: Sendable, Equatable {
+    case performedCloudReset
+    case cloudResetAlreadyCompleted
+}
+
+public enum OneOffRecordZoneResetError: LocalizedError {
+    case migrationInProgress
+
+    public var errorDescription: String? {
+        switch self {
+        case .migrationInProgress:
+            return "Another device is currently resetting this CloudKit database"
+        }
+    }
+}
+
 @BigSyncBackgroundActor
 internal class ChangeRequestProcessor {
     static let shared = ChangeRequestProcessor()
@@ -582,6 +598,84 @@ public class CloudKitSynchronizer: NSObject {
             cancelSynchronization: false,
             includingAdapters: true
         )
+        cancelSync = false
+        ChangeRequestProcessor.shared.cancelSync = false
+    }
+
+    /// Coordinates a destructive zone reset across all of a user's devices.
+    ///
+    /// Claim and completion records live in CloudKit's default zone, so deleting
+    /// the custom sync zone does not delete the coordination state. Every device
+    /// still rebuilds its local tracking once, but only the device that wins the
+    /// claim deletes the shared custom zone.
+    ///
+    /// `markerRecordType` must be an existing record type in the production
+    /// CloudKit schema. Marker records do not add any fields to that type.
+    @BigSyncBackgroundActor
+    public func performOneOffRecordZoneResetAndReupload(
+        migrationIdentifier: String,
+        markerRecordType: String
+    ) async throws -> OneOffRecordZoneResetResult {
+        let markerPrefix = "BigSyncKitMigration.\(String(migrationIdentifier.prefix(120)))"
+        let claimRecordID = CKRecord.ID(recordName: "\(markerPrefix).claim")
+        let completionRecordID = CKRecord.ID(recordName: "\(markerPrefix).completed")
+        let localClaimKey = "\(identifier).\(markerPrefix).ownsClaim"
+
+        if try await fetchRecord(completionRecordID) != nil {
+            let activeSynchronizationTask = synchronizationTask
+            cancelSynchronization()
+            await activeSynchronizationTask?.value
+            try await resetSyncCaches(
+                cancelSynchronization: false,
+                includingAdapters: true
+            )
+            cancelSync = false
+            ChangeRequestProcessor.shared.cancelSync = false
+            keyValueStore.removeObject(forKey: localClaimKey)
+            return .cloudResetAlreadyCompleted
+        }
+
+        var ownsClaim = keyValueStore.bool(forKey: localClaimKey)
+        if !ownsClaim {
+            if let existingClaim = try await fetchRecord(claimRecordID) {
+                let claimAge = existingClaim.creationDate.map {
+                    Date().timeIntervalSince($0)
+                } ?? 0
+                guard claimAge >= 15 * 60 else {
+                    throw OneOffRecordZoneResetError.migrationInProgress
+                }
+                try await deleteRecord(claimRecordID)
+            }
+
+            do {
+                try await saveMigrationMarker(
+                    CKRecord(recordType: markerRecordType, recordID: claimRecordID)
+                )
+                keyValueStore.set(boolValue: true, forKey: localClaimKey)
+                ownsClaim = true
+            } catch {
+                if isServerRecordChanged(error) {
+                    throw OneOffRecordZoneResetError.migrationInProgress
+                }
+                throw error
+            }
+        }
+
+        guard ownsClaim else {
+            throw OneOffRecordZoneResetError.migrationInProgress
+        }
+
+        try await deleteRecordZonesAndResetSyncCachesForReupload()
+        do {
+            try await saveMigrationMarker(
+                CKRecord(recordType: markerRecordType, recordID: completionRecordID)
+            )
+        } catch {
+            guard isServerRecordChanged(error) else { throw error }
+        }
+        keyValueStore.removeObject(forKey: localClaimKey)
+        try? await deleteRecord(claimRecordID)
+        return .performedCloudReset
     }
 
     @BigSyncBackgroundActor
@@ -595,6 +689,91 @@ public class CloudKitSynchronizer: NSObject {
                     continuation.resume()
                 }
             }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func fetchRecord(_ recordID: CKRecord.ID) async throws -> CKRecord? {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<CKRecord?, Error>) in
+            database.fetch(withRecordID: recordID) { record, error in
+                if let error {
+                    let nsError = error as NSError
+                    if nsError.domain == CKErrorDomain,
+                       nsError.code == CKError.unknownItem.rawValue {
+                        continuation.resume(returning: nil)
+                    } else {
+                        continuation.resume(throwing: error)
+                    }
+                } else {
+                    continuation.resume(returning: record)
+                }
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func saveMigrationMarker(_ record: CKRecord) async throws {
+        try await modifyMigrationMarkers(
+            recordsToSave: [record],
+            recordIDsToDelete: nil
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func deleteRecord(_ recordID: CKRecord.ID) async throws {
+        do {
+            try await modifyMigrationMarkers(
+                recordsToSave: nil,
+                recordIDsToDelete: [recordID]
+            )
+        } catch {
+            let nsError = error as NSError
+            guard nsError.domain == CKErrorDomain,
+                  nsError.code == CKError.unknownItem.rawValue else {
+                throw error
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func modifyMigrationMarkers(
+        recordsToSave: [CKRecord]?,
+        recordIDsToDelete: [CKRecord.ID]?
+    ) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            let operation = CKModifyRecordsOperation(
+                recordsToSave: recordsToSave,
+                recordIDsToDelete: recordIDsToDelete
+            )
+            operation.savePolicy = .ifServerRecordUnchanged
+            operation.isAtomic = true
+            operation.modifyRecordsCompletionBlock = { _, _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+            database.add(operation)
+        }
+    }
+
+    private func isServerRecordChanged(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == CKErrorDomain,
+           nsError.code == CKError.serverRecordChanged.rawValue {
+            return true
+        }
+        guard nsError.domain == CKErrorDomain,
+              nsError.code == CKError.partialFailure.rawValue,
+              let itemErrors = nsError.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] else {
+            return false
+        }
+        return itemErrors.values.contains {
+            $0.domain == CKErrorDomain &&
+            $0.code == CKError.serverRecordChanged.rawValue
         }
     }
     

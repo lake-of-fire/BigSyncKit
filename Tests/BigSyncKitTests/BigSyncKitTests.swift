@@ -25,6 +25,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var completesModifyOperations = true
     var reportsDeletedRecordsAsUnknownItems = false
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
+    private var records = [CKRecord.ID: CKRecord]()
 
     func add(_ operation: CKDatabaseOperation) {
         if let modifyOperation = operation as? CKModifyRecordsOperation {
@@ -53,8 +54,34 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
                 )
                 return
             }
+            if modifyOperation.savePolicy == .ifServerRecordUnchanged,
+               let duplicateRecord = savedRecords.first(where: {
+                   records[$0.recordID] != nil
+               }) {
+                let itemError = NSError(
+                    domain: CKErrorDomain,
+                    code: CKError.serverRecordChanged.rawValue
+                )
+                modifyOperation.modifyRecordsCompletionBlock?(
+                    [],
+                    [],
+                    CKError(
+                        .partialFailure,
+                        userInfo: [
+                            CKPartialErrorsByItemIDKey: [
+                                duplicateRecord.recordID: itemError
+                            ]
+                        ]
+                    )
+                )
+                return
+            }
             for record in savedRecords {
+                records[record.recordID] = record
                 modifyOperation.perRecordCompletionBlock?(record, nil)
+            }
+            for recordID in deletedRecordIDs {
+                records.removeValue(forKey: recordID)
             }
             modifyOperation.modifyRecordsCompletionBlock?(savedRecords, deletedRecordIDs, nil)
         }
@@ -69,7 +96,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     }
 
     func fetch(withRecordID recordID: CKRecord.ID, completionHandler: @escaping (CKRecord?, Error?) -> Void) {
-        completionHandler(nil, nil)
+        completionHandler(records[recordID], nil)
     }
 
     func delete(withRecordZoneID zoneID: CKRecordZone.ID, completionHandler: @escaping (CKRecordZone.ID?, Error?) -> Void) {
@@ -318,6 +345,77 @@ final class BigSyncKitTests: XCTestCase {
         } catch {
             XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
         }
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetDeletesSharedZoneOnlyOnceAcrossDevices() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(
+            zoneName: "multi-device-reset-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let firstSynchronizer = makeSynchronizer(database: database)
+        let firstAdapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        firstSynchronizer.addModelAdapter(firstAdapter)
+
+        let firstResult = try await firstSynchronizer
+            .performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "test-v1",
+                markerRecordType: "ExistingRecordType"
+            )
+
+        let secondSynchronizer = makeSynchronizer(database: database)
+        let secondAdapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        secondSynchronizer.addModelAdapter(secondAdapter)
+        let secondResult = try await secondSynchronizer
+            .performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "test-v1",
+                markerRecordType: "ExistingRecordType"
+            )
+
+        XCTAssertEqual(firstResult, .performedCloudReset)
+        XCTAssertEqual(secondResult, .cloudResetAlreadyCompleted)
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+        XCTAssertTrue(firstAdapter.events.contains("resetSyncCaches"))
+        XCTAssertTrue(secondAdapter.events.contains("resetSyncCaches"))
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetRetainsClaimForRetryAfterDeletionFailure() async throws {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneError = NSError(
+            domain: CKErrorDomain,
+            code: CKError.networkFailure.rawValue
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(
+                zoneName: "retry-reset-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "retry-v1",
+                markerRecordType: "ExistingRecordType"
+            )
+            XCTFail("Expected the first zone deletion to fail")
+        } catch {
+            XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
+        }
+
+        database.deleteZoneError = nil
+        let result = try await synchronizer
+            .performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "retry-v1",
+                markerRecordType: "ExistingRecordType"
+            )
+
+        XCTAssertEqual(result, .performedCloudReset)
+        XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
     }
 
     func testCloudKitAccountAvailabilityGateStartsImmediatelyWhenAvailable() async {
