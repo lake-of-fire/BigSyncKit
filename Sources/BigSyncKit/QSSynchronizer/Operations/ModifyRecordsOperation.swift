@@ -30,20 +30,20 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     private var conflictedRecords = [CKRecord]()
     private var conflictedRecordIDs = Set<CKRecord.ID>()
     private var recordIDsMissingOnServer = Set<CKRecord.ID>()
+    private let resultLock = NSLock()
 
 //    let dispatchQueue = DispatchQueue(label: "modifyRecordsDispatchQueue")
     weak var internalOperation: CKModifyRecordsOperation?
         
     override func start() {
         super.start()
+        guard !isFinished else { return }
         let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: recordIDsToDelete)
         
         operation.perRecordCompletionBlock = { @Sendable [weak self] record, error in
-//            print("# One record completed", record.recordID, error)
             guard let self else { return }
-            Task { @BigSyncBackgroundActor [weak self] in
-                guard let self else { return }
-                self.processError(error, recordID: record.recordID)
+            self.resultLock.withLock {
+                self.processErrorWithoutLock(error, recordID: record.recordID)
             }
         }
         
@@ -51,11 +51,14 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
             guard let self else { return }
             Task { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
-                //            print("# Completion block", saved?.count, deleted?.count, operationError)
-                if let error = operationError as? CKError {
-                    self.processCKError(error)
+                let results = self.resultLock.withLock { () -> ([CKRecord], Set<CKRecord.ID>) in
+                    if let error = operationError as? CKError {
+                        self.processCKErrorWithoutLock(error)
+                    }
+                    return (self.conflictedRecords, self.recordIDsMissingOnServer)
                 }
-                self.completion(saved, deleted, self.conflictedRecords, self.recordIDsMissingOnServer, operationError)
+                self.completion(saved, deleted, results.0, results.1, operationError)
+                self.finish(error: nil)
             }
         }
         
@@ -64,7 +67,7 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     }
     
     /// Handles errors from both perRecordCompletionBlock and modifyRecordsCompletionBlock
-    private func processError(_ error: Error?, recordID: CKRecord.ID) {
+    private func processErrorWithoutLock(_ error: Error?, recordID: CKRecord.ID) {
         guard let error = error as? CKError else { return }
         
         switch error.code {
@@ -85,14 +88,12 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     }
     
     /// Processes CKError for batch errors (partial failures)
-    private func processCKError(_ error: CKError) {
+    private func processCKErrorWithoutLock(_ error: CKError) {
         if error.code == .partialFailure,
            let errorsByItemID = error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] {
             for (recordID, nsError) in errorsByItemID {
-                processError(nsError, recordID: recordID)
+                processErrorWithoutLock(nsError, recordID: recordID)
             }
-        } else {
-            print(error)
         }
     }
     

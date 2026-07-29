@@ -16,14 +16,23 @@ class CloudKitSynchronizerOperation: Operation {
     
     internal var logger: Logging.Logger?
 
-    var state = State.ready {
-        willSet {
-            willChangeValue(forKey: state.keyPath)
-            willChangeValue(forKey: newValue.keyPath)
-        }
-        didSet {
-            didChangeValue(forKey: state.keyPath)
-            didChangeValue(forKey: oldValue.keyPath)
+    private let stateLock = NSRecursiveLock()
+    private var _state = State.ready
+    private var state: State {
+        stateLock.withLock { _state }
+    }
+
+    @discardableResult
+    private func transition(to newState: State) -> Bool {
+        stateLock.withLock {
+            let oldState = _state
+            guard oldState != newState else { return false }
+            willChangeValue(forKey: oldState.keyPath)
+            willChangeValue(forKey: newState.keyPath)
+            _state = newState
+            didChangeValue(forKey: newState.keyPath)
+            didChangeValue(forKey: oldState.keyPath)
+            return true
         }
     }
     
@@ -36,19 +45,19 @@ class CloudKitSynchronizerOperation: Operation {
     
     override func start() {
         if self.isCancelled {
-            state = .finished
+            transition(to: .finished)
         } else {
             logStart()
-            state = .ready
             main()
         }
     }
     
     override func main() {
-        state = self.isCancelled ? .finished : .executing
+        transition(to: self.isCancelled ? .finished : .executing)
     }
     
     func finish(error: Error?) {
+        guard transition(to: .finished) else { return }
         if let error {
 //            logger?.info("QSCloudKitSynchronizer >> Operation failed: \(error)")
             errorHandler?(self, error)
@@ -60,7 +69,6 @@ class CloudKitSynchronizerOperation: Operation {
                 synchronizer.currentOperations.removeAll { $0.isFinished }
             }
         }
-        state = .finished
     }
     
     internal func logStart() {

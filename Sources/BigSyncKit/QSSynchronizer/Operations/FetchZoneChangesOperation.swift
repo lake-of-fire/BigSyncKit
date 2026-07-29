@@ -22,11 +22,12 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     var zoneChangeTokens: [CKRecordZone.ID: CKServerChangeToken]
     let modelVersion: Int
     let ignoreDeviceIdentifier: String?
-    let onResult: ((CKRecord?, CKRecord.ID?) async -> ())?
-    let completion: ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async -> ()
+    let completion: ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async throws -> ()
     let desiredKeys: [String]?
     
-    var zoneResults = [CKRecordZone.ID: FetchZoneChangesOperationZoneResult]()
+    private let resultLock = NSLock()
+    private var zoneResults = [CKRecordZone.ID: FetchZoneChangesOperationZoneResult]()
+    private var higherModelVersionFound = false
     
 //    let dispatchQueue = DispatchQueue(label: "fetchZoneChangesDispatchQueue")
     weak var internalOperation: CKFetchRecordZoneChangesOperation?
@@ -38,8 +39,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         modelVersion: Int,
         ignoreDeviceIdentifier: String?,
         desiredKeys: [String]?,
-        onResult: ((CKRecord?, CKRecord.ID?) async -> ())? = nil,
-        completion: @escaping ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async -> ()
+        completion: @escaping ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async throws -> ()
     ) {
         self.database = database
         self.zoneIDs = zoneIDs
@@ -47,7 +47,6 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         self.modelVersion = modelVersion
         self.ignoreDeviceIdentifier = ignoreDeviceIdentifier
         self.desiredKeys = desiredKeys
-        self.onResult = onResult
         self.completion = completion
         
         super.init()
@@ -55,9 +54,12 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     
     override func start() {
         super.start()
+        guard !isFinished else { return }
         
-        for zone in zoneIDs {
-            zoneResults[zone] = FetchZoneChangesOperationZoneResult()
+        resultLock.withLock {
+            for zone in zoneIDs {
+                zoneResults[zone] = FetchZoneChangesOperationZoneResult()
+            }
         }
         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
@@ -67,19 +69,6 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     
     @BigSyncBackgroundActor
     func performFetchOperation(with zones: [CKRecordZone.ID]) {
-        actor ModelVersionChecker {
-            var higherModelVersionFound = false
-            
-            func setHigherModelVersionFound() {
-                higherModelVersionFound = true
-            }
-            
-            func isHigherModelVersionFound() -> Bool {
-                return higherModelVersionFound
-            }
-        }
-        
-        let versionChecker = ModelVersionChecker()
         var zoneOptions = [CKRecordZone.ID: CKFetchRecordZoneChangesOperation.ZoneOptions]()
         
         for zoneID in zones {
@@ -94,49 +83,39 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         
         operation.recordChangedBlock = { @Sendable [weak self] record in
             guard let self else { return }
-            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self else { return }
-                let ignoreDeviceIdentifier: String = ignoreDeviceIdentifier ?? " "
-                
-                if ignoreDeviceIdentifier != record[cloudKitSynchronizerDeviceUUIDKey] as? String {
-                    if let version = record[cloudKitSynchronizerModelCompatibilityVersionKey] as? Int,
-                       self.modelVersion > 0 && version > self.modelVersion {
-                        logger?.warning("QSCloudKitSynchronizer >> Warning: Ignoring record '\(record.recordID.recordName)' because it has a higher model version (\(version)) than the one this synchronizer is configured to support (\(self.modelVersion))")
-                        Task(priority: .background) { @BigSyncBackgroundActor in
-                            await versionChecker.setHigherModelVersionFound()
-                        }
-                    } else {
-                        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                            guard let self else { return }
-                            zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
-                            await onResult?(record, nil)
-                        }
-                    }
+            let ignoredDeviceIdentifier = self.ignoreDeviceIdentifier ?? " "
+            guard ignoredDeviceIdentifier != record[cloudKitSynchronizerDeviceUUIDKey] as? String else {
+                return
+            }
+            if let version = record[cloudKitSynchronizerModelCompatibilityVersionKey] as? Int,
+               self.modelVersion > 0 && version > self.modelVersion {
+                self.logger?.warning("QSCloudKitSynchronizer >> Warning: Ignoring record '\(record.recordID.recordName)' because it has a higher model version (\(version)) than the one this synchronizer is configured to support (\(self.modelVersion))")
+                self.resultLock.withLock {
+                    self.higherModelVersionFound = true
+                }
+            } else {
+                self.resultLock.withLock {
+                    self.zoneResults[record.recordID.zoneID]?.downloadedRecords.append(record)
                 }
             }
         }
         
-        operation.recordWithIDWasDeletedBlock = { @Sendable recordID, recordType in
-            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self = self else { return }
-                zoneResults[recordID.zoneID]?.deletedRecordIDs.append(recordID)
-                await onResult?(nil, recordID)
+        operation.recordWithIDWasDeletedBlock = { @Sendable [weak self] recordID, recordType in
+            guard let self else { return }
+            self.resultLock.withLock {
+                self.zoneResults[recordID.zoneID]?.deletedRecordIDs.append(recordID)
             }
         }
         
-        operation.recordZoneFetchCompletionBlock = { @Sendable
+        operation.recordZoneFetchCompletionBlock = { @Sendable [weak self]
             zoneID, serverChangeToken, clientChangeTokenData, moreComing, recordZoneError in
-            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self = self else { return }
-                let results = zoneResults[zoneID]!
-                
+            guard let self else { return }
+            self.resultLock.withLock {
+                guard let results = self.zoneResults[zoneID] else { return }
                 results.error = recordZoneError
                 results.serverChangeToken = serverChangeToken
-                
-                if !(await versionChecker.isHigherModelVersionFound()) {
-                    if moreComing {
-                        results.moreComing = true
-                    }
+                if !self.higherModelVersionFound && moreComing {
+                    results.moreComing = true
                 }
             }
         }
@@ -147,13 +126,18 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
                 if let error = operationError,
                    (error as NSError).code != CKError.partialFailure.rawValue { // Partial errors are returned per zone
                     self.finish(error: error)
-                } else if await versionChecker.isHigherModelVersionFound() {
+                } else if self.resultLock.withLock({ self.higherModelVersionFound }) {
                     self.finish(error: CloudKitSynchronizer.SyncError.higherModelVersionFound)
                 } else if self.isCancelled {
                     self.finish(error: CloudKitSynchronizer.SyncError.cancelled)
                 } else {
-                    await completion(self.zoneResults)
-                    self.finish(error: nil)
+                    let results = self.resultLock.withLock { self.zoneResults }
+                    do {
+                        try await completion(results)
+                        self.finish(error: nil)
+                    } catch {
+                        self.finish(error: error)
+                    }
                 }
             }
         }

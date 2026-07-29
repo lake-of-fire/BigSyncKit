@@ -441,26 +441,25 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
         guard !cancelledDueToUnauthentication else { return }
-        
-        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+        guard !syncing else { return }
+
+        logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
+        cancelSync = false
+        ChangeRequestProcessor.shared.cancelSync = false
+        syncing = true
+
+        synchronizationTask?.cancel()
+        synchronizationTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
-            guard !syncing else {
-                return
+            do {
+                for adapter in modelAdapters {
+                    try await adapter.unsetCancellation()
+                }
+                try Task.checkCancellation()
+                await performSynchronization()
+            } catch {
+                await failSynchronization(error: error)
             }
-            
-            logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
-   
-            //        debugPrint("CloudKitSynchronizer >> Initiating synchronization", identifier, containerIdentifier)
-            cancelSync = false
-            ChangeRequestProcessor.shared.cancelSync = false
-            syncing = true
-            //        self.onFailure = onFailure
-            
-            for adapter in modelAdapters {
-                try await adapter.unsetCancellation()
-            }
-            
-            await performSynchronization()
         }
     }
     
