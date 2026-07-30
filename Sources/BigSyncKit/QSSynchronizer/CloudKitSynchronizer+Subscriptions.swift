@@ -43,7 +43,7 @@ public extension CloudKitSynchronizer {
         
         database.fetchAllSubscriptions { (subscriptions, error) in
             guard error == nil else {
-                completion?(nil)
+                completion?(error)
                 return
             }
             
@@ -71,13 +71,6 @@ public extension CloudKitSynchronizer {
                     completion?(error)
                 })
 
-                // See: https://www.wwdcnotes.com/notes/wwdc16/231/
-                let operation = CKModifySubscriptionsOperation(
-                    subscriptionsToSave: [subscription],
-                    subscriptionIDsToDelete: []
-                )
-//                operation.qualityOfService = .userInitiated
-                self.database.add(operation)
             }
         }
     }
@@ -124,13 +117,6 @@ public extension CloudKitSynchronizer {
                     completion?(error)
                 })
                 
-                // See: https://www.wwdcnotes.com/notes/wwdc16/231/
-                let operation = CKModifySubscriptionsOperation(
-                    subscriptionsToSave: [subscription],
-                    subscriptionIDsToDelete: []
-                )
-//                operation.qualityOfService = .userInitiated
-                self.database.add(operation)
             }
         }
     }
@@ -207,7 +193,7 @@ public extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     fileprivate func cancelSubscription(identifier: String, completion: ((Error?)->())?) {
         database.delete(withSubscriptionID: identifier) { (subscriptionID, error) in
-            if subscriptionID == nil {
+            if error == nil {
                 self.clearSubscriptionID(identifier)
             }
             completion?(error)

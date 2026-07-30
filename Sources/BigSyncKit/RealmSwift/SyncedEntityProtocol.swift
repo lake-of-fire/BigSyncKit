@@ -39,16 +39,13 @@ public extension ChangeMetadataRecordable {
         let generation = UUID().uuidString
 
         guard let realm = object.realm else {
-            guard BigSyncMutationTrackingRegistry.tracks(className: entityType) else { return }
-            BigSyncMutationTrackingRegistry.enqueueUnbound(
-                BigSyncPendingMutationSnapshot(
-                    recordName: recordName,
-                    entityType: entityType,
-                    objectIdentifier: objectIdentifier,
-                    generation: generation,
-                    changedAt: timestamp
-                )
+#if DEBUG
+            debugPrint(
+                "BigSyncKit: refreshChangeMetadata(explicitlyModified:) was called before",
+                entityType,
+                "was added to Realm; the mutation cannot be journaled atomically."
             )
+#endif
             return
         }
         guard realm.isInWriteTransaction,

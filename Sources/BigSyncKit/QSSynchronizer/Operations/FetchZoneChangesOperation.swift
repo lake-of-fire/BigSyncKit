@@ -23,6 +23,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
     let modelVersion: Int
     let ignoreDeviceIdentifier: String?
     let completion: ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async throws -> ()
+    let didFinishPages: () async throws -> Void
     let desiredKeys: [String]?
     
     private let resultLock = NSLock()
@@ -39,7 +40,8 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         modelVersion: Int,
         ignoreDeviceIdentifier: String?,
         desiredKeys: [String]?,
-        completion: @escaping ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async throws -> ()
+        completion: @escaping ([CKRecordZone.ID: FetchZoneChangesOperationZoneResult]) async throws -> (),
+        didFinishPages: @escaping () async throws -> Void = {}
     ) {
         self.database = database
         self.zoneIDs = zoneIDs
@@ -48,6 +50,7 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         self.ignoreDeviceIdentifier = ignoreDeviceIdentifier
         self.desiredKeys = desiredKeys
         self.completion = completion
+        self.didFinishPages = didFinishPages
         
         super.init()
     }
@@ -80,7 +83,8 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
         }
         
         let operation = CKFetchRecordZoneChangesOperation(recordZoneIDs: zones, optionsByRecordZoneID: zoneOptions)
-        operation.fetchAllChanges = true
+        // Commit and release each CloudKit page before requesting the next one.
+        operation.fetchAllChanges = false
         
         operation.recordChangedBlock = { @Sendable [weak self] record in
             guard let self else { return }
@@ -138,7 +142,24 @@ class FetchZoneChangesOperation: CloudKitSynchronizerOperation {
                     let results = self.resultLock.withLock { self.zoneResults }
                     do {
                         try await completion(results)
-                        self.finish(error: nil)
+                        let pendingZones = results.compactMap { zoneID, result in
+                            result.moreComing ? zoneID : nil
+                        }
+                        if pendingZones.isEmpty {
+                            try await didFinishPages()
+                            self.finish(error: nil)
+                        } else {
+                            self.resultLock.withLock {
+                                self.zoneResults.removeAll(keepingCapacity: true)
+                                for zoneID in pendingZones {
+                                    self.zoneChangeTokens[zoneID] =
+                                        results[zoneID]?.serverChangeToken
+                                    self.zoneResults[zoneID] =
+                                        FetchZoneChangesOperationZoneResult()
+                                }
+                            }
+                            self.performFetchOperation(with: pendingZones)
+                        }
                     } catch {
                         self.finish(error: error)
                     }

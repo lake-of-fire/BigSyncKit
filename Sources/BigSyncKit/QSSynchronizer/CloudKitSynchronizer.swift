@@ -80,6 +80,19 @@ internal struct ChangeRequest: Sendable {
     let downloadedRecord: CKRecord?
     let deletedRecordID: CKRecord.ID?
     let adapter: ModelAdapter
+    let runID: UUID?
+
+    init(
+        downloadedRecord: CKRecord?,
+        deletedRecordID: CKRecord.ID?,
+        adapter: ModelAdapter,
+        runID: UUID? = nil
+    ) {
+        self.downloadedRecord = downloadedRecord
+        self.deletedRecordID = deletedRecordID
+        self.adapter = adapter
+        self.runID = runID
+    }
 }
 
 public enum OneOffRecordZoneResetResult: Sendable, Equatable {
@@ -106,30 +119,32 @@ public enum OneOffRecordZoneResetError: LocalizedError {
 
 @BigSyncBackgroundActor
 internal class ChangeRequestProcessor {
-    static let shared = ChangeRequestProcessor()
     static let defaultFetchedChangeBatchSize = 300
     
 //    internal var logger: Logging.Logger?
 
-    internal var cancelSync = false {
-        didSet {
-            if !cancelSync && oldValue {
-                Task { @BigSyncBackgroundActor [weak self] in
-                    try await self?.finishProcessing()
-                }
-            }
-        }
-    }
+    internal var cancelSync = false
     
     init() {}
     
     private var changeRequests = [ChangeRequest]()
     private var localErrors: [Error] = []
+    private var activeRunID = UUID()
     internal var processTask: Task<Void, Error>? = nil
     internal var fetchedChangeBatchSize = ChangeRequestProcessor.defaultFetchedChangeBatchSize
     
     internal func addFetchedChangeRequest(_ request: ChangeRequest) {
+        guard !cancelSync,
+              request.runID == nil || request.runID == activeRunID else { return }
         changeRequests.append(request)
+    }
+
+    @discardableResult
+    func beginRun() -> UUID {
+        reset()
+        activeRunID = UUID()
+        cancelSync = false
+        return activeRunID
     }
 
     private func entityType(for request: ChangeRequest) -> String? {
@@ -145,19 +160,22 @@ internal class ChangeRequestProcessor {
         restrictedToEntityType restrictedEntityType: String?
     ) -> [ChangeRequest] {
         var batch = [ChangeRequest]()
-        batch.reserveCapacity(fetchedChangeBatchSize)
+        var remaining = [ChangeRequest]()
+        batch.reserveCapacity(min(fetchedChangeBatchSize, changeRequests.count))
+        remaining.reserveCapacity(changeRequests.count)
 
-        var index = 0
-        while index < changeRequests.count && batch.count < fetchedChangeBatchSize {
-            let request = changeRequests[index]
+        for request in changeRequests {
             let isMatchingAdapter = request.adapter.recordZoneID == adapter.recordZoneID
             let isMatchingRestriction = restrictedEntityType == nil || entityType(for: request) == restrictedEntityType
-            if isMatchingAdapter && isMatchingRestriction {
-                batch.append(changeRequests.remove(at: index))
+            if batch.count < fetchedChangeBatchSize &&
+                isMatchingAdapter &&
+                isMatchingRestriction {
+                batch.append(request)
             } else {
-                index += 1
+                remaining.append(request)
             }
         }
+        changeRequests = remaining
 
         return batch
     }
@@ -227,6 +245,14 @@ internal class ChangeRequestProcessor {
     
     func clearErrors() {
         localErrors.removeAll()
+    }
+
+    func reset() {
+        cancelSync = true
+        processTask?.cancel()
+        processTask = nil
+        changeRequests.removeAll(keepingCapacity: false)
+        localErrors.removeAll(keepingCapacity: false)
     }
     
     @BigSyncBackgroundActor
@@ -381,6 +407,8 @@ public class CloudKitSynchronizer: NSObject {
 
     internal var lastDatabaseChangesEmptyAt: Date?
     internal var lastZoneChangesEmptyAt: Date?
+    internal let changeRequestProcessor = ChangeRequestProcessor()
+    internal var synchronizationRunID = UUID()
  
     internal let logger: Logging.Logger
     
@@ -517,7 +545,6 @@ public class CloudKitSynchronizer: NSObject {
 
         logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
         cancelSync = false
-        ChangeRequestProcessor.shared.cancelSync = false
         syncing = true
 
         synchronizationTask?.cancel()
@@ -525,6 +552,7 @@ public class CloudKitSynchronizer: NSObject {
             guard let self else { return }
             do {
                 try await validateSynchronizationAccount()
+                synchronizationRunID = changeRequestProcessor.beginRun()
                 for adapter in modelAdapters {
                     try await adapter.unsetCancellation()
                 }
@@ -543,16 +571,26 @@ public class CloudKitSynchronizer: NSObject {
         if let previousAccountIdentifier =
             keyValueStore.object(forKey: cloudKitAccountIdentifierKey) as? String,
            previousAccountIdentifier != currentAccountIdentifier {
-            ChangeRequestProcessor.shared.cancelSync = true
-            cancelSync = true
-            cancelledDueToUnauthentication = true
-            throw OneOffRecordZoneResetError.cloudKitAccountChanged
+            logger.info(
+                "QSCloudKitSynchronizer >> CloudKit account changed; rebuilding local sync metadata for the new account"
+            )
+            changeRequestProcessor.reset()
+            resetDatabaseToken()
+            resetActiveTokens()
+            clearAllStoredSubscriptionIDs()
+            for adapter in modelAdapters {
+                adapter.cancelSynchronization()
+                try await adapter.unsetCancellation()
+                try await adapter.resetSyncCaches()
+            }
         }
         keyValueStore.set(
             value: currentAccountIdentifier,
             forKey: cloudKitAccountIdentifierKey
         )
         accountValidationRequired = false
+        cancelSync = false
+        cancelledDueToUnauthentication = false
     }
 
 #if DEBUG
@@ -567,8 +605,7 @@ public class CloudKitSynchronizer: NSObject {
     @objc public func cancelSynchronization() {
         //        guard syncing, !cancelSync else { return }
         
-        ChangeRequestProcessor.shared.cancelSync = true
-        ChangeRequestProcessor.shared.processTask?.cancel()
+        changeRequestProcessor.reset()
         synchronizationTask?.cancel()
         modifyRecordsTask?.cancel()
         fetchDatabaseChangesTask?.cancel()
@@ -634,7 +671,7 @@ public class CloudKitSynchronizer: NSObject {
     public func deleteRecordZone(for adapter: ModelAdapter, completion: ((Error?) -> ())?) {
         database.delete(withRecordZoneID: adapter.recordZoneID) { (zoneID, error) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                await adapter.saveToken(nil)
+                try? await adapter.saveToken(nil)
                 if let error = error {
                     //                    debugPrint("CloudKitSynchronizer >> Error: \(error)")
                     self?.logger.error("CloudKitSynchronizer >> Error: \(error)")
@@ -681,7 +718,23 @@ public class CloudKitSynchronizer: NSObject {
             includingAdapters: true
         )
         cancelSync = false
-        ChangeRequestProcessor.shared.cancelSync = false
+        changeRequestProcessor.cancelSync = false
+    }
+
+    /// Deletes an obsolete custom zone without changing the active adapters.
+    ///
+    /// A zone that is already absent is considered successfully deleted. This is
+    /// intended for migrations that move syncing to a newly named zone.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func deleteRecordZoneIfPresent(_ zoneID: CKRecordZone.ID) async throws -> Bool {
+        do {
+            try await deleteRecordZone(zoneID)
+            return true
+        } catch {
+            guard isMissingRecordZoneError(error) else { throw error }
+            return false
+        }
     }
 
     /// Coordinates a destructive zone reset across all of a user's devices.
@@ -824,7 +877,7 @@ public class CloudKitSynchronizer: NSObject {
         keyValueStore.removeObject(forKey: localClaimTokenKey)
         try? await deleteRecord(claimRecordID)
         cancelSync = false
-        ChangeRequestProcessor.shared.cancelSync = false
+        changeRequestProcessor.cancelSync = false
         cancelledDueToUnauthentication = false
         return .performedCloudReset
     }
@@ -839,7 +892,7 @@ public class CloudKitSynchronizer: NSObject {
             includingAdapters: true
         )
         cancelSync = false
-        ChangeRequestProcessor.shared.cancelSync = false
+        changeRequestProcessor.cancelSync = false
     }
 
     @BigSyncBackgroundActor
@@ -893,6 +946,15 @@ public class CloudKitSynchronizer: NSObject {
                 }
             }
         }
+    }
+
+    private func isMissingRecordZoneError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == CKErrorDomain &&
+            [
+                CKError.zoneNotFound.rawValue,
+                CKError.userDeletedZone.rawValue,
+            ].contains(nsError.code)
     }
 
     @BigSyncBackgroundActor

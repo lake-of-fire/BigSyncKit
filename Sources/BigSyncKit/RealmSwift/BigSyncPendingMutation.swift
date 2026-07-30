@@ -40,7 +40,6 @@ struct BigSyncPendingMutationSnapshot: Sendable {
 enum BigSyncMutationTrackingRegistry {
     private static let lock = NSLock()
     private static var trackedClassNamesByRealm = [String: Set<String>]()
-    private static var unboundMutations = [String: BigSyncPendingMutationSnapshot]()
 
     static func identity(for configuration: Realm.Configuration) -> String {
         if let inMemoryIdentifier = configuration.inMemoryIdentifier {
@@ -75,40 +74,4 @@ enum BigSyncMutationTrackingRegistry {
         }
     }
 
-    static func tracks(className: String) -> Bool {
-        lock.withLock {
-            trackedClassNamesByRealm.values.contains { $0.contains(className) }
-        }
-    }
-
-    static func trackedClassNames(in realm: Realm) -> Set<String> {
-        lock.withLock {
-            trackedClassNamesByRealm[identity(for: realm.configuration)] ?? []
-        }
-    }
-
-    static func enqueueUnbound(_ mutation: BigSyncPendingMutationSnapshot) {
-        lock.withLock {
-            unboundMutations[mutation.recordName] = mutation
-        }
-    }
-
-    static func unboundMutations(for classNames: Set<String>) -> [BigSyncPendingMutationSnapshot] {
-        lock.withLock {
-            unboundMutations.values.filter { classNames.contains($0.entityType) }
-        }
-    }
-
-    static func removeUnbound(recordName: String, generation: String) {
-        lock.withLock {
-            guard unboundMutations[recordName]?.generation == generation else { return }
-            unboundMutations.removeValue(forKey: recordName)
-        }
-    }
-
-    static func removeUnbound(recordName: String) {
-        lock.withLock {
-            unboundMutations.removeValue(forKey: recordName)
-        }
-    }
 }

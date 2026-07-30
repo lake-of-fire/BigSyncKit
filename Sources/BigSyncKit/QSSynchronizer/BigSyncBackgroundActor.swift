@@ -71,7 +71,7 @@ public actor BigSyncBackgroundActor {
         initialSynchronizationTask?.cancel()
         synchronizationPreparationState = .unprepared
         logger = configuration.logger
-        
+
         let synchronizer = CloudKitSynchronizer.privateSynchronizer(
             synchronizerName: configuration.synchronizerName,
             containerName: configuration.containerName,
@@ -115,7 +115,11 @@ public actor BigSyncBackgroundActor {
         realmSynchronizer.cancelSynchronization()
 
         for modelAdapter in realmSynchronizer.modelAdapters {
-            modelAdapter.cleanUp()
+            do {
+                try await modelAdapter.cleanUp()
+            } catch {
+                logger?.error("QSCloudKitSynchronizer >> Cleanup failed: \(error)")
+            }
         }
     }
     

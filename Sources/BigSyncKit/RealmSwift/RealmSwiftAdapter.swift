@@ -90,48 +90,6 @@ fileprivate struct PendingRelationshipRequest {
     let targetIdentifier: String
 }
 
-struct SyncRealmProvider {
-    let persistenceConfiguration: Realm.Configuration
-    let targetConfigurations: [Realm.Configuration]
-    
-    let targetWriterRealmPerSchemaName: [String: Realm]
-    
-    var syncPersistenceRealm: Realm {
-        get {
-            return try! Realm(configuration: persistenceConfiguration)
-        }
-    }
-    var syncTargetRealms: [Realm] {
-        get {
-            return targetConfigurations.map { try! Realm(configuration: $0) }
-        }
-    }
-    
-    init?(
-        persistenceConfiguration: Realm.Configuration,
-        targetConfigurations: [Realm.Configuration]
-    ) {
-        guard (try? Realm(configuration: persistenceConfiguration)) != nil else {
-            return nil
-        }
-        
-        self.persistenceConfiguration = persistenceConfiguration
-        self.targetConfigurations = targetConfigurations
-        
-        var targetWriterRealmPerSchemaName = [String: Realm]()
-        for targetWriterRealmObject in targetConfigurations.map({ try! Realm(configuration: $0) }) {
-            for objectType in targetWriterRealmObject.configuration.objectTypes ?? [] {
-                targetWriterRealmPerSchemaName[objectType.className()] = targetWriterRealmObject
-            }
-        }
-        self.targetWriterRealmPerSchemaName = targetWriterRealmPerSchemaName
-        
-        guard syncTargetRealms.count == targetConfigurations.count else {
-            return nil
-        }
-    }
-}
-
 actor RealmProvider {
     let persistenceConfiguration: Realm.Configuration
     let targetConfigurations: [Realm.Configuration]
@@ -313,6 +271,13 @@ private func encodedCloudKitMap(_ value: [String: Any]) throws -> Data {
     )
 }
 
+private func objectIdentifier(fromCloudKitRecordName recordName: String) -> String? {
+    guard let separator = recordName.firstIndex(of: ".") else { return nil }
+    let identifierStart = recordName.index(after: separator)
+    guard identifierStart < recordName.endIndex else { return nil }
+    return String(recordName[identifierStart...])
+}
+
 extension RealmSwiftAdapter: @unchecked Sendable { }
 
 public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapableModelAdapter, UploadGenerationTrackingModelAdapter {
@@ -351,7 +316,6 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         PersistentAssetManager(identifier: "\(recordZoneID.ownerName).\(recordZoneID.zoneName).\(targetRealmConfigurations.map { $0.fileURL?.lastPathComponent ?? UUID().uuidString } .joined(separator: "-")).\(targetRealmConfigurations.map { $0.schemaVersion } .reduce(0, +))")
     }()
     
-    var syncRealmProvider: SyncRealmProvider?
     var realmProvider: RealmProvider?
     
     //    var collectionNotificationTokens = [NotificationToken]()
@@ -384,6 +348,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 #endif
     
     private var isSetupInterrupted: Bool = false
+    @BigSyncBackgroundActor
+    private var setupTask: Task<Void, Error>?
+    @BigSyncBackgroundActor
+    private var setupGeneration = UUID()
     
     public init(
         persistenceRealmConfiguration: Realm.Configuration,
@@ -411,15 +379,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         
         setupTypeNamesLookup()
         
-        syncRealmProvider = SyncRealmProvider(
-            persistenceConfiguration: persistenceRealmConfiguration,
-            targetConfigurations: targetRealmConfigurations
-        )
-        
         if startSetupTask {
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
-                try await setup()
+                try await ensureSetup()
             }
         }
     }
@@ -432,6 +395,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @BigSyncBackgroundActor
     public func resetSyncCaches() async throws {
+        let activeSetupTask = setupTask
+        activeSetupTask?.cancel()
+        _ = try? await activeSetupTask?.value
+        setupTask = nil
         invalidateTokens()
         
         if let persistenceRealm = realmProvider?.persistenceRealm {
@@ -444,7 +411,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
         
-        try await setup()
+        try await ensureSetup()
     }
     
     @BigSyncBackgroundActor
@@ -490,6 +457,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     public func cancelSynchronization() {
         //        debugPrint("# cancel")
         cancelSync = true
+        setupTask?.cancel()
     }
     
     @BigSyncBackgroundActor
@@ -497,12 +465,39 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         //        debugPrint("# unset cancel")
         cancelSync = false
         if isSetupInterrupted {
-            try await setup()
+            try await ensureSetup()
         }
     }
     
     @BigSyncBackgroundActor
-    func setup() async throws {
+    private func ensureSetup() async throws {
+        if let setupTask {
+            try await setupTask.value
+            return
+        }
+
+        let generation = UUID()
+        setupGeneration = generation
+        let task = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+            guard let self else { return }
+            try await performSetup()
+        }
+        setupTask = task
+        do {
+            try await task.value
+            if setupGeneration == generation {
+                setupTask = nil
+            }
+        } catch {
+            if setupGeneration == generation {
+                setupTask = nil
+            }
+            throw error
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func performSetup() async throws {
         logger.info("QSCloudKitSynchronizer >> Setup synchronization...")
         //        debugPrint("# setup() ...")
         // Setup can be retried after cancellation or a cache reset. Tear down any
@@ -638,7 +633,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         observeRealmChanges()
 
         if needsInitialSetup {
-            try await updateCreatedAndModified()
+            try await updateCreatedAndModified(notifyDelegate: false)
             try await markMutationJournalRecoveryComplete(in: persistenceRealm)
         } else if needsMutationJournalRecovery(in: persistenceRealm) {
             // This is the only broad scan for clients that carry the journal
@@ -654,14 +649,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 throw error
             }
             await enqueueCreatedAndModified()
-            try await processEnqueuedChanges()
-            try await updateCreatedAndModified()
+            try await processEnqueuedChanges(notifyDelegate: false)
+            try await updateCreatedAndModified(notifyDelegate: false)
             try await markMutationJournalRecoveryComplete(in: persistenceRealm)
         } else {
             // Normal launches touch only durable changed IDs. Target Realms that
             // have not adopted BigSyncPendingMutation retain the timestamp fallback
             // inside updateCreatedAndModified().
-            try await updateCreatedAndModified()
+            try await updateCreatedAndModified(notifyDelegate: false)
         }
 
         updateHasChanges(realm: persistenceRealm)
@@ -755,13 +750,38 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
             .store(in: &cancellables)
         
-        // For each realm, observe changes and send an event to the subject
+        // Observe only the durable mutation journal when it is present. A broad
+        // Realm notification is retained solely for legacy schemas that cannot
+        // atomically journal changed IDs.
         for (idx, targetReaderRealm) in targetReaderRealms.enumerated() {
-            let token = targetReaderRealm.observe { [weak self] _, _ in
-                guard let self else { return }
-                Task { @BigSyncBackgroundActor [weak self] in
+            let token: NotificationToken
+            if targetReaderRealm.schema.objectSchema.contains(where: {
+                $0.className == BigSyncPendingMutation.className()
+            }) {
+                token = targetReaderRealm.objects(BigSyncPendingMutation.self).observe {
+                    [weak self] changes in
                     guard let self else { return }
-                    realmChangesSubject.send(idx)
+                    switch changes {
+                    case .initial:
+                        return
+                    case .update(_, let deletions, let insertions, let modifications):
+                        guard !deletions.isEmpty || !insertions.isEmpty || !modifications.isEmpty else {
+                            return
+                        }
+                    case .error(let error):
+                        logger.error("BigSyncKit mutation journal observation failed: \(error)")
+                        return
+                    }
+                    Task { @BigSyncBackgroundActor [weak self] in
+                        self?.realmChangesSubject.send(idx)
+                    }
+                }
+            } else {
+                token = targetReaderRealm.observe { [weak self] _, _ in
+                    guard let self else { return }
+                    Task { @BigSyncBackgroundActor [weak self] in
+                        self?.realmChangesSubject.send(idx)
+                    }
                 }
             }
             cancellables.insert(AnyCancellable { token.invalidate() })
@@ -781,75 +801,31 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     /// Immediately updates.
     @BigSyncBackgroundActor
-    private func updateCreatedAndModified() async throws {
+    private func updateCreatedAndModified(notifyDelegate: Bool = true) async throws {
         guard let targetReaderRealms = realmProvider?.targetReaderRealms else { return }
         for targetReaderRealm in targetReaderRealms {
             if targetReaderRealm.schema.objectSchema.contains(where: {
                 $0.className == BigSyncPendingMutation.className()
             }) {
-                try await forwardPendingMutations(in: targetReaderRealm)
+                try await forwardPendingMutations(
+                    in: targetReaderRealm,
+                    notifyDelegate: notifyDelegate
+                )
             } else {
                 await enqueueCreatedAndModified(in: targetReaderRealm)
             }
         }
-        try await processEnqueuedChanges()
+        try await processEnqueuedChanges(notifyDelegate: notifyDelegate)
     }
 
     @BigSyncBackgroundActor
     @discardableResult
-    private func forwardPendingMutations(in targetReaderRealm: Realm) async throws -> Int {
+    private func forwardPendingMutations(
+        in targetReaderRealm: Realm,
+        notifyDelegate: Bool = true
+    ) async throws -> Int {
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else { return 0 }
-        let trackedClassNames = BigSyncMutationTrackingRegistry.trackedClassNames(
-            in: targetReaderRealm
-        )
-        let unboundMutations = BigSyncMutationTrackingRegistry.unboundMutations(
-            for: trackedClassNames
-        )
-        if !unboundMutations.isEmpty {
-            var persistedUnboundMutations = [BigSyncPendingMutationSnapshot]()
-            try await targetReaderRealm.asyncWrite {
-                for mutation in unboundMutations {
-                    guard let objectClass = realmObjectClass(name: mutation.entityType),
-                          let primaryKey = getObjectIdentifier(
-                            stringObjectId: mutation.objectIdentifier,
-                            entityType: mutation.entityType
-                          ),
-                          targetReaderRealm.object(
-                            ofType: objectClass,
-                            forPrimaryKey: primaryKey
-                          ) != nil else {
-                        continue
-                    }
-                    let existing = targetReaderRealm.object(
-                        ofType: BigSyncPendingMutation.self,
-                        forPrimaryKey: mutation.recordName
-                    )
-                    if let existing, existing.changedAt > mutation.changedAt {
-                        persistedUnboundMutations.append(mutation)
-                        continue
-                    }
-                    targetReaderRealm.add(
-                        BigSyncPendingMutation(
-                            recordName: mutation.recordName,
-                            entityType: mutation.entityType,
-                            objectIdentifier: mutation.objectIdentifier,
-                            generation: mutation.generation,
-                            changedAt: mutation.changedAt
-                        ),
-                        update: .modified
-                    )
-                    persistedUnboundMutations.append(mutation)
-                }
-            }
-            for mutation in persistedUnboundMutations {
-                BigSyncMutationTrackingRegistry.removeUnbound(
-                    recordName: mutation.recordName,
-                    generation: mutation.generation
-                )
-            }
-        }
-
         let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
         let pending = mutations.map { mutation in
             BigSyncPendingMutationSnapshot(
@@ -890,7 +866,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 
         if forwardedCount > 0 {
             updateHasChanges(realm: persistenceRealm)
-            await modelAdapterDelegate?.hasChangesToUpload()
+            if notifyDelegate {
+                await modelAdapterDelegate?.hasChangesToUpload()
+            }
         }
         return forwardedCount
     }
@@ -1042,12 +1020,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 
     @BigSyncBackgroundActor
     func _test_setup() async throws {
-        try await setup()
+        try await ensureSetup()
     }
 #endif
     
     @BigSyncBackgroundActor
-    private func processEnqueuedChanges() async throws {
+    private func processEnqueuedChanges(notifyDelegate: Bool = true) async throws {
         guard let realmProvider = realmProvider else { return }
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         let currentChangeSet: ResultsChangeSet
@@ -1133,7 +1111,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
         
-        if hasChanges {
+        if hasChanges && notifyDelegate {
             await modelAdapterDelegate?.hasChangesToUpload()
         }
     }
@@ -1361,7 +1339,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     func writeSyncedEntities(syncedEntities: [SyncedEntity], realmProvider: RealmProvider) async throws {
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         //        await persistenceRealm.asyncRefresh()
-        try? await persistenceRealm.asyncWrite {
+        try await persistenceRealm.asyncWrite {
             for entity in syncedEntities {
                 persistenceRealm.add(entity, update: .modified)
             }
@@ -1845,17 +1823,18 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 if let value = record.value(forKey: property.name) as? [String] {
                     for recordName in value {
                         try Task.checkCancellation()
-                        let separatorRange = recordName.range(of: ".")!
-                        let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        guard let objectIdentifier = objectIdentifier(
+                            fromCloudKitRecordName: recordName
+                        ) else { continue }
                         try Task.checkCancellation()
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
                 } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
                     for reference in value {
                         try Task.checkCancellation()
-                        guard let recordName = reference.value(forKey: property.name) as? String else { return }
-                        let separatorRange = recordName.range(of: ".")!
-                        let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        guard let objectIdentifier = objectIdentifier(
+                            fromCloudKitRecordName: reference.recordID.recordName
+                        ) else { continue }
                         try Task.checkCancellation()
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
@@ -1944,17 +1923,17 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 if let value = record.value(forKey: property.name) as? [String] {
                     for recordName in value {
                         try Task.checkCancellation()
-                        let separatorRange = recordName.range(of: ".")!
-                        let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        guard let objectIdentifier = objectIdentifier(
+                            fromCloudKitRecordName: recordName
+                        ) else { continue }
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
                 } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
                     for reference in value {
                         try Task.checkCancellation()
-                        // TODO: (If used anymore?) Maybe recordName should be let recordName = reference.recordID.recordName instead - GPT thought so... See elsewhere too
-                        guard let recordName = reference.value(forKey: property.name) as? String else { return }
-                        let separatorRange = recordName.range(of: ".")!
-                        let objectIdentifier = String(recordName[separatorRange.upperBound...])
+                        guard let objectIdentifier = objectIdentifier(
+                            fromCloudKitRecordName: reference.recordID.recordName
+                        ) else { continue }
                         savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
                     }
                 }
@@ -2098,9 +2077,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     }
                 }
             } catch {
-                //                debugPrint("Error during persistPendingRelationships:", error)
                 logger.error("Error during persistPendingRelationships: \(error)")
-                break
+                throw error
             }
         }
     }
@@ -2183,7 +2161,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
             
             //            await persistenceRealm.asyncRefresh()
-            try? await persistenceRealm.asyncWrite {
+            try await persistenceRealm.asyncWrite {
                 persistenceRealm.delete(relationship)
             }
             
@@ -2599,7 +2577,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     if property.type == PropertyType.data,
                        let data = value as? Data,
                        !forceDataTypeInsteadOfAsset {
-                        let fileURL = self.persistentAssetManager.store(
+                        let fileURL = try self.persistentAssetManager.store(
                             data: data,
                             forRecordID: syncedEntity.identifier,
                             propertyName: property.name
@@ -2683,7 +2661,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             record[property.name] = Double(0.0) as CKRecordValue
                         case .data:
                             let dummyData = "dummy".data(using: .utf8)!
-                            let fileURL = self.persistentAssetManager.store(
+                            let fileURL = try self.persistentAssetManager.store(
                                 data: dummyData,
                                 forRecordID: "Dummy.123",
                                 propertyName: property.name
@@ -2706,61 +2684,76 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
     
     /// Deletes soft-deleted objects.
-    public func cleanUp() {
-        guard let targetWriterRealmPerSchemaName = syncRealmProvider?.targetWriterRealmPerSchemaName, let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else {
-            print("WARNING: No sync realms found.")
+    @BigSyncBackgroundActor
+    public func cleanUp() async throws {
+        guard let realmProvider,
+              let persistenceRealm = realmProvider.persistenceRealm else {
+            logger.warning("QSCloudKitSynchronizer >> Cleanup requested before Realm setup completed")
             return
         }
-        
-        let remotelyDeletedEntities = Dictionary(
-            grouping: persistenceRealm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.deletedRemotely.rawValue },
-            by: { $0.entityType }
-        ).filter { !excludedClassNames.contains($0.key) }
-        
-        // TODO: Group by target writer realms instead of write transaction per class name, for speed
-        for className in remotelyDeletedEntities.keys {
-            guard let targetWriterRealm = targetWriterRealmPerSchemaName[className] else { return }
-            guard let objectClass = self.realmObjectClass(name: className) else {
-                logger.warning("QSCloudKitSynchronizer >> Clean Up: No Realm object class found for \(className)")
+
+        let remotelyDeleted = persistenceRealm.objects(SyncedEntity.self)
+            .where { $0.state == SyncedEntityState.deletedRemotely.rawValue }
+            .compactMap { entity -> RemoteDeletionSnapshot? in
+                guard !self.excludedClassNames.contains(entity.entityType) else { return nil }
+                let prefix = entity.entityType + "."
+                guard entity.identifier.hasPrefix(prefix) else { return nil }
+                return RemoteDeletionSnapshot(
+                    recordName: entity.identifier,
+                    entityType: entity.entityType,
+                    objectIdentifier: String(entity.identifier.dropFirst(prefix.count))
+                )
+            }
+
+        let deletionsByRealm = Dictionary(grouping: remotelyDeleted) { deletion in
+            realmProvider.targetReaderRealmPerSchemaName[deletion.entityType]
+                .map { BigSyncMutationTrackingRegistry.identity(for: $0.configuration) }
+        }
+        var skippedRecordNames = Set<String>()
+
+        for (realmIdentity, deletions) in deletionsByRealm {
+            guard realmIdentity != nil,
+                  let targetRealm = deletions.lazy.compactMap({
+                      realmProvider.targetReaderRealmPerSchemaName[$0.entityType]
+                  }).first else {
                 continue
             }
-            
-            do {
-                var skippedIdentifiers = Set<String>()
-                try targetWriterRealm.write {
-                    for syncedEntity in remotelyDeletedEntities[className] ?? [] {
-                        let objectIdentifier = self.getObjectIdentifier(for: syncedEntity)
-                        if let object = targetWriterRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier) {
-                            if let object = object as? SoftDeletable {
-                                guard object.isDeleted else {
-                                    logger.warning("QSCloudKitSynchronizer >> Clean Up: Object \(objectIdentifier) of type \(className) is not marked as deleted locally, skipping deletion")
-                                    skippedIdentifiers.insert(syncedEntity.identifier)
-                                    continue
-                                }
-                            }
-                            
-                            if let object = object as? any SyncableBase, object.needsSyncToAppServer {
-                                // Don't hard-delete before the application server received the deletion.
-                                skippedIdentifiers.insert(syncedEntity.identifier)
-                                continue
-                            }
-                            
-                            targetWriterRealm.delete(object)
-                            logger.warning("QSCloudKitSynchronizer >> Clean Up: Hard-deleted local object \(objectIdentifier) of type \(className)")
-                        } else {
-                            logger.warning("QSCloudKitSynchronizer >> Clean Up: Object \(objectIdentifier) of type \(className) not found for deletion")
-                        }
+            try await targetRealm.asyncWrite {
+                for deletion in deletions {
+                    guard let objectClass = realmObjectClass(name: deletion.entityType),
+                          let identifier = getObjectIdentifier(
+                            stringObjectId: deletion.objectIdentifier,
+                            entityType: deletion.entityType
+                          ),
+                          let object = targetRealm.object(
+                            ofType: objectClass,
+                            forPrimaryKey: identifier
+                          ) else {
+                        continue
                     }
-                }
-                
-                try persistenceRealm.write {
-                    for syncedEntity in remotelyDeletedEntities[className] ?? [] where !skippedIdentifiers.contains(syncedEntity.identifier) {
-                        logger.warning("QSCloudKitSynchronizer >> Clean Up: Deleting tracking of object \(syncedEntity.identifier)")
-                        persistenceRealm.delete(syncedEntity)
+                    if let softDeletable = object as? SoftDeletable,
+                       !softDeletable.isDeleted {
+                        skippedRecordNames.insert(deletion.recordName)
+                        continue
                     }
+                    if let syncable = object as? any SyncableBase,
+                       syncable.needsSyncToAppServer {
+                        skippedRecordNames.insert(deletion.recordName)
+                        continue
+                    }
+                    targetRealm.delete(object)
                 }
-            } catch {
-                logger.error("\(error)")
+            }
+        }
+
+        try await persistenceRealm.asyncWrite {
+            for deletion in remotelyDeleted where !skippedRecordNames.contains(deletion.recordName) {
+                if let entity = persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: deletion.recordName
+                ) {
+                    persistenceRealm.delete(entity)
+                }
             }
         }
     }
@@ -2825,7 +2818,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             
             // Batch write all syncedEntities after processing each chunk
             if !syncedEntitiesToCreate.isEmpty {
-                try? await writeSyncedEntities(syncedEntities: syncedEntitiesToCreate, realmProvider: realmProvider)
+                try await writeSyncedEntities(
+                    syncedEntities: syncedEntitiesToCreate,
+                    realmProvider: realmProvider
+                )
                 syncedEntitiesToCreate.removeAll()
             }
             
@@ -2916,7 +2912,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     }
                 }()
                 
-                try? await persistPendingRelationships()
+                try await persistPendingRelationships()
                 
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
@@ -2946,79 +2942,79 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         deletions.reserveCapacity(recordIDs.count)
         for recordID in recordIDs {
             try Task.checkCancellation()
-            guard let syncedEntity = Self.getSyncedEntity(
+            let syncedEntity = Self.getSyncedEntity(
                 objectIdentifier: recordID.recordName,
                 realm: persistenceRealm
-            ) else {
-                continue
-            }
-            let prefix = syncedEntity.entityType + "."
+            )
+            let parsedEntityType = recordID.recordName
+                .split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+                .first
+                .map(String.init)
+            guard let entityType = syncedEntity?.entityType ?? parsedEntityType,
+                  !excludedClassNames.contains(entityType),
+                  realmObjectClass(name: entityType) != nil else { continue }
+            let prefix = entityType + "."
             guard recordID.recordName.hasPrefix(prefix) else { continue }
             deletions.append(
                 RemoteDeletionSnapshot(
                     recordName: recordID.recordName,
-                    entityType: syncedEntity.entityType,
+                    entityType: entityType,
                     objectIdentifier: String(recordID.recordName.dropFirst(prefix.count))
                 )
             )
         }
 
         let deletionsByEntityType = Dictionary(grouping: deletions, by: \.entityType)
-        try await { @RealmBackgroundActor in
-            for (entityType, entityDeletions) in deletionsByEntityType where entityType != "CKShare" {
-                try Task.checkCancellation()
-                guard let objectClass = realmObjectClass(name: entityType),
-                      let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[entityType] else {
-                    continue
-                }
-                try await targetWriterRealm.asyncWrite {
-                    for deletion in entityDeletions {
-                        try Task.checkCancellation()
-                        if let objectIdentifier = getObjectIdentifier(
-                            stringObjectId: deletion.objectIdentifier,
-                            entityType: entityType
-                        ), let object = targetWriterRealm.object(
-                            ofType: objectClass,
-                            forPrimaryKey: objectIdentifier
-                        ) {
-                            if let object = object as? SoftDeletable {
-                                object.isDeleted = true
-                            } else {
-                                targetWriterRealm.delete(object)
-                            }
+        for (entityType, entityDeletions) in deletionsByEntityType where entityType != "CKShare" {
+            try Task.checkCancellation()
+            guard let objectClass = realmObjectClass(name: entityType),
+                  let targetRealm = realmProvider.targetReaderRealmPerSchemaName[entityType] else {
+                continue
+            }
+            try await targetRealm.asyncWrite {
+                for deletion in entityDeletions {
+                    try Task.checkCancellation()
+                    if let objectIdentifier = getObjectIdentifier(
+                        stringObjectId: deletion.objectIdentifier,
+                        entityType: entityType
+                    ), let object = targetRealm.object(
+                        ofType: objectClass,
+                        forPrimaryKey: objectIdentifier
+                    ) {
+                        if let object = object as? SoftDeletable {
+                            object.isDeleted = true
+                        } else {
+                            targetRealm.delete(object)
                         }
-                        if targetWriterRealm.schema.objectSchema.contains(where: {
-                            $0.className == BigSyncPendingMutation.className()
-                        }), let mutation = targetWriterRealm.object(
-                            ofType: BigSyncPendingMutation.self,
-                            forPrimaryKey: deletion.recordName
-                        ) {
-                            targetWriterRealm.delete(mutation)
-                        }
+                    }
+                    if targetRealm.schema.objectSchema.contains(where: {
+                        $0.className == BigSyncPendingMutation.className()
+                    }), let mutation = targetRealm.object(
+                        ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: deletion.recordName
+                    ) {
+                        targetRealm.delete(mutation)
                     }
                 }
             }
-        }()
+        }
 
         try await persistenceRealm.asyncWrite {
             for deletion in deletions {
                 try Task.checkCancellation()
-                guard let syncedEntity = Self.getSyncedEntity(
+                let syncedEntity = Self.getSyncedEntity(
                     objectIdentifier: deletion.recordName,
                     realm: persistenceRealm
-                ) else {
-                    continue
-                }
+                ) ?? SyncedEntity(
+                    entityType: deletion.entityType,
+                    identifier: deletion.recordName,
+                    state: SyncedEntityState.deletedRemotely.rawValue
+                )
+                persistenceRealm.add(syncedEntity, update: .modified)
                 syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
                 syncedEntity.pendingGeneration = nil
             }
         }
-        for deletion in deletions {
-            BigSyncMutationTrackingRegistry.removeUnbound(
-                recordName: deletion.recordName
-            )
-        }
-
         updateHasChanges(realm: persistenceRealm)
         logger.info(
             "Deleted \(deletions.count) local records which were previously deleted from iCloud"
@@ -3275,11 +3271,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         updateHasChanges(realm: persistenceRealm)
     }
     
-    public func didDelete(identifiers: [String]) throws {
-        guard let persistenceRealm = syncRealmProvider?.syncPersistenceRealm else { return }
+    @BigSyncBackgroundActor
+    public func didDelete(identifiers: [String]) async throws {
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         for identifier in identifiers {
             if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: identifier) {
-                try persistenceRealm.write {
+                try await persistenceRealm.asyncWrite {
                     persistenceRealm.delete(syncedEntity)
                 }
             }
@@ -3357,12 +3354,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
     
     @BigSyncBackgroundActor
-    public func saveToken(_ token: CKServerChangeToken?) async {
+    public func saveToken(_ token: CKServerChangeToken?) async throws {
         //        debugPrint("# saveToken", token, recordZoneID)
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
         //        await persistenceRealm.asyncRefresh()
         var serverToken: ServerToken! = persistenceRealm.objects(ServerToken.self).first
-        try? await persistenceRealm.asyncWrite {
+        try await persistenceRealm.asyncWrite {
             if serverToken == nil {
                 serverToken = ServerToken()
                 persistenceRealm.add(serverToken)

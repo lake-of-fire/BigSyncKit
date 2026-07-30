@@ -36,7 +36,7 @@ class PersistentAssetManager {
         return directoryURL
     }()
     
-    func store(data: Data, forRecordID recordID: String, propertyName: String) -> URL {
+    func store(data: Data, forRecordID recordID: String, propertyName: String) throws -> URL {
         let digest = Self.digestString(for: data)
         let cacheKey = AssetKey(recordID: recordID, propertyName: propertyName, digest: digest)
         if let cachedURL = cacheQueue.sync(execute: { cachedAssets[cacheKey] }) {
@@ -51,7 +51,7 @@ class PersistentAssetManager {
         let unique = ProcessInfo.processInfo.globallyUniqueString
         let fileName = "\(recordID)_\(unique)"
         let url = assetDirectory.appendingPathComponent(fileName)
-        try? data.write(to: url, options: .atomicWrite)
+        try data.write(to: url, options: .atomicWrite)
         cacheQueue.sync {
             cachedAssets[cacheKey] = url
         }

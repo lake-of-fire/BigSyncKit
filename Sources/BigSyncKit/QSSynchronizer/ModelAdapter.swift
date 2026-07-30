@@ -39,7 +39,7 @@ public protocol ModelAdapter: AnyObject, Sendable {
     
     var modelAdapterDelegate: ModelAdapterDelegate? { get set }
     
-    func cleanUp()
+    func cleanUp() async throws
     
     func resetSyncCaches() async throws
     
@@ -91,7 +91,7 @@ public protocol ModelAdapter: AnyObject, Sendable {
     
     /// Save given token for future use by this adapter.
     /// - Parameter token: `CKServerChangeToken`
-    func saveToken(_ token: CKServerChangeToken?) async
+    func saveToken(_ token: CKServerChangeToken?) async throws
     
     /**
      *  Deletes all tracking information and detaches from local model.

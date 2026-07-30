@@ -100,7 +100,7 @@ extension CloudKitSynchronizer {
         let key = containerName.appending("QSCloudKitFetchChangesServerTokenKey")
         if let encodedToken = userDefaults.object(forKey: key) as? Data {
             if let token = NSKeyedUnarchiver.unarchiveObject(with: encodedToken) as? CKServerChangeToken {
-                await adapter.saveToken(token)
+                try? await adapter.saveToken(token)
             }
             userDefaults.removeObject(forKey: key)
         }
