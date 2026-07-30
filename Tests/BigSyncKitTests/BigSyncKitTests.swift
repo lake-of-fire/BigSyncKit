@@ -355,7 +355,8 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
 }
 
 @objc(BigSyncTrackedObject)
-private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
+private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable,
+CloudKitInitialSyncEligibilityModel {
     @Persisted(primaryKey: true) var id: String
     @Persisted var createdAt: Date
     @Persisted var modifiedAt: Date
@@ -365,6 +366,11 @@ private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
     @Persisted var urls: List<URL>
     @Persisted var scores: MutableSet<Int>
     @Persisted var attributes: Map<String, String>
+    @Persisted var initialCloudKitSyncEligible = true
+
+    static var initialCloudKitSyncEligibilityPredicate: NSPredicate {
+        NSPredicate(format: "initialCloudKitSyncEligible == true")
+    }
 
     convenience init(id: String, createdAt: Date, modifiedAt: Date, explicitlyModifiedAt: Date?) {
         self.init()
@@ -399,6 +405,45 @@ SoftDeletable {
 }
 
 final class BigSyncKitTests: XCTestCase {
+    func testRefreshChangeMetadataUsesSuppliedTimestampForJournalAndMetadata() throws {
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "timestamped-tracking-\(UUID().uuidString)"
+        configuration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationTracking.install(
+            configurations: [configuration],
+            excludedClassNames: []
+        )
+        let realm = try Realm(configuration: configuration)
+        let object = BigSyncTrackedObject(
+            id: "timestamped",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        let timestamp = Date(timeIntervalSinceReferenceDate: 42_000)
+
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: timestamp
+            )
+        }
+
+        XCTAssertEqual(object.modifiedAt, timestamp)
+        XCTAssertEqual(object.explicitlyModifiedAt, timestamp)
+        XCTAssertEqual(
+            realm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".timestamped"
+            )?.changedAt,
+            timestamp
+        )
+    }
+
     func testEarlyMutationTrackingInstallationJournalsBeforeAdapterSetup() throws {
         var configuration = Realm.Configuration()
         configuration.inMemoryIdentifier = "early-tracking-\(UUID().uuidString)"
@@ -2105,6 +2150,113 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: "__BigSyncKitMutationJournalRecovery"
             )?.recoveryVersion,
             1
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testInitialSetupSkipsObjectsThatOptOutOfInitialCloudKitSync() async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier = "persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier = "target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncRelationshipChild.self,
+            BigSyncRelationshipParent.self,
+            BigSyncPendingMutation.self,
+        ]
+        let targetRealm = try await Realm(
+            configuration: targetConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let date = Date(timeIntervalSinceReferenceDate: 25_000)
+        let eligible = BigSyncTrackedObject(
+            id: "eligible",
+            createdAt: date,
+            modifiedAt: date,
+            explicitlyModifiedAt: date
+        )
+        let cacheOnly = BigSyncTrackedObject(
+            id: "cache-only",
+            createdAt: date,
+            modifiedAt: date,
+            explicitlyModifiedAt: date
+        )
+        cacheOnly.initialCloudKitSyncEligible = false
+        try await targetRealm.asyncWrite {
+            targetRealm.add(eligible)
+            targetRealm.add(cacheOnly)
+        }
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "initial-eligibility-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+
+        try await adapter._test_setup()
+        let persistenceRealm = try XCTUnwrap(
+            adapter.realmProvider?.persistenceRealm
+        )
+
+        XCTAssertNotNil(
+            persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".eligible"
+            )
+        )
+        XCTAssertNil(
+            persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".cache-only"
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryScanSkipsObjectsThatOptOutOfInitialCloudKitSync() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let date = Date(timeIntervalSinceReferenceDate: 26_000)
+        let cacheOnly = BigSyncTrackedObject(
+            id: "recovery-cache-only",
+            createdAt: date,
+            modifiedAt: date,
+            explicitlyModifiedAt: date
+        )
+        cacheOnly.initialCloudKitSyncEligible = false
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(cacheOnly)
+        }
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(
+                SyncedEntity(
+                    entityType: "Existing",
+                    identifier: "Existing.anchor",
+                    state: SyncedEntityState.synced.rawValue
+                ),
+                update: .modified
+            )
+            let recovery = fixture.persistenceRealm.object(
+                ofType: SyncedEntityType.self,
+                forPrimaryKey: "__BigSyncKitMutationJournalRecovery"
+            )
+            recovery?.recoveryVersion = 0
+        }
+
+        try await fixture.adapter._test_setup()
+
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".recovery-cache-only"
+            )
         )
     }
 

@@ -625,7 +625,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 if needsInitialSetup {
                     beforeInitialSetup?()
                     
-                    let results = targetReaderRealm.objects(objectClass)
+                    var results = targetReaderRealm.objects(objectClass)
+                    if let eligibilityType = objectClass
+                        as? CloudKitInitialSyncEligibilityModel.Type {
+                        results = results.filter(
+                            eligibilityType.initialCloudKitSyncEligibilityPredicate
+                        )
+                    }
                     let entityTypePrefix = schema.className + "."
                     let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
                     var identifiers: [String] = []
@@ -668,7 +674,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 isSetupInterrupted = true
                 throw error
             }
-            await enqueueCreatedAndModified()
+            await enqueueCreatedAndModified(
+                includeOnlyInitialSyncEligible: true
+            )
             try await processEnqueuedChanges(notifyDelegate: false)
             try await updateCreatedAndModified(notifyDelegate: false)
             try await markMutationJournalRecoveryComplete(in: persistenceRealm)
@@ -917,7 +925,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
     
     @BigSyncBackgroundActor
-    private func enqueueCreatedAndModified(in realm: Realm? = nil) async {
+    private func enqueueCreatedAndModified(
+        in realm: Realm? = nil,
+        includeOnlyInitialSyncEligible: Bool = false
+    ) async {
         let realms: [Realm]
         if let realm {
             realms = [realm]
@@ -931,7 +942,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 guard objectClass.conforms(to: ChangeMetadataRecordable.self) else { continue }
                 await self.enqueueCreatedAndModified(
                     in: objectClass,
-                    schemaName: schema.className
+                    schemaName: schema.className,
+                    includeOnlyInitialSyncEligible: includeOnlyInitialSyncEligible
                 )
             }
         }
@@ -944,7 +956,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     @BigSyncBackgroundActor
     private func enqueueCreatedAndModified(
         in objectClass: Object.Type,
-        schemaName: String
+        schemaName: String,
+        includeOnlyInitialSyncEligible: Bool = false
     ) async {
         guard let targetReaderRealm = realmProvider?.targetReaderRealmPerSchemaName[schemaName] else {
             //            print("Could not get realms or syncedEntityType for \(schemaName)")
@@ -967,7 +980,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         ) -> (changes: [PendingObjectChange], latestExplicitlyModifiedAt: Date?) {
             var changes: [PendingObjectChange] = []
             var latestExplicitlyModifiedAt: Date?
-            for object in targetReaderRealm.objects(objectClass).filter(predicate) {
+            var matchingObjects = targetReaderRealm.objects(objectClass)
+                .filter(predicate)
+            if includeOnlyInitialSyncEligible,
+               let eligibilityType = objectClass
+                    as? CloudKitInitialSyncEligibilityModel.Type {
+                matchingObjects = matchingObjects.filter(
+                    eligibilityType.initialCloudKitSyncEligibilityPredicate
+                )
+            }
+            for object in matchingObjects {
                 let change = PendingObjectChange(
                     objectID: Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey),
                     modifiedAt: object["modifiedAt"] as? Date,
@@ -1298,7 +1320,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     continue
                 }
 
-                let objects = targetReaderRealm.objects(objectClass)
+                var objects = targetReaderRealm.objects(objectClass)
+                if let eligibilityType = objectClass
+                    as? CloudKitInitialSyncEligibilityModel.Type {
+                    objects = objects.filter(
+                        eligibilityType.initialCloudKitSyncEligibilityPredicate
+                    )
+                }
                 if objects.isEmpty {
                     continue
                 }

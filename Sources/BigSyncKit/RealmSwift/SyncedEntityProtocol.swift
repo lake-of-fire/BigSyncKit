@@ -16,7 +16,10 @@ import RealmSwift
 
 public extension ChangeMetadataRecordable {
     func refreshChangeMetadata(explicitlyModified: Bool) {
-        let timestamp = Date()
+        refreshChangeMetadata(explicitlyModified: explicitlyModified, at: Date())
+    }
+
+    func refreshChangeMetadata(explicitlyModified: Bool, at timestamp: Date) {
         modifiedAt = timestamp
         if explicitlyModified {
             explicitlyModifiedAt = timestamp
@@ -70,6 +73,13 @@ public extension ChangeMetadataRecordable {
 
 @objc public protocol SyncSkippablePropertiesModel {
     func skipSyncingProperties() -> Set<String>?
+}
+
+/// Lets cache-backed models opt individual objects out of broad initial and
+/// recovery scans. Normal journaled mutations and downloaded records are not
+/// filtered through this protocol.
+public protocol CloudKitInitialSyncEligibilityModel {
+    static var initialCloudKitSyncEligibilityPredicate: NSPredicate { get }
 }
 
 /// Used for syncing with app servers, not just CloudKit.
