@@ -930,6 +930,9 @@ public class CloudKitSynchronizer: NSObject {
                     .hasPrefix(Self.resetCompletedPrefix) == true {
                     return .completed
                 }
+                if isServerRecordChanged(error) {
+                    throw OneOffRecordZoneResetError.migrationInProgress
+                }
                 throw error
             }
         } else {
@@ -945,6 +948,9 @@ public class CloudKitSynchronizer: NSObject {
                    (latest[ownerField] as? String)?
                     .hasPrefix(Self.resetCompletedPrefix) == true {
                     return .completed
+                }
+                if isServerRecordChanged(error) {
+                    throw OneOffRecordZoneResetError.migrationInProgress
                 }
                 throw error
             }
@@ -983,6 +989,9 @@ public class CloudKitSynchronizer: NSObject {
                (latest[ownerField] as? String)?
                 .hasPrefix(Self.resetCompletedPrefix) == true {
                 return
+            }
+            if isServerRecordChanged(error) {
+                throw OneOffRecordZoneResetError.migrationInProgress
             }
             throw error
         }

@@ -391,8 +391,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         excludedClassNames: [String],
         priorityEntityTypeNames: [String] = [],
         recordZoneID: CKRecordZone.ID,
-        logger: Logging.Logger,
-        startSetupTask: Bool = true
+        logger: Logging.Logger
     ) {
         self.persistenceRealmConfiguration = persistenceRealmConfiguration
         self.targetRealmConfigurations = targetRealmConfigurations
@@ -415,13 +414,30 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             persistenceConfiguration: persistenceRealmConfiguration,
             targetConfigurations: targetRealmConfigurations
         )
-        
-        if startSetupTask {
-            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self = self else { return }
-                try await setup()
-            }
-        }
+    }
+
+    @available(
+        *,
+        deprecated,
+        message: "Setup is now performed lazily before synchronization; startSetupTask is ignored."
+    )
+    public convenience init(
+        persistenceRealmConfiguration: Realm.Configuration,
+        targetRealmConfigurations: [Realm.Configuration],
+        excludedClassNames: [String],
+        priorityEntityTypeNames: [String] = [],
+        recordZoneID: CKRecordZone.ID,
+        logger: Logging.Logger,
+        startSetupTask: Bool
+    ) {
+        self.init(
+            persistenceRealmConfiguration: persistenceRealmConfiguration,
+            targetRealmConfigurations: targetRealmConfigurations,
+            excludedClassNames: excludedClassNames,
+            priorityEntityTypeNames: priorityEntityTypeNames,
+            recordZoneID: recordZoneID,
+            logger: logger
+        )
     }
     
     deinit {
@@ -434,13 +450,18 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     public func resetSyncCaches() async throws {
         invalidateTokens()
         
-        if let persistenceRealm = realmProvider?.persistenceRealm {
-            //            await persistenceRealm.asyncRefresh()
-            try await persistenceRealm.asyncWrite {
-                let objectTypes = (persistenceRealm.configuration.objectTypes ?? []).compactMap { $0 as? RealmSwift.Object.Type }
-                for objectType in objectTypes {
-                    persistenceRealm.delete(persistenceRealm.objects(objectType))
-                }
+        // The full provider is created lazily and may not exist yet when a
+        // migration requests a reset. Open only the persistence Realm on this
+        // actor so clearing durable tracking is independent of setup ordering.
+        let persistenceRealm = try await Realm(
+            configuration: persistenceRealmConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        try await persistenceRealm.asyncWrite {
+            let objectTypes = (persistenceRealm.configuration.objectTypes ?? [])
+                .compactMap { $0 as? RealmSwift.Object.Type }
+            for objectType in objectTypes {
+                persistenceRealm.delete(persistenceRealm.objects(objectType))
             }
         }
         
@@ -496,7 +517,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     public func unsetCancellation() async throws {
         //        debugPrint("# unset cancel")
         cancelSync = false
-        if isSetupInterrupted {
+        if realmProvider == nil || isSetupInterrupted {
             try await setup()
         }
     }
@@ -1090,6 +1111,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     @BigSyncBackgroundActor
     func _test_setup() async throws {
         try await setup()
+    }
+
+    @BigSyncBackgroundActor
+    var _test_cancellableCount: Int {
+        cancellables.count
     }
 #endif
     
