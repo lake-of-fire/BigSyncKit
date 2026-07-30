@@ -2261,6 +2261,32 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testJournaledMutationIsNotFilteredByInitialSyncEligibility() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "edited-cache-row",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        object.initialCloudKitSyncEligible = false
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+
+        try await fixture.adapter._test_setup()
+
+        XCTAssertNotNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className()
+                    + ".edited-cache-row"
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testNormalSetupDrainsJournalWithoutRepeatingBroadTimestampRecovery() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let date = Date(timeIntervalSinceReferenceDate: 30_000)
