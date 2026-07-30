@@ -87,7 +87,7 @@ public protocol RealmSwiftAdapterRecordProcessing: AnyObject {
 fileprivate struct PendingRelationshipRequest {
     let name: String
     let syncedEntityID: String
-    let targetIdentifier: String
+    let targetIdentifiers: [String]
 }
 
 actor RealmProvider {
@@ -425,7 +425,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 8
+        configuration.schemaVersion = 9
         configuration.shouldCompactOnLaunch = { totalBytes, usedBytes in
             // totalBytes refers to the size of the file on disk in bytes (data + free space)
             // usedBytes refers to the number of bytes used by data in the file
@@ -1820,14 +1820,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             case .object:
                 // Save relationship to be applied after all records have been downloaded and persisted
                 // to ensure target of the relationship has already been created
+                var targetIdentifiers = [String]()
                 if let value = record.value(forKey: property.name) as? [String] {
                     for recordName in value {
                         try Task.checkCancellation()
                         guard let objectIdentifier = objectIdentifier(
                             fromCloudKitRecordName: recordName
                         ) else { continue }
-                        try Task.checkCancellation()
-                        savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+                        targetIdentifiers.append(objectIdentifier)
                     }
                 } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
                     for reference in value {
@@ -1835,10 +1835,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         guard let objectIdentifier = objectIdentifier(
                             fromCloudKitRecordName: reference.recordID.recordName
                         ) else { continue }
-                        try Task.checkCancellation()
-                        savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+                        targetIdentifiers.append(objectIdentifier)
                     }
                 }
+                savePendingRelationshipsAsync(
+                    name: property.name,
+                    syncedEntityID: syncedEntityIdentifier,
+                    targetIdentifiers: targetIdentifiers
+                )
                 return
             default:
                 break
@@ -1920,13 +1924,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             case .object:
                 // Save relationship to be applied after all records have been downloaded and persisted
                 // to ensure target of the relationship has already been created
+                var targetIdentifiers = [String]()
                 if let value = record.value(forKey: property.name) as? [String] {
                     for recordName in value {
                         try Task.checkCancellation()
                         guard let objectIdentifier = objectIdentifier(
                             fromCloudKitRecordName: recordName
                         ) else { continue }
-                        savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+                        targetIdentifiers.append(objectIdentifier)
                     }
                 } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
                     for reference in value {
@@ -1934,9 +1939,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         guard let objectIdentifier = objectIdentifier(
                             fromCloudKitRecordName: reference.recordID.recordName
                         ) else { continue }
-                        savePendingRelationshipAsync(name: property.name, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+                        targetIdentifiers.append(objectIdentifier)
                     }
                 }
+                savePendingRelationshipsAsync(
+                    name: property.name,
+                    syncedEntityID: syncedEntityIdentifier,
+                    targetIdentifiers: targetIdentifiers
+                )
                 return
             default:
                 break
@@ -1959,17 +1969,26 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         } else if let reference = value as? CKRecord.Reference {
             // Save relationship to be applied after all records have been downloaded and persisted
             // to ensure target of the relationship has already been created
-            let recordName = reference.recordID.recordName
-            let separatorRange = recordName.range(of: ".")!
-            let objectIdentifier = String(recordName[separatorRange.upperBound...])
-            savePendingRelationshipAsync(name: key, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+            guard let objectIdentifier = objectIdentifier(
+                fromCloudKitRecordName: reference.recordID.recordName
+            ) else { return }
+            savePendingRelationshipsAsync(
+                name: key,
+                syncedEntityID: syncedEntityIdentifier,
+                targetIdentifiers: [objectIdentifier]
+            )
         } else if property.type == .object {
             // Save relationship to be applied after all records have been downloaded and persisted
             // to ensure target of the relationship has already been created
-            guard let recordName = record.value(forKey: property.name) as? String else { return }
-            let separatorRange = recordName.range(of: ".")!
-            let objectIdentifier = String(recordName[separatorRange.upperBound...])
-            savePendingRelationshipAsync(name: key, syncedEntityID: syncedEntityIdentifier, targetIdentifier: objectIdentifier)
+            guard let recordName = record.value(forKey: property.name) as? String,
+                  let objectIdentifier = objectIdentifier(
+                    fromCloudKitRecordName: recordName
+                  ) else { return }
+            savePendingRelationshipsAsync(
+                name: key,
+                syncedEntityID: syncedEntityIdentifier,
+                targetIdentifiers: [objectIdentifier]
+            )
         } else if property.type == .UUID {
             if let uuidString = record.value(forKey: key) as? String,
                let uuid = UUID(uuidString: uuidString) {
@@ -2042,8 +2061,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
     }
     
-    func savePendingRelationshipAsync(name: String, syncedEntityID: String, targetIdentifier: String) {
-        let request = PendingRelationshipRequest(name: name, syncedEntityID: syncedEntityID, targetIdentifier: targetIdentifier)
+    func savePendingRelationshipsAsync(
+        name: String,
+        syncedEntityID: String,
+        targetIdentifiers: [String]
+    ) {
+        let request = PendingRelationshipRequest(
+            name: name,
+            syncedEntityID: syncedEntityID,
+            targetIdentifiers: targetIdentifiers
+        )
         pendingRelationshipQueue.append(request)
     }
     
@@ -2059,23 +2086,31 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 //                await persistenceRealm.asyncRefresh()
                 try await persistenceRealm.asyncWrite {
                     for request in chunk {
-                        let pendingRelationship = PendingRelationship()
-                        pendingRelationship.relationshipName = request.name
-                        pendingRelationship.forSyncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: request.syncedEntityID)
-                        pendingRelationship.targetIdentifier = request.targetIdentifier
-                        persistenceRealm.add(pendingRelationship)
+                        let existingRelationships = persistenceRealm.objects(
+                            PendingRelationship.self
+                        ).filter(
+                            "relationshipName == %@ AND forSyncedEntity.identifier == %@",
+                            request.name,
+                            request.syncedEntityID
+                        )
+                        persistenceRealm.delete(existingRelationships)
+
+                        guard let syncedEntity = persistenceRealm.object(
+                            ofType: SyncedEntity.self,
+                            forPrimaryKey: request.syncedEntityID
+                        ) else { continue }
+                        for (position, targetIdentifier) in
+                            request.targetIdentifiers.enumerated() {
+                            let pendingRelationship = PendingRelationship()
+                            pendingRelationship.relationshipName = request.name
+                            pendingRelationship.forSyncedEntity = syncedEntity
+                            pendingRelationship.targetIdentifier = targetIdentifier
+                            pendingRelationship.position = position
+                            persistenceRealm.add(pendingRelationship)
+                        }
                     }
                 }
-                
-                for processedRequest in chunk {
-                    if let index = pendingRelationshipQueue.firstIndex(where: {
-                        $0.name == processedRequest.name &&
-                        $0.syncedEntityID == processedRequest.syncedEntityID &&
-                        $0.targetIdentifier == processedRequest.targetIdentifier
-                    }) {
-                        pendingRelationshipQueue.remove(at: index)
-                    }
-                }
+                pendingRelationshipQueue.removeFirst(chunk.count)
             } catch {
                 logger.error("Error during persistPendingRelationships: \(error)")
                 throw error
@@ -2088,87 +2123,100 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
         let pendingRelationships = persistenceRealm.objects(PendingRelationship.self)
         guard !pendingRelationships.isEmpty else { return }
-        
-        // De-dupe
-        var duplicatesToDelete = [PendingRelationship]()
-        var uniqueRelationships = Set<String>()
-        for relationship in pendingRelationships {
-            let relationshipName = relationship.relationshipName ?? ""
-            let targetIdentifier = relationship.targetIdentifier ?? ""
-            let syncedEntityID = relationship.forSyncedEntity?.identifier ?? ""
-            let uniqueKey = relationshipName + ":" + targetIdentifier + ":" + syncedEntityID
-            if uniqueRelationships.contains(uniqueKey) {
-                duplicatesToDelete.append(relationship)
-            } else {
-                uniqueRelationships.insert(uniqueKey)
-            }
+
+        struct RelationshipGroupKey: Hashable {
+            let syncedEntityID: String
+            let relationshipName: String
         }
-        if !duplicatesToDelete.isEmpty {
-            //            await persistenceRealm.asyncRefresh()
-            try await persistenceRealm.asyncWrite {
-                persistenceRealm.delete(duplicatesToDelete)
-            }
+        let groupedRelationships = Dictionary(
+            grouping: Array(pendingRelationships)
+        ) { relationship in
+            RelationshipGroupKey(
+                syncedEntityID: relationship.forSyncedEntity?.identifier ?? "",
+                relationshipName: relationship.relationshipName ?? ""
+            )
         }
-        
-        for relationship in Array(pendingRelationships) {
-            let entity = relationship.forSyncedEntity
-            
-            guard let syncedEntity = entity,
+
+        for (key, relationships) in groupedRelationships {
+            guard !key.syncedEntityID.isEmpty,
+                  !key.relationshipName.isEmpty,
+                  let syncedEntity = relationships.first?.forSyncedEntity,
                   syncedEntity.entityState != .deletedLocally && syncedEntity.entityState != .deletedRemotely else { continue }
-            
+
             guard let originObjectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
                 continue
             }
             let objectIdentifier = getObjectIdentifier(for: syncedEntity)
-            guard let originObject = realmProvider.targetReaderRealmPerSchemaName[originObjectClass.className()]?.object(ofType: originObjectClass, forPrimaryKey: objectIdentifier) else { continue }
-            
-            var targetClassName: String?
-            for property in originObject.objectSchema.properties {
-                if property.name == relationship.relationshipName {
-                    targetClassName = property.objectClassName
+            guard let targetRealm = realmProvider.targetReaderRealmPerSchemaName[
+                originObjectClass.className()
+            ], let originObject = targetRealm.object(
+                ofType: originObjectClass,
+                forPrimaryKey: objectIdentifier
+            ) else { continue }
+
+            guard let property = originObject.objectSchema.properties.first(
+                where: { $0.name == key.relationshipName }
+            ), let className = property.objectClassName else { continue }
+            guard let targetObjectClass = realmObjectClass(name: className) else { continue }
+            let targetIdentifiers = relationships
+                .sorted { lhs, rhs in lhs.position < rhs.position }
+                .compactMap(\.targetIdentifier)
+            let relationshipName = key.relationshipName
+            let isArray = property.isArray
+            let isSet = property.isSet
+            var targetObjects = [Object]()
+            targetObjects.reserveCapacity(targetIdentifiers.count)
+            for targetIdentifier in targetIdentifiers {
+                try Task.checkCancellation()
+                guard let parsedIdentifier = getObjectIdentifier(
+                    stringObjectId: targetIdentifier,
+                    entityType: className
+                ), let targetObject = targetRealm.object(
+                    ofType: targetObjectClass,
+                    forPrimaryKey: parsedIdentifier
+                ) else {
+                    targetObjects.removeAll()
                     break
                 }
+                targetObjects.append(targetObject)
             }
-            
-            guard let className = targetClassName else {
-                continue
-            }
-            
-            guard let targetObjectClass = realmObjectClass(name: className) else { continue }
-            let targetObjectIdentifier = getObjectIdentifier(stringObjectId: relationship.targetIdentifier, entityType: className)
-            
-            let relationshipName = relationship.relationshipName
-            let originRef = ThreadSafeReference(to: originObject)
-            let targetExisted = try? await { @RealmBackgroundActor in
-                guard let relationshipName = relationshipName else {
-                    return false
-                }
-                
-                guard let targetObject = realmProvider.targetWriterRealmPerSchemaName[targetObjectClass.className()]?.object(ofType: targetObjectClass, forPrimaryKey: targetObjectIdentifier) else { return false }
-                
-                guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[originObjectClass.className()] else { return false }
-                if let originObject = targetWriterRealm.resolve(originRef) {
-                    //                    await targetWriterRealm.asyncRefresh()
-                    try await targetWriterRealm.asyncWrite {
-                        try Task.checkCancellation()
-                        originObject.setValue(targetObject, forKey: relationshipName)
+            guard targetObjects.count == targetIdentifiers.count else { continue }
+
+            try await targetRealm.asyncWrite {
+                try Task.checkCancellation()
+                if isArray {
+                    guard let collection = originObject[relationshipName]
+                        as? RLMSwiftCollectionBase,
+                          let array = collection._rlmCollection
+                        as? RLMArray<AnyObject> else { return }
+                    array.removeAllObjects()
+                    for targetObject in targetObjects {
+                        array.add(targetObject)
                     }
+                } else if isSet {
+                    guard let collection = originObject[relationshipName]
+                        as? RLMSwiftCollectionBase,
+                          let set = collection._rlmCollection
+                        as? RLMSet<AnyObject> else { return }
+                    set.removeAllObjects()
+                    for targetObject in targetObjects {
+                        set.add(targetObject)
+                    }
+                } else {
+                    originObject.setValue(
+                        targetObjects.first,
+                        forKey: relationshipName
+                    )
                 }
-                return true
-            }()
-            if !(targetExisted ?? false) {
-                continue
             }
-            
-            //            await persistenceRealm.asyncRefresh()
+
             try await persistenceRealm.asyncWrite {
-                persistenceRealm.delete(relationship)
+                persistenceRealm.delete(relationships)
             }
-            
+
             await Task.yield()
             try Task.checkCancellation()
         }
-        debugPrint("Finished applying pending relationships")
     }
     
     @BigSyncBackgroundActor

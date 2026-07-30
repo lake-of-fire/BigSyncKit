@@ -322,6 +322,29 @@ private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
     }
 }
 
+@objc(BigSyncRelationshipChild)
+private final class BigSyncRelationshipChild: Object, ChangeMetadataRecordable,
+SoftDeletable {
+    @Persisted(primaryKey: true) var id = ""
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+}
+
+@objc(BigSyncRelationshipParent)
+private final class BigSyncRelationshipParent: Object, ChangeMetadataRecordable,
+SoftDeletable {
+    @Persisted(primaryKey: true) var id = ""
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+    @Persisted var children: List<BigSyncRelationshipChild>
+    @Persisted var relatedChildren: MutableSet<BigSyncRelationshipChild>
+    @Persisted var favoriteChild: BigSyncRelationshipChild?
+}
+
 final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testDatabaseSubscriptionIsSavedExactlyOnce() async {
@@ -1392,6 +1415,136 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testRemoteRelationshipCollectionsReplaceAtomicallyAndPreserveListOrder()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let staleChild = BigSyncRelationshipChild()
+        staleChild.id = "stale"
+        let firstChild = BigSyncRelationshipChild()
+        firstChild.id = "first"
+        let secondChild = BigSyncRelationshipChild()
+        secondChild.id = "second"
+        let parent = BigSyncRelationshipParent()
+        parent.id = "parent"
+        parent.children.append(staleChild)
+        parent.relatedChildren.insert(staleChild)
+        parent.favoriteChild = staleChild
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(
+                [staleChild, firstChild, secondChild, parent],
+                update: .modified
+            )
+        }
+
+        let record = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["children"] = [
+            "\(BigSyncRelationshipChild.className()).second",
+            "\(BigSyncRelationshipChild.className()).first",
+        ] as CKRecordValue
+        record["relatedChildren"] = [
+            "\(BigSyncRelationshipChild.className()).first",
+            "\(BigSyncRelationshipChild.className()).second",
+        ] as CKRecordValue
+        record["favoriteChild"] =
+            "\(BigSyncRelationshipChild.className()).first" as CKRecordValue
+        record["modifiedAt"] = Date().addingTimeInterval(60) as CKRecordValue
+        record["explicitlyModifiedAt"] =
+            Date().addingTimeInterval(60) as CKRecordValue
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.persistImportedChanges()
+        await fixture.targetRealm.asyncRefresh()
+
+        let refreshedParent = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncRelationshipParent.self,
+                forPrimaryKey: parent.id
+            )
+        )
+        XCTAssertEqual(refreshedParent.children.map(\.id), ["second", "first"])
+        XCTAssertEqual(
+            Set(refreshedParent.relatedChildren.map(\.id)),
+            Set(["first", "second"])
+        )
+        XCTAssertEqual(refreshedParent.favoriteChild?.id, "first")
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self).count,
+            0
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRemoteRelationshipCollectionWaitsForEveryTargetBeforeReplacement()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let staleChild = BigSyncRelationshipChild()
+        staleChild.id = "stale"
+        let availableChild = BigSyncRelationshipChild()
+        availableChild.id = "available"
+        let parent = BigSyncRelationshipParent()
+        parent.id = "parent"
+        parent.children.append(staleChild)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(
+                [staleChild, availableChild, parent],
+                update: .modified
+            )
+        }
+
+        let record = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["children"] = [
+            "\(BigSyncRelationshipChild.className()).available",
+            "\(BigSyncRelationshipChild.className()).late",
+        ] as CKRecordValue
+        record["modifiedAt"] = Date().addingTimeInterval(60) as CKRecordValue
+        record["explicitlyModifiedAt"] =
+            Date().addingTimeInterval(60) as CKRecordValue
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.persistImportedChanges()
+        await fixture.targetRealm.asyncRefresh()
+        XCTAssertEqual(
+            fixture.targetRealm.object(
+                ofType: BigSyncRelationshipParent.self,
+                forPrimaryKey: parent.id
+            )?.children.map(\.id),
+            ["stale"]
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self).count,
+            2
+        )
+
+        let lateChild = BigSyncRelationshipChild()
+        lateChild.id = "late"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(lateChild)
+        }
+        try await fixture.adapter.persistImportedChanges()
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertEqual(
+            fixture.targetRealm.object(
+                ofType: BigSyncRelationshipParent.self,
+                forPrimaryKey: parent.id
+            )?.children.map(\.id),
+            ["available", "late"]
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self).count,
+            0
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testSetupDrainsJournalWithoutStartingSynchronization() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let delegate = FakeModelAdapterDelegate()
@@ -1532,6 +1685,8 @@ final class BigSyncKitTests: XCTestCase {
         targetConfiguration.inMemoryIdentifier = "target-\(identifier)"
         targetConfiguration.objectTypes = [
             BigSyncTrackedObject.self,
+            BigSyncRelationshipChild.self,
+            BigSyncRelationshipParent.self,
             BigSyncPendingMutation.self,
         ]
 
