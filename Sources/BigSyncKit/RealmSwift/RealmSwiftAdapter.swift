@@ -800,8 +800,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     private func forwardPendingMutations(in targetReaderRealm: Realm) async throws -> Int {
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else { return 0 }
-        let trackedClassNames = BigSyncMutationTrackingRegistry.trackedClassNames(
-            in: targetReaderRealm
+        // Managed writes journal from the Realm schema alone so they remain
+        // durable even before the synchronizer is configured. Apply this
+        // adapter's model/exclusion policy only when forwarding.
+        let trackedClassNames = Set(
+            targetReaderRealm.schema.objectSchema
+                .map(\.className)
+                .filter {
+                    !excludedClassNames.contains($0) &&
+                    realmObjectClass(name: $0) != nil
+                }
         )
         let unboundMutations = BigSyncMutationTrackingRegistry.unboundMutations(
             for: trackedClassNames
@@ -853,7 +861,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
         // Snapshot before retiring rows below; Realm Results are live and their
         // collection indices become invalid as the write transaction deletes.
-        let pending: [BigSyncPendingMutationSnapshot] = Array(mutations).map { mutation in
+        let snapshots: [BigSyncPendingMutationSnapshot] = Array(mutations).map { mutation in
             BigSyncPendingMutationSnapshot(
                 recordName: mutation.recordName,
                 entityType: mutation.entityType,
@@ -861,6 +869,25 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 generation: mutation.generation,
                 changedAt: mutation.changedAt
             )
+        }
+        let pending = snapshots.filter {
+            trackedClassNames.contains($0.entityType)
+        }
+        let excluded = snapshots.filter {
+            !trackedClassNames.contains($0.entityType)
+        }
+        if !excluded.isEmpty {
+            try await targetReaderRealm.asyncWrite {
+                for mutation in excluded {
+                    guard let pendingMutation = targetReaderRealm.object(
+                        ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: mutation.recordName
+                    ), pendingMutation.generation == mutation.generation else {
+                        continue
+                    }
+                    targetReaderRealm.delete(pendingMutation)
+                }
+            }
         }
         guard !pending.isEmpty else { return 0 }
 

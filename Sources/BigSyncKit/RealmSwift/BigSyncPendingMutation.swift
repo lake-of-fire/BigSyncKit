@@ -4,8 +4,9 @@ import RealmSwift
 /// A durable, record-level local mutation journal stored in the target Realm.
 ///
 /// Application writes update this object in the same Realm transaction as the
-/// model object. BigSyncKit forwards its generation to the separate tracking
-/// Realm and only removes the row after that exact generation is uploaded.
+/// model object. BigSyncKit transfers each generation to its separate tracking
+/// Realm before retiring the target-Realm row. The tracking Realm then owns that
+/// generation durably until CloudKit acknowledges it.
 public final class BigSyncPendingMutation: Object {
     @Persisted(primaryKey: true) public var recordName = ""
     @Persisted(indexed: true) public var entityType = ""

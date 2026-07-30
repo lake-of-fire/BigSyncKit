@@ -25,6 +25,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var completesModifyOperations = true
     var reportsDeletedRecordsAsUnknownItems = false
     var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
+    var recordToSeedBeforeNextConditionalSave: CKRecord?
     var accountIdentifier = "test-account"
     var accountIdentifierAfterNextZoneDeletion: String?
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
@@ -40,6 +41,11 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             }
             let savedRecords = modifyOperation.recordsToSave ?? []
             let deletedRecordIDs = modifyOperation.recordIDsToDelete ?? []
+            if modifyOperation.savePolicy == .ifServerRecordUnchanged,
+               let record = recordToSeedBeforeNextConditionalSave {
+                records[record.recordID] = record
+                recordToSeedBeforeNextConditionalSave = nil
+            }
             let partialSaveErrors = partialSaveErrorsByRecordID.filter {
                 savedRecords.map(\.recordID).contains($0.key)
             }
@@ -516,7 +522,7 @@ final class BigSyncKitTests: XCTestCase {
     func testOneOffZoneResetDoesNotStealAnActiveClaim() async throws {
         let database = FakeCloudKitDatabase()
         let claimID = CKRecord.ID(
-            recordName: "BigSyncKitMigration.active-lease-v1.claim"
+            recordName: "BigSyncKitMigration.active-lease-v1.state"
         )
         let claim = CKRecord(recordType: "ExistingRecordType", recordID: claimID)
         claim["owner"] = "another-device" as CKRecordValue
@@ -552,7 +558,7 @@ final class BigSyncKitTests: XCTestCase {
     func testOneOffZoneResetTakesOverAnExpiredClaimWithoutDeletingItFirst() async throws {
         let database = FakeCloudKitDatabase()
         let claimID = CKRecord.ID(
-            recordName: "BigSyncKitMigration.expired-lease-v1.claim"
+            recordName: "BigSyncKitMigration.expired-lease-v1.state"
         )
         let claim = CKRecord(recordType: "ExistingRecordType", recordID: claimID)
         claim["owner"] = "offline-device" as CKRecordValue
@@ -578,6 +584,76 @@ final class BigSyncKitTests: XCTestCase {
 
         XCTAssertEqual(result, .performedCloudReset)
         XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetHonorsCompletionThatWinsTheInitialClaimRace() async throws {
+        let database = FakeCloudKitDatabase()
+        let markerID = CKRecord.ID(
+            recordName: "BigSyncKitMigration.completion-race-v1.state"
+        )
+        let completed = CKRecord(
+            recordType: "ExistingRecordType",
+            recordID: markerID
+        )
+        completed["owner"] = "completed:other-device" as CKRecordValue
+        completed["lease"] = Date() as CKRecordValue
+        database.recordToSeedBeforeNextConditionalSave = completed
+
+        let zoneID = CKRecordZone.ID(
+            zoneName: "completion-race-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        synchronizer.addModelAdapter(adapter)
+
+        let result = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+            migrationIdentifier: "completion-race-v1",
+            markerRecordType: "ExistingRecordType",
+            markerOwnerField: "owner",
+            markerLeaseDateField: "lease"
+        )
+
+        XCTAssertEqual(result, .cloudResetAlreadyCompleted)
+        XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+        XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetNeverTreatsCompletedStateAsAnExpiredClaim() async throws {
+        let database = FakeCloudKitDatabase()
+        let markerID = CKRecord.ID(
+            recordName: "BigSyncKitMigration.terminal-completion-v1.state"
+        )
+        let completed = CKRecord(
+            recordType: "ExistingRecordType",
+            recordID: markerID
+        )
+        completed["owner"] = "completed:offline-device" as CKRecordValue
+        completed["lease"] =
+            Date(timeIntervalSinceNow: -24 * 60 * 60) as CKRecordValue
+        database.seed(completed)
+
+        let zoneID = CKRecordZone.ID(
+            zoneName: "terminal-completion-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        synchronizer.addModelAdapter(adapter)
+
+        let result = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+            migrationIdentifier: "terminal-completion-v1",
+            markerRecordType: "ExistingRecordType",
+            markerOwnerField: "owner",
+            markerLeaseDateField: "lease",
+            leaseDuration: 1
+        )
+
+        XCTAssertEqual(result, .cloudResetAlreadyCompleted)
+        XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+        XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
     }
 
     @BigSyncBackgroundActor
@@ -1356,6 +1432,123 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: recordName
             )?.entityState,
             .new
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testManagedWriteBeforeAdapterConfigurationIsJournaledAndLaterForwarded() async throws {
+        let identifier = UUID().uuidString
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier = "preconfiguration-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let targetRealm = try await Realm(
+            configuration: targetConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let object = BigSyncTrackedObject(
+            id: "before-adapter",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await targetRealm.asyncWrite {
+            targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+
+        let recordName = BigSyncTrackedObject.className() + ".before-adapter"
+        XCTAssertNotNil(
+            targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+
+        var persistenceConfiguration = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier = "preconfiguration-persistence-\(identifier)"
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "preconfiguration-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        try await adapter.resetSyncCaches()
+        adapter.invalidateTokens()
+
+        XCTAssertNotNil(
+            adapter.realmProvider?.persistenceRealm?.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNil(
+            targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testManagedJournalForExcludedTypeIsRetiredWithoutForwarding() async throws {
+        let identifier = UUID().uuidString
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier = "excluded-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let targetRealm = try await Realm(
+            configuration: targetConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let object = BigSyncTrackedObject(
+            id: "excluded",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await targetRealm.asyncWrite {
+            targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+
+        var persistenceConfiguration = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier = "excluded-persistence-\(identifier)"
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [BigSyncTrackedObject.className()],
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "excluded-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        try await adapter.resetSyncCaches()
+        adapter.invalidateTokens()
+
+        let recordName = BigSyncTrackedObject.className() + ".excluded"
+        XCTAssertNil(
+            adapter.realmProvider?.persistenceRealm?.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNil(
+            targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
         )
     }
 

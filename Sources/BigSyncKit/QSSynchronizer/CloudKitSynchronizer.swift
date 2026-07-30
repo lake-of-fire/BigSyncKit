@@ -689,10 +689,10 @@ public class CloudKitSynchronizer: NSObject {
 
     /// Coordinates a destructive zone reset across all of a user's devices.
     ///
-    /// Claim and completion records live in CloudKit's default zone, so deleting
-    /// the custom sync zone does not delete the coordination state. Every device
-    /// still rebuilds its local tracking once, but only the device that wins the
-    /// claim deletes the shared custom zone.
+    /// A terminal claim/completion state record lives in CloudKit's default zone,
+    /// so deleting the custom sync zone does not delete coordination state. Every
+    /// device still rebuilds its local tracking once, but only the device that
+    /// transitions the marker from an active claim deletes the shared custom zone.
     ///
     /// `markerRecordType`, `markerOwnerField`, and `markerLeaseDateField` must
     /// already exist with String and Date types in the production CloudKit schema.
@@ -705,8 +705,7 @@ public class CloudKitSynchronizer: NSObject {
         leaseDuration: TimeInterval = 15 * 60
     ) async throws -> OneOffRecordZoneResetResult {
         let markerPrefix = "BigSyncKitMigration.\(String(migrationIdentifier.prefix(120)))"
-        let claimRecordID = CKRecord.ID(recordName: "\(markerPrefix).claim")
-        let completionRecordID = CKRecord.ID(recordName: "\(markerPrefix).completed")
+        let markerRecordID = CKRecord.ID(recordName: "\(markerPrefix).state")
         let accountIdentifier = try await accountIdentifierProvider()
         if let previousAccountIdentifier =
             keyValueStore.object(forKey: cloudKitAccountIdentifierKey) as? String,
@@ -726,21 +725,9 @@ public class CloudKitSynchronizer: NSObject {
                 value: accountIdentifier,
                 forKey: cloudKitAccountIdentifierKey
             )
-            accountValidationRequired = false
-            return .cloudResetAlreadyCompleted
-        }
-
-        if try await fetchRecord(completionRecordID) != nil {
-            try await ensureCurrentAccount(accountIdentifier)
-            try await rebuildLocalSyncCachesAfterCompletedReset()
-            try await ensureCurrentAccount(accountIdentifier)
-            keyValueStore.set(boolValue: true, forKey: localCompletionKey)
-            keyValueStore.set(
-                value: accountIdentifier,
-                forKey: cloudKitAccountIdentifierKey
-            )
-            accountValidationRequired = false
-            keyValueStore.removeObject(forKey: localClaimTokenKey)
+            // Normal synchronization validates again immediately before using
+            // the database, closing the final account-transition window.
+            accountValidationRequired = true
             return .cloudResetAlreadyCompleted
         }
 
@@ -748,14 +735,21 @@ public class CloudKitSynchronizer: NSObject {
             keyValueStore.object(forKey: localClaimTokenKey) as? String
             ?? UUID().uuidString
         do {
-            try await acquireOrRenewResetClaim(
-                recordID: claimRecordID,
+            let outcome = try await acquireOrRenewResetClaim(
+                recordID: markerRecordID,
                 recordType: markerRecordType,
                 ownerField: markerOwnerField,
                 leaseDateField: markerLeaseDateField,
                 claimToken: claimToken,
                 leaseDuration: leaseDuration
             )
+            if outcome == .completed {
+                return try await finishObservedCompletedReset(
+                    accountIdentifier: accountIdentifier,
+                    localCompletionKey: localCompletionKey,
+                    localClaimTokenKey: localClaimTokenKey
+                )
+            }
             keyValueStore.set(value: claimToken, forKey: localClaimTokenKey)
         } catch {
             if isServerRecordChanged(error) {
@@ -770,14 +764,21 @@ public class CloudKitSynchronizer: NSObject {
 
         try await ensureCurrentAccount(accountIdentifier)
         for zoneID in Set(modelAdapters.map(\.recordZoneID)) {
-            try await acquireOrRenewResetClaim(
-                recordID: claimRecordID,
+            let outcome = try await acquireOrRenewResetClaim(
+                recordID: markerRecordID,
                 recordType: markerRecordType,
                 ownerField: markerOwnerField,
                 leaseDateField: markerLeaseDateField,
                 claimToken: claimToken,
                 leaseDuration: leaseDuration
             )
+            if outcome == .completed {
+                return try await finishObservedCompletedReset(
+                    accountIdentifier: accountIdentifier,
+                    localCompletionKey: localCompletionKey,
+                    localClaimTokenKey: localClaimTokenKey
+                )
+            }
             do {
                 try await deleteRecordZone(zoneID)
             } catch {
@@ -793,48 +794,56 @@ public class CloudKitSynchronizer: NSObject {
             }
             try await ensureCurrentAccount(accountIdentifier)
         }
-        try await acquireOrRenewResetClaim(
-            recordID: claimRecordID,
+        let preResetOutcome = try await acquireOrRenewResetClaim(
+            recordID: markerRecordID,
             recordType: markerRecordType,
             ownerField: markerOwnerField,
             leaseDateField: markerLeaseDateField,
             claimToken: claimToken,
             leaseDuration: leaseDuration
         )
+        if preResetOutcome == .completed {
+            return try await finishObservedCompletedReset(
+                accountIdentifier: accountIdentifier,
+                localCompletionKey: localCompletionKey,
+                localClaimTokenKey: localClaimTokenKey
+            )
+        }
         try await ensureCurrentAccount(accountIdentifier)
         try await resetSyncCaches(
             cancelSynchronization: false,
             includingAdapters: true
         )
 
-        try await acquireOrRenewResetClaim(
-            recordID: claimRecordID,
+        let preCompletionOutcome = try await acquireOrRenewResetClaim(
+            recordID: markerRecordID,
             recordType: markerRecordType,
             ownerField: markerOwnerField,
             leaseDateField: markerLeaseDateField,
             claimToken: claimToken,
             leaseDuration: leaseDuration
         )
-        try await ensureCurrentAccount(accountIdentifier)
-        do {
-            let completionRecord = CKRecord(
-                recordType: markerRecordType,
-                recordID: completionRecordID
+        if preCompletionOutcome == .completed {
+            return try await finishObservedCompletedReset(
+                accountIdentifier: accountIdentifier,
+                localCompletionKey: localCompletionKey,
+                localClaimTokenKey: localClaimTokenKey
             )
-            completionRecord[markerOwnerField] = claimToken as CKRecordValue
-            completionRecord[markerLeaseDateField] = Date() as CKRecordValue
-            _ = try await saveMigrationMarker(completionRecord)
-        } catch {
-            guard isServerRecordChanged(error) else { throw error }
         }
+        try await ensureCurrentAccount(accountIdentifier)
+        try await completeResetClaim(
+            recordID: markerRecordID,
+            ownerField: markerOwnerField,
+            leaseDateField: markerLeaseDateField,
+            claimToken: claimToken
+        )
         keyValueStore.set(boolValue: true, forKey: localCompletionKey)
         keyValueStore.set(
             value: accountIdentifier,
             forKey: cloudKitAccountIdentifierKey
         )
-        accountValidationRequired = false
+        accountValidationRequired = true
         keyValueStore.removeObject(forKey: localClaimTokenKey)
-        try? await deleteRecord(claimRecordID)
         cancelSync = false
         ChangeRequestProcessor.shared.cancelSync = false
         cancelledDueToUnauthentication = false
@@ -854,6 +863,34 @@ public class CloudKitSynchronizer: NSObject {
         ChangeRequestProcessor.shared.cancelSync = false
     }
 
+    private enum ResetClaimOutcome: Equatable {
+        case acquired
+        case completed
+    }
+
+    private static let resetClaimPrefix = "claim:"
+    private static let resetCompletedPrefix = "completed:"
+
+    @BigSyncBackgroundActor
+    private func finishObservedCompletedReset(
+        accountIdentifier: String,
+        localCompletionKey: String,
+        localClaimTokenKey: String
+    ) async throws -> OneOffRecordZoneResetResult {
+        try await ensureCurrentAccount(accountIdentifier)
+        try await rebuildLocalSyncCachesAfterCompletedReset()
+        try await ensureCurrentAccount(accountIdentifier)
+        keyValueStore.set(boolValue: true, forKey: localCompletionKey)
+        keyValueStore.set(
+            value: accountIdentifier,
+            forKey: cloudKitAccountIdentifierKey
+        )
+        accountValidationRequired = true
+        keyValueStore.removeObject(forKey: localClaimTokenKey)
+        cancelledDueToUnauthentication = false
+        return .cloudResetAlreadyCompleted
+    }
+
     @BigSyncBackgroundActor
     private func acquireOrRenewResetClaim(
         recordID: CKRecord.ID,
@@ -862,10 +899,16 @@ public class CloudKitSynchronizer: NSObject {
         leaseDateField: String,
         claimToken: String,
         leaseDuration: TimeInterval
-    ) async throws {
+    ) async throws -> ResetClaimOutcome {
         let now = Date()
         if let claim = try await fetchRecord(recordID) {
-            let existingOwner = claim[ownerField] as? String
+            let rawState = claim[ownerField] as? String ?? ""
+            if rawState.hasPrefix(Self.resetCompletedPrefix) {
+                return .completed
+            }
+            let existingOwner = rawState.hasPrefix(Self.resetClaimPrefix)
+                ? String(rawState.dropFirst(Self.resetClaimPrefix.count))
+                : rawState
             let leaseDate =
                 claim[leaseDateField] as? Date
                 ?? claim.modificationDate
@@ -875,14 +918,73 @@ public class CloudKitSynchronizer: NSObject {
                     || now.timeIntervalSince(leaseDate) >= leaseDuration else {
                 throw OneOffRecordZoneResetError.migrationInProgress
             }
-            claim[ownerField] = claimToken as CKRecordValue
+            claim[ownerField] =
+                (Self.resetClaimPrefix + claimToken) as CKRecordValue
             claim[leaseDateField] = now as CKRecordValue
-            _ = try await saveMigrationMarker(claim)
+            do {
+                _ = try await saveMigrationMarker(claim)
+            } catch {
+                if isServerRecordChanged(error),
+                   let latest = try await fetchRecord(recordID),
+                   (latest[ownerField] as? String)?
+                    .hasPrefix(Self.resetCompletedPrefix) == true {
+                    return .completed
+                }
+                throw error
+            }
         } else {
             let claim = CKRecord(recordType: recordType, recordID: recordID)
-            claim[ownerField] = claimToken as CKRecordValue
+            claim[ownerField] =
+                (Self.resetClaimPrefix + claimToken) as CKRecordValue
             claim[leaseDateField] = now as CKRecordValue
-            _ = try await saveMigrationMarker(claim)
+            do {
+                _ = try await saveMigrationMarker(claim)
+            } catch {
+                if isServerRecordChanged(error),
+                   let latest = try await fetchRecord(recordID),
+                   (latest[ownerField] as? String)?
+                    .hasPrefix(Self.resetCompletedPrefix) == true {
+                    return .completed
+                }
+                throw error
+            }
+        }
+        return .acquired
+    }
+
+    @BigSyncBackgroundActor
+    private func completeResetClaim(
+        recordID: CKRecord.ID,
+        ownerField: String,
+        leaseDateField: String,
+        claimToken: String
+    ) async throws {
+        guard let marker = try await fetchRecord(recordID) else {
+            throw OneOffRecordZoneResetError.migrationInProgress
+        }
+        let rawState = marker[ownerField] as? String ?? ""
+        if rawState.hasPrefix(Self.resetCompletedPrefix) {
+            return
+        }
+        let owner = rawState.hasPrefix(Self.resetClaimPrefix)
+            ? String(rawState.dropFirst(Self.resetClaimPrefix.count))
+            : rawState
+        guard owner == claimToken else {
+            throw OneOffRecordZoneResetError.migrationInProgress
+        }
+        marker[ownerField] =
+            (Self.resetCompletedPrefix + claimToken) as CKRecordValue
+        marker[leaseDateField] = Date() as CKRecordValue
+        do {
+            _ = try await saveMigrationMarker(marker)
+        } catch {
+            if isServerRecordChanged(error),
+               let latest = try await fetchRecord(recordID),
+               (latest[ownerField] as? String)?
+                .hasPrefix(Self.resetCompletedPrefix) == true {
+                return
+            }
+            throw error
         }
     }
 

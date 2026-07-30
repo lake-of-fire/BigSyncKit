@@ -72,7 +72,6 @@ public extension ChangeMetadataRecordable {
             return
         }
         guard realm.isInWriteTransaction,
-              BigSyncMutationTrackingRegistry.tracks(className: entityType, in: realm),
               realm.schema.objectSchema.contains(where: {
                   $0.className == BigSyncPendingMutation.className()
               }) else {
