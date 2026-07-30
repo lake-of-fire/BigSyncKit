@@ -19,6 +19,13 @@ private final class NoopAdapterProvider: NSObject, AdapterProvider {
     func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async {}
 }
 
+private struct FakeZoneChangePage {
+    let zoneID: CKRecordZone.ID
+    let records: [CKRecord]
+    let deletedRecordIDs: [CKRecord.ID]
+    let moreComing: Bool
+}
+
 private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @unchecked Sendable {
     var databaseScope: CKDatabase.Scope { .private }
     var deleteZoneError: Error?
@@ -27,13 +34,40 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
     var accountIdentifier = "test-account"
     var accountIdentifierAfterNextZoneDeletion: String?
+    var zoneChangePages = [FakeZoneChangePage]()
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
     private(set) var savedSubscriptionCount = 0
     private(set) var modifySubscriptionOperationCount = 0
+    private(set) var fetchZoneChangesOperationCount = 0
     private var records = [CKRecord.ID: CKRecord]()
     private var conditionallyFetchedRecordIDs = Set<CKRecord.ID>()
 
     func add(_ operation: CKDatabaseOperation) {
+        if let fetchOperation =
+            operation as? CKFetchRecordZoneChangesOperation,
+           !zoneChangePages.isEmpty {
+            fetchZoneChangesOperationCount += 1
+            let page = zoneChangePages.removeFirst()
+            for record in page.records {
+                fetchOperation.recordChangedBlock?(record)
+            }
+            for recordID in page.deletedRecordIDs {
+                fetchOperation.recordWithIDWasDeletedBlock?(
+                    recordID,
+                    recordID.recordName.split(separator: ".", maxSplits: 1)
+                        .first.map(String.init) ?? "Record"
+                )
+            }
+            fetchOperation.recordZoneFetchCompletionBlock?(
+                page.zoneID,
+                nil,
+                nil,
+                page.moreComing,
+                nil
+            )
+            fetchOperation.fetchRecordZoneChangesCompletionBlock?(nil)
+            return
+        }
         if operation is CKModifySubscriptionsOperation {
             modifySubscriptionOperationCount += 1
         }
@@ -184,6 +218,21 @@ private final class FakeModelAdapterDelegate: ModelAdapterDelegate {
     }
 }
 
+private actor AsyncGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation {
+            continuation = $0
+        }
+    }
+
+    func open() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter, @unchecked Sendable {
     let recordZoneID: CKRecordZone.ID
     let priorityEntityTypeNames: [String]
@@ -195,6 +244,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     private var uploadedByEntity: [String: [CKRecord]]
     private var deletedByEntity: [String: [CKRecord.ID]]
     private var storedServerChangeToken: CKServerChangeToken?
+    var didFinishImportHandler: (@Sendable () async -> Void)?
 
     var hasChanges: Bool {
         uploadedByEntity.values.contains(where: { !$0.isEmpty }) ||
@@ -285,7 +335,9 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
         let recordNames = forRecordIDs.map(\.recordName).joined(separator: ",")
         events.append("deleteTracking:\(recordNames)")
     }
-    func didFinishImport() async {}
+    func didFinishImport() async {
+        await didFinishImportHandler?()
+    }
     func cancelSynchronization() {}
     func unsetCancellation() async throws {
         events.append("unsetCancellation")
@@ -346,6 +398,113 @@ SoftDeletable {
 }
 
 final class BigSyncKitTests: XCTestCase {
+    @BigSyncBackgroundActor
+    func testZoneChangesAreDeliveredAndCommittedOnePageAtATime() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(
+            zoneName: "paged-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        database.zoneChangePages = [
+            FakeZoneChangePage(
+                zoneID: zoneID,
+                records: [makeRecord(type: "Item", id: "first", zoneID: zoneID)],
+                deletedRecordIDs: [],
+                moreComing: true
+            ),
+            FakeZoneChangePage(
+                zoneID: zoneID,
+                records: [],
+                deletedRecordIDs: [],
+                moreComing: false
+            ),
+        ]
+        var deliveredPages = [[String]]()
+        var finishCount = 0
+        let finished = expectation(description: "all pages")
+        let operation = FetchZoneChangesOperation(
+            database: database,
+            zoneIDs: [zoneID],
+            zoneChangeTokens: [:],
+            modelVersion: 0,
+            ignoreDeviceIdentifier: nil,
+            desiredKeys: nil,
+            completion: { results in
+                deliveredPages.append(
+                    results[zoneID]?.downloadedRecords.map(
+                        \.recordID.recordName
+                    ) ?? []
+                )
+            },
+            didFinishPages: {
+                finishCount += 1
+                finished.fulfill()
+            }
+        )
+
+        operation.start()
+        await fulfillment(of: [finished], timeout: 1)
+
+        XCTAssertEqual(deliveredPages, [["Item.first"], []])
+        XCTAssertEqual(finishCount, 1)
+        XCTAssertEqual(database.fetchZoneChangesOperationCount, 2)
+        XCTAssertTrue(operation.isFinished)
+    }
+
+    @BigSyncBackgroundActor
+    func testStaleOperationFailureCannotFailANewerSynchronizationAttempt() async {
+        let synchronizer = makeSynchronizer()
+        synchronizer.syncing = true
+        let operation = CloudKitSynchronizerOperation()
+        synchronizer.runOperation(operation)
+        for _ in 0..<100 where !operation.isExecuting {
+            await Task.yield()
+        }
+        XCTAssertTrue(operation.isExecuting)
+
+        synchronizer.synchronizationAttemptID = UUID()
+        operation.finish(
+            error: NSError(
+                domain: "BigSyncKitTests.StaleOperation",
+                code: 1
+            )
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertTrue(synchronizer.syncing)
+        synchronizer.cancelSynchronization()
+    }
+
+    @BigSyncBackgroundActor
+    func testFinishingAnOldAttemptCannotEndANewerAttemptAfterActorReentry() async {
+        let synchronizer = makeSynchronizer()
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "finish-race-zone"),
+            priorities: []
+        )
+        let gate = AsyncGate()
+        let enteredFinish = expectation(description: "old attempt entered finish")
+        adapter.didFinishImportHandler = {
+            enteredFinish.fulfill()
+            await gate.wait()
+        }
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.syncing = true
+
+        let oldFinish = Task { @BigSyncBackgroundActor in
+            await synchronizer.changesFinishedSynchronizing()
+        }
+        await fulfillment(of: [enteredFinish], timeout: 1)
+
+        synchronizer.synchronizationAttemptID = UUID()
+        synchronizer.syncing = true
+        await gate.open()
+        await oldFinish.value
+
+        XCTAssertTrue(synchronizer.syncing)
+        synchronizer.cancelSynchronization()
+    }
+
     @BigSyncBackgroundActor
     func testDatabaseSubscriptionIsSavedExactlyOnce() async {
         let database = FakeCloudKitDatabase()

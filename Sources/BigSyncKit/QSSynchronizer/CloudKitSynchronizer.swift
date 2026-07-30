@@ -399,15 +399,13 @@ public class CloudKitSynchronizer: NSObject {
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     internal var synchronizationTask: Task<Void, Never>?
-    internal var modifyRecordsTask: Task<Void, Error>?
-    internal var fetchDatabaseChangesTask: Task<Void, Error>?
-    internal var fetchZoneChangesTask: Task<Void, Error>?
     internal var mergeChangesTask: Task<Void, Error>?
     internal var fetchZoneChangesCompletionTask: Task<Void, Error>? = nil
 
     internal var lastDatabaseChangesEmptyAt: Date?
     internal var lastZoneChangesEmptyAt: Date?
     internal let changeRequestProcessor = ChangeRequestProcessor()
+    internal var synchronizationAttemptID = UUID()
     internal var synchronizationRunID = UUID()
  
     internal let logger: Logging.Logger
@@ -546,12 +544,17 @@ public class CloudKitSynchronizer: NSObject {
         logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
         cancelSync = false
         syncing = true
+        let attemptID = UUID()
+        synchronizationAttemptID = attemptID
 
         synchronizationTask?.cancel()
         synchronizationTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
             do {
                 try await validateSynchronizationAccount()
+                guard synchronizationAttemptID == attemptID else {
+                    throw CancellationError()
+                }
                 synchronizationRunID = changeRequestProcessor.beginRun()
                 for adapter in modelAdapters {
                     try await adapter.unsetCancellation()
@@ -559,6 +562,7 @@ public class CloudKitSynchronizer: NSObject {
                 try Task.checkCancellation()
                 await performSynchronization()
             } catch {
+                guard synchronizationAttemptID == attemptID else { return }
                 await failSynchronization(error: error)
             }
         }
@@ -605,11 +609,9 @@ public class CloudKitSynchronizer: NSObject {
     @objc public func cancelSynchronization() {
         //        guard syncing, !cancelSync else { return }
         
+        synchronizationAttemptID = UUID()
         changeRequestProcessor.reset()
         synchronizationTask?.cancel()
-        modifyRecordsTask?.cancel()
-        fetchDatabaseChangesTask?.cancel()
-        fetchZoneChangesTask?.cancel()
         mergeChangesTask?.cancel()
         fetchZoneChangesCompletionTask?.cancel()
 
