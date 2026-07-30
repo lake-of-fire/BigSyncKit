@@ -177,6 +177,7 @@ extension CloudKitSynchronizer {
     
 //    @BigSyncBackgroundActor
     func runOperation(_ operation: CloudKitSynchronizerOperation) {
+        let runID = synchronizationRunID
         //        logger.info("QSCloudKitSynchronizer >> Enqueue operation: \(type(of: operation))")
         operation.logger = logger
         operation.errorHandler = { [weak self] operation, error in
@@ -185,10 +186,12 @@ extension CloudKitSynchronizer {
                 // Conflict error: skip logging and failing synchronization
                 return
             }
-            logger.error("QSCloudKitSynchronizer >> Operation error (\(type(of: operation))): \(error)")
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self else { return }
-            
+                guard let self,
+                      synchronizationRunID == runID else { return }
+                logger.error(
+                    "QSCloudKitSynchronizer >> Operation error (\(type(of: operation))): \(error)"
+                )
                 await failSynchronization(error: error)
             }
         }
@@ -374,8 +377,10 @@ extension CloudKitSynchronizer {
         
         postNotification(.SynchronizerWillFetchChanges)
         
+        let runID = synchronizationRunID
         await fetchDatabaseChanges() { [weak self] token, error in
-            guard let self else { return }
+            guard let self,
+                  synchronizationRunID == runID else { return }
             if let error {
                 await failSynchronization(error: error)
                 return
@@ -399,59 +404,67 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func fetchDatabaseChanges(completion: @escaping (CKServerChangeToken?, Error?) async throws -> ()) async {
         //        debugPrint("# fetchDatabaseChanges() (calls FetchDatabaseChangesOperation)") //, containerIdentifier, serverChangeToken)
+        let runID = synchronizationRunID
         let operation = await FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { [weak self] (token, changedZoneIDs, deletedZoneIDs) in
             guard let self else { return }
-            fetchDatabaseChangesTask?.cancel()
-            fetchDatabaseChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self else { return }
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                guard let self,
+                      synchronizationRunID == runID else { return }
+                fetchDatabaseChangesTask?.cancel()
+                fetchDatabaseChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                    guard let self,
+                          synchronizationRunID == runID else { return }
                 
-                try Task.checkCancellation()
-                guard !cancelSync else {
-                    await failSynchronization(error: SyncError.cancelled)
-                    return
-                }
+                    try Task.checkCancellation()
+                    guard !cancelSync else {
+                        await failSynchronization(error: SyncError.cancelled)
+                        return
+                    }
                 
-                await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                    await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 
-                let zoneIDsToFetch = try await loadTokens(for: changedZoneIDs, loadAdapters: true)
+                    let zoneIDsToFetch = try await loadTokens(for: changedZoneIDs, loadAdapters: true)
                 
-                //                debugPrint("# zoneIDsToFetch", zoneIDsToFetch)
-                guard zoneIDsToFetch.count > 0 else {
-                    self.lastDatabaseChangesEmptyAt = Date()
-                    await self.resetActiveTokens()
-                    try await completion(token, nil)
-                    return
-                }
-                
-                lastDatabaseChangesEmptyAt = nil
-                
-                try Task.checkCancellation()
-                guard !cancelSync else {
-                    await failSynchronization(error: SyncError.cancelled)
-                    return
-                }
-                
-                zoneIDsToFetch.forEach {
-                    self.delegate?.synchronizerWillFetchChanges(self, in: $0)
-                }
-                
-                fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
-                    guard let self else { return }
-                    fetchZoneChangesTask?.cancel()
-                    fetchZoneChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                        guard let self else { return }
-                        try Task.checkCancellation()
-                        if let error {
-                            await failSynchronization(error: error)
-                            return
-                        }
-                        try Task.checkCancellation()
-                        guard !cancelSync else {
-                            await failSynchronization(error: SyncError.cancelled)
-                            return
-                        }
-
+                    //                debugPrint("# zoneIDsToFetch", zoneIDsToFetch)
+                    guard zoneIDsToFetch.count > 0 else {
+                        self.lastDatabaseChangesEmptyAt = Date()
+                        await self.resetActiveTokens()
                         try await completion(token, nil)
+                        return
+                    }
+                
+                    lastDatabaseChangesEmptyAt = nil
+                
+                    try Task.checkCancellation()
+                    guard !cancelSync else {
+                        await failSynchronization(error: SyncError.cancelled)
+                        return
+                    }
+                
+                    zoneIDsToFetch.forEach {
+                        self.delegate?.synchronizerWillFetchChanges(self, in: $0)
+                    }
+                
+                    fetchZoneChanges(zoneIDsToFetch) { [weak self] error in
+                        guard let self,
+                              synchronizationRunID == runID else { return }
+                        fetchZoneChangesTask?.cancel()
+                        fetchZoneChangesTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                            guard let self,
+                                  synchronizationRunID == runID else { return }
+                            try Task.checkCancellation()
+                            if let error {
+                                await failSynchronization(error: error)
+                                return
+                            }
+                            try Task.checkCancellation()
+                            guard !cancelSync else {
+                                await failSynchronization(error: SyncError.cancelled)
+                                return
+                            }
+
+                            try await completion(token, nil)
+                        }
                     }
                 }
             }
@@ -474,7 +487,8 @@ extension CloudKitSynchronizer {
             ignoreDeviceIdentifier: deviceIdentifier,
             desiredKeys: nil,
             completion: { [weak self] zoneResults in
-            guard let self else { return }
+            guard let self,
+                  synchronizationRunID == runID else { return }
 
             try Task.checkCancellation()
             for (zoneID, zoneResult) in zoneResults {
@@ -524,7 +538,9 @@ extension CloudKitSynchronizer {
                 activeZoneTokens[zoneID] = zoneResult.serverChangeToken
             }
             changeRequestProcessor.clearErrors()
-        }, didFinishPages: {
+        }, didFinishPages: { [weak self] in
+            guard let self,
+                  synchronizationRunID == runID else { return }
             try await completion(nil)
         })
         runOperation(operation)
@@ -651,21 +667,32 @@ extension CloudKitSynchronizer {
         _ zoneID: CKRecordZone.ID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) {
+        let runID = synchronizationRunID
         database.fetch(withRecordZoneID: zoneID) { [weak self] (zone, error) in
             guard let self = self else { return }
             if isZoneNotFoundOrDeletedError(error) {
                 let newZone = CKRecordZone(zoneID: zoneID)
                 database.save(zone: newZone, completionHandler: { [weak self] (zone, error) in
-                    if error == nil && zone != nil {
-                        //                        debugPrint("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
-                        self?.logger.info("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
-                    }
-                    Task(priority: .background) { @BigSyncBackgroundActor in
+                    Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                        guard let self else { return }
+                        guard synchronizationRunID == runID else {
+                            try await completion(CancellationError())
+                            return
+                        }
+                        if error == nil && zone != nil {
+                            //                        debugPrint("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
+                            logger.info("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
+                        }
                         try await completion(error)
                     }
                 })
             } else {
-                Task(priority: .background) { @BigSyncBackgroundActor in
+                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                    guard let self else { return }
+                    guard synchronizationRunID == runID else {
+                        try await completion(CancellationError())
+                        return
+                    }
                     try await completion(error)
                 }
             }
@@ -722,6 +749,7 @@ extension CloudKitSynchronizer {
         
         //Add metadata: device UUID and model version
         addMetadata(to: records)
+        let runID = synchronizationRunID
         //        debugPrint("## Upload", records.map {($0.recordID, $0) })
         let modifyRecordsOperation = ModifyRecordsOperation(
             database: database,
@@ -730,13 +758,20 @@ extension CloudKitSynchronizer {
         ) { [weak self] (savedRecords, _, conflictedRecords, recordIDsMissingOnServer, operationError) in
             //            debugPrint("# uploadRecords, inside operation callback...", records.count)
             guard let self else { return }
-            modifyRecordsTask?.cancel()
-            modifyRecordsTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 //                debugPrint("# uploadRecords, inside operation callback Task...", records.count, "saved", savedRecords?.count, "del", deleted?.count, "conflicted", conflicted.count, operationError)
                 guard let self else { return }
-                try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
-                if let savedRecords, !savedRecords.isEmpty {
+                guard synchronizationRunID == runID else {
+                    try await completion(CancellationError())
+                    return
+                }
+                modifyRecordsTask?.cancel()
+                modifyRecordsTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                    guard let self,
+                          synchronizationRunID == runID else { return }
+                    try Task.checkCancellation()
+                    guard !cancelSync else { throw CancellationError() }
+                    if let savedRecords, !savedRecords.isEmpty {
                     //                    debugPrint("QSCloudKitSynchronizer >> Uploaded \(savedRecords?.count ?? 0) records")
                     logger.info("QSCloudKitSynchronizer >> Uploaded \(savedRecords.count) records")
 //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \(savedRecords.map { ($0.recordID.recordName, $0.debugDescription) })")
@@ -750,10 +785,10 @@ extension CloudKitSynchronizer {
                     } else {
                         try await adapter.didUpload(savedRecords: savedRecords)
                     }
-                }
+                    }
                 
-                try Task.checkCancellation()
-                if let error = operationError as? NSError {
+                    try Task.checkCancellation()
+                    if let error = operationError as? NSError {
                     if !recordIDsMissingOnServer.isEmpty {
                         try await adapter.deleteChangeTracking(forRecordIDs: Array(recordIDsMissingOnServer))
                     }
@@ -819,28 +854,29 @@ extension CloudKitSynchronizer {
                         try await completion(error)
                         return
                     }
-                }
+                    }
                 
-                guard !cancelSync else { throw CancellationError() }
-                try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                    guard !cancelSync else { throw CancellationError() }
+                    try Task.checkCancellation()
+                    guard !cancelSync else { throw CancellationError() }
                 
-                if recordCount >= requestedBatchSize {
-                    increaseBatchSize()
+                    if recordCount >= requestedBatchSize {
+                        increaseBatchSize()
                     //                    debugPrint("# uploadRecords from inside uploadRecords")
                     
                     try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
                     
-                    try await uploadRecords(
-                        adapter: adapter,
-                        restrictedToEntityType: restrictedToEntityType,
-                        completion: completion
-                    )
-                } else {
-                    try await completion(nil)
+                        try await uploadRecords(
+                            adapter: adapter,
+                            restrictedToEntityType: restrictedToEntityType,
+                            completion: completion
+                        )
+                    } else {
+                        try await completion(nil)
+                    }
+                    //                }
                 }
-                //                }
             }
         }
         
@@ -886,7 +922,7 @@ extension CloudKitSynchronizer {
             try await completion(nil)
             return
         }
-        
+        let runID = synchronizationRunID
         let modifyRecordsOperation = ModifyRecordsOperation(
             database: database,
             records: nil,
@@ -895,6 +931,10 @@ extension CloudKitSynchronizer {
             guard let self else { return }
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
+                guard synchronizationRunID == runID else {
+                    try await completion(CancellationError())
+                    return
+                }
                 let acknowledgedRecordIDSet = Set(deletedRecordIDs ?? [])
                     .union(recordIDsMissingOnServer)
                 let acknowledgedRecordIDs = recordIDs.filter {
@@ -1057,9 +1097,11 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func updateTokens() {
         //        debugPrint("# updateTokens() (calls FetchDatabaseChangesOperation)")
+        let runID = synchronizationRunID
         let operation = FetchDatabaseChangesOperation(database: database, databaseToken: serverChangeToken) { (databaseToken, changedZoneIDs, deletedZoneIDs) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                guard let self = self else { return }
+                guard let self = self,
+                      synchronizationRunID == runID else { return }
                 
                 guard !cancelSync else {
                     await failSynchronization(error: SyncError.cancelled)
@@ -1070,7 +1112,8 @@ extension CloudKitSynchronizer {
                 if changedZoneIDs.count > 0 {
                     let zoneIDs = try await loadTokens(for: changedZoneIDs, loadAdapters: false)
                     await updateServerToken(for: zoneIDs, completion: { [weak self] result in
-                        guard let self = self else { return }
+                        guard let self = self,
+                              synchronizationRunID == runID else { return }
                         switch result {
                         case .success(true):
                             await performSynchronization()
@@ -1107,7 +1150,7 @@ extension CloudKitSynchronizer {
         }
         
 //        logger.info("QSCloudKitSynchronizer >> Update server token....")
-        
+        let runID = synchronizationRunID
         var zonesNeedingRefetch = Set<CKRecordZone.ID>()
         let operation = FetchZoneChangesOperation(
             database: database,
@@ -1120,7 +1163,8 @@ extension CloudKitSynchronizer {
                 cloudKitSynchronizerDeviceUUIDKey
             ],
             completion: { @BigSyncBackgroundActor [weak self] zoneResults in
-            guard let self = self else { return }
+            guard let self = self,
+                  synchronizationRunID == runID else { return }
             
             guard !cancelSync else {
                 await failSynchronization(error: SyncError.cancelled)
@@ -1140,7 +1184,9 @@ extension CloudKitSynchronizer {
                 }
                 
             }
-        }, didFinishPages: {
+        }, didFinishPages: { [weak self] in
+            guard let self,
+                  synchronizationRunID == runID else { return }
             await completion(.success(!zonesNeedingRefetch.isEmpty))
         })
         runOperation(operation)

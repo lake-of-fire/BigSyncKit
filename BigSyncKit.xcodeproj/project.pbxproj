@@ -16,7 +16,9 @@
 		316D9A9305E452F821839289 /* SyncedEntityState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5900E8EA44C1DBD7E8733C77 /* SyncedEntityState.swift */; };
 		321963E53133632A9C35A162 /* RealmSwiftAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7461825A00D368BA1B328E9 /* RealmSwiftAdapter.swift */; };
 		334155ECC742E1C968DF7A7E /* PersistentAssetManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F411F5A4643CA9FDD6AD95B5 /* PersistentAssetManager.swift */; };
+		35D8AA83372F3AE55EE740F8 /* libRealmSwiftGaps.a in Frameworks */ = {isa = PBXBuildFile; fileRef = F1B215E4FDB5FE4BF55E7C7D /* libRealmSwiftGaps.a */; };
 		39524DBB45421B7B8EC0A72C /* AsyncAlgorithms.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C60CB3051325C0C330FE48F /* AsyncAlgorithms.framework */; };
+		3ED652F310A1670673BE2AC7 /* BigSyncPendingMutation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */; };
 		41B8E763FAD1533448520B02 /* PrimaryKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABEE9A26F724BE99A3697C23 /* PrimaryKey.swift */; };
 		555740A729D68758CC69E42A /* SyncedEntityProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D7E1C6F12C321A94EABEF49 /* SyncedEntityProtocol.swift */; };
 		5A6D8A0DC6ABB060CABE7AD7 /* CloudKitSynchronizer+Subscriptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */; };
@@ -26,6 +28,7 @@
 		6F46C9C9A74FA828EF4E2530 /* Algorithms.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = 94DDE581A883BAE50A2BCF02 /* Algorithms.framework */; };
 		705C9293CBFA18A54FEDDEDD /* RealModule.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7E14FD1C796F678CE02FC194 /* RealModule.framework */; };
 		75C25AD27D281B765ABE5AE3 /* BigSyncKit_BigSyncKit.bundle in Resources */ = {isa = PBXBuildFile; fileRef = F83E22060AF164CC8308EC28 /* BigSyncKit_BigSyncKit.bundle */; };
+		7C682BC17579FAE3B914DFDE /* libRealmSwiftGaps.a in Dependencies */ = {isa = PBXBuildFile; fileRef = F1B215E4FDB5FE4BF55E7C7D /* libRealmSwiftGaps.a */; };
 		8102352285F6375B3D37A86A /* CloudKitSynchronizer+Sync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AD94190617E4A1CA211C2CA /* CloudKitSynchronizer+Sync.swift */; };
 		829679DBEB9D2764FEA063D5 /* BigSyncKit_BigSyncKit.bundle in Dependencies */ = {isa = PBXBuildFile; fileRef = F83E22060AF164CC8308EC28 /* BigSyncKit_BigSyncKit.bundle */; };
 		88A374E034B19339A140C999 /* ServerToken.swift in Sources */ = {isa = PBXBuildFile; fileRef = F505BB8B89E2E9BF10241774 /* ServerToken.swift */; };
@@ -41,7 +44,6 @@
 		AB10CAD55E6330E005A2D7E2 /* libzstd.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = BBDD02968D432F5E6B3EFC72 /* libzstd.framework */; };
 		AC5DD77E159CBCFBCFBAAA72 /* DequeModule.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 56895A4BBBE9211A556CEF07 /* DequeModule.framework */; };
 		B140B9E7E9BBB5F8537B6631 /* BigSyncKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2F69716F0991001F6F0BC10F /* BigSyncKit.framework */; };
-		B84BBA4C10983AF240D707D9 /* RealmSwiftGaps.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E66CB3758E46CE49E44D618C /* RealmSwiftGaps.framework */; };
 		C2306533B62251C4BB84AA59 /* ModelAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31F48253723925F072D7A193 /* ModelAdapter.swift */; };
 		C43E4575AE89BC887B3C72E1 /* CloudKitSynchronizer+Private.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4917EC7D9AF2D7867807C196 /* CloudKitSynchronizer+Private.swift */; };
 		C57E722A1349DEBD0932E8B1 /* CloudKitAccountAvailabilityGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57073F22EFD596BFE2391A92 /* CloudKitAccountAvailabilityGate.swift */; };
@@ -64,7 +66,6 @@
 		F838B85BDCB975E7F1724613 /* ModifyRecordsOperation.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADB89FD51BD5C3320D536EC7 /* ModifyRecordsOperation.swift */; };
 		F960F4D9C6C49DBE8C886F7B /* BigSyncKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C9ACA3FFFA7672B261644D0 /* BigSyncKitTests.swift */; };
 		FBAEA35B01423A405C392D19 /* BackupDetection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2EECD71DF78701438239CEC2 /* BackupDetection.swift */; };
-		FD6C5911DBFE039FC598BE66 /* RealmSwiftGaps.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E66CB3758E46CE49E44D618C /* RealmSwiftGaps.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -134,6 +135,7 @@
 				6F46C9C9A74FA828EF4E2530 /* Algorithms.framework in Dependencies */,
 				A968574EC7A0AF1043AC8189 /* AsyncAlgorithms.framework in Dependencies */,
 				08E36BC6FD86ED9CD7B87CC0 /* Logging.framework in Dependencies */,
+				7C682BC17579FAE3B914DFDE /* libRealmSwiftGaps.a in Dependencies */,
 				66E970ECB20D9971EEF458CB /* SwiftUtilities.framework in Dependencies */,
 				AB10CAD55E6330E005A2D7E2 /* libzstd.framework in Dependencies */,
 			);
@@ -166,6 +168,7 @@
 		6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudKitSynchronizer+Subscriptions.swift"; sourceTree = "<group>"; };
 		6D34F532F253611BC2AB181F /* FetchDatabaseChangesOperation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FetchDatabaseChangesOperation.swift; sourceTree = "<group>"; };
 		73F4DCFDFCE608B084E2B80B /* PendingRelationship.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingRelationship.swift; sourceTree = "<group>"; };
+		7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncPendingMutation.swift; sourceTree = "<group>"; };
 		7E14FD1C796F678CE02FC194 /* RealModule.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = RealModule.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		7EC744C24DA41913CBC47C4B /* SyncedEntityType.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedEntityType.swift; sourceTree = "<group>"; };
 		80C8F45DFBAE47586CDE6AB5 /* QSCloudKitSynchronizer+MultiRealmResultsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "QSCloudKitSynchronizer+MultiRealmResultsController.swift"; sourceTree = "<group>"; };
@@ -188,9 +191,9 @@
 		D67DD8D570E84ABE46CAEB8B /* TuistBundle+BigSyncKit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TuistBundle+BigSyncKit.swift"; sourceTree = "<group>"; };
 		D79754445C3EA257AE732632 /* BigSyncKitTests-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "BigSyncKitTests-Info.plist"; sourceTree = "<group>"; };
 		DB2464AFEF2EB8EDC0877C63 /* MultiRealmResultsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiRealmResultsController.swift; sourceTree = "<group>"; };
-		E66CB3758E46CE49E44D618C /* RealmSwiftGaps.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = RealmSwiftGaps.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		E6D79CF15FCD41CECF1CDFF5 /* BigSyncKitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BigSyncKitTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		EB1193B4C901E7AA060A4AE9 /* SyncedEntity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedEntity.swift; sourceTree = "<group>"; };
+		F1B215E4FDB5FE4BF55E7C7D /* libRealmSwiftGaps.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libRealmSwiftGaps.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		F411F5A4643CA9FDD6AD95B5 /* PersistentAssetManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistentAssetManager.swift; sourceTree = "<group>"; };
 		F505BB8B89E2E9BF10241774 /* ServerToken.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerToken.swift; sourceTree = "<group>"; };
 		F83E22060AF164CC8308EC28 /* BigSyncKit_BigSyncKit.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BigSyncKit_BigSyncKit.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -211,7 +214,7 @@
 				CDA28EFC34F778CB1E0010AF /* OrderedCollections.framework in Frameworks */,
 				705C9293CBFA18A54FEDDEDD /* RealModule.framework in Frameworks */,
 				90E99801CAF3EC8227C36131 /* RealmSwift.framework in Frameworks */,
-				B84BBA4C10983AF240D707D9 /* RealmSwiftGaps.framework in Frameworks */,
+				35D8AA83372F3AE55EE740F8 /* libRealmSwiftGaps.a in Frameworks */,
 				D52C365383AA86BAE98600CF /* SwiftUtilities.framework in Frameworks */,
 				D243292B52BE60D63AA64A3B /* _NumericsShims.framework in Frameworks */,
 				D4E87D0063B8DD527F4F7ADB /* libzstd.framework in Frameworks */,
@@ -230,7 +233,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				D42F4A8A1BFBBDD28F602A67 /* RealmSwift.framework in Frameworks */,
-				FD6C5911DBFE039FC598BE66 /* RealmSwiftGaps.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -342,13 +344,13 @@
 				2F69716F0991001F6F0BC10F /* BigSyncKit.framework */,
 				E6D79CF15FCD41CECF1CDFF5 /* BigSyncKitTests.xctest */,
 				56895A4BBBE9211A556CEF07 /* DequeModule.framework */,
+				F1B215E4FDB5FE4BF55E7C7D /* libRealmSwiftGaps.a */,
 				BBDD02968D432F5E6B3EFC72 /* libzstd.framework */,
 				276C216D2EED7450546EB0C8 /* Logging.framework */,
 				36B6AAAAC2954D84D0086505 /* OrderedCollections.framework */,
 				81AE000449FA79F1262C25F3 /* RealmDatabase_RealmCoreResources.bundle */,
 				7E14FD1C796F678CE02FC194 /* RealModule.framework */,
 				334E77EAA11F1D8A3C955A4A /* RealmSwift.framework */,
-				E66CB3758E46CE49E44D618C /* RealmSwiftGaps.framework */,
 				375A2DE5459AEC32DBEA009C /* SwiftUtilities.framework */,
 			);
 			name = Products;
@@ -378,6 +380,7 @@
 		DFB30316A0DAA344F0F89AA8 /* RealmSwift */ = {
 			isa = PBXGroup;
 			children = (
+				7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */,
 				CD495927486A1B40B2B8DBA3 /* DefaultRealmSwiftAdapterProvider.swift */,
 				73F4DCFDFCE608B084E2B80B /* PendingRelationship.swift */,
 				58CDB4D39314DDAFE352E728 /* QSCloudKitSynchronizer+RealmSwift.swift */,
@@ -557,6 +560,7 @@
 				41B8E763FAD1533448520B02 /* PrimaryKey.swift in Sources */,
 				0F94B5F5C1645FA2C7D6CB7E /* QSCoder.swift in Sources */,
 				316D9A9305E452F821839289 /* SyncedEntityState.swift in Sources */,
+				3ED652F310A1670673BE2AC7 /* BigSyncPendingMutation.swift in Sources */,
 				D1076D33C1CCFA003ACD1332 /* DefaultRealmSwiftAdapterProvider.swift in Sources */,
 				02D03BE92F26412C61A3BB31 /* PendingRelationship.swift in Sources */,
 				9A1BF58FA7646A413503C6AC /* QSCloudKitSynchronizer+RealmSwift.swift in Sources */,
