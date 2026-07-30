@@ -40,6 +40,11 @@ public protocol ModelAdapter: AnyObject, Sendable {
     var modelAdapterDelegate: ModelAdapterDelegate? { get set }
     
     func cleanUp()
+
+    /// Prepares the adapter to clear its synchronization metadata. The default
+    /// implementation preserves the historical behavior of clearing
+    /// cancellation before reset.
+    func prepareForReset() async throws
     
     func resetSyncCaches() async throws
     
@@ -129,6 +134,10 @@ public protocol ModelAdapter: AnyObject, Sendable {
 
 public extension ModelAdapter {
     var priorityEntityTypeNames: [String] { [] }
+
+    func prepareForReset() async throws {
+        try await unsetCancellation()
+    }
 }
 
 internal protocol PrioritySyncCapableModelAdapter: ModelAdapter {

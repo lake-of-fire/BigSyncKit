@@ -503,7 +503,7 @@ public class CloudKitSynchronizer: NSObject {
         //        try? await Task.sleep(nanoseconds: 300_000_000) // Allow cancellations to catch up...
         if includingAdapters {
             for adapter in modelAdapters {
-                try await adapter.unsetCancellation()
+                try await adapter.prepareForReset()
                 try await adapter.resetSyncCaches()
             }
         }
@@ -924,16 +924,15 @@ public class CloudKitSynchronizer: NSObject {
             do {
                 _ = try await saveMigrationMarker(claim)
             } catch {
-                if isServerRecordChanged(error),
-                   let latest = try await fetchRecord(recordID),
+                guard isServerRecordChanged(error) else {
+                    throw error
+                }
+                if let latest = try? await fetchRecord(recordID),
                    (latest[ownerField] as? String)?
                     .hasPrefix(Self.resetCompletedPrefix) == true {
                     return .completed
                 }
-                if isServerRecordChanged(error) {
-                    throw OneOffRecordZoneResetError.migrationInProgress
-                }
-                throw error
+                throw OneOffRecordZoneResetError.migrationInProgress
             }
         } else {
             let claim = CKRecord(recordType: recordType, recordID: recordID)
@@ -943,16 +942,15 @@ public class CloudKitSynchronizer: NSObject {
             do {
                 _ = try await saveMigrationMarker(claim)
             } catch {
-                if isServerRecordChanged(error),
-                   let latest = try await fetchRecord(recordID),
+                guard isServerRecordChanged(error) else {
+                    throw error
+                }
+                if let latest = try? await fetchRecord(recordID),
                    (latest[ownerField] as? String)?
                     .hasPrefix(Self.resetCompletedPrefix) == true {
                     return .completed
                 }
-                if isServerRecordChanged(error) {
-                    throw OneOffRecordZoneResetError.migrationInProgress
-                }
-                throw error
+                throw OneOffRecordZoneResetError.migrationInProgress
             }
         }
         return .acquired
@@ -984,16 +982,15 @@ public class CloudKitSynchronizer: NSObject {
         do {
             _ = try await saveMigrationMarker(marker)
         } catch {
-            if isServerRecordChanged(error),
-               let latest = try await fetchRecord(recordID),
+            guard isServerRecordChanged(error) else {
+                throw error
+            }
+            if let latest = try? await fetchRecord(recordID),
                (latest[ownerField] as? String)?
                 .hasPrefix(Self.resetCompletedPrefix) == true {
                 return
             }
-            if isServerRecordChanged(error) {
-                throw OneOffRecordZoneResetError.migrationInProgress
-            }
-            throw error
+            throw OneOffRecordZoneResetError.migrationInProgress
         }
     }
 

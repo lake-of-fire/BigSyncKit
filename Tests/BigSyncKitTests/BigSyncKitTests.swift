@@ -26,14 +26,15 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var reportsDeletedRecordsAsUnknownItems = false
     var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
     var recordToSeedBeforeNextConditionalSave: CKRecord?
-    var serverRecordChangedConditionalSaveNumbers = Set<Int>()
+    var serverRecordChangedAfterZoneDeletion = false
     var serverRecordChangedValuePrefixes = Set<String>()
+    var recordFetchErrorAfterServerRecordChanged: Error?
     var accountIdentifier = "test-account"
     var accountIdentifierAfterNextZoneDeletion: String?
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
     private var records = [CKRecord.ID: CKRecord]()
     private var conditionallyFetchedRecordIDs = Set<CKRecord.ID>()
-    private var conditionalSaveCount = 0
+    private var nextRecordFetchError: Error?
     private var lastIncompleteModifyOperation: CKModifyRecordsOperation?
 
     func add(_ operation: CKDatabaseOperation) {
@@ -45,7 +46,6 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             let savedRecords = modifyOperation.recordsToSave ?? []
             let deletedRecordIDs = modifyOperation.recordIDsToDelete ?? []
             if modifyOperation.savePolicy == .ifServerRecordUnchanged {
-                conditionalSaveCount += 1
                 let matchedPrefix = serverRecordChangedValuePrefixes.first {
                     prefix in
                     savedRecords.contains { record in
@@ -54,13 +54,21 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
                         }
                     }
                 }
-                let shouldFail = serverRecordChangedConditionalSaveNumbers.remove(
-                    conditionalSaveCount
-                ) != nil || matchedPrefix != nil
+                let shouldFailAfterZoneDeletion =
+                    serverRecordChangedAfterZoneDeletion
+                    && !deletedZoneIDs.isEmpty
+                if shouldFailAfterZoneDeletion {
+                    serverRecordChangedAfterZoneDeletion = false
+                }
+                let shouldFail =
+                    shouldFailAfterZoneDeletion || matchedPrefix != nil
                 if let matchedPrefix {
                     serverRecordChangedValuePrefixes.remove(matchedPrefix)
                 }
                 if shouldFail, let recordID = savedRecords.first?.recordID {
+                    nextRecordFetchError =
+                        recordFetchErrorAfterServerRecordChanged
+                    recordFetchErrorAfterServerRecordChanged = nil
                     if let matchedPrefix,
                        let attemptedRecord = savedRecords.first {
                         let competingRecord = CKRecord(
@@ -199,6 +207,11 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     }
 
     func fetch(withRecordID recordID: CKRecord.ID, completionHandler: @escaping (CKRecord?, Error?) -> Void) {
+        if let error = nextRecordFetchError {
+            nextRecordFetchError = nil
+            completionHandler(nil, error)
+            return
+        }
         if records[recordID] != nil {
             conditionallyFetchedRecordIDs.insert(recordID)
         }
@@ -578,7 +591,9 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testOneOffZoneResetMapsPostDeletionClaimConflictToMigrationInProgress() async throws {
         let database = FakeCloudKitDatabase()
-        database.serverRecordChangedConditionalSaveNumbers = [3]
+        database.serverRecordChangedAfterZoneDeletion = true
+        database.recordFetchErrorAfterServerRecordChanged =
+            CKError(.networkFailure)
         let zoneID = CKRecordZone.ID(
             zoneName: "renewal-conflict-zone",
             ownerName: CKCurrentUserDefaultName
@@ -1849,10 +1864,121 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNil(adapter.realmProvider)
         try await adapter.unsetCancellation()
         XCTAssertNotNil(adapter.realmProvider)
-        XCTAssertEqual(adapter._test_cancellableCount, 3)
+        XCTAssertTrue(adapter._test_isSetupComplete)
+        let initialCancellableCount = adapter._test_cancellableCount
+        XCTAssertGreaterThan(initialCancellableCount, 0)
 
         try await adapter.unsetCancellation()
-        XCTAssertEqual(adapter._test_cancellableCount, 3)
+        XCTAssertEqual(
+            adapter._test_cancellableCount,
+            initialCancellableCount
+        )
+        adapter.invalidateTokens()
+    }
+
+    @BigSyncBackgroundActor
+    func testSynchronizerResetPerformsInitialSetupOnlyAfterClearingCaches() async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration =
+            RealmSwiftAdapter.defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "coordinated-reset-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "coordinated-reset-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "coordinated-reset-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            logger: Logger(label: "BigSyncKitTests")
+        )
+        var initialSetupCount = 0
+        adapter.beforeInitialSetup = {
+            initialSetupCount += 1
+        }
+        let synchronizer = makeSynchronizer()
+        synchronizer.addModelAdapter(adapter)
+
+        try await synchronizer.resetSyncCaches(cancelSynchronization: true)
+
+        XCTAssertEqual(initialSetupCount, 1)
+        XCTAssertTrue(adapter._test_isSetupComplete)
+        adapter.invalidateTokens()
+    }
+
+    @BigSyncBackgroundActor
+    func testInterruptedSetupIsRetriedBeforeSynchronization() async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration =
+            RealmSwiftAdapter.defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "interrupted-setup-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "interrupted-setup-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let targetRealm = try await Realm(
+            configuration: targetConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        try await targetRealm.asyncWrite {
+            targetRealm.add(
+                BigSyncTrackedObject(
+                    id: "interrupted",
+                    createdAt: Date(),
+                    modifiedAt: Date(),
+                    explicitlyModifiedAt: nil
+                )
+            )
+        }
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "interrupted-setup-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            logger: Logger(label: "BigSyncKitTests")
+        )
+        var setupAttemptCount = 0
+        adapter.beforeInitialSetup = { [weak adapter] in
+            setupAttemptCount += 1
+            if setupAttemptCount == 1 {
+                adapter?.cancelSynchronization()
+            }
+        }
+
+        do {
+            try await adapter.unsetCancellation()
+            XCTFail("Expected the first setup attempt to be interrupted")
+        } catch is CancellationError {
+            XCTAssertFalse(adapter._test_isSetupComplete)
+            XCTAssertEqual(adapter._test_cancellableCount, 0)
+        }
+
+        try await adapter.unsetCancellation()
+
+        XCTAssertEqual(setupAttemptCount, 2)
+        XCTAssertTrue(adapter._test_isSetupComplete)
+        XCTAssertNotNil(
+            adapter.realmProvider?.persistenceRealm?.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className()
+                    + ".interrupted"
+            )
+        )
         adapter.invalidateTokens()
     }
 
@@ -1913,7 +2039,8 @@ final class BigSyncKitTests: XCTestCase {
             forPrimaryKey: recordName
         )
         XCTAssertEqual(rebuiltEntity?.entityState, .new)
-        XCTAssertEqual(adapter._test_cancellableCount, 3)
+        XCTAssertTrue(adapter._test_isSetupComplete)
+        XCTAssertGreaterThan(adapter._test_cancellableCount, 0)
         adapter.invalidateTokens()
     }
 

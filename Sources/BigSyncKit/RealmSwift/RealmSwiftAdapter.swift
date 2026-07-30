@@ -261,6 +261,23 @@ private struct PendingObjectChange {
     let explicitlyModifiedAt: Date?
 }
 
+private enum RealmSwiftAdapterSetupError: LocalizedError {
+    case providerUnavailable
+    case persistenceRealmUnavailable
+    case targetRealmsUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .providerUnavailable:
+            return "BigSyncKit could not create its Realm provider."
+        case .persistenceRealmUnavailable:
+            return "BigSyncKit could not open its persistence Realm."
+        case .targetRealmsUnavailable:
+            return "BigSyncKit could not open its target Realms."
+        }
+    }
+}
+
 private struct RemoteDeletionSnapshot: Sendable {
     let recordName: String
     let entityType: String
@@ -383,7 +400,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     private var dummyRecordIdentifiers = Set<String>()
 #endif
     
-    private var isSetupInterrupted: Bool = false
+    private var isSetupComplete = false
     
     public init(
         persistenceRealmConfiguration: Realm.Configuration,
@@ -447,7 +464,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
     
     @BigSyncBackgroundActor
+    public func prepareForReset() async throws {
+        // Reset opens and rebuilds the tracking Realm itself. Do not perform the
+        // normal lazy synchronization setup only to discard it immediately.
+        cancelSync = false
+    }
+
+    @BigSyncBackgroundActor
     public func resetSyncCaches() async throws {
+        cancelSync = false
+        isSetupComplete = false
         invalidateTokens()
         
         // The full provider is created lazily and may not exist yet when a
@@ -517,7 +543,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     public func unsetCancellation() async throws {
         //        debugPrint("# unset cancel")
         cancelSync = false
-        if realmProvider == nil || isSetupInterrupted {
+        if !isSetupComplete {
             try await setup()
         }
     }
@@ -529,13 +555,21 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         // Setup can be retried after cancellation or a cache reset. Tear down any
         // prior notification graph so retries never accumulate duplicate Realm
         // observers or debounced processors.
+        isSetupComplete = false
         invalidateTokens()
-        isSetupInterrupted = false
+        defer {
+            if !isSetupComplete {
+                invalidateTokens()
+            }
+        }
         realmProvider = await RealmProvider(
             persistenceConfiguration: persistenceRealmConfiguration,
             targetConfigurations: targetRealmConfigurations
         )
-        guard let realmProvider else { return }
+        guard let realmProvider else {
+            try Task.checkCancellation()
+            throw RealmSwiftAdapterSetupError.providerUnavailable
+        }
 
         if let persistenceRealm = realmProvider.persistenceRealm {
             let pendingStates = [
@@ -554,7 +588,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
         
-        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+        guard let persistenceRealm = realmProvider.persistenceRealm else {
+            try Task.checkCancellation()
+            throw RealmSwiftAdapterSetupError.persistenceRealmUnavailable
+        }
         let syncEmpty = persistenceRealm.objects(SyncedEntity.self).isEmpty
         // An empty user Realm is still initialized. Without this durable marker,
         // empty databases repeated the full initial scan on every launch.
@@ -564,13 +601,18 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         if needsInitialSetup {
             do {
                 try await modelAdapterDelegate?.needsInitialSetup()
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 //                print(error)
                 logger.error("\(error)")
             }
         }
         
-        guard let targetReaderRealms = realmProvider.targetReaderRealms else { return }
+        guard let targetReaderRealms = realmProvider.targetReaderRealms else {
+            try Task.checkCancellation()
+            throw RealmSwiftAdapterSetupError.targetRealmsUnavailable
+        }
         
 #if DEBUG
         if !Self.shouldSkipDebugDummySetup {
@@ -630,6 +672,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 
                 if needsInitialSetup {
                     beforeInitialSetup?()
+                    try Task.checkCancellation()
+                    guard !cancelSync else {
+                        throw CancellationError()
+                    }
                     
                     let results = targetReaderRealm.objects(objectClass)
                     let entityTypePrefix = schema.className + "."
@@ -639,15 +685,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     for result in results {
                         identifiers.append(entityTypePrefix + Self.getTargetObjectStringIdentifier(for: result, usingPrimaryKey: primaryKey))
                     }
-                    do {
-                        try await createSyncedEntities(entityType: schema.className, identifiers: identifiers)
-                    } catch is CancellationError {
-                        isSetupInterrupted = true
-                        return
-                    } catch {
-                        isSetupInterrupted = true
-                        throw error
-                    }
+                    try await createSyncedEntities(
+                        entityType: schema.className,
+                        identifiers: identifiers
+                    )
                 }
             }
         }
@@ -655,6 +696,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         // Install observation before the final journal drain. Writes do not depend
         // on the observer for durability, but this ordering avoids adding debounce
         // latency to a mutation committed while setup is finishing.
+        try Task.checkCancellation()
+        guard !cancelSync else {
+            throw CancellationError()
+        }
         await setupPublisherDebouncer()
         observeRealmChanges()
 
@@ -665,15 +710,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             // This is the only broad scan for clients that carry the journal
             // schema. It recovers changes made by older builds and records that
             // predate durable changed-ID tracking.
-            do {
-                try await createMissingSyncedEntities()
-            } catch is CancellationError {
-                isSetupInterrupted = true
-                return
-            } catch {
-                isSetupInterrupted = true
-                throw error
-            }
+            try await createMissingSyncedEntities()
             await enqueueCreatedAndModified()
             try await processEnqueuedChanges()
             try await updateCreatedAndModified()
@@ -685,7 +722,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             try await updateCreatedAndModified()
         }
 
+        try Task.checkCancellation()
+        guard !cancelSync else {
+            throw CancellationError()
+        }
         updateHasChanges(realm: persistenceRealm)
+        isSetupComplete = true
         
         //        if hasChanges {
         //            Task { @BigSyncBackgroundActor in
@@ -1116,6 +1158,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     @BigSyncBackgroundActor
     var _test_cancellableCount: Int {
         cancellables.count
+    }
+
+    @BigSyncBackgroundActor
+    var _test_isSetupComplete: Bool {
+        isSetupComplete
     }
 #endif
     
