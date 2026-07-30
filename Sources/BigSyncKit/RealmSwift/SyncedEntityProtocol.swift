@@ -40,11 +40,13 @@ public extension ChangeMetadataRecordable {
 
         guard let realm = object.realm else {
 #if DEBUG
-            debugPrint(
-                "BigSyncKit: refreshChangeMetadata(explicitlyModified:) was called before",
-                entityType,
-                "was added to Realm; the mutation cannot be journaled atomically."
-            )
+            if BigSyncMutationTrackingRegistry.tracks(className: entityType) {
+                assertionFailure(
+                    "BigSyncKit: refreshChangeMetadata(explicitlyModified:) was called before "
+                        + entityType
+                        + " was added to Realm; the mutation cannot be journaled atomically."
+                )
+            }
 #endif
             return
         }

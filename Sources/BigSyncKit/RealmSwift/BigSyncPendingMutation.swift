@@ -74,4 +74,30 @@ enum BigSyncMutationTrackingRegistry {
         }
     }
 
+    static func tracks(className: String) -> Bool {
+        lock.withLock {
+            trackedClassNamesByRealm.values.contains { $0.contains(className) }
+        }
+    }
+}
+
+/// Installs the class allowlist used by `refreshChangeMetadata` to atomically
+/// append durable CloudKit mutations.
+///
+/// Call this while constructing a target Realm configuration, before that Realm
+/// can be opened by application writers. `RealmSwiftAdapter` also installs the
+/// policy defensively during initialization, but adapter setup may intentionally
+/// happen later than application startup.
+public enum BigSyncMutationTracking {
+    public static func install(
+        configurations: [Realm.Configuration],
+        excludedClassNames: [String]
+    ) {
+        BigSyncMutationTrackingRegistry.register(
+            configurations: configurations,
+            excluding: Set(
+                excludedClassNames + [BigSyncPendingMutation.className()]
+            )
+        )
+    }
 }

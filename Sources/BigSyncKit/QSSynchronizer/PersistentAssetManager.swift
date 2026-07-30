@@ -49,7 +49,7 @@ class PersistentAssetManager {
         }
 
         let unique = ProcessInfo.processInfo.globallyUniqueString
-        let fileName = "\(recordID)_\(unique)"
+        let fileName = "\(Self.fileNamePrefix(forRecordID: recordID))_\(unique)"
         let url = assetDirectory.appendingPathComponent(fileName)
         try data.write(to: url, options: .atomicWrite)
         cacheQueue.sync {
@@ -63,19 +63,24 @@ class PersistentAssetManager {
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
+
+    static func fileNamePrefix(forRecordID recordID: String) -> String {
+        "record-" + digestString(for: Data(recordID.utf8))
+    }
     
     func clearAssetFiles(excludingSyncedEntityIDs ids: Set<String>) {
         guard let fileURLs = try? FileManager.default.contentsOfDirectory(at: assetDirectory, includingPropertiesForKeys: nil, options: []) else {
             return
         }
+        let fileNamePrefixes = Set(ids.map(Self.fileNamePrefix(forRecordID:)))
         
         for fileURL in fileURLs {
             let fileName = fileURL.lastPathComponent
             // Find the last underscore in the file name
             if let underscoreIndex = fileName.lastIndex(of: "_") {
                 // Extract the substring from the beginning to the underscore
-                let recordID = String(fileName[..<underscoreIndex])
-                if !ids.contains(recordID) {
+                let recordIDPrefix = String(fileName[..<underscoreIndex])
+                if !fileNamePrefixes.contains(recordIDPrefix) {
                     try? FileManager.default.removeItem(at: fileURL)
 //                    debugPrint("# deleted:", fileURL)
                 }

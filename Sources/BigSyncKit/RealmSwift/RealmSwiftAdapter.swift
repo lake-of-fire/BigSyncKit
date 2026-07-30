@@ -21,6 +21,26 @@ import SwiftUtilities
 import Algorithms
 import AsyncAlgorithms
 import Logging
+
+enum BigSyncCloudKitRecordNameError: Error, Equatable, LocalizedError {
+    case empty
+    case nonASCII(String)
+    case exceedsMaximumLength(actual: Int)
+    case reservedPrefix
+
+    var errorDescription: String? {
+        switch self {
+        case .empty:
+            return "CloudKit record names must not be empty."
+        case .nonASCII(let recordName):
+            return "CloudKit record name contains non-ASCII characters: \(recordName)"
+        case .exceedsMaximumLength(let actual):
+            return "CloudKit record name is \(actual) characters; the maximum is 255."
+        case .reservedPrefix:
+            return "CloudKit record names must not start with an underscore."
+        }
+    }
+}
 import libzstd
 
 //extension Realm {
@@ -372,9 +392,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         
         super.init()
 
-        BigSyncMutationTrackingRegistry.register(
+        BigSyncMutationTracking.install(
             configurations: targetRealmConfigurations,
-            excluding: Set(self.excludedClassNames)
+            excludedClassNames: self.excludedClassNames
         )
         
         setupTypeNamesLookup()
@@ -1402,10 +1422,24 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             assertionFailure("Expected primary key \(key) on \(object.objectSchema.className) to be string-convertible")
             identifier = objectId as! String
         }
-        //        guard identifier.count <= 255 else {
-        //
-        //        }
         return identifier
+    }
+
+    static func validateCloudKitRecordName(_ recordName: String) throws {
+        guard !recordName.isEmpty else {
+            throw BigSyncCloudKitRecordNameError.empty
+        }
+        guard recordName.first != "_" else {
+            throw BigSyncCloudKitRecordNameError.reservedPrefix
+        }
+        guard recordName.unicodeScalars.allSatisfy(\.isASCII) else {
+            throw BigSyncCloudKitRecordNameError.nonASCII(recordName)
+        }
+        guard recordName.count <= 255 else {
+            throw BigSyncCloudKitRecordNameError.exceedsMaximumLength(
+                actual: recordName.count
+            )
+        }
     }
     
     static func getSyncedEntity(objectIdentifier: String, realm: Realm) -> SyncedEntity? {
@@ -2384,6 +2418,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @BigSyncBackgroundActor
     func recordToUpload(syncedEntity: SyncedEntity, parentSyncedEntity: inout SyncedEntity?) async throws -> CKRecord? {
+        try Self.validateCloudKitRecordName(syncedEntity.identifier)
         let record = getRecord(for: syncedEntity) ?? CKRecord(recordType: syncedEntity.entityType, recordID: CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
         
         guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
@@ -2445,6 +2480,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         let targetPrimaryKey = (type(of: target).primaryKey() ?? target.objectSchema.primaryKeyProperty?.name)!
                         let targetIdentifier = Self.getTargetObjectStringIdentifier(for: target, usingPrimaryKey: targetPrimaryKey)
                         let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
+                        try Self.validateCloudKitRecordName(referenceIdentifier)
                         let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                         record[property.name] = recordID.recordName as CKRecordValue
                     } else {
@@ -2467,6 +2503,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             if (object as? SoftDeletable)?.isDeleted == true { continue }
                             let targetIdentifier = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: targetPrimaryKey)
                             let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
+                            try Self.validateCloudKitRecordName(referenceIdentifier)
                             let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                             referenceArray.append(recordID.recordName)
                         }
@@ -2574,6 +2611,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             if (object as? SoftDeletable)?.isDeleted == true { continue }
                             let targetIdentifier = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: targetPrimaryKey)
                             let referenceIdentifier = "\(property.objectClassName!).\(targetIdentifier)"
+                            try Self.validateCloudKitRecordName(referenceIdentifier)
                             let recordID = CKRecord.ID(recordName: referenceIdentifier, zoneID: zoneID)
                             referenceArray.append(recordID.recordName)
                         }

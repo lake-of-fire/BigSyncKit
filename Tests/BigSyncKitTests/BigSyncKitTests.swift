@@ -398,6 +398,81 @@ SoftDeletable {
 }
 
 final class BigSyncKitTests: XCTestCase {
+    func testEarlyMutationTrackingInstallationJournalsBeforeAdapterSetup() throws {
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "early-tracking-\(UUID().uuidString)"
+        configuration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationTracking.install(
+            configurations: [configuration],
+            excludedClassNames: []
+        )
+        let realm = try Realm(configuration: configuration)
+        let object = BigSyncTrackedObject(
+            id: "created-before-adapter",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+
+        let recordName = BigSyncTrackedObject.className()
+            + ".created-before-adapter"
+        XCTAssertNotNil(
+            realm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+    }
+
+    func testCloudKitRecordNameValidationRejectsInvalidIdentifiers() throws {
+        XCTAssertNoThrow(
+            try RealmSwiftAdapter.validateCloudKitRecordName(
+                String(repeating: "a", count: 255)
+            )
+        )
+        XCTAssertThrowsError(
+            try RealmSwiftAdapter.validateCloudKitRecordName("")
+        ) {
+            XCTAssertEqual($0 as? BigSyncCloudKitRecordNameError, .empty)
+        }
+        XCTAssertThrowsError(
+            try RealmSwiftAdapter.validateCloudKitRecordName("_reserved")
+        ) {
+            XCTAssertEqual(
+                $0 as? BigSyncCloudKitRecordNameError,
+                .reservedPrefix
+            )
+        }
+        XCTAssertThrowsError(
+            try RealmSwiftAdapter.validateCloudKitRecordName("日本語")
+        )
+        XCTAssertThrowsError(
+            try RealmSwiftAdapter.validateCloudKitRecordName(
+                String(repeating: "a", count: 256)
+            )
+        )
+    }
+
+    func testPersistentAssetFilePrefixDoesNotExposeRecordNameAsAPath() {
+        let recordName = "MediaTranscript.https://example.com/a/b?x=1"
+        let prefix = PersistentAssetManager.fileNamePrefix(
+            forRecordID: recordName
+        )
+
+        XCTAssertTrue(prefix.hasPrefix("record-"))
+        XCTAssertFalse(prefix.contains(recordName))
+        XCTAssertFalse(prefix.contains("/"))
+        XCTAssertEqual(prefix.count, "record-".count + 64)
+    }
+
     @BigSyncBackgroundActor
     func testZoneChangesAreDeliveredAndCommittedOnePageAtATime() async throws {
         let database = FakeCloudKitDatabase()
