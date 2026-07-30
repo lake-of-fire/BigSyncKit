@@ -52,6 +52,8 @@ public actor BigSyncBackgroundActor {
     private var initialSynchronizationTask: Task<Void, Never>?
     @BigSyncBackgroundActor
     private var synchronizationPreparationState = SynchronizationPreparationState.unprepared
+    @BigSyncBackgroundActor
+    private var synchronizationPreparationTask: Task<Void, Error>?
     
     @BigSyncBackgroundActor
     public private(set) var realmSynchronizer: CloudKitSynchronizer?
@@ -69,6 +71,9 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     public func configure(_ configuration: BigSyncBackgroundWorkerConfiguration) {
         initialSynchronizationTask?.cancel()
+        realmSynchronizer?.cancelSynchronization()
+        synchronizationPreparationTask?.cancel()
+        synchronizationPreparationTask = nil
         synchronizationPreparationState = .unprepared
         logger = configuration.logger
 
@@ -106,13 +111,15 @@ public actor BigSyncBackgroundActor {
     public func cleanUp() async {
         initialSynchronizationTask?.cancel()
         initialSynchronizationTask = nil
+        synchronizationPreparationTask?.cancel()
+        synchronizationPreparationTask = nil
         synchronizationPreparationState = .unprepared
         guard let realmSynchronizer else {
             logger?.warning("QSCloudKitSynchronizer >> Cleanup requested before background synchronizer configuration completed")
             return
         }
 
-        realmSynchronizer.cancelSynchronization()
+        await realmSynchronizer.cancelSynchronizationAndWait()
 
         for modelAdapter in realmSynchronizer.modelAdapters {
             do {
@@ -124,20 +131,24 @@ public actor BigSyncBackgroundActor {
     }
     
     @BigSyncBackgroundActor
-    public func synchronizeCloudKit() async {
+    @discardableResult
+    public func synchronizeCloudKit()
+        async -> CloudKitSynchronizer.SynchronizationResult? {
         guard let realmSynchronizer else {
             logger?.warning("QSCloudKitSynchronizer >> Synchronization requested before background synchronizer configuration completed")
-            return
+            return nil
         }
 
-        await synchronizeCloudKit(expectedSynchronizer: realmSynchronizer)
+        return await synchronizeCloudKit(expectedSynchronizer: realmSynchronizer)
     }
 
     @BigSyncBackgroundActor
-    private func synchronizeCloudKit(expectedSynchronizer: CloudKitSynchronizer) async {
+    private func synchronizeCloudKit(
+        expectedSynchronizer: CloudKitSynchronizer
+    ) async -> CloudKitSynchronizer.SynchronizationResult? {
         guard realmSynchronizer === expectedSynchronizer,
               let containerIdentifier = expectedSynchronizer.containerIdentifier else {
-            return
+            return nil
         }
 
         switch await accountAvailabilityGate.availability(for: containerIdentifier) {
@@ -147,45 +158,75 @@ public actor BigSyncBackgroundActor {
             logger?.info(
                 "QSCloudKitSynchronizer >> Synchronization deferred because iCloud account status is \(status.rawValue)"
             )
-            return
+            return nil
         case .failed:
             logger?.warning("QSCloudKitSynchronizer >> Synchronization deferred because iCloud account status failed")
-            return
+            return nil
         }
 
-        guard !Task.isCancelled, realmSynchronizer === expectedSynchronizer else { return }
+        guard !Task.isCancelled,
+              realmSynchronizer === expectedSynchronizer else { return nil }
         switch synchronizationPreparationState {
         case .prepared:
             break
         case .preparing:
-            return
+            do {
+                try await synchronizationPreparationTask?.value
+            } catch {
+                logger?.error(
+                    "QSCloudKitSynchronizer >> Synchronization preparation failed: \(error)"
+                )
+                return nil
+            }
         case .unprepared:
             synchronizationPreparationState = .preparing
-            for modelAdapter in expectedSynchronizer.modelAdapters {
-                await CloudKitSynchronizer.transferOldServerChangeToken(
-                    to: modelAdapter,
-                    userDefaults: expectedSynchronizer.keyValueStore,
-                    containerName: containerIdentifier
-                )
-            }
-
-            guard !Task.isCancelled, realmSynchronizer === expectedSynchronizer else {
-                synchronizationPreparationState = .unprepared
-                return
-            }
-            expectedSynchronizer.subscribeForChangesInDatabase { [logger] error in
-                if let error {
-                    logger?.error("QSCloudKitSynchronizer >> Database subscription failed: \(error)")
+            let preparationTask = Task {
+                for modelAdapter in expectedSynchronizer.modelAdapters {
+                    await CloudKitSynchronizer.transferOldServerChangeToken(
+                        to: modelAdapter,
+                        userDefaults: expectedSynchronizer.keyValueStore,
+                        containerName: containerIdentifier
+                    )
                 }
+                try Task.checkCancellation()
+                guard realmSynchronizer === expectedSynchronizer else {
+                    throw CancellationError()
+                }
+                try await expectedSynchronizer
+                    .subscribeForChangesInDatabase()
             }
-            guard !Task.isCancelled, realmSynchronizer === expectedSynchronizer else {
+            synchronizationPreparationTask = preparationTask
+            do {
+                try await preparationTask.value
+            } catch {
+                synchronizationPreparationTask = nil
                 synchronizationPreparationState = .unprepared
-                return
+                logger?.error(
+                    "QSCloudKitSynchronizer >> Synchronization preparation failed: \(error)"
+                )
+                return nil
+            }
+            synchronizationPreparationTask = nil
+            guard !Task.isCancelled,
+                  realmSynchronizer === expectedSynchronizer else {
+                synchronizationPreparationState = .unprepared
+                return nil
             }
             synchronizationPreparationState = .prepared
         }
 
-        expectedSynchronizer.beginSynchronization()
+        guard !Task.isCancelled,
+              realmSynchronizer === expectedSynchronizer else { return nil }
+        do {
+            return try await expectedSynchronizer.synchronize()
+        } catch is CancellationError {
+            return nil
+        } catch {
+            logger?.error(
+                "QSCloudKitSynchronizer >> Synchronization failed: \(error)"
+            )
+            return nil
+        }
     }
     
     @BigSyncBackgroundActor
@@ -195,7 +236,7 @@ public actor BigSyncBackgroundActor {
             return
         }
 
-        realmSynchronizer.cancelSynchronization()
+        await realmSynchronizer.cancelSynchronizationAndWait()
     }
     
     public func synchronizeCloudKit(using configuration: BigSyncBackgroundWorkerConfiguration) async {

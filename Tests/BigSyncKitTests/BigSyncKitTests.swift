@@ -362,6 +362,7 @@ private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable {
     @Persisted var explicitlyModifiedAt: Date?
     @Persisted var isDeleted = false
     @Persisted var tags: List<String>
+    @Persisted var urls: List<URL>
     @Persisted var scores: MutableSet<Int>
     @Persisted var attributes: Map<String, String>
 
@@ -473,6 +474,27 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(prefix.count, "record-".count + 64)
     }
 
+    func testTrackingRealmPathIsNamespacedBeyondTheZoneName() {
+        let zoneID = CKRecordZone.ID(
+            zoneName: "shared-zone-name",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let first = DefaultRealmSwiftAdapterProvider.realmPath(
+            appGroup: nil,
+            zoneID: zoneID,
+            persistenceNamespace: "container-a|sync-a|private"
+        )
+        let second = DefaultRealmSwiftAdapterProvider.realmPath(
+            appGroup: nil,
+            zoneID: zoneID,
+            persistenceNamespace: "container-b|sync-a|private"
+        )
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertTrue(first.hasSuffix("-shared-zone-name.realm"))
+        XCTAssertFalse(first.contains("container-a"))
+    }
+
     @BigSyncBackgroundActor
     func testZoneChangesAreDeliveredAndCommittedOnePageAtATime() async throws {
         let database = FakeCloudKitDatabase()
@@ -532,8 +554,8 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.syncing = true
         let operation = CloudKitSynchronizerOperation()
         synchronizer.runOperation(operation)
-        for _ in 0..<100 where !operation.isExecuting {
-            await Task.yield()
+        for _ in 0..<1_000 where !operation.isExecuting {
+            try? await Task.sleep(nanoseconds: 1_000_000)
         }
         XCTAssertTrue(operation.isExecuting)
 
@@ -548,6 +570,77 @@ final class BigSyncKitTests: XCTestCase {
 
         XCTAssertTrue(synchronizer.syncing)
         synchronizer.cancelSynchronization()
+    }
+
+    @BigSyncBackgroundActor
+    func testSynchronizationRequestDuringActiveRunSchedulesOneTailRun()
+    async {
+        let synchronizer = makeSynchronizer()
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+        let firstAttemptID = synchronizer.synchronizationAttemptID
+
+        synchronizer.beginSynchronization()
+        synchronizer.beginSynchronization()
+        XCTAssertTrue(synchronizer.synchronizationRequestedWhileRunning)
+
+        await synchronizer.changesFinishedSynchronizing()
+
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertFalse(synchronizer.synchronizationRequestedWhileRunning)
+        XCTAssertNotEqual(
+            synchronizer.synchronizationAttemptID,
+            firstAttemptID
+        )
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testAwaitableSynchronizationReturnsOnlyAtTerminalBoundary() async
+    throws {
+        let synchronizer = makeSynchronizer()
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        for _ in 0..<1_000 where !synchronizer.syncing {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(synchronizer.syncing)
+        synchronizer.synchronizationDrainDidImportChanges = true
+
+        await synchronizer.changesFinishedSynchronizing()
+        let result = try await synchronization.value
+
+        XCTAssertEqual(
+            result,
+            CloudKitSynchronizer.SynchronizationResult(
+                didImportChanges: true
+            )
+        )
+        XCTAssertFalse(synchronizer.syncing)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testCancellationBarrierResumesAwaitingSynchronization() async {
+        let synchronizer = makeSynchronizer()
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        for _ in 0..<1_000 where !synchronizer.syncing {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        await synchronizer.cancelSynchronizationAndWait()
+
+        do {
+            _ = try await synchronization.value
+            XCTFail("Expected synchronization cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertFalse(synchronizer.syncing)
     }
 
     @BigSyncBackgroundActor
@@ -1397,6 +1490,99 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testURLListRoundTripsThroughCloudKitStrings() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "url-list",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        object.urls.append(
+            objectsIn: [
+                URL(string: "https://example.com/first")!,
+                URL(string: "file:///tmp/offline%20item")!,
+            ]
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+
+        let uploadedRecords = try await fixture.adapter.recordsToUpload(
+            limit: 10
+        )
+        let record = try XCTUnwrap(
+            uploadedRecords.first {
+                $0.recordID.recordName
+                    == BigSyncTrackedObject.className() + ".url-list"
+            }
+        )
+        XCTAssertEqual(
+            record["urls"] as? [String],
+            object.urls.map(\.absoluteString)
+        )
+
+        record["urls"] = [
+            "https://example.com/replaced",
+            "file:///tmp/second",
+        ] as CKRecordValue
+        let property = try XCTUnwrap(
+            object.objectSchema.properties.first { $0.name == "urls" }
+        )
+        try await fixture.targetRealm.asyncWrite {
+            try fixture.adapter.applyChange(
+                property: property,
+                record: record,
+                object: object,
+                syncedEntityIdentifier: record.recordID.recordName
+            )
+        }
+        XCTAssertEqual(
+            object.urls.map(\.absoluteString),
+            [
+                "https://example.com/replaced",
+                "file:///tmp/second",
+            ]
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRemoteNilClearsOptionalToOneRelationship() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let child = BigSyncRelationshipChild()
+        child.id = "favorite"
+        let parent = BigSyncRelationshipParent()
+        parent.id = "parent-with-favorite"
+        parent.favoriteChild = child
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add([child, parent], update: .modified)
+        }
+
+        let record = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["modifiedAt"] = Date().addingTimeInterval(60) as CKRecordValue
+        record["explicitlyModifiedAt"] =
+            Date().addingTimeInterval(60) as CKRecordValue
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.persistImportedChanges()
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncRelationshipParent.self,
+                forPrimaryKey: parent.id
+            )?.favoriteChild
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testUnknownCloudKitItemIsRequeuedAsNewInsteadOfLosingTracking() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -1604,6 +1790,53 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPendingLocalEditWinsOverConcurrentRemoteDeletion() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "locally-edited",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let uploadedRecords = try await fixture.adapter.recordsToUpload(
+            limit: 1
+        )
+        let uploaded = try XCTUnwrap(uploadedRecords.first)
+        try await fixture.adapter.didUpload(savedRecords: [uploaded])
+
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("offline-edit")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertFalse(object.isDeleted)
+        XCTAssertEqual(Array(object.tags), ["offline-edit"])
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: uploaded.recordID.recordName
+            )
+        )
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: uploaded.recordID.recordName
+            )
+        )
+        XCTAssertEqual(tracking.entityState, .new)
+        XCTAssertNil(tracking.encodedRecord)
+        XCTAssertNotNil(tracking.pendingGeneration)
+    }
+
+    @BigSyncBackgroundActor
     func testRemoteDeletionWithoutExistingTrackingStillDeletesLocalObject() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -1801,6 +2034,37 @@ final class BigSyncKitTests: XCTestCase {
             fixture.persistenceRealm.object(
                 ofType: SyncedEntity.self,
                 forPrimaryKey: BigSyncTrackedObject.className() + ".setup-journal"
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testJournalDropsMutationsForUntrackedEntityTypes() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let recordName = "ExcludedThing.id"
+        let mutation = BigSyncPendingMutation(
+            recordName: recordName,
+            entityType: "ExcludedThing",
+            objectIdentifier: "id"
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(mutation)
+        }
+
+        let forwarded = try await fixture.adapter
+            ._test_forwardPendingMutations(in: fixture.targetRealm)
+
+        XCTAssertEqual(forwarded, 0)
+        XCTAssertNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
             )
         )
     }

@@ -38,18 +38,10 @@ public extension ChangeMetadataRecordable {
         let recordName = entityType + "." + objectIdentifier
         let generation = UUID().uuidString
 
-        guard let realm = object.realm else {
-#if DEBUG
-            if BigSyncMutationTrackingRegistry.tracks(className: entityType) {
-                assertionFailure(
-                    "BigSyncKit: refreshChangeMetadata(explicitlyModified:) was called before "
-                        + entityType
-                        + " was added to Realm; the mutation cannot be journaled atomically."
-                )
-            }
-#endif
-            return
-        }
+        // Callers commonly initialize timestamps before adding a new object.
+        // That is valid, but durable mutation capture can only happen in the
+        // same write transaction after the object has entered Realm.
+        guard let realm = object.realm else { return }
         guard realm.isInWriteTransaction,
               BigSyncMutationTrackingRegistry.tracks(className: entityType, in: realm),
               realm.schema.objectSchema.contains(where: {

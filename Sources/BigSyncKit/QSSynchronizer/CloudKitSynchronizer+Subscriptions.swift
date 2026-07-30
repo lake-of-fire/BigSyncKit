@@ -10,6 +10,56 @@ import CloudKit
 
 @available(iOS 10.0, macOS 10.12, watchOS 6.0, *)
 public extension CloudKitSynchronizer {
+    private func fetchAllCloudKitSubscriptions() async throws
+        -> [CKSubscription] {
+        try await withCheckedThrowingContinuation {
+            (
+                continuation:
+                    CheckedContinuation<[CKSubscription], Error>
+            ) in
+            database.fetchAllSubscriptions { subscriptions, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: subscriptions ?? [])
+                }
+            }
+        }
+    }
+
+    private func saveCloudKitSubscription(
+        _ subscription: CKSubscription
+    ) async throws -> CKSubscription {
+        try await withCheckedThrowingContinuation { continuation in
+            database.save(subscription: subscription) { subscription, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let subscription {
+                    continuation.resume(returning: subscription)
+                } else {
+                    continuation.resume(
+                        throwing: CocoaError(.coderValueNotFound)
+                    )
+                }
+            }
+        }
+    }
+
+    private func deleteCloudKitSubscription(
+        identifier: String
+    ) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            database.delete(withSubscriptionID: identifier) { _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
     /// Returns identifier for a registered `CKSubscription` to track changes.
     /// - Parameter zoneID: `CKRecordZoneID` that is being tracked with the subscription.
     /// - Returns: Identifier of an existing `CKSubscription` for the record zone, if there is one.
@@ -36,43 +86,37 @@ public extension CloudKitSynchronizer {
     /// - Parameter completion: Block that will be called after subscription is created, with an optional error.
     @BigSyncBackgroundActor
     func subscribeForChangesInDatabase(completion: ((Error?) -> ())?) {
-        guard subscriptionIDForDatabaseSubscription() == nil else {
-            completion?(nil)
-            return
-        }
-        
-        database.fetchAllSubscriptions { (subscriptions, error) in
-            guard error == nil else {
-                completion?(error)
+        Task { @BigSyncBackgroundActor [weak self] in
+            guard let self else {
+                completion?(CancellationError())
                 return
             }
-            
-            let existingSubscription = subscriptions?.first {
-                $0 is CKDatabaseSubscription
-            }
-            
-            if let subscription = existingSubscription {
-                // Found existing subscription
-                self.databaseSubscriptionID = subscription.subscriptionID
+            do {
+                try await subscribeForChangesInDatabase()
                 completion?(nil)
-            } else {
-                // Create new one
-                let subscription = CKDatabaseSubscription()
-                let notificationInfo = CKSubscription.NotificationInfo()
-                notificationInfo.shouldSendContentAvailable = true
-                subscription.notificationInfo = notificationInfo
-                
-                self.database.save(subscription: subscription, completionHandler: { (subscription, error) in
-                    if error == nil,
-                        let subscription = subscription {
-                        self.databaseSubscriptionID = subscription.subscriptionID
-                    }
-                    
-                    completion?(error)
-                })
-
+            } catch {
+                completion?(error)
             }
         }
+    }
+
+    @BigSyncBackgroundActor
+    func subscribeForChangesInDatabase() async throws {
+        guard subscriptionIDForDatabaseSubscription() == nil else { return }
+        let subscriptions = try await fetchAllCloudKitSubscriptions()
+        if let existing = subscriptions.first(where: {
+            $0 is CKDatabaseSubscription
+        }) {
+            databaseSubscriptionID = existing.subscriptionID
+            return
+        }
+
+        let subscription = CKDatabaseSubscription()
+        let notificationInfo = CKSubscription.NotificationInfo()
+        notificationInfo.shouldSendContentAvailable = true
+        subscription.notificationInfo = notificationInfo
+        let saved = try await saveCloudKitSubscription(subscription)
+        databaseSubscriptionID = saved.subscriptionID
     }
     
     /// Creates a new subscription with CloudKit so the application can receive notifications when new changes happen. The application is responsible for registering for remote notifications and initiating synchronization when a notification is received. @see `CKSubscription`
@@ -81,44 +125,37 @@ public extension CloudKitSynchronizer {
     ///   - completion: Block that will be called after subscription is created, with an optional error.
     @BigSyncBackgroundActor
     func subscribeForChanges(in zoneID: CKRecordZone.ID, completion: ((Error?)->())?) {
-        guard subscriptionID(forRecordZoneID: zoneID) == nil else {
-            completion?(nil)
-            return
-        }
-        
-        database.fetchAllSubscriptions { (subscriptions, error) in
-            guard error == nil else {
-                completion?(error)
+        Task { @BigSyncBackgroundActor [weak self] in
+            guard let self else {
+                completion?(CancellationError())
                 return
             }
-            
-            let existingSubscription = subscriptions?.first {
-                let subscription = $0 as? CKRecordZoneSubscription
-                return subscription?.zoneID == zoneID
-            }
-            if let subscription = existingSubscription {
-                // Found existing subscription
-                self.storeSubscriptionID(subscription.subscriptionID, for: zoneID)
+            do {
+                try await subscribeForChanges(in: zoneID)
                 completion?(nil)
-            } else {
-                // Create new one
-                let subscription = CKRecordZoneSubscription(zoneID: zoneID)
-                let notificationInfo = CKSubscription.NotificationInfo()
-                notificationInfo.shouldSendContentAvailable = true
-                subscription.notificationInfo = notificationInfo
-                
-                self.database.save(subscription: subscription, completionHandler: { (subscription, error) in
-                    if error == nil,
-                        let subscription = subscription {
-                        
-                        self.storeSubscriptionID(subscription.subscriptionID, for: zoneID)
-                    }
-                    
-                    completion?(error)
-                })
-                
+            } catch {
+                completion?(error)
             }
         }
+    }
+
+    @BigSyncBackgroundActor
+    func subscribeForChanges(in zoneID: CKRecordZone.ID) async throws {
+        guard subscriptionID(forRecordZoneID: zoneID) == nil else { return }
+        let subscriptions = try await fetchAllCloudKitSubscriptions()
+        if let existing = subscriptions.compactMap({
+            $0 as? CKRecordZoneSubscription
+        }).first(where: { $0.zoneID == zoneID }) {
+            storeSubscriptionID(existing.subscriptionID, for: zoneID)
+            return
+        }
+
+        let subscription = CKRecordZoneSubscription(zoneID: zoneID)
+        let notificationInfo = CKSubscription.NotificationInfo()
+        notificationInfo.shouldSendContentAvailable = true
+        subscription.notificationInfo = notificationInfo
+        let saved = try await saveCloudKitSubscription(subscription)
+        storeSubscriptionID(saved.subscriptionID, for: zoneID)
     }
     
     /**
@@ -131,30 +168,32 @@ public extension CloudKitSynchronizer {
     /// - Parameter completion: Block that will be called after subscription is deleted, with an optional error.
     @BigSyncBackgroundActor
     @objc func cancelSubscriptionForChangesInDatabase(completion: ((Error?)->())?) {
-        if let subscriptionID = subscriptionIDForDatabaseSubscription() {
-            
-            self.cancelSubscription(identifier: subscriptionID, completion: completion)
-        } else {
-            // There might be an existing subscription in the server
-            database.fetchAllSubscriptions { (subscriptions, error) in
-                guard error == nil else {
-                    completion?(error)
-                    return
-                }
-                
-                let existingSubscriptionIdentifier = subscriptions?.first {
-                    $0 is CKDatabaseSubscription
-                }
-                
-                if let subscriptionID = existingSubscriptionIdentifier?.subscriptionID {
-                    
-                    self.cancelSubscription(identifier: subscriptionID, completion: completion)
-                } else {
-                    // No subscription to cancel
-                    completion?(nil)
-                }
+        Task { @BigSyncBackgroundActor [weak self] in
+            guard let self else {
+                completion?(CancellationError())
+                return
+            }
+            do {
+                try await cancelSubscriptionForChangesInDatabase()
+                completion?(nil)
+            } catch {
+                completion?(error)
             }
         }
+    }
+
+    @BigSyncBackgroundActor
+    func cancelSubscriptionForChangesInDatabase() async throws {
+        let subscriptionID: String?
+        if let stored = subscriptionIDForDatabaseSubscription() {
+            subscriptionID = stored
+        } else {
+            subscriptionID = try await fetchAllCloudKitSubscriptions()
+                .first(where: { $0 is CKDatabaseSubscription })?
+                .subscriptionID
+        }
+        guard let subscriptionID else { return }
+        try await cancelSubscription(identifier: subscriptionID)
     }
     
     /// Delete existing subscription to stop receiving notifications.
@@ -163,40 +202,56 @@ public extension CloudKitSynchronizer {
     ///   - completion: Block that will be called after subscription is deleted, with an optional error.
     @BigSyncBackgroundActor
     @objc func cancelSubscriptionForChanges(in zoneID: CKRecordZone.ID, completion: ((Error?)->())?) {
-        if let subscriptionID = subscriptionID(forRecordZoneID: zoneID) {
-            
-            self.cancelSubscription(identifier: subscriptionID, completion: completion)
-        } else {
-            // There might be an existing subscription in the server
-            database.fetchAllSubscriptions { (subscriptions, error) in
-                guard error == nil else {
-                    completion?(error)
-                    return
-                }
-                
-                let existingSubscriptionIdentifier = subscriptions?.first {
-                    let subscription = $0 as? CKRecordZoneSubscription
-                    return subscription?.zoneID == zoneID
-                }
-                
-                if let subscriptionID = existingSubscriptionIdentifier?.subscriptionID {
-                    
-                    self.cancelSubscription(identifier: subscriptionID, completion: completion)
-                } else {
-                    // No subscription to cancel
-                    completion?(nil)
-                }
+        Task { @BigSyncBackgroundActor [weak self] in
+            guard let self else {
+                completion?(CancellationError())
+                return
+            }
+            do {
+                try await cancelSubscriptionForChanges(in: zoneID)
+                completion?(nil)
+            } catch {
+                completion?(error)
             }
         }
+    }
+
+    @BigSyncBackgroundActor
+    func cancelSubscriptionForChanges(
+        in zoneID: CKRecordZone.ID
+    ) async throws {
+        let resolvedSubscriptionID: String?
+        if let stored = subscriptionID(forRecordZoneID: zoneID) {
+            resolvedSubscriptionID = stored
+        } else {
+            resolvedSubscriptionID = try await fetchAllCloudKitSubscriptions()
+                .compactMap { $0 as? CKRecordZoneSubscription }
+                .first(where: { $0.zoneID == zoneID })?
+                .subscriptionID
+        }
+        guard let resolvedSubscriptionID else { return }
+        try await cancelSubscription(identifier: resolvedSubscriptionID)
     }
     
     @BigSyncBackgroundActor
     fileprivate func cancelSubscription(identifier: String, completion: ((Error?)->())?) {
-        database.delete(withSubscriptionID: identifier) { (subscriptionID, error) in
-            if error == nil {
-                self.clearSubscriptionID(identifier)
+        Task { @BigSyncBackgroundActor [weak self] in
+            guard let self else {
+                completion?(CancellationError())
+                return
             }
-            completion?(error)
+            do {
+                try await cancelSubscription(identifier: identifier)
+                completion?(nil)
+            } catch {
+                completion?(error)
+            }
         }
+    }
+
+    @BigSyncBackgroundActor
+    fileprivate func cancelSubscription(identifier: String) async throws {
+        try await deleteCloudKitSubscription(identifier: identifier)
+        clearSubscriptionID(identifier)
     }
 }

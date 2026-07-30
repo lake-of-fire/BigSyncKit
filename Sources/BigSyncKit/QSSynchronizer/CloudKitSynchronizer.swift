@@ -7,6 +7,7 @@
 
 import Foundation
 import CloudKit
+import CryptoKit
 import Logging
 import RealmSwiftGaps
 import SwiftUtilities
@@ -306,6 +307,14 @@ public let cloudKitSynchronizerMetadataKeys: [String] = [
 @BigSyncBackgroundActor
 public class CloudKitSynchronizer: NSObject {
     public typealias AccountIdentifierProvider = @Sendable () async throws -> String
+    public struct SynchronizationResult: Sendable, Equatable {
+        public let didImportChanges: Bool
+
+        public init(didImportChanges: Bool) {
+            self.didImportChanges = didImportChanges
+        }
+    }
+
     /// SyncError
     public enum SyncError: Int, Error {
         /**
@@ -321,6 +330,8 @@ public class CloudKitSynchronizer: NSObject {
          *  Synchronization was manually cancelled.
          */
         case cancelled = 3
+        /// Synchronization cannot start until an iCloud account is available.
+        case notAuthenticated = 4
     }
     
     /// `CloudKitSynchronizer` can be configured to only download changes, never uploading local changes to CloudKit.
@@ -399,6 +410,12 @@ public class CloudKitSynchronizer: NSObject {
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     internal var synchronizationTask: Task<Void, Never>?
+    internal var synchronizationRequestedWhileRunning = false
+    internal var synchronizationDrainIsActive = false
+    internal var synchronizationDrainDidImportChanges = false
+    private var synchronizationWaiters = [
+        UUID: CheckedContinuation<SynchronizationResult, Error>
+    ]()
     internal var mergeChangesTask: Task<Void, Error>?
     internal var fetchZoneChangesCompletionTask: Task<Void, Error>? = nil
 
@@ -515,7 +532,7 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     public func resetSyncCaches(cancelSynchronization: Bool, includingAdapters: Bool = true) async throws {
         if cancelSynchronization {
-            self.cancelSynchronization()
+            await cancelSynchronizationAndWait()
         }
         
         clearDeviceIdentifier()
@@ -539,11 +556,19 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
         guard !cancelledDueToUnauthentication else { return }
-        guard !syncing else { return }
+        guard !syncing else {
+            synchronizationRequestedWhileRunning = true
+            return
+        }
 
         logger.info("QSCloudKitSynchronizer >> Begin synchronization...")
+        if !synchronizationDrainIsActive {
+            synchronizationDrainIsActive = true
+            synchronizationDrainDidImportChanges = false
+        }
         cancelSync = false
         syncing = true
+        retrySleepUntil = nil
         let attemptID = UUID()
         synchronizationAttemptID = attemptID
 
@@ -565,6 +590,48 @@ public class CloudKitSynchronizer: NSObject {
                 guard synchronizationAttemptID == attemptID else { return }
                 await failSynchronization(error: error)
             }
+        }
+    }
+
+    /// Starts synchronization, coalesces with any in-flight request, and returns
+    /// only after the full fetch/import/upload drain has finished.
+    @BigSyncBackgroundActor
+    public func synchronize() async throws -> SynchronizationResult {
+        guard !cancelledDueToUnauthentication else {
+            throw SyncError.notAuthenticated
+        }
+
+        let requestID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                synchronizationWaiters[requestID] = continuation
+                beginSynchronization()
+            }
+        } onCancel: {
+            Task { @BigSyncBackgroundActor [weak self] in
+                self?.cancelSynchronizationRequest(requestID)
+            }
+        }
+    }
+
+    private func cancelSynchronizationRequest(_ requestID: UUID) {
+        synchronizationWaiters.removeValue(forKey: requestID)?
+            .resume(throwing: CancellationError())
+    }
+
+    internal func finishSynchronizationDrain(
+        with result: Result<SynchronizationResult, Error>
+    ) {
+        synchronizationDrainIsActive = false
+        synchronizationRequestedWhileRunning = false
+        let waiters = synchronizationWaiters.values
+        synchronizationWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume(with: result)
         }
     }
 
@@ -597,6 +664,15 @@ public class CloudKitSynchronizer: NSObject {
         cancelledDueToUnauthentication = false
     }
 
+    /// Stable, non-reversible key for account-scoped one-off migration markers.
+    @BigSyncBackgroundActor
+    public func cloudKitAccountScopeIdentifier() async throws -> String {
+        let accountIdentifier = try await accountIdentifierProvider()
+        return SHA256.hash(data: Data(accountIdentifier.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
 #if DEBUG
     @BigSyncBackgroundActor
     func _test_validateSynchronizationAccount() async throws {
@@ -612,19 +688,34 @@ public class CloudKitSynchronizer: NSObject {
         synchronizationAttemptID = UUID()
         changeRequestProcessor.reset()
         synchronizationTask?.cancel()
+        synchronizationTask = nil
         mergeChangesTask?.cancel()
         fetchZoneChangesCompletionTask?.cancel()
-
-        guard !cancelSync else { return }
-        logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
-        
-        cancelSync = true
-        syncing = false // TODO: This might be buggy to set eagerly?!
         currentOperations.forEach { $0.cancel() }
+        if !cancelSync {
+            logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
+        }
+        cancelSync = true
+        syncing = false
+        retrySleepUntil = nil
         
         for adapter in modelAdapters {
             adapter.cancelSynchronization()
         }
+        finishSynchronizationDrain(
+            with: .failure(CancellationError())
+        )
+    }
+
+    /// Establishes a logical cancellation barrier before destructive metadata
+    /// or zone changes. Operation callbacks are fenced by attempt ID, so the
+    /// barrier does not need a second lock or an unbounded operation poll.
+    @BigSyncBackgroundActor
+    public func cancelSynchronizationAndWait() async {
+        let task = synchronizationTask
+        cancelSynchronization()
+        await task?.value
+        await Task.yield()
     }
     
     /**
@@ -694,9 +785,7 @@ public class CloudKitSynchronizer: NSObject {
     /// either succeeded or reported that the zone is already absent.
     @BigSyncBackgroundActor
     public func deleteRecordZonesAndResetSyncCachesForReupload() async throws {
-        let activeSynchronizationTask = synchronizationTask
-        cancelSynchronization()
-        await activeSynchronizationTask?.value
+        await cancelSynchronizationAndWait()
 
         let adapters = modelAdapters
         for zoneID in Set(adapters.map(\.recordZoneID)) {
@@ -809,9 +898,7 @@ public class CloudKitSynchronizer: NSObject {
             throw error
         }
 
-        let activeSynchronizationTask = synchronizationTask
-        cancelSynchronization()
-        await activeSynchronizationTask?.value
+        await cancelSynchronizationAndWait()
 
         try await ensureCurrentAccount(accountIdentifier)
         for zoneID in Set(modelAdapters.map(\.recordZoneID)) {
@@ -886,9 +973,7 @@ public class CloudKitSynchronizer: NSObject {
 
     @BigSyncBackgroundActor
     private func rebuildLocalSyncCachesAfterCompletedReset() async throws {
-        let activeSynchronizationTask = synchronizationTask
-        cancelSynchronization()
-        await activeSynchronizationTask?.value
+        await cancelSynchronizationAndWait()
         try await resetSyncCaches(
             cancelSynchronization: false,
             includingAdapters: true

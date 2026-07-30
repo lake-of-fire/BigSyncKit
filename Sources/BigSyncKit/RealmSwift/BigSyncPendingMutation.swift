@@ -74,11 +74,6 @@ enum BigSyncMutationTrackingRegistry {
         }
     }
 
-    static func tracks(className: String) -> Bool {
-        lock.withLock {
-            trackedClassNamesByRealm.values.contains { $0.contains(className) }
-        }
-    }
 }
 
 /// Installs the class allowlist used by `refreshChangeMetadata` to atomically

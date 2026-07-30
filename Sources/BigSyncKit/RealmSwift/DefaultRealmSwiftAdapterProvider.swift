@@ -7,6 +7,7 @@
 
 import Foundation
 import CloudKit
+import CryptoKit
 import RealmSwift
 import Logging
 
@@ -32,6 +33,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         priorityClassNames: [String] = [],
         zoneID: CKRecordZone.ID,
         appGroup: String? = nil,
+        persistenceNamespace: String? = nil,
         logger: Logging.Logger
     ) {
         self.targetConfigurations = targetConfigurations
@@ -42,7 +44,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         self.logger = logger
         persistenceConfiguration = DefaultRealmSwiftAdapterProvider.createPersistenceConfiguration(
             suiteName: appGroup,
-            zoneID: zoneID
+            zoneID: zoneID,
+            persistenceNamespace: persistenceNamespace
         )
         super.init()
         adapter = createAdapter()
@@ -96,9 +99,15 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     
     public static func realmPath(
         appGroup: String?,
-        zoneID: CKRecordZone.ID
+        zoneID: CKRecordZone.ID,
+        persistenceNamespace: String? = nil
     ) -> String {
-        return applicationBackupRealmPath(suiteName: appGroup).appending("/" + realmFileName(zoneID: zoneID))
+        return applicationBackupRealmPath(suiteName: appGroup).appending(
+            "/" + realmFileName(
+                zoneID: zoneID,
+                persistenceNamespace: persistenceNamespace
+            )
+        )
     }
     
     fileprivate static func applicationBackupRealmPath(suiteName: String?) -> String! {
@@ -121,17 +130,33 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
 #endif
     }
     
-    fileprivate static func realmFileName(zoneID: CKRecordZone.ID) -> String {
-        return zoneID.zoneName + ".realm"
+    fileprivate static func realmFileName(
+        zoneID: CKRecordZone.ID,
+        persistenceNamespace: String?
+    ) -> String {
+        guard let persistenceNamespace else {
+            return zoneID.zoneName + ".realm"
+        }
+        let digest = SHA256.hash(
+            data: Data(persistenceNamespace.utf8)
+        ).map { String(format: "%02x", $0) }.joined()
+        return "\(digest)-\(zoneID.zoneName).realm"
     }
     
     fileprivate static func createPersistenceConfiguration(
         suiteName: String?,
-        zoneID: CKRecordZone.ID
+        zoneID: CKRecordZone.ID,
+        persistenceNamespace: String?
     ) -> Realm.Configuration {
         ensurePathAvailable(suiteName: suiteName)
         var configuration = RealmSwiftAdapter.defaultPersistenceConfiguration()
-        configuration.fileURL = URL(fileURLWithPath: realmPath(appGroup: suiteName, zoneID: zoneID))
+        configuration.fileURL = URL(
+            fileURLWithPath: realmPath(
+                appGroup: suiteName,
+                zoneID: zoneID,
+                persistenceNamespace: persistenceNamespace
+            )
+        )
         return configuration
     }
     

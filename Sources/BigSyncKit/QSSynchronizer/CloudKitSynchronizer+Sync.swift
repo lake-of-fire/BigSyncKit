@@ -54,12 +54,24 @@ extension CloudKitSynchronizer {
             guard synchronizationAttemptID == attemptID else { return }
         }
         
-        postNotification(.SynchronizerDidSynchronize)
-        delegate?.synchronizerDidSync(self)
-        
 //        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
         syncing = false
         synchronizationTask = nil
+        if synchronizationRequestedWhileRunning {
+            synchronizationRequestedWhileRunning = false
+            beginSynchronization()
+            return
+        }
+        postNotification(.SynchronizerDidSynchronize)
+        delegate?.synchronizerDidSync(self)
+        finishSynchronizationDrain(
+            with: .success(
+                SynchronizationResult(
+                    didImportChanges:
+                        synchronizationDrainDidImportChanges
+                )
+            )
+        )
     }
     
 //    @BigSyncBackgroundActor
@@ -142,10 +154,12 @@ extension CloudKitSynchronizer {
             shouldRetry = false
         }
 
-        syncing = false
+        syncing = shouldRetry && !cancelSync
         synchronizationTask = nil
 
         guard shouldRetry, !cancelSync else {
+            syncing = false
+            finishSynchronizationDrain(with: .failure(error))
             return
         }
 
@@ -163,6 +177,8 @@ extension CloudKitSynchronizer {
                   synchronizationAttemptID == attemptID else { return }
             retrySleepUntil = nil
             synchronizationTask = nil
+            syncing = false
+            synchronizationRequestedWhileRunning = false
             logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
             beginSynchronization()
         }
@@ -520,6 +536,10 @@ extension CloudKitSynchronizer {
                             runID: runID
                         )
                     )
+                }
+                if !zoneResult.downloadedRecords.isEmpty
+                    || !zoneResult.deletedRecordIDs.isEmpty {
+                    synchronizationDrainDidImportChanges = true
                 }
                 if !zoneResult.downloadedRecords.isEmpty {
                     logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.downloadedRecords.count) changed records from zone \(zoneID.zoneName)")
@@ -1124,6 +1144,7 @@ extension CloudKitSynchronizer {
                         }
                     })
                 } else {
+                    storedDatabaseToken = databaseToken
                     await changesFinishedSynchronizing()
                 }
             }

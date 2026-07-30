@@ -857,9 +857,19 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             )
         }
         guard !pending.isEmpty else { return 0 }
+        let ignoredRecordNames = pending.compactMap { mutation in
+            self.modelTypes[mutation.entityType] == nil
+                || self.excludedClassNames.contains(mutation.entityType)
+                ? mutation.recordName
+                : nil
+        }
+        let trackedPending = pending.filter {
+            self.modelTypes[$0.entityType] != nil
+                && !self.excludedClassNames.contains($0.entityType)
+        }
 
         var forwardedCount = 0
-        for chunk in pending.chunks(ofCount: 1000) {
+        for chunk in trackedPending.chunks(ofCount: 1000) {
             try await persistenceRealm.asyncWrite {
                 for mutation in chunk {
                     try Task.checkCancellation()
@@ -880,6 +890,19 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         persistenceRealm: persistenceRealm
                     )
                     forwardedCount += 1
+                }
+            }
+        }
+
+        if !ignoredRecordNames.isEmpty {
+            try await targetReaderRealm.asyncWrite {
+                for recordName in ignoredRecordNames {
+                    if let mutation = targetReaderRealm.object(
+                        ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: recordName
+                    ) {
+                        targetReaderRealm.delete(mutation)
+                    }
                 }
             }
         }
@@ -1556,8 +1579,19 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         guard let newValue = newValue as? [Int], let existingValue = existingValue as? RealmSwift.List<Int> else { return true }
                         return newValue != Array(existingValue)
                     case .string:
-                        guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.List<String> else { return true }
-                        return newValue != Array(existingValue)
+                        guard let newValue = newValue as? [String] else {
+                            return true
+                        }
+                        if let existingValue =
+                            existingValue as? RealmSwift.List<String> {
+                            return newValue != Array(existingValue)
+                        }
+                        if let existingValue =
+                            existingValue as? RealmSwift.List<URL> {
+                            return newValue
+                                != existingValue.map(\.absoluteString)
+                        }
+                        return true
                     case .bool:
                         guard let newValue = newValue as? [Bool], let existingValue = existingValue as? RealmSwift.List<Bool> else { return true }
                         return newValue != Array(existingValue)
@@ -1692,38 +1726,52 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         if mergePolicy == .server {
             try applyChanges()
         } else if mergePolicy == .custom {
-            var recordChanges = [String: Any]()
-            for property in objectProperties where !skippedKeys.contains(property.name) {
-                try Task.checkCancellation()
-                if property.type == .linkingObjects {
-                    continue
-                }
-                if !shouldIgnore(key: property.name) {
-                    if let asset = record[property.name] as? CKAsset {
-                        try Task.checkCancellation()
-                        recordChanges[property.name] = asset.fileURL != nil ? NSData(contentsOf: asset.fileURL!) : NSNull()
-                    } else {
-                        recordChanges[property.name] = record[property.name] ?? NSNull()
-                    }
-                }
-            }
-            
             let acceptRemoteChange: Bool
             if let delegate {
-                acceptRemoteChange = delegate.realmSwiftAdapter(self, gotChanges: recordChanges, object: object)
+                var recordChanges = [String: Any]()
+                for property in objectProperties
+                    where !skippedKeys.contains(property.name) {
+                    try Task.checkCancellation()
+                    if property.type == .linkingObjects {
+                        continue
+                    }
+                    if !shouldIgnore(key: property.name) {
+                        if let asset = record[property.name] as? CKAsset {
+                            try Task.checkCancellation()
+                            recordChanges[property.name] = asset.fileURL.flatMap {
+                                NSData(contentsOf: $0)
+                            } ?? NSNull()
+                        } else {
+                            recordChanges[property.name] =
+                                record[property.name] ?? NSNull()
+                        }
+                    }
+                }
+                acceptRemoteChange = delegate.realmSwiftAdapter(
+                    self,
+                    gotChanges: recordChanges,
+                    object: object
+                )
             } else {
-                acceptRemoteChange = try { adapter, changes, object in
+                acceptRemoteChange = try { adapter, record, object in
                     guard adapter.hasRealmObjectClass(name: object.objectSchema.className) else {
                         logger.warning("QSCloudKitSynchronizer >> No object class found for '\(object.objectSchema.className)' in adapter")
                         return false
                     }
-                    let remoteExplicitlyModifiedAt = changes["explicitlyModifiedAt"] as? Date ?? .distantPast
+                    // The default merge policy only compares metadata. Avoid
+                    // eagerly reading every CKAsset merely to build a delegate
+                    // payload that no delegate will consume.
+                    let remoteExplicitlyModifiedAt =
+                        record["explicitlyModifiedAt"] as? Date
+                        ?? .distantPast
                     let localExplicitlyModifiedAt = object["explicitlyModifiedAt"] as? Date ?? .distantPast
                     let result: Bool
                     if remoteExplicitlyModifiedAt > localExplicitlyModifiedAt {
                         result = true
                     } else if remoteExplicitlyModifiedAt == localExplicitlyModifiedAt {
-                        let remoteModifiedAt = changes["modifiedAt"] as? Date ?? .distantPast
+                        let remoteModifiedAt =
+                            record["modifiedAt"] as? Date
+                            ?? .distantPast
                         let localModifiedAt = object["modifiedAt"] as? Date ?? .distantPast
                         result = remoteModifiedAt >= localModifiedAt
                     } else {
@@ -1738,7 +1786,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     //                    logger.info("QSCloudKitSynchronizer >> Conflict resolution object - remote: \(changes.description.prefix(5000))")
                     //#endif
                     return result
-                }(self, recordChanges, object)
+                }(self, record, object)
             }
             
             if acceptRemoteChange {
@@ -1897,12 +1945,23 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 recordValue = list
             case .string:
                 guard let value = record.value(forKey: property.name) as? [String] else { break }
-                let list = List<String>()
-                for item in value {
-                    try Task.checkCancellation()
-                    list.append(item)
+                if object[property.name] is List<URL> {
+                    let list = List<URL>()
+                    for item in value {
+                        try Task.checkCancellation()
+                        if let url = URL(string: item) {
+                            list.append(url)
+                        }
+                    }
+                    recordValue = list
+                } else {
+                    let list = List<String>()
+                    for item in value {
+                        try Task.checkCancellation()
+                        list.append(item)
+                    }
+                    recordValue = list
                 }
-                recordValue = list
             case .bool:
                 guard let value = record.value(forKey: property.name) as? [Bool] else { break }
                 let list = List<Bool>()
@@ -2014,14 +2073,21 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         } else if property.type == .object {
             // Save relationship to be applied after all records have been downloaded and persisted
             // to ensure target of the relationship has already been created
-            guard let recordName = record.value(forKey: property.name) as? String,
-                  let objectIdentifier = objectIdentifier(
+            let targetIdentifiers: [String]
+            if let recordName = record.value(forKey: property.name) as? String,
+               let objectIdentifier = objectIdentifier(
                     fromCloudKitRecordName: recordName
-                  ) else { return }
+               ) {
+                targetIdentifiers = [objectIdentifier]
+            } else if value == nil, property.isOptional {
+                targetIdentifiers = []
+            } else {
+                return
+            }
             savePendingRelationshipsAsync(
                 name: key,
                 syncedEntityID: syncedEntityIdentifier,
-                targetIdentifiers: [objectIdentifier]
+                targetIdentifiers: targetIdentifiers
             )
         } else if property.type == .UUID {
             if let uuidString = record.value(forKey: key) as? String,
@@ -2074,7 +2140,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             case .int:
                 object.setValue(List<Int>(), forKey: key)
             case .string:
-                object.setValue(List<String>(), forKey: key)
+                if object[key] is List<URL> {
+                    object.setValue(List<URL>(), forKey: key)
+                } else {
+                    object.setValue(List<String>(), forKey: key)
+                }
             case .bool:
                 object.setValue(List<Bool>(), forKey: key)
             case .float:
@@ -2140,6 +2210,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             pendingRelationship.forSyncedEntity = syncedEntity
                             pendingRelationship.targetIdentifier = targetIdentifier
                             pendingRelationship.position = position
+                            persistenceRealm.add(pendingRelationship)
+                        }
+                        if request.targetIdentifiers.isEmpty {
+                            let pendingRelationship = PendingRelationship()
+                            pendingRelationship.relationshipName = request.name
+                            pendingRelationship.forSyncedEntity = syncedEntity
+                            pendingRelationship.targetIdentifier = nil
                             persistenceRealm.add(pendingRelationship)
                         }
                     }
@@ -2375,27 +2452,22 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 return
             }
             
-            var entity: SyncedEntity! = syncedEntity
-            while entity != nil,
-                  entity.state == state.rawValue,
-                  !includedEntityIDs.contains(entity.identifier),
-                  resultArray.count < limit {
-                let entityIdentifier = entity.identifier
-                let generation = entity.pendingGeneration
-                var parentEntity: SyncedEntity? = nil
-                guard let record = try await recordToUpload(syncedEntity: entity, parentSyncedEntity: &parentEntity) else {
-                    entity = nil
-                    continue
-                }
-                resultArray.append(
-                    PreparedRecordUpload(
-                        record: record,
-                        generation: generation
-                    )
-                )
-                includedEntityIDs.insert(entityIdentifier)
-                entity = parentEntity
+            guard syncedEntity.state == state.rawValue,
+                  !includedEntityIDs.contains(syncedEntity.identifier) else {
+                return
             }
+            let entityIdentifier = syncedEntity.identifier
+            let generation = syncedEntity.pendingGeneration
+            guard let record = try await recordToUpload(
+                syncedEntity: syncedEntity
+            ) else { return }
+            resultArray.append(
+                PreparedRecordUpload(
+                    record: record,
+                    generation: generation
+                )
+            )
+            includedEntityIDs.insert(entityIdentifier)
         }
 
 #if DEBUG
@@ -2417,7 +2489,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
     
     @BigSyncBackgroundActor
-    func recordToUpload(syncedEntity: SyncedEntity, parentSyncedEntity: inout SyncedEntity?) async throws -> CKRecord? {
+    func recordToUpload(
+        syncedEntity: SyncedEntity
+    ) async throws -> CKRecord? {
         try Self.validateCloudKitRecordName(syncedEntity.identifier)
         let record = getRecord(for: syncedEntity) ?? CKRecord(recordType: syncedEntity.entityType, recordID: CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
         
@@ -2623,8 +2697,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         let array = Array(list)
                         record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .string:
-                        guard let list = value as? List<String> else { break }
-                        let array = Array(list)
+                        let array: [String]
+                        if let list = value as? List<String> {
+                            array = Array(list)
+                        } else if let list = value as? List<URL> {
+                            array = list.map(\.absoluteString)
+                        } else {
+                            break
+                        }
                         record[property.name] = array.isEmpty ? nil : array as CKRecordValue
                     case .bool:
                         guard let list = value as? List<Bool> else { break }
@@ -3025,6 +3105,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
               !recordIDs.isEmpty else { return }
 
         var deletions = [RemoteDeletionSnapshot]()
+        var localWins = [
+            (deletion: RemoteDeletionSnapshot, generation: String?)
+        ]()
         deletions.reserveCapacity(recordIDs.count)
         for recordID in recordIDs {
             try Task.checkCancellation()
@@ -3041,13 +3124,28 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                   realmObjectClass(name: entityType) != nil else { continue }
             let prefix = entityType + "."
             guard recordID.recordName.hasPrefix(prefix) else { continue }
-            deletions.append(
-                RemoteDeletionSnapshot(
-                    recordName: recordID.recordName,
-                    entityType: entityType,
-                    objectIdentifier: String(recordID.recordName.dropFirst(prefix.count))
+            let deletion = RemoteDeletionSnapshot(
+                recordName: recordID.recordName,
+                entityType: entityType,
+                objectIdentifier: String(
+                    recordID.recordName.dropFirst(prefix.count)
                 )
             )
+            let targetRealm =
+                realmProvider.targetReaderRealmPerSchemaName[entityType]
+            let pendingMutation = targetRealm?.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordID.recordName
+            )
+            if pendingMutation != nil
+                || syncedEntity?.entityState == .new
+                || syncedEntity?.entityState == .changed {
+                localWins.append(
+                    (deletion, pendingMutation?.generation)
+                )
+            } else {
+                deletions.append(deletion)
+            }
         }
 
         let deletionsByEntityType = Dictionary(grouping: deletions, by: \.entityType)
@@ -3086,6 +3184,24 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
 
         try await persistenceRealm.asyncWrite {
+            for localWin in localWins {
+                try Task.checkCancellation()
+                let syncedEntity = Self.getSyncedEntity(
+                    objectIdentifier: localWin.deletion.recordName,
+                    realm: persistenceRealm
+                ) ?? SyncedEntity(
+                    entityType: localWin.deletion.entityType,
+                    identifier: localWin.deletion.recordName,
+                    state: SyncedEntityState.new.rawValue
+                )
+                persistenceRealm.add(syncedEntity, update: .modified)
+                syncedEntity.state = SyncedEntityState.new.rawValue
+                syncedEntity.encodedRecord = nil
+                syncedEntity.pendingGeneration =
+                    localWin.generation
+                    ?? syncedEntity.pendingGeneration
+                    ?? UUID().uuidString
+            }
             for deletion in deletions {
                 try Task.checkCancellation()
                 let syncedEntity = Self.getSyncedEntity(
@@ -3105,6 +3221,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         logger.info(
             "Deleted \(deletions.count) local records which were previously deleted from iCloud"
         )
+        if !localWins.isEmpty {
+            logger.info(
+                "Requeued \(localWins.count) locally changed records after a concurrent iCloud deletion"
+            )
+        }
     }
     
     @BigSyncBackgroundActor

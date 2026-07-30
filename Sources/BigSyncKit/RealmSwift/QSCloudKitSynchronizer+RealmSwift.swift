@@ -41,6 +41,8 @@ extension CloudKitSynchronizer {
             priorityClassNames: priorityClassNames,
             zoneID: zoneID,
             appGroup: suiteName,
+            persistenceNamespace:
+                "\(containerName)|\(synchronizerName)|private",
             logger: logger
         )
         let userDefaults = UserDefaults(suiteName: suiteName)!
