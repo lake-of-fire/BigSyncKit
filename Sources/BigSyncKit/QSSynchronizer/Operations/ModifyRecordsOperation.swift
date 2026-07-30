@@ -128,15 +128,18 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
     }
     
     override func cancel() {
-        let operation = resultLock.withLock { internalOperation }
-        operation?.cancel()
-        deliverCompletion(
-            saved: nil,
-            deleted: nil,
-            conflicted: [],
-            missing: [],
-            error: CancellationError()
-        )
         super.cancel()
+        // Reserve the one completion while holding the same lock used by the
+        // CloudKit callback, before cancel() can synchronously invoke it.
+        let (operation, shouldDeliverCancellation) = resultLock.withLock {
+            let operation = internalOperation
+            guard !completionDelivered else { return (operation, false) }
+            completionDelivered = true
+            return (operation, true)
+        }
+        operation?.cancel()
+        if shouldDeliverCancellation {
+            completion(nil, nil, [], [], CancellationError())
+        }
     }
 }

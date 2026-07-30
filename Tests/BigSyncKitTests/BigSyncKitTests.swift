@@ -30,10 +30,14 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
     private var records = [CKRecord.ID: CKRecord]()
     private var conditionallyFetchedRecordIDs = Set<CKRecord.ID>()
+    private var lastIncompleteModifyOperation: CKModifyRecordsOperation?
 
     func add(_ operation: CKDatabaseOperation) {
         if let modifyOperation = operation as? CKModifyRecordsOperation {
-            guard completesModifyOperations else { return }
+            guard completesModifyOperations else {
+                lastIncompleteModifyOperation = modifyOperation
+                return
+            }
             let savedRecords = modifyOperation.recordsToSave ?? []
             let deletedRecordIDs = modifyOperation.recordIDsToDelete ?? []
             let partialSaveErrors = partialSaveErrorsByRecordID.filter {
@@ -115,6 +119,12 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             }
             modifyOperation.modifyRecordsCompletionBlock?(savedRecords, deletedRecordIDs, nil)
         }
+    }
+
+    func completeLastModifyOperation() {
+        let operation = lastIncompleteModifyOperation
+        lastIncompleteModifyOperation = nil
+        operation?.modifyRecordsCompletionBlock?([], [], nil)
     }
 
     func save(zone: CKRecordZone, completionHandler: @escaping (CKRecordZone?, Error?) -> Void) {
@@ -326,6 +336,34 @@ final class BigSyncKitTests: XCTestCase {
         wait(for: [completed], timeout: 1)
         XCTAssertTrue(operation.isFinished)
         XCTAssertEqual(completionCount, 1)
+    }
+
+    func testCancellingModifyOperationCannotBeOvertakenByACloudKitCallback() {
+        let database = FakeCloudKitDatabase()
+        database.completesModifyOperations = false
+        let completed = expectation(description: "completion")
+        completed.expectedFulfillmentCount = 1
+        var completionCount = 0
+        var completionError: Error?
+        let operation = ModifyRecordsOperation(
+            database: database,
+            records: [],
+            recordIDsToDelete: []
+        ) { _, _, _, _, error in
+            completionCount += 1
+            completionError = error
+            completed.fulfill()
+        }
+
+        operation.start()
+        operation.cancel()
+        database.completeLastModifyOperation()
+
+        wait(for: [completed], timeout: 1)
+        XCTAssertTrue(operation.isCancelled)
+        XCTAssertTrue(operation.isFinished)
+        XCTAssertEqual(completionCount, 1)
+        XCTAssertTrue(completionError is CancellationError)
     }
 
     @BigSyncBackgroundActor
@@ -555,9 +593,8 @@ final class BigSyncKitTests: XCTestCase {
             database: database,
             accountIdentifierProvider: { database.accountIdentifier }
         )
-        synchronizer.addModelAdapter(
-            FakeModelAdapter(zoneID: zoneID, priorities: [])
-        )
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        synchronizer.addModelAdapter(adapter)
 
         do {
             _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
@@ -569,6 +606,46 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Expected the account fence to stop the migration")
         } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
             XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+            XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetRejectsAStoredDifferentAccountBeforeDeletingAnything() async throws {
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-b"
+        let keyValueStore = DictionaryKeyValueStore()
+        let identifier = "account-transition-reset"
+        keyValueStore.set(
+            value: "account-a",
+            forKey: "\(identifier).BigSyncKitCloudKitAccountIdentifier"
+        )
+        let synchronizer = makeSynchronizer(
+            identifier: identifier,
+            database: database,
+            keyValueStore: keyValueStore,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(
+                zoneName: "different-account-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "different-account-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+            XCTFail("Expected reset to require an explicit account transition")
+        } catch OneOffRecordZoneResetError.cloudKitAccountTransitionRequired {
+            XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+            XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
         }
     }
 
@@ -1173,7 +1250,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertEqual(tracking.entityState, .changed)
         XCTAssertEqual(tracking.pendingGeneration, secondGeneration)
-        XCTAssertNotNil(
+        XCTAssertNil(
             fixture.targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: initialRecord.recordID.recordName
@@ -1239,7 +1316,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertEqual(tracking.entityState, .new)
         XCTAssertEqual(tracking.pendingGeneration, newerGeneration)
-        XCTAssertNotNil(
+        XCTAssertNil(
             fixture.targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
@@ -1267,7 +1344,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertEqual(forwardedCount, 1)
         let recordName = BigSyncTrackedObject.className() + ".unmanaged"
-        XCTAssertNotNil(
+        XCTAssertNil(
             fixture.targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
@@ -1280,6 +1357,94 @@ final class BigSyncKitTests: XCTestCase {
             )?.entityState,
             .new
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testForwardingRepublishesAlreadyDurableGenerationAfterRetirementInterruption() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "forward-recovery",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let uploadRecords = try await fixture.adapter.recordsToUpload(limit: 1)
+        let record = try XCTUnwrap(uploadRecords.first)
+        try await fixture.adapter.didUpload(savedRecords: [record])
+        XCTAssertFalse(fixture.adapter.hasChanges)
+
+        let generation = UUID().uuidString
+        try await fixture.persistenceRealm.asyncWrite {
+            let tracking = try XCTUnwrap(
+                fixture.persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: record.recordID.recordName
+                )
+            )
+            tracking.entityState = .changed
+            tracking.pendingGeneration = generation
+        }
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(
+                BigSyncPendingMutation(
+                    recordName: record.recordID.recordName,
+                    entityType: BigSyncTrackedObject.className(),
+                    objectIdentifier: object.id,
+                    generation: generation
+                )
+            )
+        }
+
+        let forwardedCount = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+
+        XCTAssertEqual(forwardedCount, 0)
+        XCTAssertTrue(fixture.adapter.hasChanges)
+        XCTAssertNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: record.recordID.recordName
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testPreservedTimestampJournalingDoesNotRewriteConflictAuthority() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let modifiedAt = Date(timeIntervalSinceReferenceDate: 40_000)
+        let explicitlyModifiedAt = Date(timeIntervalSinceReferenceDate: 41_000)
+        let object = BigSyncTrackedObject(
+            id: "preserved-timestamps",
+            createdAt: Date(timeIntervalSinceReferenceDate: 39_000),
+            modifiedAt: modifiedAt,
+            explicitlyModifiedAt: explicitlyModifiedAt
+        )
+        let journaledAfter = Date()
+
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                timestampPolicy: .preserve
+            )
+        }
+
+        XCTAssertEqual(object.modifiedAt, modifiedAt)
+        XCTAssertEqual(object.explicitlyModifiedAt, explicitlyModifiedAt)
+        let journalTimestamp = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: BigSyncTrackedObject.className() + ".preserved-timestamps"
+            )?.changedAt
+        )
+        XCTAssertGreaterThanOrEqual(journalTimestamp, journaledAfter)
     }
 
     @BigSyncBackgroundActor
@@ -1361,6 +1526,7 @@ final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
     private func makeSynchronizer(
+        identifier: String = UUID().uuidString,
         database: CloudKitDatabaseAdapter = FakeCloudKitDatabase(),
         keyValueStore: KeyValueStore = DictionaryKeyValueStore(),
         accountIdentifierProvider: @escaping CloudKitSynchronizer.AccountIdentifierProvider = {
@@ -1368,7 +1534,7 @@ final class BigSyncKitTests: XCTestCase {
         }
     ) -> CloudKitSynchronizer {
         CloudKitSynchronizer(
-            identifier: UUID().uuidString,
+            identifier: identifier,
             containerIdentifier: "iCloud.test",
             database: database,
             adapterProvider: NoopAdapterProvider(),

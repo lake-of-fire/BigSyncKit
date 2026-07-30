@@ -851,7 +851,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
 
         let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
-        let pending = mutations.map { mutation in
+        // Snapshot before retiring rows below; Realm Results are live and their
+        // collection indices become invalid as the write transaction deletes.
+        let pending: [BigSyncPendingMutationSnapshot] = Array(mutations).map { mutation in
             BigSyncPendingMutationSnapshot(
                 recordName: mutation.recordName,
                 entityType: mutation.entityType,
@@ -886,9 +888,27 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     forwardedCount += 1
                 }
             }
+            // The separate tracking Realm is now the durable owner of these
+            // generations. Retire only the exact source generations that were
+            // copied; a concurrent edit replaces the generation and survives.
+            try await targetReaderRealm.asyncWrite {
+                for mutation in chunk {
+                    guard let pendingMutation = targetReaderRealm.object(
+                        ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: mutation.recordName
+                    ), pendingMutation.generation == mutation.generation else {
+                        continue
+                    }
+                    targetReaderRealm.delete(pendingMutation)
+                }
+            }
         }
 
-        if forwardedCount > 0 {
+        if !pending.isEmpty {
+            // Also publish on crash recovery: the persistence write may have
+            // committed before source-journal retirement failed. In that case
+            // the matching generation is already present and forwardedCount is
+            // zero, but the synchronizer still needs its upload wake-up.
             updateHasChanges(realm: persistenceRealm)
             await modelAdapterDelegate?.hasChangesToUpload()
         }

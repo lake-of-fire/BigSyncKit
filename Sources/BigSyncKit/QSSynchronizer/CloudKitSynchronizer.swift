@@ -90,6 +90,7 @@ public enum OneOffRecordZoneResetResult: Sendable, Equatable {
 public enum OneOffRecordZoneResetError: LocalizedError {
     case migrationInProgress
     case cloudKitAccountChanged
+    case cloudKitAccountTransitionRequired
     case cloudKitAccountUnavailable
 
     public var errorDescription: String? {
@@ -98,6 +99,8 @@ public enum OneOffRecordZoneResetError: LocalizedError {
             return "Another device is currently resetting this CloudKit database"
         case .cloudKitAccountChanged:
             return "The iCloud account changed during the CloudKit reset"
+        case .cloudKitAccountTransitionRequired:
+            return "The local sync state belongs to a different iCloud account"
         case .cloudKitAccountUnavailable:
             return "The current iCloud account could not be identified"
         }
@@ -705,6 +708,11 @@ public class CloudKitSynchronizer: NSObject {
         let claimRecordID = CKRecord.ID(recordName: "\(markerPrefix).claim")
         let completionRecordID = CKRecord.ID(recordName: "\(markerPrefix).completed")
         let accountIdentifier = try await accountIdentifierProvider()
+        if let previousAccountIdentifier =
+            keyValueStore.object(forKey: cloudKitAccountIdentifierKey) as? String,
+           previousAccountIdentifier != accountIdentifier {
+            throw OneOffRecordZoneResetError.cloudKitAccountTransitionRequired
+        }
         let accountKey = Data(accountIdentifier.utf8)
             .base64EncodedString()
             .replacingOccurrences(of: "/", with: "_")
@@ -723,7 +731,9 @@ public class CloudKitSynchronizer: NSObject {
         }
 
         if try await fetchRecord(completionRecordID) != nil {
+            try await ensureCurrentAccount(accountIdentifier)
             try await rebuildLocalSyncCachesAfterCompletedReset()
+            try await ensureCurrentAccount(accountIdentifier)
             keyValueStore.set(boolValue: true, forKey: localCompletionKey)
             keyValueStore.set(
                 value: accountIdentifier,
@@ -781,6 +791,7 @@ public class CloudKitSynchronizer: NSObject {
                     throw error
                 }
             }
+            try await ensureCurrentAccount(accountIdentifier)
         }
         try await acquireOrRenewResetClaim(
             recordID: claimRecordID,
@@ -790,6 +801,7 @@ public class CloudKitSynchronizer: NSObject {
             claimToken: claimToken,
             leaseDuration: leaseDuration
         )
+        try await ensureCurrentAccount(accountIdentifier)
         try await resetSyncCaches(
             cancelSynchronization: false,
             includingAdapters: true

@@ -90,8 +90,8 @@ class FetchDatabaseChangesOperation: CloudKitSynchronizerOperation {
     }
     
     override func cancel() {
+        super.cancel()
         let operation = resultLock.withLock { internalOperation }
         operation?.cancel()
-        super.cancel()
     }
 }

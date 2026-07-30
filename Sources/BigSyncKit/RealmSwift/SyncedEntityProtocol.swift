@@ -14,13 +14,33 @@ import RealmSwift
     var explicitlyModifiedAt: Date? { get set }
 }
 
+public enum ChangeMetadataTimestampPolicy: Sendable {
+    case refresh
+    case preserve
+}
+
 public extension ChangeMetadataRecordable {
-    func refreshChangeMetadata(explicitlyModified: Bool) {
-        let timestamp = Date()
-        modifiedAt = timestamp
+    func refreshChangeMetadata(
+        explicitlyModified: Bool,
+        timestampPolicy: ChangeMetadataTimestampPolicy = .refresh
+    ) {
+        let journalTimestamp: Date
+        switch timestampPolicy {
+        case .refresh:
+            let timestamp = Date()
+            modifiedAt = timestamp
+            if explicitlyModified {
+                explicitlyModifiedAt = timestamp
+            }
+            journalTimestamp = timestamp
+        case .preserve:
+            // The journal clock orders local forwarding events; it is not sync
+            // conflict authority. Keep imported/canonical model timestamps
+            // untouched while still recording when this Realm write occurred.
+            journalTimestamp = Date()
+        }
         if explicitlyModified {
-            explicitlyModifiedAt = timestamp
-            recordBigSyncMutation(at: timestamp)
+            recordBigSyncMutation(at: journalTimestamp)
         }
     }
 
