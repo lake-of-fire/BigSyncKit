@@ -2646,6 +2646,12 @@ final class BigSyncKitTests: XCTestCase {
             )?.generation
         )
         XCTAssertNotEqual(secondGeneration, firstGeneration)
+        XCTAssertEqual(
+            try await fixture.adapter._test_forwardPendingMutations(
+                in: fixture.targetRealm
+            ),
+            1
+        )
 
         try await fixture.adapter.requeueMissingServerRecords(
             [initialRecord.recordID],
