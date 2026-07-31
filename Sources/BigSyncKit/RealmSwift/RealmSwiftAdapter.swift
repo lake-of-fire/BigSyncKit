@@ -3732,7 +3732,6 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             guard !cancelSync else { throw CancellationError() }
         }
         
-        // TODO: Chunk based on target writer Realm
         if !recordsToSave.isEmpty {
             for chunk in recordsToSave.chunks(ofCount: 100) {
                 try Task.checkCancellation()
@@ -3807,7 +3806,6 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                                 try await targetWriterRealm.asyncWrite { [weak self] in
                                     guard let self else { return }
                                     for candidate in group.candidates {
-                                        try Task.checkCancellation()
                                         try Task.checkCancellation()
 
                                         var object = targetWriterRealm.object(
