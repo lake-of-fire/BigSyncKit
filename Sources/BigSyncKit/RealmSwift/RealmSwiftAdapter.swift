@@ -351,7 +351,6 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     public private(set) var hasChangesCount: Int?
     
     private var resultsChangeSet = ResultsChangeSet()
-    private let resultsChangeSetPublisher = PassthroughSubject<Void, Never>()
     
     private var lastRealmCheckDates: [URL: Date] = [:]
     private var lastRealmFileModDates: [URL: Date] = [:]
@@ -720,7 +719,6 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         // Install observation before the final journal drain. Writes do not depend
         // on the observer for durability, but this ordering avoids adding debounce
         // latency to a mutation committed while setup is finishing.
-        await setupPublisherDebouncer()
         observeRealmChanges()
 
         if needsInitialSetup {
@@ -942,8 +940,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     in: realm
                 )
             }
+            var observedLegacyChange = false
             for idx in legacyIndexes where idx < targetReaderRealms.count {
                 await enqueueCreatedAndModified(in: targetReaderRealms[idx])
+                observedLegacyChange = true
+            }
+            if observedLegacyChange {
+                try await processEnqueuedChanges()
             }
         } catch {
             for (idx, recordNames) in observed {
@@ -1239,8 +1242,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 recentlyFetchedRecordModifiedAts.removeValue(forKey: prefix + change.objectID)
             }
             
-            //            debugPrint("# created or modified non-empty, resultsChangeSetPublisher send...", created.count, modified.count, resultsChangeSet.insertions, resultsChangeSet.modifications)
-            resultsChangeSetPublisher.send(())
+            // The owning caller drains resultsChangeSet before returning. This
+            // keeps legacy scans inside the same cancellation barrier instead
+            // of launching a second debounced task.
         }
     }
 
@@ -1254,6 +1258,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             recordNames,
             realmIndex: realmIndex
         )
+    }
+
+    @BigSyncBackgroundActor
+    func _test_enqueueObservedLegacyRealmIndex(_ realmIndex: Int = 0) {
+        changedLegacyRealmIndexes.insert(realmIndex)
     }
 
     @BigSyncBackgroundActor
@@ -1385,20 +1394,6 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         if hasChanges && notifyDelegate {
             await modelAdapterDelegate?.hasChangesToUpload()
         }
-    }
-    
-    @BigSyncBackgroundActor
-    private func setupPublisherDebouncer() {
-        resultsChangeSetPublisher
-            .debounceLeadingTrailing(for: .seconds(6), scheduler: bigSyncKitQueue)
-            .sink { @Sendable [weak self] _ in
-                guard let self else { return }
-                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                    guard let self else { return }
-                    try await processEnqueuedChanges()
-                }
-            }
-            .store(in: &cancellables)
     }
     
     public func hasRealmObjectClass(name: String) -> Bool {
