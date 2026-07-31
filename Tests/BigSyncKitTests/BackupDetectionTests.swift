@@ -39,6 +39,18 @@ final class BackupDetectionTests: XCTestCase {
             .restoredFromBackup
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: restoredSentinel.path))
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(store: store))
+
+        // Recreating the synchronizer after a crash still requires the cache
+        // reset even though the replacement sentinel now exists.
+        XCTAssertEqual(
+            try BackupDetection.run(store: store, sentinelURL: restoredSentinel),
+            .regularLaunch
+        )
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(store: store))
+
+        BackupDetection.markRestoreResetCompleted(store: store)
+        XCTAssertFalse(BackupDetection.restoreResetIsRequired(store: store))
     }
 
     func testExistingSentinelRepairsMissingBackedUpMarker() throws {

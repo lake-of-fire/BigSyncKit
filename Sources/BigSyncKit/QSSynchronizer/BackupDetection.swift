@@ -15,6 +15,8 @@ enum BackupDetection {
     }
 
     static let storeKey = "QSBackupDetectionStoreKey.v2"
+    static let restoreResetRequiredStoreKey =
+        "QSBackupDetectionRestoreResetRequiredStoreKey.v2"
 
     private static var applicationSupportDirectory: URL {
         #if os(iOS) || os(watchOS)
@@ -74,7 +76,18 @@ enum BackupDetection {
         if !markerExists {
             store.set(boolValue: true, forKey: storeKey)
         }
+        if result == .restoredFromBackup {
+            store.set(boolValue: true, forKey: restoreResetRequiredStoreKey)
+        }
 
         return result
+    }
+
+    static func restoreResetIsRequired(store: KeyValueStore) -> Bool {
+        store.bool(forKey: restoreResetRequiredStoreKey)
+    }
+
+    static func markRestoreResetCompleted(store: KeyValueStore) {
+        store.removeObject(forKey: restoreResetRequiredStoreKey)
     }
 }
