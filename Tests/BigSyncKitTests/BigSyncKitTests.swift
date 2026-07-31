@@ -1017,6 +1017,44 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testRestoredBackupResetRetainsMarkerAcrossAccountReplacement() async {
+        let store = DictionaryKeyValueStore()
+        store.set(
+            boolValue: true,
+            forKey: BackupDetection.restoreResetRequiredStoreKey
+        )
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            keyValueStore: store,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "restore-reset-account-swap"),
+            priorities: []
+        )
+        adapter.resetSyncCachesHandler = {
+            database.accountIdentifier = "replacement-account"
+        }
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("Expected restored-backup reset to reject the account swap")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(store: store))
+        XCTAssertEqual(database.subscriptionFetchCount, 0)
+        XCTAssertEqual(
+            adapter.events.filter { $0 == "resetSyncCaches" }.count,
+            1
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testCancellationBarrierDoesNotWaitForSubscriptionCallback() async {
         let database = FakeCloudKitDatabase()
         database.completesSubscriptionFetches = false
@@ -2608,6 +2646,19 @@ final class BigSyncKitTests: XCTestCase {
             )?.generation
         )
         XCTAssertNotEqual(secondGeneration, firstGeneration)
+
+        try await fixture.adapter.requeueMissingServerRecords(
+            [initialRecord.recordID],
+            matchingPreparedGenerations: [initialRecord.recordID.recordName: firstGeneration]
+        )
+        let afterMissingServerRecovery = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: initialRecord.recordID.recordName
+            )
+        )
+        XCTAssertEqual(afterMissingServerRecovery.entityState, .changed)
+        XCTAssertEqual(afterMissingServerRecovery.pendingGeneration, secondGeneration)
 
         try await fixture.adapter.didUpload(
             savedRecords: [initialRecord],

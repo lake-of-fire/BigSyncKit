@@ -681,24 +681,6 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
-    /// Completes restore recovery before this installation is allowed to fetch
-    /// or advance any CloudKit token. The required marker is durable because
-    /// backup detection may already have created the replacement sentinel when
-    /// the process terminates during cache reset.
-    @BigSyncBackgroundActor
-    private func prepareRestoredInstallationIfNeeded() async throws {
-        if let backupDetectionError {
-            throw backupDetectionError
-        }
-        guard backupRestoreDetected
-                || BackupDetection.restoreResetIsRequired(store: keyValueStore)
-        else { return }
-
-        try await resetSyncCachesOwnedByCurrentFlow(includingAdapters: true)
-        BackupDetection.markRestoreResetCompleted(store: keyValueStore)
-        backupRestoreDetected = false
-    }
-    
     @BigSyncBackgroundActor
     private func resetRestoredBackupCachesIfNeeded(
         context: RunContext
@@ -754,8 +736,6 @@ public class CloudKitSynchronizer: NSObject {
             guard let self else { return }
             do {
                 await waitForRunCallbacksToFinish()
-                try checkSynchronizationAttempt(attemptID)
-                try await prepareRestoredInstallationIfNeeded()
                 try checkSynchronizationAttempt(attemptID)
                 let accountIdentifier = try await validateSynchronizationAccount()
                 let runID = await changeRequestProcessor.beginRun()
