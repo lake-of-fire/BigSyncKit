@@ -19,8 +19,10 @@
 		35D8AA83372F3AE55EE740F8 /* libRealmSwiftGaps.a in Frameworks */ = {isa = PBXBuildFile; fileRef = F1B215E4FDB5FE4BF55E7C7D /* libRealmSwiftGaps.a */; };
 		39524DBB45421B7B8EC0A72C /* AsyncAlgorithms.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C60CB3051325C0C330FE48F /* AsyncAlgorithms.framework */; };
 		3ED652F310A1670673BE2AC7 /* BigSyncPendingMutation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */; };
+		3F957FC859E4A7FB1000C0BF /* BackupDetectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1852992FB038D6864C46EF29 /* BackupDetectionTests.swift */; };
 		41B8E763FAD1533448520B02 /* PrimaryKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABEE9A26F724BE99A3697C23 /* PrimaryKey.swift */; };
 		555740A729D68758CC69E42A /* SyncedEntityProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D7E1C6F12C321A94EABEF49 /* SyncedEntityProtocol.swift */; };
+		5A22CA086B25A59191E19AE2 /* BigSyncManualRebuildTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3018D323268107352430D467 /* BigSyncManualRebuildTests.swift */; };
 		5A6D8A0DC6ABB060CABE7AD7 /* CloudKitSynchronizer+Subscriptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */; };
 		66E970ECB20D9971EEF458CB /* SwiftUtilities.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = 375A2DE5459AEC32DBEA009C /* SwiftUtilities.framework */; };
 		6E71B679C5D0FEFAF7C484F5 /* FetchDatabaseChangesOperation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D34F532F253611BC2AB181F /* FetchDatabaseChangesOperation.swift */; };
@@ -53,6 +55,7 @@
 		CE4CDE06370BD24A2B72AF77 /* CloudKitDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF4BAFDCBEC068C8D560EFFC /* CloudKitDatabase.swift */; };
 		CE4E70ED70965934D51FFD29 /* zstd in Resources */ = {isa = PBXBuildFile; fileRef = B40AA4BA688C03337C4ADCBF /* zstd */; };
 		D1076D33C1CCFA003ACD1332 /* DefaultRealmSwiftAdapterProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD495927486A1B40B2B8DBA3 /* DefaultRealmSwiftAdapterProvider.swift */; };
+		D16089D105F52266A902BCB9 /* CloudKitAccountAvailabilityGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EE0B8BCD3020870B8A5EF17 /* CloudKitAccountAvailabilityGateTests.swift */; };
 		D243292B52BE60D63AA64A3B /* _NumericsShims.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BDFDA55E8619608D7A3ED85E /* _NumericsShims.framework */; };
 		D42F4A8A1BFBBDD28F602A67 /* RealmSwift.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 334E77EAA11F1D8A3C955A4A /* RealmSwift.framework */; };
 		D4BD4DDC54C13C0E16D32A84 /* CloudKitSynchronizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E200B95C5A241D0E2E6A036 /* CloudKitSynchronizer.swift */; };
@@ -63,6 +66,7 @@
 		EB49133DA3EC81E917AE20D6 /* BigSyncBackgroundActor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1443977751818BA283E53F9C /* BigSyncBackgroundActor.swift */; };
 		EC6C81A7BEA6CFBFD4C85B28 /* QSCloudKitSynchronizer+MultiRealmResultsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80C8F45DFBAE47586CDE6AB5 /* QSCloudKitSynchronizer+MultiRealmResultsController.swift */; };
 		EE3E8EB2C41AB3627657D1D8 /* Algorithms.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 94DDE581A883BAE50A2BCF02 /* Algorithms.framework */; };
+		F6D07BD74DED64D3F5CB5AAC /* CloudKitSynchronizerOperationLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26C2030131F15975CF88AA60 /* CloudKitSynchronizerOperationLifecycleTests.swift */; };
 		F838B85BDCB975E7F1724613 /* ModifyRecordsOperation.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADB89FD51BD5C3320D536EC7 /* ModifyRecordsOperation.swift */; };
 		F960F4D9C6C49DBE8C886F7B /* BigSyncKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C9ACA3FFFA7672B261644D0 /* BigSyncKitTests.swift */; };
 		FBAEA35B01423A405C392D19 /* BackupDetection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2EECD71DF78701438239CEC2 /* BackupDetection.swift */; };
@@ -147,11 +151,15 @@
 /* Begin PBXFileReference section */
 		0C9ACA3FFFA7672B261644D0 /* BigSyncKitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncKitTests.swift; sourceTree = "<group>"; };
 		1443977751818BA283E53F9C /* BigSyncBackgroundActor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncBackgroundActor.swift; sourceTree = "<group>"; };
+		1852992FB038D6864C46EF29 /* BackupDetectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDetectionTests.swift; sourceTree = "<group>"; };
+		1EE0B8BCD3020870B8A5EF17 /* CloudKitAccountAvailabilityGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitAccountAvailabilityGateTests.swift; sourceTree = "<group>"; };
+		26C2030131F15975CF88AA60 /* CloudKitSynchronizerOperationLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitSynchronizerOperationLifecycleTests.swift; sourceTree = "<group>"; };
 		276C216D2EED7450546EB0C8 /* Logging.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Logging.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		2AD94190617E4A1CA211C2CA /* CloudKitSynchronizer+Sync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudKitSynchronizer+Sync.swift"; sourceTree = "<group>"; };
 		2ED06A2F428466210E30922D /* CloudKitSynchronizerOperation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitSynchronizerOperation.swift; sourceTree = "<group>"; };
 		2EECD71DF78701438239CEC2 /* BackupDetection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDetection.swift; sourceTree = "<group>"; };
 		2F69716F0991001F6F0BC10F /* BigSyncKit.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = BigSyncKit.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		3018D323268107352430D467 /* BigSyncManualRebuildTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncManualRebuildTests.swift; sourceTree = "<group>"; };
 		31F48253723925F072D7A193 /* ModelAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelAdapter.swift; sourceTree = "<group>"; };
 		334E77EAA11F1D8A3C955A4A /* RealmSwift.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = RealmSwift.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		36B6AAAAC2954D84D0086505 /* OrderedCollections.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = OrderedCollections.framework; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -250,7 +258,11 @@
 		4591E52BCC604FE3C568E073 /* BigSyncKitTests */ = {
 			isa = PBXGroup;
 			children = (
+				1852992FB038D6864C46EF29 /* BackupDetectionTests.swift */,
 				0C9ACA3FFFA7672B261644D0 /* BigSyncKitTests.swift */,
+				3018D323268107352430D467 /* BigSyncManualRebuildTests.swift */,
+				1EE0B8BCD3020870B8A5EF17 /* CloudKitAccountAvailabilityGateTests.swift */,
+				26C2030131F15975CF88AA60 /* CloudKitSynchronizerOperationLifecycleTests.swift */,
 			);
 			path = BigSyncKitTests;
 			sourceTree = "<group>";
@@ -589,7 +601,11 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				3F957FC859E4A7FB1000C0BF /* BackupDetectionTests.swift in Sources */,
 				F960F4D9C6C49DBE8C886F7B /* BigSyncKitTests.swift in Sources */,
+				5A22CA086B25A59191E19AE2 /* BigSyncManualRebuildTests.swift in Sources */,
+				D16089D105F52266A902BCB9 /* CloudKitAccountAvailabilityGateTests.swift in Sources */,
+				F6D07BD74DED64D3F5CB5AAC /* CloudKitSynchronizerOperationLifecycleTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
