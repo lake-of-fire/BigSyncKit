@@ -366,6 +366,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 #if DEBUG
     @RealmBackgroundActor
     private var dummyRecordIdentifiers = Set<String>()
+    var _testBeforeRemoteDeletionTargetWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforeCleanupTargetWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
 #endif
     
     private var isSetupInterrupted: Bool = false
@@ -3016,7 +3020,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             realmProvider.targetReaderRealmPerSchemaName[deletion.entityType]
                 .map { BigSyncMutationTrackingRegistry.identity(for: $0.configuration) }
         }
-        var skippedRecordNames = Set<String>()
+        var committedRecordNames = Set<String>()
 
         for (realmIdentity, deletions) in deletionsByRealm {
             guard realmIdentity != nil,
@@ -3025,40 +3029,65 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                   }).first else {
                 continue
             }
+#if DEBUG
+            try await _testBeforeCleanupTargetWrite?()
+#endif
             try await targetRealm.asyncWrite {
                 for deletion in deletions {
-                    guard let objectClass = realmObjectClass(name: deletion.entityType),
-                          let identifier = getObjectIdentifier(
+                    try Task.checkCancellation()
+                    guard !cancelSync else { throw CancellationError() }
+                    guard persistenceRealm.object(
+                        ofType: SyncedEntity.self,
+                        forPrimaryKey: deletion.recordName
+                    )?.entityState == .deletedRemotely else {
+                        continue
+                    }
+                    if targetRealm.schema.objectSchema.contains(where: {
+                        $0.className == BigSyncPendingMutation.className()
+                    }), targetRealm.object(
+                        ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: deletion.recordName
+                    ) != nil {
+                        continue
+                    }
+                    guard let objectClass = realmObjectClass(
+                        name: deletion.entityType
+                    ), let identifier = getObjectIdentifier(
                             stringObjectId: deletion.objectIdentifier,
                             entityType: deletion.entityType
-                          ),
-                          let object = targetRealm.object(
-                            ofType: objectClass,
-                            forPrimaryKey: identifier
                           ) else {
+                        continue
+                    }
+                    guard let object = targetRealm.object(
+                        ofType: objectClass,
+                        forPrimaryKey: identifier
+                    ) else {
+                        committedRecordNames.insert(deletion.recordName)
                         continue
                     }
                     if let softDeletable = object as? SoftDeletable,
                        !softDeletable.isDeleted {
-                        skippedRecordNames.insert(deletion.recordName)
                         continue
                     }
                     if let syncable = object as? any SyncableBase,
                        syncable.needsSyncToAppServer {
-                        skippedRecordNames.insert(deletion.recordName)
                         continue
                     }
                     targetRealm.delete(object)
+                    committedRecordNames.insert(deletion.recordName)
                 }
             }
         }
 
         try await persistenceRealm.asyncWrite {
-            for deletion in remotelyDeleted where !skippedRecordNames.contains(deletion.recordName) {
+            for recordName in committedRecordNames {
+                try Task.checkCancellation()
+                guard !cancelSync else { throw CancellationError() }
                 if let entity = persistenceRealm.object(
                     ofType: SyncedEntity.self,
-                    forPrimaryKey: deletion.recordName
-                ) {
+                    forPrimaryKey: recordName
+                ), entity.entityState == .deletedRemotely,
+                   entity.pendingGeneration == nil {
                     persistenceRealm.delete(entity)
                 }
             }
@@ -3298,15 +3327,29 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
 
         let deletionsByEntityType = Dictionary(grouping: deletions, by: \.entityType)
+        var committedRemoteDeletions = [RemoteDeletionSnapshot]()
         for (entityType, entityDeletions) in deletionsByEntityType where entityType != "CKShare" {
             try Task.checkCancellation()
             guard let objectClass = realmObjectClass(name: entityType),
                   let targetRealm = realmProvider.targetReaderRealmPerSchemaName[entityType] else {
                 continue
             }
+#if DEBUG
+            try await _testBeforeRemoteDeletionTargetWrite?()
+#endif
             try await targetRealm.asyncWrite {
                 for deletion in entityDeletions {
                     try Task.checkCancellation()
+                    guard !cancelSync else { throw CancellationError() }
+                    if targetRealm.schema.objectSchema.contains(where: {
+                        $0.className == BigSyncPendingMutation.className()
+                    }), let mutation = targetRealm.object(
+                        ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: deletion.recordName
+                    ) {
+                        localWins.append((deletion, mutation.generation))
+                        continue
+                    }
                     if let objectIdentifier = getObjectIdentifier(
                         stringObjectId: deletion.objectIdentifier,
                         entityType: entityType
@@ -3316,20 +3359,33 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     ) {
                         if let object = object as? SoftDeletable {
                             object.isDeleted = true
-                        } else {
-                            targetRealm.delete(object)
                         }
                     }
-                    if targetRealm.schema.objectSchema.contains(where: {
-                        $0.className == BigSyncPendingMutation.className()
-                    }), let mutation = targetRealm.object(
-                        ofType: BigSyncPendingMutation.self,
-                        forPrimaryKey: deletion.recordName
-                    ) {
-                        targetRealm.delete(mutation)
-                    }
+                    committedRemoteDeletions.append(deletion)
                 }
             }
+        }
+
+        // A local mutation can commit immediately after the inbound-deletion
+        // transaction. Its journal is durable even if forwarding is debounced,
+        // so let it win before publishing tracking state.
+        var lateLocalRecordNames = Set<String>()
+        for deletion in committedRemoteDeletions {
+            guard let targetRealm = realmProvider
+                .targetReaderRealmPerSchemaName[deletion.entityType] else {
+                continue
+            }
+            await targetRealm.asyncRefresh()
+            if let mutation = targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: deletion.recordName
+            ) {
+                lateLocalRecordNames.insert(deletion.recordName)
+                localWins.append((deletion, mutation.generation))
+            }
+        }
+        committedRemoteDeletions.removeAll {
+            lateLocalRecordNames.contains($0.recordName)
         }
 
         try await persistenceRealm.asyncWrite {
@@ -3346,12 +3402,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 persistenceRealm.add(syncedEntity, update: .modified)
                 syncedEntity.state = SyncedEntityState.new.rawValue
                 syncedEntity.encodedRecord = nil
-                syncedEntity.pendingGeneration =
-                    localWin.generation
-                    ?? syncedEntity.pendingGeneration
-                    ?? UUID().uuidString
+                if syncedEntity.pendingGeneration == nil {
+                    syncedEntity.pendingGeneration =
+                        localWin.generation ?? UUID().uuidString
+                }
             }
-            for deletion in deletions {
+            for deletion in committedRemoteDeletions {
                 try Task.checkCancellation()
                 let syncedEntity = Self.getSyncedEntity(
                     objectIdentifier: deletion.recordName,
@@ -3362,13 +3418,18 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     state: SyncedEntityState.deletedRemotely.rawValue
                 )
                 persistenceRealm.add(syncedEntity, update: .modified)
+                guard syncedEntity.pendingGeneration == nil,
+                      syncedEntity.entityState != .new,
+                      syncedEntity.entityState != .changed,
+                      syncedEntity.entityState != .deletedLocally else {
+                    continue
+                }
                 syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
-                syncedEntity.pendingGeneration = nil
             }
         }
         updateHasChanges(realm: persistenceRealm)
         logger.info(
-            "Deleted \(deletions.count) local records which were previously deleted from iCloud"
+            "Deleted \(committedRemoteDeletions.count) local records which were previously deleted from iCloud"
         )
         if !localWins.isEmpty {
             logger.info(

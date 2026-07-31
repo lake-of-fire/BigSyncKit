@@ -2175,6 +2175,110 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testLocalEditCommittedAtRemoteDeletionBoundaryWins() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "deletion-boundary-edit",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let records = try await fixture.adapter.recordsToUpload(limit: 1)
+        let uploaded = try XCTUnwrap(records.first)
+        try await fixture.adapter.didUpload(savedRecords: [uploaded])
+
+        fixture.adapter._testBeforeRemoteDeletionTargetWrite = {
+            try await fixture.targetRealm.asyncWrite {
+                object.tags.append("committed-at-boundary")
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertFalse(object.isDeleted)
+        XCTAssertEqual(Array(object.tags), ["committed-at-boundary"])
+        let mutation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: uploaded.recordID.recordName
+            )
+        )
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: uploaded.recordID.recordName
+            )
+        )
+        XCTAssertEqual(tracking.entityState, .new)
+        XCTAssertEqual(tracking.pendingGeneration, mutation.generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testLocalEditCommittedAtCleanupBoundaryPreventsHardDeletion()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "cleanup-boundary-edit",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let records = try await fixture.adapter.recordsToUpload(limit: 1)
+        let uploaded = try XCTUnwrap(records.first)
+        try await fixture.adapter.didUpload(savedRecords: [uploaded])
+        try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
+        XCTAssertTrue(object.isDeleted)
+
+        fixture.adapter._testBeforeCleanupTargetWrite = {
+            try await fixture.targetRealm.asyncWrite {
+                object.isDeleted = false
+                object.tags.append("resurrected-at-boundary")
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        try await fixture.adapter.cleanUp()
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncTrackedObject.self,
+                forPrimaryKey: object.id
+            )
+        )
+        XCTAssertFalse(object.isDeleted)
+        XCTAssertEqual(Array(object.tags), ["resurrected-at-boundary"])
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: uploaded.recordID.recordName
+            )
+        )
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: uploaded.recordID.recordName
+            )?.entityState,
+            .new
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testRemoteDeletionWithoutExistingTrackingStillDeletesLocalObject() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
