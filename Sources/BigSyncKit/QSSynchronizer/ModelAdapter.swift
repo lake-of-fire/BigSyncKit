@@ -180,3 +180,14 @@ internal protocol UploadGenerationTrackingModelAdapter: ModelAdapter {
         matchingGenerations: [String: String]
     ) async throws
 }
+
+/// Lets the synchronizer requeue an upload rejected as missing on the server
+/// without accidentally overwriting a newer local mutation that arrived after
+/// the upload batch was prepared.
+internal protocol MissingServerGenerationTrackingModelAdapter: ModelAdapter {
+    @BigSyncBackgroundActor
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedGenerations: [String: String]
+    ) async throws
+}

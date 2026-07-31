@@ -910,7 +910,19 @@ extension CloudKitSynchronizer {
                 if let error = operationError as? NSError {
                     if !recordIDsMissingOnServer.isEmpty {
                         try await revalidateActiveRunContext(for: attemptID)
-                        try await adapter.deleteChangeTracking(forRecordIDs: Array(recordIDsMissingOnServer))
+                        if let generationTrackingAdapter = adapter as? MissingServerGenerationTrackingModelAdapter {
+                            try await generationTrackingAdapter.requeueMissingServerRecords(
+                                Array(recordIDsMissingOnServer),
+                                matchingPreparedGenerations: uploadGenerations
+                            )
+                        } else {
+                            // Third-party adapters retain the historical
+                            // recovery behavior until they opt into prepared
+                            // generation fencing.
+                            try await adapter.deleteChangeTracking(
+                                forRecordIDs: Array(recordIDsMissingOnServer)
+                            )
+                        }
                         try await revalidateActiveRunContext(for: attemptID)
                     }
 

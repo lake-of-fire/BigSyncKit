@@ -4126,6 +4126,41 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
     }
+
+    /// Requeues only records whose pending generation is still the generation
+    /// sent to CloudKit. A newer local mutation remains pending untouched.
+    @BigSyncBackgroundActor
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedGenerations: [String: String]
+    ) async throws {
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
+
+        for chunk in recordIDs.chunks(ofCount: 1000) {
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
+            try await persistenceRealm.asyncWrite {
+                for recordID in chunk {
+                    try Task.checkCancellation()
+                    guard !cancelSync else { throw CancellationError() }
+                    let recordName = recordID.recordName
+                    guard let preparedGeneration = matchingPreparedGenerations[recordName],
+                          let syncedEntity = persistenceRealm.object(
+                            ofType: SyncedEntity.self,
+                            forPrimaryKey: recordName
+                          ),
+                          syncedEntity.pendingGeneration == preparedGeneration else {
+                        continue
+                    }
+                    syncedEntity.entityState = .new
+                    syncedEntity.encodedRecord = nil
+                    // Keep the prepared generation. The matching journal row
+                    // remains the authority for retrying this exact mutation.
+                }
+            }
+        }
+        updateHasChanges(realm: persistenceRealm)
+    }
     
     public var recordZoneID: CKRecordZone.ID {
         return zoneID
