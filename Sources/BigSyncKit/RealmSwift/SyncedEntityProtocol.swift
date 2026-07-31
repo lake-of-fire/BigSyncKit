@@ -28,19 +28,49 @@ public extension ChangeMetadataRecordable {
     }
 
     private func recordBigSyncMutation(at timestamp: Date) {
-        guard let object = self as? Object,
-              let realm = object.realm,
-              realm.isInWriteTransaction else { return }
+        guard let object = self as? Object else {
+            assertionFailure("BigSync mutations require a Realm Object")
+            return
+        }
+        // Initializers commonly establish timestamps before Realm.add(). They
+        // must refresh once after add, but the unmanaged initialization itself
+        // is intentionally not diagnosed as a write-boundary violation.
+        guard let realm = object.realm else { return }
         let entityType = object.objectSchema.className
+        guard realm.isInWriteTransaction else {
+            assertionFailure(
+                "Explicit BigSync mutation for \(entityType) must occur inside a Realm write transaction"
+            )
+            return
+        }
 
-        // Callers commonly initialize timestamps before adding a new object.
-        // That is valid, but durable mutation capture can only happen in the
-        // same write transaction after the object has entered Realm.
-        guard BigSyncMutationTrackingRegistry.tracks(className: entityType, in: realm),
-              realm.schema.objectSchema.contains(where: {
-                  $0.className == BigSyncPendingMutation.className()
-              }),
-              let primaryKey = object.objectSchema.primaryKeyProperty?.name else { return }
+        switch BigSyncMutationTrackingRegistry.trackingStatus(
+            className: entityType,
+            in: realm
+        ) {
+        case .unregistered:
+            assertionFailure(
+                "No BigSync mutation policy was installed before opening Realm containing \(entityType)"
+            )
+            return
+        case .excluded:
+            return
+        case .tracked:
+            break
+        }
+
+        guard realm.schema.objectSchema.contains(where: {
+            $0.className == BigSyncPendingMutation.className()
+        }) else {
+            assertionFailure(
+                "Realm containing \(entityType) is missing BigSyncPendingMutation"
+            )
+            return
+        }
+        guard let primaryKey = object.objectSchema.primaryKeyProperty?.name else {
+            assertionFailure("BigSync tracked type \(entityType) requires a primary key")
+            return
+        }
 
         let objectIdentifier = RealmSwiftAdapter.getTargetObjectStringIdentifier(
             for: object,

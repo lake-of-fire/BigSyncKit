@@ -87,15 +87,33 @@ enum BigSyncMutationTrackingRegistry {
                         .map { $0.className() }
                         .filter { !excludedClassNames.contains($0) }
                 )
-                trackedClassNamesByRealm[identity(for: configuration)] = classNames
+                let realmIdentity = identity(for: configuration)
+                if let registeredClassNames = trackedClassNamesByRealm[realmIdentity] {
+                    precondition(
+                        registeredClassNames == classNames,
+                        "Conflicting BigSync mutation policies registered for \(realmIdentity)"
+                    )
+                } else {
+                    trackedClassNamesByRealm[realmIdentity] = classNames
+                }
             }
         }
     }
 
-    static func tracks(className: String, in realm: Realm) -> Bool {
+    enum TrackingStatus {
+        case unregistered
+        case excluded
+        case tracked
+    }
+
+    static func trackingStatus(className: String, in realm: Realm) -> TrackingStatus {
         lock.withLock {
-            trackedClassNamesByRealm[identity(for: realm.configuration)]?
-                .contains(className) == true
+            guard let classNames = trackedClassNamesByRealm[
+                identity(for: realm.configuration)
+            ] else {
+                return .unregistered
+            }
+            return classNames.contains(className) ? .tracked : .excluded
         }
     }
 
