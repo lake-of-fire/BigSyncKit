@@ -1083,14 +1083,53 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
             ) else { return nil }
-            return BigSyncPendingMutationSnapshot(
-                recordName: mutation.recordName,
-                entityType: mutation.entityType,
-                objectIdentifier: mutation.objectIdentifier,
-                generation: mutation.generation,
-                changedAt: mutation.changedAt
-            )
+            return pendingMutationSnapshot(mutation, in: realm)
         }
+    }
+
+    private func pendingMutationSnapshot(
+        _ mutation: BigSyncPendingMutation,
+        in realm: Realm
+    ) -> BigSyncPendingMutationSnapshot {
+        BigSyncPendingMutationSnapshot(
+            recordName: mutation.recordName,
+            entityType: mutation.entityType,
+            objectIdentifier: mutation.objectIdentifier,
+            generation: mutation.generation,
+            changedAt: mutation.changedAt,
+            isDeletion: pendingMutationTargetsDeletedObject(mutation, in: realm)
+        )
+    }
+
+    private func pendingMutationTargetsDeletedObject(
+        _ mutation: BigSyncPendingMutation,
+        in realm: Realm
+    ) -> Bool {
+        guard let objectType = modelTypes[mutation.entityType],
+              let primaryKey = objectType.primaryKey()
+                ?? objectType.sharedSchema()?.primaryKeyProperty?.name,
+              let primaryKeyProperty = objectType.sharedSchema()?.properties
+                .first(where: { $0.name == primaryKey }) else {
+            return false
+        }
+        let primaryKeyValue: Any
+        switch primaryKeyProperty.type {
+        case .string:
+            primaryKeyValue = mutation.objectIdentifier
+        case .int:
+            guard let value = Int64(mutation.objectIdentifier) else { return false }
+            primaryKeyValue = value
+        case .UUID:
+            guard let value = UUID(uuidString: mutation.objectIdentifier) else { return false }
+            primaryKeyValue = value
+        case .objectId:
+            guard let value = try? ObjectId(string: mutation.objectIdentifier) else { return false }
+            primaryKeyValue = value
+        default:
+            return false
+        }
+        return (realm.object(ofType: objectType, forPrimaryKey: primaryKeyValue)
+            as? SoftDeletable)?.isDeleted == true
     }
     
     private func modificationDateForFile(at url: URL) -> Date? {
@@ -1130,14 +1169,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         notifyDelegate: Bool = true
     ) async throws -> Int {
         let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
-        let pending = Array(mutations.map { mutation in
-            BigSyncPendingMutationSnapshot(
-                recordName: mutation.recordName,
-                entityType: mutation.entityType,
-                objectIdentifier: mutation.objectIdentifier,
-                generation: mutation.generation,
-                changedAt: mutation.changedAt
-            )
+        let pending = Array(mutations.map {
+            self.pendingMutationSnapshot($0, in: targetReaderRealm)
         })
         return try await forwardPendingMutations(
             pending,
@@ -1187,8 +1220,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         objectIdentifier: mutation.objectIdentifier,
                         entityName: mutation.entityType,
                         inserted: false,
-                        modified: true,
-                        deleted: false,
+                        modified: !mutation.isDeletion,
+                        deleted: mutation.isDeletion,
                         generation: mutation.generation,
                         persistenceRealm: persistenceRealm
                     )

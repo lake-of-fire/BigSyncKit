@@ -3972,11 +3972,12 @@ final class BigSyncKitTests: XCTestCase {
             )
         }
         try await fixture.persistenceRealm.asyncWrite {
-            let recovery = fixture.persistenceRealm.object(
-                ofType: SyncedEntityType.self,
-                forPrimaryKey: "__BigSyncKitMutationJournalRecovery"
-            )
-            recovery?.recoveryVersion = 0
+            for recovery in fixture.persistenceRealm.objects(SyncedEntityType.self)
+            where recovery.entityType.hasPrefix(
+                "__BigSyncKitMutationJournalRecovery.v2."
+            ) {
+                recovery.recoveryVersion = 0
+            }
         }
 
         try await fixture.adapter._test_setup()

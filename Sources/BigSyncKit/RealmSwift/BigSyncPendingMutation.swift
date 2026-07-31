@@ -60,6 +60,7 @@ struct BigSyncPendingMutationSnapshot: Sendable {
     let objectIdentifier: String
     let generation: String
     let changedAt: Date
+    let isDeletion: Bool
 }
 
 enum BigSyncMutationTrackingRegistry {
