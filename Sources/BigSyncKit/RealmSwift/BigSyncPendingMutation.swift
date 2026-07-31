@@ -29,6 +29,31 @@ public final class BigSyncPendingMutation: Object {
     }
 }
 
+/// One policy value shared by Realm configuration construction and the sync
+/// worker, preventing their exclusion lists from drifting apart.
+public struct BigSyncMutationPolicy: Sendable, Equatable {
+    public let excludedClassNames: [String]
+
+    public init(excludedClassNames: [String]) {
+        self.excludedClassNames = Array(Set(excludedClassNames)).sorted()
+    }
+
+    public func install(configurations: [Realm.Configuration]) {
+        for configuration in configurations {
+            precondition(
+                configuration.objectTypes?.contains(where: {
+                    $0.className() == BigSyncPendingMutation.className()
+                }) == true,
+                "Every BigSyncKit target Realm must include BigSyncPendingMutation in objectTypes"
+            )
+        }
+        BigSyncMutationTracking.install(
+            configurations: configurations,
+            excludedClassNames: excludedClassNames
+        )
+    }
+}
+
 struct BigSyncPendingMutationSnapshot: Sendable {
     let recordName: String
     let entityType: String

@@ -18,20 +18,50 @@ public struct BigSyncBackgroundWorkerConfiguration {
         synchronizerName: String,
         containerName: String,
         configurations: [Realm.Configuration],
+        mutationPolicy: BigSyncMutationPolicy,
+        priorityObjectTypes: [RealmSwift.Object.Type] = [],
+        suiteName: String? = nil,
+        recordZoneID: CKRecordZone.ID? = nil,
+        logger: Logging.Logger
+    ) {
+        mutationPolicy.install(configurations: configurations)
+        self.synchronizerName = synchronizerName
+        self.containerName = containerName
+        self.configurations = configurations
+        self.excludedClassNames = mutationPolicy.excludedClassNames
+        self.priorityClassNames = priorityObjectTypes.map { $0.className() }
+        self.suiteName = suiteName
+        self.recordZoneID = recordZoneID
+        self.logger = logger
+    }
+
+    @available(
+        *,
+        deprecated,
+        message: "Use init(... mutationPolicy:) so Realm journaling and worker exclusions share one policy"
+    )
+    public init(
+        synchronizerName: String,
+        containerName: String,
+        configurations: [Realm.Configuration],
         excludedClassNames: [String],
         priorityObjectTypes: [RealmSwift.Object.Type] = [],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
         logger: Logging.Logger
     ) {
-        self.synchronizerName = synchronizerName
-        self.containerName = containerName
-        self.configurations = configurations
-        self.excludedClassNames = excludedClassNames
-        self.priorityClassNames = priorityObjectTypes.map { $0.className() }
-        self.suiteName = suiteName
-        self.recordZoneID = recordZoneID
-        self.logger = logger
+        self.init(
+            synchronizerName: synchronizerName,
+            containerName: containerName,
+            configurations: configurations,
+            mutationPolicy: BigSyncMutationPolicy(
+                excludedClassNames: excludedClassNames
+            ),
+            priorityObjectTypes: priorityObjectTypes,
+            suiteName: suiteName,
+            recordZoneID: recordZoneID,
+            logger: logger
+        )
     }
 }
 
