@@ -138,26 +138,13 @@ public actor BigSyncBackgroundActor {
     }
 
     @BigSyncBackgroundActor
+    @available(
+        *,
+        deprecated,
+        message: "Cleanup is now an account-fenced terminal synchronization phase; call synchronizeCloudKit()"
+    )
     public func cleanUp() async {
-        initialSynchronizationTask?.cancel()
-        initialSynchronizationTask = nil
-        synchronizationPreparationTask?.cancel()
-        synchronizationPreparationTask = nil
-        synchronizationPreparationState = .unprepared
-        guard let realmSynchronizer else {
-            logger?.warning("QSCloudKitSynchronizer >> Cleanup requested before background synchronizer configuration completed")
-            return
-        }
-
-        await realmSynchronizer.cancelSynchronizationAndWait()
-
-        for modelAdapter in realmSynchronizer.modelAdapters {
-            do {
-                try await modelAdapter.cleanUp()
-            } catch {
-                logger?.error("QSCloudKitSynchronizer >> Cleanup failed: \(error)")
-            }
-        }
+        _ = await synchronizeCloudKit()
     }
     
     @BigSyncBackgroundActor

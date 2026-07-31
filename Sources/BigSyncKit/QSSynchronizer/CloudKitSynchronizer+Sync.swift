@@ -45,6 +45,8 @@ extension CloudKitSynchronizer {
         let attemptID = synchronizationAttemptID
         do {
             try await revalidateActiveRunContext(for: attemptID)
+        } catch is CancellationError {
+            return
         } catch {
             await failSynchronization(error: error)
             return
@@ -57,7 +59,16 @@ extension CloudKitSynchronizer {
         
         for adapter in modelAdapters {
             await adapter.didFinishImport()
-            guard synchronizationAttemptID == attemptID else { return }
+            do {
+                try await revalidateActiveRunContext(for: attemptID)
+                try await adapter.cleanUp()
+                try await revalidateActiveRunContext(for: attemptID)
+            } catch is CancellationError {
+                return
+            } catch {
+                await failSynchronization(error: error)
+                return
+            }
         }
         
 //        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")

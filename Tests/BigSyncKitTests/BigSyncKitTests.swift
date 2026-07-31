@@ -249,6 +249,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     private var deletedByEntity: [String: [CKRecord.ID]]
     private var storedServerChangeToken: CKServerChangeToken?
     var didFinishImportHandler: (@Sendable () async -> Void)?
+    var cleanUpHandler: (@Sendable () async throws -> Void)?
     var resetSyncCachesHandler: (@Sendable () async -> Void)?
     var saveChangesHandler: (@Sendable () async throws -> Void)?
 
@@ -269,7 +270,10 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
         self.deletedByEntity = deletedByEntity
     }
 
-    func cleanUp() async throws {}
+    func cleanUp() async throws {
+        events.append("cleanUp")
+        try await cleanUpHandler?()
+    }
     func resetSyncCaches() async throws {
         events.append("resetSyncCaches")
         await resetSyncCachesHandler?()
@@ -674,6 +678,42 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertFalse(synchronizer.syncing)
         await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountSwitchDuringCleanupPreventsSuccessfulReceipt() async
+    throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "cleanup-zone"),
+            priorities: []
+        )
+        adapter.cleanUpHandler = {
+            database.accountIdentifier = "different-account"
+        }
+        synchronizer.addModelAdapter(adapter)
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        for _ in 0..<1_000 where !synchronizer.syncing {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        await synchronizer.changesFinishedSynchronizing()
+
+        do {
+            _ = try await synchronization.value
+            XCTFail("Expected account switch to fail terminal cleanup")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertTrue(adapter.events.contains("cleanUp"))
+        XCTAssertFalse(synchronizer.syncing)
     }
 
     @BigSyncBackgroundActor
