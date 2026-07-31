@@ -2469,6 +2469,81 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testMalformedPresentCollectionRollsBackWholeRemoteRecord() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let originalDate = Date(timeIntervalSinceReferenceDate: 12_000)
+        let object = BigSyncTrackedObject(
+            id: "malformed-collection",
+            createdAt: originalDate,
+            modifiedAt: originalDate,
+            explicitlyModifiedAt: originalDate
+        )
+        object.tags.append("local")
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let remoteDate = originalDate.addingTimeInterval(60)
+        record["createdAt"] = originalDate as CKRecordValue
+        record["modifiedAt"] = remoteDate as CKRecordValue
+        record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record["tags"] = [42] as CKRecordValue
+
+        do {
+            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTFail("Expected malformed collection decoding to fail")
+        } catch is RealmSwiftRemoteRecordDecodingError {
+            // Expected.
+        }
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertEqual(object.modifiedAt, originalDate)
+        XCTAssertEqual(Array(object.tags), ["local"])
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedRelationshipDoesNotClearExistingTargets() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let child = BigSyncRelationshipChild()
+        child.id = "existing-child"
+        let parent = BigSyncRelationshipParent()
+        parent.id = "malformed-relationship-parent"
+        parent.children.append(child)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add([child, parent], update: .modified)
+        }
+
+        let record = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let remoteDate = Date().addingTimeInterval(60)
+        record["createdAt"] = parent.createdAt as CKRecordValue
+        record["modifiedAt"] = remoteDate as CKRecordValue
+        record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record["children"] = ["not-a-cloudkit-record-name"] as CKRecordValue
+
+        do {
+            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTFail("Expected malformed relationship decoding to fail")
+        } catch is RealmSwiftRemoteRecordDecodingError {
+            // Expected.
+        }
+        try await fixture.adapter.persistImportedChanges()
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertEqual(parent.children.map(\.id), [child.id])
+    }
+
+    @BigSyncBackgroundActor
     func testURLListRoundTripsThroughCloudKitStrings() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -2918,17 +2993,24 @@ final class BigSyncKitTests: XCTestCase {
             [uploaded],
             from: uploadBatch
         )
-        let deletionGeneration = UUID().uuidString
+        try await fixture.targetRealm.asyncWrite {
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        XCTAssertEqual(
+            try await fixture.adapter._test_forwardPendingMutations(
+                in: fixture.targetRealm
+            ),
+            1
+        )
         let tracking = try XCTUnwrap(
             fixture.persistenceRealm.object(
                 ofType: SyncedEntity.self,
                 forPrimaryKey: uploaded.recordID.recordName
             )
         )
-        try await fixture.persistenceRealm.asyncWrite {
-            tracking.entityState = .deletedLocally
-            tracking.pendingGeneration = deletionGeneration
-        }
+        let deletionGeneration = try XCTUnwrap(tracking.pendingGeneration)
+        XCTAssertEqual(tracking.entityState, .deletedLocally)
         let deletionBatch = try await fixture.adapter.prepareDeletionBatch(limit: 1)
         let preparedID = try XCTUnwrap(deletionBatch.recordIDs.first)
         let foreignID = CKRecord.ID(
