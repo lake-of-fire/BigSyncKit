@@ -133,7 +133,7 @@ public actor BigSyncBackgroundActor {
             } catch {
                 return
             }
-            await self.synchronizeCloudKit(expectedSynchronizer: synchronizer)
+            _ = await self.synchronizeCloudKit(expectedSynchronizer: synchronizer)
         }
     }
 
@@ -260,7 +260,10 @@ public actor BigSyncBackgroundActor {
         await realmSynchronizer.cancelSynchronizationAndWait()
     }
     
+    @BigSyncBackgroundActor
     public func synchronizeCloudKit(using configuration: BigSyncBackgroundWorkerConfiguration) async {
+        configure(configuration)
+        _ = await synchronizeCloudKit()
     }
 
 #if DEBUG

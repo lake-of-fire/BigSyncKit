@@ -1115,6 +1115,8 @@ public class CloudKitSynchronizer: NSObject {
         let localClaimTokenKey = "\(localKeyPrefix).claimToken"
         let localCompletionKey = "\(localKeyPrefix).completed"
 
+        try await ensureCurrentAccount(accountIdentifier)
+
         if keyValueStore.bool(forKey: localCompletionKey) {
             keyValueStore.set(
                 value: accountIdentifier,
@@ -1124,8 +1126,9 @@ public class CloudKitSynchronizer: NSObject {
             return .cloudResetAlreadyCompleted
         }
 
-        if try await fetchRecord(completionRecordID) != nil {
-            try await ensureCurrentAccount(accountIdentifier)
+        let existingCompletionRecord = try await fetchRecord(completionRecordID)
+        try await ensureCurrentAccount(accountIdentifier)
+        if existingCompletionRecord != nil {
             try await rebuildLocalSyncCachesAfterCompletedReset(
                 accountIdentifier: accountIdentifier
             )
@@ -1149,7 +1152,8 @@ public class CloudKitSynchronizer: NSObject {
                 ownerField: markerOwnerField,
                 leaseDateField: markerLeaseDateField,
                 claimToken: claimToken,
-                leaseDuration: leaseDuration
+                leaseDuration: leaseDuration,
+                accountIdentifier: accountIdentifier
             )
             keyValueStore.set(value: claimToken, forKey: localClaimTokenKey)
         } catch {
@@ -1169,7 +1173,8 @@ public class CloudKitSynchronizer: NSObject {
                 ownerField: markerOwnerField,
                 leaseDateField: markerLeaseDateField,
                 claimToken: claimToken,
-                leaseDuration: leaseDuration
+                leaseDuration: leaseDuration,
+                accountIdentifier: accountIdentifier
             )
             try await ensureCurrentAccount(accountIdentifier)
             do {
@@ -1192,7 +1197,8 @@ public class CloudKitSynchronizer: NSObject {
             ownerField: markerOwnerField,
             leaseDateField: markerLeaseDateField,
             claimToken: claimToken,
-            leaseDuration: leaseDuration
+            leaseDuration: leaseDuration,
+            accountIdentifier: accountIdentifier
         )
         try await resetSyncCachesOwnedByCurrentFlow(
             includingAdapters: true
@@ -1258,7 +1264,8 @@ public class CloudKitSynchronizer: NSObject {
             ownerField: markerOwnerField,
             leaseDateField: markerLeaseDateField,
             claimToken: claimToken,
-            leaseDuration: leaseDuration
+            leaseDuration: leaseDuration,
+            accountIdentifier: accountIdentifier
         )
         try await ensureCurrentAccount(accountIdentifier)
         do {
@@ -1273,6 +1280,9 @@ public class CloudKitSynchronizer: NSObject {
         } catch {
             guard isServerRecordChanged(error) else { throw error }
         }
+        // A server-record conflict still completes the suspension above. Fence
+        // the durable local marker regardless of which CloudKit outcome won.
+        try await ensureCurrentAccount(accountIdentifier)
         keyValueStore.set(boolValue: true, forKey: localCompletionKey)
         keyValueStore.set(
             value: accountIdentifier,
@@ -1314,10 +1324,14 @@ public class CloudKitSynchronizer: NSObject {
         ownerField: String,
         leaseDateField: String,
         claimToken: String,
-        leaseDuration: TimeInterval
+        leaseDuration: TimeInterval,
+        accountIdentifier: String
     ) async throws {
+        try await ensureCurrentAccount(accountIdentifier)
         let now = Date()
-        if let claim = try await fetchRecord(recordID) {
+        let existingClaim = try await fetchRecord(recordID)
+        try await ensureCurrentAccount(accountIdentifier)
+        if let claim = existingClaim {
             let existingOwner = claim[ownerField] as? String
             let leaseDate =
                 claim[leaseDateField] as? Date
@@ -1331,11 +1345,13 @@ public class CloudKitSynchronizer: NSObject {
             claim[ownerField] = claimToken as CKRecordValue
             claim[leaseDateField] = now as CKRecordValue
             _ = try await saveMigrationMarker(claim)
+            try await ensureCurrentAccount(accountIdentifier)
         } else {
             let claim = CKRecord(recordType: recordType, recordID: recordID)
             claim[ownerField] = claimToken as CKRecordValue
             claim[leaseDateField] = now as CKRecordValue
             _ = try await saveMigrationMarker(claim)
+            try await ensureCurrentAccount(accountIdentifier)
         }
     }
 
@@ -1367,7 +1383,8 @@ public class CloudKitSynchronizer: NSObject {
                     ownerField: ownerField,
                     leaseDateField: leaseDateField,
                     claimToken: claimToken,
-                    leaseDuration: leaseDuration
+                    leaseDuration: leaseDuration,
+                    accountIdentifier: accountIdentifier
                 )
                 try await ensureCurrentAccount(accountIdentifier)
             } catch {

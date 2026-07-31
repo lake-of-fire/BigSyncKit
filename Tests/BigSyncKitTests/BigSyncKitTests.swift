@@ -38,6 +38,8 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var reportsDeletedRecordsAsUnknownItems = false
     var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
     var accountIdentifier = "test-account"
+    var accountIdentifierAfterNextRecordFetch: String?
+    var accountIdentifierAfterNextMigrationMarkerSave: String?
     var accountIdentifierAfterNextZoneDeletion: String?
     var zoneChangePages = [FakeZoneChangePage]()
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
@@ -92,6 +94,11 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             guard completesModifyOperations else { return }
             let savedRecords = modifyOperation.recordsToSave ?? []
             let deletedRecordIDs = modifyOperation.recordIDsToDelete ?? []
+            if let nextAccountIdentifier = accountIdentifierAfterNextMigrationMarkerSave,
+               !savedRecords.isEmpty {
+                accountIdentifier = nextAccountIdentifier
+                accountIdentifierAfterNextMigrationMarkerSave = nil
+            }
             let partialSaveErrors = partialSaveErrorsByRecordID.filter {
                 savedRecords.map(\.recordID).contains($0.key)
             }
@@ -187,6 +194,10 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     func fetch(withRecordID recordID: CKRecord.ID, completionHandler: @escaping (CKRecord?, Error?) -> Void) {
         if records[recordID] != nil {
             conditionallyFetchedRecordIDs.insert(recordID)
+        }
+        if let nextAccountIdentifier = accountIdentifierAfterNextRecordFetch {
+            accountIdentifier = nextAccountIdentifier
+            accountIdentifierAfterNextRecordFetch = nil
         }
         completionHandler(records[recordID], nil)
     }
@@ -1419,6 +1430,62 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Expected the account fence to stop the migration")
         } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
             XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetStopsWhenAccountChangesAfterCompletionMarkerFetch()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-a"
+        database.accountIdentifierAfterNextRecordFetch = "account-b"
+        let zoneID = CKRecordZone.ID(zoneName: "completion-fetch-account-change")
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "completion-fetch-account-change-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+            XCTFail("Expected the account fence to reject the reset")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+            XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+            XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetStopsWhenAccountChangesDuringInitialClaimSave()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-a"
+        database.accountIdentifierAfterNextMigrationMarkerSave = "account-b"
+        let zoneID = CKRecordZone.ID(zoneName: "claim-save-account-change")
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "claim-save-account-change-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+            XCTFail("Expected the account fence to reject the reset")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+            XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+            XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
         }
     }
 
