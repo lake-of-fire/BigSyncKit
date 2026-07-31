@@ -1143,7 +1143,13 @@ public class CloudKitSynchronizer: NSObject {
         let uploadResult: SynchronizationResult
         do {
             uploadResult = try await synchronize()
+            try Task.checkCancellation()
         } catch {
+            // Cancelling the public waiter does not necessarily stop a
+            // coalesced synchronization drain. Keep renewing ownership until
+            // that drain and its callbacks have crossed the cancellation
+            // barrier, then allow another device to take over safely.
+            await cancelSynchronizationAndWait()
             claimRenewalTask.cancel()
             do {
                 try await claimRenewalTask.value

@@ -1160,6 +1160,61 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCancelledOneOffResetKeepsClaimUntilUploadDrainStops() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(zoneName: "cancelled-reset-zone")
+        let uploadGate = AsyncGate()
+        let enteredUpload = expectation(description: "replacement upload entered")
+        let firstSynchronizer = makeSynchronizer(database: database)
+        let firstAdapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        firstAdapter.didFinishImportHandler = {
+            enteredUpload.fulfill()
+            await uploadGate.wait()
+        }
+        firstSynchronizer.addModelAdapter(firstAdapter)
+
+        let firstReset = Task { @BigSyncBackgroundActor in
+            try await firstSynchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "cancelled-reset-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease",
+                leaseDuration: 0.09
+            )
+        }
+        await fulfillment(of: [enteredUpload], timeout: 1)
+
+        firstReset.cancel()
+        try await Task.sleep(nanoseconds: 160_000_000)
+
+        let secondSynchronizer = makeSynchronizer(database: database)
+        secondSynchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+        do {
+            _ = try await secondSynchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "cancelled-reset-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease",
+                leaseDuration: 0.09
+            )
+            XCTFail("Expected the cancelled reset to retain its claim until the drain stops")
+        } catch OneOffRecordZoneResetError.migrationInProgress {
+        }
+
+        await uploadGate.open()
+        do {
+            _ = try await firstReset.value
+            XCTFail("Expected reset cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
     func testOneOffZoneResetTakesOverAnExpiredClaimWithoutDeletingItFirst() async throws {
         let database = FakeCloudKitDatabase()
         let claimID = CKRecord.ID(
