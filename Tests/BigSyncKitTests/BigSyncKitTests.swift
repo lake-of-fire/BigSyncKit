@@ -24,6 +24,7 @@ private enum TestSynchronizationError: Error {
     case terminalForwardingFailed
     case deletedZoneResetFailed
     case restoredBackupResetFailed
+    case importedPersistenceCacheFailed
 }
 
 private final class FailingDeletedZoneProvider: NSObject, AdapterProvider {
@@ -2496,6 +2497,168 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testMalformedRemoteChunkDoesNotPublishPersistenceCacheBeforeCorrectedRedelivery() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let malformedObject = BigSyncTrackedObject(
+            id: "malformed-chunk",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        malformedObject.attributes["local"] = "malformed"
+        let validObject = BigSyncTrackedObject(
+            id: "valid-chunk",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        validObject.attributes["local"] = "valid"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(malformedObject)
+            fixture.targetRealm.add(validObject)
+        }
+
+        func remoteRecord(id: String, attributes: CKRecordValue) -> CKRecord {
+            let record = makeRecord(
+                type: BigSyncTrackedObject.className(),
+                id: id,
+                zoneID: fixture.adapter.recordZoneID
+            )
+            let remoteDate = Date().addingTimeInterval(60)
+            record["modifiedAt"] = remoteDate as CKRecordValue
+            record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+            record["attributes"] = attributes
+            return record
+        }
+        let malformedRecord = remoteRecord(
+            id: malformedObject.id,
+            attributes: Data([0, 1, 2]) as CKRecordValue
+        )
+        let validMap = try PropertyListSerialization.data(
+            fromPropertyList: ["remote": "valid"],
+            format: .binary,
+            options: 0
+        )
+        let validRecord = remoteRecord(
+            id: validObject.id,
+            attributes: validMap as CKRecordValue
+        )
+
+        do {
+            try await fixture.adapter.saveChanges(
+                in: [validRecord, malformedRecord],
+                forceSave: true
+            )
+            XCTFail("Expected the malformed record to reject the complete chunk")
+        } catch is RealmSwiftRemoteRecordDecodingError {
+            // Expected.
+        }
+
+        XCTAssertEqual(malformedObject.attributes["local"], "malformed")
+        XCTAssertEqual(validObject.attributes["local"], "valid")
+        for record in [malformedRecord, validRecord] {
+            XCTAssertNil(
+                fixture.persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: record.recordID.recordName
+                ),
+                "A failed target chunk published system-field cache state"
+            )
+        }
+
+        malformedRecord["attributes"] = try PropertyListSerialization.data(
+            fromPropertyList: ["remote": "corrected"],
+            format: .binary,
+            options: 0
+        ) as CKRecordValue
+        try await fixture.adapter.saveChanges(
+            in: [validRecord, malformedRecord],
+            forceSave: true
+        )
+
+        XCTAssertEqual(malformedObject.attributes["remote"], "corrected")
+        XCTAssertEqual(validObject.attributes["remote"], "valid")
+        for record in [malformedRecord, validRecord] {
+            XCTAssertNotNil(
+                fixture.persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: record.recordID.recordName
+                )?.encodedRecord
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRedeliveryFinalizesPersistenceAfterTargetCommitInterruption() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "interrupted-finalization",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        object.attributes["local"] = "value"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let remoteDate = Date().addingTimeInterval(60)
+        record["modifiedAt"] = remoteDate as CKRecordValue
+        record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        record["attributes"] = try PropertyListSerialization.data(
+            fromPropertyList: ["remote": "value"],
+            format: .binary,
+            options: 0
+        ) as CKRecordValue
+        fixture.adapter._testBeforeImportedRecordPersistenceWrite = {
+            throw CancellationError()
+        }
+
+        do {
+            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTFail("Expected interruption after target publication")
+        } catch is CancellationError {
+            // Expected.
+        }
+        fixture.adapter._testBeforeImportedRecordPersistenceWrite = nil
+
+        XCTAssertEqual(object.attributes["remote"], "value")
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName
+            )
+        )
+
+        // The committed inbound target write must retain its suppression
+        // marker instead of being re-journaled as a local upload.
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName
+            )
+        )
+
+        // CloudKit has not advanced its token, so the same record is
+        // redelivered. Even though the target now matches, cache finalization
+        // must run and publish the system fields.
+        try await fixture.adapter.saveChanges(in: [record], forceSave: false)
+        XCTAssertNotNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName
+            )?.encodedRecord
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testMissingRemoteCollectionFieldClearsLocalCollection() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -3166,6 +3329,56 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCreateThenDeleteBeforeFirstForwardProducesDurableTombstone() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "deleted-before-first-forward",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let mutation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+
+        let forwarded = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+
+        XCTAssertEqual(forwarded, 1)
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertEqual(tracking.entityState, .deletedLocally)
+        XCTAssertEqual(tracking.pendingGeneration, mutation.generation)
+        let deletionIDs = try await fixture.adapter
+            .prepareDeletionBatch(limit: 10).recordIDs
+        XCTAssertEqual(
+            deletionIDs,
+            [CKRecord.ID(recordName: recordName, zoneID: fixture.adapter.recordZoneID)]
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testPendingLocalEditWinsOverConcurrentRemoteDeletion() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -3278,6 +3491,129 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertEqual(tracking.entityState, .changed)
         XCTAssertEqual(tracking.pendingGeneration, mutation.generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testForwardedLocalMutationAtRemoteImportBoundaryKeepsItsTrackingGeneration()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let baselineDate = Date(timeIntervalSinceReferenceDate: 11_000)
+        let localDate = baselineDate.addingTimeInterval(60)
+        let object = BigSyncTrackedObject(
+            id: "import-forwarded-boundary-edit",
+            createdAt: baselineDate,
+            modifiedAt: baselineDate,
+            explicitlyModifiedAt: baselineDate
+        )
+        object.tags.append("baseline")
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+
+        let remoteRecord = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let remoteDate = baselineDate.addingTimeInterval(120)
+        remoteRecord["createdAt"] = baselineDate as CKRecordValue
+        remoteRecord["modifiedAt"] = remoteDate as CKRecordValue
+        remoteRecord["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        remoteRecord["isDeleted"] = false as CKRecordValue
+        remoteRecord["tags"] = ["remote"] as CKRecordValue
+
+        fixture.adapter._testBeforeImportedRecordTargetWrite = {
+            try await fixture.targetRealm.asyncWrite {
+                object.tags.removeAll()
+                object.tags.append("local")
+                object.refreshChangeMetadata(
+                    explicitlyModified: true,
+                    at: localDate
+                )
+            }
+            _ = try await fixture.adapter._test_forwardPendingMutations(
+                in: fixture.targetRealm
+            )
+        }
+
+        try await fixture.adapter.saveChanges(in: [remoteRecord], forceSave: true)
+
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let mutation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertEqual(tracking.entityState, .new)
+        XCTAssertEqual(tracking.pendingGeneration, mutation.generation)
+        let upload = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        XCTAssertEqual(upload.records.map(\.recordID), [remoteRecord.recordID])
+    }
+
+    @BigSyncBackgroundActor
+    func testNormalRedeliveryRepairsSystemFieldsAfterImportedPersistenceFailure()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let date = Date(timeIntervalSinceReferenceDate: 12_000)
+        let object = BigSyncTrackedObject(
+            id: "import-persistence-retry",
+            createdAt: date,
+            modifiedAt: date,
+            explicitlyModifiedAt: date
+        )
+        object.tags.append("remote")
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["createdAt"] = date as CKRecordValue
+        record["modifiedAt"] = date as CKRecordValue
+        record["explicitlyModifiedAt"] = date as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record["tags"] = ["remote"] as CKRecordValue
+
+        fixture.adapter._testBeforeImportedRecordPersistenceWrite = {
+            throw TestSynchronizationError.importedPersistenceCacheFailed
+        }
+        do {
+            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTFail("Expected persistence-cache publication to fail")
+        } catch TestSynchronizationError.importedPersistenceCacheFailed {
+            // Expected. The target Realm has already committed, but no
+            // tracking/system-field cache publication is allowed.
+        }
+        fixture.adapter._testBeforeImportedRecordPersistenceWrite = nil
+
+        let recordName = record.recordID.recordName
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: false)
+
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNotNil(tracking.encodedRecord)
+        XCTAssertEqual(Array(object.tags), ["remote"])
     }
 
     @BigSyncBackgroundActor
