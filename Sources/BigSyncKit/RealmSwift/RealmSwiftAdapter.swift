@@ -47,6 +47,17 @@ enum RealmSwiftAdapterError: Error {
     case setupUnavailable
 }
 
+enum RealmSwiftRemoteRecordDecodingError: Error, LocalizedError {
+    case malformedField(recordName: String, propertyName: String, expected: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .malformedField(recordName, propertyName, expected):
+            "CloudKit record \(recordName) has a malformed \(propertyName) field; expected \(expected)."
+        }
+    }
+}
+
 /// Acknowledging an upload requires the generation captured when its batch was
 /// prepared. Sampling the current generation can acknowledge a newer edit.
 public enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
@@ -319,8 +330,11 @@ private func decodedCloudKitMap(_ value: Any?) -> [String: Any]? {
        arrays.count == 2,
        let keys = arrays[0] as? [String],
        let values = arrays[1] as? [Any],
-       keys.count == values.count {
-        return Dictionary(uniqueKeysWithValues: zip(keys, values))
+       keys.count == values.count,
+       Set(keys).count == keys.count {
+        return zip(keys, values).reduce(into: [String: Any]()) {
+            $0[$1.0] = $1.1
+        }
     }
     return nil
 }
@@ -2172,6 +2186,22 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
         
         let value = record[key]
+        func malformed(_ expected: String) -> RealmSwiftRemoteRecordDecodingError {
+            .malformedField(
+                recordName: record.recordID.recordName,
+                propertyName: key,
+                expected: expected
+            )
+        }
+        func requireArray<Element>(
+            _ type: Element.Type,
+            expected: String
+        ) throws -> [Element] {
+            guard let result = value as? [Element] else {
+                throw malformed(expected)
+            }
+            return result
+        }
         if (property.isSet || property.isArray || property.isMap),
            !record.allKeys().contains(key) {
             // Full zone-change fetches use desiredKeys == nil, so an absent
@@ -2186,7 +2216,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         if property.isSet {
             switch property.type {
             case .int:
-                guard let value = record.value(forKey: property.name) as? [Int] else { break }
+                let value = try requireArray(Int.self, expected: "an array of integers")
                 var set = Set<Int>()
                 try value.forEach {
                     try Task.checkCancellation()
@@ -2194,7 +2224,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = set
             case .string:
-                guard let value = record.value(forKey: property.name) as? [String] else { break }
+                let value = try requireArray(String.self, expected: "an array of strings")
                 var set = Set<String>()
                 try value.forEach {
                     try Task.checkCancellation()
@@ -2202,7 +2232,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = set
             case .bool:
-                guard let value = record.value(forKey: property.name) as? [Bool] else { break }
+                let value = try requireArray(Bool.self, expected: "an array of booleans")
                 var set = Set<Bool>()
                 try value.forEach {
                     try Task.checkCancellation()
@@ -2210,7 +2240,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = set
             case .float:
-                guard let value = record.value(forKey: property.name) as? [Float] else { break }
+                let value = try requireArray(Float.self, expected: "an array of floats")
                 var set = Set<Float>()
                 try value.forEach {
                     try Task.checkCancellation()
@@ -2218,7 +2248,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = set
             case .double:
-                guard let value = record.value(forKey: property.name) as? [Double] else { break }
+                let value = try requireArray(Double.self, expected: "an array of doubles")
                 var set = Set<Double>()
                 try value.forEach {
                     try Task.checkCancellation()
@@ -2226,7 +2256,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = set
             case .data:
-                guard let value = record.value(forKey: property.name) as? [Data] else { break }
+                let value = try requireArray(Data.self, expected: "an array of data values")
                 var set = Set<Data>()
                 try value.forEach {
                     try Task.checkCancellation()
@@ -2234,7 +2264,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = set
             case .date:
-                guard let value = record.value(forKey: property.name) as? [Date] else { break }
+                let value = try requireArray(Date.self, expected: "an array of dates")
                 var set = Set<Date>()
                 try value.forEach {
                     try Task.checkCancellation()
@@ -2242,34 +2272,42 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = set
             case .UUID:
-                if let stringArray = value as? [String] {
-                    let set = try Set(stringArray.compactMap {
-                        try Task.checkCancellation()
-                        return UUID.init(uuidString: $0)
-                    })
-                    object.setValue(set, forKey: key)
+                let stringArray = try requireArray(
+                    String.self,
+                    expected: "an array of UUID strings"
+                )
+                var set = Set<UUID>()
+                for string in stringArray {
+                    try Task.checkCancellation()
+                    guard let uuid = UUID(uuidString: string) else {
+                        throw malformed("an array of UUID strings")
+                    }
+                    set.insert(uuid)
                 }
+                object.setValue(set, forKey: key)
                 return
             case .object:
                 // Save relationship to be applied after all records have been downloaded and persisted
                 // to ensure target of the relationship has already been created
                 var targetIdentifiers = [String]()
-                if let value = record.value(forKey: property.name) as? [String] {
+                if let value = value as? [String] {
                     for recordName in value {
                         try Task.checkCancellation()
                         guard let objectIdentifier = objectIdentifier(
                             fromCloudKitRecordName: recordName
-                        ) else { continue }
+                        ) else { throw malformed("an array of CloudKit record names") }
                         targetIdentifiers.append(objectIdentifier)
                     }
-                } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
+                } else if let value = value as? [CKRecord.Reference] {
                     for reference in value {
                         try Task.checkCancellation()
                         guard let objectIdentifier = objectIdentifier(
                             fromCloudKitRecordName: reference.recordID.recordName
-                        ) else { continue }
+                        ) else { throw malformed("an array of CloudKit references") }
                         targetIdentifiers.append(objectIdentifier)
                     }
+                } else {
+                    throw malformed("an array of CloudKit references or record names")
                 }
                 appendPendingRelationship(
                     name: property.name,
@@ -2280,7 +2318,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 )
                 return
             default:
-                break
+                throw malformed("a supported Realm set element type")
             }
             try Task.checkCancellation()
             if let recordValue {
@@ -2289,7 +2327,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         } else if property.isArray {
             switch property.type {
             case .int:
-                guard let value = record.value(forKey: property.name) as? [Int] else { break }
+                let value = try requireArray(Int.self, expected: "an array of integers")
                 let list = List<Int>()
                 for item in value {
                     try Task.checkCancellation()
@@ -2297,14 +2335,15 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = list
             case .string:
-                guard let value = record.value(forKey: property.name) as? [String] else { break }
+                let value = try requireArray(String.self, expected: "an array of strings")
                 if object[property.name] is List<URL> {
                     let list = List<URL>()
                     for item in value {
                         try Task.checkCancellation()
-                        if let url = URL(string: item) {
-                            list.append(url)
+                        guard let url = URL(string: item) else {
+                            throw malformed("an array of URL strings")
                         }
+                        list.append(url)
                     }
                     recordValue = list
                 } else {
@@ -2316,7 +2355,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     recordValue = list
                 }
             case .bool:
-                guard let value = record.value(forKey: property.name) as? [Bool] else { break }
+                let value = try requireArray(Bool.self, expected: "an array of booleans")
                 let list = List<Bool>()
                 for item in value {
                     try Task.checkCancellation()
@@ -2324,7 +2363,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = list
             case .float:
-                guard let value = record.value(forKey: property.name) as? [Float] else { break }
+                let value = try requireArray(Float.self, expected: "an array of floats")
                 let list = List<Float>()
                 for item in value {
                     try Task.checkCancellation()
@@ -2332,7 +2371,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = list
             case .double:
-                guard let value = record.value(forKey: property.name) as? [Double] else { break }
+                let value = try requireArray(Double.self, expected: "an array of doubles")
                 let list = List<Double>()
                 for item in value {
                     try Task.checkCancellation()
@@ -2340,7 +2379,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = list
             case .data:
-                guard let value = record.value(forKey: property.name) as? [Data] else { break }
+                let value = try requireArray(Data.self, expected: "an array of data values")
                 let list = List<Data>()
                 for item in value {
                     try Task.checkCancellation()
@@ -2348,7 +2387,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = list
             case .date:
-                guard let value = record.value(forKey: property.name) as? [Date] else { break }
+                let value = try requireArray(Date.self, expected: "an array of dates")
                 let list = List<Date>()
                 for item in value {
                     try Task.checkCancellation()
@@ -2356,11 +2395,17 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 }
                 recordValue = list
             case .UUID:
-                guard let value = record.value(forKey: property.name) as? [String] else { break }
+                let value = try requireArray(
+                    String.self,
+                    expected: "an array of UUID strings"
+                )
                 let list = List<UUID>()
-                let newValues = try value.compactMap {
+                let newValues = try value.map {
                     try Task.checkCancellation()
-                    return UUID(uuidString: $0)
+                    guard let uuid = UUID(uuidString: $0) else {
+                        throw malformed("an array of UUID strings")
+                    }
+                    return uuid
                 }
                 for item in newValues {
                     try Task.checkCancellation()
@@ -2371,22 +2416,24 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 // Save relationship to be applied after all records have been downloaded and persisted
                 // to ensure target of the relationship has already been created
                 var targetIdentifiers = [String]()
-                if let value = record.value(forKey: property.name) as? [String] {
+                if let value = value as? [String] {
                     for recordName in value {
                         try Task.checkCancellation()
                         guard let objectIdentifier = objectIdentifier(
                             fromCloudKitRecordName: recordName
-                        ) else { continue }
+                        ) else { throw malformed("an array of CloudKit record names") }
                         targetIdentifiers.append(objectIdentifier)
                     }
-                } else if let value = record.value(forKey: property.name) as? [CKRecord.Reference] {
+                } else if let value = value as? [CKRecord.Reference] {
                     for reference in value {
                         try Task.checkCancellation()
                         guard let objectIdentifier = objectIdentifier(
                             fromCloudKitRecordName: reference.recordID.recordName
-                        ) else { continue }
+                        ) else { throw malformed("an array of CloudKit references") }
                         targetIdentifiers.append(objectIdentifier)
                     }
+                } else {
+                    throw malformed("an array of CloudKit references or record names")
                 }
                 appendPendingRelationship(
                     name: property.name,
@@ -2397,19 +2444,49 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 )
                 return
             default:
-                break
+                throw malformed("a supported Realm list element type")
             }
             try Task.checkCancellation()
             if let recordValue {
                 object.setValue(recordValue, forKey: property.name)
             }
         } else if property.isMap {
-            guard var result = decodedCloudKitMap(value) else { return }
+            guard var result = decodedCloudKitMap(value) else {
+                throw malformed("an encoded string-keyed map")
+            }
             if property.type == .UUID {
-                result = result.reduce(into: [:]) { converted, entry in
-                    if let string = entry.value as? String, let uuid = UUID(uuidString: string) {
-                        converted[entry.key] = uuid
+                var converted = [String: UUID]()
+                for entry in result {
+                    try Task.checkCancellation()
+                    guard let string = entry.value as? String,
+                          let uuid = UUID(uuidString: string) else {
+                        throw malformed("a map of UUID strings")
                     }
+                    converted[entry.key] = uuid
+                }
+                result = converted
+            } else {
+                let valuesAreValid: Bool
+                switch property.type {
+                case .int:
+                    valuesAreValid = result.values.allSatisfy { $0 is Int }
+                case .string:
+                    valuesAreValid = result.values.allSatisfy { $0 is String }
+                case .bool:
+                    valuesAreValid = result.values.allSatisfy { $0 is Bool }
+                case .float:
+                    valuesAreValid = result.values.allSatisfy { $0 is Float }
+                case .double:
+                    valuesAreValid = result.values.allSatisfy { $0 is Double }
+                case .data:
+                    valuesAreValid = result.values.allSatisfy { $0 is Data }
+                case .date:
+                    valuesAreValid = result.values.allSatisfy { $0 is Date }
+                default:
+                    valuesAreValid = false
+                }
+                guard valuesAreValid else {
+                    throw malformed("a map matching the Realm property type")
                 }
             }
             try Task.checkCancellation()
@@ -2419,7 +2496,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             // to ensure target of the relationship has already been created
             guard let objectIdentifier = objectIdentifier(
                 fromCloudKitRecordName: reference.recordID.recordName
-            ) else { return }
+            ) else { throw malformed("a CloudKit reference") }
             appendPendingRelationship(
                 name: key,
                 syncedEntityID: syncedEntityIdentifier,
@@ -2439,7 +2516,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             } else if value == nil, property.isOptional {
                 targetIdentifiers = []
             } else {
-                return
+                throw malformed("a CloudKit reference or record name")
             }
             appendPendingRelationship(
                 name: key,
@@ -2453,12 +2530,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                let uuid = UUID(uuidString: uuidString) {
                 try Task.checkCancellation()
                 object.setValue(uuid, forKey: key)
+            } else if value != nil {
+                throw malformed("a UUID string")
             }
         } else if let asset = value as? CKAsset {
             if let fileURL = asset.fileURL,
                let data = NSData(contentsOf: fileURL) {
                 try Task.checkCancellation()
                 object.setValue(data, forKey: key)
+            } else {
+                throw malformed("a readable CloudKit asset")
             }
         } else if value != nil || property.isOptional == true {
             // If property is not a relationship or value is nil and property is optional.

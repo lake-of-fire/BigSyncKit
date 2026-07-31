@@ -2437,6 +2437,65 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testRemoteMapRequiresACompleteValidPayload() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "remote-map-validation",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        object.attributes["local"] = "value"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        let property = try XCTUnwrap(
+            object.objectSchema.properties.first { $0.name == "attributes" }
+        )
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["attributes"] = Data([0, 1, 2]) as CKRecordValue
+
+        do {
+            try await fixture.targetRealm.asyncWrite {
+                try fixture.adapter.applyChange(
+                    property: property,
+                    record: record,
+                    object: object,
+                    syncedEntityIdentifier: record.recordID.recordName
+                )
+            }
+            XCTFail("Expected malformed map decoding to fail")
+        } catch is RealmSwiftRemoteRecordDecodingError {
+            // Expected.
+        }
+        XCTAssertEqual(object.attributes["local"], "value")
+
+        record["attributes"] = try PropertyListSerialization.data(
+            fromPropertyList: ["remote": "accepted"],
+            format: .binary,
+            options: 0
+        ) as CKRecordValue
+        try await fixture.targetRealm.asyncWrite {
+            try fixture.adapter.applyChange(
+                property: property,
+                record: record,
+                object: object,
+                syncedEntityIdentifier: record.recordID.recordName
+            )
+        }
+        XCTAssertEqual(
+            object.attributes.reduce(into: [String: String]()) {
+                $0[$1.key] = $1.value
+            },
+            ["remote": "accepted"]
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testMissingRemoteCollectionFieldClearsLocalCollection() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -2997,12 +3056,10 @@ final class BigSyncKitTests: XCTestCase {
             object.isDeleted = true
             object.refreshChangeMetadata(explicitlyModified: true)
         }
-        XCTAssertEqual(
-            try await fixture.adapter._test_forwardPendingMutations(
-                in: fixture.targetRealm
-            ),
-            1
+        let forwardedCount = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
         )
+        XCTAssertEqual(forwardedCount, 1)
         let tracking = try XCTUnwrap(
             fixture.persistenceRealm.object(
                 ofType: SyncedEntity.self,
