@@ -56,6 +56,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var accountIdentifierAfterNextRecordFetch: String?
     var accountIdentifierAfterNextMigrationMarkerSave: String?
     var accountIdentifierAfterNextZoneDeletion: String?
+    var migrationClaimFetchDelayNanoseconds: UInt64?
     var deleteZoneDelayNanoseconds: UInt64?
     var deleteZoneHandler: (@Sendable () -> Void)?
     var zoneChangePages = [FakeZoneChangePage]()
@@ -236,7 +237,16 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             accountIdentifier = nextAccountIdentifier
             accountIdentifierAfterNextRecordFetch = nil
         }
-        completionHandler(record, nil)
+        if recordID.recordName.hasSuffix(".claim"),
+           record != nil,
+           let migrationClaimFetchDelayNanoseconds {
+            Task {
+                try? await Task.sleep(nanoseconds: migrationClaimFetchDelayNanoseconds)
+                completionHandler(record, nil)
+            }
+        } else {
+            completionHandler(record, nil)
+        }
     }
 
     func setDate(_ date: Date, field: String, for recordID: CKRecord.ID) {
@@ -1649,6 +1659,29 @@ final class BigSyncKitTests: XCTestCase {
 
         let firstResult = try await firstReset.value
         XCTAssertEqual(firstResult, .performedCloudReset)
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetDoesNotCompeteWithItsClaimHeartbeat() async throws {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneDelayNanoseconds = 80_000_000
+        database.migrationClaimFetchDelayNanoseconds = 100_000_000
+        let zoneID = CKRecordZone.ID(zoneName: "single-writer-reset-zone")
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+
+        let result = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+            migrationIdentifier: "single-writer-reset-v1",
+            markerRecordType: "ExistingRecordType",
+            markerOwnerField: "owner",
+            markerLeaseDateField: "lease",
+            leaseDuration: 0.09
+        )
+
+        XCTAssertEqual(result, .performedCloudReset)
         XCTAssertEqual(database.deletedZoneIDs, [zoneID])
     }
 
