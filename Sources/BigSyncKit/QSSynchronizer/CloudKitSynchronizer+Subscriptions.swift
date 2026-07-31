@@ -12,16 +12,12 @@ import CloudKit
 public extension CloudKitSynchronizer {
     private func fetchAllCloudKitSubscriptions() async throws
         -> [CKSubscription] {
-        try await withCheckedThrowingContinuation {
-            (
-                continuation:
-                    CheckedContinuation<[CKSubscription], Error>
-            ) in
+        try await awaitCancellableCloudKitCallback { completion in
             database.fetchAllSubscriptions { subscriptions, error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume(returning: subscriptions ?? [])
+                    completion(.success(subscriptions ?? []))
                 }
             }
         }
@@ -30,16 +26,14 @@ public extension CloudKitSynchronizer {
     private func saveCloudKitSubscription(
         _ subscription: CKSubscription
     ) async throws -> CKSubscription {
-        try await withCheckedThrowingContinuation { continuation in
+        try await awaitCancellableCloudKitCallback { completion in
             database.save(subscription: subscription) { subscription, error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else if let subscription {
-                    continuation.resume(returning: subscription)
+                    completion(.success(subscription))
                 } else {
-                    continuation.resume(
-                        throwing: CocoaError(.coderValueNotFound)
-                    )
+                    completion(.failure(CocoaError(.coderValueNotFound)))
                 }
             }
         }
@@ -48,13 +42,12 @@ public extension CloudKitSynchronizer {
     private func deleteCloudKitSubscription(
         identifier: String
     ) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await awaitCancellableCloudKitCallback { completion in
             database.delete(withSubscriptionID: identifier) { _, error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume()
+                    completion(.success(()))
                 }
             }
         }

@@ -105,6 +105,7 @@ public enum OneOffRecordZoneResetError: LocalizedError {
     case migrationInProgress
     case cloudKitAccountChanged
     case cloudKitAccountUnavailable
+    case activeRecordZoneCannotBeDeleted
 
     public var errorDescription: String? {
         switch self {
@@ -114,6 +115,8 @@ public enum OneOffRecordZoneResetError: LocalizedError {
             return "The iCloud account changed during the CloudKit reset"
         case .cloudKitAccountUnavailable:
             return "The current iCloud account could not be identified"
+        case .activeRecordZoneCannotBeDeleted:
+            return "An active synchronization zone cannot be deleted as obsolete"
         }
     }
 }
@@ -538,16 +541,16 @@ public class CloudKitSynchronizer: NSObject {
                     throw OneOffRecordZoneResetError.cloudKitAccountUnavailable
                 }
                 let container = CKContainer(identifier: containerIdentifier)
-                return try await withCheckedThrowingContinuation { continuation in
+                return try await awaitCancellableCloudKitCallback { completion in
                     container.fetchUserRecordID { recordID, error in
                         if let error {
-                            continuation.resume(throwing: error)
+                            completion(.failure(error))
                         } else if let recordID {
-                            continuation.resume(returning: recordID.recordName)
+                            completion(.success(recordID.recordName))
                         } else {
-                            continuation.resume(
-                                throwing: OneOffRecordZoneResetError.cloudKitAccountUnavailable
-                            )
+                            completion(.failure(
+                                OneOffRecordZoneResetError.cloudKitAccountUnavailable
+                            ))
                         }
                     }
                 }
@@ -955,6 +958,11 @@ public class CloudKitSynchronizer: NSObject {
         _ zoneID: CKRecordZone.ID,
         using receipt: SynchronizationReceipt
     ) async throws -> Bool {
+        guard !modelAdapters.contains(where: {
+            $0.recordZoneID == zoneID
+        }) else {
+            throw OneOffRecordZoneResetError.activeRecordZoneCannotBeDeleted
+        }
         guard receipt.issuerID == synchronizationReceiptIssuerID else {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
@@ -1096,7 +1104,36 @@ public class CloudKitSynchronizer: NSObject {
         cancelSync = false
         changeRequestProcessor.cancelSync = false
         cancelledDueToUnauthentication = false
-        let uploadResult = try await synchronize()
+        let claimRenewalTask = Task { @BigSyncBackgroundActor [weak self] in
+            guard let self else { throw CancellationError() }
+            try await maintainResetClaim(
+                recordID: claimRecordID,
+                recordType: markerRecordType,
+                ownerField: markerOwnerField,
+                leaseDateField: markerLeaseDateField,
+                claimToken: claimToken,
+                leaseDuration: leaseDuration,
+                accountIdentifier: accountIdentifier
+            )
+        }
+        let uploadResult: SynchronizationResult
+        do {
+            uploadResult = try await synchronize()
+        } catch {
+            claimRenewalTask.cancel()
+            do {
+                try await claimRenewalTask.value
+            } catch let renewalError where !(renewalError is CancellationError) {
+                throw renewalError
+            }
+            throw error
+        }
+        claimRenewalTask.cancel()
+        do {
+            try await claimRenewalTask.value
+        } catch is CancellationError {
+            // Expected after the terminal upload drain.
+        }
         guard let uploadReceipt = uploadResult.receipt,
               uploadReceipt.accountIdentifier == accountIdentifier else {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
@@ -1192,6 +1229,44 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     @BigSyncBackgroundActor
+    private func maintainResetClaim(
+        recordID: CKRecord.ID,
+        recordType: String,
+        ownerField: String,
+        leaseDateField: String,
+        claimToken: String,
+        leaseDuration: TimeInterval,
+        accountIdentifier: String
+    ) async throws {
+        // Renew well before expiry and cap the interval so unusually long
+        // leases still detect account changes promptly.
+        let interval = max(
+            0.001,
+            min(leaseDuration / 3, 60)
+        )
+        let nanoseconds = UInt64(interval * 1_000_000_000)
+        while true {
+            try await Task.sleep(nanoseconds: nanoseconds)
+            try Task.checkCancellation()
+            do {
+                try await ensureCurrentAccount(accountIdentifier)
+                try await acquireOrRenewResetClaim(
+                    recordID: recordID,
+                    recordType: recordType,
+                    ownerField: ownerField,
+                    leaseDateField: leaseDateField,
+                    claimToken: claimToken,
+                    leaseDuration: leaseDuration
+                )
+                try await ensureCurrentAccount(accountIdentifier)
+            } catch {
+                cancelSynchronization()
+                throw error
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
     private func ensureCurrentAccount(_ expectedIdentifier: String) async throws {
         guard try await accountIdentifierProvider() == expectedIdentifier else {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
@@ -1200,13 +1275,12 @@ public class CloudKitSynchronizer: NSObject {
 
     @BigSyncBackgroundActor
     private func deleteRecordZone(_ zoneID: CKRecordZone.ID) async throws {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await awaitCancellableCloudKitCallback { completion in
             database.delete(withRecordZoneID: zoneID) { _, error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume()
+                    completion(.success(()))
                 }
             }
         }
@@ -1223,19 +1297,18 @@ public class CloudKitSynchronizer: NSObject {
 
     @BigSyncBackgroundActor
     private func fetchRecord(_ recordID: CKRecord.ID) async throws -> CKRecord? {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<CKRecord?, Error>) in
+        try await awaitCancellableCloudKitCallback { completion in
             database.fetch(withRecordID: recordID) { record, error in
                 if let error {
                     let nsError = error as NSError
                     if nsError.domain == CKErrorDomain,
                        nsError.code == CKError.unknownItem.rawValue {
-                        continuation.resume(returning: nil)
+                        completion(.success(nil))
                     } else {
-                        continuation.resume(throwing: error)
+                        completion(.failure(error))
                     }
                 } else {
-                    continuation.resume(returning: record)
+                    completion(.success(record))
                 }
             }
         }
@@ -1274,8 +1347,7 @@ public class CloudKitSynchronizer: NSObject {
         recordsToSave: [CKRecord]?,
         recordIDsToDelete: [CKRecord.ID]?
     ) async throws -> (savedRecords: [CKRecord], deletedRecordIDs: [CKRecord.ID]) {
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<([CKRecord], [CKRecord.ID]), Error>) in
+        try await awaitCancellableCloudKitCallback { completion in
             let operation = CKModifyRecordsOperation(
                 recordsToSave: recordsToSave,
                 recordIDsToDelete: recordIDsToDelete
@@ -1284,11 +1356,11 @@ public class CloudKitSynchronizer: NSObject {
             operation.isAtomic = true
             operation.modifyRecordsCompletionBlock = { savedRecords, deletedRecordIDs, error in
                 if let error {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 } else {
-                    continuation.resume(
-                        returning: (savedRecords ?? [], deletedRecordIDs ?? [])
-                    )
+                    completion(.success(
+                        (savedRecords ?? [], deletedRecordIDs ?? [])
+                    ))
                 }
             }
             database.add(operation)

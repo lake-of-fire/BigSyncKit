@@ -360,9 +360,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     @BigSyncBackgroundActor
     private let realmChangesSubject = PassthroughSubject<Void, Never>()
     @BigSyncBackgroundActor
-    private var observedJournalMutations = [
-        Int: [String: BigSyncPendingMutationSnapshot]
-    ]()
+    private var observedJournalRecordNames = [Int: Set<String>]()
     @BigSyncBackgroundActor
     private var changedLegacyRealmIndexes = Set<Int>()
     
@@ -775,15 +773,19 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                     guard let self else { return }
                     guard let targetReaderRealms = self.realmProvider?.targetReaderRealms else { return }
-                    let observed = observedJournalMutations
+                    let observed = observedJournalRecordNames
                     let legacyIndexes = changedLegacyRealmIndexes
-                    observedJournalMutations.removeAll(keepingCapacity: true)
+                    observedJournalRecordNames.removeAll(keepingCapacity: true)
                     changedLegacyRealmIndexes.removeAll(keepingCapacity: true)
-                    for (idx, mutationsByRecordName) in observed
+                    for (idx, recordNames) in observed
                     where idx < targetReaderRealms.count {
+                        let realm = targetReaderRealms[idx]
                         try await self.forwardPendingMutations(
-                            Array(mutationsByRecordName.values),
-                            in: targetReaderRealms[idx]
+                            self.pendingMutationSnapshots(
+                                for: recordNames,
+                                in: realm
+                            ),
+                            in: realm
                         )
                     }
                     for idx in legacyIndexes where idx < targetReaderRealms.count {
@@ -812,19 +814,15 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             return
                         }
                         let changedIndexes = Set(insertions).union(modifications)
-                        let snapshots = changedIndexes.map { index in
-                            let mutation = collection[index]
-                            return BigSyncPendingMutationSnapshot(
-                                recordName: mutation.recordName,
-                                entityType: mutation.entityType,
-                                objectIdentifier: mutation.objectIdentifier,
-                                generation: mutation.generation,
-                                changedAt: mutation.changedAt
-                            )
+                        let recordNames = changedIndexes.map {
+                            collection[$0].recordName
                         }
-                        guard !snapshots.isEmpty else { return }
+                        guard !recordNames.isEmpty else { return }
                         Task { @BigSyncBackgroundActor [weak self] in
-                            self?.enqueueObservedJournalMutations(snapshots, realmIndex: idx)
+                            self?.enqueueObservedJournalRecordNames(
+                                recordNames,
+                                realmIndex: idx
+                            )
                         }
                         return
                     case .error(let error):
@@ -846,13 +844,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
 
     @BigSyncBackgroundActor
-    private func enqueueObservedJournalMutations(
-        _ snapshots: [BigSyncPendingMutationSnapshot],
+    private func enqueueObservedJournalRecordNames(
+        _ recordNames: [String],
         realmIndex: Int
     ) {
-        for snapshot in snapshots {
-            observedJournalMutations[realmIndex, default: [:]][snapshot.recordName] = snapshot
-        }
+        observedJournalRecordNames[realmIndex, default: []]
+            .formUnion(recordNames)
         realmChangesSubject.send(())
     }
 
