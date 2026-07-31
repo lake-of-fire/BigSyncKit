@@ -250,6 +250,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     private var storedServerChangeToken: CKServerChangeToken?
     var didFinishImportHandler: (@Sendable () async -> Void)?
     var resetSyncCachesHandler: (@Sendable () async -> Void)?
+    var saveChangesHandler: (@Sendable () async throws -> Void)?
 
     var hasChanges: Bool {
         uploadedByEntity.values.contains(where: { !$0.isEmpty }) ||
@@ -279,6 +280,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
         savedBatchSizes.append(records.count)
         let recordTypes = records.map { $0.recordType }.joined(separator: ",")
         events.append("save:\(recordTypes)")
+        try await saveChangesHandler?()
     }
 
     func deleteRecords(with recordIDs: [CKRecord.ID]) async throws {
@@ -661,12 +663,14 @@ final class BigSyncKitTests: XCTestCase {
 
         await synchronizer.changesFinishedSynchronizing()
         let result = try await synchronization.value
+        let expectedAccountScope =
+            try await synchronizer.cloudKitAccountScopeIdentifier()
 
+        XCTAssertTrue(result.didImportChanges)
+        XCTAssertNotNil(result.receipt)
         XCTAssertEqual(
-            result,
-            CloudKitSynchronizer.SynchronizationResult(
-                didImportChanges: true
-            )
+            result.receipt?.accountScopeIdentifier,
+            expectedAccountScope
         )
         XCTAssertFalse(synchronizer.syncing)
         await synchronizer.cancelSynchronizationAndWait()
@@ -842,12 +846,21 @@ final class BigSyncKitTests: XCTestCase {
         )
         let expectedAccountScope =
             try await synchronizer.cloudKitAccountScopeIdentifier()
+        let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+            context: .init(
+                attemptID: UUID(),
+                runID: UUID(),
+                accountIdentifier: database.accountIdentifier,
+                accountScopeIdentifier: expectedAccountScope
+            ),
+            issuerID: synchronizer.synchronizationReceiptIssuerID
+        )
         database.accountIdentifier = "different-account"
 
         do {
             _ = try await synchronizer.deleteRecordZoneIfPresent(
                 CKRecordZone.ID(zoneName: "obsolete-zone"),
-                expectedAccountScopeIdentifier: expectedAccountScope
+                using: receipt
             )
             XCTFail("Expected account switch to stop zone deletion")
         } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
@@ -856,6 +869,40 @@ final class BigSyncKitTests: XCTestCase {
         }
 
         XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testObsoleteZoneDeletionReportsAccountSwitchDuringDeletion() async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let expectedAccountScope =
+            try await synchronizer.cloudKitAccountScopeIdentifier()
+        let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+            context: .init(
+                attemptID: UUID(),
+                runID: UUID(),
+                accountIdentifier: database.accountIdentifier,
+                accountScopeIdentifier: expectedAccountScope
+            ),
+            issuerID: synchronizer.synchronizationReceiptIssuerID
+        )
+        database.accountIdentifierAfterNextZoneDeletion = "different-account"
+
+        do {
+            _ = try await synchronizer.deleteRecordZoneIfPresent(
+                CKRecordZone.ID(zoneName: "obsolete-zone"),
+                using: receipt
+            )
+            XCTFail("Expected account switch to prevent migration completion")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(database.deletedZoneIDs.count, 1)
     }
 
     @BigSyncBackgroundActor
@@ -1516,6 +1563,69 @@ final class BigSyncKitTests: XCTestCase {
 
         try await first.finishProcessing(for: adapter)
         XCTAssertEqual(adapter.savedBatchSizes, [1])
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledFetchedBatchCannotReenterNewRun() async throws {
+        let zoneID = CKRecordZone.ID(
+            zoneName: "cancelled-batch",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        let processor = ChangeRequestProcessor()
+        let oldRunID = processor.beginRun()
+        let enteredSave = expectation(description: "old run entered save")
+        let gate = AsyncGate()
+        adapter.saveChangesHandler = {
+            enteredSave.fulfill()
+            await gate.wait()
+            try Task.checkCancellation()
+        }
+        processor.addFetchedChangeRequest(
+            ChangeRequest(
+                downloadedRecord: makeRecord(
+                    type: "OldAccountRecord",
+                    id: "old",
+                    zoneID: zoneID
+                ),
+                deletedRecordID: nil,
+                adapter: adapter,
+                runID: oldRunID
+            )
+        )
+
+        let oldProcessing = Task { @BigSyncBackgroundActor in
+            try await processor.finishProcessing(for: adapter)
+        }
+        await fulfillment(of: [enteredSave], timeout: 1)
+
+        let newRunID = processor.beginRun()
+        processor.addFetchedChangeRequest(
+            ChangeRequest(
+                downloadedRecord: makeRecord(
+                    type: "NewAccountRecord",
+                    id: "new",
+                    zoneID: zoneID
+                ),
+                deletedRecordID: nil,
+                adapter: adapter,
+                runID: newRunID
+            )
+        )
+        await gate.open()
+        _ = try? await oldProcessing.value
+        adapter.saveChangesHandler = nil
+
+        try await processor.finishProcessing(for: adapter)
+        XCTAssertEqual(
+            adapter.events.filter { $0 == "save:OldAccountRecord" }.count,
+            1
+        )
+        XCTAssertEqual(
+            adapter.events.filter { $0 == "save:NewAccountRecord" }.count,
+            1
+        )
+        XCTAssertFalse(processor.hasPendingChangeRequests(for: adapter))
     }
 
     @BigSyncBackgroundActor

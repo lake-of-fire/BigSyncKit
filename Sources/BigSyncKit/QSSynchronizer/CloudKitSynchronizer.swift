@@ -131,7 +131,6 @@ internal class ChangeRequestProcessor {
     private var changeRequests = [ChangeRequest]()
     private var localErrors: [Error] = []
     private var activeRunID = UUID()
-    internal var processTask: Task<Void, Error>? = nil
     internal var fetchedChangeBatchSize = ChangeRequestProcessor.defaultFetchedChangeBatchSize
     
     internal func addFetchedChangeRequest(_ request: ChangeRequest) {
@@ -158,14 +157,19 @@ internal class ChangeRequestProcessor {
 
     private func dequeueBatch(
         for adapter: ModelAdapter,
-        restrictedToEntityType restrictedEntityType: String?
+        restrictedToEntityType restrictedEntityType: String?,
+        runID: UUID
     ) -> [ChangeRequest] {
+        guard activeRunID == runID, !cancelSync else { return [] }
         var batch = [ChangeRequest]()
         var remaining = [ChangeRequest]()
         batch.reserveCapacity(min(fetchedChangeBatchSize, changeRequests.count))
         remaining.reserveCapacity(changeRequests.count)
 
         for request in changeRequests {
+            guard request.runID == nil || request.runID == runID else {
+                continue
+            }
             let isMatchingAdapter = request.adapter.recordZoneID == adapter.recordZoneID
             let isMatchingRestriction = restrictedEntityType == nil || entityType(for: request) == restrictedEntityType
             if batch.count < fetchedChangeBatchSize &&
@@ -185,28 +189,31 @@ internal class ChangeRequestProcessor {
         for adapter: ModelAdapter,
         restrictedToEntityType restrictedEntityType: String?
     ) async throws {
-        processTask?.cancel()
-        _ = try? await processTask?.value
-        processTask = Task { @BigSyncBackgroundActor [weak self] in
-            try await self?.processFetchedChangeRequests(
-                for: adapter,
-                restrictedToEntityType: restrictedEntityType
-            )
-            self?.processTask = nil
-        }
-        try await processTask?.value
+        let runID = activeRunID
+        try await processFetchedChangeRequests(
+            for: adapter,
+            restrictedToEntityType: restrictedEntityType,
+            runID: runID
+        )
     }
     
     private func processFetchedChangeRequests(
         for adapter: ModelAdapter,
-        restrictedToEntityType restrictedEntityType: String?
+        restrictedToEntityType restrictedEntityType: String?,
+        runID: UUID
     ) async throws {
         try Task.checkCancellation()
         
         while true {
             try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
-            let batch = dequeueBatch(for: adapter, restrictedToEntityType: restrictedEntityType)
+            guard !cancelSync, activeRunID == runID else {
+                throw CancellationError()
+            }
+            let batch = dequeueBatch(
+                for: adapter,
+                restrictedToEntityType: restrictedEntityType,
+                runID: runID
+            )
             guard !batch.isEmpty else { return }
             
             do {
@@ -218,6 +225,9 @@ internal class ChangeRequestProcessor {
                 if !downloadedRecords.isEmpty {
                     try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
                     try Task.checkCancellation()
+                    guard !cancelSync, activeRunID == runID else {
+                        throw CancellationError()
+                    }
                 }
                 
                 let deletedRecordIDs = try batch.compactMap {
@@ -226,13 +236,20 @@ internal class ChangeRequestProcessor {
                 }
                 if !deletedRecordIDs.isEmpty {
                     try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
+                    try Task.checkCancellation()
+                    guard !cancelSync, activeRunID == runID else {
+                        throw CancellationError()
+                    }
                 }
             } catch is CancellationError {
-                changeRequests.insert(contentsOf: batch, at: 0)
-                return
+                // The page token is committed only after the complete fetched page
+                // publishes successfully. Discard this batch and let CloudKit
+                // redeliver it; requeueing can leak an old run into a newer one.
+                throw CancellationError()
             } catch {
                 localErrors.append(error)
-                changeRequests.insert(contentsOf: batch, at: 0)
+                // As above, retaining a failed value batch is unnecessary because
+                // its page token has not advanced.
                 return
             }
             
@@ -250,8 +267,6 @@ internal class ChangeRequestProcessor {
 
     func reset() {
         cancelSync = true
-        processTask?.cancel()
-        processTask = nil
         changeRequests.removeAll(keepingCapacity: false)
         localErrors.removeAll(keepingCapacity: false)
     }
@@ -307,11 +322,37 @@ public let cloudKitSynchronizerMetadataKeys: [String] = [
 @BigSyncBackgroundActor
 public class CloudKitSynchronizer: NSObject {
     public typealias AccountIdentifierProvider = @Sendable () async throws -> String
+    internal struct RunContext: Sendable, Equatable {
+        let attemptID: UUID
+        let runID: UUID
+        let accountIdentifier: String
+        let accountScopeIdentifier: String
+    }
+
+    public struct SynchronizationReceipt: Sendable, Equatable {
+        public let accountScopeIdentifier: String
+        public let runID: UUID
+        internal let accountIdentifier: String
+        internal let issuerID: UUID
+
+        internal init(context: RunContext, issuerID: UUID) {
+            accountScopeIdentifier = context.accountScopeIdentifier
+            runID = context.runID
+            accountIdentifier = context.accountIdentifier
+            self.issuerID = issuerID
+        }
+    }
+
     public struct SynchronizationResult: Sendable, Equatable {
         public let didImportChanges: Bool
+        public let receipt: SynchronizationReceipt?
 
-        public init(didImportChanges: Bool) {
+        public init(
+            didImportChanges: Bool,
+            receipt: SynchronizationReceipt? = nil
+        ) {
             self.didImportChanges = didImportChanges
+            self.receipt = receipt
         }
     }
 
@@ -361,6 +402,7 @@ public class CloudKitSynchronizer: NSObject {
     /// Required by the synchronizer to persist some state. `UserDefaults` can be used via `UserDefaultsAdapter`.
     public let keyValueStore: KeyValueStore
     private let accountIdentifierProvider: AccountIdentifierProvider
+    internal let synchronizationReceiptIssuerID = UUID()
     private var cloudKitAccountIdentifierKey: String {
         "\(identifier).BigSyncKitCloudKitAccountIdentifier"
     }
@@ -424,6 +466,7 @@ public class CloudKitSynchronizer: NSObject {
     internal let changeRequestProcessor = ChangeRequestProcessor()
     internal var synchronizationAttemptID = UUID()
     internal var synchronizationRunID = UUID()
+    internal var activeRunContext: RunContext?
  
     internal let logger: Logging.Logger
     
@@ -576,19 +619,28 @@ public class CloudKitSynchronizer: NSObject {
         synchronizationTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
             do {
-                try await validateSynchronizationAccount()
+                let accountIdentifier = try await validateSynchronizationAccount()
+                let runID = changeRequestProcessor.beginRun()
+                synchronizationRunID = runID
+                let context = RunContext(
+                    attemptID: attemptID,
+                    runID: runID,
+                    accountIdentifier: accountIdentifier,
+                    accountScopeIdentifier: Self.accountScopeIdentifier(
+                        for: accountIdentifier
+                    )
+                )
+                activeRunContext = context
                 // Subscription identifiers are account-scoped sync metadata.
                 // Account validation clears them after an iCloud account
                 // change, so ensure the current account has a subscription as
                 // part of every attempt. The stored-ID fast path performs no
                 // CloudKit request during ordinary synchronization.
                 try await subscribeForChangesInDatabase()
-                guard synchronizationAttemptID == attemptID else {
-                    throw CancellationError()
-                }
-                synchronizationRunID = changeRequestProcessor.beginRun()
+                try await revalidateRunContext(context)
                 for adapter in modelAdapters {
                     try await adapter.unsetCancellation()
+                    try checkRunContext(context)
                 }
                 try Task.checkCancellation()
                 await performSynchronization()
@@ -641,6 +693,34 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
+    internal func checkRunContext(_ context: RunContext) throws {
+        try Task.checkCancellation()
+        guard activeRunContext == context,
+              synchronizationAttemptID == context.attemptID,
+              synchronizationRunID == context.runID,
+              !cancelSync else {
+            throw CancellationError()
+        }
+    }
+
+    internal func revalidateRunContext(_ context: RunContext) async throws {
+        try checkRunContext(context)
+        let currentAccountIdentifier = try await accountIdentifierProvider()
+        try checkRunContext(context)
+        guard currentAccountIdentifier == context.accountIdentifier else {
+            accountValidationRequired = true
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
+        }
+    }
+
+    internal func revalidateActiveRunContext(
+        for attemptID: UUID
+    ) async throws {
+        try checkSynchronizationAttempt(attemptID)
+        guard let context = activeRunContext else { return }
+        try await revalidateRunContext(context)
+    }
+
     private func checkAccountValidationAttempt(_ attemptID: UUID) throws {
         try Task.checkCancellation()
         guard synchronizationAttemptID == attemptID else {
@@ -661,8 +741,7 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     @BigSyncBackgroundActor
-    private func validateSynchronizationAccount() async throws {
-        guard accountValidationRequired else { return }
+    private func validateSynchronizationAccount() async throws -> String {
         let validationAttemptID = synchronizationAttemptID
         let currentAccountIdentifier = try await accountIdentifierProvider()
         try checkAccountValidationAttempt(validationAttemptID)
@@ -701,13 +780,20 @@ public class CloudKitSynchronizer: NSObject {
         accountValidationRequired = false
         cancelSync = false
         cancelledDueToUnauthentication = false
+        return confirmedAccountIdentifier
     }
 
     /// Stable, non-reversible key for account-scoped one-off migration markers.
     @BigSyncBackgroundActor
     public func cloudKitAccountScopeIdentifier() async throws -> String {
         let accountIdentifier = try await accountIdentifierProvider()
-        return SHA256.hash(data: Data(accountIdentifier.utf8))
+        return Self.accountScopeIdentifier(for: accountIdentifier)
+    }
+
+    private static func accountScopeIdentifier(
+        for accountIdentifier: String
+    ) -> String {
+        SHA256.hash(data: Data(accountIdentifier.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
     }
@@ -715,7 +801,7 @@ public class CloudKitSynchronizer: NSObject {
 #if DEBUG
     @BigSyncBackgroundActor
     func _test_validateSynchronizationAccount() async throws {
-        try await validateSynchronizationAccount()
+        _ = try await validateSynchronizationAccount()
     }
 #endif
     
@@ -725,6 +811,7 @@ public class CloudKitSynchronizer: NSObject {
         //        guard syncing, !cancelSync else { return }
         
         synchronizationAttemptID = UUID()
+        activeRunContext = nil
         changeRequestProcessor.reset()
         synchronizationTask?.cancel()
         synchronizationTask = nil
@@ -859,21 +946,22 @@ public class CloudKitSynchronizer: NSObject {
     @discardableResult
     public func deleteRecordZoneIfPresent(
         _ zoneID: CKRecordZone.ID,
-        expectedAccountScopeIdentifier: String? = nil
+        using receipt: SynchronizationReceipt
     ) async throws -> Bool {
-        if let expectedAccountScopeIdentifier {
-            guard try await cloudKitAccountScopeIdentifier()
-                    == expectedAccountScopeIdentifier else {
-                throw OneOffRecordZoneResetError.cloudKitAccountChanged
-            }
+        guard receipt.issuerID == synchronizationReceiptIssuerID else {
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
+        try await ensureCurrentAccount(receipt.accountIdentifier)
+        let deleted: Bool
         do {
             try await deleteRecordZone(zoneID)
-            return true
+            deleted = true
         } catch {
             guard isMissingRecordZoneError(error) else { throw error }
-            return false
+            deleted = false
         }
+        try await ensureCurrentAccount(receipt.accountIdentifier)
+        return deleted
     }
 
     /// Coordinates a destructive zone reset across all of a user's devices.

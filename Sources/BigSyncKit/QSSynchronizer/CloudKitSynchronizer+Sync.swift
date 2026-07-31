@@ -43,6 +43,12 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func changesFinishedSynchronizing() async {
         let attemptID = synchronizationAttemptID
+        do {
+            try await revalidateActiveRunContext(for: attemptID)
+        } catch {
+            await failSynchronization(error: error)
+            return
+        }
 //        logger.info("QSCloudKitSynchronizer >> Finishing synchronization batch...")
         
         resetActiveTokens()
@@ -68,7 +74,13 @@ extension CloudKitSynchronizer {
             with: .success(
                 SynchronizationResult(
                     didImportChanges:
-                        synchronizationDrainDidImportChanges
+                        synchronizationDrainDidImportChanges,
+                    receipt: activeRunContext.map {
+                        SynchronizationReceipt(
+                            context: $0,
+                            issuerID: synchronizationReceiptIssuerID
+                        )
+                    }
                 )
             )
         )
@@ -408,6 +420,7 @@ extension CloudKitSynchronizer {
                 await failSynchronization(error: error)
                 return
             }
+            try await revalidateActiveRunContext(for: attemptID)
             
             serverChangeToken = token
             if syncMode == .sync {
@@ -415,6 +428,7 @@ extension CloudKitSynchronizer {
             } else {
                 do {
                     try await processFetchedChanges()
+                    try await revalidateActiveRunContext(for: attemptID)
                     storedDatabaseToken = token
                     await changesFinishedSynchronizing()
                 } catch {
@@ -553,8 +567,9 @@ extension CloudKitSynchronizer {
                 if !zoneResult.deletedRecordIDs.isEmpty {
                     logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs from zone \(zoneID.zoneName)")
                 }
+                try await revalidateActiveRunContext(for: attemptID)
                 try await changeRequestProcessor.finishProcessing(for: adapter)
-                try checkSynchronizationAttempt(attemptID)
+                try await revalidateActiveRunContext(for: attemptID)
                 guard synchronizationRunID == runID else {
                     throw CancellationError()
                 }
@@ -563,12 +578,12 @@ extension CloudKitSynchronizer {
                     throw firstError
                 }
                 try await adapter.persistImportedChanges()
-                try checkSynchronizationAttempt(attemptID)
+                try await revalidateActiveRunContext(for: attemptID)
                 guard synchronizationRunID == runID else {
                     throw CancellationError()
                 }
                 try await adapter.saveToken(zoneResult.serverChangeToken)
-                try checkSynchronizationAttempt(attemptID)
+                try await revalidateActiveRunContext(for: attemptID)
                 guard synchronizationRunID == runID else {
                     throw CancellationError()
                 }
@@ -642,6 +657,7 @@ extension CloudKitSynchronizer {
                 // The database token is a commit barrier for the zone changes it
                 // announced. Persist it only after every downloaded zone change
                 // has been applied and its zone token has been saved.
+                try await revalidateActiveRunContext(for: attemptID)
                 storedDatabaseToken = serverChangeToken
                 if try await shouldDeferFetches() {
                     //                    debugPrint("# USED TO STOP HERE, NOw LOOPIN!")
@@ -815,6 +831,7 @@ extension CloudKitSynchronizer {
 //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \(savedRecords.map { ($0.recordID.recordName, $0.debugDescription) })")
                     //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
 
+                    try await revalidateActiveRunContext(for: attemptID)
                     if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
                         try await generationTrackingAdapter.didUpload(
                             savedRecords: savedRecords,
@@ -823,7 +840,7 @@ extension CloudKitSynchronizer {
                     } else {
                         try await adapter.didUpload(savedRecords: savedRecords)
                     }
-                    try checkSynchronizationAttempt(attemptID)
+                    try await revalidateActiveRunContext(for: attemptID)
                 }
                 
                 try checkSynchronizationAttempt(attemptID)
@@ -985,6 +1002,7 @@ extension CloudKitSynchronizer {
                     "QSCloudKitSynchronizer >> Deleted or confirmed absent \(acknowledgedRecordIDs.count) records"
                 )
                 do {
+                    try await revalidateActiveRunContext(for: attemptID)
                     if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
                         try await generationTrackingAdapter.didDelete(
                             recordIDs: acknowledgedRecordIDs,
@@ -993,7 +1011,7 @@ extension CloudKitSynchronizer {
                     } else {
                         await adapter.didDelete(recordIDs: acknowledgedRecordIDs)
                     }
-                    try checkSynchronizationAttempt(attemptID)
+                    try await revalidateActiveRunContext(for: attemptID)
                 } catch {
                     try await completion(error)
                     return
@@ -1072,6 +1090,9 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func saveActiveTokenIfNeeded(for adapter: ModelAdapter) async throws {
         if let token = activeZoneToken(zoneID: adapter.recordZoneID) {
+            try await revalidateActiveRunContext(
+                for: synchronizationAttemptID
+            )
             try await adapter.saveToken(token)
         }
     }
@@ -1164,15 +1185,25 @@ extension CloudKitSynchronizer {
                         case .success(true):
                             await performSynchronization()
                         case .success(false):
-                            storedDatabaseToken = databaseToken
-                            await changesFinishedSynchronizing()
+                            do {
+                                try await revalidateActiveRunContext(for: attemptID)
+                                storedDatabaseToken = databaseToken
+                                await changesFinishedSynchronizing()
+                            } catch {
+                                await failSynchronization(error: error)
+                            }
                         case .failure(let error):
                             await failSynchronization(error: error)
                         }
                     })
                 } else {
-                    storedDatabaseToken = databaseToken
-                    await changesFinishedSynchronizing()
+                    do {
+                        try await revalidateActiveRunContext(for: attemptID)
+                        storedDatabaseToken = databaseToken
+                        await changesFinishedSynchronizing()
+                    } catch {
+                        await failSynchronization(error: error)
+                    }
                 }
             }
         }
@@ -1226,8 +1257,9 @@ extension CloudKitSynchronizer {
                 if result.downloadedRecords.count > 0 || result.deletedRecordIDs.count > 0 {
                     zonesNeedingRefetch.insert(zoneID)
                 } else if !zonesNeedingRefetch.contains(zoneID) {
+                    try await revalidateActiveRunContext(for: attemptID)
                     try await adapter?.saveToken(result.serverChangeToken)
-                    try checkSynchronizationAttempt(attemptID)
+                    try await revalidateActiveRunContext(for: attemptID)
                     activeZoneTokens[zoneID] = result.serverChangeToken
                 }
                 

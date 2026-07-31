@@ -103,7 +103,11 @@ public extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func subscribeForChangesInDatabase() async throws {
         guard subscriptionIDForDatabaseSubscription() == nil else { return }
+        let context = activeRunContext
         let subscriptions = try await fetchAllCloudKitSubscriptions()
+        if let context {
+            try await revalidateRunContext(context)
+        }
         if let existing = subscriptions.first(where: {
             $0 is CKDatabaseSubscription
         }) {
@@ -116,6 +120,9 @@ public extension CloudKitSynchronizer {
         notificationInfo.shouldSendContentAvailable = true
         subscription.notificationInfo = notificationInfo
         let saved = try await saveCloudKitSubscription(subscription)
+        if let context {
+            try await revalidateRunContext(context)
+        }
         databaseSubscriptionID = saved.subscriptionID
     }
     
@@ -142,7 +149,11 @@ public extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func subscribeForChanges(in zoneID: CKRecordZone.ID) async throws {
         guard subscriptionID(forRecordZoneID: zoneID) == nil else { return }
+        let context = activeRunContext
         let subscriptions = try await fetchAllCloudKitSubscriptions()
+        if let context {
+            try await revalidateRunContext(context)
+        }
         if let existing = subscriptions.compactMap({
             $0 as? CKRecordZoneSubscription
         }).first(where: { $0.zoneID == zoneID }) {
@@ -155,6 +166,9 @@ public extension CloudKitSynchronizer {
         notificationInfo.shouldSendContentAvailable = true
         subscription.notificationInfo = notificationInfo
         let saved = try await saveCloudKitSubscription(subscription)
+        if let context {
+            try await revalidateRunContext(context)
+        }
         storeSubscriptionID(saved.subscriptionID, for: zoneID)
     }
     
