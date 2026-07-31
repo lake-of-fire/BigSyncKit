@@ -58,8 +58,8 @@ extension CloudKitSynchronizer {
         uploadRetries = 0
         
         for adapter in modelAdapters {
-            await adapter.didFinishImport()
             do {
+                try await adapter.didFinishImport()
                 try await revalidateActiveRunContext(for: attemptID)
                 try await adapter.cleanUp()
                 try await revalidateActiveRunContext(for: attemptID)
@@ -111,7 +111,11 @@ extension CloudKitSynchronizer {
         uploadRetries = 0
         
         for adapter in modelAdapters {
-            await adapter.didFinishImport()
+            do {
+                try await adapter.didFinishImport()
+            } catch {
+                logger.error("QSCloudKitSynchronizer >> Failed final import forwarding: \(error)")
+            }
             guard synchronizationAttemptID == attemptID else { return }
         }
         
@@ -250,9 +254,9 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func notifyProviderForDeletedZoneIDs(_ zoneIDs: [CKRecordZone.ID]) async {
+    func notifyProviderForDeletedZoneIDs(_ zoneIDs: [CKRecordZone.ID]) async throws {
         for zoneID in zoneIDs {
-            await self.adapterProvider.cloudKitSynchronizer(self, zoneWasDeletedWithZoneID: zoneID)
+            try await self.adapterProvider.cloudKitSynchronizer(self, zoneWasDeletedWithZoneID: zoneID)
             self.delegate?.synchronizer(self, zoneIDWasDeleted: zoneID)
         }
     }
@@ -471,7 +475,7 @@ extension CloudKitSynchronizer {
                     return
                 }
                 
-                await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                try await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 try await revalidateActiveRunContext(for: attemptID)
                 
                 let zoneIDsToFetch = try await loadTokens(for: changedZoneIDs, loadAdapters: true)
@@ -544,7 +548,7 @@ extension CloudKitSynchronizer {
                 try Task.checkCancellation()
                 if let error = zoneResult.error {
                     if isZoneNotFoundOrDeletedError(error) {
-                        await notifyProviderForDeletedZoneIDs([zoneID])
+                        try await notifyProviderForDeletedZoneIDs([zoneID])
                         try await revalidateActiveRunContext(for: attemptID)
                         guard synchronizationRunID == runID else {
                             throw CancellationError()
@@ -1245,7 +1249,7 @@ extension CloudKitSynchronizer {
                     return
                 }
                 
-                await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                try await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
                 guard synchronizationAttemptID == attemptID,
                       !cancelSync else { return }
                 if changedZoneIDs.count > 0 {

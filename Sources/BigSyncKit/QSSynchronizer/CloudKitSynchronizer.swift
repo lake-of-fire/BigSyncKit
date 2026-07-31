@@ -88,7 +88,7 @@ public protocol AdapterProvider {
     ///   - synchronizer: `QSCloudKitSynchronizer` that found the deleted record zone.
     ///   - zoneID: `CKRecordZoneID` of the record zone that was deleted.
     @BigSyncBackgroundActor
-    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async
+    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async throws
 }
 
 //@objc public protocol CloudKitSynchronizerDelegate: AnyObject {
@@ -464,6 +464,11 @@ public class CloudKitSynchronizer: NSObject {
     }
     private var accountValidationRequired = true
     private var accountChangeObserver: NSObjectProtocol?
+    /// Set during construction when the local defaults marker survived a backup
+    /// but the excluded-from-backup sentinel did not. The synchronization
+    /// bootstrap consumes this before any fetch can advance a token.
+    internal private(set) var backupRestoreDetected = false
+    private var backupDetectionError: Error?
     
     /// Indicates whether the instance is currently synchronizing data.
     @BigSyncBackgroundActor
@@ -600,11 +605,17 @@ public class CloudKitSynchronizer: NSObject {
             }
         }
         
-        BackupDetection.runBackupDetection { [weak self] (result, error) in
-            guard let self else { return }
-            if result == .restoredFromBackup {
+        do {
+            let result = try BackupDetection.run(store: keyValueStore)
+            backupRestoreDetected = BackupDetection.restoreResetIsRequired(
+                store: keyValueStore
+            )
+            if result == .restoredFromBackup || backupRestoreDetected {
                 clearDeviceIdentifier()
             }
+        } catch {
+            backupDetectionError = error
+            logger.error("QSCloudKitSynchronizer >> Backup detection failed: \(error)")
         }
         
 //        Task {

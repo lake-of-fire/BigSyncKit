@@ -17,7 +17,20 @@ private final class DictionaryKeyValueStore: NSObject, KeyValueStore {
 
 private final class NoopAdapterProvider: NSObject, AdapterProvider {
     func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID zoneID: CKRecordZone.ID) -> ModelAdapter? { nil }
-    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async {}
+    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async throws {}
+}
+
+private enum TestSynchronizationError: Error {
+    case terminalForwardingFailed
+    case deletedZoneResetFailed
+}
+
+private final class FailingDeletedZoneProvider: NSObject, AdapterProvider {
+    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID zoneID: CKRecordZone.ID) -> ModelAdapter? { nil }
+
+    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async throws {
+        throw TestSynchronizationError.deletedZoneResetFailed
+    }
 }
 
 private struct FakeZoneChangePage {
@@ -323,7 +336,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     private var uploadedByEntity: [String: [CKRecord]]
     private var deletedByEntity: [String: [CKRecord.ID]]
     private var storedServerChangeToken: CKServerChangeToken?
-    var didFinishImportHandler: (@Sendable () async -> Void)?
+    var didFinishImportHandler: (@Sendable () async throws -> Void)?
     var cleanUpHandler: (@Sendable () async throws -> Void)?
     var resetSyncCachesHandler: (@Sendable () async -> Void)?
     var saveChangesHandler: (@Sendable () async throws -> Void)?
@@ -424,8 +437,8 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
         let recordNames = forRecordIDs.map(\.recordName).joined(separator: ",")
         events.append("deleteTracking:\(recordNames)")
     }
-    func didFinishImport() async {
-        await didFinishImportHandler?()
+    func didFinishImport() async throws {
+        try await didFinishImportHandler?()
     }
     func cancelSynchronization() {}
     func unsetCancellation() async throws {
@@ -757,6 +770,63 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertFalse(synchronizer.syncing)
         await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalForwardingFailureWithholdsSynchronizationReceipt() async {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "terminal-forwarding-failure"),
+            priorities: []
+        )
+        adapter.didFinishImportHandler = {
+            throw TestSynchronizationError.terminalForwardingFailed
+        }
+        synchronizer.addModelAdapter(adapter)
+
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        await synchronizer.changesFinishedSynchronizing()
+
+        do {
+            _ = try await synchronization.value
+            XCTFail("Expected final journal forwarding failure")
+        } catch TestSynchronizationError.terminalForwardingFailed {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
+        XCTAssertFalse(synchronizer.syncing)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletedZoneProviderFailureIsPropagatedBeforeTokenCommit() async {
+        let synchronizer = CloudKitSynchronizer(
+            identifier: "deleted-zone-reset-failure",
+            database: FakeCloudKitDatabase(),
+            adapterProvider: FailingDeletedZoneProvider(),
+            keyValueStore: DictionaryKeyValueStore(),
+            accountIdentifierProvider: { "test-account" },
+            logger: Logger(label: "BigSyncKitTests")
+        )
+
+        do {
+            try await synchronizer.notifyProviderForDeletedZoneIDs([
+                CKRecordZone.ID(zoneName: "deleted-zone")
+            ])
+            XCTFail("Expected deleted-zone cache reset failure")
+        } catch TestSynchronizationError.deletedZoneResetFailed {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertNil(synchronizer.storedDatabaseToken)
     }
 
     @BigSyncBackgroundActor

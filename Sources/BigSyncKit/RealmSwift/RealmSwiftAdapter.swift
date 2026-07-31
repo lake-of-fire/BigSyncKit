@@ -41,6 +41,10 @@ enum BigSyncCloudKitRecordNameError: Error, Equatable, LocalizedError {
         }
     }
 }
+
+enum RealmSwiftAdapterError: Error {
+    case setupUnavailable
+}
 import libzstd
 
 //extension Realm {
@@ -176,10 +180,10 @@ actor RealmProvider {
     //    }
     
     @BigSyncBackgroundActor
-    init?(
+    init(
         persistenceConfiguration: Realm.Configuration,
         targetConfigurations: [Realm.Configuration]
-    ) async {
+    ) async throws {
         self.persistenceConfiguration = persistenceConfiguration
         self.targetConfigurations = targetConfigurations
         
@@ -208,8 +212,7 @@ actor RealmProvider {
             }
             self.targetWriterRealmObjects = targetWriterRealmObjects
         } catch {
-            print(error)
-            return nil
+            throw error
         }
         
         var targetReaderRealmPerSchemaName = [String: Realm]()
@@ -595,11 +598,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         // observers or debounced processors.
         invalidateTokens()
         isSetupInterrupted = false
-        realmProvider = await RealmProvider(
+        let provider = try await RealmProvider(
             persistenceConfiguration: persistenceRealmConfiguration,
             targetConfigurations: targetRealmConfigurations
         )
-        guard let realmProvider else { return }
+        self.realmProvider = provider
+        let realmProvider = provider
 
         if let persistenceRealm = realmProvider.persistenceRealm {
             let pendingStates = [
@@ -4065,11 +4069,14 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
     
     @BigSyncBackgroundActor
-    public func didFinishImport() async {
-        guard let realmProvider, let persistenceRealm = realmProvider.persistenceRealm else { return }
+    public func didFinishImport() async throws {
+        try await ensureSetup()
+        guard let realmProvider, let persistenceRealm = realmProvider.persistenceRealm else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
         
         //        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
-        try? await updateCreatedAndModified()
+        try await updateCreatedAndModified()
         let pendingEntities = persistenceRealm.objects(SyncedEntity.self).where({ $0.state.in([SyncedEntityState.new.rawValue, SyncedEntityState.changed.rawValue]) })
         let pendingRecordIDs = Set(pendingEntities.map { $0.identifier })
         persistentAssetManager.clearAssetFiles(excludingSyncedEntityIDs: pendingRecordIDs)

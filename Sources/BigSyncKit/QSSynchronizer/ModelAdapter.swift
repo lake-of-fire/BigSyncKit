@@ -81,7 +81,7 @@ public protocol ModelAdapter: AnyObject, Sendable {
 //    func hasRecordID(_ recordID: CKRecord.ID) -> Bool
     
     /// Tells the model adapter that the current import operation finished.
-    func didFinishImport() async
+    func didFinishImport() async throws
     
     /// Record zone ID managed by this adapter
     var recordZoneID: CKRecordZone.ID { get }
