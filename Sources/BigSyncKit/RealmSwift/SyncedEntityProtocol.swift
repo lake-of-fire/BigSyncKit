@@ -29,29 +29,25 @@ public extension ChangeMetadataRecordable {
 
     private func recordBigSyncMutation(at timestamp: Date) {
         guard let object = self as? Object,
-              let primaryKey = object.objectSchema.primaryKeyProperty?.name else {
-            return
-        }
+              let realm = object.realm,
+              realm.isInWriteTransaction else { return }
+        let entityType = object.objectSchema.className
+
+        // Callers commonly initialize timestamps before adding a new object.
+        // That is valid, but durable mutation capture can only happen in the
+        // same write transaction after the object has entered Realm.
+        guard BigSyncMutationTrackingRegistry.tracks(className: entityType, in: realm),
+              realm.schema.objectSchema.contains(where: {
+                  $0.className == BigSyncPendingMutation.className()
+              }),
+              let primaryKey = object.objectSchema.primaryKeyProperty?.name else { return }
 
         let objectIdentifier = RealmSwiftAdapter.getTargetObjectStringIdentifier(
             for: object,
             usingPrimaryKey: primaryKey
         )
-        let entityType = object.objectSchema.className
         let recordName = entityType + "." + objectIdentifier
         let generation = UUID().uuidString
-
-        // Callers commonly initialize timestamps before adding a new object.
-        // That is valid, but durable mutation capture can only happen in the
-        // same write transaction after the object has entered Realm.
-        guard let realm = object.realm else { return }
-        guard realm.isInWriteTransaction,
-              BigSyncMutationTrackingRegistry.tracks(className: entityType, in: realm),
-              realm.schema.objectSchema.contains(where: {
-                  $0.className == BigSyncPendingMutation.className()
-              }) else {
-            return
-        }
 
         let mutation = realm.object(
             ofType: BigSyncPendingMutation.self,

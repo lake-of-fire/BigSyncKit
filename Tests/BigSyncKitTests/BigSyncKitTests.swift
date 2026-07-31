@@ -39,6 +39,8 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private(set) var savedSubscriptionCount = 0
     private(set) var modifySubscriptionOperationCount = 0
     private(set) var fetchZoneChangesOperationCount = 0
+    private(set) var modifyRecordsAtomicValues = [Bool]()
+    private(set) var modifyRecordsSavePolicies = [CKModifyRecordsOperation.RecordSavePolicy]()
     private var records = [CKRecord.ID: CKRecord]()
     private var conditionallyFetchedRecordIDs = Set<CKRecord.ID>()
 
@@ -72,6 +74,8 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             modifySubscriptionOperationCount += 1
         }
         if let modifyOperation = operation as? CKModifyRecordsOperation {
+            modifyRecordsAtomicValues.append(modifyOperation.isAtomic)
+            modifyRecordsSavePolicies.append(modifyOperation.savePolicy)
             guard completesModifyOperations else { return }
             let savedRecords = modifyOperation.recordsToSave ?? []
             let deletedRecordIDs = modifyOperation.recordIDsToDelete ?? []
@@ -1114,6 +1118,11 @@ final class BigSyncKitTests: XCTestCase {
         )
         let clientRecord = makeRecord(type: "Bookmark", id: "conflict", zoneID: zoneID)
         let serverRecord = makeRecord(type: "Bookmark", id: "conflict", zoneID: zoneID)
+        let successfulRecord = makeRecord(
+            type: "Bookmark",
+            id: "successful",
+            zoneID: zoneID
+        )
         database.partialSaveErrorsByRecordID = [
             clientRecord.recordID: NSError(
                 domain: CKErrorDomain,
@@ -1124,7 +1133,9 @@ final class BigSyncKitTests: XCTestCase {
         let adapter = FakeModelAdapter(
             zoneID: zoneID,
             priorities: ["Bookmark"],
-            uploadedByEntity: ["Bookmark": [clientRecord]]
+            uploadedByEntity: [
+                "Bookmark": [clientRecord, successfulRecord]
+            ]
         )
         let synchronizer = makeSynchronizer(database: database)
         synchronizer.addModelAdapter(adapter)
@@ -1133,6 +1144,29 @@ final class BigSyncKitTests: XCTestCase {
 
         XCTAssertTrue(adapter.events.contains("save:Bookmark"))
         XCTAssertTrue(adapter.events.contains("persist"))
+        XCTAssertTrue(
+            adapter.events.contains("didUpload:Bookmark.successful")
+        )
+        XCTAssertEqual(database.modifyRecordsAtomicValues, [false])
+        XCTAssertEqual(
+            database.modifyRecordsSavePolicies,
+            [.ifServerRecordUnchanged]
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testExplicitSynchronizationCancelsDelayedStartupSynchronization() async {
+        let backgroundActor = BigSyncBackgroundActor()
+        backgroundActor._test_scheduleDormantInitialSynchronization()
+
+        XCTAssertTrue(
+            backgroundActor._test_hasScheduledInitialSynchronization
+        )
+        let result = await backgroundActor.synchronizeCloudKit()
+        XCTAssertNil(result)
+        XCTAssertFalse(
+            backgroundActor._test_hasScheduledInitialSynchronization
+        )
     }
 
     func testCloudKitAccountAvailabilityGateDefersUnavailableAndFailedStatuses() async {

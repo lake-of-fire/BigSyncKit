@@ -134,6 +134,12 @@ public actor BigSyncBackgroundActor {
     @discardableResult
     public func synchronizeCloudKit()
         async -> CloudKitSynchronizer.SynchronizationResult? {
+        // An explicit request supersedes the delayed startup request. Leaving
+        // both alive performs a second full drain ten seconds after every
+        // configuration, or queues it behind a long initial reupload.
+        initialSynchronizationTask?.cancel()
+        initialSynchronizationTask = nil
+
         guard let realmSynchronizer else {
             logger?.warning("QSCloudKitSynchronizer >> Synchronization requested before background synchronizer configuration completed")
             return nil
@@ -241,4 +247,19 @@ public actor BigSyncBackgroundActor {
     
     public func synchronizeCloudKit(using configuration: BigSyncBackgroundWorkerConfiguration) async {
     }
+
+#if DEBUG
+    @BigSyncBackgroundActor
+    var _test_hasScheduledInitialSynchronization: Bool {
+        initialSynchronizationTask != nil
+    }
+
+    @BigSyncBackgroundActor
+    func _test_scheduleDormantInitialSynchronization() {
+        initialSynchronizationTask?.cancel()
+        initialSynchronizationTask = Task {
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+        }
+    }
+#endif
 }

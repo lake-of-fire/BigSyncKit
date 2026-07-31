@@ -40,6 +40,12 @@ class ModifyRecordsOperation: CloudKitSynchronizerOperation {
         super.start()
         guard !isFinished else { return }
         let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: recordIDsToDelete)
+        // BigSync records are independently mergeable and relationships are
+        // represented by record names, so one conflict must not reject an
+        // otherwise uploadable batch. Keep change-tag conflict detection while
+        // allowing the existing per-record partial-failure path to make progress.
+        operation.savePolicy = .ifServerRecordUnchanged
+        operation.isAtomic = false
         
         operation.perRecordCompletionBlock = { @Sendable [weak self] record, error in
             guard let self else { return }
