@@ -1,5 +1,5 @@
 {
-  "originHash" : "8ae0f868ba150387e320b88f8c606e8a2922281b3da5a40e6bee71d884bc8e33",
+  "originHash" : "0b914254173f3a0a2428bbe66c526a5c3d5fdb24a3577a33952b95807aa6a72e",
   "pins" : [
     {
       "identity" : "realm-core",
@@ -25,7 +25,7 @@
       "location" : "https://github.com/lake-of-fire/RealmSwiftGaps.git",
       "state" : {
         "branch" : "main",
-        "revision" : "f2f5e54628b3474f281ae3d70fc3aaed471a9ecd"
+        "revision" : "0bd15d81f806cba51e4c75053534d52f740aa8e2"
       }
     },
     {

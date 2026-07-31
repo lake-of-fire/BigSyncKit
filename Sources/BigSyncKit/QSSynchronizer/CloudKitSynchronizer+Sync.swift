@@ -706,45 +706,83 @@ extension CloudKitSynchronizer {
     func setupZoneAndUploadRecords(
         adapter: ModelAdapter,
         restrictedToEntityType: String? = nil,
+        attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
-        try await setupRecordZoneIfNeeded(adapter: adapter) { [weak self] (error) in
-            guard let self, error == nil else {
+        try checkSynchronizationAttempt(attemptID)
+        try await setupRecordZoneIfNeeded(
+            adapter: adapter,
+            attemptID: attemptID
+        ) { [weak self] error in
+            guard let self else {
+                try await completion(CancellationError())
+                return
+            }
+            do {
+                try checkSynchronizationAttempt(attemptID)
+            } catch {
                 try await completion(error)
                 return
             }
-            guard !cancelSync else { throw CancellationError() }
-            try await uploadRecords(
-                adapter: adapter,
-                restrictedToEntityType: restrictedToEntityType,
-                completion: { [weak self] (error) in
-                if error == nil {
-                    self?.increaseBatchSize()
-                }
+            guard error == nil else {
                 try await completion(error)
-            })
+                return
+            }
+            do {
+                try await uploadRecords(
+                    adapter: adapter,
+                    restrictedToEntityType: restrictedToEntityType,
+                    attemptID: attemptID,
+                    completion: { [weak self] (error) in
+                        guard let self else {
+                            try await completion(CancellationError())
+                            return
+                        }
+                        do {
+                            try checkSynchronizationAttempt(attemptID)
+                        } catch {
+                            try await completion(error)
+                            return
+                        }
+                        if error == nil {
+                            increaseBatchSize()
+                        }
+                        try await completion(error)
+                    }
+                )
+            } catch {
+                try await completion(error)
+            }
         }
     }
     
     @BigSyncBackgroundActor
     func setupRecordZoneIfNeeded(
         adapter: ModelAdapter,
+        attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
-        guard try await needsZoneSetup(adapter: adapter) else {
+        try checkSynchronizationAttempt(attemptID)
+        let shouldSetup = try await needsZoneSetup(adapter: adapter)
+        try checkSynchronizationAttempt(attemptID)
+        guard shouldSetup else {
             try await completion(nil)
             return
         }
         
-        try await setupRecordZoneID(adapter.recordZoneID, completion: completion)
+        setupRecordZoneID(
+            adapter.recordZoneID,
+            attemptID: attemptID,
+            completion: completion
+        )
     }
     
     @BigSyncBackgroundActor
     func setupRecordZoneID(
         _ zoneID: CKRecordZone.ID,
+        attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) {
-        let attemptID = synchronizationAttemptID
         database.fetch(withRecordZoneID: zoneID) { [weak self] (zone, error) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self,
@@ -781,9 +819,10 @@ extension CloudKitSynchronizer {
     func uploadRecords(
         adapter: ModelAdapter,
         restrictedToEntityType: String? = nil,
+        attemptID: UUID,
         completion: @escaping (Error?) async throws -> ()
     ) async throws {
-        guard !cancelSync else { throw CancellationError() }
+        try checkSynchronizationAttempt(attemptID)
         
         let requestedBatchSize = batchSize
         let preparedUploads: [PreparedRecordUpload]
@@ -808,6 +847,7 @@ extension CloudKitSynchronizer {
                 PreparedRecordUpload(record: $0, generation: nil)
             }
         }
+        try checkSynchronizationAttempt(attemptID)
         let uploadGenerations = preparedUploads.reduce(into: [String: String]()) {
             guard let generation = $1.generation else { return }
             $0[$1.record.recordID.recordName] = generation
@@ -818,8 +858,6 @@ extension CloudKitSynchronizer {
         logger.info("QSCloudKitSynchronizer >> Uploading \(recordCount) records to \(adapter.recordZoneID)")
 //        logger.info("QSCloudKitSynchronizer >> Uploading records: \(records.map { $0.recordID.recordName } .joined(separator: " "))")
         
-        guard !cancelSync else { throw CancellationError() }
-        
         if !didNotifyUpload.contains(adapter.recordZoneID) {
             didNotifyUpload.insert(adapter.recordZoneID)
             delegate?.synchronizerWillUploadChanges(self, to: adapter.recordZoneID)
@@ -827,7 +865,7 @@ extension CloudKitSynchronizer {
         
         //Add metadata: device UUID and model version
         addMetadata(to: records)
-        let attemptID = synchronizationAttemptID
+        try checkSynchronizationAttempt(attemptID)
         //        debugPrint("## Upload", records.map {($0.recordID, $0) })
         let modifyRecordsOperation = ModifyRecordsOperation(
             database: database,
@@ -924,6 +962,7 @@ extension CloudKitSynchronizer {
                         try await uploadRecords(
                             adapter: adapter,
                             restrictedToEntityType: restrictedToEntityType,
+                            attemptID: attemptID,
                             completion: completion
                         )
                         return
@@ -952,6 +991,7 @@ extension CloudKitSynchronizer {
                     try await uploadRecords(
                         adapter: adapter,
                         restrictedToEntityType: restrictedToEntityType,
+                        attemptID: attemptID,
                         completion: completion
                     )
                 } else {
@@ -968,8 +1008,10 @@ extension CloudKitSynchronizer {
     func uploadDeletions(
         adapter: ModelAdapter,
         restrictedToEntityType: String? = nil,
+        attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
+        try checkSynchronizationAttempt(attemptID)
         let preparedDeletions: [PreparedRecordDeletion]
         let recordIDs: [CKRecord.ID]
         if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
@@ -992,6 +1034,7 @@ extension CloudKitSynchronizer {
                 PreparedRecordDeletion(recordID: $0, generation: nil)
             }
         }
+        try checkSynchronizationAttempt(attemptID)
         let deletionGenerations = preparedDeletions.reduce(into: [String: String]()) {
             guard let generation = $1.generation else { return }
             $0[$1.recordID.recordName] = generation
@@ -1003,7 +1046,6 @@ extension CloudKitSynchronizer {
             try await completion(nil)
             return
         }
-        let attemptID = synchronizationAttemptID
         let modifyRecordsOperation = ModifyRecordsOperation(
             database: database,
             records: nil,
@@ -1052,6 +1094,7 @@ extension CloudKitSynchronizer {
                         try await uploadDeletions(
                             adapter: adapter,
                             restrictedToEntityType: restrictedToEntityType,
+                            attemptID: attemptID,
                             completion: completion
                         )
                     } else {
@@ -1127,27 +1170,27 @@ extension CloudKitSynchronizer {
         restrictedToEntityType restrictedEntityType: String?
     ) async throws {
         let attemptID = synchronizationAttemptID
-        try await withCheckedThrowingContinuation { continuation in
+        try await awaitAttemptCallback(for: attemptID) { completion in
             Task { @BigSyncBackgroundActor [weak self] in
-                guard let self,
-                      beginRunCallback(for: attemptID) else {
-                    continuation.resume()
+                guard let self else {
+                    completion(.failure(CancellationError()))
                     return
                 }
-                defer { endRunCallback() }
                 do {
+                    try checkSynchronizationAttempt(attemptID)
                     try await setupZoneAndUploadRecords(
                         adapter: adapter,
-                        restrictedToEntityType: restrictedEntityType
+                        restrictedToEntityType: restrictedEntityType,
+                        attemptID: attemptID
                     ) { error in
                         if let error {
-                            continuation.resume(throwing: error)
+                            completion(.failure(error))
                         } else {
-                            continuation.resume()
+                            completion(.success(()))
                         }
                     }
                 } catch {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 }
             }
         }
@@ -1159,27 +1202,27 @@ extension CloudKitSynchronizer {
         restrictedToEntityType restrictedEntityType: String?
     ) async throws {
         let attemptID = synchronizationAttemptID
-        try await withCheckedThrowingContinuation { continuation in
+        try await awaitAttemptCallback(for: attemptID) { completion in
             Task { @BigSyncBackgroundActor [weak self] in
-                guard let self,
-                      beginRunCallback(for: attemptID) else {
-                    continuation.resume()
+                guard let self else {
+                    completion(.failure(CancellationError()))
                     return
                 }
-                defer { endRunCallback() }
                 do {
+                    try checkSynchronizationAttempt(attemptID)
                     try await uploadDeletions(
                         adapter: adapter,
-                        restrictedToEntityType: restrictedEntityType
+                        restrictedToEntityType: restrictedEntityType,
+                        attemptID: attemptID
                     ) { error in
                         if let error {
-                            continuation.resume(throwing: error)
+                            completion(.failure(error))
                         } else {
-                            continuation.resume()
+                            completion(.success(()))
                         }
                     }
                 } catch {
-                    continuation.resume(throwing: error)
+                    completion(.failure(error))
                 }
             }
         }

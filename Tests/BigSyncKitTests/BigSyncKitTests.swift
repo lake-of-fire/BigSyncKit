@@ -31,6 +31,8 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var deleteZoneError: Error?
     var completesModifyOperations = true
     var completesFetchDatabaseChanges = true
+    var completesRecordZoneFetches = true
+    var recordZoneFetchHandler: (@Sendable () -> Void)?
     var completesSubscriptionFetches = true
     var reportsDeletedRecordsAsUnknownItems = false
     var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
@@ -42,6 +44,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private(set) var subscriptionFetchCount = 0
     private(set) var modifySubscriptionOperationCount = 0
     private(set) var fetchZoneChangesOperationCount = 0
+    private(set) var recordZoneFetchCount = 0
     private(set) var modifyRecordsAtomicValues = [Bool]()
     private(set) var modifyRecordsSavePolicies = [CKModifyRecordsOperation.RecordSavePolicy]()
     private var records = [CKRecord.ID: CKRecord]()
@@ -174,6 +177,9 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     }
 
     func fetch(withRecordZoneID zoneID: CKRecordZone.ID, completionHandler: @escaping (CKRecordZone?, Error?) -> Void) {
+        recordZoneFetchCount += 1
+        recordZoneFetchHandler?()
+        guard completesRecordZoneFetches else { return }
         completionHandler(CKRecordZone(zoneID: zoneID), nil)
     }
 
@@ -235,14 +241,17 @@ private final class FakeModelAdapterDelegate: ModelAdapterDelegate {
 
 private actor AsyncGate {
     private var continuation: CheckedContinuation<Void, Never>?
+    private var isOpen = false
 
     func wait() async {
+        guard !isOpen else { return }
         await withCheckedContinuation {
             continuation = $0
         }
     }
 
     func open() {
+        isOpen = true
         continuation?.resume()
         continuation = nil
     }
@@ -263,6 +272,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     var cleanUpHandler: (@Sendable () async throws -> Void)?
     var resetSyncCachesHandler: (@Sendable () async -> Void)?
     var saveChangesHandler: (@Sendable () async throws -> Void)?
+    var recordsToUploadHandler: (@Sendable () async throws -> Void)?
 
     var hasChanges: Bool {
         uploadedByEntity.values.contains(where: { !$0.isEmpty }) ||
@@ -308,6 +318,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     }
 
     func recordsToUpload(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord] {
+        try await recordsToUploadHandler?()
         let target = restrictedToEntityType ?? nextEntityTypeWithPendingUploads()
         events.append("recordsToUpload:\(target ?? "*")")
         guard let target else { return [] }
@@ -752,6 +763,49 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
         XCTAssertFalse(synchronizer.syncing)
+    }
+
+    @BigSyncBackgroundActor
+    func testPublicCacheResetCannotBypassCancellationBarrier() async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(database: database)
+        let gate = AsyncGate()
+        let enteredTerminalImport = expectation(
+            description: "terminal import entered"
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "public-reset-barrier"),
+            priorities: []
+        )
+        adapter.didFinishImportHandler = {
+            enteredTerminalImport.fulfill()
+            await gate.wait()
+        }
+        synchronizer.addModelAdapter(adapter)
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        await fulfillment(of: [enteredTerminalImport], timeout: 1)
+
+        let reset = Task { @BigSyncBackgroundActor in
+            try await synchronizer.resetSyncCaches(
+                cancelSynchronization: false,
+                includingAdapters: true
+            )
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
+
+        await gate.open()
+        try await reset.value
+        XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
+        do {
+            _ = try await synchronization.value
+            XCTFail("Expected synchronization cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 
     @BigSyncBackgroundActor
@@ -1206,6 +1260,97 @@ final class BigSyncKitTests: XCTestCase {
         await uploadGate.open()
         do {
             _ = try await firstReset.value
+            XCTFail("Expected reset cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
+    func testSuspendedUploadPreparationCannotJoinANewerAttempt() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(zoneName: "stale-upload-preparation")
+        let record = CKRecord(
+            recordType: "Item",
+            recordID: CKRecord.ID(
+                recordName: "Item.stale",
+                zoneID: zoneID
+            )
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: [],
+            uploadedByEntity: ["Item": [record]]
+        )
+        let gate = AsyncGate()
+        let enteredPreparation = expectation(
+            description: "old upload preparation suspended"
+        )
+        adapter.recordsToUploadHandler = {
+            enteredPreparation.fulfill()
+            await gate.wait()
+        }
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(adapter)
+
+        let oldUpload = Task { @BigSyncBackgroundActor in
+            try await synchronizer.uploadRecordsIfNeeded(
+                adapter: adapter,
+                restrictedToEntityType: nil
+            )
+        }
+        await fulfillment(of: [enteredPreparation], timeout: 1)
+
+        synchronizer.cancelSynchronization()
+        synchronizer.cancelSync = false
+        await gate.open()
+
+        do {
+            try await oldUpload.value
+            XCTFail("Expected the stale upload attempt to be rejected")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertTrue(database.modifyRecordsAtomicValues.isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledOneOffResetDoesNotWaitForMissingZoneFetchCallback()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesRecordZoneFetches = false
+        let enteredZoneFetch = expectation(
+            description: "record-zone fetch entered"
+        )
+        database.recordZoneFetchHandler = {
+            enteredZoneFetch.fulfill()
+        }
+        let zoneID = CKRecordZone.ID(zoneName: "missing-zone-callback")
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+        let finished = expectation(description: "cancelled reset returned")
+        let reset = Task { @BigSyncBackgroundActor in
+            defer { finished.fulfill() }
+            return try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "missing-zone-callback-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease",
+                leaseDuration: 0.09
+            )
+        }
+        await fulfillment(of: [enteredZoneFetch], timeout: 1)
+        XCTAssertEqual(database.recordZoneFetchCount, 1)
+
+        reset.cancel()
+        await fulfillment(of: [finished], timeout: 1)
+        do {
+            _ = try await reset.value
             XCTFail("Expected reset cancellation")
         } catch is CancellationError {
         } catch {
@@ -2333,6 +2478,73 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testLocalEditCommittedAtRemoteImportBoundaryWins() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let baselineDate = Date(timeIntervalSinceReferenceDate: 10_000)
+        let object = BigSyncTrackedObject(
+            id: "import-boundary-edit",
+            createdAt: baselineDate,
+            modifiedAt: baselineDate,
+            explicitlyModifiedAt: baselineDate
+        )
+        object.tags.append("baseline")
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+
+        let remoteDate = baselineDate.addingTimeInterval(120)
+        let remoteRecord = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        remoteRecord["createdAt"] = baselineDate as CKRecordValue
+        remoteRecord["modifiedAt"] = remoteDate as CKRecordValue
+        remoteRecord["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        remoteRecord["isDeleted"] = false as CKRecordValue
+        remoteRecord["tags"] = ["remote"] as CKRecordValue
+
+        let localDate = baselineDate.addingTimeInterval(60)
+        fixture.adapter._testBeforeImportedRecordTargetWrite = {
+            try await fixture.targetRealm.asyncWrite {
+                object.tags.removeAll()
+                object.tags.append("local")
+                object.refreshChangeMetadata(
+                    explicitlyModified: true,
+                    at: localDate
+                )
+            }
+        }
+
+        try await fixture.adapter.saveChanges(
+            in: [remoteRecord],
+            forceSave: true
+        )
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertEqual(Array(object.tags), ["local"])
+        XCTAssertEqual(object.modifiedAt, localDate)
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let mutation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertEqual(tracking.entityState, .changed)
+        XCTAssertEqual(tracking.pendingGeneration, mutation.generation)
+    }
+
+    @BigSyncBackgroundActor
     func testLocalEditCommittedAtRemoteDeletionBoundaryWins() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -2705,6 +2917,60 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCancelledDebouncedJournalForwardingRetainsDurableWakeup()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "cancelled-journal-forward",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let mutation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+
+        fixture.adapter.cancelSynchronization()
+        fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
+        do {
+            try await fixture.adapter._test_processObservedRealmChanges()
+            XCTFail("Expected forwarding cancellation")
+        } catch is CancellationError {
+        }
+        XCTAssertTrue(
+            fixture.adapter._test_hasPendingObservedRealmChanges()
+        )
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+
+        try await fixture.adapter.unsetCancellation()
+        try await fixture.adapter._test_processObservedRealmChanges()
+
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertEqual(tracking.pendingGeneration, mutation.generation)
+        XCTAssertFalse(
+            fixture.adapter._test_hasPendingObservedRealmChanges()
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testJournalDropsMutationsForUntrackedEntityTypes() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let recordName = "ExcludedThing.id"
@@ -2997,6 +3263,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
+        print("FIXTURE", identifier, await RealmBackgroundActor.shared.cachedRealms.keys.sorted())
 
         guard let persistenceRealm = adapter.realmProvider?.persistenceRealm,
               let targetRealm = adapter.realmProvider?.targetReaderRealms?.first else {

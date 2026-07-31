@@ -518,6 +518,11 @@ public class CloudKitSynchronizer: NSObject {
     internal var fetchZoneChangesCompletionTask: Task<Void, Error>? = nil
     private var activeRunCallbackCount = 0
     private var runCallbackWaiters = [CheckedContinuation<Void, Never>]()
+    private var attemptCallbackContinuations = [
+        UUID: [
+            UUID: AsyncThrowingStream<Void, Error>.Continuation
+        ]
+    ]()
 
     internal var lastDatabaseChangesEmptyAt: Date?
     internal var lastZoneChangesEmptyAt: Date?
@@ -631,18 +636,32 @@ public class CloudKitSynchronizer: NSObject {
         _deviceIdentifier = nil
     }
     
+    /// Resets synchronization metadata after crossing the cancellation barrier.
+    ///
+    /// The `cancelSynchronization` argument is retained for source compatibility;
+    /// public callers can no longer opt out of the barrier. Internal migration and
+    /// initial-setup flows use `resetSyncCachesOwnedByCurrentFlow` only after they
+    /// have established exclusive attempt ownership.
     @BigSyncBackgroundActor
-    public func resetSyncCaches(cancelSynchronization: Bool, includingAdapters: Bool = true) async throws {
-        if cancelSynchronization {
-            await cancelSynchronizationAndWait()
-        }
-        
+    public func resetSyncCaches(
+        cancelSynchronization _: Bool,
+        includingAdapters: Bool = true
+    ) async throws {
+        await cancelSynchronizationAndWait()
+        try await resetSyncCachesOwnedByCurrentFlow(
+            includingAdapters: includingAdapters
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func resetSyncCachesOwnedByCurrentFlow(
+        includingAdapters: Bool
+    ) async throws {
         clearDeviceIdentifier()
         resetDatabaseToken()
         resetActiveTokens()
         lastDatabaseChangesEmptyAt = nil
-        
-        //        try? await Task.sleep(nanoseconds: 300_000_000) // Allow cancellations to catch up...
+
         if includingAdapters {
             for adapter in modelAdapters {
                 try await adapter.unsetCancellation()
@@ -809,6 +828,63 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
+    /// Bridges callback work that belongs to a synchronization attempt.
+    /// Cancelling that attempt finishes the waiter even when an underlying
+    /// callback API fails to invoke its completion handler.
+    internal func awaitAttemptCallback(
+        for attemptID: UUID,
+        _ start: (@escaping @Sendable (Result<Void, Error>) -> Void) -> Void
+    ) async throws {
+        try checkSynchronizationAttempt(attemptID)
+        let callbackID = UUID()
+        let (stream, continuation) =
+            AsyncThrowingStream<Void, Error>.makeStream()
+        attemptCallbackContinuations[attemptID, default: [:]][callbackID] =
+            continuation
+        start { [weak self] result in
+            Task { @BigSyncBackgroundActor [weak self] in
+                guard let self else {
+                    continuation.finish(throwing: CancellationError())
+                    return
+                }
+                guard let registered =
+                    attemptCallbackContinuations[attemptID]?
+                        .removeValue(forKey: callbackID) else { return }
+                if attemptCallbackContinuations[attemptID]?.isEmpty == true {
+                    attemptCallbackContinuations.removeValue(forKey: attemptID)
+                }
+                switch result {
+                case .success:
+                    registered.yield(())
+                    registered.finish()
+                case .failure(let error):
+                    registered.finish(throwing: error)
+                }
+            }
+        }
+        defer {
+            attemptCallbackContinuations[attemptID]?
+                .removeValue(forKey: callbackID)
+            if attemptCallbackContinuations[attemptID]?.isEmpty == true {
+                attemptCallbackContinuations.removeValue(forKey: attemptID)
+            }
+            continuation.finish()
+        }
+        var iterator = stream.makeAsyncIterator()
+        guard try await iterator.next() != nil else {
+            throw CancellationError()
+        }
+        try checkSynchronizationAttempt(attemptID)
+    }
+
+    private func cancelAttemptCallbacks(for attemptID: UUID) {
+        guard let continuations = attemptCallbackContinuations
+            .removeValue(forKey: attemptID) else { return }
+        for continuation in continuations.values {
+            continuation.finish(throwing: CancellationError())
+        }
+    }
+
     private func checkAccountValidationAttempt(_ attemptID: UUID) throws {
         try Task.checkCancellation()
         guard synchronizationAttemptID == attemptID else {
@@ -897,8 +973,9 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     @objc public func cancelSynchronization() {
         //        guard syncing, !cancelSync else { return }
-        
+        let cancelledAttemptID = synchronizationAttemptID
         synchronizationAttemptID = UUID()
+        cancelAttemptCallbacks(for: cancelledAttemptID)
         activeRunContext = nil
         activeReceiptAuthorizationID = nil
         changeRequestProcessor.reset()
@@ -1117,8 +1194,7 @@ public class CloudKitSynchronizer: NSObject {
             claimToken: claimToken,
             leaseDuration: leaseDuration
         )
-        try await resetSyncCaches(
-            cancelSynchronization: false,
+        try await resetSyncCachesOwnedByCurrentFlow(
             includingAdapters: true
         )
         try await ensureCurrentAccount(accountIdentifier)
@@ -1142,7 +1218,13 @@ public class CloudKitSynchronizer: NSObject {
         }
         let uploadResult: SynchronizationResult
         do {
-            uploadResult = try await synchronize()
+            uploadResult = try await withTaskCancellationHandler {
+                try await synchronize()
+            } onCancel: {
+                Task { @BigSyncBackgroundActor [weak self] in
+                    self?.cancelSynchronization()
+                }
+            }
             try Task.checkCancellation()
         } catch {
             // Cancelling the public waiter does not necessarily stop a
@@ -1211,8 +1293,7 @@ public class CloudKitSynchronizer: NSObject {
     ) async throws {
         await cancelSynchronizationAndWait()
         try await ensureCurrentAccount(accountIdentifier)
-        try await resetSyncCaches(
-            cancelSynchronization: false,
+        try await resetSyncCachesOwnedByCurrentFlow(
             includingAdapters: true
         )
         cancelSync = false
@@ -1435,7 +1516,9 @@ public class CloudKitSynchronizer: NSObject {
 
 extension CloudKitSynchronizer: ModelAdapterDelegate {
     public func needsInitialSetup() async throws {
-        try await resetSyncCaches(cancelSynchronization: false, includingAdapters: false)
+        try await resetSyncCachesOwnedByCurrentFlow(
+            includingAdapters: false
+        )
     }
     
     public func hasChangesToUpload() async {
