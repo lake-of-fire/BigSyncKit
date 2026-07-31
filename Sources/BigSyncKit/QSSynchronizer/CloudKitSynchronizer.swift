@@ -1139,6 +1139,11 @@ public class CloudKitSynchronizer: NSObject {
     /// `markerRecordType`, `markerOwnerField`, and `markerLeaseDateField` must
     /// already exist with String and Date types in the production CloudKit schema.
     @BigSyncBackgroundActor
+    @available(
+        *,
+        deprecated,
+        message: "Destructive same-zone recovery; migrations should upload a replacement zone, obtain a SynchronizationReceipt, then delete the obsolete zone"
+    )
     public func performOneOffRecordZoneResetAndReupload(
         migrationIdentifier: String,
         markerRecordType: String,
@@ -1146,6 +1151,8 @@ public class CloudKitSynchronizer: NSObject {
         markerLeaseDateField: String,
         leaseDuration: TimeInterval = 15 * 60
     ) async throws -> OneOffRecordZoneResetResult {
+        // Retain the legacy key format while this API remains available so an
+        // already-completed destructive recovery is not accidentally repeated.
         let markerPrefix = "BigSyncKitMigration.\(String(migrationIdentifier.prefix(120)))"
         let claimRecordID = CKRecord.ID(recordName: "\(markerPrefix).claim")
         let completionRecordID = CKRecord.ID(recordName: "\(markerPrefix).completed")
