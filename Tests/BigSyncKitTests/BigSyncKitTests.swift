@@ -3264,7 +3264,6 @@ final class BigSyncKitTests: XCTestCase {
         )
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
-        print("FIXTURE", identifier, await RealmBackgroundActor.shared.cachedRealms.keys.sorted())
 
         guard let persistenceRealm = adapter.realmProvider?.persistenceRealm,
               let targetRealm = adapter.realmProvider?.targetReaderRealms?.first else {
