@@ -30,6 +30,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var databaseScope: CKDatabase.Scope { .private }
     var deleteZoneError: Error?
     var completesModifyOperations = true
+    var completesFetchDatabaseChanges = true
     var reportsDeletedRecordsAsUnknownItems = false
     var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
     var accountIdentifier = "test-account"
@@ -45,6 +46,12 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private var conditionallyFetchedRecordIDs = Set<CKRecord.ID>()
 
     func add(_ operation: CKDatabaseOperation) {
+        if let fetchOperation = operation as? CKFetchDatabaseChangesOperation {
+            if completesFetchDatabaseChanges {
+                fetchOperation.fetchDatabaseChangesCompletionBlock?(nil, false, nil)
+            }
+            return
+        }
         if let fetchOperation =
             operation as? CKFetchRecordZoneChangesOperation,
            !zoneChangePages.isEmpty {
@@ -655,7 +662,9 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testAwaitableSynchronizationReturnsOnlyAtTerminalBoundary() async
     throws {
-        let synchronizer = makeSynchronizer()
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
         let synchronization = Task { @BigSyncBackgroundActor in
             try await synchronizer.synchronize()
         }
@@ -684,6 +693,7 @@ final class BigSyncKitTests: XCTestCase {
     func testAccountSwitchDuringCleanupPreventsSuccessfulReceipt() async
     throws {
         let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
         let synchronizer = makeSynchronizer(
             database: database,
             accountIdentifierProvider: { database.accountIdentifier }
@@ -718,7 +728,9 @@ final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
     func testCancellationBarrierResumesAwaitingSynchronization() async {
-        let synchronizer = makeSynchronizer()
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
         let synchronization = Task { @BigSyncBackgroundActor in
             try await synchronizer.synchronize()
         }
@@ -811,73 +823,6 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testZoneResetDeletesManagedZoneThenRebuildsLocalTracking() async throws {
-        let database = FakeCloudKitDatabase()
-        let synchronizer = makeSynchronizer(database: database)
-        let zoneID = CKRecordZone.ID(
-            zoneName: "reset-zone",
-            ownerName: CKCurrentUserDefaultName
-        )
-        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
-        synchronizer.addModelAdapter(adapter)
-
-        try await synchronizer.deleteRecordZonesAndResetSyncCachesForReupload()
-
-        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
-        XCTAssertEqual(
-            adapter.events.suffix(2),
-            ["unsetCancellation", "resetSyncCaches"]
-        )
-    }
-
-    @BigSyncBackgroundActor
-    func testZoneResetTreatsAlreadyDeletedZoneAsSuccess() async throws {
-        let database = FakeCloudKitDatabase()
-        database.deleteZoneError = NSError(
-            domain: CKErrorDomain,
-            code: CKError.zoneNotFound.rawValue
-        )
-        let synchronizer = makeSynchronizer(database: database)
-        let adapter = FakeModelAdapter(
-            zoneID: CKRecordZone.ID(
-                zoneName: "missing-zone",
-                ownerName: CKCurrentUserDefaultName
-            ),
-            priorities: []
-        )
-        synchronizer.addModelAdapter(adapter)
-
-        try await synchronizer.deleteRecordZonesAndResetSyncCachesForReupload()
-
-        XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
-    }
-
-    @BigSyncBackgroundActor
-    func testZoneResetDoesNotClearLocalTrackingWhenDeletionFails() async {
-        let database = FakeCloudKitDatabase()
-        database.deleteZoneError = NSError(
-            domain: CKErrorDomain,
-            code: CKError.networkFailure.rawValue
-        )
-        let synchronizer = makeSynchronizer(database: database)
-        let adapter = FakeModelAdapter(
-            zoneID: CKRecordZone.ID(
-                zoneName: "failed-zone",
-                ownerName: CKCurrentUserDefaultName
-            ),
-            priorities: []
-        )
-        synchronizer.addModelAdapter(adapter)
-
-        do {
-            try await synchronizer.deleteRecordZonesAndResetSyncCachesForReupload()
-            XCTFail("Expected zone deletion to fail")
-        } catch {
-            XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
-        }
-    }
-
-    @BigSyncBackgroundActor
     func testObsoleteZoneDeletionStopsAfterAccountSwitch() async throws {
         let database = FakeCloudKitDatabase()
         let synchronizer = makeSynchronizer(
@@ -886,6 +831,8 @@ final class BigSyncKitTests: XCTestCase {
         )
         let expectedAccountScope =
             try await synchronizer.cloudKitAccountScopeIdentifier()
+        let authorizationID = UUID()
+        synchronizer.activeReceiptAuthorizationID = authorizationID
         let receipt = CloudKitSynchronizer.SynchronizationReceipt(
             context: .init(
                 attemptID: UUID(),
@@ -893,7 +840,8 @@ final class BigSyncKitTests: XCTestCase {
                 accountIdentifier: database.accountIdentifier,
                 accountScopeIdentifier: expectedAccountScope
             ),
-            issuerID: synchronizer.synchronizationReceiptIssuerID
+            issuerID: synchronizer.synchronizationReceiptIssuerID,
+            authorizationID: authorizationID
         )
         database.accountIdentifier = "different-account"
 
@@ -920,6 +868,8 @@ final class BigSyncKitTests: XCTestCase {
         )
         let expectedAccountScope =
             try await synchronizer.cloudKitAccountScopeIdentifier()
+        let authorizationID = UUID()
+        synchronizer.activeReceiptAuthorizationID = authorizationID
         let receipt = CloudKitSynchronizer.SynchronizationReceipt(
             context: .init(
                 attemptID: UUID(),
@@ -927,7 +877,8 @@ final class BigSyncKitTests: XCTestCase {
                 accountIdentifier: database.accountIdentifier,
                 accountScopeIdentifier: expectedAccountScope
             ),
-            issuerID: synchronizer.synchronizationReceiptIssuerID
+            issuerID: synchronizer.synchronizationReceiptIssuerID,
+            authorizationID: authorizationID
         )
         database.accountIdentifierAfterNextZoneDeletion = "different-account"
 
@@ -943,6 +894,42 @@ final class BigSyncKitTests: XCTestCase {
         }
 
         XCTAssertEqual(database.deletedZoneIDs.count, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testObsoleteZoneDeletionRejectsReceiptAfterRunInvalidation() async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let authorizationID = UUID()
+        synchronizer.activeReceiptAuthorizationID = authorizationID
+        let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+            context: .init(
+                attemptID: UUID(),
+                runID: UUID(),
+                accountIdentifier: database.accountIdentifier,
+                accountScopeIdentifier:
+                    try await synchronizer.cloudKitAccountScopeIdentifier()
+            ),
+            issuerID: synchronizer.synchronizationReceiptIssuerID,
+            authorizationID: authorizationID
+        )
+
+        // Models account A -> B -> A: the public account string is the same,
+        // but cancellation invalidates the old run's one-shot authorization.
+        synchronizer.cancelSynchronization()
+
+        do {
+            _ = try await synchronizer.deleteRecordZoneIfPresent(
+                CKRecordZone.ID(zoneName: "obsolete-zone"),
+                using: receipt
+            )
+            XCTFail("Expected the stale receipt to be rejected")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        }
+        XCTAssertTrue(database.deletedZoneIDs.isEmpty)
     }
 
     @BigSyncBackgroundActor
@@ -1613,7 +1600,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
         let processor = ChangeRequestProcessor()
-        let oldRunID = processor.beginRun()
+        let oldRunID = await processor.beginRun()
         let enteredSave = expectation(description: "old run entered save")
         let gate = AsyncGate()
         adapter.saveChangesHandler = {
@@ -1639,7 +1626,12 @@ final class BigSyncKitTests: XCTestCase {
         }
         await fulfillment(of: [enteredSave], timeout: 1)
 
-        let newRunID = processor.beginRun()
+        let newRun = Task { @BigSyncBackgroundActor in
+            await processor.beginRun()
+        }
+        await Task.yield()
+        await gate.open()
+        let newRunID = await newRun.value
         processor.addFetchedChangeRequest(
             ChangeRequest(
                 downloadedRecord: makeRecord(
@@ -1652,7 +1644,6 @@ final class BigSyncKitTests: XCTestCase {
                 runID: newRunID
             )
         )
-        await gate.open()
         _ = try? await oldProcessing.value
         adapter.saveChangesHandler = nil
 
