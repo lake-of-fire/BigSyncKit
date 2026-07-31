@@ -267,6 +267,25 @@ private actor AsyncGate {
         continuation?.resume()
         continuation = nil
     }
+
+    func hasOpened() -> Bool {
+        isOpen
+    }
+}
+
+private actor AccountIdentifierSequence {
+    private var identifiers: [String]
+
+    init(_ identifiers: [String]) {
+        self.identifiers = identifiers
+    }
+
+    func next() -> String {
+        guard identifiers.count > 1 else {
+            return identifiers[0]
+        }
+        return identifiers.removeFirst()
+    }
 }
 
 private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter, @unchecked Sendable {
@@ -1101,6 +1120,42 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(database.deletedZoneIDs, [zoneID])
         XCTAssertTrue(firstAdapter.events.contains("resetSyncCaches"))
         XCTAssertTrue(secondAdapter.events.contains("resetSyncCaches"))
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetRevalidatesAccountBeforeUsingLocalCompletion()
+    async throws {
+        let keyValueStore = DictionaryKeyValueStore()
+        let accounts = AccountIdentifierSequence(["account-a", "account-b"])
+        let synchronizer = makeSynchronizer(
+            keyValueStore: keyValueStore,
+            accountIdentifierProvider: { await accounts.next() }
+        )
+        let migrationIdentifier = "local-completion-v1"
+        let accountKey = Data("account-a".utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+        keyValueStore.set(
+            boolValue: true,
+            forKey: "\(synchronizer.identifier).BigSyncKitMigration."
+                + migrationIdentifier + ".\(accountKey).completed"
+        )
+
+        do {
+            _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: migrationIdentifier,
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+            XCTFail(
+                "Expected the local completion fast path to reject the account swap"
+            )
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 
     @BigSyncBackgroundActor
@@ -3036,6 +3091,106 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertFalse(
             fixture.adapter._test_hasPendingObservedRealmChanges()
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testCancellationBarrierOwnsQueuedInitialSetup() async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "queued-setup-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "queued-setup-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "queued-setup-zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            logger: Logger(label: "BigSyncKitTests")
+        )
+
+        // The actor cannot start the queued bootstrap task until this test
+        // suspends, so cancellation deterministically precedes setup entry.
+        adapter.cancelSynchronization()
+        await adapter.waitForCancellation()
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+
+        XCTAssertNil(adapter.realmProvider)
+    }
+
+    @BigSyncBackgroundActor
+    func testCacheResetWaitsForObservedJournalForwardingCancellation()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "reset-journal-barrier",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let mutation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        let expectedGeneration = mutation.generation
+        let enteredForwarding = AsyncGate()
+        let releaseForwarding = AsyncGate()
+        let finishedReset = AsyncGate()
+        fixture.adapter._testBeforePendingMutationTrackingWrite = {
+            await enteredForwarding.open()
+            await releaseForwarding.wait()
+        }
+        fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
+        fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
+        await enteredForwarding.wait()
+
+        let reset = Task { @BigSyncBackgroundActor in
+            fixture.adapter.cancelSynchronization()
+            await fixture.adapter.waitForCancellation()
+            try await fixture.adapter.resetSyncCaches()
+            await finishedReset.open()
+        }
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        let resetCompletedBeforeRelease = await finishedReset.hasOpened()
+        XCTAssertFalse(resetCompletedBeforeRelease)
+
+        await releaseForwarding.open()
+        try await reset.value
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+
+        try await fixture.adapter.unsetCancellation()
+        let tracking = try XCTUnwrap(
+            fixture.adapter.realmProvider?.persistenceRealm?.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertEqual(tracking.pendingGeneration, expectedGeneration)
     }
 
     @BigSyncBackgroundActor

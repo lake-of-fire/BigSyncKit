@@ -106,6 +106,10 @@ public protocol ModelAdapter: AnyObject, Sendable {
     var mergePolicy: MergePolicy { get set }
     
     func cancelSynchronization()
+    /// Waits until adapter-owned work from the cancelled synchronization can no
+    /// longer publish tracking metadata. Implementations without background
+    /// work may use the default no-op implementation.
+    func waitForCancellation() async
     func unsetCancellation() async throws
         
     /// Returns corresponding `CKRecord` for the given model object.
@@ -129,6 +133,8 @@ public protocol ModelAdapter: AnyObject, Sendable {
 
 public extension ModelAdapter {
     var priorityEntityTypeNames: [String] { [] }
+
+    func waitForCancellation() async {}
 }
 
 internal protocol PrioritySyncCapableModelAdapter: ModelAdapter {

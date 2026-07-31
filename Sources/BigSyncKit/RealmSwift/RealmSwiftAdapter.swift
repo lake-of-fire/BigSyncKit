@@ -334,6 +334,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @BigSyncBackgroundActor
     private var cancelSync: Bool = false
+    @BigSyncBackgroundActor
+    private var cancellationGeneration: UInt64 = 0
     
     private lazy var persistentAssetManager: PersistentAssetManager = {
         PersistentAssetManager(identifier: "\(recordZoneID.ownerName).\(recordZoneID.zoneName).\(targetRealmConfigurations.map { $0.fileURL?.lastPathComponent ?? UUID().uuidString } .joined(separator: "-")).\(targetRealmConfigurations.map { $0.schemaVersion } .reduce(0, +))")
@@ -363,6 +365,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     private var observedJournalRecordNames = [Int: Set<String>]()
     @BigSyncBackgroundActor
     private var changedLegacyRealmIndexes = Set<Int>()
+    @BigSyncBackgroundActor
+    private var observedRealmChangesTask: Task<Void, Never>?
+    @BigSyncBackgroundActor
+    private var observedRealmChangesTaskID: UUID?
     
     @BigSyncBackgroundActor
     private var cancellables = Set<AnyCancellable>()
@@ -376,6 +382,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeCleanupTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforePendingMutationTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
 #endif
     
     private var isSetupInterrupted: Bool = false
@@ -383,6 +391,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     private var setupTask: Task<Void, Error>?
     @BigSyncBackgroundActor
     private var setupGeneration = UUID()
+    @BigSyncBackgroundActor
+    private var initialSetupTask: Task<Void, Never>?
     
     public init(
         persistenceRealmConfiguration: Realm.Configuration,
@@ -411,9 +421,18 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         setupTypeNamesLookup()
         
         if startSetupTask {
-            Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+            initialSetupTask = Task(priority: .background) {
+                @BigSyncBackgroundActor [weak self] in
                 guard let self = self else { return }
-                try await ensureSetup()
+                do {
+                    try Task.checkCancellation()
+                    try await ensureSetup()
+                } catch is CancellationError {
+                    // A synchronizer reset owns retrying setup after its
+                    // cancellation barrier has cleared the tracking Realm.
+                } catch {
+                    logger.error("BigSyncKit initial Realm setup failed: \(error)")
+                }
             }
         }
     }
@@ -426,6 +445,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @BigSyncBackgroundActor
     public func resetSyncCaches() async throws {
+        let shouldResumeAfterReset = !cancelSync
+        if shouldResumeAfterReset {
+            cancelSynchronization()
+        }
+        let resetCancellationGeneration = cancellationGeneration
+        await waitForCancellation()
+
         let activeSetupTask = setupTask
         activeSetupTask?.cancel()
         _ = try? await activeSetupTask?.value
@@ -442,7 +468,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
         
-        try await ensureSetup()
+        guard shouldResumeAfterReset,
+              cancellationGeneration == resetCancellationGeneration else {
+            isSetupInterrupted = true
+            return
+        }
+        isSetupInterrupted = true
+        try await unsetCancellation()
     }
     
     @BigSyncBackgroundActor
@@ -488,7 +520,24 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     public func cancelSynchronization() {
         //        debugPrint("# cancel")
         cancelSync = true
+        cancellationGeneration &+= 1
+        initialSetupTask?.cancel()
         setupTask?.cancel()
+        observedRealmChangesTask?.cancel()
+    }
+
+    @BigSyncBackgroundActor
+    public func waitForCancellation() async {
+        let activeInitialSetupTask = initialSetupTask
+        let activeSetupTask = setupTask
+        let activeObservedRealmChangesTask = observedRealmChangesTask
+        activeInitialSetupTask?.cancel()
+        activeSetupTask?.cancel()
+        activeObservedRealmChangesTask?.cancel()
+        await activeInitialSetupTask?.value
+        _ = try? await activeSetupTask?.value
+        await activeObservedRealmChangesTask?.value
+        initialSetupTask = nil
     }
     
     @BigSyncBackgroundActor
@@ -506,6 +555,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     @BigSyncBackgroundActor
     private func ensureSetup() async throws {
+        try Task.checkCancellation()
         if let setupTask {
             try await setupTask.value
             return
@@ -777,17 +827,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             .sink { @Sendable [weak self] _ in
                 guard let self else { return }
                 Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-                    guard let self else { return }
-                    do {
-                        try await self.processObservedRealmChanges()
-                    } catch is CancellationError {
-                        // The durable journal names were requeued. unsetCancellation()
-                        // will signal the processor after the cancellation barrier.
-                    } catch {
-                        logger.error(
-                            "BigSyncKit mutation journal forwarding failed: \(error)"
-                        )
-                    }
+                    self?.startObservedRealmChangesTaskIfNeeded()
                 }
             }
             .store(in: &cancellables)
@@ -848,6 +888,36 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         observedJournalRecordNames[realmIndex, default: []]
             .formUnion(recordNames)
         realmChangesSubject.send(())
+    }
+
+    @BigSyncBackgroundActor
+    private func startObservedRealmChangesTaskIfNeeded() {
+        guard !cancelSync, observedRealmChangesTask == nil else { return }
+        let taskID = UUID()
+        observedRealmChangesTaskID = taskID
+        observedRealmChangesTask = Task(priority: .background) {
+            @BigSyncBackgroundActor [weak self] in
+            guard let self else { return }
+            do {
+                try await processObservedRealmChanges()
+            } catch is CancellationError {
+                // The durable journal names were requeued. unsetCancellation()
+                // will signal the processor after the cancellation barrier.
+            } catch {
+                logger.error(
+                    "BigSyncKit mutation journal forwarding failed: \(error)"
+                )
+            }
+            if observedRealmChangesTaskID == taskID {
+                observedRealmChangesTask = nil
+                observedRealmChangesTaskID = nil
+                if !cancelSync,
+                   (!observedJournalRecordNames.isEmpty
+                    || !changedLegacyRealmIndexes.isEmpty) {
+                    realmChangesSubject.send(())
+                }
+            }
+        }
     }
 
     @BigSyncBackgroundActor
@@ -984,6 +1054,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 
         var forwardedCount = 0
         for chunk in trackedPending.chunks(ofCount: 1000) {
+#if DEBUG
+            try await _testBeforePendingMutationTrackingWrite?()
+#endif
             try await persistenceRealm.asyncWrite {
                 for mutation in chunk {
                     try Task.checkCancellation()
@@ -1186,6 +1259,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     @BigSyncBackgroundActor
     func _test_processObservedRealmChanges() async throws {
         try await processObservedRealmChanges()
+    }
+
+    @BigSyncBackgroundActor
+    func _test_startObservedRealmChangesTaskIfNeeded() {
+        startObservedRealmChangesTaskIfNeeded()
     }
 
     @BigSyncBackgroundActor

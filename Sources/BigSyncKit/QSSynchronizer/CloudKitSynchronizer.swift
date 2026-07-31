@@ -664,8 +664,8 @@ public class CloudKitSynchronizer: NSObject {
 
         if includingAdapters {
             for adapter in modelAdapters {
-                try await adapter.unsetCancellation()
                 try await adapter.resetSyncCaches()
+                try await adapter.unsetCancellation()
             }
         }
     }
@@ -720,6 +720,7 @@ public class CloudKitSynchronizer: NSObject {
                 try await subscribeForChangesInDatabase()
                 try await revalidateRunContext(context)
                 for adapter in modelAdapters {
+                    await adapter.waitForCancellation()
                     try await adapter.unsetCancellation()
                     try checkRunContext(context)
                 }
@@ -922,8 +923,9 @@ public class CloudKitSynchronizer: NSObject {
             clearAllStoredSubscriptionIDs()
             for adapter in modelAdapters {
                 adapter.cancelSynchronization()
-                try await adapter.unsetCancellation()
+                await adapter.waitForCancellation()
                 try await adapter.resetSyncCaches()
+                try await adapter.unsetCancellation()
                 try checkAccountValidationAttempt(validationAttemptID)
             }
             // Confirm the provider still reports the account whose metadata was
@@ -1009,6 +1011,9 @@ public class CloudKitSynchronizer: NSObject {
         await task?.value
         await changeRequestProcessor.waitForProcessingToStop()
         await waitForRunCallbacksToFinish()
+        for adapter in modelAdapters {
+            await adapter.waitForCancellation()
+        }
     }
     
     /**
@@ -1290,7 +1295,8 @@ public class CloudKitSynchronizer: NSObject {
         )
         accountValidationRequired = false
         keyValueStore.removeObject(forKey: localClaimTokenKey)
-        try? await deleteRecord(claimRecordID)
+        // The completion marker makes the claim inert. Leaving it in the old
+        // account avoids a best-effort delete racing an account replacement.
         cancelSync = false
         changeRequestProcessor.cancelSync = false
         cancelledDueToUnauthentication = false
@@ -1452,22 +1458,6 @@ public class CloudKitSynchronizer: NSObject {
             throw CKError(.internalError)
         }
         return savedRecord
-    }
-
-    @BigSyncBackgroundActor
-    private func deleteRecord(_ recordID: CKRecord.ID) async throws {
-        do {
-            _ = try await modifyMigrationMarkers(
-                recordsToSave: nil,
-                recordIDsToDelete: [recordID]
-            )
-        } catch {
-            let nsError = error as NSError
-            guard nsError.domain == CKErrorDomain,
-                  nsError.code == CKError.unknownItem.rawValue else {
-                throw error
-            }
-        }
     }
 
     @BigSyncBackgroundActor
