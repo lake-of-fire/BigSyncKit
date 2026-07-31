@@ -21,6 +21,7 @@ import SwiftUtilities
 import Algorithms
 import AsyncAlgorithms
 import Logging
+import CryptoKit
 
 enum BigSyncCloudKitRecordNameError: Error, Equatable, LocalizedError {
     case empty
@@ -307,8 +308,8 @@ private func objectIdentifier(fromCloudKitRecordName recordName: String) -> Stri
 extension RealmSwiftAdapter: @unchecked Sendable { }
 
 public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapableModelAdapter, UploadGenerationTrackingModelAdapter {
-    private static let mutationJournalRecoveryEntityType =
-        "__BigSyncKitMutationJournalRecovery"
+    private static let mutationJournalRecoveryEntityTypePrefix =
+        "__BigSyncKitMutationJournalRecovery.v2."
     private static let mutationJournalRecoveryVersion = 1
 
     private static var shouldSkipDebugDummySetup: Bool {
@@ -626,8 +627,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         let syncEmpty = persistenceRealm.objects(SyncedEntity.self).isEmpty
         // An empty user Realm is still initialized. Without this durable marker,
         // empty databases repeated the full initial scan on every launch.
-        let needsInitialSetup =
-            syncEmpty && needsMutationJournalRecovery(in: persistenceRealm)
+        let recoveryMarkerIDs = mutationJournalRecoveryMarkerIDs()
+        let needsMutationJournalRecovery = needsMutationJournalRecovery(
+            in: persistenceRealm,
+            markerIDs: recoveryMarkerIDs
+        )
+        let needsInitialSetup = syncEmpty && needsMutationJournalRecovery
         
         if needsInitialSetup {
             do {
@@ -733,8 +738,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 
         if needsInitialSetup {
             try await updateCreatedAndModified(notifyDelegate: false)
-            try await markMutationJournalRecoveryComplete(in: persistenceRealm)
-        } else if needsMutationJournalRecovery(in: persistenceRealm) {
+            try await markMutationJournalRecoveryComplete(
+                in: persistenceRealm,
+                markerIDs: recoveryMarkerIDs
+            )
+        } else if needsMutationJournalRecovery {
             // This is the only broad scan for clients that carry the journal
             // schema. It recovers changes made by older builds and records that
             // predate durable changed-ID tracking.
@@ -752,7 +760,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             )
             try await processEnqueuedChanges(notifyDelegate: false)
             try await updateCreatedAndModified(notifyDelegate: false)
-            try await markMutationJournalRecoveryComplete(in: persistenceRealm)
+            try await markMutationJournalRecoveryComplete(
+                in: persistenceRealm,
+                markerIDs: recoveryMarkerIDs
+            )
         } else {
             // Normal launches touch only durable changed IDs. Target Realms that
             // have not adopted BigSyncPendingMutation retain the timestamp fallback
@@ -770,22 +781,56 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
 
     @BigSyncBackgroundActor
-    private func needsMutationJournalRecovery(in persistenceRealm: Realm) -> Bool {
-        persistenceRealm.object(
-            ofType: SyncedEntityType.self,
-            forPrimaryKey: Self.mutationJournalRecoveryEntityType
-        )?.recoveryVersion != Self.mutationJournalRecoveryVersion
+    private func mutationJournalRecoveryMarkerIDs() -> Set<String> {
+        Set(targetRealmConfigurations.map { configuration in
+            let realmIdentity: String
+            if let fileURL = configuration.fileURL {
+                realmIdentity = fileURL.standardizedFileURL.path
+            } else if let inMemoryIdentifier = configuration.inMemoryIdentifier {
+                realmIdentity = "memory:\(inMemoryIdentifier)"
+            } else {
+                realmIdentity = "default"
+            }
+            let synchronizedTypeNames = (configuration.objectTypes ?? [])
+                .map { $0.className() }
+                .filter { !excludedClassNames.contains($0) }
+                .sorted()
+                .joined(separator: ",")
+            let component =
+                "\(realmIdentity)|schema:\(configuration.schemaVersion)|\(synchronizedTypeNames)"
+            let digest = SHA256.hash(data: Data(component.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+            return Self.mutationJournalRecoveryEntityTypePrefix + digest
+        })
+    }
+
+    private func needsMutationJournalRecovery(
+        in persistenceRealm: Realm,
+        markerIDs: Set<String>
+    ) -> Bool {
+        markerIDs.contains { markerID in
+            persistenceRealm.object(
+                ofType: SyncedEntityType.self,
+                forPrimaryKey: markerID
+            )?.recoveryVersion != Self.mutationJournalRecoveryVersion
+        }
     }
 
     @BigSyncBackgroundActor
-    private func markMutationJournalRecoveryComplete(in persistenceRealm: Realm) async throws {
+    private func markMutationJournalRecoveryComplete(
+        in persistenceRealm: Realm,
+        markerIDs: Set<String>
+    ) async throws {
         try await persistenceRealm.asyncWrite {
-            let state = persistenceRealm.object(
-                ofType: SyncedEntityType.self,
-                forPrimaryKey: Self.mutationJournalRecoveryEntityType
-            ) ?? SyncedEntityType(entityType: Self.mutationJournalRecoveryEntityType)
-            state.recoveryVersion = Self.mutationJournalRecoveryVersion
-            persistenceRealm.add(state, update: .modified)
+            for markerID in markerIDs {
+                let state = persistenceRealm.object(
+                    ofType: SyncedEntityType.self,
+                    forPrimaryKey: markerID
+                ) ?? SyncedEntityType(entityType: markerID)
+                state.recoveryVersion = Self.mutationJournalRecoveryVersion
+                persistenceRealm.add(state, update: .modified)
+            }
         }
     }
     

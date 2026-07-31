@@ -3600,10 +3600,12 @@ final class BigSyncKitTests: XCTestCase {
             )
         )
         XCTAssertEqual(
-            fixture.persistenceRealm.object(
-                ofType: SyncedEntityType.self,
-                forPrimaryKey: "__BigSyncKitMutationJournalRecovery"
-            )?.recoveryVersion,
+            fixture.persistenceRealm.objects(SyncedEntityType.self)
+                .first(where: {
+                    $0.entityType.hasPrefix(
+                        "__BigSyncKitMutationJournalRecovery.v2."
+                    )
+                })?.recoveryVersion,
             1
         )
     }
