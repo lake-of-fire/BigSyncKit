@@ -810,6 +810,7 @@ final class BigSyncKitTests: XCTestCase {
     func testDeletedZoneProviderFailureIsPropagatedBeforeTokenCommit() async {
         let synchronizer = CloudKitSynchronizer(
             identifier: "deleted-zone-reset-failure",
+            containerIdentifier: "iCloud.test",
             database: FakeCloudKitDatabase(),
             adapterProvider: FailingDeletedZoneProvider(),
             keyValueStore: DictionaryKeyValueStore(),
