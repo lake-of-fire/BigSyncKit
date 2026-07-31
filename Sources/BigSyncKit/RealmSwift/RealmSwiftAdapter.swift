@@ -383,6 +383,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforePendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterPendingMutationTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
 #endif
     
     private var isSetupInterrupted: Bool = false
@@ -543,7 +545,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     public func unsetCancellation() async throws {
         //        debugPrint("# unset cancel")
         cancelSync = false
-        if isSetupInterrupted {
+        // `waitForCancellation()` also owns a queued bootstrap task. If that
+        // task was cancelled before it could install the provider, a normal
+        // synchronizer start must restart setup instead of leaving this adapter
+        // permanently inert.
+        if isSetupInterrupted || realmProvider == nil {
             try await ensureSetup()
         }
         if !observedJournalRecordNames.isEmpty
@@ -929,6 +935,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         changedLegacyRealmIndexes.removeAll(keepingCapacity: true)
 
         do {
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
             for (idx, recordNames) in observed
             where idx < targetReaderRealms.count {
                 let realm = targetReaderRealms[idx]
@@ -948,6 +956,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             if observedLegacyChange {
                 try await processEnqueuedChanges()
             }
+            // Forwarding can suspend after a durable tracking write (for
+            // example while waking the synchronizer). Do not acknowledge this
+            // batch as complete after a reset has cancelled it: the catch below
+            // requeues its durable journal identities for the resumed adapter.
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
         } catch {
             for (idx, recordNames) in observed {
                 observedJournalRecordNames[idx, default: []]
@@ -1082,6 +1096,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     forwardedCount += 1
                 }
             }
+#if DEBUG
+            try await _testAfterPendingMutationTrackingWrite?()
+#endif
         }
 
         if !ignoredGenerationsByRecordName.isEmpty {

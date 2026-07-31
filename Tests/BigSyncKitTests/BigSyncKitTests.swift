@@ -3094,7 +3094,7 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testCancellationBarrierOwnsQueuedInitialSetup() async throws {
+    func testBeginBarrierRestartsQueuedInitialSetup() async throws {
         let identifier = UUID().uuidString
         var persistenceConfiguration = RealmSwiftAdapter
             .defaultPersistenceConfiguration()
@@ -3120,13 +3120,18 @@ final class BigSyncKitTests: XCTestCase {
 
         // The actor cannot start the queued bootstrap task until this test
         // suspends, so cancellation deterministically precedes setup entry.
-        adapter.cancelSynchronization()
+        // This mirrors the normal begin-synchronization barrier: it owns the
+        // queued bootstrap task even though the adapter was not first marked
+        // cancelled by a destructive reset.
         await adapter.waitForCancellation()
         for _ in 0..<20 {
             await Task.yield()
         }
 
         XCTAssertNil(adapter.realmProvider)
+
+        try await adapter.unsetCancellation()
+        XCTAssertNotNil(adapter.realmProvider)
     }
 
     @BigSyncBackgroundActor
@@ -3245,6 +3250,61 @@ final class BigSyncKitTests: XCTestCase {
             )
         )
         XCTAssertEqual(tracking.pendingGeneration, expectedGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testResetRequeuesJournalForwardedBeforeCancellation() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "reset-after-forward-journal",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let mutation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        let enteredPostWrite = AsyncGate()
+        let releasePostWrite = AsyncGate()
+        fixture.adapter._testAfterPendingMutationTrackingWrite = {
+            await enteredPostWrite.open()
+            await releasePostWrite.wait()
+        }
+        fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
+        fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
+        await enteredPostWrite.wait()
+
+        let reset = Task { @BigSyncBackgroundActor in
+            fixture.adapter.cancelSynchronization()
+            await fixture.adapter.waitForCancellation()
+            try await fixture.adapter.resetSyncCaches()
+        }
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        await releasePostWrite.open()
+        try await reset.value
+
+        XCTAssertTrue(fixture.adapter._test_hasPendingObservedRealmChanges())
+        try await fixture.adapter.unsetCancellation()
+        try await fixture.adapter._test_processObservedRealmChanges()
+
+        let tracking = try XCTUnwrap(
+            fixture.adapter.realmProvider?.persistenceRealm?.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertEqual(tracking.pendingGeneration, mutation.generation)
+        XCTAssertFalse(fixture.adapter._test_hasPendingObservedRealmChanges())
     }
 
     @BigSyncBackgroundActor
