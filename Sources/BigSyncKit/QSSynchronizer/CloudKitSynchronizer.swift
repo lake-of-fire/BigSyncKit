@@ -36,6 +36,23 @@ internal func awaitCancellableCloudKitCallback<Value>(
     return value
 }
 
+/// A reset lease is held by a detached child task while the synchronizer actor
+/// performs destructive work. Keep its terminal failure observable without
+/// awaiting a successful (intentionally infinite) heartbeat task.
+private actor ResetClaimHeartbeatStatus {
+    private var terminalError: Error?
+
+    func record(_ error: Error) {
+        terminalError = error
+    }
+
+    func throwIfFailed() throws {
+        if let terminalError {
+            throw terminalError
+        }
+    }
+}
+
 // For Swift
 public extension Notification.Name {
     /// Sent when the synchronizer is going to start a sync with CloudKit.
@@ -536,6 +553,8 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationRunID = UUID()
     internal var activeRunContext: RunContext?
     internal var activeReceiptAuthorizationID: UUID?
+    private var reservedReceiptAuthorizationID: UUID?
+    private var activeOneOffResetIdentifier: String?
  
     internal let logger: Logging.Logger
     
@@ -730,6 +749,7 @@ public class CloudKitSynchronizer: NSObject {
         let attemptID = UUID()
         synchronizationAttemptID = attemptID
         activeReceiptAuthorizationID = nil
+        reservedReceiptAuthorizationID = nil
 
         synchronizationTask?.cancel()
         synchronizationTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
@@ -1018,6 +1038,7 @@ public class CloudKitSynchronizer: NSObject {
         cancelAttemptCallbacks(for: cancelledAttemptID)
         activeRunContext = nil
         activeReceiptAuthorizationID = nil
+        reservedReceiptAuthorizationID = nil
         changeRequestProcessor.reset()
         synchronizationTask?.cancel()
         synchronizationTask = nil
@@ -1113,20 +1134,39 @@ public class CloudKitSynchronizer: NSObject {
         guard activeReceiptAuthorizationID == receipt.authorizationID else {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
-        // Consume before the first suspension so concurrent/replayed calls
-        // cannot use the same account-scoped authorization twice.
-        activeReceiptAuthorizationID = nil
-        try await ensureCurrentAccount(receipt.accountIdentifier)
-        let deleted: Bool
-        do {
-            try await deleteRecordZone(zoneID)
-            deleted = true
-        } catch {
-            guard isMissingRecordZoneError(error) else { throw error }
-            deleted = false
+        guard reservedReceiptAuthorizationID == nil else {
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
-        try await ensureCurrentAccount(receipt.accountIdentifier)
-        return deleted
+        // Reserve before suspending so a concurrent/replayed call cannot use
+        // this authorization. Consume only after a terminal delete outcome;
+        // transient CloudKit failures may safely retry the same fenced receipt.
+        reservedReceiptAuthorizationID = receipt.authorizationID
+        var shouldConsumeAuthorization = false
+        defer {
+            if reservedReceiptAuthorizationID == receipt.authorizationID {
+                reservedReceiptAuthorizationID = nil
+            }
+            if shouldConsumeAuthorization,
+               activeReceiptAuthorizationID == receipt.authorizationID {
+                activeReceiptAuthorizationID = nil
+            }
+        }
+        do {
+            try await ensureCurrentAccount(receipt.accountIdentifier)
+            let deleted: Bool
+            do {
+                try await deleteRecordZone(zoneID)
+                deleted = true
+            } catch {
+                guard isMissingRecordZoneError(error) else { throw error }
+                deleted = false
+            }
+            try await ensureCurrentAccount(receipt.accountIdentifier)
+            shouldConsumeAuthorization = true
+            return deleted
+        } catch {
+            throw error
+        }
     }
 
     /// Coordinates a destructive zone reset across all of a user's devices.
@@ -1151,9 +1191,29 @@ public class CloudKitSynchronizer: NSObject {
         markerLeaseDateField: String,
         leaseDuration: TimeInterval = 15 * 60
     ) async throws -> OneOffRecordZoneResetResult {
-        // Retain the legacy key format while this API remains available so an
-        // already-completed destructive recovery is not accidentally repeated.
-        let markerPrefix = "BigSyncKitMigration.\(String(migrationIdentifier.prefix(120)))"
+        guard activeOneOffResetIdentifier == nil else {
+            throw OneOffRecordZoneResetError.migrationInProgress
+        }
+        activeOneOffResetIdentifier = migrationIdentifier
+        defer {
+            if activeOneOffResetIdentifier == migrationIdentifier {
+                activeOneOffResetIdentifier = nil
+            }
+        }
+        // Existing short identifiers used their literal value. Preserve that
+        // format so their completed recovery remains recognized, but never
+        // truncate a long identifier: two distinct migrations must not share a
+        // CloudKit claim or completion marker.
+        let markerComponent: String
+        if migrationIdentifier.count <= 120 {
+            markerComponent = migrationIdentifier
+        } else {
+            let digest = SHA256.hash(data: Data(migrationIdentifier.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+            markerComponent = "v2-\(digest)"
+        }
+        let markerPrefix = "BigSyncKitMigration.\(markerComponent)"
         let claimRecordID = CKRecord.ID(recordName: "\(markerPrefix).claim")
         let completionRecordID = CKRecord.ID(recordName: "\(markerPrefix).completed")
         let accountIdentifier = try await accountIdentifierProvider()
@@ -1213,10 +1273,94 @@ public class CloudKitSynchronizer: NSObject {
             throw error
         }
 
-        await cancelSynchronizationAndWait()
+        // Keep ownership alive from the first destructive operation through
+        // completion publication, not merely while the replacement upload is
+        // in flight. A slow zone deletion or cache reset can otherwise outlive
+        // the lease and permit another device to take over mid-reset.
+        let claimHeartbeatStatus = ResetClaimHeartbeatStatus()
+        let claimRenewalTask = Task { @BigSyncBackgroundActor [weak self] in
+            guard let self else { throw CancellationError() }
+            do {
+                try await maintainResetClaim(
+                    recordID: claimRecordID,
+                    recordType: markerRecordType,
+                    ownerField: markerOwnerField,
+                    leaseDateField: markerLeaseDateField,
+                    claimToken: claimToken,
+                    leaseDuration: leaseDuration,
+                    accountIdentifier: accountIdentifier
+                )
+            } catch {
+                await claimHeartbeatStatus.record(error)
+                throw error
+            }
+        }
+        do {
+            await cancelSynchronizationAndWait()
 
-        try await ensureCurrentAccount(accountIdentifier)
-        for zoneID in Set(modelAdapters.map(\.recordZoneID)) {
+            try await ensureCurrentAccount(accountIdentifier)
+            for zoneID in Set(modelAdapters.map(\.recordZoneID)) {
+                try await claimHeartbeatStatus.throwIfFailed()
+                try await acquireOrRenewResetClaim(
+                    recordID: claimRecordID,
+                    recordType: markerRecordType,
+                    ownerField: markerOwnerField,
+                    leaseDateField: markerLeaseDateField,
+                    claimToken: claimToken,
+                    leaseDuration: leaseDuration,
+                    accountIdentifier: accountIdentifier
+                )
+                try await ensureCurrentAccount(accountIdentifier)
+                do {
+                    try await deleteRecordZone(zoneID)
+                } catch {
+                    let nsError = error as NSError
+                    let missingZoneCodes = [
+                        CKError.zoneNotFound.rawValue,
+                        CKError.userDeletedZone.rawValue,
+                    ]
+                    guard nsError.domain == CKErrorDomain,
+                          missingZoneCodes.contains(nsError.code) else {
+                        throw error
+                    }
+                }
+            }
+            try await acquireOrRenewResetClaim(
+                recordID: claimRecordID,
+                recordType: markerRecordType,
+                ownerField: markerOwnerField,
+                leaseDateField: markerLeaseDateField,
+                claimToken: claimToken,
+                leaseDuration: leaseDuration,
+                accountIdentifier: accountIdentifier
+            )
+            try await resetSyncCachesOwnedByCurrentFlow(
+                includingAdapters: true
+            )
+            try await ensureCurrentAccount(accountIdentifier)
+            try await claimHeartbeatStatus.throwIfFailed()
+
+            // Rebuild is only preparation. Do not publish the completion marker
+            // until the replacement snapshot has reached a terminal sync drain.
+            cancelSync = false
+            changeRequestProcessor.cancelSync = false
+            cancelledDueToUnauthentication = false
+            let uploadResult = try await withTaskCancellationHandler {
+                try await synchronize()
+            } onCancel: {
+                Task { @BigSyncBackgroundActor [weak self] in
+                    self?.cancelSynchronization()
+                }
+            }
+            try Task.checkCancellation()
+            try await claimHeartbeatStatus.throwIfFailed()
+            guard let uploadReceipt = uploadResult.receipt,
+                  uploadReceipt.accountIdentifier == accountIdentifier else {
+                throw OneOffRecordZoneResetError.cloudKitAccountChanged
+            }
+            try await ensureCurrentAccount(accountIdentifier)
+            try await claimHeartbeatStatus.throwIfFailed()
+
             try await acquireOrRenewResetClaim(
                 recordID: claimRecordID,
                 recordType: markerRecordType,
@@ -1228,60 +1372,38 @@ public class CloudKitSynchronizer: NSObject {
             )
             try await ensureCurrentAccount(accountIdentifier)
             do {
-                try await deleteRecordZone(zoneID)
+                try await claimHeartbeatStatus.throwIfFailed()
+                let completionRecord = CKRecord(
+                    recordType: markerRecordType,
+                    recordID: completionRecordID
+                )
+                completionRecord[markerOwnerField] = claimToken as CKRecordValue
+                completionRecord[markerLeaseDateField] = Date() as CKRecordValue
+                _ = try await saveMigrationMarker(completionRecord)
+                try await ensureCurrentAccount(accountIdentifier)
+                try await claimHeartbeatStatus.throwIfFailed()
             } catch {
-                let nsError = error as NSError
-                let missingZoneCodes = [
-                    CKError.zoneNotFound.rawValue,
-                    CKError.userDeletedZone.rawValue,
-                ]
-                guard nsError.domain == CKErrorDomain,
-                      missingZoneCodes.contains(nsError.code) else {
-                    throw error
-                }
+                guard isServerRecordChanged(error) else { throw error }
             }
-        }
-        try await acquireOrRenewResetClaim(
-            recordID: claimRecordID,
-            recordType: markerRecordType,
-            ownerField: markerOwnerField,
-            leaseDateField: markerLeaseDateField,
-            claimToken: claimToken,
-            leaseDuration: leaseDuration,
-            accountIdentifier: accountIdentifier
-        )
-        try await resetSyncCachesOwnedByCurrentFlow(
-            includingAdapters: true
-        )
-        try await ensureCurrentAccount(accountIdentifier)
-
-        // Rebuild is only preparation. Do not publish the completion marker
-        // until the replacement snapshot has reached a terminal sync drain.
-        cancelSync = false
-        changeRequestProcessor.cancelSync = false
-        cancelledDueToUnauthentication = false
-        let claimRenewalTask = Task { @BigSyncBackgroundActor [weak self] in
-            guard let self else { throw CancellationError() }
-            try await maintainResetClaim(
-                recordID: claimRecordID,
-                recordType: markerRecordType,
-                ownerField: markerOwnerField,
-                leaseDateField: markerLeaseDateField,
-                claimToken: claimToken,
-                leaseDuration: leaseDuration,
-                accountIdentifier: accountIdentifier
+            // A server-record conflict still completes the suspension above. Fence
+            // the durable local marker regardless of which CloudKit outcome won.
+            try await ensureCurrentAccount(accountIdentifier)
+            try await claimHeartbeatStatus.throwIfFailed()
+            keyValueStore.set(boolValue: true, forKey: localCompletionKey)
+            keyValueStore.set(
+                value: accountIdentifier,
+                forKey: cloudKitAccountIdentifierKey
             )
-        }
-        let uploadResult: SynchronizationResult
-        do {
-            uploadResult = try await withTaskCancellationHandler {
-                try await synchronize()
-            } onCancel: {
-                Task { @BigSyncBackgroundActor [weak self] in
-                    self?.cancelSynchronization()
-                }
-            }
-            try Task.checkCancellation()
+            accountValidationRequired = false
+            keyValueStore.removeObject(forKey: localClaimTokenKey)
+            // The completion marker makes the claim inert. Leaving it in the old
+            // account avoids a best-effort delete racing an account replacement.
+            cancelSync = false
+            changeRequestProcessor.cancelSync = false
+            cancelledDueToUnauthentication = false
+            claimRenewalTask.cancel()
+            _ = try? await claimRenewalTask.value
+            return .performedCloudReset
         } catch {
             // Cancelling the public waiter does not necessarily stop a
             // coalesced synchronization drain. Keep renewing ownership until
@@ -1289,63 +1411,9 @@ public class CloudKitSynchronizer: NSObject {
             // barrier, then allow another device to take over safely.
             await cancelSynchronizationAndWait()
             claimRenewalTask.cancel()
-            do {
-                try await claimRenewalTask.value
-            } catch let renewalError where !(renewalError is CancellationError) {
-                throw renewalError
-            }
+            _ = try? await claimRenewalTask.value
             throw error
         }
-        claimRenewalTask.cancel()
-        do {
-            try await claimRenewalTask.value
-        } catch is CancellationError {
-            // Expected after the terminal upload drain.
-        }
-        guard let uploadReceipt = uploadResult.receipt,
-              uploadReceipt.accountIdentifier == accountIdentifier else {
-            throw OneOffRecordZoneResetError.cloudKitAccountChanged
-        }
-        try await ensureCurrentAccount(accountIdentifier)
-
-        try await acquireOrRenewResetClaim(
-            recordID: claimRecordID,
-            recordType: markerRecordType,
-            ownerField: markerOwnerField,
-            leaseDateField: markerLeaseDateField,
-            claimToken: claimToken,
-            leaseDuration: leaseDuration,
-            accountIdentifier: accountIdentifier
-        )
-        try await ensureCurrentAccount(accountIdentifier)
-        do {
-            let completionRecord = CKRecord(
-                recordType: markerRecordType,
-                recordID: completionRecordID
-            )
-            completionRecord[markerOwnerField] = claimToken as CKRecordValue
-            completionRecord[markerLeaseDateField] = Date() as CKRecordValue
-            _ = try await saveMigrationMarker(completionRecord)
-            try await ensureCurrentAccount(accountIdentifier)
-        } catch {
-            guard isServerRecordChanged(error) else { throw error }
-        }
-        // A server-record conflict still completes the suspension above. Fence
-        // the durable local marker regardless of which CloudKit outcome won.
-        try await ensureCurrentAccount(accountIdentifier)
-        keyValueStore.set(boolValue: true, forKey: localCompletionKey)
-        keyValueStore.set(
-            value: accountIdentifier,
-            forKey: cloudKitAccountIdentifierKey
-        )
-        accountValidationRequired = false
-        keyValueStore.removeObject(forKey: localClaimTokenKey)
-        // The completion marker makes the claim inert. Leaving it in the old
-        // account avoids a best-effort delete racing an account replacement.
-        cancelSync = false
-        changeRequestProcessor.cancelSync = false
-        cancelledDueToUnauthentication = false
-        return .performedCloudReset
     }
 
     @BigSyncBackgroundActor

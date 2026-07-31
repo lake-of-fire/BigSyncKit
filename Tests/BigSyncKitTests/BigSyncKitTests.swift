@@ -56,6 +56,8 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var accountIdentifierAfterNextRecordFetch: String?
     var accountIdentifierAfterNextMigrationMarkerSave: String?
     var accountIdentifierAfterNextZoneDeletion: String?
+    var deleteZoneDelayNanoseconds: UInt64?
+    var deleteZoneHandler: (@Sendable () -> Void)?
     var zoneChangePages = [FakeZoneChangePage]()
     private(set) var deletedZoneIDs = [CKRecordZone.ID]()
     private(set) var savedSubscriptionCount = 0
@@ -251,11 +253,22 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
 
     func delete(withRecordZoneID zoneID: CKRecordZone.ID, completionHandler: @escaping (CKRecordZone.ID?, Error?) -> Void) {
         deletedZoneIDs.append(zoneID)
+        deleteZoneHandler?()
         if let nextAccountIdentifier = accountIdentifierAfterNextZoneDeletion {
             accountIdentifier = nextAccountIdentifier
             accountIdentifierAfterNextZoneDeletion = nil
         }
-        completionHandler(deleteZoneError == nil ? zoneID : nil, deleteZoneError)
+        let complete = { [deleteZoneError] in
+            completionHandler(deleteZoneError == nil ? zoneID : nil, deleteZoneError)
+        }
+        if let deleteZoneDelayNanoseconds {
+            Task {
+                try? await Task.sleep(nanoseconds: deleteZoneDelayNanoseconds)
+                complete()
+            }
+        } else {
+            complete()
+        }
     }
 
     @available(iOS 10.0, macOS 10.12, watchOS 6.0, *)
@@ -1227,6 +1240,104 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testObsoleteZoneDeletionReceiptCanRetryAfterTransientFailure() async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let authorizationID = UUID()
+        synchronizer.activeReceiptAuthorizationID = authorizationID
+        let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+            context: .init(
+                attemptID: UUID(),
+                runID: UUID(),
+                accountIdentifier: database.accountIdentifier,
+                accountScopeIdentifier:
+                    try await synchronizer.cloudKitAccountScopeIdentifier()
+            ),
+            issuerID: synchronizer.synchronizationReceiptIssuerID,
+            authorizationID: authorizationID
+        )
+        let zoneID = CKRecordZone.ID(zoneName: "transient-obsolete-zone")
+        database.deleteZoneError = NSError(
+            domain: CKErrorDomain,
+            code: CKError.networkFailure.rawValue
+        )
+
+        do {
+            _ = try await synchronizer.deleteRecordZoneIfPresent(
+                zoneID,
+                using: receipt
+            )
+            XCTFail("Expected the transient delete failure")
+        } catch {
+            XCTAssertEqual((error as NSError).code, CKError.networkFailure.rawValue)
+        }
+
+        database.deleteZoneError = nil
+        let deleted = try await synchronizer.deleteRecordZoneIfPresent(
+            zoneID,
+            using: receipt
+        )
+        XCTAssertTrue(deleted)
+        do {
+            _ = try await synchronizer.deleteRecordZoneIfPresent(
+                zoneID,
+                using: receipt
+            )
+            XCTFail("Expected a successfully consumed receipt to reject replay")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testObsoleteZoneDeletionReceiptRejectsConcurrentReplay() async throws {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneDelayNanoseconds = 100_000_000
+        let enteredDeletion = expectation(description: "obsolete deletion entered")
+        database.deleteZoneHandler = { enteredDeletion.fulfill() }
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let authorizationID = UUID()
+        synchronizer.activeReceiptAuthorizationID = authorizationID
+        let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+            context: .init(
+                attemptID: UUID(),
+                runID: UUID(),
+                accountIdentifier: database.accountIdentifier,
+                accountScopeIdentifier:
+                    try await synchronizer.cloudKitAccountScopeIdentifier()
+            ),
+            issuerID: synchronizer.synchronizationReceiptIssuerID,
+            authorizationID: authorizationID
+        )
+        let zoneID = CKRecordZone.ID(zoneName: "concurrent-obsolete-zone")
+        let firstDeletion = Task { @BigSyncBackgroundActor in
+            try await synchronizer.deleteRecordZoneIfPresent(
+                zoneID,
+                using: receipt
+            )
+        }
+        await fulfillment(of: [enteredDeletion], timeout: 1)
+
+        do {
+            _ = try await synchronizer.deleteRecordZoneIfPresent(
+                zoneID,
+                using: receipt
+            )
+            XCTFail("Expected concurrent receipt replay to be rejected")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        }
+
+        let firstDeleted = try await firstDeletion.value
+        XCTAssertTrue(firstDeleted)
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
     func testObsoleteZoneDeletionRejectsReceiptAfterRunInvalidation() async throws {
         let database = FakeCloudKitDatabase()
         let synchronizer = makeSynchronizer(
@@ -1494,6 +1605,124 @@ final class BigSyncKitTests: XCTestCase {
         let firstResult = try await firstReset.value
         XCTAssertEqual(firstResult, .performedCloudReset)
         XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetRenewsClaimDuringSlowZoneDeletion() async throws {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneDelayNanoseconds = 300_000_000
+        let zoneID = CKRecordZone.ID(zoneName: "slow-delete-reset-zone")
+        let enteredDeletion = expectation(description: "zone deletion entered")
+        database.deleteZoneHandler = { enteredDeletion.fulfill() }
+        let firstSynchronizer = makeSynchronizer(database: database)
+        firstSynchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+
+        let firstReset = Task { @BigSyncBackgroundActor in
+            try await firstSynchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "slow-delete-reset-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease",
+                leaseDuration: 0.09
+            )
+        }
+        await fulfillment(of: [enteredDeletion], timeout: 1)
+        try await Task.sleep(nanoseconds: 160_000_000)
+
+        let secondSynchronizer = makeSynchronizer(database: database)
+        secondSynchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+        do {
+            _ = try await secondSynchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "slow-delete-reset-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease",
+                leaseDuration: 0.09
+            )
+            XCTFail("Expected the slow deletion claim to remain owned")
+        } catch OneOffRecordZoneResetError.migrationInProgress {
+        }
+
+        let firstResult = try await firstReset.value
+        XCTAssertEqual(firstResult, .performedCloudReset)
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetRejectsActorLocalConcurrentInvocation() async throws {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneDelayNanoseconds = 100_000_000
+        let enteredDeletion = expectation(description: "reset deletion entered")
+        database.deleteZoneHandler = { enteredDeletion.fulfill() }
+        let zoneID = CKRecordZone.ID(zoneName: "single-flight-reset-zone")
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+        let firstReset = Task { @BigSyncBackgroundActor in
+            try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "single-flight-v1",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+        }
+        await fulfillment(of: [enteredDeletion], timeout: 1)
+
+        do {
+            _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: "single-flight-v2",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+            XCTFail("Expected the actor-local reset to remain single flight")
+        } catch OneOffRecordZoneResetError.migrationInProgress {
+        }
+
+        let firstResult = try await firstReset.value
+        XCTAssertEqual(firstResult, .performedCloudReset)
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID])
+    }
+
+    @BigSyncBackgroundActor
+    func testLongOneOffResetIdentifiersWithCommonPrefixDoNotCollide() async throws {
+        let database = FakeCloudKitDatabase()
+        let commonPrefix = String(repeating: "same-prefix-", count: 12)
+        XCTAssertGreaterThan(commonPrefix.count, 120)
+        let zoneID = CKRecordZone.ID(zoneName: "long-identifier-zone")
+
+        let firstSynchronizer = makeSynchronizer(database: database)
+        firstSynchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+        let firstResult = try await firstSynchronizer
+            .performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: commonPrefix + "first",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+
+        let secondSynchronizer = makeSynchronizer(database: database)
+        secondSynchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+        let secondResult = try await secondSynchronizer
+            .performOneOffRecordZoneResetAndReupload(
+                migrationIdentifier: commonPrefix + "second",
+                markerRecordType: "ExistingRecordType",
+                markerOwnerField: "owner",
+                markerLeaseDateField: "lease"
+            )
+
+        XCTAssertEqual(firstResult, .performedCloudReset)
+        XCTAssertEqual(secondResult, .performedCloudReset)
+        XCTAssertEqual(database.deletedZoneIDs, [zoneID, zoneID])
     }
 
     @BigSyncBackgroundActor
@@ -2766,6 +2995,94 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testRelationshipListRejectsWrongEntityType() async throws {
+        try await assertMalformedRelationshipDoesNotApply(
+            field: "children",
+            value: ["UnexpectedType.existing-child"] as CKRecordValue
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRelationshipSetRejectsWrongEntityType() async throws {
+        try await assertMalformedRelationshipDoesNotApply(
+            field: "relatedChildren",
+            value: ["UnexpectedType.existing-child"] as CKRecordValue
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testToOneRelationshipRejectsWrongEntityType() async throws {
+        try await assertMalformedRelationshipDoesNotApply(
+            field: "favoriteChild",
+            value: "UnexpectedType.existing-child" as CKRecordValue
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRelationshipReferenceRejectsAnotherZone() async throws {
+        let otherZone = CKRecordZone.ID(
+            zoneName: "another-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let reference = CKRecord.Reference(
+            recordID: CKRecord.ID(
+                recordName: BigSyncRelationshipChild.className() + ".existing-child",
+                zoneID: otherZone
+            ),
+            action: .none
+        )
+        try await assertMalformedRelationshipDoesNotApply(
+            field: "favoriteChild",
+            value: reference
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func assertMalformedRelationshipDoesNotApply(
+        field: String,
+        value: CKRecordValue
+    ) async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let child = BigSyncRelationshipChild()
+        child.id = "existing-child"
+        let parent = BigSyncRelationshipParent()
+        parent.id = "wrong-relationship-type-\(field)"
+        parent.children.append(child)
+        parent.relatedChildren.insert(child)
+        parent.favoriteChild = child
+        let originalDate = parent.modifiedAt
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add([child, parent], update: .modified)
+        }
+
+        let record = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let remoteDate = originalDate.addingTimeInterval(60)
+        record["createdAt"] = parent.createdAt as CKRecordValue
+        record["modifiedAt"] = remoteDate as CKRecordValue
+        record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record[field] = value
+
+        do {
+            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTFail("Expected invalid relationship reference to fail")
+        } catch is RealmSwiftRemoteRecordDecodingError {
+            // Expected.
+        }
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertEqual(parent.children.map(\.id), [child.id])
+        XCTAssertEqual(Set(parent.relatedChildren.map(\.id)), Set([child.id]))
+        XCTAssertEqual(parent.favoriteChild?.id, child.id)
+        XCTAssertEqual(parent.modifiedAt, originalDate)
+        XCTAssertTrue(fixture.persistenceRealm.objects(PendingRelationship.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
     func testURLListRoundTripsThroughCloudKitStrings() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -3292,6 +3609,37 @@ final class BigSyncKitTests: XCTestCase {
             )?.entityState,
             .synced
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testGenerationlessIdentifierDeletionAcknowledgementFailsClosed() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let identifier = "BigSyncTrackedObject.generationless-delete"
+        let tracking = SyncedEntity(
+            entityType: BigSyncTrackedObject.className(),
+            identifier: identifier,
+            state: SyncedEntityState.deletedLocally.rawValue
+        )
+        tracking.pendingGeneration = "current-generation"
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(tracking)
+        }
+
+        do {
+            try await fixture.adapter.didDelete(identifiers: [identifier])
+            XCTFail("Expected a prepared-generation error")
+        } catch RealmSwiftAdapterAcknowledgementError.preparedGenerationRequired {
+            // Expected.
+        }
+
+        let preserved = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: identifier
+            )
+        )
+        XCTAssertEqual(preserved.entityState, .deletedLocally)
+        XCTAssertEqual(preserved.pendingGeneration, "current-generation")
     }
 
     @BigSyncBackgroundActor

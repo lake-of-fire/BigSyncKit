@@ -669,8 +669,10 @@ extension CloudKitSynchronizer {
             if let error = error as? NSError {
                 if isZoneNotFoundOrDeletedError(error) {
                     for adapter in modelAdapters {
+                        try await revalidateActiveRunContext(for: attemptID)
                         activeZoneTokens[adapter.recordZoneID] = nil
                         try await adapter.saveToken(nil)
+                        try await revalidateActiveRunContext(for: attemptID)
                     }
                 }
                 if shouldRetryUpload(for: error) {
@@ -1267,13 +1269,12 @@ extension CloudKitSynchronizer {
                     return
                 }
                 
+                try await revalidateActiveRunContext(for: attemptID)
                 try await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
-                guard synchronizationAttemptID == attemptID,
-                      !cancelSync else { return }
+                try await revalidateActiveRunContext(for: attemptID)
                 if changedZoneIDs.count > 0 {
                     let zoneIDs = try await loadTokens(for: changedZoneIDs, loadAdapters: false)
-                    guard synchronizationAttemptID == attemptID,
-                          !cancelSync else { return }
+                    try await revalidateActiveRunContext(for: attemptID)
                     await updateServerToken(for: zoneIDs, completion: { [weak self] result in
                         guard let self = self,
                               synchronizationAttemptID == attemptID else { return }
