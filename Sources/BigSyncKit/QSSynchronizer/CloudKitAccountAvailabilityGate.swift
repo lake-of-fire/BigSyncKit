@@ -8,35 +8,56 @@ enum CloudKitAccountAvailability: Equatable, Sendable {
 
 struct CloudKitAccountAvailabilityGate: Sendable {
     typealias StatusProvider = @Sendable (String) async -> CloudKitAccountAvailability
+    typealias AccountStatusProvider = @Sendable (
+        String,
+        @escaping @Sendable (CKAccountStatus, Error?) -> Void
+    ) -> Void
 
     private let statusProvider: StatusProvider
 
     init() {
-        statusProvider = { containerIdentifier in
-            await Self.liveStatus(for: containerIdentifier)
-        }
+        self.init(accountStatusProvider: { containerIdentifier, completion in
+            CKContainer(identifier: containerIdentifier).accountStatus(completionHandler: completion)
+        })
     }
 
     init(statusProvider: @escaping StatusProvider) {
         self.statusProvider = statusProvider
     }
 
+    init(accountStatusProvider: @escaping AccountStatusProvider) {
+        statusProvider = { containerIdentifier in
+            await Self.liveStatus(
+                for: containerIdentifier,
+                accountStatusProvider: accountStatusProvider
+            )
+        }
+    }
+
     func availability(for containerIdentifier: String) async -> CloudKitAccountAvailability {
         await statusProvider(containerIdentifier)
     }
 
-    private static func liveStatus(for containerIdentifier: String) async -> CloudKitAccountAvailability {
-        let container = CKContainer(identifier: containerIdentifier)
-        return await withCheckedContinuation { continuation in
-            container.accountStatus { status, error in
-                if error != nil {
-                    continuation.resume(returning: .failed)
-                } else if status == .available {
-                    continuation.resume(returning: .available)
-                } else {
-                    continuation.resume(returning: .unavailable(status))
+    private static func liveStatus(
+        for containerIdentifier: String,
+        accountStatusProvider: @escaping AccountStatusProvider
+    ) async -> CloudKitAccountAvailability {
+        do {
+            return try await awaitCancellableCloudKitCallback { completion in
+                accountStatusProvider(containerIdentifier) { status, error in
+                    if error != nil {
+                        completion(.success(.failed))
+                    } else if status == .available {
+                        completion(.success(.available))
+                    } else {
+                        completion(.success(.unavailable(status)))
+                    }
                 }
             }
+        } catch is CancellationError {
+            return .failed
+        } catch {
+            return .failed
         }
     }
 }
