@@ -46,6 +46,16 @@ enum BigSyncCloudKitRecordNameError: Error, Equatable, LocalizedError {
 enum RealmSwiftAdapterError: Error {
     case setupUnavailable
 }
+
+/// Acknowledging an upload requires the generation captured when its batch was
+/// prepared. Sampling the current generation can acknowledge a newer edit.
+public enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
+    case preparedGenerationRequired
+
+    public var errorDescription: String? {
+        "RealmSwiftAdapter acknowledgements require prepared record generations."
+    }
+}
 import libzstd
 
 //extension Realm {
@@ -3889,19 +3899,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
     
     @BigSyncBackgroundActor
+    @available(*, deprecated, message: "Use didUpload(savedRecords:matchingGenerations:) with generations captured from preparedRecordsToUpload.")
     public func didUpload(savedRecords: [CKRecord]) async throws {
-        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
-        let matchingGenerations = savedRecords.reduce(into: [String: String]()) {
-            guard let syncedEntity = persistenceRealm.object(
-                ofType: SyncedEntity.self,
-                forPrimaryKey: $1.recordID.recordName
-            ), let generation = syncedEntity.pendingGeneration else { return }
-            $0[$1.recordID.recordName] = generation
-        }
-        try await didUpload(
-            savedRecords: savedRecords,
-            matchingGenerations: matchingGenerations
-        )
+        throw RealmSwiftAdapterAcknowledgementError.preparedGenerationRequired
     }
 
     @BigSyncBackgroundActor
@@ -4026,18 +4026,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
     
     @BigSyncBackgroundActor
+    @available(*, deprecated, message: "Use didDelete(recordIDs:matchingGenerations:) with generations captured from preparedRecordDeletions.")
     public func didDelete(recordIDs deletedRecordIDs: [CKRecord.ID]) async {
-        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
-        let matchingGenerations = deletedRecordIDs.reduce(into: [String: String]()) {
-            guard let generation = persistenceRealm.object(
-                ofType: SyncedEntity.self,
-                forPrimaryKey: $1.recordName
-            )?.pendingGeneration else { return }
-            $0[$1.recordName] = generation
-        }
-        try? await didDelete(
-            recordIDs: deletedRecordIDs,
-            matchingGenerations: matchingGenerations
+        logger.error(
+            "Ignoring generationless deletion acknowledgement for \(deletedRecordIDs.count) records; prepared generations are required."
         )
     }
 
