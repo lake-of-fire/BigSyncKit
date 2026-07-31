@@ -65,6 +65,16 @@ public struct BigSyncBackgroundWorkerConfiguration {
     }
 }
 
+public enum BigSyncManualRebuildOutcome: Sendable, Equatable {
+    /// The current synchronizer reset its local caches and finished a new drain.
+    case succeeded
+    /// The worker was not configured, iCloud was unavailable, or configuration
+    /// superseded the request before it could safely drain.
+    case deferred
+    /// Resetting the current synchronizer's local caches failed.
+    case failed(String)
+}
+
 @globalActor
 public actor BigSyncBackgroundActor {
     private enum SynchronizationPreparationState {
@@ -84,6 +94,10 @@ public actor BigSyncBackgroundActor {
     private var synchronizationPreparationState = SynchronizationPreparationState.unprepared
     @BigSyncBackgroundActor
     private var synchronizationPreparationTask: Task<Void, Error>?
+    @BigSyncBackgroundActor
+    private var manualRebuildTask: Task<BigSyncManualRebuildOutcome, Never>?
+    @BigSyncBackgroundActor
+    private var manualRebuildID: UUID?
     
     @BigSyncBackgroundActor
     public private(set) var realmSynchronizer: CloudKitSynchronizer?
@@ -101,6 +115,9 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     public func configure(_ configuration: BigSyncBackgroundWorkerConfiguration) {
         initialSynchronizationTask?.cancel()
+        manualRebuildTask?.cancel()
+        manualRebuildTask = nil
+        manualRebuildID = nil
         realmSynchronizer?.cancelSynchronization()
         synchronizationPreparationTask?.cancel()
         synchronizationPreparationTask = nil
@@ -264,6 +281,74 @@ public actor BigSyncBackgroundActor {
     public func synchronizeCloudKit(using configuration: BigSyncBackgroundWorkerConfiguration) async {
         configure(configuration)
         _ = await synchronizeCloudKit()
+    }
+
+    /// Non-destructively rebuilds the synchronization caches and drains the
+    /// exact synchronizer that was current when the request began. Concurrent
+    /// requests coalesce; a later configuration cancels the in-flight rebuild.
+    @BigSyncBackgroundActor
+    public func rebuildAndReuploadCloudKitData() async -> BigSyncManualRebuildOutcome {
+        if let manualRebuildTask {
+            return await manualRebuildTask.value
+        }
+        guard let expectedSynchronizer = realmSynchronizer else {
+            logger?.warning(
+                "QSCloudKitSynchronizer >> Manual rebuild requested before background synchronizer configuration completed"
+            )
+            return .deferred
+        }
+
+        initialSynchronizationTask?.cancel()
+        initialSynchronizationTask = nil
+        let rebuildID = UUID()
+        let task: Task<BigSyncManualRebuildOutcome, Never> = Task {
+            @BigSyncBackgroundActor [weak self] in
+            guard let self else { return BigSyncManualRebuildOutcome.deferred }
+            return await self.performManualRebuild(
+                expectedSynchronizer: expectedSynchronizer,
+                rebuildID: rebuildID
+            )
+        }
+        manualRebuildID = rebuildID
+        manualRebuildTask = task
+
+        let outcome = await task.value
+        if manualRebuildID == rebuildID {
+            manualRebuildTask = nil
+            manualRebuildID = nil
+        }
+        return outcome
+    }
+
+    @BigSyncBackgroundActor
+    private func performManualRebuild(
+        expectedSynchronizer: CloudKitSynchronizer,
+        rebuildID: UUID
+    ) async -> BigSyncManualRebuildOutcome {
+        guard !Task.isCancelled,
+              manualRebuildID == rebuildID,
+              realmSynchronizer === expectedSynchronizer else {
+            return .deferred
+        }
+        do {
+            try await expectedSynchronizer.resetSyncCaches(
+                cancelSynchronization: true
+            )
+        } catch is CancellationError {
+            return .deferred
+        } catch {
+            logger?.error("QSCloudKitSynchronizer >> Manual rebuild failed: \(error)")
+            return .failed(error.localizedDescription)
+        }
+
+        guard !Task.isCancelled,
+              manualRebuildID == rebuildID,
+              realmSynchronizer === expectedSynchronizer else {
+            return .deferred
+        }
+        return await synchronizeCloudKit(expectedSynchronizer: expectedSynchronizer) == nil
+            ? .deferred
+            : .succeeded
     }
 
 #if DEBUG
