@@ -577,6 +577,12 @@ public class CloudKitSynchronizer: NSObject {
             guard let self else { return }
             do {
                 try await validateSynchronizationAccount()
+                // Subscription identifiers are account-scoped sync metadata.
+                // Account validation clears them after an iCloud account
+                // change, so ensure the current account has a subscription as
+                // part of every attempt. The stored-ID fast path performs no
+                // CloudKit request during ordinary synchronization.
+                try await subscribeForChangesInDatabase()
                 guard synchronizationAttemptID == attemptID else {
                     throw CancellationError()
                 }
@@ -623,6 +629,25 @@ public class CloudKitSynchronizer: NSObject {
             .resume(throwing: CancellationError())
     }
 
+    /// Checks that an asynchronous callback still belongs to the active sync.
+    ///
+    /// CloudKit callbacks and adapter calls can suspend the global actor. A
+    /// cancellation or account change may start a newer attempt while they are
+    /// suspended, so checking only when a callback first enters is insufficient.
+    internal func checkSynchronizationAttempt(_ attemptID: UUID) throws {
+        try Task.checkCancellation()
+        guard synchronizationAttemptID == attemptID, !cancelSync else {
+            throw CancellationError()
+        }
+    }
+
+    private func checkAccountValidationAttempt(_ attemptID: UUID) throws {
+        try Task.checkCancellation()
+        guard synchronizationAttemptID == attemptID else {
+            throw CancellationError()
+        }
+    }
+
     internal func finishSynchronizationDrain(
         with result: Result<SynchronizationResult, Error>
     ) {
@@ -638,7 +663,10 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     private func validateSynchronizationAccount() async throws {
         guard accountValidationRequired else { return }
+        let validationAttemptID = synchronizationAttemptID
         let currentAccountIdentifier = try await accountIdentifierProvider()
+        try checkAccountValidationAttempt(validationAttemptID)
+        var confirmedAccountIdentifier = currentAccountIdentifier
         if let previousAccountIdentifier =
             keyValueStore.object(forKey: cloudKitAccountIdentifierKey) as? String,
            previousAccountIdentifier != currentAccountIdentifier {
@@ -653,10 +681,21 @@ public class CloudKitSynchronizer: NSObject {
                 adapter.cancelSynchronization()
                 try await adapter.unsetCancellation()
                 try await adapter.resetSyncCaches()
+                try checkAccountValidationAttempt(validationAttemptID)
             }
+            // Confirm the provider still reports the account whose metadata was
+            // prepared. This catches account changes that occur while an
+            // adapter cache reset is suspended. Normal validation has no
+            // suspension after the first lookup and avoids a second request.
+            confirmedAccountIdentifier = try await accountIdentifierProvider()
+            try checkAccountValidationAttempt(validationAttemptID)
+        }
+        guard confirmedAccountIdentifier == currentAccountIdentifier else {
+            accountValidationRequired = true
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
         keyValueStore.set(
-            value: currentAccountIdentifier,
+            value: confirmedAccountIdentifier,
             forKey: cloudKitAccountIdentifierKey
         )
         accountValidationRequired = false

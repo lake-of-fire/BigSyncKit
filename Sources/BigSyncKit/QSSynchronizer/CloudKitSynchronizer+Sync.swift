@@ -441,8 +441,10 @@ extension CloudKitSynchronizer {
                 }
                 
                 await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                try checkSynchronizationAttempt(attemptID)
                 
                 let zoneIDsToFetch = try await loadTokens(for: changedZoneIDs, loadAdapters: true)
+                try checkSynchronizationAttempt(attemptID)
                 
                 //                debugPrint("# zoneIDsToFetch", zoneIDsToFetch)
                 guard zoneIDsToFetch.count > 0 else {
@@ -511,6 +513,10 @@ extension CloudKitSynchronizer {
                 if let error = zoneResult.error {
                     if isZoneNotFoundOrDeletedError(error) {
                         await notifyProviderForDeletedZoneIDs([zoneID])
+                        try checkSynchronizationAttempt(attemptID)
+                        guard synchronizationRunID == runID else {
+                            throw CancellationError()
+                        }
                         continue
                     } else {
                         throw error
@@ -548,12 +554,24 @@ extension CloudKitSynchronizer {
                     logger.info("QSCloudKitSynchronizer >> Downloaded \(zoneResult.deletedRecordIDs.count) deleted record IDs from zone \(zoneID.zoneName)")
                 }
                 try await changeRequestProcessor.finishProcessing(for: adapter)
+                try checkSynchronizationAttempt(attemptID)
+                guard synchronizationRunID == runID else {
+                    throw CancellationError()
+                }
                 if let firstError = changeRequestProcessor.getErrors().first {
                     changeRequestProcessor.clearErrors()
                     throw firstError
                 }
                 try await adapter.persistImportedChanges()
+                try checkSynchronizationAttempt(attemptID)
+                guard synchronizationRunID == runID else {
+                    throw CancellationError()
+                }
                 try await adapter.saveToken(zoneResult.serverChangeToken)
+                try checkSynchronizationAttempt(attemptID)
+                guard synchronizationRunID == runID else {
+                    throw CancellationError()
+                }
                 activeZoneTokens[zoneID] = zoneResult.serverChangeToken
             }
             changeRequestProcessor.clearErrors()
@@ -805,12 +823,14 @@ extension CloudKitSynchronizer {
                     } else {
                         try await adapter.didUpload(savedRecords: savedRecords)
                     }
+                    try checkSynchronizationAttempt(attemptID)
                 }
                 
-                try Task.checkCancellation()
+                try checkSynchronizationAttempt(attemptID)
                 if let error = operationError as? NSError {
                     if !recordIDsMissingOnServer.isEmpty {
                         try await adapter.deleteChangeTracking(forRecordIDs: Array(recordIDsMissingOnServer))
+                        try checkSynchronizationAttempt(attemptID)
                     }
 
                     let errorsByItemID =
@@ -846,7 +866,9 @@ extension CloudKitSynchronizer {
                                 in: Array(resolvedRecordsByID.values),
                                 forceSave: true
                             )
+                            try checkSynchronizationAttempt(attemptID)
                             try await adapter.persistImportedChanges()
+                            try checkSynchronizationAttempt(attemptID)
                         } catch {
                             logger.warning(
                                 "QSCloudKitSynchronizer >> Failed to resolve conflicted records: \(error)"
@@ -971,6 +993,7 @@ extension CloudKitSynchronizer {
                     } else {
                         await adapter.didDelete(recordIDs: acknowledgedRecordIDs)
                     }
+                    try checkSynchronizationAttempt(attemptID)
                 } catch {
                     try await completion(error)
                     return
@@ -1128,8 +1151,12 @@ extension CloudKitSynchronizer {
                 }
                 
                 await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                guard synchronizationAttemptID == attemptID,
+                      !cancelSync else { return }
                 if changedZoneIDs.count > 0 {
                     let zoneIDs = try await loadTokens(for: changedZoneIDs, loadAdapters: false)
+                    guard synchronizationAttemptID == attemptID,
+                          !cancelSync else { return }
                     await updateServerToken(for: zoneIDs, completion: { [weak self] result in
                         guard let self = self,
                               synchronizationAttemptID == attemptID else { return }
@@ -1199,8 +1226,9 @@ extension CloudKitSynchronizer {
                 if result.downloadedRecords.count > 0 || result.deletedRecordIDs.count > 0 {
                     zonesNeedingRefetch.insert(zoneID)
                 } else if !zonesNeedingRefetch.contains(zoneID) {
-                    activeZoneTokens[zoneID] = result.serverChangeToken
                     try await adapter?.saveToken(result.serverChangeToken)
+                    try checkSynchronizationAttempt(attemptID)
+                    activeZoneTokens[zoneID] = result.serverChangeToken
                 }
                 
             }

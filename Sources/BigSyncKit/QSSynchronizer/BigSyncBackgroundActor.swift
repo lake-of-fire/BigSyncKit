@@ -198,8 +198,6 @@ public actor BigSyncBackgroundActor {
                 guard realmSynchronizer === expectedSynchronizer else {
                     throw CancellationError()
                 }
-                try await expectedSynchronizer
-                    .subscribeForChangesInDatabase()
             }
             synchronizationPreparationTask = preparationTask
             do {

@@ -249,6 +249,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     private var deletedByEntity: [String: [CKRecord.ID]]
     private var storedServerChangeToken: CKServerChangeToken?
     var didFinishImportHandler: (@Sendable () async -> Void)?
+    var resetSyncCachesHandler: (@Sendable () async -> Void)?
 
     var hasChanges: Bool {
         uploadedByEntity.values.contains(where: { !$0.isEmpty }) ||
@@ -270,6 +271,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     func cleanUp() async throws {}
     func resetSyncCaches() async throws {
         events.append("resetSyncCaches")
+        await resetSyncCachesHandler?()
     }
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool { true }
 
@@ -727,10 +729,12 @@ final class BigSyncKitTests: XCTestCase {
         let database = FakeCloudKitDatabase()
         let synchronizer = makeSynchronizer(database: database)
 
-        await withCheckedContinuation { continuation in
-            synchronizer.subscribeForChangesInDatabase { error in
-                XCTAssertNil(error)
-                continuation.resume()
+        for _ in 0..<2 {
+            await withCheckedContinuation { continuation in
+                synchronizer.subscribeForChangesInDatabase { error in
+                    XCTAssertNil(error)
+                    continuation.resume()
+                }
             }
         }
 
@@ -1057,6 +1061,86 @@ final class BigSyncKitTests: XCTestCase {
 
         XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
         XCTAssertFalse(synchronizer.cancelledDueToUnauthentication)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountChangeDuringCacheResetLeavesValidationRequired()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-a"
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(
+                zoneName: "account-reset-race",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+        try await synchronizer._test_validateSynchronizationAccount()
+
+        database.accountIdentifier = "account-b"
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        await Task.yield()
+
+        let gate = AsyncGate()
+        let enteredReset = expectation(description: "entered cache reset")
+        adapter.resetSyncCachesHandler = {
+            enteredReset.fulfill()
+            await gate.wait()
+        }
+        let validation = Task { @BigSyncBackgroundActor in
+            try await synchronizer._test_validateSynchronizationAccount()
+        }
+        await fulfillment(of: [enteredReset], timeout: 1)
+
+        database.accountIdentifier = "account-c"
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        await Task.yield()
+        await gate.open()
+
+        do {
+            try await validation.value
+            XCTFail("Expected the superseded validation to be cancelled")
+        } catch is CancellationError {
+        }
+
+        adapter.resetSyncCachesHandler = nil
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertEqual(
+            adapter.events.filter { $0 == "resetSyncCaches" }.count,
+            2
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testSynchronizationAccountSwitchRecreatesDatabaseSubscription()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-a"
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+
+        try await synchronizer._test_validateSynchronizationAccount()
+        try await synchronizer.subscribeForChangesInDatabase()
+        XCTAssertEqual(database.savedSubscriptionCount, 1)
+
+        database.accountIdentifier = "account-b"
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        await Task.yield()
+        synchronizer.beginSynchronization()
+
+        for _ in 0..<1_000 where database.savedSubscriptionCount < 2 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertEqual(database.savedSubscriptionCount, 2)
+        await synchronizer.cancelSynchronizationAndWait()
     }
 
     func testCloudKitAccountAvailabilityGateStartsImmediatelyWhenAvailable() async {
