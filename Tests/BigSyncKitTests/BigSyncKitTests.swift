@@ -23,6 +23,7 @@ private final class NoopAdapterProvider: NSObject, AdapterProvider {
 private enum TestSynchronizationError: Error {
     case terminalForwardingFailed
     case deletedZoneResetFailed
+    case restoredBackupResetFailed
 }
 
 private final class FailingDeletedZoneProvider: NSObject, AdapterProvider {
@@ -926,6 +927,86 @@ final class BigSyncKitTests: XCTestCase {
         await gate.open()
         try await reset.value
         XCTAssertTrue(adapter.events.contains("resetSyncCaches"))
+        do {
+            _ = try await synchronization.value
+            XCTFail("Expected synchronization cancellation")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRestoredBackupResetFailureRetainsPendingMarker() async {
+        let store = DictionaryKeyValueStore()
+        store.set(
+            boolValue: true,
+            forKey: BackupDetection.restoreResetRequiredStoreKey
+        )
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            keyValueStore: store
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "restore-reset-failure"),
+            priorities: []
+        )
+        adapter.resetSyncCachesHandler = {
+            throw TestSynchronizationError.restoredBackupResetFailed
+        }
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("Expected restored-backup cache reset to fail")
+        } catch TestSynchronizationError.restoredBackupResetFailed {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(store: store))
+        XCTAssertEqual(database.subscriptionFetchCount, 0)
+        XCTAssertEqual(
+            adapter.events.filter { $0 == "resetSyncCaches" }.count,
+            1
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRestoredBackupResetCompletesBeforeCloudKitFetch() async throws {
+        let store = DictionaryKeyValueStore()
+        store.set(
+            boolValue: true,
+            forKey: BackupDetection.restoreResetRequiredStoreKey
+        )
+        let database = FakeCloudKitDatabase()
+        database.completesSubscriptionFetches = false
+        let synchronizer = makeSynchronizer(
+            database: database,
+            keyValueStore: store
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "restore-reset-success"),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+
+        for _ in 0..<1_000 where database.subscriptionFetchCount == 0 {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertEqual(database.subscriptionFetchCount, 1)
+        XCTAssertFalse(BackupDetection.restoreResetIsRequired(store: store))
+        XCTAssertEqual(
+            adapter.events.filter { $0 == "resetSyncCaches" }.count,
+            1
+        )
+
+        await synchronizer.cancelSynchronizationAndWait()
         do {
             _ = try await synchronization.value
             XCTFail("Expected synchronization cancellation")
