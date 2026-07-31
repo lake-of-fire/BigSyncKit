@@ -350,12 +350,6 @@ private actor AccountIdentifierSequence {
     }
 }
 
-private extension RealmBackgroundActor {
-    func removeCachedTestRealms() {
-        cachedRealms.removeAll()
-    }
-}
-
 private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter, @unchecked Sendable {
     let recordZoneID: CKRecordZone.ID
     let priorityEntityTypeNames: [String]
@@ -538,11 +532,6 @@ SoftDeletable {
 }
 
 final class BigSyncKitTests: XCTestCase {
-    override func tearDown() async throws {
-        await RealmBackgroundActor.shared.removeCachedTestRealms()
-        try await super.tearDown()
-    }
-
     func testRefreshChangeMetadataUsesSuppliedTimestampForJournalAndMetadata() throws {
         var configuration = Realm.Configuration()
         configuration.inMemoryIdentifier = "timestamped-tracking-\(UUID().uuidString)"
