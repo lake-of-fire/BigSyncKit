@@ -7,56 +7,74 @@
 
 import Foundation
 
-class BackupDetection: NSObject {
-    
-    @objc enum DetectionResult: Int {
+enum BackupDetection {
+    enum DetectionResult: Int {
         case firstRun
         case restoredFromBackup
         case regularLaunch
     }
-    
-    fileprivate static let backupDetectionStoreKey = "QSBackupDetectionStoreKey"
-    fileprivate static var applicationDocumentsDirectory: String {
-    #if os(iOS) || os(watchOS)
-        return NSSearchPathForDirectoriesInDomains(.libraryDirectory, .userDomainMask, true).first!
-    #else
-        let urls = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-        return urls.last?.appendingPathComponent("com.mentrena.QSCloudKitSynchronizer").path ?? ""
-    #endif
+
+    static let storeKey = "QSBackupDetectionStoreKey.v2"
+
+    private static var applicationSupportDirectory: URL {
+        #if os(iOS) || os(watchOS)
+        FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+        #else
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("com.mentrena.QSCloudKitSynchronizer", isDirectory: true)
+        #endif
     }
-    
-    fileprivate static let fileName = "backupDetection"
-    fileprivate static var backupDetectionFilePath: String {
-        return NSString.path(withComponents: [applicationDocumentsDirectory, fileName])
+
+    static var defaultSentinelURL: URL {
+        applicationSupportDirectory
+            .appendingPathComponent("backupDetection.v2", isDirectory: false)
     }
-   
-    @objc
-    static func runBackupDetection(completion: (DetectionResult, Error?) -> ()) {
-        
+
+    /// Detects a restored installation by pairing a defaults marker, which is
+    /// expected to be restored from backup, with a filesystem sentinel that is
+    /// explicitly excluded from backup.
+    ///
+    /// The marker is written only after the sentinel has been created and marked
+    /// as excluded. A failed sentinel write therefore cannot make the next launch
+    /// look like a restore.
+    static func run(
+        store: KeyValueStore,
+        fileManager: FileManager = .default,
+        sentinelURL: URL = defaultSentinelURL
+    ) throws -> DetectionResult {
+        let sentinelExists = fileManager.fileExists(atPath: sentinelURL.path)
+        let markerExists = store.bool(forKey: storeKey)
+
         let result: DetectionResult
-        if FileManager.default.fileExists(atPath: backupDetectionFilePath) {
+        if sentinelExists {
             result = .regularLaunch
-        } else if UserDefaults.standard.bool(forKey: backupDetectionStoreKey) {
+        } else if markerExists {
             result = .restoredFromBackup
         } else {
             result = .firstRun
         }
-        
-        var error: Error?
-        if result == .firstRun || result == .restoredFromBackup {
-            let content = "Backup detection file\n"
-            let fileContents = content.data(using: .utf8)
-            FileManager.default.createFile(atPath: backupDetectionFilePath, contents: fileContents, attributes: nil)
-            var fileURL = URL(fileURLWithPath: backupDetectionFilePath)
+
+        if !sentinelExists {
+            try fileManager.createDirectory(
+                at: sentinelURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("Backup detection file\n".utf8).write(
+                to: sentinelURL,
+                options: .atomic
+            )
             var resourceValues = URLResourceValues()
             resourceValues.isExcludedFromBackup = true
-            do {
-                try fileURL.setResourceValues(resourceValues)
-            } catch let err {
-                error = err
-            }
+            var mutableSentinelURL = sentinelURL
+            try mutableSentinelURL.setResourceValues(resourceValues)
         }
-        
-        completion(result, error)
+
+        // Repair older or partially initialized installations that have the
+        // excluded sentinel but never persisted the backed-up marker.
+        if !markerExists {
+            store.set(boolValue: true, forKey: storeKey)
+        }
+
+        return result
     }
 }
