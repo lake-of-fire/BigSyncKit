@@ -3,6 +3,7 @@ import CloudKit
 import Logging
 @testable import BigSyncKit
 import RealmSwift
+import RealmSwiftGaps
 
 private final class DictionaryKeyValueStore: NSObject, KeyValueStore {
     private var storage = [String: Any]()
