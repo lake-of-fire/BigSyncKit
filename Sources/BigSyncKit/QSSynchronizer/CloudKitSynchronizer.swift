@@ -680,7 +680,51 @@ public class CloudKitSynchronizer: NSObject {
             }
         }
     }
+
+    /// Completes restore recovery before this installation is allowed to fetch
+    /// or advance any CloudKit token. The required marker is durable because
+    /// backup detection may already have created the replacement sentinel when
+    /// the process terminates during cache reset.
+    @BigSyncBackgroundActor
+    private func prepareRestoredInstallationIfNeeded() async throws {
+        if let backupDetectionError {
+            throw backupDetectionError
+        }
+        guard backupRestoreDetected
+                || BackupDetection.restoreResetIsRequired(store: keyValueStore)
+        else { return }
+
+        try await resetSyncCachesOwnedByCurrentFlow(includingAdapters: true)
+        BackupDetection.markRestoreResetCompleted(store: keyValueStore)
+        backupRestoreDetected = false
+    }
     
+    @BigSyncBackgroundActor
+    private func resetRestoredBackupCachesIfNeeded(
+        context: RunContext
+    ) async throws {
+        if backupDetectionError != nil {
+            let result = try BackupDetection.run(store: keyValueStore)
+            backupDetectionError = nil
+            backupRestoreDetected = BackupDetection.restoreResetIsRequired(
+                store: keyValueStore
+            )
+            if result == .restoredFromBackup || backupRestoreDetected {
+                clearDeviceIdentifier()
+            }
+        }
+        guard backupRestoreDetected
+                || BackupDetection.restoreResetIsRequired(store: keyValueStore) else {
+            return
+        }
+
+        try await revalidateRunContext(context)
+        try await resetSyncCachesOwnedByCurrentFlow(includingAdapters: true)
+        try await revalidateRunContext(context)
+        BackupDetection.markRestoreResetCompleted(store: keyValueStore)
+        backupRestoreDetected = false
+    }
+
     // MARK: - Public
     
     /// Synchronize data with CloudKit.
@@ -711,6 +755,8 @@ public class CloudKitSynchronizer: NSObject {
             do {
                 await waitForRunCallbacksToFinish()
                 try checkSynchronizationAttempt(attemptID)
+                try await prepareRestoredInstallationIfNeeded()
+                try checkSynchronizationAttempt(attemptID)
                 let accountIdentifier = try await validateSynchronizationAccount()
                 let runID = await changeRequestProcessor.beginRun()
                 synchronizationRunID = runID
@@ -723,6 +769,7 @@ public class CloudKitSynchronizer: NSObject {
                     )
                 )
                 activeRunContext = context
+                try await resetRestoredBackupCachesIfNeeded(context: context)
                 // Subscription identifiers are account-scoped sync metadata.
                 // Account validation clears them after an iCloud account
                 // change, so ensure the current account has a subscription as
