@@ -1301,15 +1301,6 @@ public class CloudKitSynchronizer: NSObject {
             try await ensureCurrentAccount(accountIdentifier)
             for zoneID in Set(modelAdapters.map(\.recordZoneID)) {
                 try await claimHeartbeatStatus.throwIfFailed()
-                try await acquireOrRenewResetClaim(
-                    recordID: claimRecordID,
-                    recordType: markerRecordType,
-                    ownerField: markerOwnerField,
-                    leaseDateField: markerLeaseDateField,
-                    claimToken: claimToken,
-                    leaseDuration: leaseDuration,
-                    accountIdentifier: accountIdentifier
-                )
                 try await ensureCurrentAccount(accountIdentifier)
                 do {
                     try await deleteRecordZone(zoneID)
@@ -1325,15 +1316,7 @@ public class CloudKitSynchronizer: NSObject {
                     }
                 }
             }
-            try await acquireOrRenewResetClaim(
-                recordID: claimRecordID,
-                recordType: markerRecordType,
-                ownerField: markerOwnerField,
-                leaseDateField: markerLeaseDateField,
-                claimToken: claimToken,
-                leaseDuration: leaseDuration,
-                accountIdentifier: accountIdentifier
-            )
+            try await claimHeartbeatStatus.throwIfFailed()
             try await resetSyncCachesOwnedByCurrentFlow(
                 includingAdapters: true
             )
@@ -1361,15 +1344,6 @@ public class CloudKitSynchronizer: NSObject {
             try await ensureCurrentAccount(accountIdentifier)
             try await claimHeartbeatStatus.throwIfFailed()
 
-            try await acquireOrRenewResetClaim(
-                recordID: claimRecordID,
-                recordType: markerRecordType,
-                ownerField: markerOwnerField,
-                leaseDateField: markerLeaseDateField,
-                claimToken: claimToken,
-                leaseDuration: leaseDuration,
-                accountIdentifier: accountIdentifier
-            )
             try await ensureCurrentAccount(accountIdentifier)
             do {
                 try await claimHeartbeatStatus.throwIfFailed()
