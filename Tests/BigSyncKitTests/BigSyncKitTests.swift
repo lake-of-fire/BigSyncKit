@@ -350,6 +350,12 @@ private actor AccountIdentifierSequence {
     }
 }
 
+private extension RealmBackgroundActor {
+    func removeCachedTestRealms() {
+        cachedRealms.removeAll()
+    }
+}
+
 private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter, @unchecked Sendable {
     let recordZoneID: CKRecordZone.ID
     let priorityEntityTypeNames: [String]
@@ -532,6 +538,11 @@ SoftDeletable {
 }
 
 final class BigSyncKitTests: XCTestCase {
+    override func tearDown() async throws {
+        await RealmBackgroundActor.shared.removeCachedTestRealms()
+        try await super.tearDown()
+    }
+
     func testRefreshChangeMetadataUsesSuppliedTimestampForJournalAndMetadata() throws {
         var configuration = Realm.Configuration()
         configuration.inMemoryIdentifier = "timestamped-tracking-\(UUID().uuidString)"
@@ -1571,6 +1582,30 @@ final class BigSyncKitTests: XCTestCase {
         } catch OneOffRecordZoneResetError.migrationInProgress {
             XCTAssertTrue(database.deletedZoneIDs.isEmpty)
         }
+    }
+
+    @BigSyncBackgroundActor
+    func testOneOffZoneResetRejectsInvalidLeaseDurationsBeforeCloudKitWork() async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(database: database)
+
+        for leaseDuration in [0, -1, .infinity, .nan] {
+            do {
+                _ = try await synchronizer.performOneOffRecordZoneResetAndReupload(
+                    migrationIdentifier: "invalid-lease-\(leaseDuration)",
+                    markerRecordType: "ExistingRecordType",
+                    markerOwnerField: "owner",
+                    markerLeaseDateField: "lease",
+                    leaseDuration: leaseDuration
+                )
+                XCTFail("Expected invalid lease duration to fail")
+            } catch OneOffRecordZoneResetError.invalidLeaseDuration {
+                // Expected.
+            }
+        }
+
+        XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+        XCTAssertTrue(database.modifyRecordsAtomicValues.isEmpty)
     }
 
     @BigSyncBackgroundActor
@@ -3067,6 +3102,30 @@ final class BigSyncKitTests: XCTestCase {
         try await assertMalformedRelationshipDoesNotApply(
             field: "favoriteChild",
             value: reference
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRelationshipReferenceCollectionsRejectAnotherZone() async throws {
+        let otherZone = CKRecordZone.ID(
+            zoneName: "another-collection-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let reference = CKRecord.Reference(
+            recordID: CKRecord.ID(
+                recordName: BigSyncRelationshipChild.className() + ".existing-child",
+                zoneID: otherZone
+            ),
+            action: .none
+        )
+
+        try await assertMalformedRelationshipDoesNotApply(
+            field: "children",
+            value: [reference] as CKRecordValue
+        )
+        try await assertMalformedRelationshipDoesNotApply(
+            field: "relatedChildren",
+            value: [reference] as CKRecordValue
         )
     }
 

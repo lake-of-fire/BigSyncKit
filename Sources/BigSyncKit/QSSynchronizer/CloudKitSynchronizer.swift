@@ -147,6 +147,7 @@ public enum OneOffRecordZoneResetError: LocalizedError {
     case cloudKitAccountChanged
     case cloudKitAccountUnavailable
     case activeRecordZoneCannotBeDeleted
+    case invalidLeaseDuration
 
     public var errorDescription: String? {
         switch self {
@@ -158,6 +159,8 @@ public enum OneOffRecordZoneResetError: LocalizedError {
             return "The current iCloud account could not be identified"
         case .activeRecordZoneCannotBeDeleted:
             return "An active synchronization zone cannot be deleted as obsolete"
+        case .invalidLeaseDuration:
+            return "The CloudKit reset lease duration must be finite and greater than zero"
         }
     }
 }
@@ -1191,6 +1194,9 @@ public class CloudKitSynchronizer: NSObject {
         markerLeaseDateField: String,
         leaseDuration: TimeInterval = 15 * 60
     ) async throws -> OneOffRecordZoneResetResult {
+        guard leaseDuration.isFinite, leaseDuration > 0 else {
+            throw OneOffRecordZoneResetError.invalidLeaseDuration
+        }
         guard activeOneOffResetIdentifier == nil else {
             throw OneOffRecordZoneResetError.migrationInProgress
         }
