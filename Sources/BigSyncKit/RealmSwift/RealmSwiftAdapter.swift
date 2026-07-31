@@ -1385,7 +1385,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
         
-        try await Task.sleep(nanoseconds: 10_000_000)
+        await Task.yield()
         await persistenceRealm.asyncRefresh()
         
         var lastTrackedChangesAtUpdates: [(String, Date)] = []
@@ -1611,7 +1611,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     persistenceRealm.add(syncedEntity, update: .modified)
                 }
             }
-            try await Task.sleep(nanoseconds: 20_000_000)
+            await Task.yield()
             //            await persistenceRealm.asyncRefresh()
         }
         //        logger.info("QSCloudKitSynchronizer >> Created \(identifiers.count) SyncedEntity records for \(entityType)")
@@ -3436,7 +3436,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
-            try await Task.sleep(nanoseconds: 10_000_000)
+            await Task.yield()
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
         }
@@ -3606,7 +3606,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-                try await Task.sleep(nanoseconds: 100_000)
+                await Task.yield()
             }
             
             logger.info("QSCloudKitSynchronizer >> Persisted \(recordsToSave.count) downloaded records")
@@ -3890,7 +3890,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     }
                 }
             }
-            try await Task.sleep(nanoseconds: 20_000_000)
+            await Task.yield()
         }
 
         if !acknowledgedGenerations.isEmpty {

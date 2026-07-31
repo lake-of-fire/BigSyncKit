@@ -248,6 +248,11 @@ extension CloudKitSynchronizer {
                 await failSynchronization(error: error)
             }
         }
+        operation.finishedHandler = { [weak self] finishedOperation in
+            Task { @BigSyncBackgroundActor [weak self] in
+                self?.currentOperations.removeAll { $0 === finishedOperation }
+            }
+        }
         currentOperations.removeAll { $0.isFinished }
         currentOperations.append(operation)
         operationQueue.addOperation(operation)
@@ -363,8 +368,9 @@ extension CloudKitSynchronizer {
                 return
             }
             
-            // For lowering CPU priority gently
-            try? await Task.sleep(nanoseconds: 10_000)
+            // Cooperatively allow other work to run without imposing a
+            // wall-clock delay between each sequential operation.
+            await Task.yield()
             do {
                 try Task.checkCancellation()
                 guard await !cancelSync else { throw CancellationError() }

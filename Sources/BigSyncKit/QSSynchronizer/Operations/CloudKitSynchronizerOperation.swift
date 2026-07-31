@@ -13,6 +13,7 @@ class CloudKitSynchronizerOperation: Operation {
     override var isExecuting: Bool { return state == .executing }
     override var isFinished: Bool { return state == .finished }
     @objc var errorHandler: ((CloudKitSynchronizerOperation, Error) -> ())?
+    var finishedHandler: ((CloudKitSynchronizerOperation) -> ())?
     
     internal var logger: Logging.Logger?
 
@@ -64,6 +65,7 @@ class CloudKitSynchronizerOperation: Operation {
         } else {
 //            logger?.info("QSCloudKitSynchronizer >> Operation succeeded: \(type(of: self))")
         }
+        finishedHandler?(self)
     }
 
     override func cancel() {
