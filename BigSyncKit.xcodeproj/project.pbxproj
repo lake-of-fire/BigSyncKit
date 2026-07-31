@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		0052B5D9D5CC3BF0CDFFC0B9 /* SyncedEntity.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB1193B4C901E7AA060A4AE9 /* SyncedEntity.swift */; };
 		02D03BE92F26412C61A3BB31 /* PendingRelationship.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73F4DCFDFCE608B084E2B80B /* PendingRelationship.swift */; };
+		3ED652F310A1670673BE2AC7 /* BigSyncPendingMutation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */; };
 		08E36BC6FD86ED9CD7B87CC0 /* Logging.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = 276C216D2EED7450546EB0C8 /* Logging.framework */; };
 		0E5982BF8ED3B78EB86D930F /* FetchZoneChangesOperation.swift in Sources */ = {isa = PBXBuildFile; fileRef = F92C426D1A2B0A00DEC3AF1C /* FetchZoneChangesOperation.swift */; };
 		0F7AFD763CDA892F5630A9EC /* TuistBundle+BigSyncKit.swift in Sources */ = {isa = PBXBuildFile; fileRef = D67DD8D570E84ABE46CAEB8B /* TuistBundle+BigSyncKit.swift */; };
@@ -166,6 +167,7 @@
 		6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudKitSynchronizer+Subscriptions.swift"; sourceTree = "<group>"; };
 		6D34F532F253611BC2AB181F /* FetchDatabaseChangesOperation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FetchDatabaseChangesOperation.swift; sourceTree = "<group>"; };
 		73F4DCFDFCE608B084E2B80B /* PendingRelationship.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingRelationship.swift; sourceTree = "<group>"; };
+		7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncPendingMutation.swift; sourceTree = "<group>"; };
 		7E14FD1C796F678CE02FC194 /* RealModule.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = RealModule.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		7EC744C24DA41913CBC47C4B /* SyncedEntityType.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedEntityType.swift; sourceTree = "<group>"; };
 		80C8F45DFBAE47586CDE6AB5 /* QSCloudKitSynchronizer+MultiRealmResultsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "QSCloudKitSynchronizer+MultiRealmResultsController.swift"; sourceTree = "<group>"; };
@@ -378,6 +380,7 @@
 		DFB30316A0DAA344F0F89AA8 /* RealmSwift */ = {
 			isa = PBXGroup;
 			children = (
+				7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */,
 				CD495927486A1B40B2B8DBA3 /* DefaultRealmSwiftAdapterProvider.swift */,
 				73F4DCFDFCE608B084E2B80B /* PendingRelationship.swift */,
 				58CDB4D39314DDAFE352E728 /* QSCloudKitSynchronizer+RealmSwift.swift */,
@@ -557,6 +560,7 @@
 				41B8E763FAD1533448520B02 /* PrimaryKey.swift in Sources */,
 				0F94B5F5C1645FA2C7D6CB7E /* QSCoder.swift in Sources */,
 				316D9A9305E452F821839289 /* SyncedEntityState.swift in Sources */,
+				3ED652F310A1670673BE2AC7 /* BigSyncPendingMutation.swift in Sources */,
 				D1076D33C1CCFA003ACD1332 /* DefaultRealmSwiftAdapterProvider.swift in Sources */,
 				02D03BE92F26412C61A3BB31 /* PendingRelationship.swift in Sources */,
 				9A1BF58FA7646A413503C6AC /* QSCloudKitSynchronizer+RealmSwift.swift in Sources */,
