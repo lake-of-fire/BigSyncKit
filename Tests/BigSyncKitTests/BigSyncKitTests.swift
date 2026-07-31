@@ -2310,6 +2310,72 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testDeferredRemoteRelationshipCannotOverwriteNewerLocalEdit()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let originalChild = BigSyncRelationshipChild()
+        originalChild.id = "original"
+        let availableRemoteChild = BigSyncRelationshipChild()
+        availableRemoteChild.id = "available"
+        let localChild = BigSyncRelationshipChild()
+        localChild.id = "local"
+        let parent = BigSyncRelationshipParent()
+        parent.id = "parent"
+        parent.children.append(originalChild)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(
+                [originalChild, availableRemoteChild, localChild, parent],
+                update: .modified
+            )
+        }
+
+        let remoteDate = Date(timeIntervalSinceReferenceDate: 30_000)
+        let record = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["children"] = [
+            "\(BigSyncRelationshipChild.className()).available",
+            "\(BigSyncRelationshipChild.className()).late",
+        ] as CKRecordValue
+        record["modifiedAt"] = remoteDate as CKRecordValue
+        record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.persistImportedChanges()
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self).count,
+            2
+        )
+
+        let localEditDate = remoteDate.addingTimeInterval(60)
+        try await fixture.targetRealm.asyncWrite {
+            parent.children.removeAll()
+            parent.children.append(localChild)
+            parent.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: localEditDate
+            )
+        }
+        let lateRemoteChild = BigSyncRelationshipChild()
+        lateRemoteChild.id = "late"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(lateRemoteChild)
+        }
+
+        try await fixture.adapter.persistImportedChanges()
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertEqual(parent.children.map(\.id), ["local"])
+        XCTAssertEqual(parent.modifiedAt, localEditDate)
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self).count,
+            0
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testSetupDrainsJournalWithoutStartingSynchronization() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let delegate = FakeModelAdapterDelegate()

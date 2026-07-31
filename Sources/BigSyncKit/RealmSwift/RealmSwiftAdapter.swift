@@ -104,10 +104,13 @@ public protocol RealmSwiftAdapterRecordProcessing: AnyObject {
     func shouldProcessPropertyInDownload(propertyName: String, object: Object, record: CKRecord) -> Bool
 }
 
-fileprivate struct PendingRelationshipRequest {
+struct PendingRelationshipRequest: Sendable {
     let name: String
     let syncedEntityID: String
     let targetIdentifiers: [String]
+    let sourceRecordChangeTag: String?
+    let expectedModifiedAt: Date?
+    let expectedExplicitlyModifiedAt: Date?
 }
 
 actor RealmProvider {
@@ -357,8 +360,6 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     @BigSyncBackgroundActor
     private let realmChangesSubject = PassthroughSubject<Int, Never>()
     
-    private var pendingRelationshipQueue = [PendingRelationshipRequest]()
-    
     @BigSyncBackgroundActor
     private var cancellables = Set<AnyCancellable>()
     
@@ -445,7 +446,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 9
+        configuration.schemaVersion = 10
         configuration.shouldCompactOnLaunch = { totalBytes, usedBytes in
             // totalBytes refers to the size of the file on disk in bytes (data + free space)
             // usedBytes refers to the number of bytes used by data in the file
@@ -1719,8 +1720,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         syncedEntityID: String,
         syncedEntityState: SyncedEntityState,
         entityType: String
-    ) throws {
+    ) throws -> [PendingRelationshipRequest] {
         let objectProperties = object.objectSchema.properties
+        var pendingRelationships = [PendingRelationshipRequest]()
         
         let skippedKeys: Set<String>
         if let skippable = object as? SyncSkippablePropertiesModel {
@@ -1746,7 +1748,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     property: property,
                     record: record,
                     object: object,
-                    syncedEntityIdentifier: syncedEntityID
+                    syncedEntityIdentifier: syncedEntityID,
+                    pendingRelationships: &pendingRelationships
                 )
             }
         }
@@ -1830,6 +1833,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 // TODO: Ensure this local object is pending upload...
             }
         }
+        return pendingRelationships
     }
     
     func applyChange(
@@ -1837,6 +1841,23 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         record: CKRecord,
         object: Object,
         syncedEntityIdentifier: String
+    ) throws {
+        var pendingRelationships = [PendingRelationshipRequest]()
+        try applyChange(
+            property: property,
+            record: record,
+            object: object,
+            syncedEntityIdentifier: syncedEntityIdentifier,
+            pendingRelationships: &pendingRelationships
+        )
+    }
+
+    func applyChange(
+        property: Property,
+        record: CKRecord,
+        object: Object,
+        syncedEntityIdentifier: String,
+        pendingRelationships: inout [PendingRelationshipRequest]
     ) throws {
         let key = property.name
         if key == object.objectSchema.primaryKeyProperty!.name {
@@ -1948,10 +1969,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         targetIdentifiers.append(objectIdentifier)
                     }
                 }
-                savePendingRelationshipsAsync(
+                appendPendingRelationship(
                     name: property.name,
                     syncedEntityID: syncedEntityIdentifier,
-                    targetIdentifiers: targetIdentifiers
+                    targetIdentifiers: targetIdentifiers,
+                    record: record,
+                    to: &pendingRelationships
                 )
                 return
             default:
@@ -2063,10 +2086,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         targetIdentifiers.append(objectIdentifier)
                     }
                 }
-                savePendingRelationshipsAsync(
+                appendPendingRelationship(
                     name: property.name,
                     syncedEntityID: syncedEntityIdentifier,
-                    targetIdentifiers: targetIdentifiers
+                    targetIdentifiers: targetIdentifiers,
+                    record: record,
+                    to: &pendingRelationships
                 )
                 return
             default:
@@ -2093,10 +2118,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             guard let objectIdentifier = objectIdentifier(
                 fromCloudKitRecordName: reference.recordID.recordName
             ) else { return }
-            savePendingRelationshipsAsync(
+            appendPendingRelationship(
                 name: key,
                 syncedEntityID: syncedEntityIdentifier,
-                targetIdentifiers: [objectIdentifier]
+                targetIdentifiers: [objectIdentifier],
+                record: record,
+                to: &pendingRelationships
             )
         } else if property.type == .object {
             // Save relationship to be applied after all records have been downloaded and persisted
@@ -2112,10 +2139,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             } else {
                 return
             }
-            savePendingRelationshipsAsync(
+            appendPendingRelationship(
                 name: key,
                 syncedEntityID: syncedEntityIdentifier,
-                targetIdentifiers: targetIdentifiers
+                targetIdentifiers: targetIdentifiers,
+                record: record,
+                to: &pendingRelationships
             )
         } else if property.type == .UUID {
             if let uuidString = record.value(forKey: key) as? String,
@@ -2193,23 +2222,31 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
     }
     
-    func savePendingRelationshipsAsync(
+    private func appendPendingRelationship(
         name: String,
         syncedEntityID: String,
-        targetIdentifiers: [String]
+        targetIdentifiers: [String],
+        record: CKRecord,
+        to pendingRelationships: inout [PendingRelationshipRequest]
     ) {
-        let request = PendingRelationshipRequest(
-            name: name,
-            syncedEntityID: syncedEntityID,
-            targetIdentifiers: targetIdentifiers
+        pendingRelationships.append(
+            PendingRelationshipRequest(
+                name: name,
+                syncedEntityID: syncedEntityID,
+                targetIdentifiers: targetIdentifiers,
+                sourceRecordChangeTag: record.recordChangeTag,
+                expectedModifiedAt: record["modifiedAt"] as? Date,
+                expectedExplicitlyModifiedAt:
+                    record["explicitlyModifiedAt"] as? Date
+            )
         )
-        pendingRelationshipQueue.append(request)
     }
     
     @BigSyncBackgroundActor
-    func persistPendingRelationships() async throws {
-        while !pendingRelationshipQueue.isEmpty {
-            let chunk = Array(pendingRelationshipQueue.prefix(5000))
+    func persistPendingRelationships(
+        _ requests: [PendingRelationshipRequest]
+    ) async throws {
+        for chunk in requests.chunks(ofCount: 5000) {
             try Task.checkCancellation()
             
             guard let persistenceRealm = realmProvider?.persistenceRealm else { break }
@@ -2238,6 +2275,12 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             pendingRelationship.forSyncedEntity = syncedEntity
                             pendingRelationship.targetIdentifier = targetIdentifier
                             pendingRelationship.position = position
+                            pendingRelationship.sourceRecordChangeTag =
+                                request.sourceRecordChangeTag
+                            pendingRelationship.expectedModifiedAt =
+                                request.expectedModifiedAt
+                            pendingRelationship.expectedExplicitlyModifiedAt =
+                                request.expectedExplicitlyModifiedAt
                             persistenceRealm.add(pendingRelationship)
                         }
                         if request.targetIdentifiers.isEmpty {
@@ -2245,11 +2288,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                             pendingRelationship.relationshipName = request.name
                             pendingRelationship.forSyncedEntity = syncedEntity
                             pendingRelationship.targetIdentifier = nil
+                            pendingRelationship.sourceRecordChangeTag =
+                                request.sourceRecordChangeTag
+                            pendingRelationship.expectedModifiedAt =
+                                request.expectedModifiedAt
+                            pendingRelationship.expectedExplicitlyModifiedAt =
+                                request.expectedExplicitlyModifiedAt
                             persistenceRealm.add(pendingRelationship)
                         }
                     }
                 }
-                pendingRelationshipQueue.removeFirst(chunk.count)
             } catch {
                 logger.error("Error during persistPendingRelationships: \(error)")
                 throw error
@@ -2288,10 +2336,65 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             let objectIdentifier = getObjectIdentifier(for: syncedEntity)
             guard let targetRealm = realmProvider.targetReaderRealmPerSchemaName[
                 originObjectClass.className()
-            ], let originObject = targetRealm.object(
+            ] else { continue }
+            await targetRealm.asyncRefresh()
+            guard let originObject = targetRealm.object(
                 ofType: originObjectClass,
                 forPrimaryKey: objectIdentifier
             ) else { continue }
+
+            let expectedModifiedAt =
+                relationships.first?.expectedModifiedAt
+            let expectedExplicitlyModifiedAt =
+                relationships.first?.expectedExplicitlyModifiedAt
+            func datesMatch(_ lhs: Date?, _ rhs: Date?) -> Bool {
+                switch (lhs, rhs) {
+                case (.none, .none):
+                    return true
+                case let (.some(lhs), .some(rhs)):
+                    // Realm and CloudKit can round date storage at different
+                    // sub-millisecond precision.
+                    return abs(lhs.timeIntervalSince(rhs)) < 0.001
+                default:
+                    return false
+                }
+            }
+            let hasServerVersion =
+                relationships.first?.sourceRecordChangeTag != nil
+            func hasInterveningLocalMutation() -> Bool {
+                let hasPendingMutation =
+                    targetRealm.schema.objectSchema.contains {
+                        $0.className == BigSyncPendingMutation.className()
+                    }
+                    && targetRealm.object(
+                        ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: syncedEntity.identifier
+                    ) != nil
+                let localMetadataChanged =
+                    !datesMatch(
+                        originObject["modifiedAt"] as? Date,
+                        expectedModifiedAt
+                    )
+                    || !datesMatch(
+                        originObject["explicitlyModifiedAt"] as? Date,
+                        expectedExplicitlyModifiedAt
+                    )
+                return hasPendingMutation
+                    || syncedEntity.pendingGeneration != nil
+                    || (hasServerVersion && localMetadataChanged)
+            }
+            if hasInterveningLocalMutation() {
+                logger.info(
+                    "QSCloudKitSynchronizer >> Discarding stale deferred relationship \(key.relationshipName) for \(key.syncedEntityID)"
+                )
+                // The deferred relationship belongs to an older remote record.
+                // BigSyncKit resolves conflicts at record granularity, so any
+                // intervening local mutation wins over this stale intent.
+                try await persistenceRealm.asyncWrite {
+                    persistenceRealm.delete(relationships)
+                }
+                continue
+            }
 
             guard let property = originObject.objectSchema.properties.first(
                 where: { $0.name == key.relationshipName }
@@ -2321,8 +2424,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
             guard targetObjects.count == targetIdentifiers.count else { continue }
 
+            var becameStaleBeforeWrite = false
             try await targetRealm.asyncWrite {
                 try Task.checkCancellation()
+                guard !hasInterveningLocalMutation() else {
+                    becameStaleBeforeWrite = true
+                    return
+                }
                 if isArray {
                     guard let collection = originObject[relationshipName]
                         as? RLMSwiftCollectionBase,
@@ -2351,6 +2459,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 
             try await persistenceRealm.asyncWrite {
                 persistenceRealm.delete(relationships)
+            }
+            if becameStaleBeforeWrite {
+                logger.info(
+                    "QSCloudKitSynchronizer >> Discarding deferred relationship \(key.relationshipName) for \(key.syncedEntityID) after a concurrent local mutation"
+                )
             }
 
             await Task.yield()
@@ -3060,8 +3173,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 let safeChunk: [(CKRecord, Object.Type, any Sendable, String, SyncedEntityState, String)] = chunk.map {
                     ($0.record, $0.objectClass, $0.objectIdentifier as! any Sendable, $0.syncedEntityID, $0.syncedEntityState, $0.entityType)
                 }
-                try await { @RealmBackgroundActor in
-                    guard let targetWriterRealms = realmProvider.targetWriterRealms else { return }
+                let relationshipRequests =
+                    try await { @RealmBackgroundActor () async throws
+                        -> [PendingRelationshipRequest] in
+                    var relationshipRequests =
+                        [PendingRelationshipRequest]()
+                    guard let targetWriterRealms =
+                        realmProvider.targetWriterRealms else { return [] }
                     
                     for targetWriterRealm in targetWriterRealms {
                         try Task.checkCancellation()
@@ -3093,20 +3211,23 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                                 
                                 try Task.checkCancellation()
                                 if let object {
-                                    try self.applyChanges(
-                                        in: record,
-                                        to: object,
-                                        syncedEntityID: syncedEntityID,
-                                        syncedEntityState: syncedEntityState,
-                                        entityType: entityType
+                                    relationshipRequests.append(
+                                        contentsOf: try self.applyChanges(
+                                            in: record,
+                                            to: object,
+                                            syncedEntityID: syncedEntityID,
+                                            syncedEntityState: syncedEntityState,
+                                            entityType: entityType
+                                        )
                                     )
                                 }
                             }
                         }
                     }
+                    return relationshipRequests
                 }()
                 
-                try await persistPendingRelationships()
+                try await persistPendingRelationships(relationshipRequests)
                 
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
