@@ -50,8 +50,15 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private(set) var recordZoneFetchCount = 0
     private(set) var modifyRecordsAtomicValues = [Bool]()
     private(set) var modifyRecordsSavePolicies = [CKModifyRecordsOperation.RecordSavePolicy]()
+    private let recordsLock = NSLock()
     private var records = [CKRecord.ID: CKRecord]()
     private var conditionallyFetchedRecordIDs = Set<CKRecord.ID>()
+
+    private func withRecordsLock<T>(_ operation: () throws -> T) rethrows -> T {
+        recordsLock.lock()
+        defer { recordsLock.unlock() }
+        return try operation()
+    }
 
     func add(_ operation: CKDatabaseOperation) {
         if let fetchOperation = operation as? CKFetchDatabaseChangesOperation {
@@ -108,7 +115,9 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
                     if let error = partialSaveErrors[record.recordID] {
                         modifyOperation.perRecordCompletionBlock?(record, error)
                     } else {
-                        records[record.recordID] = record
+                        withRecordsLock {
+                            records[record.recordID] = record
+                        }
                         successfullySaved.append(record)
                         modifyOperation.perRecordCompletionBlock?(record, nil)
                     }
@@ -145,11 +154,14 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
                 )
                 return
             }
+            let duplicateRecord = withRecordsLock {
+                savedRecords.first(where: {
+                    records[$0.recordID] != nil
+                        && !conditionallyFetchedRecordIDs.contains($0.recordID)
+                })
+            }
             if modifyOperation.savePolicy == .ifServerRecordUnchanged,
-               let duplicateRecord = savedRecords.first(where: {
-                   records[$0.recordID] != nil
-                    && !conditionallyFetchedRecordIDs.contains($0.recordID)
-               }) {
+               let duplicateRecord {
                 let itemError = NSError(
                     domain: CKErrorDomain,
                     code: CKError.serverRecordChanged.rawValue
@@ -169,12 +181,16 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
                 return
             }
             for record in savedRecords {
-                records[record.recordID] = record
-                conditionallyFetchedRecordIDs.remove(record.recordID)
+                withRecordsLock {
+                    records[record.recordID] = record
+                    conditionallyFetchedRecordIDs.remove(record.recordID)
+                }
                 modifyOperation.perRecordCompletionBlock?(record, nil)
             }
             for recordID in deletedRecordIDs {
-                records.removeValue(forKey: recordID)
+                _ = withRecordsLock {
+                    records.removeValue(forKey: recordID)
+                }
             }
             modifyOperation.modifyRecordsCompletionBlock?(savedRecords, deletedRecordIDs, nil)
         }
@@ -192,22 +208,30 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     }
 
     func fetch(withRecordID recordID: CKRecord.ID, completionHandler: @escaping (CKRecord?, Error?) -> Void) {
-        if records[recordID] != nil {
-            conditionallyFetchedRecordIDs.insert(recordID)
+        let record = withRecordsLock {
+            let record = records[recordID]
+            if record != nil {
+                conditionallyFetchedRecordIDs.insert(recordID)
+            }
+            return record
         }
         if let nextAccountIdentifier = accountIdentifierAfterNextRecordFetch {
             accountIdentifier = nextAccountIdentifier
             accountIdentifierAfterNextRecordFetch = nil
         }
-        completionHandler(records[recordID], nil)
+        completionHandler(record, nil)
     }
 
     func setDate(_ date: Date, field: String, for recordID: CKRecord.ID) {
-        records[recordID]?[field] = date as CKRecordValue
+        withRecordsLock {
+            records[recordID]?[field] = date as CKRecordValue
+        }
     }
 
     func seed(_ record: CKRecord) {
-        records[record.recordID] = record
+        withRecordsLock {
+            records[record.recordID] = record
+        }
     }
 
     func delete(withRecordZoneID zoneID: CKRecordZone.ID, completionHandler: @escaping (CKRecordZone.ID?, Error?) -> Void) {
@@ -714,10 +738,10 @@ final class BigSyncKitTests: XCTestCase {
         let synchronization = Task { @BigSyncBackgroundActor in
             try await synchronizer.synchronize()
         }
-        for _ in 0..<1_000 where !synchronizer.syncing {
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
             try await Task.sleep(nanoseconds: 1_000_000)
         }
-        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertNotNil(synchronizer.activeRunContext)
         synchronizer.synchronizationDrainDidImportChanges = true
 
         await synchronizer.changesFinishedSynchronizing()
@@ -755,9 +779,10 @@ final class BigSyncKitTests: XCTestCase {
         let synchronization = Task { @BigSyncBackgroundActor in
             try await synchronizer.synchronize()
         }
-        for _ in 0..<1_000 where !synchronizer.syncing {
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
             try await Task.sleep(nanoseconds: 1_000_000)
         }
+        XCTAssertNotNil(synchronizer.activeRunContext)
 
         await synchronizer.changesFinishedSynchronizing()
 
