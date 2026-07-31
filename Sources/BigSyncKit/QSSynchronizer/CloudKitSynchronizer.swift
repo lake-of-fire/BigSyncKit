@@ -818,7 +818,16 @@ public class CloudKitSynchronizer: NSObject {
     /// intended for migrations that move syncing to a newly named zone.
     @BigSyncBackgroundActor
     @discardableResult
-    public func deleteRecordZoneIfPresent(_ zoneID: CKRecordZone.ID) async throws -> Bool {
+    public func deleteRecordZoneIfPresent(
+        _ zoneID: CKRecordZone.ID,
+        expectedAccountScopeIdentifier: String? = nil
+    ) async throws -> Bool {
+        if let expectedAccountScopeIdentifier {
+            guard try await cloudKitAccountScopeIdentifier()
+                    == expectedAccountScopeIdentifier else {
+                throw OneOffRecordZoneResetError.cloudKitAccountChanged
+            }
+        }
         do {
             try await deleteRecordZone(zoneID)
             return true

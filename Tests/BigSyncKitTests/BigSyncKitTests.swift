@@ -830,6 +830,31 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testObsoleteZoneDeletionStopsAfterAccountSwitch() async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let expectedAccountScope =
+            try await synchronizer.cloudKitAccountScopeIdentifier()
+        database.accountIdentifier = "different-account"
+
+        do {
+            _ = try await synchronizer.deleteRecordZoneIfPresent(
+                CKRecordZone.ID(zoneName: "obsolete-zone"),
+                expectedAccountScopeIdentifier: expectedAccountScope
+            )
+            XCTFail("Expected account switch to stop zone deletion")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+    }
+
+    @BigSyncBackgroundActor
     func testOneOffZoneResetDeletesSharedZoneOnlyOnceAcrossDevices() async throws {
         let database = FakeCloudKitDatabase()
         let zoneID = CKRecordZone.ID(
