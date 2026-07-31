@@ -1501,7 +1501,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         //        if !currentChangeSet.modifications.isEmpty {                            debugPrint("# processEnqueuedChanges MODIFY RECS", currentChangeSet.modifications.values.compactMap { $0 })                        }
         
         for (schema, identifiers) in currentChangeSet.insertions.mapValues(\.0) {
-            guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
+            guard let syncedEntityType = try await getOrCreateSyncedEntityType(schema) else {
+                throw RealmSwiftAdapterError.setupUnavailable
+            }
             
             for chunk in identifiers.chunks(ofCount: 2000) {
                 //                await persistenceRealm.asyncRefresh()
@@ -1523,7 +1525,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
         
         for (schema, identifiers) in currentChangeSet.modifications.mapValues(\.0) {
-            guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { return }
+            guard let syncedEntityType = try await getOrCreateSyncedEntityType(schema) else {
+                throw RealmSwiftAdapterError.setupUnavailable
+            }
             
             for chunk in identifiers.chunks(ofCount: 2000) {
                 //                await persistenceRealm.asyncRefresh()
@@ -1551,7 +1555,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         for (schema, latestExplicitlyModifiedAt) in currentChangeSet.trackedChangeHighWatermarks {
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
-            guard let syncedEntityType = try? await getOrCreateSyncedEntityType(schema) else { continue }
+            guard let syncedEntityType = try await getOrCreateSyncedEntityType(schema) else {
+                throw RealmSwiftAdapterError.setupUnavailable
+            }
             guard !cancelSync else { throw CancellationError() }
 
             if latestExplicitlyModifiedAt > (syncedEntityType.lastTrackedChangesAt ?? .distantPast) {
