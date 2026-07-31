@@ -916,7 +916,7 @@ extension CloudKitSynchronizer {
                 if let error = operationError as? NSError {
                     if !recordIDsMissingOnServer.isEmpty {
                         try await revalidateActiveRunContext(for: attemptID)
-                        if let generationTrackingAdapter = adapter as? MissingServerGenerationTrackingModelAdapter {
+                        if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
                             try await generationTrackingAdapter.requeueMissingServerRecords(
                                 Array(recordIDsMissingOnServer),
                                 matchingPreparedGenerations: uploadGenerations

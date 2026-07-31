@@ -2562,7 +2562,7 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testUnknownCloudKitItemIsRequeuedAsNewInsteadOfLosingTracking() async throws {
+    func testUnknownCloudKitItemWithMatchingGenerationIsRequeuedAsNew() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
             id: "missing-on-server",
@@ -2578,13 +2578,15 @@ final class BigSyncKitTests: XCTestCase {
         let tracked = try XCTUnwrap(
             fixture.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordName)
         )
+        let preparedGeneration = try XCTUnwrap(tracked.pendingGeneration)
         try await fixture.persistenceRealm.asyncWrite {
             tracked.entityState = .changed
             tracked.encodedRecord = Data([1, 2, 3])
         }
 
-        try await fixture.adapter.deleteChangeTracking(
-            forRecordIDs: [CKRecord.ID(recordName: recordName, zoneID: fixture.adapter.recordZoneID)]
+        try await fixture.adapter.requeueMissingServerRecords(
+            [CKRecord.ID(recordName: recordName, zoneID: fixture.adapter.recordZoneID)],
+            matchingPreparedGenerations: [recordName: preparedGeneration]
         )
 
         let requeued = try XCTUnwrap(
@@ -2592,6 +2594,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertEqual(requeued.entityState, .new)
         XCTAssertNil(requeued.encodedRecord)
+        XCTAssertEqual(requeued.pendingGeneration, preparedGeneration)
     }
 
     @BigSyncBackgroundActor
