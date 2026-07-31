@@ -2610,9 +2610,10 @@ final class BigSyncKitTests: XCTestCase {
             fixture.targetRealm.add(object)
         }
         try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
-        let initialRecords = try await fixture.adapter.recordsToUpload(limit: 10)
-        let initialRecord = try XCTUnwrap(initialRecords.first)
-        try await fixture.adapter.didUpload(savedRecords: [initialRecord])
+        let initialPrepared = try await fixture.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let initial = try XCTUnwrap(initialPrepared.first)
+        let initialRecord = initial.record
+        try await fixture.adapter.didUpload(savedRecords: [initialRecord], matchingGenerations: [initialRecord.recordID.recordName: try XCTUnwrap(initial.generation)])
 
         try await fixture.targetRealm.asyncWrite {
             object.tags.append("first-edit")
@@ -2702,9 +2703,13 @@ final class BigSyncKitTests: XCTestCase {
         try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
             in: fixture.targetRealm
         )
-        let initialRecords = try await fixture.adapter.recordsToUpload(limit: 1)
-        let initialRecord = try XCTUnwrap(initialRecords.first)
-        try await fixture.adapter.didUpload(savedRecords: [initialRecord])
+        let initialPrepared = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 1,
+            restrictedToEntityType: nil
+        )
+        let initial = try XCTUnwrap(initialPrepared.first)
+        let initialRecord = initial.record
+        try await fixture.adapter.didUpload(savedRecords: [initialRecord], matchingGenerations: [initialRecord.recordID.recordName: try XCTUnwrap(initial.generation)])
 
         let recordName = initialRecord.recordID.recordName
         let deletionGeneration = UUID().uuidString
@@ -2750,6 +2755,240 @@ final class BigSyncKitTests: XCTestCase {
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
             )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testOpaquePreparedUploadBatchSupportsPartialAcknowledgement() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "partial-upload",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        XCTAssertEqual(batch.records.count, 1)
+        let acknowledged = try XCTUnwrap(batch.records.first)
+
+        try await fixture.adapter.acknowledgeUploadedRecords([], from: batch)
+        XCTAssertNotEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: acknowledged.recordID.recordName
+            )?.entityState,
+            .synced
+        )
+
+        try await fixture.adapter.acknowledgeUploadedRecords(
+            [acknowledged],
+            from: batch
+        )
+
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: acknowledged.recordID.recordName
+            )?.entityState,
+            .synced
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testOpaquePreparedUploadBatchRejectsAnotherAdapter() async throws {
+        let firstFixture = try await makeRealmAdapterFixture()
+        let secondFixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "wrong-adapter-batch",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await firstFixture.targetRealm.asyncWrite {
+            firstFixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await firstFixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: firstFixture.targetRealm
+        )
+        let batch = try await firstFixture.adapter.prepareUploadBatch(limit: 1)
+
+        do {
+            try await secondFixture.adapter.acknowledgeUploadedRecords(
+                batch.records,
+                from: batch
+            )
+            XCTFail("Expected an adapter ownership error")
+        } catch RealmSwiftAdapterAcknowledgementError.batchBelongsToAnotherAdapter {
+            // Expected.
+        }
+
+        let preparedRecord = try XCTUnwrap(batch.records.first)
+        let foreignRecord = CKRecord(
+            recordType: preparedRecord.recordType,
+            recordID: CKRecord.ID(
+                recordName: preparedRecord.recordID.recordName,
+                zoneID: CKRecordZone.ID(zoneName: "other-zone")
+            )
+        )
+        do {
+            try await firstFixture.adapter.acknowledgeUploadedRecords(
+                [foreignRecord],
+                from: batch
+            )
+            XCTFail("Expected an unprepared-record error")
+        } catch RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared {
+            // Expected.
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testOpaqueUploadBatchReplayDoesNotOverwriteNewerGeneration() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "replayed-upload",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        let record = try XCTUnwrap(batch.records.first)
+        try await fixture.adapter.acknowledgeUploadedRecords([record], from: batch)
+
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("newer-edit")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName
+            )
+        )
+        let newerGeneration = try XCTUnwrap(tracking.pendingGeneration)
+        let encodedBeforeReplay = tracking.encodedRecord
+        record["tags"] = ["stale-response"] as CKRecordValue
+
+        try await fixture.adapter.acknowledgeUploadedRecords([record], from: batch)
+
+        XCTAssertEqual(tracking.entityState, .changed)
+        XCTAssertEqual(tracking.pendingGeneration, newerGeneration)
+        XCTAssertEqual(tracking.encodedRecord, encodedBeforeReplay)
+    }
+
+    @BigSyncBackgroundActor
+    func testOpaqueDeletionBatchValidatesFullIDAndFailsClosed() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "opaque-deletion",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let uploadBatch = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        let uploaded = try XCTUnwrap(uploadBatch.records.first)
+        try await fixture.adapter.acknowledgeUploadedRecords(
+            [uploaded],
+            from: uploadBatch
+        )
+        let deletionGeneration = UUID().uuidString
+        let tracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: uploaded.recordID.recordName
+            )
+        )
+        try await fixture.persistenceRealm.asyncWrite {
+            tracking.entityState = .deletedLocally
+            tracking.pendingGeneration = deletionGeneration
+        }
+        let deletionBatch = try await fixture.adapter.prepareDeletionBatch(limit: 1)
+        let preparedID = try XCTUnwrap(deletionBatch.recordIDs.first)
+        let foreignID = CKRecord.ID(
+            recordName: preparedID.recordName,
+            zoneID: CKRecordZone.ID(zoneName: "other-zone")
+        )
+
+        do {
+            try await fixture.adapter.acknowledgeDeletedRecordIDs(
+                [foreignID],
+                from: deletionBatch
+            )
+            XCTFail("Expected an unprepared-record error")
+        } catch RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared {
+            // Expected.
+        }
+        await fixture.adapter.didDelete(recordIDs: [preparedID])
+        XCTAssertEqual(tracking.entityState, .deletedLocally)
+        XCTAssertEqual(tracking.pendingGeneration, deletionGeneration)
+
+        try await fixture.adapter.acknowledgeDeletedRecordIDs(
+            [preparedID],
+            from: deletionBatch
+        )
+        XCTAssertEqual(tracking.entityState, .deletedRemotely)
+        XCTAssertNil(tracking.pendingGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testGenerationlessUploadAcknowledgementFailsClosed() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "generationless-ack",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        let record = try XCTUnwrap(batch.records.first)
+
+        do {
+            try await fixture.adapter.didUpload(savedRecords: [record])
+            XCTFail("Expected a prepared-generation error")
+        } catch RealmSwiftAdapterAcknowledgementError.preparedGenerationRequired {
+            // Expected.
+        }
+
+        XCTAssertNotEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName
+            )?.entityState,
+            .synced
         )
     }
 
@@ -2802,11 +3041,12 @@ final class BigSyncKitTests: XCTestCase {
         try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
             in: fixture.targetRealm
         )
-        let uploadedRecords = try await fixture.adapter.recordsToUpload(
-            limit: 1
+        let uploadBatch = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        let uploaded = try XCTUnwrap(uploadBatch.records.first)
+        try await fixture.adapter.acknowledgeUploadedRecords(
+            [uploaded],
+            from: uploadBatch
         )
-        let uploaded = try XCTUnwrap(uploadedRecords.first)
-        try await fixture.adapter.didUpload(savedRecords: [uploaded])
 
         try await fixture.targetRealm.asyncWrite {
             object.tags.append("offline-edit")
@@ -2916,9 +3156,12 @@ final class BigSyncKitTests: XCTestCase {
         try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
             in: fixture.targetRealm
         )
-        let records = try await fixture.adapter.recordsToUpload(limit: 1)
-        let uploaded = try XCTUnwrap(records.first)
-        try await fixture.adapter.didUpload(savedRecords: [uploaded])
+        let uploadBatch = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        let uploaded = try XCTUnwrap(uploadBatch.records.first)
+        try await fixture.adapter.acknowledgeUploadedRecords(
+            [uploaded],
+            from: uploadBatch
+        )
 
         fixture.adapter._testBeforeRemoteDeletionTargetWrite = {
             try await fixture.targetRealm.asyncWrite {
@@ -2963,9 +3206,12 @@ final class BigSyncKitTests: XCTestCase {
         try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
             in: fixture.targetRealm
         )
-        let records = try await fixture.adapter.recordsToUpload(limit: 1)
-        let uploaded = try XCTUnwrap(records.first)
-        try await fixture.adapter.didUpload(savedRecords: [uploaded])
+        let uploadBatch = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        let uploaded = try XCTUnwrap(uploadBatch.records.first)
+        try await fixture.adapter.acknowledgeUploadedRecords(
+            [uploaded],
+            from: uploadBatch
+        )
         try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
         XCTAssertTrue(object.isDeleted)
 

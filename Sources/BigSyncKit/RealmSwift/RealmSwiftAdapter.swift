@@ -51,10 +51,35 @@ enum RealmSwiftAdapterError: Error {
 /// prepared. Sampling the current generation can acknowledge a newer edit.
 public enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
     case preparedGenerationRequired
+    case batchBelongsToAnotherAdapter
+    case recordWasNotPrepared
 
     public var errorDescription: String? {
-        "RealmSwiftAdapter acknowledgements require prepared record generations."
+        switch self {
+        case .preparedGenerationRequired:
+            "RealmSwiftAdapter acknowledgements require a prepared batch."
+        case .batchBelongsToAnotherAdapter:
+            "The prepared batch belongs to another RealmSwiftAdapter."
+        case .recordWasNotPrepared:
+            "The acknowledgement contains a record that was not in the prepared batch."
+        }
     }
+}
+
+/// Records prepared for one upload attempt. The mutation generations are kept
+/// opaque so acknowledgements cannot accidentally sample newer local edits.
+public struct RealmSwiftPreparedUploadBatch: @unchecked Sendable {
+    public let records: [CKRecord]
+    fileprivate let matchingGenerations: [String: String]
+    fileprivate let issuerID: UUID
+}
+
+/// Record identifiers prepared for one deletion attempt. The mutation
+/// generations are kept opaque for generation-matched acknowledgement.
+public struct RealmSwiftPreparedDeletionBatch: @unchecked Sendable {
+    public let recordIDs: [CKRecord.ID]
+    fileprivate let matchingGenerations: [String: String]
+    fileprivate let issuerID: UUID
 }
 import libzstd
 
@@ -345,6 +370,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     public var beforeInitialSetup: (() -> Void)?
     
     private let logger: Logging.Logger
+    private let acknowledgementIssuerID = UUID()
     
     @BigSyncBackgroundActor
     private var cancelSync: Bool = false
@@ -3894,12 +3920,50 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
 
     @BigSyncBackgroundActor
+    @available(*, deprecated, message: "Use prepareUploadBatch(limit:) so its result can be acknowledged safely.")
     public func recordsToUpload(limit: Int) async throws -> [CKRecord] {
         try await recordsToUpload(limit: limit, restrictedToEntityType: nil)
     }
+
+    /// Prepares upload records together with an opaque snapshot of their local
+    /// mutation generations. Pass this batch back when acknowledging successes.
+    @BigSyncBackgroundActor
+    public func prepareUploadBatch(limit: Int) async throws -> RealmSwiftPreparedUploadBatch {
+        let prepared = try await preparedRecordsToUpload(
+            limit: limit,
+            restrictedToEntityType: nil
+        )
+        return RealmSwiftPreparedUploadBatch(
+            records: prepared.map(\.record),
+            matchingGenerations: prepared.reduce(into: [:]) { generations, item in
+                guard let generation = item.generation else { return }
+                generations[item.record.recordID.recordName] = generation
+            },
+            issuerID: acknowledgementIssuerID
+        )
+    }
+
+    /// Acknowledges the successful subset of a previously prepared upload.
+    @BigSyncBackgroundActor
+    public func acknowledgeUploadedRecords(
+        _ savedRecords: [CKRecord],
+        from batch: RealmSwiftPreparedUploadBatch
+    ) async throws {
+        guard batch.issuerID == acknowledgementIssuerID else {
+            throw RealmSwiftAdapterAcknowledgementError.batchBelongsToAnotherAdapter
+        }
+        let preparedRecordIDs = Set(batch.records.map(\.recordID))
+        guard savedRecords.allSatisfy({ preparedRecordIDs.contains($0.recordID) }) else {
+            throw RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared
+        }
+        try await didUpload(
+            savedRecords: savedRecords,
+            matchingGenerations: batch.matchingGenerations
+        )
+    }
     
     @BigSyncBackgroundActor
-    @available(*, deprecated, message: "Use didUpload(savedRecords:matchingGenerations:) with generations captured from preparedRecordsToUpload.")
+    @available(*, deprecated, message: "Use prepareUploadBatch(limit:) and acknowledgeUploadedRecords(_:from:).")
     public func didUpload(savedRecords: [CKRecord]) async throws {
         throw RealmSwiftAdapterAcknowledgementError.preparedGenerationRequired
     }
@@ -3923,16 +3987,16 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                     try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
                     
-                    if let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName) {
-                        try Task.checkCancellation()
-                        try save(record: record, for: syncedEntity)
-                        if let uploadedGeneration = matchingGenerations[record.recordID.recordName],
-                           syncedEntity.pendingGeneration == uploadedGeneration {
-                            syncedEntity.state = SyncedEntityState.synced.rawValue
-                            syncedEntity.pendingGeneration = nil
-                            acknowledgedGenerations[record.recordID.recordName] = uploadedGeneration
-                        }
-                    }
+                    guard let syncedEntity = persistenceRealm.object(
+                        ofType: SyncedEntity.self,
+                        forPrimaryKey: record.recordID.recordName
+                    ), let uploadedGeneration = matchingGenerations[record.recordID.recordName],
+                       syncedEntity.pendingGeneration == uploadedGeneration else { continue }
+                    try Task.checkCancellation()
+                    try save(record: record, for: syncedEntity)
+                    syncedEntity.state = SyncedEntityState.synced.rawValue
+                    syncedEntity.pendingGeneration = nil
+                    acknowledgedGenerations[record.recordID.recordName] = uploadedGeneration
                 }
             }
             await Task.yield()
@@ -4021,12 +4085,50 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     }
 
     @BigSyncBackgroundActor
+    @available(*, deprecated, message: "Use prepareDeletionBatch(limit:) so its result can be acknowledged safely.")
     public func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID] {
         try await recordIDsMarkedForDeletion(limit: limit, restrictedToEntityType: nil)
     }
+
+    /// Prepares deletions together with an opaque snapshot of their local
+    /// mutation generations. Pass this batch back when acknowledging successes.
+    @BigSyncBackgroundActor
+    public func prepareDeletionBatch(limit: Int) async throws -> RealmSwiftPreparedDeletionBatch {
+        let prepared = try await preparedRecordDeletions(
+            limit: limit,
+            restrictedToEntityType: nil
+        )
+        return RealmSwiftPreparedDeletionBatch(
+            recordIDs: prepared.map(\.recordID),
+            matchingGenerations: prepared.reduce(into: [:]) { generations, item in
+                guard let generation = item.generation else { return }
+                generations[item.recordID.recordName] = generation
+            },
+            issuerID: acknowledgementIssuerID
+        )
+    }
+
+    /// Acknowledges the successful subset of a previously prepared deletion.
+    @BigSyncBackgroundActor
+    public func acknowledgeDeletedRecordIDs(
+        _ recordIDs: [CKRecord.ID],
+        from batch: RealmSwiftPreparedDeletionBatch
+    ) async throws {
+        guard batch.issuerID == acknowledgementIssuerID else {
+            throw RealmSwiftAdapterAcknowledgementError.batchBelongsToAnotherAdapter
+        }
+        let preparedRecordIDs = Set(batch.recordIDs)
+        guard recordIDs.allSatisfy({ preparedRecordIDs.contains($0) }) else {
+            throw RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared
+        }
+        try await didDelete(
+            recordIDs: recordIDs,
+            matchingGenerations: batch.matchingGenerations
+        )
+    }
     
     @BigSyncBackgroundActor
-    @available(*, deprecated, message: "Use didDelete(recordIDs:matchingGenerations:) with generations captured from preparedRecordDeletions.")
+    @available(*, deprecated, message: "Use prepareDeletionBatch(limit:) and acknowledgeDeletedRecordIDs(_:from:).")
     public func didDelete(recordIDs deletedRecordIDs: [CKRecord.ID]) async {
         logger.error(
             "Ignoring generationless deletion acknowledgement for \(deletedRecordIDs.count) records; prepared generations are required."
