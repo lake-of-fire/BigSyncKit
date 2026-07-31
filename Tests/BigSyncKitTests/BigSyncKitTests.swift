@@ -338,7 +338,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     private var storedServerChangeToken: CKServerChangeToken?
     var didFinishImportHandler: (@Sendable () async throws -> Void)?
     var cleanUpHandler: (@Sendable () async throws -> Void)?
-    var resetSyncCachesHandler: (@Sendable () async -> Void)?
+    var resetSyncCachesHandler: (@Sendable () async throws -> Void)?
     var saveChangesHandler: (@Sendable () async throws -> Void)?
     var recordsToUploadHandler: (@Sendable () async throws -> Void)?
 
@@ -365,7 +365,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     }
     func resetSyncCaches() async throws {
         events.append("resetSyncCaches")
-        await resetSyncCachesHandler?()
+        try await resetSyncCachesHandler?()
     }
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool { true }
 
