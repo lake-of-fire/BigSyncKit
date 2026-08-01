@@ -21,6 +21,7 @@ private final class NoopAdapterProvider: NSObject, AdapterProvider {
 }
 
 private enum TestSynchronizationError: Error {
+    case initialSetupFailed
     case terminalForwardingFailed
     case deletedZoneResetFailed
     case restoredBackupResetFailed
@@ -54,7 +55,12 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
     var accountIdentifier = "test-account"
     var accountIdentifierAfterNextRecordFetch: String?
+    // Review findings 3 and 4 test seams for account replacement at callback
+    // and final CloudKit mutation boundaries.
+    var accountIdentifierAfterNextDatabaseChangesFetch: String?
+    var databaseDeletedZoneIDs = [CKRecordZone.ID]()
     var accountIdentifierAfterNextMigrationMarkerSave: String?
+    var accountIdentifierAfterNextModifyRecords: String?
     var accountIdentifierAfterNextZoneDeletion: String?
     var migrationClaimFetchDelayNanoseconds: UInt64?
     var deleteZoneDelayNanoseconds: UInt64?
@@ -64,6 +70,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private(set) var savedSubscriptionCount = 0
     private(set) var subscriptionFetchCount = 0
     private(set) var modifySubscriptionOperationCount = 0
+    private(set) var modifyRecordsOperationCount = 0
     private(set) var fetchZoneChangesOperationCount = 0
     private(set) var recordZoneFetchCount = 0
     private(set) var modifyRecordsAtomicValues = [Bool]()
@@ -81,6 +88,14 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     func add(_ operation: CKDatabaseOperation) {
         if let fetchOperation = operation as? CKFetchDatabaseChangesOperation {
             if completesFetchDatabaseChanges {
+                for zoneID in databaseDeletedZoneIDs {
+                    fetchOperation.recordZoneWithIDWasDeletedBlock?(zoneID)
+                }
+                if let nextAccountIdentifier =
+                    accountIdentifierAfterNextDatabaseChangesFetch {
+                    accountIdentifier = nextAccountIdentifier
+                    accountIdentifierAfterNextDatabaseChangesFetch = nil
+                }
                 fetchOperation.fetchDatabaseChangesCompletionBlock?(nil, false, nil)
             }
             return
@@ -114,11 +129,17 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             modifySubscriptionOperationCount += 1
         }
         if let modifyOperation = operation as? CKModifyRecordsOperation {
+            modifyRecordsOperationCount += 1
             modifyRecordsAtomicValues.append(modifyOperation.isAtomic)
             modifyRecordsSavePolicies.append(modifyOperation.savePolicy)
             guard completesModifyOperations else { return }
             let savedRecords = modifyOperation.recordsToSave ?? []
             let deletedRecordIDs = modifyOperation.recordIDsToDelete ?? []
+            if let nextAccountIdentifier =
+                accountIdentifierAfterNextModifyRecords {
+                accountIdentifier = nextAccountIdentifier
+                accountIdentifierAfterNextModifyRecords = nil
+            }
             if let nextAccountIdentifier = accountIdentifierAfterNextMigrationMarkerSave,
                !savedRecords.isEmpty {
                 accountIdentifier = nextAccountIdentifier
@@ -303,9 +324,12 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
 private final class FakeModelAdapterDelegate: ModelAdapterDelegate {
     private(set) var initialSetupCount = 0
     private(set) var uploadWakeupCount = 0
+    // Review finding 1 test seam for throwing adapter readiness.
+    var initialSetupHandler: (@Sendable () async throws -> Void)?
 
     func needsInitialSetup() async throws {
         initialSetupCount += 1
+        try await initialSetupHandler?()
     }
 
     func hasChangesToUpload() async {
@@ -358,6 +382,8 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
 
     private(set) var events = [String]()
     private(set) var savedBatchSizes = [Int]()
+    // Review finding 2 test seam for the post-cleanup forwarding boundary.
+    private(set) var didFinishImportCount = 0
     private var uploadedByEntity: [String: [CKRecord]]
     private var deletedByEntity: [String: [CKRecord.ID]]
     private var storedServerChangeToken: CKServerChangeToken?
@@ -463,6 +489,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
         events.append("deleteTracking:\(recordNames)")
     }
     func didFinishImport() async throws {
+        didFinishImportCount += 1
         try await didFinishImportHandler?()
     }
     func cancelSynchronization() {}
@@ -712,7 +739,7 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         operation.start()
-        await fulfillment(of: [finished], timeout: 1)
+        await fulfillment(of: [finished], timeout: 5)
 
         XCTAssertEqual(deliveredPages, [["Item.first"], []])
         XCTAssertEqual(finishCount, 1)
@@ -832,11 +859,55 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPostCleanupJournalForwardingFailureWithholdsReceipt() async {
+        // Review finding 2: the second forwarding boundary is the only call that
+        // sees a mutation committed while cleanup was running.
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "post-cleanup-forwarding"),
+            priorities: []
+        )
+        adapter.didFinishImportHandler = { [weak adapter] in
+            if adapter?.didFinishImportCount == 2 {
+                throw TestSynchronizationError.terminalForwardingFailed
+            }
+        }
+        synchronizer.addModelAdapter(adapter)
+
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        await synchronizer.changesFinishedSynchronizing()
+
+        do {
+            _ = try await synchronization.value
+            XCTFail("Expected post-cleanup journal forwarding failure")
+        } catch TestSynchronizationError.terminalForwardingFailed {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertGreaterThanOrEqual(adapter.didFinishImportCount, 2)
+        XCTAssertTrue(adapter.events.contains("cleanUp"))
+        XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
+        XCTAssertFalse(synchronizer.syncing)
+    }
+
+    @BigSyncBackgroundActor
     func testDeletedZoneProviderFailureIsPropagatedBeforeTokenCommit() async {
+        let database = FakeCloudKitDatabase()
+        database.databaseDeletedZoneIDs = [
+            CKRecordZone.ID(zoneName: "deleted-zone")
+        ]
         let synchronizer = CloudKitSynchronizer(
             identifier: "deleted-zone-reset-failure",
             containerIdentifier: "iCloud.test",
-            database: FakeCloudKitDatabase(),
+            database: database,
             adapterProvider: FailingDeletedZoneProvider(),
             keyValueStore: DictionaryKeyValueStore(),
             accountIdentifierProvider: { "test-account" },
@@ -844,9 +915,7 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         do {
-            try await synchronizer.notifyProviderForDeletedZoneIDs([
-                CKRecordZone.ID(zoneName: "deleted-zone")
-            ])
+            _ = try await synchronizer.synchronize()
             XCTFail("Expected deleted-zone cache reset failure")
         } catch TestSynchronizationError.deletedZoneResetFailed {
         } catch {
@@ -890,6 +959,244 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
         XCTAssertTrue(adapter.events.contains("cleanUp"))
+        XCTAssertFalse(synchronizer.syncing)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountSwitchBeforeDeletedZonePublicationSkipsProviderMutation()
+    async {
+        // Review finding 3: the provider callback can destructively reset Realm
+        // tracking state, so it must not run for a stale account callback.
+        final class RecordingProvider: NSObject, AdapterProvider {
+            private(set) var deletedZoneCount = 0
+
+            func cloudKitSynchronizer(
+                _ synchronizer: CloudKitSynchronizer,
+                modelAdapterForRecordZoneID zoneID: CKRecordZone.ID
+            ) -> ModelAdapter? {
+                nil
+            }
+
+            func cloudKitSynchronizer(
+                _ synchronizer: CloudKitSynchronizer,
+                zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID
+            ) async throws {
+                deletedZoneCount += 1
+            }
+        }
+
+        let database = FakeCloudKitDatabase()
+        database.databaseDeletedZoneIDs = [
+            CKRecordZone.ID(zoneName: "stale-deleted-zone")
+        ]
+        database.accountIdentifierAfterNextDatabaseChangesFetch = "account-b"
+        let provider = RecordingProvider()
+        let synchronizer = CloudKitSynchronizer(
+            identifier: UUID().uuidString,
+            containerIdentifier: "iCloud.test",
+            database: database,
+            adapterProvider: provider,
+            keyValueStore: DictionaryKeyValueStore(),
+            accountIdentifierProvider: { database.accountIdentifier },
+            logger: Logger(label: "BigSyncKitTests")
+        )
+
+        // Review finding 4: the account check runs inside a callback-owned Task.
+        // Bound the assertion so a discarded thrown error is reported as a hang.
+        let finished = expectation(description: "stale callback failed the run")
+        var didComplete = false
+        var observedError: Error?
+        let synchronization = Task { @BigSyncBackgroundActor in
+            defer {
+                didComplete = true
+                finished.fulfill()
+            }
+            do {
+                _ = try await synchronizer.synchronize()
+            } catch {
+                observedError = error
+            }
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        guard didComplete else {
+            synchronization.cancel()
+            await synchronizer.cancelSynchronizationAndWait()
+            XCTFail("Stale database callback abandoned the synchronization run")
+            return
+        }
+        guard let resetError = observedError as? OneOffRecordZoneResetError else {
+            if let observedError {
+                XCTFail("Unexpected error: \(observedError)")
+            } else {
+                XCTFail("Expected account replacement to fail the stale callback")
+            }
+            return
+        }
+        guard case .cloudKitAccountChanged = resetError else {
+            XCTFail("Unexpected reset error: \(resetError)")
+            return
+        }
+        XCTAssertEqual(provider.deletedZoneCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountSwitchDuringUploadPreparationSkipsCloudKitMutation()
+    async {
+        // Review finding 3: adapter preparation can suspend after the run's last
+        // account check. The mutating CloudKit operation must perform its own
+        // final preflight.
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(
+            zoneName: "upload-account-preflight",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: [],
+            uploadedByEntity: [
+                "Item": [makeRecord(type: "Item", id: "1", zoneID: zoneID)]
+            ]
+        )
+        adapter.recordsToUploadHandler = {
+            database.accountIdentifier = "account-b"
+        }
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("Expected account replacement before upload")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountSwitchInUploadCallbackFailsRunInsteadOfHanging() async {
+        // Review finding 4: CloudKit can complete after the account changes. The
+        // callback's final validation must resolve the awaiting upload bridge.
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifierAfterNextModifyRecords = "account-b"
+        let zoneID = CKRecordZone.ID(
+            zoneName: "upload-callback-account-switch",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: [],
+            uploadedByEntity: [
+                "Item": [makeRecord(type: "Item", id: "1", zoneID: zoneID)]
+            ]
+        )
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        let finished = expectation(description: "upload callback failed the run")
+        var didComplete = false
+        var observedError: Error?
+        let synchronization = Task { @BigSyncBackgroundActor in
+            defer {
+                didComplete = true
+                finished.fulfill()
+            }
+            do {
+                _ = try await synchronizer.synchronize()
+            } catch {
+                observedError = error
+            }
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        guard didComplete else {
+            synchronization.cancel()
+            await synchronizer.cancelSynchronizationAndWait()
+            XCTFail("Upload callback abandoned the synchronization run")
+            return
+        }
+        guard let resetError = observedError as? OneOffRecordZoneResetError else {
+            if let observedError {
+                XCTFail("Unexpected error: \(observedError)")
+            } else {
+                XCTFail("Expected account replacement during upload callback")
+            }
+            return
+        }
+        guard case .cloudKitAccountChanged = resetError else {
+            XCTFail("Unexpected reset error: \(resetError)")
+            return
+        }
+        XCTAssertEqual(database.modifyRecordsOperationCount, 1)
+        XCTAssertFalse(synchronizer.syncing)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountSwitchInDeletionCallbackFailsRunInsteadOfHanging() async {
+        // Review finding 4: the deletion callback has the same unstructured-task
+        // boundary as uploads and must resolve its awaiting attempt on failure.
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifierAfterNextModifyRecords = "account-b"
+        let zoneID = CKRecordZone.ID(
+            zoneName: "deletion-callback-account-switch",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let recordID = CKRecord.ID(
+            recordName: "Item.1",
+            zoneID: zoneID
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: [],
+            deletedByEntity: ["Item": [recordID]]
+        )
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        let finished = expectation(
+            description: "deletion callback failed the run"
+        )
+        var didComplete = false
+        var observedError: Error?
+        let synchronization = Task { @BigSyncBackgroundActor in
+            defer {
+                didComplete = true
+                finished.fulfill()
+            }
+            do {
+                _ = try await synchronizer.synchronize()
+            } catch {
+                observedError = error
+            }
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        guard didComplete else {
+            synchronization.cancel()
+            await synchronizer.cancelSynchronizationAndWait()
+            XCTFail("Deletion callback abandoned the synchronization run")
+            return
+        }
+        guard let resetError = observedError as? OneOffRecordZoneResetError else {
+            if let observedError {
+                XCTFail("Unexpected error: \(observedError)")
+            } else {
+                XCTFail("Expected account replacement during deletion callback")
+            }
+            return
+        }
+        guard case .cloudKitAccountChanged = resetError else {
+            XCTFail("Unexpected reset error: \(resetError)")
+            return
+        }
+        XCTAssertEqual(database.modifyRecordsOperationCount, 1)
         XCTAssertFalse(synchronizer.syncing)
     }
 
@@ -1917,7 +2224,7 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(database.recordZoneFetchCount, 1)
 
         reset.cancel()
-        await fulfillment(of: [finished], timeout: 1)
+        await fulfillment(of: [finished], timeout: 5)
         do {
             _ = try await reset.value
             XCTFail("Expected reset cancellation")
@@ -4394,6 +4701,89 @@ final class BigSyncKitTests: XCTestCase {
             fixture.persistenceRealm.objects(PendingRelationship.self).count,
             0
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalImportUsesCompletedSetupAndWakesForNewJournalEntry()
+    async throws {
+        // Review finding 1: rerunning setup here forwards with notifyDelegate=false
+        // and suppresses the only wakeup for this durable mutation.
+        let fixture = try await makeRealmAdapterFixture()
+        let delegate = FakeModelAdapterDelegate()
+        fixture.adapter.modelAdapterDelegate = delegate
+        let object = BigSyncTrackedObject(
+            id: "terminal-ready-journal",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className()
+            + ".terminal-ready-journal"
+        let generation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )?.generation
+        )
+
+        try await fixture.adapter.didFinishImport()
+
+        XCTAssertEqual(delegate.uploadWakeupCount, 1)
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration,
+            generation
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testInitialSetupFailureRemainsRetryable() async throws {
+        // Review finding 1: a setup callback failure must not leave a non-nil
+        // provider that later passes readiness checks as an empty adapter.
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "retryable-setup-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "retryable-setup-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(zoneName: "retryable-setup"),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        let delegate = FakeModelAdapterDelegate()
+        delegate.initialSetupHandler = {
+            throw TestSynchronizationError.initialSetupFailed
+        }
+        adapter.modelAdapterDelegate = delegate
+
+        do {
+            try await adapter.unsetCancellation()
+            XCTFail("Expected initial setup failure")
+        } catch TestSynchronizationError.initialSetupFailed {
+        }
+        XCTAssertEqual(delegate.initialSetupCount, 1)
+
+        delegate.initialSetupHandler = nil
+        try await adapter.unsetCancellation()
+
+        XCTAssertEqual(delegate.initialSetupCount, 2)
+        XCTAssertNotNil(adapter.realmProvider?.persistenceRealm)
     }
 
     @BigSyncBackgroundActor

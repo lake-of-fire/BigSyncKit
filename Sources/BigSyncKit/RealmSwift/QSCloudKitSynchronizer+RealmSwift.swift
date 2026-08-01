@@ -98,13 +98,26 @@ extension CloudKitSynchronizer {
     
     /// Must call this after initializing synchronizer.
     @BigSyncBackgroundActor
-    internal class func transferOldServerChangeToken(to adapter: ModelAdapter, userDefaults: KeyValueStore, containerName: String) async {
+    internal class func transferOldServerChangeToken(
+        to adapter: ModelAdapter,
+        userDefaults: KeyValueStore,
+        containerName: String
+    ) async throws {
         let key = containerName.appending("QSCloudKitFetchChangesServerTokenKey")
-        if let encodedToken = userDefaults.object(forKey: key) as? Data {
-            if let token = NSKeyedUnarchiver.unarchiveObject(with: encodedToken) as? CKServerChangeToken {
-                try? await adapter.saveToken(token)
-            }
-            userDefaults.removeObject(forKey: key)
+        guard let encodedToken = userDefaults.object(forKey: key) as? Data else {
+            return
         }
+        guard let token = NSKeyedUnarchiver.unarchiveObject(
+            with: encodedToken
+        ) as? CKServerChangeToken else {
+            // Corrupt legacy data cannot be retried usefully; discard it so the
+            // adapter performs a full fetch.
+            userDefaults.removeObject(forKey: key)
+            return
+        }
+        // Do not destroy a valid legacy token until its Realm-backed copy has
+        // been durably written.
+        try await adapter.saveToken(token)
+        userDefaults.removeObject(forKey: key)
     }
 }

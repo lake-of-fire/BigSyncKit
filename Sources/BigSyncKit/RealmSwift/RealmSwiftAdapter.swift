@@ -542,6 +542,11 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         activeSetupTask?.cancel()
         _ = try? await activeSetupTask?.value
         setupTask = nil
+        // A destructive reset invalidates setup readiness before any tracking
+        // mutation. If a Realm write below fails, the next
+        // synchronization must retry setup rather than use a partially cleared
+        // provider.
+        isSetupInterrupted = true
         invalidateTokens()
         
         if let persistenceRealm = realmProvider?.persistenceRealm {
@@ -646,6 +651,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     @BigSyncBackgroundActor
     private func ensureSetup() async throws {
         try Task.checkCancellation()
+        // A non-nil provider is not sufficient while setup is in progress or
+        // failed. Conversely, a completed setup must not be rerun
+        // by terminal forwarding because that drain intentionally suppresses
+        // delegate wakeups.
+        if !isSetupInterrupted, realmProvider != nil {
+            return
+        }
         if let setupTask {
             try await setupTask.value
             return
@@ -675,11 +687,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     private func performSetup() async throws {
         logger.info("QSCloudKitSynchronizer >> Setup synchronization...")
         //        debugPrint("# setup() ...")
-        // Setup can be retried after cancellation or a cache reset. Tear down any
-        // prior notification graph so retries never accumulate duplicate Realm
-        // observers or debounced processors.
+        // Setup can be retried after cancellation or a cache reset. Tear down
+        // any prior notification graph so retries never accumulate
+        // duplicate Realm observers or debounced processors. Readiness remains
+        // interrupted until every setup step, including journal forwarding,
+        // succeeds.
+        isSetupInterrupted = true
         invalidateTokens()
-        isSetupInterrupted = false
         let provider = try await RealmProvider(
             persistenceConfiguration: persistenceRealmConfiguration,
             targetConfigurations: targetRealmConfigurations
@@ -704,7 +718,10 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
         
-        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+        guard let persistenceRealm = realmProvider.persistenceRealm else {
+            try Task.checkCancellation()
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
         let syncEmpty = persistenceRealm.objects(SyncedEntity.self).isEmpty
         // An empty user Realm is still initialized. Without this durable marker,
         // empty databases repeated the full initial scan on every launch.
@@ -716,15 +733,15 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         let needsInitialSetup = syncEmpty && needsMutationJournalRecovery
         
         if needsInitialSetup {
-            do {
-                try await modelAdapterDelegate?.needsInitialSetup()
-            } catch {
-                //                print(error)
-                logger.error("\(error)")
-            }
+            // Reset/setup failures are synchronization failures. Continuing
+            // would make an unprepared adapter look like an empty data set.
+            try await modelAdapterDelegate?.needsInitialSetup()
         }
         
-        guard let targetReaderRealms = realmProvider.targetReaderRealms else { return }
+        guard let targetReaderRealms = realmProvider.targetReaderRealms else {
+            try Task.checkCancellation()
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
         
 #if DEBUG
         if !Self.shouldSkipDebugDummySetup {
@@ -803,7 +820,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                         try await createSyncedEntities(entityType: schema.className, identifiers: identifiers)
                     } catch is CancellationError {
                         isSetupInterrupted = true
-                        return
+                        throw CancellationError()
                     } catch {
                         isSetupInterrupted = true
                         throw error
@@ -831,7 +848,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
                 try await createMissingSyncedEntities()
             } catch is CancellationError {
                 isSetupInterrupted = true
-                return
+                throw CancellationError()
             } catch {
                 isSetupInterrupted = true
                 throw error
@@ -853,6 +870,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         }
 
         updateHasChanges(realm: persistenceRealm)
+        isSetupInterrupted = false
         
         //        if hasChanges {
         //            Task { @BigSyncBackgroundActor in
@@ -1199,15 +1217,46 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         in targetReaderRealm: Realm,
         notifyDelegate: Bool = true
     ) async throws -> Int {
+        // Freeze the journal boundary so paging does not change which generations
+        // this drain promises to forward, while avoiding one O(N) snapshot array.
         let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
-        let pending = Array(mutations.map {
-            self.pendingMutationSnapshot($0, in: targetReaderRealm)
-        })
-        return try await forwardPendingMutations(
-            pending,
-            in: targetReaderRealm,
-            notifyDelegate: notifyDelegate
-        )
+            .sorted(byKeyPath: "recordName")
+            .freeze()
+        let pageSize = 1_000
+        var forwardedCount = 0
+        var offset = 0
+        while offset < mutations.count {
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
+            let end = min(offset + pageSize, mutations.count)
+            var pending = [BigSyncPendingMutationSnapshot]()
+            pending.reserveCapacity(end - offset)
+            for index in offset..<end {
+                pending.append(
+                    pendingMutationSnapshot(
+                        mutations[index],
+                        in: targetReaderRealm
+                    )
+                )
+            }
+            forwardedCount += try await forwardPendingMutations(
+                pending,
+                in: targetReaderRealm,
+                notifyDelegate: false,
+                updateStatus: false
+            )
+            offset = end
+            await Task.yield()
+        }
+
+        if forwardedCount > 0,
+           let persistenceRealm = realmProvider?.persistenceRealm {
+            updateHasChanges(realm: persistenceRealm)
+            if notifyDelegate {
+                await modelAdapterDelegate?.hasChangesToUpload()
+            }
+        }
+        return forwardedCount
     }
 
     @BigSyncBackgroundActor
@@ -1215,7 +1264,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     private func forwardPendingMutations(
         _ pending: [BigSyncPendingMutationSnapshot],
         in targetReaderRealm: Realm,
-        notifyDelegate: Bool = true
+        notifyDelegate: Bool = true,
+        updateStatus: Bool = true
     ) async throws -> Int {
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else { return 0 }
@@ -1277,7 +1327,7 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             }
         }
 
-        if forwardedCount > 0 {
+        if forwardedCount > 0, updateStatus {
             updateHasChanges(realm: persistenceRealm)
             if notifyDelegate {
                 await modelAdapterDelegate?.hasChangesToUpload()
@@ -1480,6 +1530,9 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 
     @BigSyncBackgroundActor
     func _test_setup() async throws {
+        // Tests that model relaunch/recovery explicitly force setup. Production
+        // readiness checks use the completed-state fast path.
+        isSetupInterrupted = true
         try await ensureSetup()
     }
 #endif
@@ -1599,12 +1652,17 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         ]
         let results = realm.objects(SyncedEntity.self).where { $0.state.in(pendingStates) }
         let count = results.count
-        if hasChangesCount != count {
-            let syncedCount = realm.objects(SyncedEntity.self).where { $0.state == SyncedEntityState.synced.rawValue } .count
-            logger.debug("QSCloudKitSynchronizer >> \(count) changed records remaining to upload. \(syncedCount) records already marked as synced.")
-        }
+        let previousCount = hasChangesCount
         hasChangesCount = count
         hasChanges = count > 0
+        guard previousCount != count else { return }
+
+        let syncedCount = realm.objects(SyncedEntity.self).where {
+            $0.state == SyncedEntityState.synced.rawValue
+        }.count
+        logger.debug(
+            "QSCloudKitSynchronizer >> \(count) changed records remaining to upload. \(syncedCount) records already marked as synced."
+        )
         Task(priority: .background) { @BigSyncBackgroundActor in
             NotificationCenter.default.post(
                 name: .SynchronizerChangesRemainingToUpload,

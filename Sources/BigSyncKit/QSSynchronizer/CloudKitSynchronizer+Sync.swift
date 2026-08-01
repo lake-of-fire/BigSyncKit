@@ -63,6 +63,11 @@ extension CloudKitSynchronizer {
                 try await revalidateActiveRunContext(for: attemptID)
                 try await adapter.cleanUp()
                 try await revalidateActiveRunContext(for: attemptID)
+                // Cleanup can overlap a newly committed local mutation. Forward
+                // journals again so that mutation requests a new
+                // drain before a terminal receipt is issued.
+                try await adapter.didFinishImport()
+                try await revalidateActiveRunContext(for: attemptID)
             } catch is CancellationError {
                 return
             } catch {
@@ -259,9 +264,19 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func notifyProviderForDeletedZoneIDs(_ zoneIDs: [CKRecordZone.ID]) async throws {
+    func notifyProviderForDeletedZoneIDs(
+        _ zoneIDs: [CKRecordZone.ID],
+        attemptID: UUID
+    ) async throws {
         for zoneID in zoneIDs {
-            try await self.adapterProvider.cloudKitSynchronizer(self, zoneWasDeletedWithZoneID: zoneID)
+            // A deleted-zone callback must not clear tracking metadata after
+            // CloudKit has switched accounts.
+            try await revalidateActiveRunContext(for: attemptID)
+            try await self.adapterProvider.cloudKitSynchronizer(
+                self,
+                zoneWasDeletedWithZoneID: zoneID
+            )
+            try await revalidateActiveRunContext(for: attemptID)
             self.delegate?.synchronizer(self, zoneIDWasDeleted: zoneID)
         }
     }
@@ -474,6 +489,7 @@ extension CloudKitSynchronizer {
                 guard let self,
                       beginRunCallback(for: attemptID) else { return }
                 defer { endRunCallback() }
+                do {
                 
                 try Task.checkCancellation()
                 guard !cancelSync else {
@@ -481,7 +497,10 @@ extension CloudKitSynchronizer {
                     return
                 }
                 
-                try await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                try await notifyProviderForDeletedZoneIDs(
+                    deletedZoneIDs,
+                    attemptID: attemptID
+                )
                 try await revalidateActiveRunContext(for: attemptID)
                 
                 let zoneIDsToFetch = try await loadTokens(for: changedZoneIDs, loadAdapters: true)
@@ -523,6 +542,13 @@ extension CloudKitSynchronizer {
 
                     try await completion(token, nil)
                 }
+                } catch {
+                    // Errors thrown inside this callback-owned task must not be
+                    // discarded after the CloudKit operation
+                    // has already reported success, leaving the run unresolved.
+                    guard synchronizationAttemptID == attemptID else { return }
+                    await failSynchronization(error: error)
+                }
             }
         }
         await runOperation(operation)
@@ -554,7 +580,10 @@ extension CloudKitSynchronizer {
                 try Task.checkCancellation()
                 if let error = zoneResult.error {
                     if isZoneNotFoundOrDeletedError(error) {
-                        try await notifyProviderForDeletedZoneIDs([zoneID])
+                        try await notifyProviderForDeletedZoneIDs(
+                            [zoneID],
+                            attemptID: attemptID
+                        )
                         try await revalidateActiveRunContext(for: attemptID)
                         guard synchronizationRunID == runID else {
                             throw CancellationError()
@@ -782,7 +811,7 @@ extension CloudKitSynchronizer {
             return
         }
         
-        setupRecordZoneID(
+        try await setupRecordZoneID(
             adapter.recordZoneID,
             attemptID: attemptID,
             completion: completion
@@ -794,7 +823,10 @@ extension CloudKitSynchronizer {
         _ zoneID: CKRecordZone.ID,
         attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
-    ) {
+    ) async throws {
+        // Validate after the preceding adapter await and immediately before
+        // starting an account-routed CloudKit operation.
+        try await revalidateActiveRunContext(for: attemptID)
         database.fetch(withRecordZoneID: zoneID) { [weak self] (zone, error) in
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self,
@@ -803,8 +835,21 @@ extension CloudKitSynchronizer {
                     return
                 }
                 defer { endRunCallback() }
+                do {
+                    try await revalidateActiveRunContext(for: attemptID)
+                } catch {
+                    try await completion(error)
+                    return
+                }
                 if isZoneNotFoundOrDeletedError(error) {
                     let newZone = CKRecordZone(zoneID: zoneID)
+                    do {
+                        // No suspension occurs between this validation and save().
+                        try await revalidateActiveRunContext(for: attemptID)
+                    } catch {
+                        try await completion(error)
+                        return
+                    }
                     database.save(zone: newZone, completionHandler: { [weak self] (zone, error) in
                         Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                             guard let self,
@@ -813,6 +858,12 @@ extension CloudKitSynchronizer {
                                 return
                             }
                             defer { endRunCallback() }
+                            do {
+                                try await revalidateActiveRunContext(for: attemptID)
+                            } catch {
+                                try await completion(error)
+                                return
+                            }
                             if error == nil && zone != nil {
                                 //                        debugPrint("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
                                 logger.info("QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)")
@@ -878,6 +929,9 @@ extension CloudKitSynchronizer {
         //Add metadata: device UUID and model version
         addMetadata(to: records)
         try checkSynchronizationAttempt(attemptID)
+        // Prepared Realm work can suspend. Revalidate the account immediately
+        // before starting the mutating operation.
+        try await revalidateActiveRunContext(for: attemptID)
         //        debugPrint("## Upload", records.map {($0.recordID, $0) })
         let modifyRecordsOperation = ModifyRecordsOperation(
             database: database,
@@ -890,10 +944,20 @@ extension CloudKitSynchronizer {
                 //                debugPrint("# uploadRecords, inside operation callback Task...", records.count, "saved", savedRecords?.count, "del", deleted?.count, "conflicted", conflicted.count, operationError)
                 guard let self else { return }
                 guard beginRunCallback(for: attemptID) else {
-                    try await completion(CancellationError())
+                    try? await completion(CancellationError())
                     return
                 }
                 defer { endRunCallback() }
+                @BigSyncBackgroundActor
+                func finish(_ resultError: Error?) async {
+                    do {
+                        try await completion(resultError)
+                    } catch {
+                        guard synchronizationAttemptID == attemptID else { return }
+                        await failSynchronization(error: error)
+                    }
+                }
+                do {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 if let savedRecords, !savedRecords.isEmpty {
@@ -957,7 +1021,7 @@ extension CloudKitSynchronizer {
                         if self.isLimitExceededError(error) {
                             reduceBatchSize()
                         }
-                        try await completion(error)
+                        await finish(error)
                         return
                     }
 
@@ -975,7 +1039,7 @@ extension CloudKitSynchronizer {
                             logger.warning(
                                 "QSCloudKitSynchronizer >> Failed to resolve conflicted records: \(error)"
                             )
-                            try await completion(error)
+                            await finish(error)
                             return
                         }
                     }
@@ -996,7 +1060,7 @@ extension CloudKitSynchronizer {
                         }
                         try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
-                        try await completion(error)
+                        await finish(error)
                         return
                     }
                 }
@@ -1019,7 +1083,13 @@ extension CloudKitSynchronizer {
                         completion: completion
                     )
                 } else {
-                    try await completion(nil)
+                    await finish(nil)
+                }
+                } catch {
+                    // Acknowledgement, account validation, and recursive-batch
+                    // errors occur in an unstructured callback
+                    // Task. Always resolve the attempt bridge with that error.
+                    await finish(error)
                 }
                 //                }
             }
@@ -1070,6 +1140,9 @@ extension CloudKitSynchronizer {
             try await completion(nil)
             return
         }
+        // Deletion preparation can suspend. Revalidate the account at the final
+        // boundary before the CloudKit mutation starts.
+        try await revalidateActiveRunContext(for: attemptID)
         let modifyRecordsOperation = ModifyRecordsOperation(
             database: database,
             records: nil,
@@ -1079,19 +1152,28 @@ extension CloudKitSynchronizer {
             Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
                 guard beginRunCallback(for: attemptID) else {
-                    try await completion(CancellationError())
+                    try? await completion(CancellationError())
                     return
                 }
                 defer { endRunCallback() }
-                let acknowledgedRecordIDSet = Set(deletedRecordIDs ?? [])
-                    .union(recordIDsMissingOnServer)
-                let acknowledgedRecordIDs = recordIDs.filter {
-                    acknowledgedRecordIDSet.contains($0)
+                @BigSyncBackgroundActor
+                func finish(_ resultError: Error?) async {
+                    do {
+                        try await completion(resultError)
+                    } catch {
+                        guard synchronizationAttemptID == attemptID else { return }
+                        await failSynchronization(error: error)
+                    }
                 }
-                logger.info(
-                    "QSCloudKitSynchronizer >> Deleted or confirmed absent \(acknowledgedRecordIDs.count) records"
-                )
                 do {
+                    let acknowledgedRecordIDSet = Set(deletedRecordIDs ?? [])
+                        .union(recordIDsMissingOnServer)
+                    let acknowledgedRecordIDs = recordIDs.filter {
+                        acknowledgedRecordIDSet.contains($0)
+                    }
+                    logger.info(
+                        "QSCloudKitSynchronizer >> Deleted or confirmed absent \(acknowledgedRecordIDs.count) records"
+                    )
                     try await revalidateActiveRunContext(for: attemptID)
                     if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
                         try await generationTrackingAdapter.didDelete(
@@ -1102,19 +1184,15 @@ extension CloudKitSynchronizer {
                         await adapter.didDelete(recordIDs: acknowledgedRecordIDs)
                     }
                     try await revalidateActiveRunContext(for: attemptID)
-                } catch {
-                    try await completion(error)
-                    return
-                }
 
-                let allDeletionsAcknowledged = acknowledgedRecordIDs.count == recordCount
-                if let error = operationError, !allDeletionsAcknowledged {
-                    if isLimitExceededError(error as NSError) {
-                        reduceBatchSize()
-                    }
-                    try await completion(error)
-                } else {
-                    if recordCount >= requestedBatchSize {
+                    let allDeletionsAcknowledged =
+                        acknowledgedRecordIDs.count == recordCount
+                    if let error = operationError, !allDeletionsAcknowledged {
+                        if isLimitExceededError(error as NSError) {
+                            reduceBatchSize()
+                        }
+                        await finish(error)
+                    } else if recordCount >= requestedBatchSize {
                         try await uploadDeletions(
                             adapter: adapter,
                             restrictedToEntityType: restrictedToEntityType,
@@ -1122,8 +1200,12 @@ extension CloudKitSynchronizer {
                             completion: completion
                         )
                     } else {
-                        try await completion(nil)
+                        await finish(nil)
                     }
+                } catch {
+                    // Recursive deletion preparation and acknowledgement
+                    // failures must resolve the attempt bridge.
+                    await finish(error)
                 }
             }
         }
@@ -1263,6 +1345,7 @@ extension CloudKitSynchronizer {
                 guard let self = self,
                       beginRunCallback(for: attemptID) else { return }
                 defer { endRunCallback() }
+                do {
                 
                 guard !cancelSync else {
                     await failSynchronization(error: SyncError.cancelled)
@@ -1270,7 +1353,10 @@ extension CloudKitSynchronizer {
                 }
                 
                 try await revalidateActiveRunContext(for: attemptID)
-                try await notifyProviderForDeletedZoneIDs(deletedZoneIDs)
+                try await notifyProviderForDeletedZoneIDs(
+                    deletedZoneIDs,
+                    attemptID: attemptID
+                )
                 try await revalidateActiveRunContext(for: attemptID)
                 if changedZoneIDs.count > 0 {
                     let zoneIDs = try await loadTokens(for: changedZoneIDs, loadAdapters: false)
@@ -1301,6 +1387,13 @@ extension CloudKitSynchronizer {
                     } catch {
                         await failSynchronization(error: error)
                     }
+                }
+                } catch {
+                    // This callback is not awaited by FetchDatabaseChangesOperation.
+                    // Convert actor-task failures
+                    // into synchronization failure instead of abandoning the run.
+                    guard synchronizationAttemptID == attemptID else { return }
+                    await failSynchronization(error: error)
                 }
             }
         }

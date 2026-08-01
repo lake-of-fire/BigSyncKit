@@ -221,8 +221,10 @@ public actor BigSyncBackgroundActor {
         case .unprepared:
             synchronizationPreparationState = .preparing
             let preparationTask = Task {
+                // A valid legacy token remains retryable until the adapter
+                // durably accepts it.
                 for modelAdapter in expectedSynchronizer.modelAdapters {
-                    await CloudKitSynchronizer.transferOldServerChangeToken(
+                    try await CloudKitSynchronizer.transferOldServerChangeToken(
                         to: modelAdapter,
                         userDefaults: expectedSynchronizer.keyValueStore,
                         containerName: containerIdentifier
