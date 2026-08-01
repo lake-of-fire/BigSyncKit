@@ -75,6 +75,31 @@ extension CloudKitSynchronizer {
                 return
             }
         }
+
+        do {
+            // The final import can legitimately forward zero new journal rows
+            // while durable tracking work remains.
+            // Recheck all adapters after the last suspension and convert any
+            // pending state into a tail drain before authorizing a receipt.
+            for adapter in modelAdapters {
+                let hasPendingChanges: Bool
+                if let terminalStateAdapter =
+                    adapter as? TerminalSynchronizationStateModelAdapter {
+                    hasPendingChanges = try terminalStateAdapter
+                        .hasPendingChangesAtTerminalBoundary()
+                } else {
+                    hasPendingChanges = adapter.hasChanges
+                }
+                if hasPendingChanges {
+                    synchronizationRequestedWhileRunning = true
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            await failSynchronization(error: error)
+            return
+        }
         
 //        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
         syncing = false
@@ -648,9 +673,16 @@ extension CloudKitSynchronizer {
             }
             changeRequestProcessor.clearErrors()
         }, didFinishPages: { [weak self] in
-            guard let self,
-                  synchronizationAttemptID == attemptID,
-                  synchronizationRunID == runID else { return }
+            guard let self else { throw CancellationError() }
+            // Page publication and terminal continuation are separate
+            // operation-owned async callbacks. Keep both inside the run barrier.
+            guard synchronizationAttemptID == attemptID,
+                  synchronizationRunID == runID,
+                  beginRunCallback(for: attemptID) else {
+                throw CancellationError()
+            }
+            defer { endRunCallback() }
+            try await revalidateActiveRunContext(for: attemptID)
             try await completion(nil)
         })
         runOperation(operation)
@@ -1364,18 +1396,21 @@ extension CloudKitSynchronizer {
                     await updateServerToken(for: zoneIDs, completion: { [weak self] result in
                         guard let self = self,
                               synchronizationAttemptID == attemptID else { return }
-                        switch result {
-                        case .success(true):
-                            await performSynchronization()
-                        case .success(false):
-                            do {
-                                try await revalidateActiveRunContext(for: attemptID)
+                        do {
+                            // This operation-owned callback can reenter after
+                            // cancellation. Fence its first publication too.
+                            try await revalidateActiveRunContext(for: attemptID)
+                            switch result {
+                            case .success(true):
+                                await performSynchronization()
+                            case .success(false):
                                 storedDatabaseToken = databaseToken
                                 await changesFinishedSynchronizing()
-                            } catch {
+                            case .failure(let error):
                                 await failSynchronization(error: error)
                             }
-                        case .failure(let error):
+                        } catch {
+                            guard synchronizationAttemptID == attemptID else { return }
                             await failSynchronization(error: error)
                         }
                     })
@@ -1419,6 +1454,7 @@ extension CloudKitSynchronizer {
         
 //        logger.info("QSCloudKitSynchronizer >> Update server token....")
         let attemptID = synchronizationAttemptID
+        let runID = synchronizationRunID
         var zonesNeedingRefetch = Set<CKRecordZone.ID>()
         let operation = FetchZoneChangesOperation(
             database: database,
@@ -1431,14 +1467,17 @@ extension CloudKitSynchronizer {
                 cloudKitSynchronizerDeviceUUIDKey
             ],
             completion: { @BigSyncBackgroundActor [weak self] zoneResults in
-            guard let self = self,
-                  synchronizationAttemptID == attemptID else { return }
-            
-            guard !cancelSync else {
-                await failSynchronization(error: SyncError.cancelled)
-                return
+            guard let self else { throw CancellationError() }
+            // This operation callback can suspend in Realm token publication.
+            // A newer run must not clear adapter cancellation until it exits.
+            guard synchronizationAttemptID == attemptID,
+                  synchronizationRunID == runID,
+                  beginRunCallback(for: attemptID) else {
+                throw CancellationError()
             }
-            
+            defer { endRunCallback() }
+
+            try await revalidateActiveRunContext(for: attemptID)
             for (zoneID, result) in zoneResults {
                 if let error = result.error {
                     throw error
@@ -1455,8 +1494,16 @@ extension CloudKitSynchronizer {
                 
             }
         }, didFinishPages: { [weak self] in
-            guard let self,
-                  synchronizationAttemptID == attemptID else { return }
+            guard let self else { throw CancellationError() }
+            // The final completion is a second async callback owned by the same
+            // operation and must participate in the same run barrier.
+            guard synchronizationAttemptID == attemptID,
+                  synchronizationRunID == runID,
+                  beginRunCallback(for: attemptID) else {
+                throw CancellationError()
+            }
+            defer { endRunCallback() }
+            try await revalidateActiveRunContext(for: attemptID)
             await completion(.success(!zonesNeedingRefetch.isEmpty))
         })
         runOperation(operation)

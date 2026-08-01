@@ -542,6 +542,11 @@ public class CloudKitSynchronizer: NSObject {
     internal var mergeChangesTask: Task<Void, Error>?
     internal var fetchZoneChangesCompletionTask: Task<Void, Error>? = nil
     private var activeRunCallbackCount = 0
+#if DEBUG
+    internal var _testActiveRunCallbackCount: Int {
+        activeRunCallbackCount
+    }
+#endif
     private var runCallbackWaiters = [CheckedContinuation<Void, Never>]()
     private var attemptCallbackContinuations = [
         UUID: [

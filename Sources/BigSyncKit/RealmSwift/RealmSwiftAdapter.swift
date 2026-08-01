@@ -385,7 +385,11 @@ private func objectIdentifier(
 
 extension RealmSwiftAdapter: @unchecked Sendable { }
 
-public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapableModelAdapter, UploadGenerationTrackingModelAdapter {
+public final class RealmSwiftAdapter:
+    NSObject,
+    @preconcurrency PrioritySyncCapableModelAdapter,
+    UploadGenerationTrackingModelAdapter,
+    TerminalSynchronizationStateModelAdapter {
     private static let mutationJournalRecoveryEntityTypePrefix =
         "__BigSyncKitMutationJournalRecovery.v2."
     private static let mutationJournalRecoveryVersion = 1
@@ -1685,11 +1689,8 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         hasChanges = count > 0
         guard previousCount != count else { return }
 
-        let syncedCount = realm.objects(SyncedEntity.self).where {
-            $0.state == SyncedEntityState.synced.rawValue
-        }.count
         logger.debug(
-            "QSCloudKitSynchronizer >> \(count) changed records remaining to upload. \(syncedCount) records already marked as synced."
+            "QSCloudKitSynchronizer >> \(count) changed records remaining to upload."
         )
         Task(priority: .background) { @BigSyncBackgroundActor in
             NotificationCenter.default.post(
@@ -4618,6 +4619,34 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
         persistentAssetManager.clearAssetFiles(excludingSyncedEntityIDs: pendingRecordIDs)
         updateHasChanges(realm: persistenceRealm)
     }
+
+    @BigSyncBackgroundActor
+    func hasPendingChangesAtTerminalBoundary() throws -> Bool {
+        // Do not suspend between refreshing these Realm views and deciding
+        // whether a receipt can be issued. A target write committed before this
+        // cut remains visible even when its debounced observer has not fired.
+        try Task.checkCancellation()
+        guard !cancelSync else { throw CancellationError() }
+        guard let realmProvider,
+              let persistenceRealm = realmProvider.persistenceRealm,
+              let targetReaderRealms = realmProvider.targetReaderRealms else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
+
+        for targetReaderRealm in targetReaderRealms where
+            targetReaderRealm.schema.objectSchema.contains(where: {
+                $0.className == BigSyncPendingMutation.className()
+            }) {
+            targetReaderRealm.refresh()
+            if targetReaderRealm.objects(BigSyncPendingMutation.self).first != nil {
+                return true
+            }
+        }
+
+        persistenceRealm.refresh()
+        updateHasChanges(realm: persistenceRealm)
+        return hasChanges
+    }
     
     //    @BigSyncBackgroundActor
     //    public func deleteChangeTracking() async {
@@ -4727,13 +4756,17 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             throw RealmSwiftAdapterError.setupUnavailable
         }
         //        await persistenceRealm.asyncRefresh()
-        var serverToken: ServerToken! = persistenceRealm.objects(ServerToken.self).first
         try Task.checkCancellation()
         guard !cancelSync else { throw CancellationError() }
         try await persistenceRealm.asyncWrite {
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
-            if serverToken == nil {
+            // Resolve the managed token at the transaction boundary rather than
+            // carrying a Realm object across the async-write suspension.
+            let serverToken: ServerToken
+            if let existingToken = persistenceRealm.objects(ServerToken.self).first {
+                serverToken = existingToken
+            } else {
                 serverToken = ServerToken()
                 persistenceRealm.add(serverToken)
             }

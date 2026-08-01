@@ -155,6 +155,13 @@ internal struct PreparedRecordDeletion {
     let generation: String?
 }
 
+// Terminal receipts need a synchronous view of adapter-owned durable work after
+// the final suspending import and cleanup boundary.
+internal protocol TerminalSynchronizationStateModelAdapter: ModelAdapter {
+    @BigSyncBackgroundActor
+    func hasPendingChangesAtTerminalBoundary() throws -> Bool
+}
+
 internal protocol UploadGenerationTrackingModelAdapter: ModelAdapter {
     @BigSyncBackgroundActor
     func preparedRecordsToUpload(

@@ -49,6 +49,8 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var completesModifyOperations = true
     var completesFetchDatabaseChanges = true
     var completesRecordZoneFetches = true
+    // Allows a zero-zone token probe to reach its terminal callback.
+    var completesEmptyZoneChangeOperation = false
     var recordZoneFetchHandler: (@Sendable () -> Void)?
     var completesSubscriptionFetches = true
     var reportsDeletedRecordsAsUnknownItems = false
@@ -101,28 +103,31 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
             return
         }
         if let fetchOperation =
-            operation as? CKFetchRecordZoneChangesOperation,
-           !zoneChangePages.isEmpty {
+            operation as? CKFetchRecordZoneChangesOperation {
             fetchZoneChangesOperationCount += 1
-            let page = zoneChangePages.removeFirst()
-            for record in page.records {
-                fetchOperation.recordChangedBlock?(record)
-            }
-            for recordID in page.deletedRecordIDs {
-                fetchOperation.recordWithIDWasDeletedBlock?(
-                    recordID,
-                    recordID.recordName.split(separator: ".", maxSplits: 1)
-                        .first.map(String.init) ?? "Record"
+            if !zoneChangePages.isEmpty {
+                let page = zoneChangePages.removeFirst()
+                for record in page.records {
+                    fetchOperation.recordChangedBlock?(record)
+                }
+                for recordID in page.deletedRecordIDs {
+                    fetchOperation.recordWithIDWasDeletedBlock?(
+                        recordID,
+                        recordID.recordName.split(separator: ".", maxSplits: 1)
+                            .first.map(String.init) ?? "Record"
+                    )
+                }
+                fetchOperation.recordZoneFetchCompletionBlock?(
+                    page.zoneID,
+                    nil,
+                    nil,
+                    page.moreComing,
+                    nil
                 )
+                fetchOperation.fetchRecordZoneChangesCompletionBlock?(nil)
+            } else if completesEmptyZoneChangeOperation {
+                fetchOperation.fetchRecordZoneChangesCompletionBlock?(nil)
             }
-            fetchOperation.recordZoneFetchCompletionBlock?(
-                page.zoneID,
-                nil,
-                nil,
-                page.moreComing,
-                nil
-            )
-            fetchOperation.fetchRecordZoneChangesCompletionBlock?(nil)
             return
         }
         if operation is CKModifySubscriptionsOperation {
@@ -374,7 +379,11 @@ private actor AccountIdentifierSequence {
     }
 }
 
-private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter, @unchecked Sendable {
+private final class FakeModelAdapter:
+    NSObject,
+    PrioritySyncCapableModelAdapter,
+    TerminalSynchronizationStateModelAdapter,
+    @unchecked Sendable {
     let recordZoneID: CKRecordZone.ID
     let priorityEntityTypeNames: [String]
     weak var modelAdapterDelegate: ModelAdapterDelegate?
@@ -392,6 +401,7 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     var resetSyncCachesHandler: (@Sendable () async throws -> Void)?
     var saveChangesHandler: (@Sendable () async throws -> Void)?
     var recordsToUploadHandler: (@Sendable () async throws -> Void)?
+    var terminalPendingChanges = false
 
     var hasChanges: Bool {
         uploadedByEntity.values.contains(where: { !$0.isEmpty }) ||
@@ -495,6 +505,12 @@ private final class FakeModelAdapter: NSObject, PrioritySyncCapableModelAdapter,
     func cancelSynchronization() {}
     func unsetCancellation() async throws {
         events.append("unsetCancellation")
+    }
+
+    @BigSyncBackgroundActor
+    func hasPendingChangesAtTerminalBoundary() throws -> Bool {
+        events.append("terminalPendingState")
+        return terminalPendingChanges || hasChanges
     }
 
     private func nextEntityTypeWithPendingUploads() -> String? {
@@ -896,6 +912,36 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertTrue(adapter.events.contains("cleanUp"))
         XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
         XCTAssertFalse(synchronizer.syncing)
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalPendingStateSchedulesTailRunAndWithholdsReceipt() async {
+        // Zero newly-forwarded journal rows do not prove the adapter is empty.
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "terminal-pending-state"),
+            priorities: []
+        )
+        adapter.didFinishImportHandler = { [weak adapter] in
+            if adapter?.didFinishImportCount == 2 {
+                adapter?.terminalPendingChanges = true
+            }
+        }
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+        let firstAttemptID = synchronizer.synchronizationAttemptID
+
+        await synchronizer.changesFinishedSynchronizing()
+
+        XCTAssertEqual(adapter.didFinishImportCount, 2)
+        XCTAssertTrue(adapter.events.contains("terminalPendingState"))
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertNotEqual(synchronizer.synchronizationAttemptID, firstAttemptID)
+        XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
+        await synchronizer.cancelSynchronizationAndWait()
     }
 
     @BigSyncBackgroundActor
@@ -1383,6 +1429,75 @@ final class BigSyncKitTests: XCTestCase {
             adapter.events.filter { $0 == "resetSyncCaches" }.count,
             1
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testZoneFetchTerminalCompletionParticipatesInRunCallbackBarrier()
+    async {
+        // The terminal continuation that resumes upload work must retain
+        // old-run ownership after the page callback exits.
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(
+            zoneName: "zone-fetch-terminal-callback",
+            ownerName: CKCurrentUserDefaultName
+        )
+        database.zoneChangePages = [
+            FakeZoneChangePage(
+                zoneID: zoneID,
+                records: [],
+                deletedRecordIDs: [],
+                moreComing: false
+            )
+        ]
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: zoneID, priorities: [])
+        )
+        let callbackEntered = AsyncGate()
+        let releaseCallback = AsyncGate()
+        synchronizer.syncing = true
+
+        synchronizer.fetchZoneChanges([zoneID]) { error in
+            XCTAssertNil(error)
+            await callbackEntered.open()
+            await releaseCallback.wait()
+        }
+        await callbackEntered.wait()
+
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 1)
+        synchronizer.cancelSynchronization()
+        await releaseCallback.open()
+        await synchronizer.waitForRunCallbacksToFinish()
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testServerTokenProbeCompletionParticipatesInRunCallbackBarrier()
+    async {
+        // FetchZoneChangesOperation owns an unstructured Task, so both its page
+        // and terminal callbacks must be registered before they suspend.
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let synchronizer = makeSynchronizer(database: database)
+        let callbackEntered = AsyncGate()
+        let releaseCallback = AsyncGate()
+        synchronizer.syncing = true
+
+        await synchronizer.updateServerToken(for: []) { result in
+            if case .success(false) = result {
+                await callbackEntered.open()
+                await releaseCallback.wait()
+            } else {
+                XCTFail("Expected an empty token probe to report no refetch")
+            }
+        }
+        await callbackEntered.wait()
+
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 1)
+        synchronizer.cancelSynchronization()
+        await releaseCallback.open()
+        await synchronizer.waitForRunCallbacksToFinish()
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 0)
     }
 
     @BigSyncBackgroundActor
@@ -4700,6 +4815,27 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(
             fixture.persistenceRealm.objects(PendingRelationship.self).count,
             0
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRealmTerminalBoundaryDetectsDurablePendingMutation() async throws {
+        // The receipt cut must see the durable target journal before its
+        // debounced observer becomes the upload wakeup.
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "terminal-boundary-journal",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+
+        XCTAssertTrue(
+            try fixture.adapter.hasPendingChangesAtTerminalBoundary()
         )
     }
 
