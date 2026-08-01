@@ -4743,6 +4743,37 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testJournalForwardingPreservesEveryGenerationAcrossPages() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let recordCount = 1_001
+        let objects = (0..<recordCount).map { index in
+            BigSyncTrackedObject(
+                id: "paged-journal-\(index)",
+                createdAt: Date(),
+                modifiedAt: Date(),
+                explicitlyModifiedAt: nil
+            )
+        }
+        try await fixture.targetRealm.asyncWrite {
+            for object in objects {
+                fixture.targetRealm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+
+        let forwardedCount = try await fixture.adapter
+            ._test_forwardPendingMutations(in: fixture.targetRealm)
+
+        XCTAssertEqual(forwardedCount, recordCount)
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(SyncedEntity.self).where {
+                $0.pendingGeneration != nil
+            }.count,
+            recordCount
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testInitialSetupFailureRemainsRetryable() async throws {
         // Review finding 1: a setup callback failure must not leave a non-nil
         // provider that later passes readiness checks as an empty adapter.
