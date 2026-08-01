@@ -1287,8 +1287,29 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
 #if DEBUG
             try await _testBeforePendingMutationTrackingWrite?()
 #endif
-            try await persistenceRealm.asyncWrite {
-                for mutation in chunk {
+            // A frozen/page snapshot can become stale while the actor is
+            // suspended above. Resolve each identity from the live journal at
+            // the final publication boundary so an older pass cannot overwrite
+            // a newer generation that another reentrant pass already forwarded.
+            targetReaderRealm.refresh()
+            let currentMutations: [BigSyncPendingMutationSnapshot] =
+                chunk.compactMap { mutation in
+                    guard let current = targetReaderRealm.object(
+                        ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: mutation.recordName
+                    ) else { return nil }
+                    return pendingMutationSnapshot(
+                        current,
+                        in: targetReaderRealm
+                    )
+                }
+
+            // Keep the live-journal read and tracking publication in one
+            // non-suspending actor boundary. Application writers can still
+            // commit a later target generation concurrently; its durable row
+            // and observer notification remain authoritative for the next pass.
+            try persistenceRealm.write {
+                for mutation in currentMutations {
                     try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
                     if persistenceRealm.object(
@@ -1651,6 +1672,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
             SyncedEntityState.deletedLocally.rawValue,
         ]
         let results = realm.objects(SyncedEntity.self).where { $0.state.in(pendingStates) }
+        // The common idle path only needs to prove that the indexed result is
+        // still empty. Avoid recomputing its exact cardinality at every no-op
+        // import, acknowledgement, and terminal callback.
+        if hasChangesCount == 0, results.first == nil {
+            hasChanges = false
+            return
+        }
         let count = results.count
         let previousCount = hasChangesCount
         hasChangesCount = count
@@ -4691,7 +4719,13 @@ public final class RealmSwiftAdapter: NSObject, @preconcurrency PrioritySyncCapa
     @BigSyncBackgroundActor
     public func saveToken(_ token: CKServerChangeToken?) async throws {
         //        debugPrint("# saveToken", token, recordZoneID)
-        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
+        // Token migration and zone-token publication require the same completed
+        // readiness boundary as imports and uploads. Returning while setup is
+        // incomplete would let callers discard their only durable token copy.
+        try await ensureSetup()
+        guard let persistenceRealm = realmProvider?.persistenceRealm else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
         //        await persistenceRealm.asyncRefresh()
         var serverToken: ServerToken! = persistenceRealm.objects(ServerToken.self).first
         try Task.checkCancellation()

@@ -4774,6 +4774,78 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testJournalForwardingRechecksGenerationAfterPageSuspension()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "reentrant-journal-generation",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let firstGeneration = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )?.generation
+        )
+        let enteredFirstForward = AsyncGate()
+        let releaseFirstForward = AsyncGate()
+        fixture.adapter._testBeforePendingMutationTrackingWrite = {
+            guard !(await enteredFirstForward.hasOpened()) else { return }
+            await enteredFirstForward.open()
+            await releaseFirstForward.wait()
+        }
+
+        let firstForward = Task { @BigSyncBackgroundActor in
+            try await fixture.adapter._test_forwardPendingMutations(
+                in: fixture.targetRealm
+            )
+        }
+        await enteredFirstForward.wait()
+
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("newer")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let secondGeneration = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )?.generation
+        )
+        XCTAssertNotEqual(firstGeneration, secondGeneration)
+
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration,
+            secondGeneration
+        )
+
+        await releaseFirstForward.open()
+        _ = try await firstForward.value
+        fixture.adapter._testBeforePendingMutationTrackingWrite = nil
+
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration,
+            secondGeneration
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testInitialSetupFailureRemainsRetryable() async throws {
         // Review finding 1: a setup callback failure must not leave a non-nil
         // provider that later passes readiness checks as an empty adapter.
@@ -4815,6 +4887,58 @@ final class BigSyncKitTests: XCTestCase {
 
         XCTAssertEqual(delegate.initialSetupCount, 2)
         XCTAssertNotNil(adapter.realmProvider?.persistenceRealm)
+    }
+
+    @BigSyncBackgroundActor
+    func testSaveTokenWaitsForCompletedRealmSetupAndPropagatesFailure()
+    async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "token-readiness-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "token-readiness-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(zoneName: "token-readiness"),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        let delegate = FakeModelAdapterDelegate()
+        delegate.initialSetupHandler = {
+            throw TestSynchronizationError.initialSetupFailed
+        }
+        adapter.modelAdapterDelegate = delegate
+
+        do {
+            try await adapter.saveToken(nil)
+            XCTFail("Expected setup failure before token publication")
+        } catch TestSynchronizationError.initialSetupFailed {
+        }
+        XCTAssertEqual(delegate.initialSetupCount, 1)
+        XCTAssertEqual(
+            adapter.realmProvider?.persistenceRealm?
+                .objects(ServerToken.self).count,
+            0
+        )
+
+        delegate.initialSetupHandler = nil
+        try await adapter.saveToken(nil)
+
+        XCTAssertEqual(delegate.initialSetupCount, 2)
+        XCTAssertEqual(
+            adapter.realmProvider?.persistenceRealm?
+                .objects(ServerToken.self).count,
+            1
+        )
     }
 
     @BigSyncBackgroundActor
