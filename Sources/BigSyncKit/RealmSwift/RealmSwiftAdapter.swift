@@ -3154,6 +3154,12 @@ public final class RealmSwiftAdapter:
         limit: Int,
         restrictedToEntityType restrictedEntityType: String? = nil
     ) async throws -> [PreparedRecordUpload] {
+#if DEBUG
+        // Read the RealmBackgroundActor-owned debug set before creating or
+        // enumerating any live Realm query. Record materialization below is
+        // deliberately non-suspending.
+        let dummyRecordIdentifiers = await dummyRecordIdentifiers
+#endif
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return [] }
         let allResults = persistenceRealm.objects(SyncedEntity.self)
         let results: Results<SyncedEntity>
@@ -3169,22 +3175,19 @@ public final class RealmSwiftAdapter:
 
         func appendUploadRecords(
             matching include: (SyncedEntity) -> Bool
-        ) async throws {
+        ) throws {
+            // Never suspend while Realm's fast enumerator is live. Record
+            // materialization and its missing-object transition are kept in
+            // this non-reentrant actor boundary.
             for candidate in results where include(candidate) {
                 if resultArray.count >= limit {
                     return
                 }
-                guard let syncedEntity = persistenceRealm.object(
-                    ofType: SyncedEntity.self,
-                    forPrimaryKey: candidate.identifier
-                ) else {
-                    continue
-                }
-                try await appendUploadRecords(startingAt: syncedEntity)
+                try appendUploadRecords(startingAt: candidate)
             }
         }
 
-        func appendUploadRecords(startingAt syncedEntity: SyncedEntity) async throws {
+        func appendUploadRecords(startingAt syncedEntity: SyncedEntity) throws {
             if let restrictedEntityType, syncedEntity.entityType != restrictedEntityType {
                 return
             }
@@ -3202,8 +3205,14 @@ public final class RealmSwiftAdapter:
             }
             let entityIdentifier = syncedEntity.identifier
             let generation = syncedEntity.pendingGeneration
-            guard let record = try await recordToUpload(
-                syncedEntity: syncedEntity
+#if DEBUG
+            let isDummyRecord = dummyRecordIdentifiers.contains(entityIdentifier)
+#else
+            let isDummyRecord = false
+#endif
+            guard let record = try recordToUpload(
+                syncedEntity: syncedEntity,
+                isDummyRecord: isDummyRecord
             ) else { return }
             resultArray.append(
                 PreparedRecordUpload(
@@ -3216,17 +3225,16 @@ public final class RealmSwiftAdapter:
 
 #if DEBUG
         // Ensure dummy records are uploaded first.
-        let dummyRecordIdentifiers = await dummyRecordIdentifiers
         if dummyRecordIdentifiers.isEmpty {
-            try await appendUploadRecords { _ in true }
+            try appendUploadRecords { _ in true }
         } else {
-            try await appendUploadRecords { dummyRecordIdentifiers.contains($0.identifier) }
+            try appendUploadRecords { dummyRecordIdentifiers.contains($0.identifier) }
             if resultArray.count < limit {
-                try await appendUploadRecords { !dummyRecordIdentifiers.contains($0.identifier) }
+                try appendUploadRecords { !dummyRecordIdentifiers.contains($0.identifier) }
             }
         }
 #else
-        try await appendUploadRecords { _ in true }
+        try appendUploadRecords { _ in true }
 #endif
         
         return resultArray
@@ -3234,8 +3242,9 @@ public final class RealmSwiftAdapter:
     
     @BigSyncBackgroundActor
     func recordToUpload(
-        syncedEntity: SyncedEntity
-    ) async throws -> CKRecord? {
+        syncedEntity: SyncedEntity,
+        isDummyRecord: Bool
+    ) throws -> CKRecord? {
         try Self.validateCloudKitRecordName(syncedEntity.identifier)
         let record = getRecord(for: syncedEntity) ?? CKRecord(recordType: syncedEntity.entityType, recordID: CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID))
         
@@ -3250,15 +3259,21 @@ public final class RealmSwiftAdapter:
         guard let object else {
             // Object does not exist, but tracking syncedEntity thinks it does.
             // We mark it as deleted so the iCloud record will get deleted too
-            try await persistenceRealm.asyncWrite {
-                syncedEntity.entityState = .deletedLocally
+            try persistenceRealm.write {
+                // Resolve at the transaction boundary. A different operation
+                // may already have changed or removed this tracking row.
+                guard let current = persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: syncedEntity.identifier
+                ), current.state == entityState else { return }
+                current.entityState = .deletedLocally
             }
             return nil
         }
         
         let skippedKeys: Set<String>
         if let skippable = object as? SyncSkippablePropertiesModel {
-            skippedKeys = Set(await skippable.skipSyncingProperties() ?? [])
+            skippedKeys = skippable.skipSyncingProperties() ?? []
         } else {
             skippedKeys = []
         }
@@ -3510,7 +3525,7 @@ public final class RealmSwiftAdapter:
         }
         
 #if DEBUG
-        if await dummyRecordIdentifiers.contains(syncedEntity.identifier) {
+        if isDummyRecord {
             for property in object.objectSchema.properties {
                 let isNil = record[property.name] == nil
                 let isEmptyArrayOrSet = (property.isArray || property.isSet) && ((record[property.name] as? [Any])?.isEmpty ?? false)
