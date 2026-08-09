@@ -558,16 +558,47 @@ public final class RealmSwiftAdapter:
         // provider.
         isSetupInterrupted = true
         invalidateTokens()
-        
-        if let persistenceRealm = realmProvider?.persistenceRealm {
-            //            await persistenceRealm.asyncRefresh()
-            try await persistenceRealm.asyncWrite {
-                let objectTypes = (persistenceRealm.configuration.objectTypes ?? []).compactMap { $0 as? RealmSwift.Object.Type }
-                for objectType in objectTypes {
-                    persistenceRealm.delete(persistenceRealm.objects(objectType))
-                }
-            }
+
+        // Account replacement and backup-restore recovery can run before the
+        // asynchronous RealmProvider setup task has published its Realms. A
+        // missing provider must not turn a destructive reset into a successful
+        // no-op: open just the tracking Realm and establish the same durable
+        // empty-state postcondition. The target Realms intentionally remain
+        // untouched; their mutation journals are the recovery source that the
+        // next setup forwards into fresh tracking state.
+        let persistenceRealm: Realm
+        if let configuredPersistenceRealm = realmProvider?.persistenceRealm {
+            persistenceRealm = configuredPersistenceRealm
+        } else {
+            persistenceRealm = try await Realm(
+                configuration: persistenceRealmConfiguration,
+                actor: BigSyncBackgroundActor.shared
+            )
         }
+        try await persistenceRealm.asyncWrite {
+            // The tracking schema is owned by BigSyncKit. Delete the known
+            // types explicitly so a configuration with `objectTypes == nil`
+            // cannot accidentally turn reset into another successful no-op.
+            persistenceRealm.delete(
+                persistenceRealm.objects(PendingRelationship.self)
+            )
+            persistenceRealm.delete(persistenceRealm.objects(SyncedEntity.self))
+            persistenceRealm.delete(
+                persistenceRealm.objects(SyncedEntityType.self)
+            )
+            persistenceRealm.delete(persistenceRealm.objects(ServerToken.self))
+        }
+
+        // Nothing from the prior account/setup may be carried into the fresh
+        // provider. Durable target-journal entries are deliberately not
+        // cleared and will be rediscovered by setup.
+        realmProvider = nil
+        resultsChangeSet = ResultsChangeSet()
+        recentlyFetchedRecordModifiedAts.removeAll(keepingCapacity: false)
+        observedJournalRecordNames.removeAll(keepingCapacity: false)
+        hasChanges = false
+        hasChangesCount = 0
+        persistentAssetManager.clearAssetFiles()
         
         guard shouldResumeAfterReset,
               cancellationGeneration == resetCancellationGeneration else {

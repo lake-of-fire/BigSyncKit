@@ -5841,6 +5841,256 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPreSetupCacheResetClearsTrackingAndPreservesTargetJournal()
+    async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "pre-setup-reset-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "pre-setup-reset-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(zoneName: "pre-setup-reset"),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+
+        let persistenceRealm = try await Realm(
+            configuration: persistenceConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let targetRealm = try await Realm(
+            configuration: targetConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let object = BigSyncTrackedObject(
+            id: "journal-survives-reset",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        try await targetRealm.asyncWrite {
+            targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let expectedGeneration = try XCTUnwrap(
+            targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )?.generation
+        )
+        try await persistenceRealm.asyncWrite {
+            let staleEntity = SyncedEntity(
+                entityType: BigSyncTrackedObject.className(),
+                identifier: "BigSyncTrackedObject.stale-account",
+                state: SyncedEntityState.changed.rawValue
+            )
+            staleEntity.pendingGeneration = UUID().uuidString
+            persistenceRealm.add(staleEntity)
+            persistenceRealm.add(
+                SyncedEntityType(
+                    entityType: BigSyncTrackedObject.className(),
+                    lastTrackedChangesAt: Date()
+                )
+            )
+            let pendingRelationship = PendingRelationship()
+            pendingRelationship.relationshipName = "favoriteChild"
+            pendingRelationship.targetIdentifier = "stale-target"
+            pendingRelationship.forSyncedEntity = staleEntity
+            persistenceRealm.add(pendingRelationship)
+            persistenceRealm.add(ServerToken())
+        }
+        adapter.cancelSynchronization()
+        try await adapter.resetSyncCaches()
+        persistenceRealm.refresh()
+        targetRealm.refresh()
+
+        XCTAssertNil(adapter.realmProvider)
+        XCTAssertTrue(persistenceRealm.objects(SyncedEntity.self).isEmpty)
+        XCTAssertTrue(
+            persistenceRealm.objects(SyncedEntityType.self).isEmpty
+        )
+        XCTAssertTrue(
+            persistenceRealm.objects(PendingRelationship.self).isEmpty
+        )
+        XCTAssertTrue(persistenceRealm.objects(ServerToken.self).isEmpty)
+        XCTAssertEqual(
+            targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )?.generation,
+            expectedGeneration
+        )
+        XCTAssertNotNil(
+            targetRealm.object(
+                ofType: BigSyncTrackedObject.self,
+                forPrimaryKey: object.id
+            )
+        )
+
+        try await adapter.unsetCancellation()
+        persistenceRealm.refresh()
+        targetRealm.refresh()
+
+        XCTAssertEqual(
+            persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration,
+            expectedGeneration
+        )
+        XCTAssertEqual(
+            targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )?.generation,
+            expectedGeneration
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testPreSetupCacheResetPropagatesTrackingRealmOpenFailure()
+    async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.fileURL = URL(
+            fileURLWithPath: NSTemporaryDirectory(),
+            isDirectory: true
+        ).appendingPathComponent(
+            "missing-read-only-reset-\(identifier).realm"
+        )
+        persistenceConfiguration.shouldCompactOnLaunch = nil
+        persistenceConfiguration.readOnly = true
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "failed-pre-setup-reset-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(zoneName: "failed-pre-setup-reset"),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        let targetRealm = try await Realm(
+            configuration: targetConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let mutation = BigSyncPendingMutation(
+            recordName: "\(BigSyncTrackedObject.className()).durable",
+            entityType: BigSyncTrackedObject.className(),
+            objectIdentifier: "durable"
+        )
+        try await targetRealm.asyncWrite {
+            targetRealm.add(mutation)
+        }
+        adapter.cancelSynchronization()
+
+        do {
+            try await adapter.resetSyncCaches()
+            XCTFail("Expected the tracking Realm open to fail")
+        } catch {
+            XCTAssertNil(adapter.realmProvider)
+        }
+
+        targetRealm.refresh()
+        XCTAssertEqual(
+            targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: mutation.recordName
+            )?.generation,
+            mutation.generation
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountSwitchClearsTrackingBeforeAdapterSetup() async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "pre-setup-account-reset-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "pre-setup-account-reset-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let persistenceRealm = try await Realm(
+            configuration: persistenceConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let staleRecordName = "\(BigSyncTrackedObject.className()).account-a"
+        try await persistenceRealm.asyncWrite {
+            let staleEntity = SyncedEntity(
+                entityType: BigSyncTrackedObject.className(),
+                identifier: staleRecordName,
+                state: SyncedEntityState.changed.rawValue
+            )
+            staleEntity.pendingGeneration = UUID().uuidString
+            persistenceRealm.add(staleEntity)
+            let pendingRelationship = PendingRelationship()
+            pendingRelationship.relationshipName = "children"
+            pendingRelationship.targetIdentifier = "account-a-target"
+            pendingRelationship.forSyncedEntity = staleEntity
+            persistenceRealm.add(pendingRelationship)
+            persistenceRealm.add(ServerToken())
+        }
+
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-a"
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(zoneName: "pre-setup-account-reset"),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertNil(adapter.realmProvider)
+
+        database.accountIdentifier = "account-b"
+        try await synchronizer._test_validateSynchronizationAccount()
+        persistenceRealm.refresh()
+
+        XCTAssertNil(
+            persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: staleRecordName
+            )
+        )
+        XCTAssertTrue(
+            persistenceRealm.objects(PendingRelationship.self).isEmpty
+        )
+        XCTAssertTrue(persistenceRealm.objects(ServerToken.self).isEmpty)
+        XCTAssertNotNil(adapter.realmProvider)
+    }
+
+    @BigSyncBackgroundActor
     func testCacheResetWaitsForObservedJournalForwardingCancellation()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
@@ -5905,7 +6155,8 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testResetRequeuesJournalForwardedBeforeCancellation() async throws {
+    func testResetRecoversJournalForwardedBeforeCancellationFromDurableState()
+    async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
             id: "reset-after-forward-journal",
@@ -5945,9 +6196,11 @@ final class BigSyncKitTests: XCTestCase {
         await releasePostWrite.open()
         try await reset.value
 
-        XCTAssertTrue(fixture.adapter._test_hasPendingObservedRealmChanges())
+        // Cache reset deliberately discards transient observer work. The
+        // target-Realm journal remains authoritative and setup must recover it
+        // without relying on an account-agnostic in-memory queue.
+        XCTAssertFalse(fixture.adapter._test_hasPendingObservedRealmChanges())
         try await fixture.adapter.unsetCancellation()
-        try await fixture.adapter._test_processObservedRealmChanges()
 
         let tracking = try XCTUnwrap(
             fixture.adapter.realmProvider?.persistenceRealm?.object(
