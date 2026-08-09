@@ -5590,60 +5590,6 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testLegacyObservationDrainsInsideOwnedProcessorTask() async throws {
-        let identifier = UUID().uuidString
-        var persistenceConfiguration = RealmSwiftAdapter
-            .defaultPersistenceConfiguration()
-        persistenceConfiguration.inMemoryIdentifier =
-            "legacy-observation-persistence-\(identifier)"
-        var targetConfiguration = Realm.Configuration()
-        targetConfiguration.inMemoryIdentifier =
-            "legacy-observation-target-\(identifier)"
-        targetConfiguration.objectTypes = [BigSyncTrackedObject.self]
-        let adapter = RealmSwiftAdapter(
-            persistenceRealmConfiguration: persistenceConfiguration,
-            targetRealmConfigurations: [targetConfiguration],
-            excludedClassNames: [],
-            recordZoneID: CKRecordZone.ID(
-                zoneName: "legacy-observation-zone",
-                ownerName: CKCurrentUserDefaultName
-            ),
-            logger: Logger(label: "BigSyncKitTests"),
-            startSetupTask: false
-        )
-        try await adapter.resetSyncCaches()
-        let targetRealm = try XCTUnwrap(
-            adapter.realmProvider?.targetReaderRealms?.first
-        )
-        let persistenceRealm = try XCTUnwrap(
-            adapter.realmProvider?.persistenceRealm
-        )
-        adapter.invalidateTokens()
-        let changedAt = Date(timeIntervalSinceReferenceDate: 34_000)
-        try await targetRealm.asyncWrite {
-            targetRealm.add(
-                BigSyncTrackedObject(
-                    id: "legacy-observed",
-                    createdAt: changedAt,
-                    modifiedAt: changedAt,
-                    explicitlyModifiedAt: changedAt
-                )
-            )
-        }
-
-        adapter._test_enqueueObservedLegacyRealmIndex()
-        try await adapter._test_processObservedRealmChanges()
-
-        XCTAssertNotNil(
-            persistenceRealm.object(
-                ofType: SyncedEntity.self,
-                forPrimaryKey:
-                    BigSyncTrackedObject.className() + ".legacy-observed"
-            )
-        )
-    }
-
-    @BigSyncBackgroundActor
     func testCacheResetWaitsForObservedJournalForwardingCancellation()
     async throws {
         let fixture = try await makeRealmAdapterFixture()

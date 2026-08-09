@@ -452,8 +452,6 @@ public final class RealmSwiftAdapter:
     
     private var resultsChangeSet = ResultsChangeSet()
     
-    private var lastRealmCheckDates: [URL: Date] = [:]
-    private var lastRealmFileModDates: [URL: Date] = [:]
     private var recentlyFetchedRecordModifiedAts = [String: Date]()
     
     private var appForegroundCancellable: AnyCancellable?
@@ -462,8 +460,6 @@ public final class RealmSwiftAdapter:
     private let realmChangesSubject = PassthroughSubject<Void, Never>()
     @BigSyncBackgroundActor
     private var observedJournalRecordNames = [Int: Set<String>]()
-    @BigSyncBackgroundActor
-    private var changedLegacyRealmIndexes = Set<Int>()
     @BigSyncBackgroundActor
     private var observedRealmChangesTask: Task<Void, Never>?
     @BigSyncBackgroundActor
@@ -516,9 +512,10 @@ public final class RealmSwiftAdapter:
         
         super.init()
 
-        BigSyncMutationTracking.install(
-            configurations: targetRealmConfigurations,
+        BigSyncMutationPolicy(
             excludedClassNames: self.excludedClassNames
+        ).install(
+            configurations: targetRealmConfigurations
         )
         
         setupTypeNamesLookup()
@@ -659,8 +656,7 @@ public final class RealmSwiftAdapter:
         if isSetupInterrupted || realmProvider == nil {
             try await ensureSetup()
         }
-        if !observedJournalRecordNames.isEmpty
-            || !changedLegacyRealmIndexes.isEmpty {
+        if !observedJournalRecordNames.isEmpty {
             realmChangesSubject.send(())
         }
     }
@@ -894,9 +890,7 @@ public final class RealmSwiftAdapter:
                 markerIDs: recoveryMarkerIDs
             )
         } else {
-            // Normal launches touch only durable changed IDs. Target Realms that
-            // have not adopted BigSyncPendingMutation retain the timestamp fallback
-            // inside updateCreatedAndModified().
+            // Normal launches touch only the durable record-level journal.
             try await updateCreatedAndModified(notifyDelegate: false)
         }
 
@@ -1031,54 +1025,41 @@ public final class RealmSwiftAdapter:
             }
             .store(in: &cancellables)
         
-        // Observe only the durable mutation journal when it is present. A broad
-        // Realm notification is retained solely for legacy schemas that cannot
-        // atomically journal changed IDs.
+        // Every supported target Realm has the durable record-level journal.
+        // Older timestamp metadata is consulted only by the bounded recovery
+        // scan above, never by steady-state observation.
         for (idx, targetReaderRealm) in targetReaderRealms.enumerated() {
-            let token: NotificationToken
-            if targetReaderRealm.schema.objectSchema.contains(where: {
-                $0.className == BigSyncPendingMutation.className()
-            }) {
-                token = targetReaderRealm.objects(BigSyncPendingMutation.self).observe {
-                    [weak self] changes in
-                    guard let self else { return }
-                    switch changes {
-                    case .initial:
-                        return
-                    case .update(let collection, let deletions, let insertions, let modifications):
-                        guard !deletions.isEmpty || !insertions.isEmpty || !modifications.isEmpty else {
-                            return
-                        }
-                        let changedIndexes = Set(insertions).union(modifications)
-                        let recordNames = changedIndexes.map {
-                            collection[$0].recordName
-                        }
-                        guard !recordNames.isEmpty else { return }
-                        Task { @BigSyncBackgroundActor [weak self] in
-                            self?.enqueueObservedJournalRecordNames(
-                                recordNames,
-                                realmIndex: idx
-                            )
-                        }
-                        return
-                    case .error(let error):
-                        // RealmSwift 20 documents collection observation errors
-                        // as unreachable. Keep the legacy enum case exhaustive
-                        // without adding a second adapter-recovery lifecycle for
-                        // a state the pinned runtime cannot produce.
-                        assertionFailure(
-                            "Unexpected Realm collection observation error: \(error)"
-                        )
+            let token = targetReaderRealm.objects(BigSyncPendingMutation.self).observe {
+                [weak self] changes in
+                guard let self else { return }
+                switch changes {
+                case .initial:
+                    return
+                case .update(let collection, let deletions, let insertions, let modifications):
+                    guard !deletions.isEmpty || !insertions.isEmpty || !modifications.isEmpty else {
                         return
                     }
-                }
-            } else {
-                token = targetReaderRealm.observe { [weak self] _, _ in
-                    guard let self else { return }
+                    let changedIndexes = Set(insertions).union(modifications)
+                    let recordNames = changedIndexes.map {
+                        collection[$0].recordName
+                    }
+                    guard !recordNames.isEmpty else { return }
                     Task { @BigSyncBackgroundActor [weak self] in
-                        self?.changedLegacyRealmIndexes.insert(idx)
-                        self?.realmChangesSubject.send(())
+                        self?.enqueueObservedJournalRecordNames(
+                            recordNames,
+                            realmIndex: idx
+                        )
                     }
+                    return
+                case .error(let error):
+                    // RealmSwift 20 documents collection observation errors
+                    // as unreachable. The durable rows remain available for
+                    // the next setup/terminal drain if the runtime ever
+                    // violates that contract.
+                    assertionFailure(
+                        "Unexpected Realm collection observation error: \(error)"
+                    )
+                    return
                 }
             }
             cancellables.insert(AnyCancellable { token.invalidate() })
@@ -1117,8 +1098,7 @@ public final class RealmSwiftAdapter:
                 observedRealmChangesTask = nil
                 observedRealmChangesTaskID = nil
                 if !cancelSync,
-                   (!observedJournalRecordNames.isEmpty
-                    || !changedLegacyRealmIndexes.isEmpty) {
+                   !observedJournalRecordNames.isEmpty {
                     realmChangesSubject.send(())
                 }
             }
@@ -1131,9 +1111,7 @@ public final class RealmSwiftAdapter:
             return
         }
         let observed = observedJournalRecordNames
-        let legacyIndexes = changedLegacyRealmIndexes
         observedJournalRecordNames.removeAll(keepingCapacity: true)
-        changedLegacyRealmIndexes.removeAll(keepingCapacity: true)
 
         do {
             try Task.checkCancellation()
@@ -1149,14 +1127,6 @@ public final class RealmSwiftAdapter:
                     in: realm
                 )
             }
-            var observedLegacyChange = false
-            for idx in legacyIndexes where idx < targetReaderRealms.count {
-                await enqueueCreatedAndModified(in: targetReaderRealms[idx])
-                observedLegacyChange = true
-            }
-            if observedLegacyChange {
-                try await processEnqueuedChanges()
-            }
             // Forwarding can suspend after a durable tracking write (for
             // example while waking the synchronizer). Do not acknowledge this
             // batch as complete after a reset has cancelled it: the catch below
@@ -1168,7 +1138,6 @@ public final class RealmSwiftAdapter:
                 observedJournalRecordNames[idx, default: []]
                     .formUnion(recordNames)
             }
-            changedLegacyRealmIndexes.formUnion(legacyIndexes)
             if !cancelSync {
                 realmChangesSubject.send(())
             }
@@ -1234,34 +1203,16 @@ public final class RealmSwiftAdapter:
             as? SoftDeletable)?.isDeleted == true
     }
     
-    private func modificationDateForFile(at url: URL) -> Date? {
-        do {
-            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-            return attrs[.modificationDate] as? Date
-        } catch {
-            //            print("Could not read file attributes for \(url.path): \(error)")
-            logger.error("Could not read file attributes for \(url.path): \(error)")
-            return nil
-        }
-    }
-    
     /// Immediately updates.
     @BigSyncBackgroundActor
     private func updateCreatedAndModified(notifyDelegate: Bool = true) async throws {
         guard let targetReaderRealms = realmProvider?.targetReaderRealms else { return }
         for targetReaderRealm in targetReaderRealms {
-            if targetReaderRealm.schema.objectSchema.contains(where: {
-                $0.className == BigSyncPendingMutation.className()
-            }) {
-                try await forwardPendingMutations(
-                    in: targetReaderRealm,
-                    notifyDelegate: notifyDelegate
-                )
-            } else {
-                await enqueueCreatedAndModified(in: targetReaderRealm)
-            }
+            try await forwardPendingMutations(
+                in: targetReaderRealm,
+                notifyDelegate: notifyDelegate
+            )
         }
-        try await processEnqueuedChanges(notifyDelegate: notifyDelegate)
     }
 
     @BigSyncBackgroundActor
@@ -1565,11 +1516,6 @@ public final class RealmSwiftAdapter:
     }
 
     @BigSyncBackgroundActor
-    func _test_enqueueObservedLegacyRealmIndex(_ realmIndex: Int = 0) {
-        changedLegacyRealmIndexes.insert(realmIndex)
-    }
-
-    @BigSyncBackgroundActor
     func _test_processObservedRealmChanges() async throws {
         try await processObservedRealmChanges()
     }
@@ -1582,7 +1528,6 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     func _test_hasPendingObservedRealmChanges() -> Bool {
         !observedJournalRecordNames.isEmpty
-            || !changedLegacyRealmIndexes.isEmpty
     }
 
     @BigSyncBackgroundActor
