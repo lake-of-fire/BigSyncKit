@@ -43,8 +43,18 @@ enum BigSyncCloudKitRecordNameError: Error, Equatable, LocalizedError {
     }
 }
 
-enum RealmSwiftAdapterError: Error {
+enum RealmSwiftAdapterError: Error, LocalizedError {
     case setupUnavailable
+    case malformedRecordIdentifier(recordName: String, entityType: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .setupUnavailable:
+            return "The Realm adapter has not completed setup."
+        case let .malformedRecordIdentifier(recordName, entityType):
+            return "Record name \(recordName) does not contain a valid \(entityType) identifier."
+        }
+    }
 }
 
 enum RealmSwiftRemoteRecordDecodingError: Error, LocalizedError {
@@ -1925,11 +1935,22 @@ public final class RealmSwiftAdapter:
         }
     }
     
-    func getObjectIdentifier(for syncedEntity: SyncedEntity) -> Any {
-        let range = syncedEntity.identifier.range(of: syncedEntity.entityType)!
-        let index = syncedEntity.identifier.index(range.upperBound, offsetBy: 1)
-        let objectIdentifier = String(syncedEntity.identifier[index...])
-        return getObjectIdentifier(stringObjectId: objectIdentifier, entityType: syncedEntity.entityType) ?? objectIdentifier
+    func getObjectIdentifier(for syncedEntity: SyncedEntity) -> Any? {
+        getObjectIdentifier(
+            recordName: syncedEntity.identifier,
+            entityType: syncedEntity.entityType
+        )
+    }
+
+    func getObjectIdentifier(recordName: String, entityType: String) -> Any? {
+        let prefix = entityType + "."
+        guard recordName.hasPrefix(prefix) else { return nil }
+        let objectIdentifier = String(recordName.dropFirst(prefix.count))
+        guard !objectIdentifier.isEmpty else { return nil }
+        return getObjectIdentifier(
+            stringObjectId: objectIdentifier,
+            entityType: entityType
+        )
     }
     
     func getObjectIdentifier(stringObjectId: String, entityType: String) -> Any? {
@@ -2065,9 +2086,17 @@ public final class RealmSwiftAdapter:
                 }
                 
                 if let newValue = newValue as? CKRecord.Reference {
-                    let recordName = newValue.recordID.recordName
-                    let separatorRange = recordName.range(of: ".")!
-                    let newObjectIdentifier = String(recordName[separatorRange.upperBound...])
+                    guard let expectedEntityType = property.objectClassName,
+                          let newObjectIdentifier = objectIdentifier(
+                            from: newValue,
+                            expectedEntityType: expectedEntityType,
+                            expectedZoneID: zoneID
+                          ) else {
+                        // Let the throwing decoder reject the malformed
+                        // relationship rather than trapping during this cheap
+                        // change-detection pass.
+                        return true
+                    }
                     
                     if let existingValue = existingValue as? String {
                         return existingValue != newObjectIdentifier
@@ -2759,6 +2788,30 @@ public final class RealmSwiftAdapter:
             // when extending an object model with a new non-optional property, when an old record is applied to the object.
             //            let ref = ThreadSafeReference(to: object)
             //            debugPrint("!! applyChange", type(of: object), key, value.debugDescription.prefix(100))
+            if let value {
+                let isExpectedScalar: Bool
+                switch property.type {
+                case .int:
+                    isExpectedScalar = value is Int
+                case .string:
+                    isExpectedScalar = value is String
+                case .bool:
+                    isExpectedScalar = value is Bool
+                case .float:
+                    isExpectedScalar = value is Float
+                case .double:
+                    isExpectedScalar = value is Double
+                case .data:
+                    isExpectedScalar = value is Data
+                case .date:
+                    isExpectedScalar = value is Date
+                default:
+                    isExpectedScalar = false
+                }
+                guard isExpectedScalar else {
+                    throw malformed("a scalar matching the Realm property type")
+                }
+            }
             try Task.checkCancellation()
             object.setValue(value, forKey: key)
         }
@@ -2944,11 +2997,22 @@ public final class RealmSwiftAdapter:
             guard let originObjectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
                 continue
             }
-            let objectIdentifier = getObjectIdentifier(for: syncedEntity)
+            guard let objectIdentifier = getObjectIdentifier(for: syncedEntity) else {
+                throw RealmSwiftAdapterError.malformedRecordIdentifier(
+                    recordName: syncedEntity.identifier,
+                    entityType: syncedEntity.entityType
+                )
+            }
             guard let targetRealm = realmProvider.targetReaderRealmPerSchemaName[
                 originObjectClass.className()
             ] else { continue }
             await targetRealm.asyncRefresh()
+            // A cancelled synchronization task can resume after Realm refresh
+            // while a newer run is preparing the same adapter. Stop before
+            // touching persistence-backed relationship objects from the old
+            // run; the pending rows remain durable for retry.
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
             guard let originObject = targetRealm.object(
                 ofType: originObjectClass,
                 forPrimaryKey: objectIdentifier
@@ -3273,7 +3337,12 @@ public final class RealmSwiftAdapter:
         guard let objectClass = self.realmObjectClass(name: syncedEntity.entityType) else {
             return nil
         }
-        let objectIdentifier = getObjectIdentifier(for: syncedEntity)
+        guard let objectIdentifier = getObjectIdentifier(for: syncedEntity) else {
+            throw RealmSwiftAdapterError.malformedRecordIdentifier(
+                recordName: syncedEntity.identifier,
+                entityType: syncedEntity.entityType
+            )
+        }
         let object = realmProvider?.targetReaderRealmPerSchemaName[objectClass.className()]?.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
         let entityState = syncedEntity.state
         
@@ -3795,7 +3864,16 @@ public final class RealmSwiftAdapter:
                         guard let objectClass = self.realmObjectClass(name: record.recordType) else {
                             continue
                         }
-                        let objectIdentifier = getObjectIdentifier(for: syncedEntity)
+                        guard syncedEntity.entityType == record.recordType,
+                              let objectIdentifier = getObjectIdentifier(
+                                for: syncedEntity
+                              ) else {
+                            throw RealmSwiftAdapterError
+                                .malformedRecordIdentifier(
+                                    recordName: record.recordID.recordName,
+                                    entityType: record.recordType
+                                )
+                        }
                         try Task.checkCancellation()
                         guard !cancelSync else { throw CancellationError() }
                         
@@ -4192,6 +4270,8 @@ public final class RealmSwiftAdapter:
                 continue
             }
             await targetRealm.asyncRefresh()
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
             if let mutation = targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: deletion.recordName

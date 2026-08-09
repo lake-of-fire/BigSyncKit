@@ -677,6 +677,43 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    @BigSyncBackgroundActor
+    func testMalformedInboundRecordIdentifierFailsWithoutPublishingTrackingState() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let malformedRecordName = "WrongType.remote-object"
+        let record = CKRecord(
+            recordType: BigSyncTrackedObject.className(),
+            recordID: CKRecord.ID(
+                recordName: malformedRecordName,
+                zoneID: fixture.adapter.recordZoneID
+            )
+        )
+
+        do {
+            try await fixture.adapter.saveChanges(
+                in: [record],
+                forceSave: true
+            )
+            XCTFail("Expected the malformed record identifier to fail")
+        } catch RealmSwiftAdapterError.malformedRecordIdentifier(
+            let recordName,
+            let entityType
+        ) {
+            XCTAssertEqual(recordName, malformedRecordName)
+            XCTAssertEqual(entityType, BigSyncTrackedObject.className())
+        }
+
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: malformedRecordName
+            )
+        )
+        XCTAssertTrue(
+            fixture.targetRealm.objects(BigSyncTrackedObject.self).isEmpty
+        )
+    }
+
     func testPersistentAssetFilePrefixDoesNotExposeRecordNameAsAPath() {
         let recordName = "MediaTranscript.https://example.com/a/b?x=1"
         let prefix = PersistentAssetManager.fileNamePrefix(
@@ -3438,6 +3475,44 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testMalformedPresentScalarRollsBackWholeRemoteRecord() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let originalDate = Date(timeIntervalSinceReferenceDate: 12_500)
+        let object = BigSyncTrackedObject(
+            id: "malformed-scalar",
+            createdAt: originalDate,
+            modifiedAt: originalDate,
+            explicitlyModifiedAt: originalDate
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let remoteDate = originalDate.addingTimeInterval(60)
+        record["createdAt"] = originalDate as CKRecordValue
+        record["modifiedAt"] = remoteDate as CKRecordValue
+        record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record["initialCloudKitSyncEligible"] = "not-a-boolean" as CKRecordValue
+
+        do {
+            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTFail("Expected malformed scalar decoding to fail")
+        } catch is RealmSwiftRemoteRecordDecodingError {
+            // Expected.
+        }
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertEqual(object.modifiedAt, originalDate)
+        XCTAssertTrue(object.initialCloudKitSyncEligible)
+    }
+
+    @BigSyncBackgroundActor
     func testMalformedRelationshipDoesNotClearExistingTargets() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let child = BigSyncRelationshipChild()
@@ -3507,6 +3582,24 @@ final class BigSyncKitTests: XCTestCase {
             recordID: CKRecord.ID(
                 recordName: BigSyncRelationshipChild.className() + ".existing-child",
                 zoneID: otherZone
+            ),
+            action: .none
+        )
+        try await assertMalformedRelationshipDoesNotApply(
+            field: "favoriteChild",
+            value: reference
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRelationshipReferenceRejectsMalformedRecordName() async throws {
+        let reference = CKRecord.Reference(
+            recordID: CKRecord.ID(
+                recordName: "missing-type-prefix",
+                zoneID: CKRecordZone.ID(
+                    zoneName: "realm-adapter-zone",
+                    ownerName: CKCurrentUserDefaultName
+                )
             ),
             action: .none
         )
