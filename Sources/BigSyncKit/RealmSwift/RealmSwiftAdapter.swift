@@ -401,7 +401,7 @@ public final class RealmSwiftAdapter:
     TerminalSynchronizationStateModelAdapter {
     private static let mutationJournalRecoveryEntityTypePrefix =
         "__BigSyncKitMutationJournalRecovery.v2."
-    private static let mutationJournalRecoveryVersion = 1
+    private static let mutationJournalRecoveryVersion = 2
 
     private static var shouldSkipDebugDummySetup: Bool {
         let environment = ProcessInfo.processInfo.environment
@@ -711,41 +711,10 @@ public final class RealmSwiftAdapter:
         self.realmProvider = provider
         let realmProvider = provider
 
-        if let persistenceRealm = realmProvider.persistenceRealm {
-            let pendingStates = [
-                SyncedEntityState.new.rawValue,
-                SyncedEntityState.changed.rawValue,
-                SyncedEntityState.deletedLocally.rawValue,
-            ]
-            let entitiesMissingGeneration = persistenceRealm.objects(SyncedEntity.self)
-                .where { $0.state.in(pendingStates) && $0.pendingGeneration == nil }
-            // Assigning a generation removes the row from this live query.
-            // Snapshot primary keys first, then resolve each row inside the
-            // transaction so Realm never mutates a collection while its fast
-            // enumerator is active.
-            let identifiersMissingGeneration = entitiesMissingGeneration
-                .map(\.identifier)
-            if !identifiersMissingGeneration.isEmpty {
-                try await persistenceRealm.asyncWrite {
-                    for identifier in identifiersMissingGeneration {
-                        guard let entity = persistenceRealm.object(
-                            ofType: SyncedEntity.self,
-                            forPrimaryKey: identifier
-                        ), entity.pendingGeneration == nil,
-                           pendingStates.contains(entity.state) else {
-                            continue
-                        }
-                        entity.pendingGeneration = UUID().uuidString
-                    }
-                }
-            }
-        }
-        
         guard let persistenceRealm = realmProvider.persistenceRealm else {
             try Task.checkCancellation()
             throw RealmSwiftAdapterError.setupUnavailable
         }
-        let syncEmpty = persistenceRealm.objects(SyncedEntity.self).isEmpty
         // An empty user Realm is still initialized. Without this durable marker,
         // empty databases repeated the full initial scan on every launch.
         let recoveryMarkerIDs = mutationJournalRecoveryMarkerIDs()
@@ -753,6 +722,46 @@ public final class RealmSwiftAdapter:
             in: persistenceRealm,
             markerIDs: recoveryMarkerIDs
         )
+        if needsMutationJournalRecovery {
+            // The marker signature changes when synchronized object types or
+            // exclusions change. Retire tracking metadata that the current
+            // adapter no longer owns before deciding whether initial setup is
+            // empty. These are local bookkeeping rows, not CloudKit tombstones.
+            try await reconcilePersistedTrackingOwnership(
+                in: persistenceRealm
+            )
+        }
+
+        let pendingStates = [
+            SyncedEntityState.new.rawValue,
+            SyncedEntityState.changed.rawValue,
+            SyncedEntityState.deletedLocally.rawValue,
+        ]
+        let entitiesMissingGeneration = persistenceRealm.objects(SyncedEntity.self)
+            .where { $0.state.in(pendingStates) && $0.pendingGeneration == nil }
+        // Assigning a generation removes the row from this live query.
+        // Snapshot primary keys first, then resolve each row inside the
+        // transaction so Realm never mutates a collection while its fast
+        // enumerator is active.
+        let identifiersMissingGeneration = entitiesMissingGeneration
+            .map(\.identifier)
+        if !identifiersMissingGeneration.isEmpty {
+            try await persistenceRealm.asyncWrite {
+                for identifier in identifiersMissingGeneration {
+                    guard let entity = persistenceRealm.object(
+                        ofType: SyncedEntity.self,
+                        forPrimaryKey: identifier
+                    ), entity.pendingGeneration == nil,
+                       pendingStates.contains(entity.state),
+                       isOwnedEntityType(entity.entityType) else {
+                        continue
+                    }
+                    entity.pendingGeneration = UUID().uuidString
+                }
+            }
+        }
+
+        let syncEmpty = persistenceRealm.objects(SyncedEntity.self).isEmpty
         let needsInitialSetup = syncEmpty && needsMutationJournalRecovery
         
         if needsInitialSetup {
@@ -910,6 +919,64 @@ public final class RealmSwiftAdapter:
                 }
             }
         }
+    }
+
+    private var ownedEntityTypeNames: Set<String> {
+        Set(modelTypes.keys).subtracting(excludedClassNames)
+    }
+
+    private func isOwnedEntityType(_ entityType: String) -> Bool {
+        modelTypes[entityType] != nil
+            && !excludedClassNames.contains(entityType)
+    }
+
+    @BigSyncBackgroundActor
+    private func reconcilePersistedTrackingOwnership(
+        in persistenceRealm: Realm
+    ) async throws {
+        let ownedEntityTypes = ownedEntityTypeNames
+        let staleEntityIdentifiers: [String] = Array(
+            persistenceRealm.objects(SyncedEntity.self)
+        )
+            .compactMap { entity in
+                ownedEntityTypes.contains(entity.entityType)
+                    ? nil
+                    : entity.identifier
+            }
+        guard !staleEntityIdentifiers.isEmpty else { return }
+
+        let staleIdentifierSet = Set(staleEntityIdentifiers)
+        try await persistenceRealm.asyncWrite {
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
+
+            // PendingRelationship has no primary key, so resolve the current
+            // relationship set inside the same transaction that removes its
+            // retired origin tracking rows.
+            let staleRelationships = Array(
+                persistenceRealm.objects(PendingRelationship.self)
+            ).filter { relationship in
+                guard let ownerIdentifier = relationship.forSyncedEntity?
+                    .identifier else {
+                    return true
+                }
+                return staleIdentifierSet.contains(ownerIdentifier)
+            }
+            persistenceRealm.delete(staleRelationships)
+
+            for identifier in staleEntityIdentifiers {
+                guard let entity = persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: identifier
+                ), !ownedEntityTypes.contains(entity.entityType) else {
+                    continue
+                }
+                persistenceRealm.delete(entity)
+            }
+        }
+        logger.info(
+            "QSCloudKitSynchronizer >> Retired \(staleEntityIdentifiers.count) tracking records for unowned model types"
+        )
     }
 
     @BigSyncBackgroundActor
@@ -1661,7 +1728,11 @@ public final class RealmSwiftAdapter:
             SyncedEntityState.changed.rawValue,
             SyncedEntityState.deletedLocally.rawValue,
         ]
-        let results = realm.objects(SyncedEntity.self).where { $0.state.in(pendingStates) }
+        let ownedEntityTypes = ownedEntityTypeNames.sorted()
+        let results = realm.objects(SyncedEntity.self).where {
+            $0.state.in(pendingStates)
+                && $0.entityType.in(ownedEntityTypes)
+        }
         // The common idle path only needs to prove that the indexed result is
         // still empty. Avoid recomputing its exact cardinality at every no-op
         // import, acknowledgement, and terminal callback.
@@ -3200,6 +3271,7 @@ public final class RealmSwiftAdapter:
         ]
         let pendingEntities = persistenceRealm.objects(SyncedEntity.self)
         for entityType in priorityEntityTypeNames {
+            guard isOwnedEntityType(entityType) else { continue }
             if pendingEntities.where({
                 $0.state.in(pendingStates) && $0.entityType == entityType
             }).first != nil {
@@ -3265,7 +3337,7 @@ public final class RealmSwiftAdapter:
                 return
             }
             
-            if !hasRealmObjectClass(name: syncedEntity.entityType) {
+            if !isOwnedEntityType(syncedEntity.entityType) {
                 return
             }
             
@@ -4503,6 +4575,9 @@ public final class RealmSwiftAdapter:
         var deletions = [PreparedRecordDeletion]()
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return [] }
         let targetEntityType = restrictedToEntityType ?? prioritizedEntityTypeWithPendingUploadOrDeletion()
+        if let targetEntityType, !isOwnedEntityType(targetEntityType) {
+            return []
+        }
         let allEntities = persistenceRealm.objects(SyncedEntity.self)
         let deletedEntities: Results<SyncedEntity>
         if let targetEntityType {
@@ -4518,6 +4593,7 @@ public final class RealmSwiftAdapter:
         
         for syncedEntity in deletedEntities {
             guard !cancelSync else { throw CancellationError() }
+            guard isOwnedEntityType(syncedEntity.entityType) else { continue }
             if deletions.count >= limit {
                 break
             }
@@ -4667,7 +4743,13 @@ public final class RealmSwiftAdapter:
         
         //        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
         try await updateCreatedAndModified()
-        let pendingEntities = persistenceRealm.objects(SyncedEntity.self).where({ $0.state.in([SyncedEntityState.new.rawValue, SyncedEntityState.changed.rawValue]) })
+        let ownedEntityTypes = ownedEntityTypeNames.sorted()
+        let pendingEntities = persistenceRealm.objects(SyncedEntity.self).where {
+            $0.state.in([
+                SyncedEntityState.new.rawValue,
+                SyncedEntityState.changed.rawValue,
+            ]) && $0.entityType.in(ownedEntityTypes)
+        }
         let pendingRecordIDs = Set(pendingEntities.map { $0.identifier })
         persistentAssetManager.clearAssetFiles(excludingSyncedEntityIDs: pendingRecordIDs)
         updateHasChanges(realm: persistenceRealm)

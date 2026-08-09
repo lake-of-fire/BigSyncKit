@@ -772,6 +772,211 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    @BigSyncBackgroundActor
+    func testSetupRetiresTrackingForNewlyExcludedTypeAndFailsClosed()
+    async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "excluded-transition-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "excluded-transition-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+
+        let persistenceRealm = try await Realm(
+            configuration: persistenceConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let targetRealm = try await Realm(
+            configuration: targetConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let recordName = BigSyncTrackedObject.className() + ".excluded"
+        let trackedObject = BigSyncTrackedObject(
+            id: "excluded",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await targetRealm.asyncWrite {
+            targetRealm.add(trackedObject)
+            targetRealm.add(
+                BigSyncPendingMutation(
+                    recordName: recordName,
+                    entityType: BigSyncTrackedObject.className(),
+                    objectIdentifier: trackedObject.id
+                )
+            )
+        }
+        try await persistenceRealm.asyncWrite {
+            let staleEntities = (0..<3).map { index in
+                let entity = SyncedEntity(
+                    entityType: BigSyncTrackedObject.className(),
+                    identifier: index == 0
+                        ? recordName
+                        : recordName + "-\(index)",
+                    state: SyncedEntityState.changed.rawValue
+                )
+                entity.pendingGeneration = UUID().uuidString
+                persistenceRealm.add(entity)
+                return entity
+            }
+            let relationship = PendingRelationship()
+            relationship.relationshipName = "favoriteChild"
+            relationship.targetIdentifier = "unused"
+            relationship.forSyncedEntity = staleEntities[0]
+            persistenceRealm.add(relationship)
+        }
+        XCTAssertEqual(persistenceRealm.objects(SyncedEntity.self).count, 3)
+        XCTAssertEqual(
+            persistenceRealm.objects(PendingRelationship.self).count,
+            1
+        )
+
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [BigSyncTrackedObject.className()],
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "excluded-transition"
+            ),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        try await adapter.unsetCancellation()
+        persistenceRealm.refresh()
+        targetRealm.refresh()
+
+        XCTAssertNil(
+            persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertTrue(persistenceRealm.objects(SyncedEntity.self).isEmpty)
+        XCTAssertTrue(
+            persistenceRealm.objects(PendingRelationship.self).isEmpty
+        )
+        XCTAssertNil(
+            targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+
+        // Preparation also fails closed if corrupt or externally authored
+        // tracking rows appear after the versioned setup reconciliation.
+        try await persistenceRealm.asyncWrite {
+            let upload = SyncedEntity(
+                entityType: BigSyncTrackedObject.className(),
+                identifier: recordName + "-upload",
+                state: SyncedEntityState.changed.rawValue
+            )
+            upload.pendingGeneration = UUID().uuidString
+            persistenceRealm.add(upload)
+            let deletion = SyncedEntity(
+                entityType: BigSyncTrackedObject.className(),
+                identifier: recordName + "-deletion",
+                state: SyncedEntityState.deletedLocally.rawValue
+            )
+            deletion.pendingGeneration = UUID().uuidString
+            persistenceRealm.add(deletion)
+        }
+
+        let preparedUploads = try await adapter.preparedRecordsToUpload(
+            limit: 100,
+            restrictedToEntityType: nil
+        )
+        let preparedDeletions = try await adapter.preparedRecordDeletions(
+            limit: 100,
+            restrictedToEntityType: nil
+        )
+        XCTAssertTrue(preparedUploads.isEmpty)
+        XCTAssertTrue(preparedDeletions.isEmpty)
+        XCTAssertFalse(try adapter.hasPendingChangesAtTerminalBoundary())
+    }
+
+    @BigSyncBackgroundActor
+    func testSetupRetiresRemovedTypeBeforeDeterminingInitialState()
+    async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "removed-transition-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "removed-transition-target-\(identifier)"
+        targetConfiguration.objectTypes = [BigSyncPendingMutation.self]
+
+        let persistenceRealm = try await Realm(
+            configuration: persistenceConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let targetRealm = try await Realm(
+            configuration: targetConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let recordName = BigSyncTrackedObject.className() + ".removed"
+        try await targetRealm.asyncWrite {
+            targetRealm.add(
+                BigSyncPendingMutation(
+                    recordName: recordName,
+                    entityType: BigSyncTrackedObject.className(),
+                    objectIdentifier: "removed"
+                )
+            )
+        }
+        try await persistenceRealm.asyncWrite {
+            let staleEntity = SyncedEntity(
+                entityType: BigSyncTrackedObject.className(),
+                identifier: recordName,
+                state: SyncedEntityState.changed.rawValue
+            )
+            staleEntity.pendingGeneration = UUID().uuidString
+            persistenceRealm.add(staleEntity)
+            let relationship = PendingRelationship()
+            relationship.relationshipName = "children"
+            relationship.targetIdentifier = "unused"
+            relationship.forSyncedEntity = staleEntity
+            persistenceRealm.add(relationship)
+        }
+        XCTAssertEqual(persistenceRealm.objects(SyncedEntity.self).count, 1)
+        XCTAssertEqual(
+            persistenceRealm.objects(PendingRelationship.self).count,
+            1
+        )
+
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(zoneName: "removed-transition"),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        let delegate = FakeModelAdapterDelegate()
+        adapter.modelAdapterDelegate = delegate
+        try await adapter.unsetCancellation()
+        persistenceRealm.refresh()
+        targetRealm.refresh()
+
+        XCTAssertEqual(delegate.initialSetupCount, 1)
+        XCTAssertTrue(persistenceRealm.objects(SyncedEntity.self).isEmpty)
+        XCTAssertTrue(
+            persistenceRealm.objects(PendingRelationship.self).isEmpty
+        )
+        XCTAssertTrue(
+            targetRealm.objects(BigSyncPendingMutation.self).isEmpty
+        )
+        XCTAssertFalse(try adapter.hasPendingChangesAtTerminalBoundary())
+    }
+
     func testPersistentAssetFilePrefixDoesNotExposeRecordNameAsAPath() {
         let recordName = "MediaTranscript.https://example.com/a/b?x=1"
         let prefix = PersistentAssetManager.fileNamePrefix(
@@ -1411,6 +1616,11 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testPublicCacheResetCannotBypassCancellationBarrier() async throws {
         let database = FakeCloudKitDatabase()
+        // This scenario needs synchronization to reach the terminal import
+        // barrier before reset is requested.  The fake database deliberately
+        // leaves an empty zone-change operation open unless a test opts into
+        // its completion, so the barrier test must close that operation here.
+        database.completesEmptyZoneChangeOperation = true
         let synchronizer = makeSynchronizer(database: database)
         let gate = AsyncGate()
         let enteredTerminalImport = expectation(
@@ -5728,7 +5938,7 @@ final class BigSyncKitTests: XCTestCase {
                         "__BigSyncKitMutationJournalRecovery.v2."
                     )
                 })?.recoveryVersion,
-            1
+            2
         )
     }
 
