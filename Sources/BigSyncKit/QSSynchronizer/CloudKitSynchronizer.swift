@@ -1150,6 +1150,12 @@ public class CloudKitSynchronizer: NSObject {
         // transient CloudKit failures may safely retry the same fenced receipt.
         reservedReceiptAuthorizationID = receipt.authorizationID
         var shouldConsumeAuthorization = false
+        func validateReservedAuthorization() throws {
+            guard activeReceiptAuthorizationID == receipt.authorizationID,
+                  reservedReceiptAuthorizationID == receipt.authorizationID else {
+                throw OneOffRecordZoneResetError.cloudKitAccountChanged
+            }
+        }
         defer {
             if reservedReceiptAuthorizationID == receipt.authorizationID {
                 reservedReceiptAuthorizationID = nil
@@ -1161,6 +1167,7 @@ public class CloudKitSynchronizer: NSObject {
         }
         do {
             try await ensureCurrentAccount(receipt.accountIdentifier)
+            try validateReservedAuthorization()
             let deleted: Bool
             do {
                 try await deleteRecordZone(zoneID)
@@ -1169,7 +1176,9 @@ public class CloudKitSynchronizer: NSObject {
                 guard isMissingRecordZoneError(error) else { throw error }
                 deleted = false
             }
+            try validateReservedAuthorization()
             try await ensureCurrentAccount(receipt.accountIdentifier)
+            try validateReservedAuthorization()
             shouldConsumeAuthorization = true
             return deleted
         } catch {

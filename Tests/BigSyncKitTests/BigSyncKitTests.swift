@@ -714,6 +714,52 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    @BigSyncBackgroundActor
+    func testExcludedRecordTypeIsNotImportedFromCloudKit() async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "excluded-import-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "excluded-import-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [BigSyncTrackedObject.className()],
+            recordZoneID: CKRecordZone.ID(zoneName: "excluded-import"),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        try await adapter.resetSyncCaches()
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "remote",
+            zoneID: adapter.recordZoneID
+        )
+
+        try await adapter.saveChanges(in: [record], forceSave: true)
+
+        let targetRealm = try XCTUnwrap(
+            adapter.realmProvider?.targetReaderRealms?.first
+        )
+        let persistenceRealm = try XCTUnwrap(
+            adapter.realmProvider?.persistenceRealm
+        )
+        XCTAssertTrue(targetRealm.objects(BigSyncTrackedObject.self).isEmpty)
+        XCTAssertNil(
+            persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName
+            )
+        )
+    }
+
     func testPersistentAssetFilePrefixDoesNotExposeRecordNameAsAPath() {
         let recordName = "MediaTranscript.https://example.com/a/b?x=1"
         let prefix = PersistentAssetManager.fileNamePrefix(
@@ -745,6 +791,49 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNotEqual(first, second)
         XCTAssertTrue(first.hasSuffix("-shared-zone-name.realm"))
         XCTAssertFalse(first.contains("container-a"))
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletedManagedZoneResetsTrackingEvenWhenZoneTokenIsNil()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let staleRecordName = BigSyncTrackedObject.className() + ".stale"
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(
+                SyncedEntity(
+                    entityType: BigSyncTrackedObject.className(),
+                    identifier: staleRecordName,
+                    state: SyncedEntityState.synced.rawValue
+                )
+            )
+        }
+        let storedToken = await fixture.adapter.serverChangeToken
+        XCTAssertNil(storedToken)
+        XCTAssertNotNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: staleRecordName
+            )
+        )
+
+        let provider = DefaultRealmSwiftAdapterProvider(
+            adapter: fixture.adapter,
+            logger: Logger(label: "BigSyncKitTests")
+        )
+        try await provider.cloudKitSynchronizer(
+            makeSynchronizer(),
+            zoneWasDeletedWithZoneID: fixture.adapter.recordZoneID
+        )
+
+        let rebuiltPersistenceRealm = try XCTUnwrap(
+            fixture.adapter.realmProvider?.persistenceRealm
+        )
+        XCTAssertNil(
+            rebuiltPersistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: staleRecordName
+            )
+        )
     }
 
     @BigSyncBackgroundActor
@@ -1840,6 +1929,53 @@ final class BigSyncKitTests: XCTestCase {
         } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
         }
         XCTAssertTrue(database.deletedZoneIDs.isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testObsoleteZoneDeletionRejectsAuthorizationRevokedWhileSuspended()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneDelayNanoseconds = 100_000_000
+        let enteredDeletion = expectation(description: "zone deletion entered")
+        database.deleteZoneHandler = { enteredDeletion.fulfill() }
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let authorizationID = UUID()
+        synchronizer.activeReceiptAuthorizationID = authorizationID
+        let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+            context: .init(
+                attemptID: UUID(),
+                runID: UUID(),
+                accountIdentifier: database.accountIdentifier,
+                accountScopeIdentifier:
+                    try await synchronizer.cloudKitAccountScopeIdentifier()
+            ),
+            issuerID: synchronizer.synchronizationReceiptIssuerID,
+            authorizationID: authorizationID
+        )
+        let deletion = Task { @BigSyncBackgroundActor in
+            try await synchronizer.deleteRecordZoneIfPresent(
+                CKRecordZone.ID(zoneName: "revoked-obsolete-zone"),
+                using: receipt
+            )
+        }
+        await fulfillment(of: [enteredDeletion], timeout: 1)
+
+        // Models account A -> B -> A while the destructive callback is in
+        // flight. The visible account is A again, but account-change
+        // cancellation revoked this one-shot receipt authorization.
+        synchronizer.cancelSynchronization()
+
+        do {
+            _ = try await deletion.value
+            XCTFail("Expected the revoked receipt to reject stale success")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(database.deletedZoneIDs.count, 1)
     }
 
     @BigSyncBackgroundActor
@@ -4908,6 +5044,71 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(
             fixture.persistenceRealm.objects(PendingRelationship.self).count,
             0
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testNewerRemoteEmptyRelationshipReplacesMissingTargetIntent()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let parent = BigSyncRelationshipParent()
+        parent.id = "parent"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(parent)
+        }
+        let remoteDate = Date(timeIntervalSinceReferenceDate: 31_000)
+        let relationshipRecord = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        relationshipRecord["children"] = [
+            "\(BigSyncRelationshipChild.className()).late"
+        ] as CKRecordValue
+        relationshipRecord["modifiedAt"] = remoteDate as CKRecordValue
+        relationshipRecord["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+
+        try await fixture.adapter.saveChanges(
+            in: [relationshipRecord],
+            forceSave: true
+        )
+        try await fixture.adapter.persistImportedChanges()
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self)
+                .where { $0.relationshipName == "children" }.count,
+            1
+        )
+
+        // CloudKit omits empty relationship collections. Keep identical
+        // metadata to prove correctness does not depend on timestamp ordering.
+        let clearedRecord = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        clearedRecord["modifiedAt"] = remoteDate as CKRecordValue
+        clearedRecord["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        try await fixture.adapter.saveChanges(
+            in: [clearedRecord],
+            forceSave: true
+        )
+        try await fixture.adapter.persistImportedChanges()
+        XCTAssertTrue(parent.children.isEmpty)
+        XCTAssertTrue(
+            fixture.persistenceRealm.objects(PendingRelationship.self)
+                .where { $0.relationshipName == "children" }.isEmpty
+        )
+
+        let lateChild = BigSyncRelationshipChild()
+        lateChild.id = "late"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(lateChild)
+        }
+        try await fixture.adapter.persistImportedChanges()
+
+        XCTAssertTrue(parent.children.isEmpty)
+        XCTAssertTrue(
+            fixture.persistenceRealm.objects(PendingRelationship.self).isEmpty
         )
     }
 

@@ -2453,6 +2453,22 @@ public final class RealmSwiftAdapter:
             // Full zone-change fetches use desiredKeys == nil, so an absent
             // collection field is the CloudKit representation of an empty
             // collection. Realm collections cannot be assigned nil.
+            if property.type == .object {
+                guard property.objectClassName != nil else {
+                    throw malformed("a Realm relationship type")
+                }
+                // Replace any older deferred relationship with an explicit
+                // empty intent. Clearing only the target object would leave a
+                // prior missing-target request able to replay later.
+                appendPendingRelationship(
+                    name: property.name,
+                    syncedEntityID: syncedEntityIdentifier,
+                    targetIdentifiers: [],
+                    record: record,
+                    to: &pendingRelationships
+                )
+                return
+            }
             clearCollection(property: property, on: object)
             return
         }
@@ -3048,6 +3064,10 @@ public final class RealmSwiftAdapter:
                 relationships.first?.expectedModifiedAt
             let expectedExplicitlyModifiedAt =
                 relationships.first?.expectedExplicitlyModifiedAt
+            let expectedRecordChangeTag =
+                relationships.first?.sourceRecordChangeTag
+            let currentRecordChangeTag = getRecord(for: syncedEntity)?
+                .recordChangeTag
             func datesMatch(_ lhs: Date?, _ rhs: Date?) -> Bool {
                 switch (lhs, rhs) {
                 case (.none, .none):
@@ -3060,8 +3080,6 @@ public final class RealmSwiftAdapter:
                     return false
                 }
             }
-            let hasServerVersion =
-                relationships.first?.sourceRecordChangeTag != nil
             func hasInterveningLocalMutation() -> Bool {
                 let hasPendingMutation =
                     targetRealm.schema.objectSchema.contains {
@@ -3080,9 +3098,13 @@ public final class RealmSwiftAdapter:
                         originObject["explicitlyModifiedAt"] as? Date,
                         expectedExplicitlyModifiedAt
                     )
+                let remoteVersionChanged = expectedRecordChangeTag != nil
+                    && currentRecordChangeTag != expectedRecordChangeTag
                 return hasPendingMutation
                     || syncedEntity.pendingGeneration != nil
-                    || (hasServerVersion && localMetadataChanged)
+                    || remoteVersionChanged
+                    || (expectedRecordChangeTag != nil
+                        && localMetadataChanged)
             }
             if hasInterveningLocalMutation() {
                 logger.info(
@@ -3864,6 +3886,12 @@ public final class RealmSwiftAdapter:
             for record in chunk {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
+                // Exclusions define ownership in both directions. Records for
+                // AppSync-owned models must never be imported merely because a
+                // stale or older client left them in this CloudKit zone.
+                guard !excludedClassNames.contains(record.recordType) else {
+                    continue
+                }
                 
                 guard let persistenceRealm = realmProvider.persistenceRealm else { return }
                 var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm)

@@ -50,6 +50,18 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         super.init()
         adapter = createAdapter()
     }
+
+    init(adapter: RealmSwiftAdapter, logger: Logging.Logger) {
+        zoneID = adapter.recordZoneID
+        persistenceConfiguration = adapter.persistenceRealmConfiguration
+        targetConfigurations = adapter.targetRealmConfigurations
+        excludedClassNames = adapter.excludedClassNames
+        priorityClassNames = adapter.priorityEntityTypeNames
+        appGroup = nil
+        self.logger = logger
+        super.init()
+        self.adapter = adapter
+    }
     
     public func cloudKitSynchronizer(
         _ synchronizer: CloudKitSynchronizer,
@@ -61,8 +73,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     
     @BigSyncBackgroundActor
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) async throws {
-        let adapterHasSyncedBefore = await adapter.serverChangeToken != nil
-        if recordZoneID == zoneID && adapterHasSyncedBefore {
+        if recordZoneID == zoneID {
 //            await adapter.deleteChangeTracking()
 //            synchronizer.removeModelAdapter(adapter)
 //            adapter = createAdapter()
