@@ -713,9 +713,22 @@ public final class RealmSwiftAdapter:
             ]
             let entitiesMissingGeneration = persistenceRealm.objects(SyncedEntity.self)
                 .where { $0.state.in(pendingStates) && $0.pendingGeneration == nil }
-            if !entitiesMissingGeneration.isEmpty {
+            // Assigning a generation removes the row from this live query.
+            // Snapshot primary keys first, then resolve each row inside the
+            // transaction so Realm never mutates a collection while its fast
+            // enumerator is active.
+            let identifiersMissingGeneration = entitiesMissingGeneration
+                .map(\.identifier)
+            if !identifiersMissingGeneration.isEmpty {
                 try await persistenceRealm.asyncWrite {
-                    for entity in entitiesMissingGeneration {
+                    for identifier in identifiersMissingGeneration {
+                        guard let entity = persistenceRealm.object(
+                            ofType: SyncedEntity.self,
+                            forPrimaryKey: identifier
+                        ), entity.pendingGeneration == nil,
+                           pendingStates.contains(entity.state) else {
+                            continue
+                        }
                         entity.pendingGeneration = UUID().uuidString
                     }
                 }
@@ -3170,18 +3183,27 @@ public final class RealmSwiftAdapter:
         } else {
             results = allResults.where { $0.state == state.rawValue }
         }
+        // Capture only primary keys before materializing any records. The
+        // missing-target path in recordToUpload can mark a tracking row as
+        // deleted; iterating a live Results while that write occurs can leave
+        // Realm's fast enumerator pointing at invalidated storage.
+        let candidateIdentifiers = results.map(\.identifier)
         var resultArray = [PreparedRecordUpload]()
         var includedEntityIDs = Set<String>()
 
         func appendUploadRecords(
-            matching include: (SyncedEntity) -> Bool
+            matching include: (String) -> Bool
         ) throws {
-            // Never suspend while Realm's fast enumerator is live. Record
-            // materialization and its missing-object transition are kept in
-            // this non-reentrant actor boundary.
-            for candidate in results where include(candidate) {
+            for identifier in candidateIdentifiers {
+                guard include(identifier) else { continue }
                 if resultArray.count >= limit {
                     return
+                }
+                guard let candidate = persistenceRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: identifier
+                ) else {
+                    continue
                 }
                 try appendUploadRecords(startingAt: candidate)
             }
@@ -3228,9 +3250,9 @@ public final class RealmSwiftAdapter:
         if dummyRecordIdentifiers.isEmpty {
             try appendUploadRecords { _ in true }
         } else {
-            try appendUploadRecords { dummyRecordIdentifiers.contains($0.identifier) }
+            try appendUploadRecords { dummyRecordIdentifiers.contains($0) }
             if resultArray.count < limit {
-                try appendUploadRecords { !dummyRecordIdentifiers.contains($0.identifier) }
+                try appendUploadRecords { !dummyRecordIdentifiers.contains($0) }
             }
         }
 #else

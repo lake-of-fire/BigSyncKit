@@ -5026,6 +5026,60 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testSetupAssignsEveryMissingGenerationWithoutMutatingLiveResults()
+    async throws {
+        let identifier = UUID().uuidString
+        var persistenceConfiguration = RealmSwiftAdapter
+            .defaultPersistenceConfiguration()
+        persistenceConfiguration.inMemoryIdentifier =
+            "missing-generation-persistence-\(identifier)"
+        var targetConfiguration = Realm.Configuration()
+        targetConfiguration.inMemoryIdentifier =
+            "missing-generation-target-\(identifier)"
+        targetConfiguration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+
+        let persistenceRealm = try await Realm(
+            configuration: persistenceConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let recordCount = 1_001
+        try await persistenceRealm.asyncWrite {
+            for index in 0..<recordCount {
+                persistenceRealm.add(
+                    SyncedEntity(
+                        entityType: BigSyncTrackedObject.className(),
+                        identifier: "\(BigSyncTrackedObject.className()).legacy-\(index)",
+                        state: SyncedEntityState.changed.rawValue
+                    )
+                )
+            }
+        }
+
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(zoneName: "missing-generations"),
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+
+        try await adapter.unsetCancellation()
+        persistenceRealm.refresh()
+
+        XCTAssertEqual(
+            persistenceRealm.objects(SyncedEntity.self).where {
+                $0.state == SyncedEntityState.changed.rawValue
+                    && $0.pendingGeneration != nil
+            }.count,
+            recordCount
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testSaveTokenWaitsForCompletedRealmSetupAndPropagatesFailure()
     async throws {
         let identifier = UUID().uuidString
