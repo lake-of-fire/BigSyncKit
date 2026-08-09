@@ -27,6 +27,24 @@ private enum TestSynchronizationError: Error {
     case importedPersistenceCacheFailed
 }
 
+@BigSyncBackgroundActor
+private final class TerminalCallbackObservation: NSObject {
+    private let synchronizer: CloudKitSynchronizer
+    private(set) var sawCompletedDrain = false
+
+    init(synchronizer: CloudKitSynchronizer) {
+        self.synchronizer = synchronizer
+    }
+
+    @objc func synchronizerDidSynchronize(_ notification: Notification) {
+        guard notification.object as? CloudKitSynchronizer === synchronizer else {
+            return
+        }
+        sawCompletedDrain = !synchronizer.synchronizationDrainIsActive
+        synchronizer.beginSynchronization()
+    }
+}
+
 private final class FailingDeletedZoneProvider: NSObject, AdapterProvider {
     func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async throws {
         throw TestSynchronizationError.deletedZoneResetFailed
@@ -1199,6 +1217,30 @@ final class BigSyncKitTests: XCTestCase {
             expectedAccountScope
         )
         XCTAssertFalse(synchronizer.syncing)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalNotificationReentrancyStartsAnIndependentDrain() async {
+        let synchronizer = makeSynchronizer()
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+        let firstAttemptID = synchronizer.synchronizationAttemptID
+        let observation = TerminalCallbackObservation(synchronizer: synchronizer)
+        NotificationCenter.default.addObserver(
+            observation,
+            selector: #selector(observation.synchronizerDidSynchronize(_:)),
+            name: .SynchronizerDidSynchronize,
+            object: synchronizer
+        )
+        defer { NotificationCenter.default.removeObserver(observation) }
+
+        await synchronizer.changesFinishedSynchronizing()
+
+        XCTAssertTrue(observation.sawCompletedDrain)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        XCTAssertNotEqual(synchronizer.synchronizationAttemptID, firstAttemptID)
         await synchronizer.cancelSynchronizationAndWait()
     }
 

@@ -109,8 +109,11 @@ extension CloudKitSynchronizer {
             beginSynchronization()
             return
         }
-        postNotification(.SynchronizerDidSynchronize)
-        delegate?.synchronizerDidSync(self)
+        // Snapshot and publish the terminal result before invoking synchronous
+        // external callbacks. A notification observer or delegate is allowed to
+        // request another synchronization. If it does, that request must start a
+        // fresh drain; the old completion must not subsequently clear the new
+        // drain's state or mint its receipt from mutable run state.
         let receipt = activeRunContext.map { context in
             let authorizationID = UUID()
             activeReceiptAuthorizationID = authorizationID
@@ -120,15 +123,13 @@ extension CloudKitSynchronizer {
                 authorizationID: authorizationID
             )
         }
-        finishSynchronizationDrain(
-            with: .success(
-                SynchronizationResult(
-                    didImportChanges:
-                        synchronizationDrainDidImportChanges,
-                    receipt: receipt
-                )
-            )
+        let result = SynchronizationResult(
+            didImportChanges: synchronizationDrainDidImportChanges,
+            receipt: receipt
         )
+        finishSynchronizationDrain(with: .success(result))
+        postNotification(.SynchronizerDidSynchronize)
+        delegate?.synchronizerDidSync(self)
     }
     
 //    @BigSyncBackgroundActor
