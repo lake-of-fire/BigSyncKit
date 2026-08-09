@@ -46,6 +46,7 @@ enum BigSyncCloudKitRecordNameError: Error, Equatable, LocalizedError {
 enum RealmSwiftAdapterError: Error, LocalizedError {
     case setupUnavailable
     case malformedRecordIdentifier(recordName: String, entityType: String)
+    case duplicateTrackedEntityType(entityType: String)
 
     var errorDescription: String? {
         switch self {
@@ -53,6 +54,8 @@ enum RealmSwiftAdapterError: Error, LocalizedError {
             return "The Realm adapter has not completed setup."
         case let .malformedRecordIdentifier(recordName, entityType):
             return "Record name \(recordName) does not contain a valid \(entityType) identifier."
+        case let .duplicateTrackedEntityType(entityType):
+            return "Tracked Realm entity type \(entityType) is present in more than one target Realm."
         }
     }
 }
@@ -465,6 +468,8 @@ public final class RealmSwiftAdapter:
     private var observedRealmChangesTask: Task<Void, Never>?
     @BigSyncBackgroundActor
     private var observedRealmChangesTaskID: UUID?
+    @BigSyncBackgroundActor
+    private var realmObservationGeneration: UUID?
     
     @BigSyncBackgroundActor
     private var cancellables = Set<AnyCancellable>()
@@ -585,6 +590,7 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     func invalidateTokens() {
         //        debugPrint("# invalidateRealmAndTokens()")
+        realmObservationGeneration = nil
         for cancellable in cancellables {
             cancellable.cancel()
         }
@@ -708,6 +714,7 @@ public final class RealmSwiftAdapter:
         // succeeds.
         isSetupInterrupted = true
         invalidateTokens()
+        try validateUniqueTrackedEntityOwnership()
         let provider = try await RealmProvider(
             persistenceConfiguration: persistenceRealmConfiguration,
             targetConfigurations: targetRealmConfigurations
@@ -906,6 +913,22 @@ public final class RealmSwiftAdapter:
         //        }
     }
 
+    private func validateUniqueTrackedEntityOwnership() throws {
+        var ownedEntityTypes = Set<String>()
+        for configuration in targetRealmConfigurations {
+            let entityTypes = Set(
+                (configuration.objectTypes ?? []).map { $0.className() }
+            ).subtracting(excludedClassNames)
+            for entityType in entityTypes {
+                guard ownedEntityTypes.insert(entityType).inserted else {
+                    throw RealmSwiftAdapterError.duplicateTrackedEntityType(
+                        entityType: entityType
+                    )
+                }
+            }
+        }
+    }
+
     @BigSyncBackgroundActor
     private func mutationJournalRecoveryMarkerIDs() -> Set<String> {
         Set(targetRealmConfigurations.map { configuration in
@@ -994,6 +1017,8 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     private func observeRealmChanges() {
         guard let targetReaderRealms = realmProvider?.targetReaderRealms else { return }
+        let observationGeneration = UUID()
+        realmObservationGeneration = observationGeneration
         
         // Subscribe to the subject with a 6-second debounce
         realmChangesSubject
@@ -1042,7 +1067,12 @@ public final class RealmSwiftAdapter:
                         }
                         return
                     case .error(let error):
-                        logger.error("BigSyncKit mutation journal observation failed: \(error)")
+                        Task { @BigSyncBackgroundActor [weak self] in
+                            await self?.recoverFromRealmObservationFailure(
+                                error,
+                                generation: observationGeneration
+                            )
+                        }
                         return
                     }
                 }
@@ -1056,6 +1086,54 @@ public final class RealmSwiftAdapter:
                 }
             }
             cancellables.insert(AnyCancellable { token.invalidate() })
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func recoverFromRealmObservationFailure(
+        _ error: Error,
+        generation: UUID
+    ) async {
+        // Realm collection-notification errors are terminal for that token.
+        // Keep the journal as the authority, replace the failed observation
+        // graph through the existing retryable setup path, and explicitly wake
+        // the worker when the recovery drain discovers pending work.
+        guard realmObservationGeneration == generation else { return }
+        logger.error("BigSyncKit mutation journal observation failed: \(error)")
+        isSetupInterrupted = true
+        invalidateTokens()
+        let interruptedSetupTask = setupTask
+        let interruptedSetupGeneration = setupGeneration
+        let activeForwardingTask = observedRealmChangesTask
+        interruptedSetupTask?.cancel()
+        activeForwardingTask?.cancel()
+        _ = try? await interruptedSetupTask?.value
+        await activeForwardingTask?.value
+        guard !cancelSync else { return }
+        // An observation can fail after performSetup() installs it but before
+        // the task publishes completed readiness. Never let that setup task
+        // certify a graph that recovery already invalidated. If another caller
+        // has installed a replacement graph while we were suspended, it owns
+        // the retry and there is nothing left to do here.
+        if realmObservationGeneration != nil { return }
+        if setupGeneration == interruptedSetupGeneration {
+            setupTask = nil
+        }
+        isSetupInterrupted = true
+        do {
+            try await ensureSetup()
+            try Task.checkCancellation()
+            guard !cancelSync else { throw CancellationError() }
+            if hasChanges {
+                await modelAdapterDelegate?.hasChangesToUpload()
+            }
+        } catch is CancellationError {
+            // unsetCancellation() owns retrying interrupted setup for the next
+            // synchronization attempt.
+        } catch {
+            logger.error(
+                "BigSyncKit mutation journal observation recovery failed: \(error)"
+            )
         }
     }
 
@@ -1557,6 +1635,23 @@ public final class RealmSwiftAdapter:
     func _test_hasPendingObservedRealmChanges() -> Bool {
         !observedJournalRecordNames.isEmpty
             || !changedLegacyRealmIndexes.isEmpty
+    }
+
+    @BigSyncBackgroundActor
+    func _test_recoverFromRealmObservationFailure() async {
+        guard let generation = realmObservationGeneration else {
+            assertionFailure("Expected an installed Realm observation")
+            return
+        }
+        await recoverFromRealmObservationFailure(
+            CocoaError(.fileReadUnknown),
+            generation: generation
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func _test_hasCompletedRealmObservationSetup() -> Bool {
+        realmObservationGeneration != nil && !isSetupInterrupted
     }
 
     @BigSyncBackgroundActor
