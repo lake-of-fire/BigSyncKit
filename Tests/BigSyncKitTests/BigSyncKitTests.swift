@@ -5274,6 +5274,64 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCleanupRemovesDeferredRelationshipsWithRetiredRemoteDeletion()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let parent = BigSyncRelationshipParent()
+        parent.id = "remotely-deleted-parent"
+        let parentID = parent.id
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(parent)
+        }
+
+        let record = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["children"] = [
+            "\(BigSyncRelationshipChild.className()).missing"
+        ] as CKRecordValue
+        record["modifiedAt"] = Date().addingTimeInterval(60) as CKRecordValue
+        record["explicitlyModifiedAt"] =
+            Date().addingTimeInterval(60) as CKRecordValue
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.persistImportedChanges()
+        try await fixture.persistenceRealm.asyncWrite {
+            let alreadyOrphaned = PendingRelationship()
+            alreadyOrphaned.relationshipName = "favoriteChild"
+            alreadyOrphaned.targetIdentifier =
+                BigSyncRelationshipChild.className() + ".also-missing"
+            fixture.persistenceRealm.add(alreadyOrphaned)
+        }
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self).count,
+            2
+        )
+
+        try await fixture.adapter.deleteRecords(with: [record.recordID])
+        try await fixture.adapter.cleanUp()
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncRelationshipParent.self,
+                forPrimaryKey: parentID
+            )
+        )
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName
+            )
+        )
+        XCTAssertTrue(
+            fixture.persistenceRealm.objects(PendingRelationship.self).isEmpty
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testRealmTerminalBoundaryDetectsDurablePendingMutation() async throws {
         // The receipt cut must see the durable target journal before its
         // debounced observer becomes the upload wakeup.

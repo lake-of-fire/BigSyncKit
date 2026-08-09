@@ -3841,6 +3841,7 @@ public final class RealmSwiftAdapter:
         }
 
         try await persistenceRealm.asyncWrite {
+            var entitiesToDelete = [SyncedEntity]()
             for recordName in committedRecordNames {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
@@ -3849,9 +3850,22 @@ public final class RealmSwiftAdapter:
                     forPrimaryKey: recordName
                 ), entity.entityState == .deletedRemotely,
                    entity.pendingGeneration == nil {
-                    persistenceRealm.delete(entity)
+                    entitiesToDelete.append(entity)
                 }
             }
+
+            let retiredIdentifiers = Set(entitiesToDelete.map(\.identifier))
+            let obsoleteRelationships = Array(
+                persistenceRealm.objects(PendingRelationship.self)
+            ).filter { relationship in
+                guard let ownerIdentifier = relationship.forSyncedEntity?
+                    .identifier else {
+                    return true
+                }
+                return retiredIdentifiers.contains(ownerIdentifier)
+            }
+            persistenceRealm.delete(obsoleteRelationships)
+            persistenceRealm.delete(entitiesToDelete)
         }
     }
     
