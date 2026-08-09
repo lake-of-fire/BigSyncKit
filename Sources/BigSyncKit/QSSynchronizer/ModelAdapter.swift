@@ -56,25 +56,45 @@ public protocol ModelAdapter: AnyObject, Sendable {
     
     /// Tells the model adapter to persist all downloaded changes in the current import operation.
     func persistImportedChanges() async throws
-    
-    /// Provides an array of up to `limit` records with changes that need to be uploaded to CloudKit.
-    /// - Parameter limit: Maximum number of records that should be provided.
-    /// - Returns: Array of `CKRecord`.
-    func recordsToUpload(limit: Int) async throws -> [CKRecord]
-    
-    /// Tells the model adapter that these records were uploaded successfully to CloudKit.
-    /// - Parameter savedRecords: Records that were saved.
-    func didUpload(savedRecords: [CKRecord]) async throws
-    
-    /// Provides an array of record IDs to be deleted on CloudKit, for model objects that were deleted locally.
-    /// - Parameter limit: Maximum number of records that should be provided.
-    /// - Returns: Array of `CKRecordID`.
-    func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID]
-    
-    /// Tells the model adapter that these record identifiers were deleted successfully from CloudKit.
-    /// - Parameter recordIDs: Record IDs that were deleted on CloudKit.
-    func didDelete(recordIDs: [CKRecord.ID]) async
-    
+
+    /// Prepares upload records with the exact durable mutation generation that
+    /// authorized each record. Restricting by entity type supports Manabi's
+    /// deterministic priority phases.
+    @BigSyncBackgroundActor
+    func preparedRecordsToUpload(
+        limit: Int,
+        restrictedToEntityType: String?
+    ) async throws -> [PreparedRecordUpload]
+
+    /// Acknowledges only generations returned by the matching preparation.
+    @BigSyncBackgroundActor
+    func didUpload(
+        savedRecords: [CKRecord],
+        matchingGenerations: [String: String]
+    ) async throws
+
+    /// Prepares deletions with their exact durable mutation generations.
+    @BigSyncBackgroundActor
+    func preparedRecordDeletions(
+        limit: Int,
+        restrictedToEntityType: String?
+    ) async throws -> [PreparedRecordDeletion]
+
+    /// Acknowledges only deletion generations returned by preparation.
+    @BigSyncBackgroundActor
+    func didDelete(
+        recordIDs: [CKRecord.ID],
+        matchingGenerations: [String: String]
+    ) async throws
+
+    /// Requeues an upload rejected as missing on the server without
+    /// overwriting a newer mutation that arrived after preparation.
+    @BigSyncBackgroundActor
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedGenerations: [String: String]
+    ) async throws
+
     /// Asks the model adapter whether it has a local object for the given record identifier.
     /// - Parameter recordID: Record identifier.
     /// - Returns: Whether there is a corresponding object for this identifier.
@@ -93,15 +113,6 @@ public protocol ModelAdapter: AnyObject, Sendable {
     /// - Parameter token: `CKServerChangeToken`
     func saveToken(_ token: CKServerChangeToken?) async throws
     
-    /**
-     *  Deletes all tracking information and detaches from local model.
-     *  This adapter should not be used after calling this method, create a new adapter if you wish to synchronize
-     *  the same model again.
-     */
-//    func deleteChangeTracking() async
-    
-    func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async throws
-
     /// Merge policy in case of conflicts. Default is `server`.
     var mergePolicy: MergePolicy { get set }
     
@@ -137,22 +148,24 @@ public extension ModelAdapter {
     func waitForCancellation() async {}
 }
 
-internal protocol PrioritySyncCapableModelAdapter: ModelAdapter {
-    @BigSyncBackgroundActor
-    func recordsToUpload(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord]
+public struct PreparedRecordUpload: @unchecked Sendable {
+    public let record: CKRecord
+    public let generation: String?
 
-    @BigSyncBackgroundActor
-    func recordIDsMarkedForDeletion(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord.ID]
+    public init(record: CKRecord, generation: String?) {
+        self.record = record
+        self.generation = generation
+    }
 }
 
-internal struct PreparedRecordUpload {
-    let record: CKRecord
-    let generation: String?
-}
+public struct PreparedRecordDeletion: Sendable {
+    public let recordID: CKRecord.ID
+    public let generation: String?
 
-internal struct PreparedRecordDeletion {
-    let recordID: CKRecord.ID
-    let generation: String?
+    public init(recordID: CKRecord.ID, generation: String?) {
+        self.recordID = recordID
+        self.generation = generation
+    }
 }
 
 // Terminal receipts need a synchronous view of adapter-owned durable work after
@@ -160,38 +173,4 @@ internal struct PreparedRecordDeletion {
 internal protocol TerminalSynchronizationStateModelAdapter: ModelAdapter {
     @BigSyncBackgroundActor
     func hasPendingChangesAtTerminalBoundary() throws -> Bool
-}
-
-internal protocol UploadGenerationTrackingModelAdapter: ModelAdapter {
-    @BigSyncBackgroundActor
-    func preparedRecordsToUpload(
-        limit: Int,
-        restrictedToEntityType: String?
-    ) async throws -> [PreparedRecordUpload]
-
-    @BigSyncBackgroundActor
-    func didUpload(
-        savedRecords: [CKRecord],
-        matchingGenerations: [String: String]
-    ) async throws
-
-    @BigSyncBackgroundActor
-    func preparedRecordDeletions(
-        limit: Int,
-        restrictedToEntityType: String?
-    ) async throws -> [PreparedRecordDeletion]
-
-    @BigSyncBackgroundActor
-    func didDelete(
-        recordIDs: [CKRecord.ID],
-        matchingGenerations: [String: String]
-    ) async throws
-
-    /// Requeues an upload rejected as missing on the server without
-    /// overwriting a newer mutation that arrived after preparation.
-    @BigSyncBackgroundActor
-    func requeueMissingServerRecords(
-        _ recordIDs: [CKRecord.ID],
-        matchingPreparedGenerations: [String: String]
-    ) async throws
 }

@@ -137,7 +137,7 @@ internal struct ChangeRequest: Sendable {
     }
 }
 
-public enum OneOffRecordZoneResetResult: Sendable, Equatable {
+enum OneOffRecordZoneResetResult: Sendable, Equatable {
     case performedCloudReset
     case cloudResetAlreadyCompleted
 }
@@ -1196,12 +1196,7 @@ public class CloudKitSynchronizer: NSObject {
     /// `markerRecordType`, `markerOwnerField`, and `markerLeaseDateField` must
     /// already exist with String and Date types in the production CloudKit schema.
     @BigSyncBackgroundActor
-    @available(
-        *,
-        deprecated,
-        message: "Destructive same-zone recovery; migrations should upload a replacement zone, obtain a SynchronizationReceipt, then delete the obsolete zone"
-    )
-    public func performOneOffRecordZoneResetAndReupload(
+    func performOneOffRecordZoneResetAndReupload(
         migrationIdentifier: String,
         markerRecordType: String,
         markerOwnerField: String,

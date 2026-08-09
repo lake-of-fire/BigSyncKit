@@ -43,7 +43,7 @@ class PersistentAssetManager {
             if FileManager.default.fileExists(atPath: cachedURL.path) {
                 return cachedURL
             }
-            cacheQueue.sync {
+            _ = cacheQueue.sync {
                 cachedAssets.removeValue(forKey: cacheKey)
             }
         }

@@ -920,28 +920,11 @@ extension CloudKitSynchronizer {
         try checkSynchronizationAttempt(attemptID)
         
         let requestedBatchSize = batchSize
-        let preparedUploads: [PreparedRecordUpload]
-        let records: [CKRecord]
-        if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
-            preparedUploads = try await generationTrackingAdapter.preparedRecordsToUpload(
-                limit: requestedBatchSize,
-                restrictedToEntityType: restrictedToEntityType
-            )
-            records = preparedUploads.map(\.record)
-        } else if let restrictedAdapter = adapter as? PrioritySyncCapableModelAdapter {
-            records = try await restrictedAdapter.recordsToUpload(
-                limit: requestedBatchSize,
-                restrictedToEntityType: restrictedToEntityType
-            )
-            preparedUploads = records.map {
-                PreparedRecordUpload(record: $0, generation: nil)
-            }
-        } else {
-            records = try await adapter.recordsToUpload(limit: requestedBatchSize)
-            preparedUploads = records.map {
-                PreparedRecordUpload(record: $0, generation: nil)
-            }
-        }
+        let preparedUploads = try await adapter.preparedRecordsToUpload(
+            limit: requestedBatchSize,
+            restrictedToEntityType: restrictedToEntityType
+        )
+        let records = preparedUploads.map(\.record)
         try checkSynchronizationAttempt(attemptID)
         let uploadGenerations = preparedUploads.reduce(into: [String: String]()) {
             guard let generation = $1.generation else { return }
@@ -999,14 +982,10 @@ extension CloudKitSynchronizer {
                     //                    logger.info("QSCloudKitSynchronizer >> Uploaded records: \((savedRecords?.map { $0.recordID.recordName } ?? []).joined(separator: " "))")
 
                     try await revalidateActiveRunContext(for: attemptID)
-                    if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
-                        try await generationTrackingAdapter.didUpload(
-                            savedRecords: savedRecords,
-                            matchingGenerations: uploadGenerations
-                        )
-                    } else {
-                        try await adapter.didUpload(savedRecords: savedRecords)
-                    }
+                    try await adapter.didUpload(
+                        savedRecords: savedRecords,
+                        matchingGenerations: uploadGenerations
+                    )
                     try await revalidateActiveRunContext(for: attemptID)
                 }
                 
@@ -1014,19 +993,10 @@ extension CloudKitSynchronizer {
                 if let error = operationError as? NSError {
                     if !recordIDsMissingOnServer.isEmpty {
                         try await revalidateActiveRunContext(for: attemptID)
-                        if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
-                            try await generationTrackingAdapter.requeueMissingServerRecords(
-                                Array(recordIDsMissingOnServer),
-                                matchingPreparedGenerations: uploadGenerations
-                            )
-                        } else {
-                            // Third-party adapters retain the historical
-                            // recovery behavior until they opt into prepared
-                            // generation fencing.
-                            try await adapter.deleteChangeTracking(
-                                forRecordIDs: Array(recordIDsMissingOnServer)
-                            )
-                        }
+                        try await adapter.requeueMissingServerRecords(
+                            Array(recordIDsMissingOnServer),
+                            matchingPreparedGenerations: uploadGenerations
+                        )
                         try await revalidateActiveRunContext(for: attemptID)
                     }
 
@@ -1138,28 +1108,11 @@ extension CloudKitSynchronizer {
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
         try checkSynchronizationAttempt(attemptID)
-        let preparedDeletions: [PreparedRecordDeletion]
-        let recordIDs: [CKRecord.ID]
-        if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
-            preparedDeletions = try await generationTrackingAdapter.preparedRecordDeletions(
-                limit: batchSize,
-                restrictedToEntityType: restrictedToEntityType
-            )
-            recordIDs = preparedDeletions.map(\.recordID)
-        } else if let restrictedAdapter = adapter as? PrioritySyncCapableModelAdapter {
-            recordIDs = try await restrictedAdapter.recordIDsMarkedForDeletion(
-                limit: batchSize,
-                restrictedToEntityType: restrictedToEntityType
-            )
-            preparedDeletions = recordIDs.map {
-                PreparedRecordDeletion(recordID: $0, generation: nil)
-            }
-        } else {
-            recordIDs = try await adapter.recordIDsMarkedForDeletion(limit: batchSize)
-            preparedDeletions = recordIDs.map {
-                PreparedRecordDeletion(recordID: $0, generation: nil)
-            }
-        }
+        let preparedDeletions = try await adapter.preparedRecordDeletions(
+            limit: batchSize,
+            restrictedToEntityType: restrictedToEntityType
+        )
+        let recordIDs = preparedDeletions.map(\.recordID)
         try checkSynchronizationAttempt(attemptID)
         let deletionGenerations = preparedDeletions.reduce(into: [String: String]()) {
             guard let generation = $1.generation else { return }
@@ -1207,14 +1160,10 @@ extension CloudKitSynchronizer {
                         "QSCloudKitSynchronizer >> Deleted or confirmed absent \(acknowledgedRecordIDs.count) records"
                     )
                     try await revalidateActiveRunContext(for: attemptID)
-                    if let generationTrackingAdapter = adapter as? UploadGenerationTrackingModelAdapter {
-                        try await generationTrackingAdapter.didDelete(
-                            recordIDs: acknowledgedRecordIDs,
-                            matchingGenerations: deletionGenerations
-                        )
-                    } else {
-                        await adapter.didDelete(recordIDs: acknowledgedRecordIDs)
-                    }
+                    try await adapter.didDelete(
+                        recordIDs: acknowledgedRecordIDs,
+                        matchingGenerations: deletionGenerations
+                    )
                     try await revalidateActiveRunContext(for: attemptID)
 
                     let allDeletionsAcknowledged =

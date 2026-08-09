@@ -35,34 +35,6 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.logger = logger
     }
 
-    @available(
-        *,
-        deprecated,
-        message: "Use init(... mutationPolicy:) so Realm journaling and worker exclusions share one policy"
-    )
-    public init(
-        synchronizerName: String,
-        containerName: String,
-        configurations: [Realm.Configuration],
-        excludedClassNames: [String],
-        priorityObjectTypes: [RealmSwift.Object.Type] = [],
-        suiteName: String? = nil,
-        recordZoneID: CKRecordZone.ID? = nil,
-        logger: Logging.Logger
-    ) {
-        self.init(
-            synchronizerName: synchronizerName,
-            containerName: containerName,
-            configurations: configurations,
-            mutationPolicy: BigSyncMutationPolicy(
-                excludedClassNames: excludedClassNames
-            ),
-            priorityObjectTypes: priorityObjectTypes,
-            suiteName: suiteName,
-            recordZoneID: recordZoneID,
-            logger: logger
-        )
-    }
 }
 
 public enum BigSyncManualRebuildOutcome: Sendable, Equatable {
@@ -114,14 +86,10 @@ public actor BigSyncBackgroundActor {
     
     @BigSyncBackgroundActor
     public func configure(_ configuration: BigSyncBackgroundWorkerConfiguration) {
-        initialSynchronizationTask?.cancel()
-        manualRebuildTask?.cancel()
-        manualRebuildTask = nil
-        manualRebuildID = nil
-        realmSynchronizer?.cancelSynchronization()
-        synchronizationPreparationTask?.cancel()
-        synchronizationPreparationTask = nil
-        synchronizationPreparationState = .unprepared
+        precondition(
+            realmSynchronizer == nil,
+            "BigSyncKit worker configuration is one-shot; await shutdown before introducing runtime replacement"
+        )
         logger = configuration.logger
 
         let synchronizer = CloudKitSynchronizer.privateSynchronizer(
@@ -154,16 +122,6 @@ public actor BigSyncBackgroundActor {
         }
     }
 
-    @BigSyncBackgroundActor
-    @available(
-        *,
-        deprecated,
-        message: "Cleanup is now an account-fenced terminal synchronization phase; call synchronizeCloudKit()"
-    )
-    public func cleanUp() async {
-        _ = await synchronizeCloudKit()
-    }
-    
     @BigSyncBackgroundActor
     @discardableResult
     public func synchronizeCloudKit()
@@ -279,12 +237,6 @@ public actor BigSyncBackgroundActor {
         await realmSynchronizer.cancelSynchronizationAndWait()
     }
     
-    @BigSyncBackgroundActor
-    public func synchronizeCloudKit(using configuration: BigSyncBackgroundWorkerConfiguration) async {
-        configure(configuration)
-        _ = await synchronizeCloudKit()
-    }
-
     /// Non-destructively rebuilds the synchronization caches and drains the
     /// exact synchronizer that was current when the request began. Concurrent
     /// requests coalesce; a later configuration cancels the in-flight rebuild.

@@ -381,7 +381,7 @@ private actor AccountIdentifierSequence {
 
 private final class FakeModelAdapter:
     NSObject,
-    PrioritySyncCapableModelAdapter,
+    ModelAdapter,
     TerminalSynchronizationStateModelAdapter,
     @unchecked Sendable {
     let recordZoneID: CKRecordZone.ID
@@ -446,7 +446,10 @@ private final class FakeModelAdapter:
         events.append("persist")
     }
 
-    func recordsToUpload(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord] {
+    func preparedRecordsToUpload(
+        limit: Int,
+        restrictedToEntityType: String?
+    ) async throws -> [PreparedRecordUpload] {
         try await recordsToUploadHandler?()
         let target = restrictedToEntityType ?? nextEntityTypeWithPendingUploads()
         events.append("recordsToUpload:\(target ?? "*")")
@@ -454,35 +457,48 @@ private final class FakeModelAdapter:
         let allRecords = uploadedByEntity[target] ?? []
         let selectedRecords = Array(allRecords.prefix(limit))
         uploadedByEntity[target] = Array(allRecords.dropFirst(selectedRecords.count))
-        return selectedRecords
+        return selectedRecords.map {
+            PreparedRecordUpload(record: $0, generation: nil)
+        }
     }
 
-    func recordsToUpload(limit: Int) async throws -> [CKRecord] {
-        try await recordsToUpload(limit: limit, restrictedToEntityType: nil)
-    }
-
-    func didUpload(savedRecords: [CKRecord]) async throws {
+    func didUpload(
+        savedRecords: [CKRecord],
+        matchingGenerations: [String: String]
+    ) async throws {
         let recordNames = savedRecords.map { $0.recordID.recordName }.joined(separator: ",")
         events.append("didUpload:\(recordNames)")
     }
 
-    func recordIDsMarkedForDeletion(limit: Int, restrictedToEntityType: String?) async throws -> [CKRecord.ID] {
+    func preparedRecordDeletions(
+        limit: Int,
+        restrictedToEntityType: String?
+    ) async throws -> [PreparedRecordDeletion] {
         let target = restrictedToEntityType ?? nextEntityTypeWithPendingDeletions()
         events.append("recordIDsMarkedForDeletion:\(target ?? "*")")
         guard let target else { return [] }
         let allRecordIDs = deletedByEntity[target] ?? []
         let selectedRecordIDs = Array(allRecordIDs.prefix(limit))
         deletedByEntity[target] = Array(allRecordIDs.dropFirst(selectedRecordIDs.count))
-        return selectedRecordIDs
+        return selectedRecordIDs.map {
+            PreparedRecordDeletion(recordID: $0, generation: nil)
+        }
     }
 
-    func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID] {
-        try await recordIDsMarkedForDeletion(limit: limit, restrictedToEntityType: nil)
-    }
-
-    func didDelete(recordIDs: [CKRecord.ID]) async {
+    func didDelete(
+        recordIDs: [CKRecord.ID],
+        matchingGenerations: [String: String]
+    ) async throws {
         let recordNames = recordIDs.map { $0.recordName }.joined(separator: ",")
         events.append("didDelete:\(recordNames)")
+    }
+
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedGenerations: [String: String]
+    ) async throws {
+        let recordNames = recordIDs.map(\.recordName).joined(separator: ",")
+        events.append("deleteTracking:\(recordNames)")
     }
 
     var serverChangeToken: CKServerChangeToken? {
@@ -494,10 +510,6 @@ private final class FakeModelAdapter:
         events.append("saveToken")
     }
 
-    func deleteChangeTracking(forRecordIDs: [CKRecord.ID]) async throws {
-        let recordNames = forRecordIDs.map(\.recordName).joined(separator: ",")
-        events.append("deleteTracking:\(recordNames)")
-    }
     func didFinishImport() async throws {
         didFinishImportCount += 1
         try await didFinishImportHandler?()
@@ -3045,7 +3057,7 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testRecordsToUploadWrapperFallsBackToUnrestrictedBehaviorAfterPriorityWorkIsExhausted() async throws {
+    func testPreparedUploadsUseUnrestrictedBehaviorAfterPriorityWorkIsExhausted() async throws {
         let zoneID = CKRecordZone.ID(zoneName: "wrapper-upload-zone", ownerName: CKCurrentUserDefaultName)
         let adapter = FakeModelAdapter(
             zoneID: zoneID,
@@ -3054,13 +3066,16 @@ final class BigSyncKitTests: XCTestCase {
                 "Article": [makeRecord(type: "Article", id: "1", zoneID: zoneID)],
             ]
         )
-        let records = try await adapter.recordsToUpload(limit: 10)
-        XCTAssertEqual(records.map(\.recordType), ["Article"])
-        XCTAssertEqual(records.map(\.recordID.recordName), ["Article.1"])
+        let prepared = try await adapter.preparedRecordsToUpload(
+            limit: 10,
+            restrictedToEntityType: nil
+        )
+        XCTAssertEqual(prepared.map(\.record.recordType), ["Article"])
+        XCTAssertEqual(prepared.map(\.record.recordID.recordName), ["Article.1"])
     }
 
     @BigSyncBackgroundActor
-    func testDeletionWrapperFallsBackToUnrestrictedBehaviorAfterPriorityWorkIsExhausted() async throws {
+    func testPreparedDeletionsUseUnrestrictedBehaviorAfterPriorityWorkIsExhausted() async throws {
         let zoneID = CKRecordZone.ID(zoneName: "wrapper-delete-zone", ownerName: CKCurrentUserDefaultName)
         let adapter = FakeModelAdapter(
             zoneID: zoneID,
@@ -3069,8 +3084,11 @@ final class BigSyncKitTests: XCTestCase {
                 "Article": [CKRecord.ID(recordName: "Article.1", zoneID: zoneID)],
             ]
         )
-        let recordIDs = try await adapter.recordIDsMarkedForDeletion(limit: 10)
-        XCTAssertEqual(recordIDs.map(\.recordName), ["Article.1"])
+        let prepared = try await adapter.preparedRecordDeletions(
+            limit: 10,
+            restrictedToEntityType: nil
+        )
+        XCTAssertEqual(prepared.map(\.recordID.recordName), ["Article.1"])
     }
 
     @BigSyncBackgroundActor
@@ -3267,8 +3285,8 @@ final class BigSyncKitTests: XCTestCase {
         }
         try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
 
-        let records = try await fixture.adapter.recordsToUpload(limit: 10)
-        let record = try XCTUnwrap(records.first {
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        let record = try XCTUnwrap(batch.records.first {
             $0.recordID.recordName == BigSyncTrackedObject.className() + ".empty-collections"
         })
 
@@ -3303,8 +3321,8 @@ final class BigSyncKitTests: XCTestCase {
         }
         try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(in: fixture.targetRealm)
 
-        let records = try await fixture.adapter.recordsToUpload(limit: 10)
-        let record = try XCTUnwrap(records.first {
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        let record = try XCTUnwrap(batch.records.first {
             $0.recordID.recordName == BigSyncTrackedObject.className() + ".map"
         })
         let encodedMap = try XCTUnwrap(record["attributes"] as? Data)
@@ -3836,11 +3854,11 @@ final class BigSyncKitTests: XCTestCase {
             in: fixture.targetRealm
         )
 
-        let uploadedRecords = try await fixture.adapter.recordsToUpload(
+        let uploadBatch = try await fixture.adapter.prepareUploadBatch(
             limit: 10
         )
         let record = try XCTUnwrap(
-            uploadedRecords.first {
+            uploadBatch.records.first {
                 $0.recordID.recordName
                     == BigSyncTrackedObject.className() + ".url-list"
             }
@@ -4296,7 +4314,6 @@ final class BigSyncKitTests: XCTestCase {
         } catch RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared {
             // Expected.
         }
-        await fixture.adapter.didDelete(recordIDs: [preparedID])
         XCTAssertEqual(tracking.entityState, .deletedLocally)
         XCTAssertEqual(tracking.pendingGeneration, deletionGeneration)
 
@@ -4306,72 +4323,6 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertEqual(tracking.entityState, .deletedRemotely)
         XCTAssertNil(tracking.pendingGeneration)
-    }
-
-    @BigSyncBackgroundActor
-    func testGenerationlessUploadAcknowledgementFailsClosed() async throws {
-        let fixture = try await makeRealmAdapterFixture()
-        let object = BigSyncTrackedObject(
-            id: "generationless-ack",
-            createdAt: Date(),
-            modifiedAt: Date(),
-            explicitlyModifiedAt: Date()
-        )
-        try await fixture.targetRealm.asyncWrite {
-            fixture.targetRealm.add(object)
-            object.refreshChangeMetadata(explicitlyModified: true)
-        }
-        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
-            in: fixture.targetRealm
-        )
-        let batch = try await fixture.adapter.prepareUploadBatch(limit: 1)
-        let record = try XCTUnwrap(batch.records.first)
-
-        do {
-            try await fixture.adapter.didUpload(savedRecords: [record])
-            XCTFail("Expected a prepared-generation error")
-        } catch RealmSwiftAdapterAcknowledgementError.preparedGenerationRequired {
-            // Expected.
-        }
-
-        XCTAssertNotEqual(
-            fixture.persistenceRealm.object(
-                ofType: SyncedEntity.self,
-                forPrimaryKey: record.recordID.recordName
-            )?.entityState,
-            .synced
-        )
-    }
-
-    @BigSyncBackgroundActor
-    func testGenerationlessIdentifierDeletionAcknowledgementFailsClosed() async throws {
-        let fixture = try await makeRealmAdapterFixture()
-        let identifier = "BigSyncTrackedObject.generationless-delete"
-        let tracking = SyncedEntity(
-            entityType: BigSyncTrackedObject.className(),
-            identifier: identifier,
-            state: SyncedEntityState.deletedLocally.rawValue
-        )
-        tracking.pendingGeneration = "current-generation"
-        try await fixture.persistenceRealm.asyncWrite {
-            fixture.persistenceRealm.add(tracking)
-        }
-
-        do {
-            try await fixture.adapter.didDelete(identifiers: [identifier])
-            XCTFail("Expected a prepared-generation error")
-        } catch RealmSwiftAdapterAcknowledgementError.preparedGenerationRequired {
-            // Expected.
-        }
-
-        let preserved = try XCTUnwrap(
-            fixture.persistenceRealm.object(
-                ofType: SyncedEntity.self,
-                forPrimaryKey: identifier
-            )
-        )
-        XCTAssertEqual(preserved.entityState, .deletedLocally)
-        XCTAssertEqual(preserved.pendingGeneration, "current-generation")
     }
 
     @BigSyncBackgroundActor

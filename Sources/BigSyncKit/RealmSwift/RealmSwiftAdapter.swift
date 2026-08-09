@@ -74,14 +74,11 @@ enum RealmSwiftRemoteRecordDecodingError: Error, LocalizedError {
 /// Acknowledging an upload requires the generation captured when its batch was
 /// prepared. Sampling the current generation can acknowledge a newer edit.
 public enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
-    case preparedGenerationRequired
     case batchBelongsToAnotherAdapter
     case recordWasNotPrepared
 
     public var errorDescription: String? {
         switch self {
-        case .preparedGenerationRequired:
-            "RealmSwiftAdapter acknowledgements require a prepared batch."
         case .batchBelongsToAnotherAdapter:
             "The prepared batch belongs to another RealmSwiftAdapter."
         case .recordWasNotPrepared:
@@ -400,8 +397,7 @@ extension RealmSwiftAdapter: @unchecked Sendable { }
 
 public final class RealmSwiftAdapter:
     NSObject,
-    @preconcurrency PrioritySyncCapableModelAdapter,
-    UploadGenerationTrackingModelAdapter,
+    @preconcurrency ModelAdapter,
     TerminalSynchronizationStateModelAdapter {
     private static let mutationJournalRecoveryEntityTypePrefix =
         "__BigSyncKitMutationJournalRecovery.v2."
@@ -783,7 +779,6 @@ public final class RealmSwiftAdapter:
                 await { @RealmBackgroundActor in
                     do {
                         guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[schema.className] else { return }
-                        let writerURL = targetWriterRealm.configuration.fileURL?.path ?? "nil"
                         let writerTypedCount = targetWriterRealm.objects(objectClass).count
                         if writerTypedCount == 0 {
                             try targetWriterRealm.write {
@@ -800,9 +795,6 @@ public final class RealmSwiftAdapter:
                                 } else {
                                     ()
                                 }
-                                let writerTypedCountAfter = targetWriterRealm.objects(objectClass).count
-                                let writerDynamicCountAfter = targetWriterRealm.dynamicObjects(schema.className).count
-                                ()
                             }
                         }
                     } catch {
@@ -1573,7 +1565,7 @@ public final class RealmSwiftAdapter:
         //        if !currentChangeSet.modifications.isEmpty {                            debugPrint("# processEnqueuedChanges MODIFY RECS", currentChangeSet.modifications.values.compactMap { $0 })                        }
         
         for (schema, identifiers) in currentChangeSet.insertions.mapValues(\.0) {
-            guard let syncedEntityType = try await getOrCreateSyncedEntityType(schema) else {
+            guard try await getOrCreateSyncedEntityType(schema) != nil else {
                 throw RealmSwiftAdapterError.setupUnavailable
             }
             
@@ -1597,7 +1589,7 @@ public final class RealmSwiftAdapter:
         }
         
         for (schema, identifiers) in currentChangeSet.modifications.mapValues(\.0) {
-            guard let syncedEntityType = try await getOrCreateSyncedEntityType(schema) else {
+            guard try await getOrCreateSyncedEntityType(schema) != nil else {
                 throw RealmSwiftAdapterError.setupUnavailable
             }
             
@@ -1853,7 +1845,6 @@ public final class RealmSwiftAdapter:
     }
     
     @BigSyncBackgroundActor
-    @discardableResult
     func createSyncedEntities(entityType: String, identifiers: [String]) async throws {
         //                debugPrint("Create synced entities", entityType, identifiers.count)
         //        logger.info("QSCloudKitSynchronizer >> Creating \(identifiers.count) SyncedEntity records for \(entityType)…")
@@ -3958,7 +3949,7 @@ public final class RealmSwiftAdapter:
                     RemoteRecordWriteCandidate(
                         record: $0.record,
                         objectType: $0.objectClass,
-                        objectIdentifier: $0.objectIdentifier as! any Sendable,
+                        objectIdentifier: $0.objectIdentifier as any Sendable,
                         syncedEntityID: $0.syncedEntityID,
                         syncedEntityState: $0.syncedEntityState,
                         entityType: $0.entityType,
@@ -4340,7 +4331,7 @@ public final class RealmSwiftAdapter:
     }
     
     @BigSyncBackgroundActor
-    func preparedRecordsToUpload(
+    public func preparedRecordsToUpload(
         limit: Int,
         restrictedToEntityType: String?
     ) async throws -> [PreparedRecordUpload] {
@@ -4374,23 +4365,6 @@ public final class RealmSwiftAdapter:
         }
         
         return recordsArray
-    }
-
-    @BigSyncBackgroundActor
-    func recordsToUpload(
-        limit: Int,
-        restrictedToEntityType: String?
-    ) async throws -> [CKRecord] {
-        try await preparedRecordsToUpload(
-            limit: limit,
-            restrictedToEntityType: restrictedToEntityType
-        ).map(\.record)
-    }
-
-    @BigSyncBackgroundActor
-    @available(*, deprecated, message: "Use prepareUploadBatch(limit:) so its result can be acknowledged safely.")
-    public func recordsToUpload(limit: Int) async throws -> [CKRecord] {
-        try await recordsToUpload(limit: limit, restrictedToEntityType: nil)
     }
 
     /// Prepares upload records together with an opaque snapshot of their local
@@ -4431,13 +4405,7 @@ public final class RealmSwiftAdapter:
     }
     
     @BigSyncBackgroundActor
-    @available(*, deprecated, message: "Use prepareUploadBatch(limit:) and acknowledgeUploadedRecords(_:from:).")
-    public func didUpload(savedRecords: [CKRecord]) async throws {
-        throw RealmSwiftAdapterAcknowledgementError.preparedGenerationRequired
-    }
-
-    @BigSyncBackgroundActor
-    func didUpload(
+    public func didUpload(
         savedRecords: [CKRecord],
         matchingGenerations: [String: String]
     ) async throws {
@@ -4526,9 +4494,9 @@ public final class RealmSwiftAdapter:
         
         updateHasChanges(realm: persistenceRealm)
     }
-    
+
     @BigSyncBackgroundActor
-    func preparedRecordDeletions(
+    public func preparedRecordDeletions(
         limit: Int,
         restrictedToEntityType: String?
     ) async throws -> [PreparedRecordDeletion] {
@@ -4565,23 +4533,6 @@ public final class RealmSwiftAdapter:
         }
         
         return deletions
-    }
-
-    @BigSyncBackgroundActor
-    func recordIDsMarkedForDeletion(
-        limit: Int,
-        restrictedToEntityType: String?
-    ) async throws -> [CKRecord.ID] {
-        try await preparedRecordDeletions(
-            limit: limit,
-            restrictedToEntityType: restrictedToEntityType
-        ).map(\.recordID)
-    }
-
-    @BigSyncBackgroundActor
-    @available(*, deprecated, message: "Use prepareDeletionBatch(limit:) so its result can be acknowledged safely.")
-    public func recordIDsMarkedForDeletion(limit: Int) async throws -> [CKRecord.ID] {
-        try await recordIDsMarkedForDeletion(limit: limit, restrictedToEntityType: nil)
     }
 
     /// Prepares deletions together with an opaque snapshot of their local
@@ -4622,15 +4573,7 @@ public final class RealmSwiftAdapter:
     }
     
     @BigSyncBackgroundActor
-    @available(*, deprecated, message: "Use prepareDeletionBatch(limit:) and acknowledgeDeletedRecordIDs(_:from:).")
-    public func didDelete(recordIDs deletedRecordIDs: [CKRecord.ID]) async {
-        logger.error(
-            "Ignoring generationless deletion acknowledgement for \(deletedRecordIDs.count) records; prepared generations are required."
-        )
-    }
-
-    @BigSyncBackgroundActor
-    func didDelete(
+    public func didDelete(
         recordIDs deletedRecordIDs: [CKRecord.ID],
         matchingGenerations: [String: String]
     ) async throws {
@@ -4714,13 +4657,7 @@ public final class RealmSwiftAdapter:
 
         updateHasChanges(realm: persistenceRealm)
     }
-    
-    @BigSyncBackgroundActor
-    @available(*, deprecated, message: "Use prepareDeletionBatch(limit:) and acknowledgeDeletedRecordIDs(_:from:).")
-    public func didDelete(identifiers: [String]) async throws {
-        throw RealmSwiftAdapterAcknowledgementError.preparedGenerationRequired
-    }
-    
+
     @BigSyncBackgroundActor
     public func didFinishImport() async throws {
         try await ensureSetup()
@@ -4764,54 +4701,10 @@ public final class RealmSwiftAdapter:
         return hasChanges
     }
     
-    //    @BigSyncBackgroundActor
-    //    public func deleteChangeTracking() async {
-    //        await invalidateRealmAndTokens()
-    //
-    //        let config = self.persistenceRealmConfiguration
-    //        let realmFileURLs: [URL] = [config.fileURL,
-    //                                    config.fileURL?.appendingPathExtension("lock"),
-    //                                    config.fileURL?.appendingPathExtension("note"),
-    //                                    config.fileURL?.appendingPathExtension("management")
-    //        ].compactMap { $0 }
-    //
-    //        for url in realmFileURLs where FileManager.default.fileExists(atPath: url.path) {
-    //            do {
-    //                try FileManager.default.removeItem(at: url)
-    //            } catch {
-    //                print("Error deleting file at \(url): \(error)")
-    //            }
-    //        }
-    //    }
-    
-    @BigSyncBackgroundActor
-    public func deleteChangeTracking(forRecordIDs recordIDs: [CKRecord.ID]) async throws {
-        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
-        
-        for chunk in recordIDs.chunks(ofCount: 1000) {
-            try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
-            try await persistenceRealm.asyncWrite {
-                for recordID in chunk {
-                    try Task.checkCancellation()
-                    guard !cancelSync else { throw CancellationError() }
-                    let identifier = recordID.recordName
-                    guard let syncedEntity = Self.getSyncedEntity(
-                        objectIdentifier: identifier,
-                        realm: persistenceRealm
-                    ) else { continue }
-                    syncedEntity.entityState = .new
-                    syncedEntity.encodedRecord = nil
-                    syncedEntity.pendingGeneration = UUID().uuidString
-                }
-            }
-        }
-    }
-
     /// Requeues only records whose pending generation is still the generation
     /// sent to CloudKit. A newer local mutation remains pending untouched.
     @BigSyncBackgroundActor
-    func requeueMissingServerRecords(
+    public func requeueMissingServerRecords(
         _ recordIDs: [CKRecord.ID],
         matchingPreparedGenerations: [String: String]
     ) async throws {
