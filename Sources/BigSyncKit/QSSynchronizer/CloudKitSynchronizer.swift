@@ -88,18 +88,9 @@ public extension Notification.Name {
     static let CloudKitSynchronizerDidFailToSynchronizeNotification: NSString = "QSCloudKitSynchronizerDidFailToSynchronizeNotification"
 }
 
-/// An `AdapterProvider` gets requested for new model adapters when a `CloudKitSynchronizer` encounters a new `CKRecordZone` that does not already correspond to an existing model adapter.
-//@objc public protocol AdapterProvider {
+/// Handles destructive CloudKit zone notifications for the synchronizer's
+/// explicitly registered model adapters.
 public protocol AdapterProvider {
-    
-    /// The `CloudKitSynchronizer` requests a new model adapter for the given record zone.
-    /// - Parameters:
-    ///   - synchronizer: `QSCloudKitSynchronizer` asking for the adapter.
-    ///   - zoneID: `CKRecordZoneID` that the model adapter will be used for.
-    /// - Returns: `ModelAdapter` correctly configured to sync changes in the given record zone.
-    @BigSyncBackgroundActor
-    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID zoneID: CKRecordZone.ID) -> ModelAdapter?
-    
     /// The `CloudKitSynchronizer` informs the provider that a record zone was deleted so it can clean up any associated data.
     /// - Parameters:
     ///   - synchronizer: `QSCloudKitSynchronizer` that found the deleted record zone.
@@ -114,7 +105,6 @@ public protocol CloudKitSynchronizerDelegate: AnyObject {
     func synchronizerWillUploadChanges(_ synchronizer: CloudKitSynchronizer, to recordZone: CKRecordZone.ID)
     func synchronizerDidSync(_ synchronizer: CloudKitSynchronizer)
     func synchronizerDidfailToSync(_ synchronizer: CloudKitSynchronizer, error: Error)
-    func synchronizer(_ synchronizer: CloudKitSynchronizer, didAddAdapter adapter: ModelAdapter, forRecordZoneID zoneID: CKRecordZone.ID)
     func synchronizer(_ synchronizer: CloudKitSynchronizer, zoneIDWasDeleted zoneID: CKRecordZone.ID)
 }
 
@@ -1096,31 +1086,6 @@ public class CloudKitSynchronizer: NSObject {
         return activeZoneTokens[zoneID]
     }
     
-    //    /**
-    //    * Deletes saved database token and all local metadata used to track changes in models.
-    //    * The synchronizer should not be used after calling this function, create a new synchronizer instead if you need it.
-    //    */
-    //    @BigSyncBackgroundActor
-    //    @objc public func eraseLocalMetadata(removeModelAdapters: Bool) {
-    //        cancelSynchronization()
-    //
-    ////        dispatchQueue.async {
-    //        Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
-    //            guard let self = self else { return }
-    //            storedDatabaseToken = nil
-    //            clearAllStoredSubscriptionIDs()
-    //            deviceUUID = nil
-    //            for modelAdapter in modelAdapters {
-    //                await modelAdapter.deleteChangeTracking()
-    //                if removeModelAdapters {
-    //                    removeModelAdapter(modelAdapter)
-    ////                } else {
-    ////                    await modelAdapter.saveToken(nil)
-    //                }
-    //            }
-    //        }
-    //    }
-    
     /// Deletes an obsolete custom zone without changing the active adapters.
     ///
     /// A zone that is already absent is considered successfully deleted. This is
@@ -1616,11 +1581,6 @@ public class CloudKitSynchronizer: NSObject {
         adapter.modelAdapterDelegate = self
     }
     
-    /// Removes the model adapter so data managed by it won't be synced with CloudKit any more.
-    /// - Parameter adapter: Adapter to be removed from the synchronizer
-    public func removeModelAdapter(_ adapter: ModelAdapter) {
-        modelAdapterDictionary.removeValue(forKey: adapter.recordZoneID)
-    }
 }
 
 extension CloudKitSynchronizer: ModelAdapterDelegate {

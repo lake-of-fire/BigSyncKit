@@ -68,30 +68,22 @@ class PersistentAssetManager {
         "record-" + digestString(for: Data(recordID.utf8))
     }
     
-    func clearAssetFiles(excludingSyncedEntityIDs ids: Set<String>) {
+    /// Removes materialized CKAsset files after the synchronization operation
+    /// that owned them has reached a terminal import boundary. Pending Realm
+    /// data remains the source of truth and will rematerialize an asset for the
+    /// next prepared generation. Keeping every historical file for a pending
+    /// record causes unbounded growth during repeated offline edits.
+    func clearAssetFiles() {
         guard let fileURLs = try? FileManager.default.contentsOfDirectory(at: assetDirectory, includingPropertiesForKeys: nil, options: []) else {
             return
         }
-        let fileNamePrefixes = Set(ids.map(Self.fileNamePrefix(forRecordID:)))
         
         for fileURL in fileURLs {
-            let fileName = fileURL.lastPathComponent
-            // Find the last underscore in the file name
-            if let underscoreIndex = fileName.lastIndex(of: "_") {
-                // Extract the substring from the beginning to the underscore
-                let recordIDPrefix = String(fileName[..<underscoreIndex])
-                if !fileNamePrefixes.contains(recordIDPrefix) {
-                    try? FileManager.default.removeItem(at: fileURL)
-//                    debugPrint("# deleted:", fileURL)
-                }
-            } else {
-                print("Invalid file detected by PersistentAssetManager - deleting:", fileURL)
-                try? FileManager.default.removeItem(at: fileURL)
-            }
+            try? FileManager.default.removeItem(at: fileURL)
         }
 
         cacheQueue.sync {
-            cachedAssets = cachedAssets.filter { ids.contains($0.key.recordID) }
+            cachedAssets.removeAll(keepingCapacity: false)
         }
     }
 }

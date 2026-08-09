@@ -219,8 +219,23 @@ extension CloudKitSynchronizer {
         synchronizationTask = nil
 
         guard shouldRetry, !cancelSync else {
+            // A final journal drain can discover a local mutation while this
+            // failed attempt is still marked as running. Its delegate wakeup
+            // is therefore coalesced into synchronizationRequestedWhileRunning.
+            // Complete the failed caller first, then give that newly discovered
+            // durable work one independent tail attempt. The next failure will
+            // not loop unless another journal generation is actually forwarded.
+            let shouldStartDeferredLocalWorkDrain =
+                synchronizationRequestedWhileRunning &&
+                !cancelSync &&
+                !(error is CancellationError) &&
+                (error as? SyncError) != .cancelled &&
+                !cancelledDueToUnauthentication
             syncing = false
             finishSynchronizationDrain(with: .failure(error))
+            if shouldStartDeferredLocalWorkDrain {
+                beginSynchronization()
+            }
             return
         }
 
@@ -307,24 +322,17 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func loadTokens(for zoneIDs: [CKRecordZone.ID], loadAdapters: Bool) async throws -> [CKRecordZone.ID] {
+    func loadTokens(for zoneIDs: [CKRecordZone.ID]) async throws -> [CKRecordZone.ID] {
         var filteredZoneIDs = [CKRecordZone.ID]()
         activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
         
         for zoneID in zoneIDs {
-            var modelAdapter = modelAdapterDictionary[zoneID]
-            if modelAdapter == nil && loadAdapters {
-                if let newModelAdapter = adapterProvider.cloudKitSynchronizer(self, modelAdapterForRecordZoneID: zoneID) {
-                    modelAdapter = newModelAdapter
-                    modelAdapterDictionary[zoneID] = newModelAdapter
-                    delegate?.synchronizer(self, didAddAdapter: newModelAdapter, forRecordZoneID: zoneID)
-                }
-            }
-            
-            if let adapter = modelAdapter {
-                filteredZoneIDs.append(zoneID)
-                activeZoneTokens[zoneID] = await adapter.serverChangeToken
-            }
+            // Manabi explicitly registers its one supported synchronization
+            // zone. Ignore unrelated private-database zones instead of
+            // dynamically constructing an incompletely configured adapter.
+            guard let adapter = modelAdapterDictionary[zoneID] else { continue }
+            filteredZoneIDs.append(zoneID)
+            activeZoneTokens[zoneID] = await adapter.serverChangeToken
         }
         
         return filteredZoneIDs
@@ -528,7 +536,7 @@ extension CloudKitSynchronizer {
                 )
                 try await revalidateActiveRunContext(for: attemptID)
                 
-                let zoneIDsToFetch = try await loadTokens(for: changedZoneIDs, loadAdapters: true)
+                let zoneIDsToFetch = try await loadTokens(for: changedZoneIDs)
                 try await revalidateActiveRunContext(for: attemptID)
                 
                 //                debugPrint("# zoneIDsToFetch", zoneIDsToFetch)
@@ -1340,7 +1348,7 @@ extension CloudKitSynchronizer {
                 )
                 try await revalidateActiveRunContext(for: attemptID)
                 if changedZoneIDs.count > 0 {
-                    let zoneIDs = try await loadTokens(for: changedZoneIDs, loadAdapters: false)
+                    let zoneIDs = try await loadTokens(for: changedZoneIDs)
                     try await revalidateActiveRunContext(for: attemptID)
                     await updateServerToken(for: zoneIDs, completion: { [weak self] result in
                         guard let self = self,
@@ -1389,6 +1397,16 @@ extension CloudKitSynchronizer {
         for recordZoneIDs: [CKRecordZone.ID],
         completion: @escaping (Result<Bool, Error>) async -> ()
     ) async {
+        // Database changes can mention zones this synchronizer does not own
+        // (for example, the obsolete zone during a replacement migration).
+        // There is no token work to perform after filtering those zones, and
+        // constructing an empty CKFetchRecordZoneChangesOperation needlessly
+        // relies on CloudKit invoking a terminal callback for an empty input.
+        guard !recordZoneIDs.isEmpty else {
+            await completion(.success(false))
+            return
+        }
+
         // If we found a new record zone at this point then needsToFetchChanges=true
         var hasAllTokens = true
         for zoneID in recordZoneIDs {

@@ -73,11 +73,11 @@ enum RealmSwiftRemoteRecordDecodingError: Error, LocalizedError {
 
 /// Acknowledging an upload requires the generation captured when its batch was
 /// prepared. Sampling the current generation can acknowledge a newer edit.
-public enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
+enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
     case batchBelongsToAnotherAdapter
     case recordWasNotPrepared
 
-    public var errorDescription: String? {
+    var errorDescription: String? {
         switch self {
         case .batchBelongsToAnotherAdapter:
             "The prepared batch belongs to another RealmSwiftAdapter."
@@ -89,16 +89,16 @@ public enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
 
 /// Records prepared for one upload attempt. The mutation generations are kept
 /// opaque so acknowledgements cannot accidentally sample newer local edits.
-public struct RealmSwiftPreparedUploadBatch: @unchecked Sendable {
-    public let records: [CKRecord]
+struct RealmSwiftPreparedUploadBatch: @unchecked Sendable {
+    let records: [CKRecord]
     fileprivate let matchingGenerations: [String: String]
     fileprivate let issuerID: UUID
 }
 
 /// Record identifiers prepared for one deletion attempt. The mutation
 /// generations are kept opaque for generation-matched acknowledgement.
-public struct RealmSwiftPreparedDeletionBatch: @unchecked Sendable {
-    public let recordIDs: [CKRecord.ID]
+struct RealmSwiftPreparedDeletionBatch: @unchecked Sendable {
+    let recordIDs: [CKRecord.ID]
     fileprivate let matchingGenerations: [String: String]
     fileprivate let issuerID: UUID
 }
@@ -4456,7 +4456,7 @@ public final class RealmSwiftAdapter:
     /// Prepares upload records together with an opaque snapshot of their local
     /// mutation generations. Pass this batch back when acknowledging successes.
     @BigSyncBackgroundActor
-    public func prepareUploadBatch(limit: Int) async throws -> RealmSwiftPreparedUploadBatch {
+    func prepareUploadBatch(limit: Int) async throws -> RealmSwiftPreparedUploadBatch {
         let prepared = try await preparedRecordsToUpload(
             limit: limit,
             restrictedToEntityType: nil
@@ -4473,7 +4473,7 @@ public final class RealmSwiftAdapter:
 
     /// Acknowledges the successful subset of a previously prepared upload.
     @BigSyncBackgroundActor
-    public func acknowledgeUploadedRecords(
+    func acknowledgeUploadedRecords(
         _ savedRecords: [CKRecord],
         from batch: RealmSwiftPreparedUploadBatch
     ) async throws {
@@ -4628,7 +4628,7 @@ public final class RealmSwiftAdapter:
     /// Prepares deletions together with an opaque snapshot of their local
     /// mutation generations. Pass this batch back when acknowledging successes.
     @BigSyncBackgroundActor
-    public func prepareDeletionBatch(limit: Int) async throws -> RealmSwiftPreparedDeletionBatch {
+    func prepareDeletionBatch(limit: Int) async throws -> RealmSwiftPreparedDeletionBatch {
         let prepared = try await preparedRecordDeletions(
             limit: limit,
             restrictedToEntityType: nil
@@ -4645,7 +4645,7 @@ public final class RealmSwiftAdapter:
 
     /// Acknowledges the successful subset of a previously prepared deletion.
     @BigSyncBackgroundActor
-    public func acknowledgeDeletedRecordIDs(
+    func acknowledgeDeletedRecordIDs(
         _ recordIDs: [CKRecord.ID],
         from batch: RealmSwiftPreparedDeletionBatch
     ) async throws {
@@ -4757,15 +4757,11 @@ public final class RealmSwiftAdapter:
         
         //        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
         try await updateCreatedAndModified()
-        let ownedEntityTypes = ownedEntityTypeNames.sorted()
-        let pendingEntities = persistenceRealm.objects(SyncedEntity.self).where {
-            $0.state.in([
-                SyncedEntityState.new.rawValue,
-                SyncedEntityState.changed.rawValue,
-            ]) && $0.entityType.in(ownedEntityTypes)
-        }
-        let pendingRecordIDs = Set(pendingEntities.map { $0.identifier })
-        persistentAssetManager.clearAssetFiles(excludingSyncedEntityIDs: pendingRecordIDs)
+        // didFinishImport is reached only after the operation that consumed
+        // prepared CKAssets is terminal. Realm data, not these files, owns any
+        // still-pending generation, so future retries can safely rematerialize
+        // their current values without retaining superseded offline versions.
+        persistentAssetManager.clearAssetFiles()
         updateHasChanges(realm: persistenceRealm)
     }
 

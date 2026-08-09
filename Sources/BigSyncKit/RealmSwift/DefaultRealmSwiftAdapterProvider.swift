@@ -63,21 +63,9 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         self.adapter = adapter
     }
     
-    public func cloudKitSynchronizer(
-        _ synchronizer: CloudKitSynchronizer,
-        modelAdapterForRecordZoneID recordZoneID: CKRecordZone.ID
-    ) -> ModelAdapter? {
-        guard recordZoneID == zoneID else { return nil }
-        return adapter
-    }
-    
     @BigSyncBackgroundActor
     public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) async throws {
         if recordZoneID == zoneID {
-//            await adapter.deleteChangeTracking()
-//            synchronizer.removeModelAdapter(adapter)
-//            adapter = createAdapter()
-//            synchronizer.addModelAdapter(adapter)
             try await adapter.resetSyncCaches()
         }
     }

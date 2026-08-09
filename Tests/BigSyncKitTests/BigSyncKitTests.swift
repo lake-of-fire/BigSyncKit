@@ -16,7 +16,6 @@ private final class DictionaryKeyValueStore: NSObject, KeyValueStore {
 }
 
 private final class NoopAdapterProvider: NSObject, AdapterProvider {
-    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID zoneID: CKRecordZone.ID) -> ModelAdapter? { nil }
     func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async throws {}
 }
 
@@ -29,8 +28,6 @@ private enum TestSynchronizationError: Error {
 }
 
 private final class FailingDeletedZoneProvider: NSObject, AdapterProvider {
-    func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, modelAdapterForRecordZoneID zoneID: CKRecordZone.ID) -> ModelAdapter? { nil }
-
     func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID zoneID: CKRecordZone.ID) async throws {
         throw TestSynchronizationError.deletedZoneResetFailed
     }
@@ -989,6 +986,28 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(prefix.count, "record-".count + 64)
     }
 
+    func testTerminalAssetCleanupRemovesSupersededPendingRecordVersions()
+    throws {
+        let manager = PersistentAssetManager(identifier: UUID().uuidString)
+        let firstURL = try manager.store(
+            data: Data("first".utf8),
+            forRecordID: "AssetRecord.pending",
+            propertyName: "payload"
+        )
+        let secondURL = try manager.store(
+            data: Data("second".utf8),
+            forRecordID: "AssetRecord.pending",
+            propertyName: "payload"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondURL.path))
+
+        manager.clearAssetFiles()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: secondURL.path))
+    }
+
     func testTrackingRealmPathIsNamespacedBeyondTheZoneName() {
         let zoneID = CKRecordZone.ID(
             zoneName: "shared-zone-name",
@@ -1258,6 +1277,33 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testLocalWorkForwardedDuringTerminalFailureStartsOneTailDrain() async {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "failure-tail-local-work"),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+        adapter.didFinishImportHandler = { [weak adapter] in
+            await adapter?.modelAdapterDelegate?.hasChangesToUpload()
+        }
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+        let failedAttemptID = synchronizer.synchronizationAttemptID
+
+        await synchronizer.failSynchronization(
+            error: TestSynchronizationError.terminalForwardingFailed
+        )
+
+        XCTAssertNotEqual(synchronizer.synchronizationAttemptID, failedAttemptID)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertFalse(synchronizer.synchronizationRequestedWhileRunning)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     func testTerminalPendingStateSchedulesTailRunAndWithholdsReceipt() async {
         // Zero newly-forwarded journal rows do not prove the adapter is empty.
         let database = FakeCloudKitDatabase()
@@ -1358,13 +1404,6 @@ final class BigSyncKitTests: XCTestCase {
         // tracking state, so it must not run for a stale account callback.
         final class RecordingProvider: NSObject, AdapterProvider {
             private(set) var deletedZoneCount = 0
-
-            func cloudKitSynchronizer(
-                _ synchronizer: CloudKitSynchronizer,
-                modelAdapterForRecordZoneID zoneID: CKRecordZone.ID
-            ) -> ModelAdapter? {
-                nil
-            }
 
             func cloudKitSynchronizer(
                 _ synchronizer: CloudKitSynchronizer,
@@ -1820,31 +1859,23 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testServerTokenProbeCompletionParticipatesInRunCallbackBarrier()
-    async {
-        // FetchZoneChangesOperation owns an unstructured Task, so both its page
-        // and terminal callbacks must be registered before they suspend.
+    func testEmptyServerTokenProbeCompletesWithoutCloudKitOperation() async {
+        // Database changes can contain only unowned zones. After filtering,
+        // the probe must complete locally rather than depending on CloudKit to
+        // invoke a callback for an empty CKFetchRecordZoneChangesOperation.
         let database = FakeCloudKitDatabase()
-        database.completesEmptyZoneChangeOperation = true
         let synchronizer = makeSynchronizer(database: database)
-        let callbackEntered = AsyncGate()
-        let releaseCallback = AsyncGate()
         synchronizer.syncing = true
+        var result: Result<Bool, Error>?
 
-        await synchronizer.updateServerToken(for: []) { result in
-            if case .success(false) = result {
-                await callbackEntered.open()
-                await releaseCallback.wait()
-            } else {
-                XCTFail("Expected an empty token probe to report no refetch")
-            }
+        await synchronizer.updateServerToken(for: []) { value in
+            result = value
         }
-        await callbackEntered.wait()
 
-        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 1)
-        synchronizer.cancelSynchronization()
-        await releaseCallback.open()
-        await synchronizer.waitForRunCallbacksToFinish()
+        guard case .success(false) = result else {
+            return XCTFail("Expected an empty token probe to report no refetch")
+        }
+        XCTAssertEqual(database.fetchZoneChangesOperationCount, 0)
         XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 0)
     }
 
@@ -2464,6 +2495,7 @@ final class BigSyncKitTests: XCTestCase {
         database.deleteZoneDelayNanoseconds = 300_000_000
         let zoneID = CKRecordZone.ID(zoneName: "slow-delete-reset-zone")
         let enteredDeletion = expectation(description: "zone deletion entered")
+        enteredDeletion.assertForOverFulfill = false
         database.deleteZoneHandler = { enteredDeletion.fulfill() }
         let firstSynchronizer = makeSynchronizer(database: database)
         firstSynchronizer.addModelAdapter(
