@@ -21,7 +21,7 @@ extension CloudKitSynchronizer {
      
      -Returns: A new CloudKit synchronizer for the given realm.
      */
-    public class func privateSynchronizer(
+    class func privateSynchronizer(
         synchronizerName: String = "DefaultRealmSwiftPrivateSynchronizer",
         containerName: String,
         configurations: [Realm.Configuration],
@@ -29,6 +29,12 @@ extension CloudKitSynchronizer {
         priorityClassNames: [String] = [],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
+        localState: BigSyncLocalStateConfiguration? = nil,
+        accountIdentifierProvider: AccountIdentifierProvider? = nil,
+        progressHandler: ProgressHandler? = nil,
+        changeFeed: (any CloudKitChangeFeed)? = nil,
+        recordStore: (any CloudKitRecordStore)? = nil,
+        allowsDisposableZoneDeletion: Bool = false,
         compatibilityVersion: Int = 0,
         logger: Logging.Logger
     ) -> CloudKitSynchronizer {
@@ -41,20 +47,39 @@ extension CloudKitSynchronizer {
             appGroup: suiteName,
             persistenceNamespace:
                 "\(containerName)|\(synchronizerName)|private",
+            persistenceDirectoryURL: localState?.trackingRealmDirectoryURL,
+            assetDirectoryURL: localState?.assetDirectoryURL,
             logger: logger
         )
-        let userDefaults = UserDefaults(suiteName: suiteName)!
-        let userDefaultsAdapter = UserDefaultsAdapter(userDefaults: userDefaults)
+        let keyValueStore: any KeyValueStore
+        if let localState {
+            keyValueStore = localState.keyValueStore
+        } else {
+            let userDefaults = UserDefaults(suiteName: suiteName)!
+            keyValueStore = UserDefaultsAdapter(userDefaults: userDefaults)
+        }
         let container = CKContainer(identifier: containerName)
+        let database = DefaultCloudKitDatabaseAdapter(
+            database: container.privateCloudDatabase
+        )
         let synchronizer = CloudKitSynchronizer(
             identifier: synchronizerName,
             containerIdentifier: containerName,
-            database: DefaultCloudKitDatabaseAdapter(database: container.privateCloudDatabase),
+            database: database,
             adapterProvider: provider,
-            keyValueStore: userDefaultsAdapter,
+            keyValueStore: keyValueStore,
             compatibilityVersion: compatibilityVersion,
+            accountIdentifierProvider: accountIdentifierProvider,
+            progressHandler: progressHandler,
+            changeFeed: changeFeed ?? database,
+            recordStore: recordStore ?? database,
             logger: logger
         )
+#if DEBUG
+        if allowsDisposableZoneDeletion, localState != nil {
+            synchronizer._enableDisposableZoneDeletionForTesting()
+        }
+#endif
         provider.beforeInitialSetup = {
             synchronizer.clearDeviceIdentifier()
         }
@@ -94,28 +119,4 @@ extension CloudKitSynchronizer {
 //        return synchronizer
 //    }
     
-    /// Must call this after initializing synchronizer.
-    @BigSyncBackgroundActor
-    internal class func transferOldServerChangeToken(
-        to adapter: ModelAdapter,
-        userDefaults: KeyValueStore,
-        containerName: String
-    ) async throws {
-        let key = containerName.appending("QSCloudKitFetchChangesServerTokenKey")
-        guard let encodedToken = userDefaults.object(forKey: key) as? Data else {
-            return
-        }
-        guard let token = NSKeyedUnarchiver.unarchiveObject(
-            with: encodedToken
-        ) as? CKServerChangeToken else {
-            // Corrupt legacy data cannot be retried usefully; discard it so the
-            // adapter performs a full fetch.
-            userDefaults.removeObject(forKey: key)
-            return
-        }
-        // Do not destroy a valid legacy token until its Realm-backed copy has
-        // been durably written.
-        try await adapter.saveToken(token)
-        userDefaults.removeObject(forKey: key)
-    }
 }

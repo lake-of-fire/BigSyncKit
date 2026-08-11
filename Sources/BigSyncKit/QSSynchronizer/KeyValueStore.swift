@@ -85,3 +85,98 @@ import Foundation
         userDefaults.removeObject(forKey: defaultName)
     }
 }
+
+/// A synchronous, file-backed `KeyValueStore` for an isolated synchronizer
+/// client. Values are kept in a property-list file at the caller-supplied URL;
+/// every mutation replaces that file atomically by default.
+///
+/// This store is thread-safe for callers sharing an instance. It is intended
+/// for one client namespace; separate instances must use separate file URLs.
+@objc public final class FileKeyValueStore: NSObject, KeyValueStore {
+    public let fileURL: URL
+    public let writesAtomically: Bool
+
+    private let lock = NSLock()
+    private var storage: [String: Any]
+
+    @objc public init(fileURL: URL, writesAtomically: Bool = true) {
+        self.fileURL = fileURL.standardizedFileURL
+        self.writesAtomically = writesAtomically
+        storage = Self.loadStorage(from: fileURL.standardizedFileURL)
+        super.init()
+    }
+
+    @objc public func object(forKey defaultName: String) -> Any? {
+        lock.withLock {
+            storage[defaultName]
+        }
+    }
+
+    @objc public func bool(forKey defaultName: String) -> Bool {
+        lock.withLock {
+            storage[defaultName] as? Bool ?? false
+        }
+    }
+
+    @objc public func set(value: Any?, forKey defaultName: String) {
+        lock.withLock {
+            var updatedStorage = storage
+            if let value {
+                updatedStorage[defaultName] = value
+            } else {
+                updatedStorage.removeValue(forKey: defaultName)
+            }
+            persist(updatedStorage)
+        }
+    }
+
+    @objc public func set(boolValue: Bool, forKey defaultName: String) {
+        set(value: boolValue, forKey: defaultName)
+    }
+
+    @objc public func removeObject(forKey defaultName: String) {
+        lock.withLock {
+            var updatedStorage = storage
+            updatedStorage.removeValue(forKey: defaultName)
+            persist(updatedStorage)
+        }
+    }
+
+    private static func loadStorage(from fileURL: URL) -> [String: Any] {
+        guard let data = try? Data(contentsOf: fileURL),
+              let propertyList = try? PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+              ),
+              let storage = propertyList as? [String: Any] else {
+            return [:]
+        }
+        return storage
+    }
+
+    private func persist(_ updatedStorage: [String: Any]) {
+        guard PropertyListSerialization.propertyList(updatedStorage, isValidFor: .binary) else {
+            assertionFailure("FileKeyValueStore accepts property-list values only")
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try PropertyListSerialization.data(
+                fromPropertyList: updatedStorage,
+                format: .binary,
+                options: 0
+            )
+            try data.write(
+                to: fileURL,
+                options: writesAtomically ? .atomic : []
+            )
+            storage = updatedStorage
+        } catch {
+            assertionFailure("Unable to persist FileKeyValueStore: \(error)")
+        }
+    }
+}

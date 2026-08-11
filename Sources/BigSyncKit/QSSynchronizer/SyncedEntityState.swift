@@ -14,4 +14,8 @@ enum SyncedEntityState: Int, Sendable {
     case deletedLocally = 3
     case synced = 4
     case deletedRemotely = 5
+    /// A tracking rebuild knew this record had previously reached CloudKit but
+    /// its nil-token bootstrap has not supplied a live record or deletion.
+    /// It is intentionally outside upload ordering and never creates work.
+    case awaitingServerEvidence = 6
 }

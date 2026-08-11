@@ -35,19 +35,17 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    var storedDatabaseToken: CKServerChangeToken? {
+    var storedDatabaseToken: DatabaseChangeCursor? {
         get {
             guard let encodedToken = keyValueStore.object(forKey: userDefaultsKey(for: databaseServerChangeTokenKey)) as? Data else {
                 return nil
             }
-            
-            return QSCoder.shared.object(from: encodedToken) as? CKServerChangeToken
+            return DatabaseChangeCursor(serializedData: encodedToken)
         }
         set {
             let key = userDefaultsKey(for: databaseServerChangeTokenKey)
-            if let token = newValue,
-                let encodedToken = QSCoder.shared.data(from: token) {
-                keyValueStore.set(value: encodedToken, forKey: key)
+            if let token = newValue {
+                keyValueStore.set(value: token.serializedData, forKey: key)
             } else {
                 keyValueStore.removeObject(forKey: key)
             }
@@ -81,6 +79,13 @@ extension CloudKitSynchronizer {
             dictionary = [String: String]()
         }
         dictionary[storeKey(for: recordZoneID)] = subscriptionID
+        setStoredSubscriptionIDsDictionary(dictionary)
+    }
+
+    @BigSyncBackgroundActor
+    func clearStoredSubscriptionID(for recordZoneID: CKRecordZone.ID) {
+        var dictionary = getStoredSubscriptionIDsDictionary()
+        dictionary?.removeValue(forKey: storeKey(for: recordZoneID))
         setStoredSubscriptionIDsDictionary(dictionary)
     }
     

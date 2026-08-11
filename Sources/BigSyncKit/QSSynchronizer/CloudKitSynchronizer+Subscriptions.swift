@@ -7,50 +7,74 @@
 
 import Foundation
 import CloudKit
+import CryptoKit
+
+private struct CloudKitSubscriptionAccountFence: Sendable {
+    let accountIdentifier: String
+    let runContext: CloudKitSynchronizer.RunContext?
+}
 
 @available(iOS 10.0, macOS 10.12, watchOS 6.0, *)
 public extension CloudKitSynchronizer {
-    private func fetchAllCloudKitSubscriptions() async throws
-        -> [CKSubscription] {
-        try await awaitCancellableCloudKitCallback { completion in
-            database.fetchAllSubscriptions { subscriptions, error in
-                if let error {
-                    completion(.failure(error))
-                } else {
-                    completion(.success(subscriptions ?? []))
-                }
+    @BigSyncBackgroundActor
+    private func makeSubscriptionAccountFence() async throws
+        -> CloudKitSubscriptionAccountFence {
+        let runContext = activeRunContext
+        let accountIdentifier = try await accountIdentifierProvider()
+        if let runContext {
+            try checkRunContext(runContext)
+            guard accountIdentifier == runContext.accountIdentifier else {
+                throw OneOffRecordZoneResetError.cloudKitAccountChanged
             }
         }
+        return CloudKitSubscriptionAccountFence(
+            accountIdentifier: accountIdentifier,
+            runContext: runContext
+        )
     }
 
-    private func saveCloudKitSubscription(
-        _ subscription: CKSubscription
-    ) async throws -> CKSubscription {
-        try await awaitCancellableCloudKitCallback { completion in
-            database.save(subscription: subscription) { subscription, error in
-                if let error {
-                    completion(.failure(error))
-                } else if let subscription {
-                    completion(.success(subscription))
-                } else {
-                    completion(.failure(CocoaError(.coderValueNotFound)))
-                }
-            }
-        }
-    }
-
-    private func deleteCloudKitSubscription(
-        identifier: String
+    @BigSyncBackgroundActor
+    private func revalidateSubscriptionAccountFence(
+        _ fence: CloudKitSubscriptionAccountFence
     ) async throws {
-        let _: Void = try await awaitCancellableCloudKitCallback { completion in
-            database.delete(withSubscriptionID: identifier) { _, error in
-                if let error {
-                    completion(.failure(error))
-                } else {
-                    completion(.success(()))
-                }
-            }
+        if let runContext = fence.runContext {
+            try await revalidateRunContext(runContext)
+            return
         }
+        let currentAccountIdentifier = try await accountIdentifierProvider()
+        guard currentAccountIdentifier == fence.accountIdentifier else {
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
+        }
+    }
+
+    /// CloudKit subscriptions are shared by every client of this database.
+    /// Never adopt an arbitrary subscription merely because it has the same
+    /// type: it may belong to another feature/app and not request a
+    /// content-available push.  Keep IDs deterministic so a reinstall can
+    /// recover this synchronizer's own subscription without creating another.
+    @BigSyncBackgroundActor
+    private func ownedSubscriptionID(
+        kind: String,
+        zoneID: CKRecordZone.ID? = nil
+    ) -> CKSubscription.ID {
+        let zoneComponent: String
+        if let zoneID {
+            zoneComponent = "\(zoneID.ownerName)/\(zoneID.zoneName)"
+        } else {
+            zoneComponent = "database"
+        }
+        let source = [
+            "BigSyncKit.Subscription.v2",
+            identifier,
+            containerIdentifier ?? "default-container",
+            String(database.databaseScope.rawValue),
+            kind,
+            zoneComponent,
+        ].joined(separator: "|")
+        let digest = SHA256.hash(data: Data(source.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "BigSyncKit.v2.\(kind).\(digest)"
     }
 
     /// Returns identifier for a registered `CKSubscription` to track changes.
@@ -95,28 +119,38 @@ public extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func subscribeForChangesInDatabase() async throws {
-        guard subscriptionIDForDatabaseSubscription() == nil else { return }
-        let context = activeRunContext
-        let subscriptions = try await fetchAllCloudKitSubscriptions()
-        if let context {
-            try await revalidateRunContext(context)
+        let expectedSubscriptionID = ownedSubscriptionID(kind: "database")
+        if let storedSubscriptionID = subscriptionIDForDatabaseSubscription() {
+            guard storedSubscriptionID == expectedSubscriptionID else {
+                // Do not perpetuate an older arbitrary ID: it may have been
+                // adopted from another CloudKit client by pre-v2 code.
+                databaseSubscriptionID = nil
+                return try await subscribeForChangesInDatabase()
+            }
+            return
         }
-        if let existing = subscriptions.first(where: {
-            $0 is CKDatabaseSubscription
-        }) {
+        let accountFence = try await makeSubscriptionAccountFence()
+        let existing = try await subscriptionStore.subscription(
+            withID: expectedSubscriptionID
+        )
+        try await revalidateSubscriptionAccountFence(accountFence)
+        if let existing = existing as? CKDatabaseSubscription {
             databaseSubscriptionID = existing.subscriptionID
             return
         }
 
-        let subscription = CKDatabaseSubscription()
+        let subscription = CKDatabaseSubscription(
+            subscriptionID: expectedSubscriptionID
+        )
         let notificationInfo = CKSubscription.NotificationInfo()
         notificationInfo.shouldSendContentAvailable = true
         subscription.notificationInfo = notificationInfo
-        let saved = try await saveCloudKitSubscription(subscription)
-        if let context {
-            try await revalidateRunContext(context)
+        let saved = try await subscriptionStore.save(subscription: subscription)
+        try await revalidateSubscriptionAccountFence(accountFence)
+        guard saved.subscriptionID == expectedSubscriptionID else {
+            throw CocoaError(.coderValueNotFound)
         }
-        databaseSubscriptionID = saved.subscriptionID
+        databaseSubscriptionID = expectedSubscriptionID
     }
     
     /// Creates a new subscription with CloudKit so the application can receive notifications when new changes happen. The application is responsible for registering for remote notifications and initiating synchronization when a notification is received. @see `CKSubscription`
@@ -141,28 +175,44 @@ public extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func subscribeForChanges(in zoneID: CKRecordZone.ID) async throws {
-        guard subscriptionID(forRecordZoneID: zoneID) == nil else { return }
-        let context = activeRunContext
-        let subscriptions = try await fetchAllCloudKitSubscriptions()
-        if let context {
-            try await revalidateRunContext(context)
+        let expectedSubscriptionID = ownedSubscriptionID(
+            kind: "zone",
+            zoneID: zoneID
+        )
+        if let storedSubscriptionID = subscriptionID(forRecordZoneID: zoneID) {
+            guard storedSubscriptionID == expectedSubscriptionID else {
+                // See the database-subscription equivalent above. Clear only
+                // local metadata; an unknown server subscription is not ours
+                // to delete.
+                clearStoredSubscriptionID(for: zoneID)
+                return try await subscribeForChanges(in: zoneID)
+            }
+            return
         }
-        if let existing = subscriptions.compactMap({
-            $0 as? CKRecordZoneSubscription
-        }).first(where: { $0.zoneID == zoneID }) {
+        let accountFence = try await makeSubscriptionAccountFence()
+        let existing = try await subscriptionStore.subscription(
+            withID: expectedSubscriptionID
+        )
+        try await revalidateSubscriptionAccountFence(accountFence)
+        if let existing = existing as? CKRecordZoneSubscription,
+           existing.zoneID == zoneID {
             storeSubscriptionID(existing.subscriptionID, for: zoneID)
             return
         }
 
-        let subscription = CKRecordZoneSubscription(zoneID: zoneID)
+        let subscription = CKRecordZoneSubscription(
+            zoneID: zoneID,
+            subscriptionID: expectedSubscriptionID
+        )
         let notificationInfo = CKSubscription.NotificationInfo()
         notificationInfo.shouldSendContentAvailable = true
         subscription.notificationInfo = notificationInfo
-        let saved = try await saveCloudKitSubscription(subscription)
-        if let context {
-            try await revalidateRunContext(context)
+        let saved = try await subscriptionStore.save(subscription: subscription)
+        try await revalidateSubscriptionAccountFence(accountFence)
+        guard saved.subscriptionID == expectedSubscriptionID else {
+            throw CocoaError(.coderValueNotFound)
         }
-        storeSubscriptionID(saved.subscriptionID, for: zoneID)
+        storeSubscriptionID(expectedSubscriptionID, for: zoneID)
     }
     
     /**
@@ -191,16 +241,33 @@ public extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func cancelSubscriptionForChangesInDatabase() async throws {
+        let accountFence = try await makeSubscriptionAccountFence()
+        let expectedSubscriptionID = ownedSubscriptionID(kind: "database")
         let subscriptionID: String?
         if let stored = subscriptionIDForDatabaseSubscription() {
-            subscriptionID = stored
+            if stored == expectedSubscriptionID {
+                subscriptionID = stored
+            } else {
+                // Pre-v2 code may have persisted another client's ID. Clear
+                // only our local pointer; never delete an unowned server
+                // subscription.
+                databaseSubscriptionID = nil
+                subscriptionID = try await subscriptionStore.subscription(
+                    withID: expectedSubscriptionID
+                ).flatMap { $0 is CKDatabaseSubscription ? $0.subscriptionID : nil }
+                try await revalidateSubscriptionAccountFence(accountFence)
+            }
         } else {
-            subscriptionID = try await fetchAllCloudKitSubscriptions()
-                .first(where: { $0 is CKDatabaseSubscription })?
-                .subscriptionID
+            subscriptionID = try await subscriptionStore.subscription(
+                withID: expectedSubscriptionID
+            ).flatMap { $0 is CKDatabaseSubscription ? $0.subscriptionID : nil }
+            try await revalidateSubscriptionAccountFence(accountFence)
         }
         guard let subscriptionID else { return }
-        try await cancelSubscription(identifier: subscriptionID)
+        try await cancelSubscription(
+            identifier: subscriptionID,
+            accountFence: accountFence
+        )
     }
     
     /// Delete existing subscription to stop receiving notifications.
@@ -227,17 +294,41 @@ public extension CloudKitSynchronizer {
     func cancelSubscriptionForChanges(
         in zoneID: CKRecordZone.ID
     ) async throws {
+        let accountFence = try await makeSubscriptionAccountFence()
+        let expectedSubscriptionID = ownedSubscriptionID(
+            kind: "zone",
+            zoneID: zoneID
+        )
         let resolvedSubscriptionID: String?
         if let stored = subscriptionID(forRecordZoneID: zoneID) {
-            resolvedSubscriptionID = stored
+            if stored == expectedSubscriptionID {
+                resolvedSubscriptionID = stored
+            } else {
+                clearStoredSubscriptionID(for: zoneID)
+                resolvedSubscriptionID = try await subscriptionStore.subscription(
+                    withID: expectedSubscriptionID
+                ).flatMap { subscription in
+                    guard let zoneSubscription = subscription as? CKRecordZoneSubscription,
+                          zoneSubscription.zoneID == zoneID else { return nil }
+                    return zoneSubscription.subscriptionID
+                }
+                try await revalidateSubscriptionAccountFence(accountFence)
+            }
         } else {
-            resolvedSubscriptionID = try await fetchAllCloudKitSubscriptions()
-                .compactMap { $0 as? CKRecordZoneSubscription }
-                .first(where: { $0.zoneID == zoneID })?
-                .subscriptionID
+            resolvedSubscriptionID = try await subscriptionStore.subscription(
+                withID: expectedSubscriptionID
+            ).flatMap { subscription in
+                guard let zoneSubscription = subscription as? CKRecordZoneSubscription,
+                      zoneSubscription.zoneID == zoneID else { return nil }
+                return zoneSubscription.subscriptionID
+            }
+            try await revalidateSubscriptionAccountFence(accountFence)
         }
         guard let resolvedSubscriptionID else { return }
-        try await cancelSubscription(identifier: resolvedSubscriptionID)
+        try await cancelSubscription(
+            identifier: resolvedSubscriptionID,
+            accountFence: accountFence
+        )
     }
     
     @BigSyncBackgroundActor
@@ -248,7 +339,11 @@ public extension CloudKitSynchronizer {
                 return
             }
             do {
-                try await cancelSubscription(identifier: identifier)
+                let accountFence = try await makeSubscriptionAccountFence()
+                try await cancelSubscription(
+                    identifier: identifier,
+                    accountFence: accountFence
+                )
                 completion?(nil)
             } catch {
                 completion?(error)
@@ -257,8 +352,13 @@ public extension CloudKitSynchronizer {
     }
 
     @BigSyncBackgroundActor
-    fileprivate func cancelSubscription(identifier: String) async throws {
-        try await deleteCloudKitSubscription(identifier: identifier)
+    fileprivate func cancelSubscription(
+        identifier: String,
+        accountFence: CloudKitSubscriptionAccountFence
+    ) async throws {
+        try await revalidateSubscriptionAccountFence(accountFence)
+        try await subscriptionStore.deleteSubscription(withID: identifier)
+        try await revalidateSubscriptionAccountFence(accountFence)
         clearSubscriptionID(identifier)
     }
 }

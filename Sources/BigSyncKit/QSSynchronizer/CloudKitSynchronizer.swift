@@ -16,18 +16,40 @@ import SwiftUtilities
 /// continuation after its task is cancelled. The callback may still arrive,
 /// but `AsyncThrowingStream` safely discards it after termination.
 internal func awaitCancellableCloudKitCallback<Value>(
+    timeoutNanoseconds: UInt64? = nil,
     _ start: (@escaping (Result<Value, Error>) -> Void) -> Void
 ) async throws -> Value {
-    let stream = AsyncThrowingStream<Value, Error> { continuation in
-        start { result in
-            switch result {
-            case .success(let value):
-                continuation.yield(value)
-                continuation.finish()
-            case .failure(let error):
-                continuation.finish(throwing: error)
-            }
+    let (stream, continuation) = AsyncThrowingStream<Value, Error>.makeStream()
+    start { result in
+        switch result {
+        case .success(let value):
+            continuation.yield(value)
+            continuation.finish()
+        case .failure(let error):
+            continuation.finish(throwing: error)
         }
+    }
+    let timeoutTask = timeoutNanoseconds.map { timeoutNanoseconds in
+        Task.detached {
+            do {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+            } catch {
+                return
+            }
+            continuation.finish(
+                throwing: CKError(
+                    .networkFailure,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "CloudKit callback exceeded its deadline"
+                    ]
+                )
+            )
+        }
+    }
+    defer {
+        timeoutTask?.cancel()
+        continuation.finish()
     }
     var iterator = stream.makeAsyncIterator()
     guard let value = try await iterator.next() else {
@@ -36,20 +58,77 @@ internal func awaitCancellableCloudKitCallback<Value>(
     return value
 }
 
-/// A reset lease is held by a detached child task while the synchronizer actor
-/// performs destructive work. Keep its terminal failure observable without
-/// awaiting a successful (intentionally infinite) heartbeat task.
-private actor ResetClaimHeartbeatStatus {
-    private var terminalError: Error?
-
-    func record(_ error: Error) {
-        terminalError = error
+/// Durable, account-scoped progress for the one-time transition to the
+/// page-oriented CloudKit change feed.  This deliberately lives beside the
+/// synchronizer's other local metadata rather than in a target Realm: a
+/// migration can be resumed after a process death before an adapter has opened
+/// its tracking Realm.
+private struct ChangeFeedMigrationState {
+    static let version = 1
+    // Epochs are durable adapter identities, not merely counters inside one KVS
+    // key. Reserve a disjoint range for each future migration version so a v2
+    // reset can never be mistaken for an already-completed v1 reset.
+    static let epochRangeSize = 1_000_000_000
+    static var initialEpoch: Int {
+        (version * epochRangeSize) + 1
     }
 
-    func throwIfFailed() throws {
-        if let terminalError {
-            throw terminalError
+    enum Phase: String {
+        case requested
+        case prepared
+        case serverBootstrap
+        case reconciled
+        case finishing
+        case completed
+    }
+
+    let key: String
+    let accountScopeIdentifier: String
+    let epoch: Int
+    var mode: ChangeFeedResetMode
+    var phase: Phase
+}
+
+/// A production migration must never recreate a zone that CloudKit reports as
+/// deleted, purged, or reset.  The target Realm and durable journal remain
+/// intact so a future, explicitly supported recovery can classify the state.
+public enum ChangeFeedMigrationError: LocalizedError {
+    case establishedZoneUnavailable(
+        CKRecordZone.ID,
+        CloudKitZoneDeletionKind
+    )
+
+    public var deletionKind: CloudKitZoneDeletionKind {
+        switch self {
+        case .establishedZoneUnavailable(_, let kind):
+            return kind
         }
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .establishedZoneUnavailable(let zoneID, let kind):
+            return "The established CloudKit zone \(zoneID.zoneName) is unavailable (\(kind.rawValue)); local data was preserved and upload is blocked"
+        }
+    }
+}
+
+public struct CloudKitTerminalZoneState: Sendable, Equatable {
+    public let zoneName: String
+    public let ownerName: String
+    public let deletionKind: CloudKitZoneDeletionKind
+    public let observedAt: Date
+
+    public init(
+        zoneName: String,
+        ownerName: String,
+        deletionKind: CloudKitZoneDeletionKind,
+        observedAt: Date
+    ) {
+        self.zoneName = zoneName
+        self.ownerName = ownerName
+        self.deletionKind = deletionKind
+        self.observedAt = observedAt
     }
 }
 
@@ -127,30 +206,22 @@ internal struct ChangeRequest: Sendable {
     }
 }
 
-enum OneOffRecordZoneResetResult: Sendable, Equatable {
-    case performedCloudReset
-    case cloudResetAlreadyCompleted
-}
-
 public enum OneOffRecordZoneResetError: LocalizedError {
-    case migrationInProgress
     case cloudKitAccountChanged
     case cloudKitAccountUnavailable
-    case activeRecordZoneCannotBeDeleted
-    case invalidLeaseDuration
+    case disposableClientMustUseExactlyOneRecordZone
+    case disposableZoneDeletionNotAllowed
 
     public var errorDescription: String? {
         switch self {
-        case .migrationInProgress:
-            return "Another device is currently resetting this CloudKit database"
         case .cloudKitAccountChanged:
             return "The iCloud account changed during the CloudKit reset"
         case .cloudKitAccountUnavailable:
             return "The current iCloud account could not be identified"
-        case .activeRecordZoneCannotBeDeleted:
-            return "An active synchronization zone cannot be deleted as obsolete"
-        case .invalidLeaseDuration:
-            return "The CloudKit reset lease duration must be finite and greater than zero"
+        case .disposableClientMustUseExactlyOneRecordZone:
+            return "A disposable synchronization client must use exactly one record zone"
+        case .disposableZoneDeletionNotAllowed:
+            return "This synchronizer is not permitted to delete CloudKit zones"
         }
     }
 }
@@ -382,6 +453,9 @@ public let cloudKitSynchronizerMetadataKeys: [String] = [
 @BigSyncBackgroundActor
 public class CloudKitSynchronizer: NSObject {
     public typealias AccountIdentifierProvider = @Sendable () async throws -> String
+    /// Optional, actor-isolated lifecycle observation for diagnostics. Production
+    /// callers receive a no-op unless they explicitly provide a handler.
+    public typealias ProgressHandler = @BigSyncBackgroundActor @Sendable (String) -> Void
     internal struct RunContext: Sendable, Equatable {
         let attemptID: UUID
         let runID: UUID
@@ -467,10 +541,26 @@ public class CloudKitSynchronizer: NSObject {
     
     /// Required by the synchronizer to persist some state. `UserDefaults` can be used via `UserDefaultsAdapter`.
     public let keyValueStore: KeyValueStore
-    private let accountIdentifierProvider: AccountIdentifierProvider
+    internal let accountIdentifierProvider: AccountIdentifierProvider
+    private let progressHandler: ProgressHandler
+    private var allowsDisposableZoneDeletion: Bool
+    /// Page-oriented history transport. A non-default database adapter must
+    /// inject this explicitly; callback fetch operations are intentionally not
+    /// a fallback.
+    @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
+    internal let changeFeed: any CloudKitChangeFeed
+    /// Async lifecycle transport. Unlike the callback database façade, this
+    /// provides exact-ID lookups and per-subscription mutation results.
+    @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
+    internal let subscriptionStore: any CloudKitSubscriptionStore
+    internal let zoneStore: any CloudKitZoneStore
+    internal let recordStore: any CloudKitRecordStore
     internal let synchronizationReceiptIssuerID = UUID()
     private var cloudKitAccountIdentifierKey: String {
         "\(identifier).BigSyncKitCloudKitAccountIdentifier"
+    }
+    private var transientRetryStateKey: String {
+        "\(identifier).BigSyncKitTransientRetryState.v1"
     }
     private var accountValidationRequired = true
     private var accountChangeObserver: NSObjectProtocol?
@@ -512,14 +602,19 @@ public class CloudKitSynchronizer: NSObject {
         return queue
     }()
     internal var modelAdapterDictionary = [CKRecordZone.ID: ModelAdapter]()
-    internal var serverChangeToken: CKServerChangeToken?
-    internal var activeZoneTokens = [CKRecordZone.ID: CKServerChangeToken]()
+    internal var serverChangeToken: DatabaseChangeCursor?
+    internal var activeZoneTokens = [CKRecordZone.ID: RecordZoneChangeCursor]()
     @BigSyncBackgroundActor
     internal var cancelSync = false
     @BigSyncBackgroundActor
     internal var retrySleepUntil: Date?
+    /// In-memory mirror of the current account-scoped durable retry count.
+    /// An explicit cancellation stops the active sleep but deliberately keeps
+    /// a server-directed floor durable; account replacement rejects and clears
+    /// a state belonging to another account.
+    @BigSyncBackgroundActor
+    internal var consecutiveTransientCloudKitFailures = 0
     
-    internal var currentOperations = [Operation]()
     internal var uploadRetries = 0
     internal var didNotifyUpload = Set<CKRecordZone.ID>()
     internal var synchronizationTask: Task<Void, Never>?
@@ -529,8 +624,6 @@ public class CloudKitSynchronizer: NSObject {
     private var synchronizationWaiters = [
         UUID: CheckedContinuation<SynchronizationResult, Error>
     ]()
-    internal var mergeChangesTask: Task<Void, Error>?
-    internal var fetchZoneChangesCompletionTask: Task<Void, Error>? = nil
     private var activeRunCallbackCount = 0
 #if DEBUG
     internal var _testActiveRunCallbackCount: Int {
@@ -552,7 +645,10 @@ public class CloudKitSynchronizer: NSObject {
     internal var activeRunContext: RunContext?
     internal var activeReceiptAuthorizationID: UUID?
     private var reservedReceiptAuthorizationID: UUID?
-    private var activeOneOffResetIdentifier: String?
+    /// Non-nil only for the attempt currently performing the durable
+    /// change-feed migration.  Adapter state remains the source of truth for
+    /// per-zone provenance; this value merely fences the orchestration.
+    private var activeChangeFeedMigration: ChangeFeedMigrationState?
  
     internal let logger: Logging.Logger
     
@@ -576,6 +672,11 @@ public class CloudKitSynchronizer: NSObject {
         keyValueStore: KeyValueStore = UserDefaultsAdapter(userDefaults: UserDefaults.standard),
         compatibilityVersion: Int = 0,
         accountIdentifierProvider: AccountIdentifierProvider? = nil,
+        progressHandler: ProgressHandler? = nil,
+        changeFeed: (any CloudKitChangeFeed)? = nil,
+        subscriptionStore: (any CloudKitSubscriptionStore)? = nil,
+        zoneStore: (any CloudKitZoneStore)? = nil,
+        recordStore: (any CloudKitRecordStore)? = nil,
         logger: Logging.Logger
     ) {
         self.identifier = identifier
@@ -592,7 +693,9 @@ public class CloudKitSynchronizer: NSObject {
                     throw OneOffRecordZoneResetError.cloudKitAccountUnavailable
                 }
                 let container = CKContainer(identifier: containerIdentifier)
-                return try await awaitCancellableCloudKitCallback { completion in
+                return try await awaitCancellableCloudKitCallback(
+                    timeoutNanoseconds: 60_000_000_000
+                ) { completion in
                     container.fetchUserRecordID { recordID, error in
                         if let error {
                             completion(.failure(error))
@@ -607,6 +710,34 @@ public class CloudKitSynchronizer: NSObject {
                 }
             }
         }
+        self.progressHandler = progressHandler ?? { _ in }
+        self.allowsDisposableZoneDeletion = false
+        guard #available(iOS 15.0, macOS 12.0, watchOS 8.0, *),
+              let resolvedChangeFeed = changeFeed ?? (database as? any CloudKitChangeFeed) else {
+            preconditionFailure("CloudKitSynchronizer requires an async CloudKitChangeFeed")
+        }
+        self.changeFeed = resolvedChangeFeed
+        guard let resolvedSubscriptionStore = subscriptionStore
+            ?? (database as? any CloudKitSubscriptionStore) else {
+            preconditionFailure(
+                "CloudKitSynchronizer requires an async CloudKitSubscriptionStore"
+            )
+        }
+        self.subscriptionStore = resolvedSubscriptionStore
+        guard let resolvedZoneStore = zoneStore
+            ?? (database as? any CloudKitZoneStore) else {
+            preconditionFailure(
+                "CloudKitSynchronizer requires an async CloudKitZoneStore"
+            )
+        }
+        self.zoneStore = resolvedZoneStore
+        guard let resolvedRecordStore = recordStore
+            ?? (database as? any CloudKitRecordStore) else {
+            preconditionFailure(
+                "CloudKitSynchronizer requires an async CloudKitRecordStore"
+            )
+        }
+        self.recordStore = resolvedRecordStore
         self.logger = logger
         super.init()
 
@@ -640,6 +771,131 @@ public class CloudKitSynchronizer: NSObject {
 //        }
     }
 
+#if DEBUG
+    /// Test-only capability for an isolated synchronizer with a disposable
+    /// CloudKit zone. Production construction always leaves deletion disabled.
+    internal func _enableDisposableZoneDeletionForTesting() {
+        allowsDisposableZoneDeletion = true
+    }
+#endif
+
+    @BigSyncBackgroundActor
+    internal func reportProgress(_ checkpoint: String) {
+        progressHandler(checkpoint)
+    }
+
+    internal var isChangeFeedMigrationActive: Bool {
+        activeChangeFeedMigration != nil
+    }
+
+    internal var isEncryptedDataResetRecoveryActive: Bool {
+        activeChangeFeedMigration?.mode == .encryptedDataReset
+    }
+
+    internal func markConfiguredZoneEstablished(
+        _ zoneID: CKRecordZone.ID,
+        accountScopeIdentifier: String
+    ) {
+        keyValueStore.set(
+            boolValue: true,
+            forKey: zoneLifecycleKey(zoneID, accountScopeIdentifier: accountScopeIdentifier, suffix: "established")
+        )
+    }
+
+    internal func markConfiguredZoneTerminal(
+        _ zoneID: CKRecordZone.ID,
+        kind: CloudKitZoneDeletionKind,
+        accountScopeIdentifier: String,
+        observedAt: Date = Date()
+    ) {
+        // A database-history deletion event is itself durable proof that the
+        // zone existed. All deletion kinds are terminal for production sync:
+        // preserve the concrete reason and never silently recreate the zone
+        // from possibly stale local objects.
+        let establishedKey = zoneLifecycleKey(zoneID, accountScopeIdentifier: accountScopeIdentifier, suffix: "established")
+        keyValueStore.set(boolValue: true, forKey: establishedKey)
+        keyValueStore.set(
+            value: kind.rawValue,
+            forKey: zoneLifecycleKey(zoneID, accountScopeIdentifier: accountScopeIdentifier, suffix: "terminal")
+        )
+        keyValueStore.set(
+            value: observedAt,
+            forKey: zoneLifecycleKey(
+                zoneID,
+                accountScopeIdentifier: accountScopeIdentifier,
+                suffix: "terminalObservedAt"
+            )
+        )
+    }
+
+    internal func configuredZoneIsEstablished(_ zoneID: CKRecordZone.ID) -> Bool {
+        guard let context = activeRunContext else { return false }
+        return keyValueStore.bool(
+            forKey: zoneLifecycleKey(
+                zoneID,
+                accountScopeIdentifier: context.accountScopeIdentifier,
+                suffix: "established"
+            )
+        )
+    }
+
+    internal func configuredZoneIsTerminal(_ zoneID: CKRecordZone.ID) -> Bool {
+        configuredZoneTerminalState(zoneID) != nil
+    }
+
+    internal func configuredZoneTerminalState(
+        _ zoneID: CKRecordZone.ID
+    ) -> CloudKitTerminalZoneState? {
+        guard let context = activeRunContext,
+              let rawKind = keyValueStore.object(
+                forKey: zoneLifecycleKey(
+                    zoneID,
+                    accountScopeIdentifier: context.accountScopeIdentifier,
+                    suffix: "terminal"
+                )
+              ) as? String else {
+            return nil
+        }
+        let deletionKind = CloudKitZoneDeletionKind(rawValue: rawKind)
+            ?? .unknown
+        let observedAt = keyValueStore.object(
+            forKey: zoneLifecycleKey(
+                zoneID,
+                accountScopeIdentifier: context.accountScopeIdentifier,
+                suffix: "terminalObservedAt"
+            )
+        ) as? Date ?? .distantPast
+        return CloudKitTerminalZoneState(
+            zoneName: zoneID.zoneName,
+            ownerName: zoneID.ownerName,
+            deletionKind: deletionKind,
+            observedAt: observedAt
+        )
+    }
+
+    internal func clearConfiguredZoneTerminal(
+        _ zoneID: CKRecordZone.ID,
+        accountScopeIdentifier: String
+    ) {
+        for suffix in ["terminal", "terminalObservedAt"] {
+            keyValueStore.removeObject(
+                forKey: zoneLifecycleKey(
+                    zoneID,
+                    accountScopeIdentifier: accountScopeIdentifier,
+                    suffix: suffix
+                )
+            )
+        }
+    }
+
+    private func zoneLifecycleKey(
+        _ zoneID: CKRecordZone.ID,
+        accountScopeIdentifier: String,
+        suffix: String
+    ) -> String {
+        "\(identifier).BigSyncKit.ZoneLifecycle.v1.\(accountScopeIdentifier).\(zoneID.ownerName).\(zoneID.zoneName).\(suffix)"
+    }
+
     deinit {
         if let accountChangeObserver {
             NotificationCenter.default.removeObserver(accountChangeObserver)
@@ -666,12 +922,12 @@ public class CloudKitSynchronizer: NSObject {
     
     /// Resets synchronization metadata after crossing the cancellation barrier.
     ///
-    /// The `cancelSynchronization` argument is retained for source compatibility;
-    /// public callers can no longer opt out of the barrier. Internal migration and
-    /// initial-setup flows use `resetSyncCachesOwnedByCurrentFlow` only after they
-    /// have established exclusive attempt ownership.
+    /// This remains internal because a metadata-only reset outside the fenced
+    /// change-feed migration can rediscover established local objects as new and
+    /// re-upload them. Internal recovery flows call it only after establishing
+    /// exclusive attempt ownership.
     @BigSyncBackgroundActor
-    public func resetSyncCaches(
+    internal func resetSyncCaches(
         cancelSynchronization _: Bool,
         includingAdapters: Bool = true
     ) async throws {
@@ -725,12 +981,36 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     // MARK: - Public
+
+    @BigSyncBackgroundActor
+    private func activeTerminalZoneError() -> ChangeFeedMigrationError? {
+        guard let context = activeRunContext,
+              !hasPendingEncryptedDataResetRecovery(context: context),
+              let terminalState = modelAdapters.compactMap({ adapter in
+                  configuredZoneTerminalState(adapter.recordZoneID)
+              }).first else {
+            return nil
+        }
+        return .establishedZoneUnavailable(
+            CKRecordZone.ID(
+                zoneName: terminalState.zoneName,
+                ownerName: terminalState.ownerName
+            ),
+            terminalState.deletionKind
+        )
+    }
     
     /// Synchronize data with CloudKit.
     /// - Parameter onFailure: Block that receives an error if the synchronization stopped due to a failure. Could be a `SyncError`, `CKError`, or any other error found during synchronization.
     @BigSyncBackgroundActor
     @objc public func beginSynchronization() { //onFailure: ((Error) -> ())?) {
         guard !cancelledDueToUnauthentication else { return }
+        if activeTerminalZoneError() != nil {
+            // A purge or unexplained zone loss intentionally leaves local
+            // journal generations pending. Ignore their observer wakeups so
+            // they cannot spin terminal synchronization attempts.
+            return
+        }
         guard !syncing else {
             synchronizationRequestedWhileRunning = true
             return
@@ -756,6 +1036,7 @@ public class CloudKitSynchronizer: NSObject {
                 await waitForRunCallbacksToFinish()
                 try checkSynchronizationAttempt(attemptID)
                 let accountIdentifier = try await validateSynchronizationAccount()
+                reportProgress("account-identity-validated")
                 let runID = await changeRequestProcessor.beginRun()
                 synchronizationRunID = runID
                 let context = RunContext(
@@ -767,6 +1048,23 @@ public class CloudKitSynchronizer: NSObject {
                     )
                 )
                 activeRunContext = context
+                if let terminalState = modelAdapters.compactMap({
+                    self.configuredZoneTerminalState($0.recordZoneID)
+                }).first,
+                   !hasPendingEncryptedDataResetRecovery(context: context) {
+                    throw ChangeFeedMigrationError
+                        .establishedZoneUnavailable(
+                            CKRecordZone.ID(
+                                zoneName: terminalState.zoneName,
+                                ownerName: terminalState.ownerName
+                            ),
+                            terminalState.deletionKind
+                        )
+                }
+                try await waitForPersistedTransientRetryIfNeeded(
+                    context: context
+                )
+                try recordSyncHealth(.syncing, context: context)
                 try await resetRestoredBackupCachesIfNeeded(context: context)
                 // Subscription identifiers are account-scoped sync metadata.
                 // Account validation clears them after an iCloud account
@@ -774,12 +1072,17 @@ public class CloudKitSynchronizer: NSObject {
                 // part of every attempt. The stored-ID fast path performs no
                 // CloudKit request during ordinary synchronization.
                 try await subscribeForChangesInDatabase()
+                reportProgress("subscription-completed")
                 try await revalidateRunContext(context)
                 for adapter in modelAdapters {
                     await adapter.waitForCancellation()
                     try await adapter.unsetCancellation()
                     try checkRunContext(context)
                 }
+                reportProgress("adapters-ready")
+                try await beginChangeFeedMigrationIfNeeded(context: context)
+                try await revalidateRunContext(context)
+                reportProgress("change-feed-migration-ready")
                 try Task.checkCancellation()
                 await performSynchronization()
             } catch {
@@ -795,6 +1098,9 @@ public class CloudKitSynchronizer: NSObject {
     public func synchronize() async throws -> SynchronizationResult {
         guard !cancelledDueToUnauthentication else {
             throw SyncError.notAuthenticated
+        }
+        if let terminalError = activeTerminalZoneError() {
+            throw terminalError
         }
 
         let requestID = UUID()
@@ -977,6 +1283,7 @@ public class CloudKitSynchronizer: NSObject {
             resetDatabaseToken()
             resetActiveTokens()
             clearAllStoredSubscriptionIDs()
+            clearPersistedTransientRetryState()
             for adapter in modelAdapters {
                 adapter.cancelSynchronization()
                 await adapter.waitForCancellation()
@@ -1005,19 +1312,398 @@ public class CloudKitSynchronizer: NSObject {
         return confirmedAccountIdentifier
     }
 
-    /// Stable, non-reversible key for account-scoped one-off migration markers.
+    private func persistedTransientRetryState() -> (
+        accountScopeIdentifier: String,
+        notBefore: Date,
+        consecutiveFailures: Int
+    )? {
+        guard let value = keyValueStore.object(
+            forKey: transientRetryStateKey
+        ) as? [String: Any],
+        let accountScopeIdentifier = value["accountScopeIdentifier"] as? String,
+        let notBefore = value["notBefore"] as? Date,
+        let consecutiveFailures = value["consecutiveFailures"] as? Int,
+        consecutiveFailures > 0 else {
+            return nil
+        }
+        return (accountScopeIdentifier, notBefore, consecutiveFailures)
+    }
+
+    internal func persistTransientRetryState(
+        context: RunContext,
+        notBefore: Date,
+        consecutiveFailures: Int
+    ) {
+        keyValueStore.set(
+            value: [
+                "accountScopeIdentifier": context.accountScopeIdentifier,
+                "notBefore": notBefore,
+                "consecutiveFailures": max(1, consecutiveFailures),
+            ],
+            forKey: transientRetryStateKey
+        )
+    }
+
+    internal func clearPersistedTransientRetryState() {
+        keyValueStore.removeObject(forKey: transientRetryStateKey)
+    }
+
+    internal func waitForPersistedTransientRetryIfNeeded(
+        context: RunContext
+    ) async throws {
+        guard let state = persistedTransientRetryState() else { return }
+        guard state.accountScopeIdentifier == context.accountScopeIdentifier else {
+            clearPersistedTransientRetryState()
+            return
+        }
+        consecutiveTransientCloudKitFailures = state.consecutiveFailures
+        let delay = state.notBefore.timeIntervalSinceNow
+        guard delay > 0 else {
+            clearPersistedTransientRetryState()
+            return
+        }
+        retrySleepUntil = state.notBefore
+        do {
+            try await Task.sleep(
+                nanoseconds: UInt64(delay * 1_000_000_000)
+            )
+            try await revalidateRunContext(context)
+            retrySleepUntil = nil
+            clearPersistedTransientRetryState()
+        } catch {
+            retrySleepUntil = nil
+            throw error
+        }
+    }
+
+#if DEBUG
+    internal func _test_persistedTransientRetryNotBefore(
+        accountScopeIdentifier: String
+    ) -> Date? {
+        guard let state = persistedTransientRetryState(),
+              state.accountScopeIdentifier == accountScopeIdentifier else {
+            return nil
+        }
+        return state.notBefore
+    }
+#endif
+
+    /// Stable, non-reversible identifier for account-scoped safety markers.
     @BigSyncBackgroundActor
     public func cloudKitAccountScopeIdentifier() async throws -> String {
         let accountIdentifier = try await accountIdentifierProvider()
         return Self.accountScopeIdentifier(for: accountIdentifier)
     }
 
-    private static func accountScopeIdentifier(
+    internal static func accountScopeIdentifier(
         for accountIdentifier: String
     ) -> String {
         SHA256.hash(data: Data(accountIdentifier.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    // MARK: - Change-feed migration
+
+    @BigSyncBackgroundActor
+    private func changeFeedMigrationStateKey(
+        for context: RunContext
+    ) -> String {
+        let zoneComponent = modelAdapters
+            .map {
+                "\($0.recordZoneID.ownerName)/\($0.recordZoneID.zoneName)"
+            }
+            .sorted()
+            .joined(separator: "|")
+        let containerComponent = containerIdentifier ?? "default-container"
+        return "\(identifier).BigSyncKit.ChangeFeedMigration.v\(ChangeFeedMigrationState.version).\(containerComponent).\(context.accountScopeIdentifier).\(zoneComponent)"
+    }
+
+    @BigSyncBackgroundActor
+    private func changeFeedMigrationEpoch(
+        for stateKey: String
+    ) -> Int {
+        let epochKey = "\(stateKey).epoch"
+        return (keyValueStore.object(forKey: epochKey) as? NSNumber)?.intValue
+            ?? (keyValueStore.object(forKey: epochKey) as? Int)
+            ?? ChangeFeedMigrationState.initialEpoch
+    }
+
+    @BigSyncBackgroundActor
+    private func changeFeedMigrationMode(
+        for stateKey: String
+    ) -> ChangeFeedResetMode {
+        guard let rawMode = keyValueStore.object(
+            forKey: "\(stateKey).mode"
+        ) as? String else {
+            return .serverReconciliation
+        }
+        return ChangeFeedResetMode(rawValue: rawMode)
+            ?? .serverReconciliation
+    }
+
+    @BigSyncBackgroundActor
+    internal func hasPendingEncryptedDataResetRecovery(
+        context: RunContext
+    ) -> Bool {
+        let stateKey = changeFeedMigrationStateKey(for: context)
+        let phase = (keyValueStore.object(forKey: stateKey) as? String)
+            .flatMap(ChangeFeedMigrationState.Phase.init(rawValue:))
+        return phase != nil
+            && phase != .completed
+            && changeFeedMigrationMode(for: stateKey)
+                == .encryptedDataReset
+    }
+
+    /// Requests a new server-first rebuild after opaque CloudKit history can no
+    /// longer continue. Target Realms and their durable mutation journals remain
+    /// untouched; only adapter tracking/provenance is rebuilt on the next run.
+    @BigSyncBackgroundActor
+    internal func requestChangeFeedRecovery(
+        context: RunContext,
+        mode: ChangeFeedResetMode = .serverReconciliation
+    ) {
+        let stateKey = changeFeedMigrationStateKey(for: context)
+        let currentPhase = (keyValueStore.object(forKey: stateKey) as? String)
+            .flatMap(ChangeFeedMigrationState.Phase.init(rawValue:))
+        let currentMode = changeFeedMigrationMode(for: stateKey)
+
+        // A migration already in progress owns valid provenance for this exact
+        // epoch. Restarting its nil-token bootstrap is idempotent; incrementing
+        // here would discard evidence captured before the interrupted fetch.
+        if currentPhase != .completed,
+           currentPhase != nil,
+           currentMode == mode {
+            return
+        }
+
+        // An encrypted-data reset supersedes a conservative server
+        // reconciliation already in flight. Its next epoch must rebuild all
+        // live local records rather than interpret the empty server as remote
+        // deletion. A conservative recovery never downgrades an encrypted
+        // reset already in progress.
+        if currentPhase != .completed,
+           currentPhase != nil,
+           currentMode == .encryptedDataReset,
+           mode == .serverReconciliation {
+            return
+        }
+
+        let epochKey = "\(stateKey).epoch"
+        let nextEpoch = changeFeedMigrationEpoch(for: stateKey) + 1
+        keyValueStore.set(value: nextEpoch, forKey: epochKey)
+        keyValueStore.set(value: mode.rawValue, forKey: "\(stateKey).mode")
+        keyValueStore.set(
+            value: ChangeFeedMigrationState.Phase.requested.rawValue,
+            forKey: stateKey
+        )
+        activeChangeFeedMigration = nil
+    }
+
+    /// A fresh install can discover an encrypted-data reset while its normal
+    /// server-first migration is already active. Promote that same durable
+    /// epoch instead of clearing Realm tracking twice; no server pages or
+    /// uploads have been published yet, and each adapter changes only its
+    /// recovery marker.
+    @BigSyncBackgroundActor
+    internal func promoteActiveChangeFeedMigrationToEncryptedDataReset(
+        context: RunContext
+    ) async throws {
+        guard var migration = activeChangeFeedMigration else { return }
+        guard migration.mode != .encryptedDataReset else { return }
+        for adapter in modelAdapters {
+            guard let migrating = adapter as? any ChangeFeedResetMigrating
+            else { continue }
+            try await migrating
+                .promoteChangeFeedResetToEncryptedDataReset(
+                    accountScopeIdentifier:
+                        migration.accountScopeIdentifier,
+                    epoch: migration.epoch
+                )
+            try await revalidateRunContext(context)
+        }
+        migration.mode = .encryptedDataReset
+        activeChangeFeedMigration = migration
+        keyValueStore.set(
+            value: ChangeFeedResetMode.encryptedDataReset.rawValue,
+            forKey: "\(migration.key).mode"
+        )
+    }
+
+    /// Starts (or resumes) the production migration before any normal token
+    /// can advance.  Every suspension is followed by a run-context validation;
+    /// a changed account or superseding attempt therefore leaves the durable
+    /// requested state for the next valid attempt instead of publishing stale
+    /// progress.
+    @BigSyncBackgroundActor
+    internal func beginChangeFeedMigrationIfNeeded(
+        context: RunContext
+    ) async throws {
+        let migratingAdapters = modelAdapters.compactMap { $0 as? any ChangeFeedResetMigrating }
+        guard !migratingAdapters.isEmpty else { return }
+
+        let stateKey = changeFeedMigrationStateKey(for: context)
+        var previousPhase = (keyValueStore.object(forKey: stateKey) as? String)
+            .flatMap(ChangeFeedMigrationState.Phase.init(rawValue:))
+            ?? .requested
+        guard previousPhase != .completed else { return }
+        let epochKey = "\(stateKey).epoch"
+        let epoch = changeFeedMigrationEpoch(for: stateKey)
+        let mode = changeFeedMigrationMode(for: stateKey)
+        keyValueStore.set(value: epoch, forKey: epochKey)
+        // `finishing` is the only cross-store ambiguous window: all adapters
+        // may have durably finished before the local KVS marker was written.
+        // In that case observing no active bootstrap is sufficient to publish
+        // completion.  If any adapter is still active, restart from requested;
+        // the adapter's provenance makes that restart idempotent.
+        if previousPhase == .finishing {
+            var anyBootstrapActive = false
+            for adapter in migratingAdapters {
+                let isBootstrapActive = await adapter.isChangeFeedServerBootstrapActive()
+                anyBootstrapActive = anyBootstrapActive || isBootstrapActive
+                try await revalidateRunContext(context)
+            }
+            if !anyBootstrapActive {
+                if mode == .encryptedDataReset {
+                    for adapter in modelAdapters {
+                        clearConfiguredZoneTerminal(
+                            adapter.recordZoneID,
+                            accountScopeIdentifier:
+                                context.accountScopeIdentifier
+                        )
+                    }
+                }
+                keyValueStore.set(
+                    value: ChangeFeedMigrationState.Phase.completed.rawValue,
+                    forKey: stateKey
+                )
+                return
+            }
+            previousPhase = .requested
+        }
+        keyValueStore.set(value: previousPhase.rawValue, forKey: stateKey)
+        let migration = ChangeFeedMigrationState(
+            key: stateKey,
+            accountScopeIdentifier: context.accountScopeIdentifier,
+            epoch: epoch,
+            mode: mode,
+            phase: .requested
+        )
+        activeChangeFeedMigration = migration
+
+        // A database cursor is not per-zone evidence. With multiple adapters it
+        // may predate a newly configured zone, so only an adapter's valid server
+        // record proof or a previously persisted zone marker may establish it.
+        for adapter in modelAdapters {
+            guard let migrating = adapter as? any ChangeFeedResetMigrating else { continue }
+            if try await migrating.hasChangeFeedEstablishedServerEvidence() {
+                markConfiguredZoneEstablished(
+                    adapter.recordZoneID,
+                    accountScopeIdentifier: context.accountScopeIdentifier
+                )
+            }
+            try await revalidateRunContext(context)
+        }
+
+        for adapter in migratingAdapters {
+            try await adapter.prepareChangeFeedReset(
+                accountScopeIdentifier: context.accountScopeIdentifier,
+                epoch: epoch,
+                mode: mode
+            )
+            try await revalidateRunContext(context)
+        }
+        keyValueStore.set(
+            value: ChangeFeedMigrationState.Phase.prepared.rawValue,
+            forKey: stateKey
+        )
+        for adapter in migratingAdapters {
+            try await adapter.beginChangeFeedServerBootstrap(
+                accountScopeIdentifier: context.accountScopeIdentifier,
+                epoch: epoch,
+                mode: mode
+            )
+            try await revalidateRunContext(context)
+        }
+
+        // A nil database and zone token is the explicit full-server bootstrap
+        // contract.  Do not reuse a token left by the legacy transport.
+        resetDatabaseToken()
+        resetActiveTokens()
+        for adapter in modelAdapters {
+            try await adapter.saveToken(nil)
+            try await revalidateRunContext(context)
+        }
+        activeChangeFeedMigration?.phase = .serverBootstrap
+        keyValueStore.set(
+            value: ChangeFeedMigrationState.Phase.serverBootstrap.rawValue,
+            forKey: stateKey
+        )
+    }
+
+    /// Runs exactly after the nil-token feed has consumed its pages and before
+    /// upload discovery.  Remote tracking rows and the target Realm's durable
+    /// mutation journal win over captured provenance during reconciliation.
+    @BigSyncBackgroundActor
+    internal func reconcileChangeFeedMigrationIfNeeded(
+        context: RunContext
+    ) async throws {
+        guard var migration = activeChangeFeedMigration,
+              migration.phase == .serverBootstrap else { return }
+        for adapter in modelAdapters {
+            guard let migrating = adapter as? any ChangeFeedResetMigrating else { continue }
+            try await migrating.reconcileAfterChangeFeedServerBootstrap(
+                accountScopeIdentifier: migration.accountScopeIdentifier,
+                epoch: migration.epoch,
+                mode: migration.mode
+            )
+            try await revalidateRunContext(context)
+        }
+        migration.phase = .reconciled
+        activeChangeFeedMigration = migration
+        keyValueStore.set(value: ChangeFeedMigrationState.Phase.reconciled.rawValue, forKey: migration.key)
+    }
+
+    /// Called only at the normal terminal receipt, after the post-upload
+    /// refetch establishes quiescence.  Interrupted migrations intentionally
+    /// retain their non-complete state and restart safely with nil tokens.
+    @BigSyncBackgroundActor
+    internal func finishChangeFeedMigrationIfNeeded(
+        context: RunContext
+    ) async throws {
+        guard var migration = activeChangeFeedMigration,
+              migration.phase == .reconciled else { return }
+        keyValueStore.set(
+            value: ChangeFeedMigrationState.Phase.finishing.rawValue,
+            forKey: migration.key
+        )
+        migration.phase = .finishing
+        activeChangeFeedMigration = migration
+        for adapter in modelAdapters {
+            guard let migrating = adapter as? any ChangeFeedResetMigrating else { continue }
+            try await migrating.finishChangeFeedReset(
+                accountScopeIdentifier: migration.accountScopeIdentifier,
+                epoch: migration.epoch,
+                mode: migration.mode
+            )
+            try await revalidateRunContext(context)
+        }
+        if migration.mode == .encryptedDataReset {
+            // Clear the terminal fence only after every adapter has completed
+            // its journal-backed re-upload and the normal terminal drain has
+            // proven quiescence. Clearing before the durable `completed`
+            // marker makes the crash window safely resumable.
+            for adapter in modelAdapters {
+                clearConfiguredZoneTerminal(
+                    adapter.recordZoneID,
+                    accountScopeIdentifier:
+                        migration.accountScopeIdentifier
+                )
+            }
+        }
+        migration.phase = .completed
+        keyValueStore.set(value: ChangeFeedMigrationState.Phase.completed.rawValue, forKey: migration.key)
+        activeChangeFeedMigration = nil
     }
 
 #if DEBUG
@@ -1040,15 +1726,13 @@ public class CloudKitSynchronizer: NSObject {
         changeRequestProcessor.reset()
         synchronizationTask?.cancel()
         synchronizationTask = nil
-        mergeChangesTask?.cancel()
-        fetchZoneChangesCompletionTask?.cancel()
-        currentOperations.forEach { $0.cancel() }
         if !cancelSync {
             logger.info("QSCloudKitSynchronizer >> Cancelling synchronization...")
         }
         cancelSync = true
         syncing = false
         retrySleepUntil = nil
+        consecutiveTransientCloudKitFailures = 0
         
         for adapter in modelAdapters {
             adapter.cancelSynchronization()
@@ -1063,9 +1747,13 @@ public class CloudKitSynchronizer: NSObject {
     /// barrier does not need a second lock or an unbounded operation poll.
     @BigSyncBackgroundActor
     public func cancelSynchronizationAndWait() async {
-        let task = synchronizationTask
         cancelSynchronization()
-        await task?.value
+        // Do not await the orchestration task itself. An async CloudKit request
+        // is allowed to ignore cooperative task cancellation and can therefore
+        // remain suspended indefinitely. Attempt/run-context fencing prevents
+        // that task from publishing anything if it eventually resumes; the
+        // barriers below cover the callback and adapter work that can mutate
+        // durable state.
         await changeRequestProcessor.waitForProcessingToStop()
         await waitForRunCallbacksToFinish()
         for adapter in modelAdapters {
@@ -1078,28 +1766,42 @@ public class CloudKitSynchronizer: NSObject {
      * This does not reset tokens stored by model adapters.
      */
     @BigSyncBackgroundActor
-    @objc public func resetDatabaseToken() {
+    @objc internal func resetDatabaseToken() {
         storedDatabaseToken = nil
     }
     
-    internal func activeZoneToken(zoneID: CKRecordZone.ID) -> CKServerChangeToken? {
+    internal func activeZoneToken(zoneID: CKRecordZone.ID) -> RecordZoneChangeCursor? {
         return activeZoneTokens[zoneID]
     }
     
-    /// Deletes an obsolete custom zone without changing the active adapters.
+    /// Deletes the one active custom zone of a disposable synchronizer client.
     ///
-    /// A zone that is already absent is considered successfully deleted. This is
-    /// intended for migrations that move syncing to a newly named zone.
+    /// The caller must discard the synchronizer and all of its adapters after
+    /// this succeeds: their local tracking state now refers to a deleted zone.
+    /// This is intentionally limited to a client whose every adapter targets
+    /// one identical zone, such as an isolated end-to-end test client.
     @BigSyncBackgroundActor
     @discardableResult
-    public func deleteRecordZoneIfPresent(
+    public func deleteActiveRecordZoneForDisposableClient(
+        using receipt: SynchronizationReceipt
+    ) async throws -> Bool {
+        let activeZoneIDs = Set(modelAdapters.map(\.recordZoneID))
+        guard activeZoneIDs.count == 1,
+              let activeZoneID = activeZoneIDs.first else {
+            throw OneOffRecordZoneResetError.disposableClientMustUseExactlyOneRecordZone
+        }
+        return try await deleteDisposableRecordZoneIfPresent(
+            activeZoneID,
+            using: receipt
+        )
+    }
+
+    private func deleteDisposableRecordZoneIfPresent(
         _ zoneID: CKRecordZone.ID,
         using receipt: SynchronizationReceipt
     ) async throws -> Bool {
-        guard !modelAdapters.contains(where: {
-            $0.recordZoneID == zoneID
-        }) else {
-            throw OneOffRecordZoneResetError.activeRecordZoneCannotBeDeleted
+        guard allowsDisposableZoneDeletion else {
+            throw OneOffRecordZoneResetError.disposableZoneDeletionNotAllowed
         }
         guard receipt.issuerID == synchronizationReceiptIssuerID else {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
@@ -1151,322 +1853,6 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
-    /// Coordinates a destructive zone reset across all of a user's devices.
-    ///
-    /// Claim and completion records live in CloudKit's default zone, so deleting
-    /// the custom sync zone does not delete the coordination state. Every device
-    /// still rebuilds its local tracking once, but only the device that wins the
-    /// claim deletes the shared custom zone.
-    ///
-    /// `markerRecordType`, `markerOwnerField`, and `markerLeaseDateField` must
-    /// already exist with String and Date types in the production CloudKit schema.
-    @BigSyncBackgroundActor
-    func performOneOffRecordZoneResetAndReupload(
-        migrationIdentifier: String,
-        markerRecordType: String,
-        markerOwnerField: String,
-        markerLeaseDateField: String,
-        leaseDuration: TimeInterval = 15 * 60
-    ) async throws -> OneOffRecordZoneResetResult {
-        guard leaseDuration.isFinite, leaseDuration > 0 else {
-            throw OneOffRecordZoneResetError.invalidLeaseDuration
-        }
-        guard activeOneOffResetIdentifier == nil else {
-            throw OneOffRecordZoneResetError.migrationInProgress
-        }
-        activeOneOffResetIdentifier = migrationIdentifier
-        defer {
-            if activeOneOffResetIdentifier == migrationIdentifier {
-                activeOneOffResetIdentifier = nil
-            }
-        }
-        // Existing short identifiers used their literal value. Preserve that
-        // format so their completed recovery remains recognized, but never
-        // truncate a long identifier: two distinct migrations must not share a
-        // CloudKit claim or completion marker.
-        let markerComponent: String
-        if migrationIdentifier.count <= 120 {
-            markerComponent = migrationIdentifier
-        } else {
-            let digest = SHA256.hash(data: Data(migrationIdentifier.utf8))
-                .map { String(format: "%02x", $0) }
-                .joined()
-            markerComponent = "v2-\(digest)"
-        }
-        let markerPrefix = "BigSyncKitMigration.\(markerComponent)"
-        let claimRecordID = CKRecord.ID(recordName: "\(markerPrefix).claim")
-        let completionRecordID = CKRecord.ID(recordName: "\(markerPrefix).completed")
-        let accountIdentifier = try await accountIdentifierProvider()
-        let accountKey = Data(accountIdentifier.utf8)
-            .base64EncodedString()
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "+", with: "-")
-        let localKeyPrefix = "\(identifier).\(markerPrefix).\(accountKey)"
-        let localClaimTokenKey = "\(localKeyPrefix).claimToken"
-        let localCompletionKey = "\(localKeyPrefix).completed"
-
-        try await ensureCurrentAccount(accountIdentifier)
-
-        if keyValueStore.bool(forKey: localCompletionKey) {
-            keyValueStore.set(
-                value: accountIdentifier,
-                forKey: cloudKitAccountIdentifierKey
-            )
-            accountValidationRequired = false
-            return .cloudResetAlreadyCompleted
-        }
-
-        let existingCompletionRecord = try await fetchRecord(completionRecordID)
-        try await ensureCurrentAccount(accountIdentifier)
-        if existingCompletionRecord != nil {
-            try await rebuildLocalSyncCachesAfterCompletedReset(
-                accountIdentifier: accountIdentifier
-            )
-            keyValueStore.set(boolValue: true, forKey: localCompletionKey)
-            keyValueStore.set(
-                value: accountIdentifier,
-                forKey: cloudKitAccountIdentifierKey
-            )
-            accountValidationRequired = false
-            keyValueStore.removeObject(forKey: localClaimTokenKey)
-            return .cloudResetAlreadyCompleted
-        }
-
-        let claimToken =
-            keyValueStore.object(forKey: localClaimTokenKey) as? String
-            ?? UUID().uuidString
-        do {
-            try await acquireOrRenewResetClaim(
-                recordID: claimRecordID,
-                recordType: markerRecordType,
-                ownerField: markerOwnerField,
-                leaseDateField: markerLeaseDateField,
-                claimToken: claimToken,
-                leaseDuration: leaseDuration,
-                accountIdentifier: accountIdentifier
-            )
-            keyValueStore.set(value: claimToken, forKey: localClaimTokenKey)
-        } catch {
-            if isServerRecordChanged(error) {
-                throw OneOffRecordZoneResetError.migrationInProgress
-            }
-            throw error
-        }
-
-        // Keep ownership alive from the first destructive operation through
-        // completion publication, not merely while the replacement upload is
-        // in flight. A slow zone deletion or cache reset can otherwise outlive
-        // the lease and permit another device to take over mid-reset.
-        let claimHeartbeatStatus = ResetClaimHeartbeatStatus()
-        let claimRenewalTask = Task { @BigSyncBackgroundActor [weak self] in
-            guard let self else { throw CancellationError() }
-            do {
-                try await maintainResetClaim(
-                    recordID: claimRecordID,
-                    recordType: markerRecordType,
-                    ownerField: markerOwnerField,
-                    leaseDateField: markerLeaseDateField,
-                    claimToken: claimToken,
-                    leaseDuration: leaseDuration,
-                    accountIdentifier: accountIdentifier
-                )
-            } catch {
-                await claimHeartbeatStatus.record(error)
-                throw error
-            }
-        }
-        do {
-            await cancelSynchronizationAndWait()
-
-            try await ensureCurrentAccount(accountIdentifier)
-            for zoneID in Set(modelAdapters.map(\.recordZoneID)) {
-                try await claimHeartbeatStatus.throwIfFailed()
-                try await ensureCurrentAccount(accountIdentifier)
-                do {
-                    try await deleteRecordZone(zoneID)
-                } catch {
-                    let nsError = error as NSError
-                    let missingZoneCodes = [
-                        CKError.zoneNotFound.rawValue,
-                        CKError.userDeletedZone.rawValue,
-                    ]
-                    guard nsError.domain == CKErrorDomain,
-                          missingZoneCodes.contains(nsError.code) else {
-                        throw error
-                    }
-                }
-            }
-            try await claimHeartbeatStatus.throwIfFailed()
-            try await resetSyncCachesOwnedByCurrentFlow(
-                includingAdapters: true
-            )
-            try await ensureCurrentAccount(accountIdentifier)
-            try await claimHeartbeatStatus.throwIfFailed()
-
-            // Rebuild is only preparation. Do not publish the completion marker
-            // until the replacement snapshot has reached a terminal sync drain.
-            cancelSync = false
-            changeRequestProcessor.cancelSync = false
-            cancelledDueToUnauthentication = false
-            let uploadResult = try await withTaskCancellationHandler {
-                try await synchronize()
-            } onCancel: {
-                Task { @BigSyncBackgroundActor [weak self] in
-                    self?.cancelSynchronization()
-                }
-            }
-            try Task.checkCancellation()
-            try await claimHeartbeatStatus.throwIfFailed()
-            guard let uploadReceipt = uploadResult.receipt,
-                  uploadReceipt.accountIdentifier == accountIdentifier else {
-                throw OneOffRecordZoneResetError.cloudKitAccountChanged
-            }
-            try await ensureCurrentAccount(accountIdentifier)
-            try await claimHeartbeatStatus.throwIfFailed()
-
-            try await ensureCurrentAccount(accountIdentifier)
-            do {
-                try await claimHeartbeatStatus.throwIfFailed()
-                let completionRecord = CKRecord(
-                    recordType: markerRecordType,
-                    recordID: completionRecordID
-                )
-                completionRecord[markerOwnerField] = claimToken as CKRecordValue
-                completionRecord[markerLeaseDateField] = Date() as CKRecordValue
-                _ = try await saveMigrationMarker(completionRecord)
-                try await ensureCurrentAccount(accountIdentifier)
-                try await claimHeartbeatStatus.throwIfFailed()
-            } catch {
-                guard isServerRecordChanged(error) else { throw error }
-            }
-            // A server-record conflict still completes the suspension above. Fence
-            // the durable local marker regardless of which CloudKit outcome won.
-            try await ensureCurrentAccount(accountIdentifier)
-            try await claimHeartbeatStatus.throwIfFailed()
-            keyValueStore.set(boolValue: true, forKey: localCompletionKey)
-            keyValueStore.set(
-                value: accountIdentifier,
-                forKey: cloudKitAccountIdentifierKey
-            )
-            accountValidationRequired = false
-            keyValueStore.removeObject(forKey: localClaimTokenKey)
-            // The completion marker makes the claim inert. Leaving it in the old
-            // account avoids a best-effort delete racing an account replacement.
-            cancelSync = false
-            changeRequestProcessor.cancelSync = false
-            cancelledDueToUnauthentication = false
-            claimRenewalTask.cancel()
-            _ = try? await claimRenewalTask.value
-            return .performedCloudReset
-        } catch {
-            // Cancelling the public waiter does not necessarily stop a
-            // coalesced synchronization drain. Keep renewing ownership until
-            // that drain and its callbacks have crossed the cancellation
-            // barrier, then allow another device to take over safely.
-            await cancelSynchronizationAndWait()
-            claimRenewalTask.cancel()
-            _ = try? await claimRenewalTask.value
-            throw error
-        }
-    }
-
-    @BigSyncBackgroundActor
-    private func rebuildLocalSyncCachesAfterCompletedReset(
-        accountIdentifier: String
-    ) async throws {
-        await cancelSynchronizationAndWait()
-        try await ensureCurrentAccount(accountIdentifier)
-        try await resetSyncCachesOwnedByCurrentFlow(
-            includingAdapters: true
-        )
-        cancelSync = false
-        changeRequestProcessor.cancelSync = false
-        cancelledDueToUnauthentication = false
-        let result = try await synchronize()
-        guard let receipt = result.receipt,
-              receipt.accountIdentifier == accountIdentifier else {
-            throw OneOffRecordZoneResetError.cloudKitAccountChanged
-        }
-        try await ensureCurrentAccount(accountIdentifier)
-    }
-
-    @BigSyncBackgroundActor
-    private func acquireOrRenewResetClaim(
-        recordID: CKRecord.ID,
-        recordType: String,
-        ownerField: String,
-        leaseDateField: String,
-        claimToken: String,
-        leaseDuration: TimeInterval,
-        accountIdentifier: String
-    ) async throws {
-        try await ensureCurrentAccount(accountIdentifier)
-        let now = Date()
-        let existingClaim = try await fetchRecord(recordID)
-        try await ensureCurrentAccount(accountIdentifier)
-        if let claim = existingClaim {
-            let existingOwner = claim[ownerField] as? String
-            let leaseDate =
-                claim[leaseDateField] as? Date
-                ?? claim.modificationDate
-                ?? claim.creationDate
-                ?? .distantPast
-            guard existingOwner == claimToken
-                    || now.timeIntervalSince(leaseDate) >= leaseDuration else {
-                throw OneOffRecordZoneResetError.migrationInProgress
-            }
-            claim[ownerField] = claimToken as CKRecordValue
-            claim[leaseDateField] = now as CKRecordValue
-            _ = try await saveMigrationMarker(claim)
-            try await ensureCurrentAccount(accountIdentifier)
-        } else {
-            let claim = CKRecord(recordType: recordType, recordID: recordID)
-            claim[ownerField] = claimToken as CKRecordValue
-            claim[leaseDateField] = now as CKRecordValue
-            _ = try await saveMigrationMarker(claim)
-            try await ensureCurrentAccount(accountIdentifier)
-        }
-    }
-
-    @BigSyncBackgroundActor
-    private func maintainResetClaim(
-        recordID: CKRecord.ID,
-        recordType: String,
-        ownerField: String,
-        leaseDateField: String,
-        claimToken: String,
-        leaseDuration: TimeInterval,
-        accountIdentifier: String
-    ) async throws {
-        // Renew well before expiry and cap the interval so unusually long
-        // leases still detect account changes promptly.
-        let interval = max(
-            0.001,
-            min(leaseDuration / 3, 60)
-        )
-        let nanoseconds = UInt64(interval * 1_000_000_000)
-        while true {
-            try await Task.sleep(nanoseconds: nanoseconds)
-            try Task.checkCancellation()
-            do {
-                try await ensureCurrentAccount(accountIdentifier)
-                try await acquireOrRenewResetClaim(
-                    recordID: recordID,
-                    recordType: recordType,
-                    ownerField: ownerField,
-                    leaseDateField: leaseDateField,
-                    claimToken: claimToken,
-                    leaseDuration: leaseDuration,
-                    accountIdentifier: accountIdentifier
-                )
-                try await ensureCurrentAccount(accountIdentifier)
-            } catch {
-                cancelSynchronization()
-                throw error
-            }
-        }
-    }
-
     @BigSyncBackgroundActor
     private func ensureCurrentAccount(_ expectedIdentifier: String) async throws {
         guard try await accountIdentifierProvider() == expectedIdentifier else {
@@ -1476,15 +1862,7 @@ public class CloudKitSynchronizer: NSObject {
 
     @BigSyncBackgroundActor
     private func deleteRecordZone(_ zoneID: CKRecordZone.ID) async throws {
-        let _: Void = try await awaitCancellableCloudKitCallback { completion in
-            database.delete(withRecordZoneID: zoneID) { _, error in
-                if let error {
-                    completion(.failure(error))
-                } else {
-                    completion(.success(()))
-                }
-            }
-        }
+        try await zoneStore.deleteRecordZone(withID: zoneID)
     }
 
     private func isMissingRecordZoneError(_ error: Error) -> Bool {
@@ -1496,87 +1874,42 @@ public class CloudKitSynchronizer: NSObject {
             ].contains(nsError.code)
     }
 
-    @BigSyncBackgroundActor
-    private func fetchRecord(_ recordID: CKRecord.ID) async throws -> CKRecord? {
-        try await awaitCancellableCloudKitCallback { completion in
-            database.fetch(withRecordID: recordID) { record, error in
-                if let error {
-                    let nsError = error as NSError
-                    if nsError.domain == CKErrorDomain,
-                       nsError.code == CKError.unknownItem.rawValue {
-                        completion(.success(nil))
-                    } else {
-                        completion(.failure(error))
-                    }
-                } else {
-                    completion(.success(record))
-                }
-            }
-        }
-    }
-
-    @BigSyncBackgroundActor
-    private func saveMigrationMarker(_ record: CKRecord) async throws -> CKRecord {
-        let result = try await modifyMigrationMarkers(
-            recordsToSave: [record],
-            recordIDsToDelete: nil
-        )
-        guard let savedRecord = result.savedRecords.first else {
-            throw CKError(.internalError)
-        }
-        return savedRecord
-    }
-
-    @BigSyncBackgroundActor
-    private func modifyMigrationMarkers(
-        recordsToSave: [CKRecord]?,
-        recordIDsToDelete: [CKRecord.ID]?
-    ) async throws -> (savedRecords: [CKRecord], deletedRecordIDs: [CKRecord.ID]) {
-        try await awaitCancellableCloudKitCallback { completion in
-            let operation = CKModifyRecordsOperation(
-                recordsToSave: recordsToSave,
-                recordIDsToDelete: recordIDsToDelete
-            )
-            operation.savePolicy = .ifServerRecordUnchanged
-            operation.isAtomic = true
-            operation.modifyRecordsCompletionBlock = { savedRecords, deletedRecordIDs, error in
-                if let error {
-                    completion(.failure(error))
-                } else {
-                    completion(.success(
-                        (savedRecords ?? [], deletedRecordIDs ?? [])
-                    ))
-                }
-            }
-            database.add(operation)
-        }
-    }
-
-    private func isServerRecordChanged(_ error: Error) -> Bool {
-        let nsError = error as NSError
-        if nsError.domain == CKErrorDomain,
-           nsError.code == CKError.serverRecordChanged.rawValue {
-            return true
-        }
-        guard nsError.domain == CKErrorDomain,
-              nsError.code == CKError.partialFailure.rawValue,
-              let itemErrors = nsError.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError] else {
-            return false
-        }
-        return itemErrors.values.contains {
-            $0.domain == CKErrorDomain &&
-            $0.code == CKError.serverRecordChanged.rawValue
-        }
-    }
-    
     /// Model adapters in use by this synchronizer
     public var modelAdapters: [ModelAdapter] {
         return Array(modelAdapterDictionary.values)
+    }
+
+    /// Returns whether `adapter` can be registered without sharing a Realm
+    /// tracking store with a different CloudKit zone. The rebuild provenance is
+    /// deliberately adapter-local, so sharing it would allow one zone's reset
+    /// or completion to erase another zone's server evidence.
+    internal func canAddModelAdapter(_ adapter: ModelAdapter) -> Bool {
+        if let existing = modelAdapterDictionary[adapter.recordZoneID] {
+            // Registration is idempotent for the same object, but silently
+            // replacing a live adapter would leave the old instance able to
+            // call this synchronizer through its delegate.
+            return existing === adapter
+        }
+        guard let realmAdapter = adapter as? RealmSwiftAdapter else {
+            return true
+        }
+        return !modelAdapters.contains { existingAdapter in
+            guard existingAdapter.recordZoneID != realmAdapter.recordZoneID,
+                  let existingRealmAdapter = existingAdapter as? RealmSwiftAdapter else {
+                return false
+            }
+            return existingRealmAdapter.persistenceRealmIdentity
+                == realmAdapter.persistenceRealmIdentity
+        }
     }
     
     /// Adds a new model adapter to be synchronized with CloudKit.
     /// - Parameter adapter: The adapter to be managed by this synchronizer.
     public func addModelAdapter(_ adapter: ModelAdapter) {
+        precondition(
+            canAddModelAdapter(adapter),
+            "RealmSwiftAdapters for different CloudKit zones must use distinct persistence Realm identities"
+        )
         modelAdapterDictionary[adapter.recordZoneID] = adapter
         adapter.modelAdapterDelegate = self
     }
@@ -1591,6 +1924,6 @@ extension CloudKitSynchronizer: ModelAdapterDelegate {
     }
     
     public func hasChangesToUpload() async {
-        await beginSynchronization()
+        beginSynchronization()
     }
 }

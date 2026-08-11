@@ -44,6 +44,9 @@ public class SyncStatusViewModel: ObservableObject {
 //    @Published public var syncStatusWithoutFailure: String = "Initializing"
     @Published public var syncFailed = false
     @Published public var currentDeviceID: UUID?
+    /// Durable, account-scoped state restored independently from the transient
+    /// notification-driven status above.
+    @Published public private(set) var cloudKitSyncHealth: CloudKitSyncHealthSnapshot?
 //    @Published public var lastSeenDevices: [LastSeenDevice]?
     @Published public var changesRemainingToUpload: Int?
 
@@ -60,6 +63,17 @@ public class SyncStatusViewModel: ObservableObject {
                 if let count = userInfo?["CloudKitSynchronizerChangesRemainingToUploadKey"] as? Int {
                     changesRemainingToUpload = count
                 }
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .SynchronizerSyncHealthDidChange)
+            .receive(on: RunLoop.main)
+            .sink { @Sendable @MainActor [weak self] notification in
+                guard let self,
+                      let snapshot = notification.userInfo?[
+                        cloudKitSynchronizerSyncHealthSnapshotKey
+                      ] as? CloudKitSyncHealthSnapshot else { return }
+                cloudKitSyncHealth = snapshot
             }
             .store(in: &cancellables)
         
@@ -127,7 +141,7 @@ public class SyncStatusViewModel: ObservableObject {
                         default:
                             syncStatus = "Synchronization Failed: \(String(describing: error).prefix(150))"
                         }
-                    } else if let cancellationError = error as? CancellationError {
+                    } else if error is CancellationError {
                         syncFailed = false
                     } else {
                         syncStatus = "Synchronization Failed: \(error.localizedDescription)"
@@ -139,6 +153,49 @@ public class SyncStatusViewModel: ObservableObject {
                 syncIsOver()
             }
             .store(in: &cancellables)
+    }
+
+    /// Reload after the BigSync worker is configured. The worker verifies the
+    /// current account scope before returning persisted state.
+    public func restoreCloudKitSyncHealth() {
+        Task { @MainActor [weak self] in
+            let snapshot = await BigSyncBackgroundActor.shared
+                .cloudKitSyncHealthSnapshot()
+            self?.cloudKitSyncHealth = snapshot
+        }
+    }
+
+    public var cloudKitSyncHealthText: String? {
+        guard let cloudKitSyncHealth else { return nil }
+        switch cloudKitSyncHealth.terminalZoneDeletionKind {
+        case .purged:
+            return "iCloud data was removed in Settings; sync is paused and local data will not be re-uploaded"
+        case .encryptedDataReset:
+            if cloudKitSyncHealth.category == .succeeded {
+                break
+            }
+            return "Recovering iCloud data after an encrypted-data reset"
+        case .deleted:
+            return "The iCloud sync zone was deleted; local data was preserved and sync is paused"
+        case .unknown:
+            return "The iCloud sync zone is unavailable; local data was preserved and sync is paused"
+        case nil:
+            break
+        }
+        switch cloudKitSyncHealth.category {
+        case .idle: return "Idle"
+        case .syncing: return "Synchronizing"
+        case .succeeded: return "Last sync succeeded"
+        case .transientRetry:
+            if let retryNotBefore = cloudKitSyncHealth.retryNotBefore {
+                return "Retrying after \(retryNotBefore.formatted(date: .abbreviated, time: .shortened))"
+            }
+            return "Retrying"
+        case .notAuthenticated: return "iCloud authentication required"
+        case .higherModelVersion: return "Update required to sync newer data"
+        case .terminalZoneUnavailable: return "Cloud sync recovery required"
+        case .failed: return "Last sync failed"
+        }
     }
     
     private func syncBegan() {

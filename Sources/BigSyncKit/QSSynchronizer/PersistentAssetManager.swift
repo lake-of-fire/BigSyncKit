@@ -6,12 +6,16 @@
 //
 
 import CryptoKit
+import Darwin
 import Foundation
 
 class PersistentAssetManager {
     let identifier: String
-    init(identifier: String) {
+    let rootDirectoryURL: URL?
+
+    init(identifier: String, rootDirectoryURL: URL? = nil) {
         self.identifier = identifier
+        self.rootDirectoryURL = rootDirectoryURL
     }
 
     private struct AssetKey: Hashable {
@@ -24,9 +28,11 @@ class PersistentAssetManager {
     private let cacheQueue = DispatchQueue(label: "PersistentAssetManager.Cache")
     
     private lazy var assetDirectory: URL = {
-        let appSupportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let directoryURL = appSupportURL
-            .appendingPathComponent("CloudKitAssets")
+        let defaultRootURL = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0].appendingPathComponent("CloudKitAssets")
+        let directoryURL = (rootDirectoryURL ?? defaultRootURL)
             .appendingPathComponent(identifier)
         
         if !FileManager.default.fileExists(atPath: directoryURL.path) {
@@ -74,12 +80,27 @@ class PersistentAssetManager {
     /// next prepared generation. Keeping every historical file for a pending
     /// record causes unbounded growth during repeated offline edits.
     func clearAssetFiles() {
-        guard let fileURLs = try? FileManager.default.contentsOfDirectory(at: assetDirectory, includingPropertiesForKeys: nil, options: []) else {
+        let directoryURL = assetDirectory
+        // Foundation directory enumeration can route through CoreServices and
+        // block while resolving unrelated mounted volumes. These directories
+        // contain only flat files owned by this manager, so POSIX enumeration
+        // avoids making a sync/reset dependent on volume metadata discovery.
+        guard let directory = opendir(directoryURL.path) else {
             return
         }
-        
-        for fileURL in fileURLs {
-            try? FileManager.default.removeItem(at: fileURL)
+        defer { closedir(directory) }
+
+        while let entry = readdir(directory) {
+            let fileName = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                    String(cString: $0)
+                }
+            }
+            guard fileName != ".", fileName != ".." else { continue }
+            let filePath = directoryURL
+                .appendingPathComponent(fileName)
+                .path
+            _ = unlink(filePath)
         }
 
         cacheQueue.sync {

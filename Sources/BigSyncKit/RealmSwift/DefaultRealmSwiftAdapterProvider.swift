@@ -18,6 +18,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let excludedClassNames: [String]
     let priorityClassNames: [String]
     let appGroup: String?
+    let assetDirectoryURL: URL?
     let logger: Logging.Logger
     public private(set) var adapter: RealmSwiftAdapter!
    
@@ -34,6 +35,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         zoneID: CKRecordZone.ID,
         appGroup: String? = nil,
         persistenceNamespace: String? = nil,
+        persistenceDirectoryURL: URL? = nil,
+        assetDirectoryURL: URL? = nil,
         logger: Logging.Logger
     ) {
         self.targetConfigurations = targetConfigurations
@@ -41,11 +44,13 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         self.priorityClassNames = priorityClassNames
         self.zoneID = zoneID
         self.appGroup = appGroup
+        self.assetDirectoryURL = assetDirectoryURL
         self.logger = logger
         persistenceConfiguration = DefaultRealmSwiftAdapterProvider.createPersistenceConfiguration(
             suiteName: appGroup,
             zoneID: zoneID,
-            persistenceNamespace: persistenceNamespace
+            persistenceNamespace: persistenceNamespace,
+            persistenceDirectoryURL: persistenceDirectoryURL
         )
         super.init()
         adapter = createAdapter()
@@ -58,6 +63,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         excludedClassNames = adapter.excludedClassNames
         priorityClassNames = adapter.priorityEntityTypeNames
         appGroup = nil
+        assetDirectoryURL = nil
         self.logger = logger
         super.init()
         self.adapter = adapter
@@ -77,7 +83,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
             excludedClassNames: excludedClassNames,
             priorityEntityTypeNames: priorityClassNames,
             recordZoneID: zoneID,
-            logger: logger
+            logger: logger,
+            assetDirectoryURL: assetDirectoryURL
         )
     }
     
@@ -141,17 +148,34 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     fileprivate static func createPersistenceConfiguration(
         suiteName: String?,
         zoneID: CKRecordZone.ID,
-        persistenceNamespace: String?
+        persistenceNamespace: String?,
+        persistenceDirectoryURL: URL?
     ) -> Realm.Configuration {
-        ensurePathAvailable(suiteName: suiteName)
-        var configuration = RealmSwiftAdapter.defaultPersistenceConfiguration()
-        configuration.fileURL = URL(
-            fileURLWithPath: realmPath(
-                appGroup: suiteName,
-                zoneID: zoneID,
-                persistenceNamespace: persistenceNamespace
+        if let persistenceDirectoryURL {
+            try? FileManager.default.createDirectory(
+                at: persistenceDirectoryURL,
+                withIntermediateDirectories: true
             )
+        } else {
+            ensurePathAvailable(suiteName: suiteName)
+        }
+        var configuration = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        let fileName = realmFileName(
+            zoneID: zoneID,
+            persistenceNamespace: persistenceNamespace
         )
+        if let persistenceDirectoryURL {
+            configuration.fileURL = persistenceDirectoryURL
+                .appendingPathComponent(fileName, isDirectory: false)
+        } else {
+            configuration.fileURL = URL(
+                fileURLWithPath: realmPath(
+                    appGroup: suiteName,
+                    zoneID: zoneID,
+                    persistenceNamespace: persistenceNamespace
+                )
+            )
+        }
         return configuration
     }
     

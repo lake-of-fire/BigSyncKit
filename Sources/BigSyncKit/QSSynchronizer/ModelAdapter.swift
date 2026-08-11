@@ -28,6 +28,81 @@ public protocol ModelAdapterDelegate: AnyObject {
     func hasChangesToUpload() async
 }
 
+/// Optional hooks for the one-time change-feed tracking migration. The
+/// synchronizer owns account fencing and phase ordering; adapters own durable
+/// tracking/provenance storage.
+public enum ChangeFeedResetMode: String, Sendable {
+    /// Reconcile a full server bootstrap conservatively. A previously
+    /// server-backed record that is now absent must not be resurrected.
+    case serverReconciliation
+    /// CloudKit explicitly reset the account's encrypted data. The direct
+    /// database API documents that locally retained live data may be
+    /// re-uploaded, so rebuild durable upload generations without changing the
+    /// target objects themselves.
+    case encryptedDataReset
+}
+
+public protocol ChangeFeedResetMigrating: AnyObject {
+    /// Evidence captured before reset that this zone has previously held a
+    /// valid server record.  It protects an established zone from accidental
+    /// recreation after a deletion lifecycle event.
+    func hasChangeFeedEstablishedServerEvidence() async throws -> Bool
+    func prepareChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
+    func beginChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
+    func promoteChangeFeedResetToEncryptedDataReset(accountScopeIdentifier: String, epoch: Int) async throws
+    func isChangeFeedServerBootstrapActive() async -> Bool
+    func reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
+    func finishChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
+}
+
+public extension ChangeFeedResetMigrating {
+    func hasChangeFeedEstablishedServerEvidence() async throws -> Bool { false }
+
+    func prepareChangeFeedReset(
+        accountScopeIdentifier: String,
+        epoch: Int
+    ) async throws {
+        try await prepareChangeFeedReset(
+            accountScopeIdentifier: accountScopeIdentifier,
+            epoch: epoch,
+            mode: .serverReconciliation
+        )
+    }
+
+    func beginChangeFeedServerBootstrap(
+        accountScopeIdentifier: String,
+        epoch: Int
+    ) async throws {
+        try await beginChangeFeedServerBootstrap(
+            accountScopeIdentifier: accountScopeIdentifier,
+            epoch: epoch,
+            mode: .serverReconciliation
+        )
+    }
+
+    func reconcileAfterChangeFeedServerBootstrap(
+        accountScopeIdentifier: String,
+        epoch: Int
+    ) async throws {
+        try await reconcileAfterChangeFeedServerBootstrap(
+            accountScopeIdentifier: accountScopeIdentifier,
+            epoch: epoch,
+            mode: .serverReconciliation
+        )
+    }
+
+    func finishChangeFeedReset(
+        accountScopeIdentifier: String,
+        epoch: Int
+    ) async throws {
+        try await finishChangeFeedReset(
+            accountScopeIdentifier: accountScopeIdentifier,
+            epoch: epoch,
+            mode: .serverReconciliation
+        )
+    }
+}
+
 /// An object conforming to `ModelAdapter` will track the local model, provide changes to upload to CloudKit and import downloaded changes.
 //@objc public protocol ModelAdapter: AnyObject {
 public protocol ModelAdapter: AnyObject, Sendable {
@@ -106,12 +181,12 @@ public protocol ModelAdapter: AnyObject, Sendable {
     /// Record zone ID managed by this adapter
     var recordZoneID: CKRecordZone.ID { get }
     
-    /// Latest `CKServerChangeToken` stored by this adapter, or `nil` if one does not exist.
-    var serverChangeToken: CKServerChangeToken? { get async }
+    /// Latest record-zone cursor stored by this adapter, or `nil` if one does not exist.
+    var serverChangeToken: RecordZoneChangeCursor? { get async }
     
     /// Save given token for future use by this adapter.
-    /// - Parameter token: `CKServerChangeToken`
-    func saveToken(_ token: CKServerChangeToken?) async throws
+    /// - Parameter token: opaque record-zone history cursor.
+    func saveToken(_ token: RecordZoneChangeCursor?) async throws
     
     /// Merge policy in case of conflicts. Default is `server`.
     var mergePolicy: MergePolicy { get set }
