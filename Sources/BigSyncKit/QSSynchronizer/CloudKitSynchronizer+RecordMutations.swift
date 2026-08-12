@@ -193,6 +193,7 @@ extension CloudKitSynchronizer {
         restrictedToEntityType: String?,
         attemptID: UUID
     ) async throws {
+        var handledRetryCounts = [CKRecord.ID: Int]()
         while true {
             try checkSynchronizationAttempt(attemptID)
             let requestedBatchSize = batchSize
@@ -219,6 +220,7 @@ extension CloudKitSynchronizer {
             try await revalidateActiveRunContext(for: attemptID)
 
             var acknowledged = [CKRecord.ID]()
+            var conflictedRecordsByID = [CKRecord.ID: CKRecord]()
             var unresolvedFailures = [CKRecord.ID: NSError]()
             for recordID in recordIDs {
                 guard let result = mutationResults.deleteResults[recordID] else {
@@ -229,12 +231,26 @@ extension CloudKitSynchronizer {
                 }
                 switch result {
                 case .success:
+                    handledRetryCounts.removeValue(forKey: recordID)
                     acknowledged.append(recordID)
                 case .failure(let error):
                     let nsError = error as NSError
                     if nsError.domain == CKErrorDomain,
                        nsError.code == CKError.unknownItem.rawValue {
+                        handledRetryCounts.removeValue(forKey: recordID)
                         acknowledged.append(recordID)
+                    } else if nsError.domain == CKErrorDomain,
+                              nsError.code == CKError.serverRecordChanged.rawValue,
+                              let serverRecord = nsError.userInfo[
+                                  CKRecordChangedErrorServerRecordKey
+                              ] as? CKRecord {
+                        let retryCount = handledRetryCounts[recordID, default: 0] + 1
+                        guard retryCount <= Self.maximumHandledRecordRetries else {
+                            unresolvedFailures[recordID] = nsError
+                            continue
+                        }
+                        handledRetryCounts[recordID] = retryCount
+                        conflictedRecordsByID[recordID] = serverRecord
                     } else {
                         unresolvedFailures[recordID] = nsError
                     }
@@ -248,6 +264,17 @@ extension CloudKitSynchronizer {
                 )
                 try await revalidateActiveRunContext(for: attemptID)
             }
+            if !conflictedRecordsByID.isEmpty {
+                // Rebase only server system fields before retrying the local
+                // tombstone. Applying inbound model values here would either
+                // overwrite the local delete or be (correctly) ignored by a
+                // local-wins importer, leaving stale conflict metadata.
+                try await adapter.rebasePendingDeletionMetadata(
+                    using: Array(conflictedRecordsByID.values),
+                    matchingPreparedGenerations: generations
+                )
+                try await revalidateActiveRunContext(for: attemptID)
+            }
             guard unresolvedFailures.isEmpty else {
                 if unresolvedFailures.values.contains(where: {
                     $0.domain == CKErrorDomain
@@ -257,10 +284,11 @@ extension CloudKitSynchronizer {
                 }
                 throw partialMutationError(unresolvedFailures)
             }
-            if recordIDs.count >= requestedBatchSize {
+            let handledFailures = conflictedRecordsByID.count
+            if handledFailures == 0, recordIDs.count >= requestedBatchSize {
                 increaseBatchSize()
             }
-            guard recordIDs.count >= requestedBatchSize else { return }
+            guard handledFailures > 0 || recordIDs.count >= requestedBatchSize else { return }
             await Task.yield()
         }
     }

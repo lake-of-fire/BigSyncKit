@@ -656,13 +656,6 @@ public class CloudKitSynchronizer: NSObject {
         durableStateKey("CloudKitAccountIdentifier")
     }
 
-    /// v1 predated the durable container/zone namespace. These keys are read
-    /// only by the one-time safety bridge below; normal runtime state never
-    /// falls back to them.
-    private var legacyCloudKitAccountIdentifierKey: String {
-        "\(identifier).BigSyncKitCloudKitAccountIdentifier"
-    }
-
     private var transientRetryStateKey: String {
         durableStateKey("TransientRetryState.v2")
     }
@@ -944,10 +937,19 @@ public class CloudKitSynchronizer: NSObject {
     internal func markConfiguredZoneEstablished(
         _ zoneID: CKRecordZone.ID,
         accountScopeIdentifier: String
-    ) {
-        keyValueStore.set(
-            boolValue: true,
-            forKey: zoneLifecycleKey(zoneID, accountScopeIdentifier: accountScopeIdentifier, suffix: "established")
+    ) throws {
+        var state = storedZoneLifecycleState(
+            zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
+        ) ?? baseZoneLifecycleState(
+            zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
+        )
+        state["established"] = true
+        try persistZoneLifecycleState(
+            state,
+            zoneID: zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
         )
     }
 
@@ -956,36 +958,31 @@ public class CloudKitSynchronizer: NSObject {
         kind: CloudKitZoneDeletionKind,
         accountScopeIdentifier: String,
         observedAt: Date = Date()
-    ) {
+    ) throws {
         // A database-history deletion event is itself durable proof that the
         // zone existed. All deletion kinds are terminal for production sync:
         // preserve the concrete reason and never silently recreate the zone
         // from possibly stale local objects.
-        let establishedKey = zoneLifecycleKey(zoneID, accountScopeIdentifier: accountScopeIdentifier, suffix: "established")
-        keyValueStore.set(boolValue: true, forKey: establishedKey)
-        keyValueStore.set(
-            value: kind.rawValue,
-            forKey: zoneLifecycleKey(zoneID, accountScopeIdentifier: accountScopeIdentifier, suffix: "terminal")
+        var state = baseZoneLifecycleState(
+            zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
         )
-        keyValueStore.set(
-            value: observedAt,
-            forKey: zoneLifecycleKey(
-                zoneID,
-                accountScopeIdentifier: accountScopeIdentifier,
-                suffix: "terminalObservedAt"
-            )
+        state["established"] = true
+        state["terminal"] = kind.rawValue
+        state["terminalObservedAt"] = observedAt
+        try persistZoneLifecycleState(
+            state,
+            zoneID: zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
         )
     }
 
     internal func configuredZoneIsEstablished(_ zoneID: CKRecordZone.ID) -> Bool {
         guard let context = activeRunContext else { return false }
-        return keyValueStore.bool(
-            forKey: zoneLifecycleKey(
-                zoneID,
-                accountScopeIdentifier: context.accountScopeIdentifier,
-                suffix: "established"
-            )
-        )
+        return storedZoneLifecycleState(
+            zoneID,
+            accountScopeIdentifier: context.accountScopeIdentifier
+        )?["established"] as? Bool == true
     }
 
     internal func configuredZoneIsTerminal(_ zoneID: CKRecordZone.ID) -> Bool {
@@ -996,24 +993,16 @@ public class CloudKitSynchronizer: NSObject {
         _ zoneID: CKRecordZone.ID
     ) -> CloudKitTerminalZoneState? {
         guard let context = activeRunContext,
-              let rawKind = keyValueStore.object(
-                forKey: zoneLifecycleKey(
-                    zoneID,
-                    accountScopeIdentifier: context.accountScopeIdentifier,
-                    suffix: "terminal"
-                )
-              ) as? String else {
+              let state = storedZoneLifecycleState(
+                zoneID,
+                accountScopeIdentifier: context.accountScopeIdentifier
+              ),
+              let rawKind = state["terminal"] as? String else {
             return nil
         }
         let deletionKind = CloudKitZoneDeletionKind(rawValue: rawKind)
             ?? .unknown
-        let observedAt = keyValueStore.object(
-            forKey: zoneLifecycleKey(
-                zoneID,
-                accountScopeIdentifier: context.accountScopeIdentifier,
-                suffix: "terminalObservedAt"
-            )
-        ) as? Date ?? .distantPast
+        let observedAt = state["terminalObservedAt"] as? Date ?? .distantPast
         return CloudKitTerminalZoneState(
             zoneName: zoneID.zoneName,
             ownerName: zoneID.ownerName,
@@ -1025,51 +1014,83 @@ public class CloudKitSynchronizer: NSObject {
     internal func clearConfiguredZoneTerminal(
         _ zoneID: CKRecordZone.ID,
         accountScopeIdentifier: String
-    ) {
-        for suffix in ["terminal", "terminalObservedAt"] {
-            keyValueStore.removeObject(
-                forKey: zoneLifecycleKey(
-                    zoneID,
-                    accountScopeIdentifier: accountScopeIdentifier,
-                    suffix: suffix
-                )
-            )
-        }
-    }
-
-    private func zoneLifecycleKey(
-        _ zoneID: CKRecordZone.ID,
-        accountScopeIdentifier: String,
-        suffix: String
-    ) -> String {
-        durableStateKey(
-            "ZoneLifecycle.v2.\(accountScopeIdentifier).\(zoneID.ownerName).\(zoneID.zoneName).\(suffix)"
+    ) throws {
+        guard var state = storedZoneLifecycleState(
+            zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
+        ) else { return }
+        state.removeValue(forKey: "terminal")
+        state.removeValue(forKey: "terminalObservedAt")
+        try persistZoneLifecycleState(
+            state,
+            zoneID: zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
         )
     }
 
-    /// Keeps v1 evidence from reviving after a later restore reintroduces old
-    /// defaults. The marker is scoped to the legacy account and zone, not a
-    /// process-global migration flag.
-    private func legacyStateConsumptionKey(
-        accountScopeIdentifier: String,
-        zoneID: CKRecordZone.ID
-    ) -> String {
-        "\(identifier).BigSyncKit.LegacyStateImport.v1.\(accountScopeIdentifier).\(zoneID.ownerName).\(zoneID.zoneName).consumed"
-    }
-
-    private func legacyZoneLifecycleKey(
-        _ zoneID: CKRecordZone.ID,
-        accountScopeIdentifier: String,
-        suffix: String
-    ) -> String {
-        "\(identifier).BigSyncKit.ZoneLifecycle.v1.\(accountScopeIdentifier).\(zoneID.ownerName).\(zoneID.zoneName).\(suffix)"
-    }
-
-    private func legacyChangeFeedMigrationKey(
+    private func zoneLifecycleStateKey(
         _ zoneID: CKRecordZone.ID,
         accountScopeIdentifier: String
     ) -> String {
-        "\(identifier).BigSyncKit.ChangeFeedMigration.v1.\(accountScopeIdentifier).\(zoneID.ownerName).\(zoneID.zoneName)"
+        durableStateKey(
+            "ZoneLifecycle.v3.\(accountScopeIdentifier).\(zoneID.ownerName).\(zoneID.zoneName)"
+        )
+    }
+
+    private func baseZoneLifecycleState(
+        _ zoneID: CKRecordZone.ID,
+        accountScopeIdentifier: String
+    ) -> [String: Any] {
+        [
+            "version": 3,
+            "accountScopeIdentifier": accountScopeIdentifier,
+            "zoneOwnerName": zoneID.ownerName,
+            "zoneName": zoneID.zoneName,
+        ]
+    }
+
+    private func storedZoneLifecycleState(
+        _ zoneID: CKRecordZone.ID,
+        accountScopeIdentifier: String
+    ) -> [String: Any]? {
+        guard let state = keyValueStore.object(forKey: zoneLifecycleStateKey(
+            zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
+        )) as? [String: Any],
+        (state["version"] as? NSNumber)?.intValue == 3,
+        state["accountScopeIdentifier"] as? String == accountScopeIdentifier,
+        state["zoneOwnerName"] as? String == zoneID.ownerName,
+        state["zoneName"] as? String == zoneID.zoneName else {
+            return nil
+        }
+        return state
+    }
+
+    private func persistZoneLifecycleState(
+        _ state: [String: Any],
+        zoneID: CKRecordZone.ID,
+        accountScopeIdentifier: String
+    ) throws {
+        let key = zoneLifecycleStateKey(
+            zoneID,
+            accountScopeIdentifier: accountScopeIdentifier
+        )
+        let previousValue = keyValueStore.object(forKey: key)
+        keyValueStore.set(value: state, forKey: key)
+        guard keyValueStore.synchronize?() == true,
+              let persisted = storedZoneLifecycleState(
+                zoneID,
+                accountScopeIdentifier: accountScopeIdentifier
+              ),
+              NSDictionary(dictionary: persisted).isEqual(to: state) else {
+            if let previousValue {
+                keyValueStore.set(value: previousValue, forKey: key)
+            } else {
+                keyValueStore.removeObject(forKey: key)
+            }
+            _ = keyValueStore.synchronize?()
+            throw ChangeFeedMigrationPersistenceError.stateNotDurable
+        }
     }
 
     deinit {
@@ -1082,16 +1103,19 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     var deviceIdentifier: String {
         if _deviceIdentifier == nil {
-            _deviceIdentifier = deviceUUID
-            if _deviceIdentifier == nil {
-                _deviceIdentifier = UUID().uuidString
-                deviceUUID = _deviceIdentifier
-            }
+            // This is an optimization tag, not durable client identity. Keeping
+            // it across launches lets a restored backup suppress newer records
+            // written by the original installation while still advancing its
+            // cursor. A process-scoped value filters only the current process's
+            // immediate post-upload echo.
+            _deviceIdentifier = UUID().uuidString
         }
         return _deviceIdentifier
     }
     
     internal func clearDeviceIdentifier() {
+        // Retire the legacy persisted optimization value. It is deliberately
+        // never read by the modern transport.
         deviceUUID = nil
         _deviceIdentifier = nil
     }
@@ -1171,12 +1195,11 @@ public class CloudKitSynchronizer: NSObject {
         lastDatabaseChangesEmptyAt = nil
         try requestChangeFeedRecovery(
             context: context,
-            mode: .serverReconciliation
+            mode: .backupRestore
         )
         guard let recovery = storedChangeFeedMigrationState(for: context),
               recovery.phase != .completed,
-              recovery.mode == .serverReconciliation
-                || recovery.mode == .encryptedDataReset else {
+              recovery.mode == .backupRestore else {
             // The restore event remains on disk. Do not recreate upload state
             // or acknowledge recovery unless its migration envelope can be
             // read back from the client's durable store.
@@ -1187,7 +1210,7 @@ public class CloudKitSynchronizer: NSObject {
         // server evidence, so it must not fence the reconciliation it requested.
         // If the nil-token feed observes a current deletion, that event records
         // a new terminal marker and aborts before migration completion.
-        clearConfiguredZoneTerminal(
+        try clearConfiguredZoneTerminal(
             recordZoneID,
             accountScopeIdentifier: context.accountScopeIdentifier
         )
@@ -1198,7 +1221,7 @@ public class CloudKitSynchronizer: NSObject {
     private func completeRestoredBackupRecoveryIfNeeded() throws {
         refreshBackupRestoreRequirement()
         guard backupRestoreDetected else { return }
-        BackupDetection.markRestoreResetCompleted(
+        try BackupDetection.markRestoreResetCompleted(
             namespace: durableStateNamespace,
             sharedSentinelBaseURL: backupDetectionBaseURL
         )
@@ -1237,7 +1260,11 @@ public class CloudKitSynchronizer: NSObject {
         reservedReceiptAuthorizationID = nil
 
         synchronizationTask?.cancel()
-        synchronizationTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+        // Synchronization is deferrable user-data work, but it must still make
+        // progress under sustained system load. `.background` cooperative
+        // tasks can be starved indefinitely; utility QoS preserves energy
+        // intent without making CloudKit work user-interactive.
+        synchronizationTask = Task(priority: .utility) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
             do {
                 await waitForRunCallbacksToFinish()
@@ -1301,15 +1328,18 @@ public class CloudKitSynchronizer: NSObject {
                 try await subscribeForChangesInDatabase()
                 reportProgress("subscription-completed")
                 try await revalidateRunContext(context)
+                try await beginChangeFeedMigrationIfNeeded(context: context)
+                try await revalidateRunContext(context)
+                reportProgress("change-feed-migration-ready")
+                // Migration preparation must precede setup. In recovery modes it
+                // activates Realm provenance (and, for backup restore, retires
+                // the copied outbox) before setup can scan target objects.
                 for adapter in modelAdapters {
                     await adapter.waitForCancellation()
                     try await adapter.unsetCancellation()
                     try checkRunContext(context)
                 }
                 reportProgress("adapters-ready")
-                try await beginChangeFeedMigrationIfNeeded(context: context)
-                try await revalidateRunContext(context)
-                reportProgress("change-feed-migration-ready")
                 try Task.checkCancellation()
                 await performSynchronization()
             } catch {
@@ -1516,9 +1546,6 @@ public class CloudKitSynchronizer: NSObject {
         let validationAttemptID = synchronizationAttemptID
         let currentAccountIdentifier = try await accountIdentifierProvider()
         try checkAccountValidationAttempt(validationAttemptID)
-        try importLegacyDurableSafetyStateIfNeeded(
-            currentAccountIdentifier: currentAccountIdentifier
-        )
         var confirmedAccountIdentifier = currentAccountIdentifier
         var didReplaceAccount = false
         if let previousAccountIdentifier =
@@ -1528,11 +1555,6 @@ public class CloudKitSynchronizer: NSObject {
             logger.info(
                 "QSCloudKitSynchronizer >> CloudKit account changed; rebuilding local sync metadata for the new account"
             )
-            changeRequestProcessor.reset()
-            resetDatabaseToken()
-            resetActiveTokens()
-            clearAllStoredSubscriptionIDs()
-            clearPersistedTransientRetryState()
             // Confirm the provider still reports the account whose metadata was
             // prepared. The new account's tracking rebuild is requested only
             // after this exact identity has been confirmed; it captures prior
@@ -1546,17 +1568,26 @@ public class CloudKitSynchronizer: NSObject {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
         if didReplaceAccount {
+            let recoveryContext = RunContext(
+                attemptID: validationAttemptID,
+                runID: synchronizationRunID,
+                accountIdentifier: confirmedAccountIdentifier,
+                accountScopeIdentifier: Self.accountScopeIdentifier(
+                    for: confirmedAccountIdentifier
+                )
+            )
+            // The new account's recovery envelope is the durable hand-off.
+            // Do not discard the old account's cursors, subscriptions, or
+            // retry state until that hand-off is readable after a restart.
             try requestChangeFeedRecovery(
-                context: RunContext(
-                    attemptID: validationAttemptID,
-                    runID: synchronizationRunID,
-                    accountIdentifier: confirmedAccountIdentifier,
-                    accountScopeIdentifier: Self.accountScopeIdentifier(
-                        for: confirmedAccountIdentifier
-                    )
-                ),
+                context: recoveryContext,
                 mode: .serverReconciliation
             )
+            changeRequestProcessor.reset()
+            resetDatabaseToken()
+            resetActiveTokens()
+            clearAllStoredSubscriptionIDs()
+            clearPersistedTransientRetryState()
         }
         // Publish the new account identity only after its server-first rebuild
         // request is durable. If the process dies first, the next validation
@@ -1571,128 +1602,6 @@ public class CloudKitSynchronizer: NSObject {
         cancelSync = false
         cancelledDueToUnauthentication = false
         return confirmedAccountIdentifier
-    }
-
-    /// Imports only v1 safety proof. A mismatched legacy account is first
-    /// admitted into an empty current namespace so the normal account fence
-    /// requests its server-first recovery. Matching account/zone evidence can
-    /// establish lifecycle proof or request a fresh current reconciliation;
-    /// cursors, tokens, retry state, health, epochs, and phases never cross.
-    @BigSyncBackgroundActor
-    private func importLegacyDurableSafetyStateIfNeeded(
-        currentAccountIdentifier: String
-    ) throws {
-        let accountScopeIdentifier = Self.accountScopeIdentifier(
-            for: currentAccountIdentifier
-        )
-        let currentContext = RunContext(
-            attemptID: synchronizationAttemptID,
-            runID: synchronizationRunID,
-            accountIdentifier: currentAccountIdentifier,
-            accountScopeIdentifier: accountScopeIdentifier
-        )
-        // Current state is authoritative, including a partial durable
-        // lifecycle/recovery record from an interrupted current run.
-        guard keyValueStore.object(forKey: cloudKitAccountIdentifierKey) == nil,
-              keyValueStore.object(forKey: zoneLifecycleKey(
-                recordZoneID,
-                accountScopeIdentifier: accountScopeIdentifier,
-                suffix: "established"
-              )) == nil,
-              keyValueStore.object(forKey: zoneLifecycleKey(
-                recordZoneID,
-                accountScopeIdentifier: accountScopeIdentifier,
-                suffix: "terminal"
-              )) == nil,
-              keyValueStore.object(forKey: changeFeedMigrationStateKey(
-                for: currentContext
-              )) == nil,
-              let legacyAccountIdentifier = keyValueStore.object(
-                forKey: legacyCloudKitAccountIdentifierKey
-              ) as? String,
-              !legacyAccountIdentifier.isEmpty else {
-            return
-        }
-
-        // The mismatch path needs no v1 zone proof: publish the legacy
-        // account now so the existing validation path owns the reset.
-        guard legacyAccountIdentifier == currentAccountIdentifier else {
-            keyValueStore.set(
-                value: legacyAccountIdentifier,
-                forKey: cloudKitAccountIdentifierKey
-            )
-            return
-        }
-
-        let consumptionKey = legacyStateConsumptionKey(
-            accountScopeIdentifier: accountScopeIdentifier,
-            zoneID: recordZoneID
-        )
-        guard !keyValueStore.bool(forKey: consumptionKey) else {
-            keyValueStore.set(
-                value: legacyAccountIdentifier,
-                forKey: cloudKitAccountIdentifierKey
-            )
-            return
-        }
-
-        if keyValueStore.bool(forKey: legacyZoneLifecycleKey(
-            recordZoneID,
-            accountScopeIdentifier: accountScopeIdentifier,
-            suffix: "established"
-        )) {
-            markConfiguredZoneEstablished(
-                recordZoneID,
-                accountScopeIdentifier: accountScopeIdentifier
-            )
-        }
-
-        if let rawTerminalKind = keyValueStore.object(forKey:
-            legacyZoneLifecycleKey(
-                recordZoneID,
-                accountScopeIdentifier: accountScopeIdentifier,
-                suffix: "terminal"
-            )
-        ) as? String {
-            let observedAt = keyValueStore.object(forKey:
-                legacyZoneLifecycleKey(
-                    recordZoneID,
-                    accountScopeIdentifier: accountScopeIdentifier,
-                    suffix: "terminalObservedAt"
-                )
-            ) as? Date ?? .distantPast
-            markConfiguredZoneTerminal(
-                recordZoneID,
-                kind: CloudKitZoneDeletionKind(rawValue: rawTerminalKind)
-                    ?? .unknown,
-                accountScopeIdentifier: accountScopeIdentifier,
-                observedAt: observedAt
-            )
-        }
-
-        if let legacyMigration = keyValueStore.object(forKey:
-            legacyChangeFeedMigrationKey(
-                recordZoneID,
-                accountScopeIdentifier: accountScopeIdentifier
-            )
-        ) as? [String: Any],
-        (legacyMigration["version"] as? NSNumber)?.intValue == 1,
-        let rawPhase = legacyMigration["phase"] as? String,
-        let phase = ChangeFeedMigrationState.Phase(rawValue: rawPhase),
-        phase != .completed {
-            try requestChangeFeedRecovery(
-                context: currentContext,
-                mode: .serverReconciliation
-            )
-        }
-
-        // A crash before this point repeats only idempotent safety writes. A
-        // crash after it cannot resurrect v1 state for this account/zone.
-        keyValueStore.set(boolValue: true, forKey: consumptionKey)
-        keyValueStore.set(
-            value: legacyAccountIdentifier,
-            forKey: cloudKitAccountIdentifierKey
-        )
     }
 
     private func persistedTransientRetryState() -> (
@@ -1820,8 +1729,10 @@ public class CloudKitSynchronizer: NSObject {
         // is not durable, the database cursor is still uncommitted and
         // CloudKit replays the loss event. No partially updated mode/epoch/
         // phase combination can be observed after relaunch.
+        let previousValue = keyValueStore.object(forKey: state.key)
         keyValueStore.set(value: state.propertyList, forKey: state.key)
-        guard let propertyList = keyValueStore.object(forKey: state.key)
+        guard keyValueStore.synchronize?() == true,
+              let propertyList = keyValueStore.object(forKey: state.key)
                 as? [String: Any],
               let persisted = ChangeFeedMigrationState(
                 key: state.key,
@@ -1835,6 +1746,12 @@ public class CloudKitSynchronizer: NSObject {
               persisted.epoch == state.epoch,
               persisted.mode == state.mode,
               persisted.phase == state.phase else {
+            if let previousValue {
+                keyValueStore.set(value: previousValue, forKey: state.key)
+            } else {
+                keyValueStore.removeObject(forKey: state.key)
+            }
+            _ = keyValueStore.synchronize?()
             throw ChangeFeedMigrationPersistenceError.stateNotDurable
         }
     }
@@ -1867,6 +1784,18 @@ public class CloudKitSynchronizer: NSObject {
             return
         }
 
+        // A verified restore event describes the provenance of every migration
+        // envelope copied in that backup. Replace it with a fresh restore epoch.
+        // A subsequently observed encrypted-reset error can still supersede it.
+        if let current, current.phase != .completed,
+           mode == .backupRestore {
+            // Continue below and allocate a new epoch.
+        } else if let current, current.phase != .completed,
+                  current.mode == .backupRestore,
+                  mode != .encryptedDataReset {
+            return
+        }
+
         // An encrypted-data reset supersedes a conservative server
         // reconciliation already in flight. Its next epoch must rebuild all
         // live local records rather than interpret the empty server as remote
@@ -1874,7 +1803,7 @@ public class CloudKitSynchronizer: NSObject {
         // reset already in progress.
         if let current, current.phase != .completed,
            current.mode == .encryptedDataReset,
-           mode == .serverReconciliation {
+           mode != .backupRestore {
             return
         }
 
@@ -1913,7 +1842,7 @@ public class CloudKitSynchronizer: NSObject {
                 accountScopeIdentifier: context.accountScopeIdentifier,
                 zoneID: modelAdapter.recordZoneID,
                 epoch: ChangeFeedMigrationState.initialEpoch,
-                mode: .serverReconciliation,
+                mode: .initialImport,
                 phase: .requested
             )
             try persistChangeFeedMigrationState(initial)
@@ -1934,7 +1863,7 @@ public class CloudKitSynchronizer: NSObject {
             try await revalidateRunContext(context)
             if !bootstrapIsActive {
                 if migration.mode == .encryptedDataReset {
-                    clearConfiguredZoneTerminal(
+                    try clearConfiguredZoneTerminal(
                         modelAdapter.recordZoneID,
                         accountScopeIdentifier: context.accountScopeIdentifier
                     )
@@ -1951,11 +1880,11 @@ public class CloudKitSynchronizer: NSObject {
         try persistChangeFeedMigrationState(migration)
         activeChangeFeedMigration = migration
 
-        // A database cursor is not per-zone evidence. With multiple adapters it
-        // may predate a newly configured zone, so only an adapter's valid server
-        // record proof or a previously persisted zone marker may establish it.
+        // A database cursor is not record-zone evidence. It may predate this
+        // configured zone, so only the adapter's valid server record proof or
+        // a previously persisted lifecycle marker may establish the zone.
         if try await migratingAdapter.hasChangeFeedEstablishedServerEvidence() {
-            markConfiguredZoneEstablished(
+            try markConfiguredZoneEstablished(
                 modelAdapter.recordZoneID,
                 accountScopeIdentifier: context.accountScopeIdentifier
             )
@@ -2037,7 +1966,7 @@ public class CloudKitSynchronizer: NSObject {
             // its journal-backed re-upload and the normal terminal drain has
             // proven quiescence. Clearing before the durable `completed`
             // marker makes the crash window safely resumable.
-            clearConfiguredZoneTerminal(
+            try clearConfiguredZoneTerminal(
                 modelAdapter.recordZoneID,
                 accountScopeIdentifier: migration.accountScopeIdentifier
             )

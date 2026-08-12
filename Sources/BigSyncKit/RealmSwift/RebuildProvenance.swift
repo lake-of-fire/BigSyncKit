@@ -6,10 +6,12 @@ import RealmSwift
 /// Realm's `BigSyncPendingMutation` remains the authority for local intent.
 ///
 /// A row means that a record was previously tracked. `hadValidServerRecord`
-/// means that the prior cache contained a decodable system-fields record whose
-/// record ID, zone and change tag were all valid. Such a record must never be
+/// means either that the prior cache contained a decodable system-fields
+/// record whose record ID, zone and change tag were valid, or that its prior
+/// tracking state was already server-backed. Such a record must never be
 /// blindly re-uploaded merely because a fresh CloudKit bootstrap did not see
-/// it; it may have been deleted remotely.
+/// it; its optional cached system fields may be damaged and it may have been
+/// deleted remotely.
 final class RebuildProvenance: Object {
     @objc dynamic var identifier = ""
     @objc dynamic var entityType = ""

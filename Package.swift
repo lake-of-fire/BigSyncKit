@@ -5,7 +5,9 @@ import PackageDescription
 
 let package = Package(
     name: "BigSyncKit",
-    platforms: [.macOS("15.0"), .iOS(.v15), .watchOS(.v8)],
+    // BigSyncKit's supported clients are iOS and macOS. The Realm-backed
+    // adapter is intentionally not offered as a watchOS transport.
+    platforms: [.macOS("15.0"), .iOS(.v15)],
     products: [
         // Products define the executables and libraries a package produces, and make them visible to other packages.
         .library(

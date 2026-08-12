@@ -192,6 +192,8 @@ public class SyncStatusViewModel: ObservableObject {
             }
             return "Retrying"
         case .notAuthenticated: return "iCloud authentication required"
+        case .accountTemporarilyUnavailable:
+            return "iCloud account is temporarily unavailable"
         case .higherModelVersion: return "Update required to sync newer data"
         case .terminalZoneUnavailable: return "Cloud sync recovery required"
         case .failed: return "Last sync failed"

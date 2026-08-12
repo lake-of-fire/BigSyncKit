@@ -127,17 +127,7 @@ extension CloudKitSynchronizer {
     }
     
     fileprivate func userDefaultsKey(for key: String) -> String {
-        // Do not touch CKContainer.default when the synchronizer was created
-        // with an explicit container. Besides avoiding unnecessary CloudKit
-        // initialization, this keeps injected/test databases independent of
-        // host-process entitlements.
-        let prefix: String
-        if let containerIdentifier {
-            prefix = containerIdentifier
-        } else {
-            prefix = CKContainer.default().containerIdentifier ?? ""
-        }
-        return "\(prefix)-\(identifier)-\(key)"
+        durableStateKey(key)
     }
     
     fileprivate func storeKey(for zoneID: CKRecordZone.ID) -> String {

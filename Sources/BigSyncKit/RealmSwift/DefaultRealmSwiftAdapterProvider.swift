@@ -11,7 +11,7 @@ import CryptoKit
 import RealmSwift
 import Logging
 
-public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
+public class DefaultRealmSwiftAdapterProvider: NSObject {
     let zoneID: CKRecordZone.ID
     let persistenceConfiguration: Realm.Configuration
     let targetConfigurations: [Realm.Configuration]
@@ -20,6 +20,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let appGroup: String?
     let assetDirectoryURL: URL?
     let logger: Logging.Logger
+    let startsSetupTask: Bool
     public private(set) var adapter: RealmSwiftAdapter!
    
     public var beforeInitialSetup: (() -> Void)? {
@@ -37,6 +38,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         persistenceNamespace: String? = nil,
         persistenceDirectoryURL: URL? = nil,
         assetDirectoryURL: URL? = nil,
+        startSetupTask: Bool = true,
         logger: Logging.Logger
     ) {
         self.targetConfigurations = targetConfigurations
@@ -45,6 +47,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         self.zoneID = zoneID
         self.appGroup = appGroup
         self.assetDirectoryURL = assetDirectoryURL
+        startsSetupTask = startSetupTask
         self.logger = logger
         persistenceConfiguration = DefaultRealmSwiftAdapterProvider.createPersistenceConfiguration(
             suiteName: appGroup,
@@ -64,16 +67,10 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         priorityClassNames = adapter.priorityEntityTypeNames
         appGroup = nil
         assetDirectoryURL = nil
+        startsSetupTask = false
         self.logger = logger
         super.init()
         self.adapter = adapter
-    }
-    
-    @BigSyncBackgroundActor
-    public func cloudKitSynchronizer(_ synchronizer: CloudKitSynchronizer, zoneWasDeletedWithZoneID recordZoneID: CKRecordZone.ID) async throws {
-        if recordZoneID == zoneID {
-            try await adapter.resetSyncCaches()
-        }
     }
     
     fileprivate func createAdapter() -> RealmSwiftAdapter {
@@ -84,6 +81,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
             priorityEntityTypeNames: priorityClassNames,
             recordZoneID: zoneID,
             logger: logger,
+            startSetupTask: startsSetupTask,
             assetDirectoryURL: assetDirectoryURL
         )
     }

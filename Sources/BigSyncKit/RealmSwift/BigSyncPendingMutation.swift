@@ -7,6 +7,21 @@ import RealmSwift
 /// model object. BigSyncKit forwards its generation to the separate tracking
 /// Realm and only removes the row after that exact generation is uploaded.
 public final class BigSyncPendingMutation: Object {
+    /// Process identity is encoded into the otherwise opaque generation rather
+    /// than added to Realm's schema. This lets backup recovery distinguish an
+    /// outbox row copied from the backup from a genuine mutation committed by
+    /// the currently running restored app, including writes made before the
+    /// synchronizer finishes configuring.
+    private static let processGenerationPrefix = UUID().uuidString + ":"
+
+    static func makeGeneration() -> String {
+        processGenerationPrefix + UUID().uuidString
+    }
+
+    static func wasCreatedInCurrentProcess(_ generation: String) -> Bool {
+        generation.hasPrefix(processGenerationPrefix)
+    }
+
     @Persisted(primaryKey: true) public var recordName = ""
     @Persisted(indexed: true) public var entityType = ""
     @Persisted public var objectIdentifier = ""
@@ -17,14 +32,14 @@ public final class BigSyncPendingMutation: Object {
         recordName: String,
         entityType: String,
         objectIdentifier: String,
-        generation: String = UUID().uuidString,
+        generation: String? = nil,
         changedAt: Date = Date()
     ) {
         self.init()
         self.recordName = recordName
         self.entityType = entityType
         self.objectIdentifier = objectIdentifier
-        self.generation = generation
+        self.generation = generation ?? Self.makeGeneration()
         self.changedAt = changedAt
     }
 }

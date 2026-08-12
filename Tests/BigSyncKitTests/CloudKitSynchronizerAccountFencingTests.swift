@@ -7,6 +7,7 @@ import XCTest
 
 private final class AccountFencingStore: NSObject, KeyValueStore {
     private var values = [String: Any]()
+    var synchronizesDurably = true
 
     func object(forKey defaultName: String) -> Any? { values[defaultName] }
     func bool(forKey defaultName: String) -> Bool {
@@ -21,8 +22,13 @@ private final class AccountFencingStore: NSObject, KeyValueStore {
     func removeObject(forKey defaultName: String) {
         values.removeValue(forKey: defaultName)
     }
+    func synchronize() -> Bool { synchronizesDurably }
 
     override func value(forKey key: String) -> Any? { values[key] }
+
+    func valuesWithPrefix(_ prefix: String) -> [String: Any] {
+        values.filter { $0.key.hasPrefix(prefix) }
+    }
 }
 
 private final class AccountFencingTransport:
@@ -278,11 +284,10 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
 
         let oldScope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
         store.set(value: "account-a", forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier"))
-        store.set(
-            value: CloudKitZoneDeletionKind.purged.rawValue,
-            forKey: synchronizer.durableStateKey(
-                "ZoneLifecycle.v2.\(oldScope).\(zoneID.ownerName).\(zoneID.zoneName).terminal"
-            )
+        try synchronizer.markConfiguredZoneTerminal(
+            zoneID,
+            kind: .purged,
+            accountScopeIdentifier: oldScope
         )
 
         do {
@@ -437,7 +442,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             accountIdentifier: "account-a",
             now: Date()
         )
-        first.markConfiguredZoneEstablished(
+        try first.markConfiguredZoneEstablished(
             zoneA,
             accountScopeIdentifier: scope
         )
@@ -450,7 +455,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         let secondHealth = try await second.syncHealthSnapshot()
         XCTAssertNil(secondHealth)
         XCTAssertNil(store.value(forKey: second.durableStateKey(
-            "ZoneLifecycle.v2.\(scope).\(zoneB.ownerName).\(zoneB.zoneName).established"
+            "ZoneLifecycle.v3.\(scope).\(zoneB.ownerName).\(zoneB.zoneName)"
         )))
         XCTAssertNil(store.value(forKey: second.durableStateKey(
             "ChangeFeedMigration.v2.\(scope).\(zoneB.ownerName).\(zoneB.zoneName)"
@@ -465,27 +470,26 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testMismatchedLegacyAccountDoesNotImportZoneSafetyEvidence() async throws {
+    func testAmbiguousLegacyStateIsIgnoredByZoneBoundNamespace() async throws {
         let store = AccountFencingStore()
         let transport = AccountFencingTransport()
         let zoneID = makeZoneID()
+        let identifier = "legacy-ignored-\(UUID().uuidString)"
         let synchronizer = makeSynchronizer(
             transport: transport,
             store: store,
-            identifier: "legacy-account-\(UUID().uuidString)",
+            identifier: identifier,
             recordZoneID: zoneID,
-            accountIdentifierProvider: { "account-b" }
+            accountIdentifierProvider: { "account-a" }
         )
         let adapter = AccountFencingModelAdapter(zoneID: zoneID)
         synchronizer.addModelAdapter(adapter)
-        // A mismatched legacy account may trigger the normal current-account
-        // recovery, but must not authorize account-b zone evidence.
+        let scope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
         store.set(
             value: "account-a",
-            forKey: "\(synchronizer.identifier).BigSyncKitCloudKitAccountIdentifier"
+            forKey: "\(identifier).BigSyncKitCloudKitAccountIdentifier"
         )
-        let scope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-b")
-        let legacyPrefix = "\(synchronizer.identifier).BigSyncKit.ZoneLifecycle.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
+        let legacyPrefix = "\(identifier).BigSyncKit.ZoneLifecycle.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
         store.set(boolValue: true, forKey: "\(legacyPrefix).established")
         store.set(
             value: CloudKitZoneDeletionKind.purged.rawValue,
@@ -493,7 +497,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         )
         store.set(
             value: ["version": 1, "phase": "prepared", "epoch": 7],
-            forKey: "\(synchronizer.identifier).BigSyncKit.ChangeFeedMigration.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
+            forKey: "\(identifier).BigSyncKit.ChangeFeedMigration.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
         )
 
         try await synchronizer._test_validateSynchronizationAccount()
@@ -501,107 +505,111 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         XCTAssertEqual(adapter.resetSyncCachesCount, 0)
         XCTAssertEqual(transport.operationCount, 0)
         XCTAssertNil(store.value(forKey: synchronizer.durableStateKey(
-            "ZoneLifecycle.v2.\(scope).\(zoneID.ownerName).\(zoneID.zoneName).terminal"
+            "ZoneLifecycle.v3.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
+        )))
+        XCTAssertNil(store.value(forKey: synchronizer.durableStateKey(
+            "ChangeFeedMigration.v2.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
         )))
         XCTAssertEqual(
             store.value(forKey: synchronizer.durableStateKey(
                 "CloudKitAccountIdentifier"
             )) as? String,
-            "account-b"
+            "account-a"
         )
-    }
-
-    @BigSyncBackgroundActor
-    func testMatchingLegacySafetyStateImportsFreshCurrentRecovery() async throws {
-        let store = AccountFencingStore()
-        let zoneID = makeZoneID()
-        let identifier = "legacy-safety-\(UUID().uuidString)"
-        let synchronizer = makeSynchronizer(
-            transport: AccountFencingTransport(), store: store,
-            identifier: identifier, recordZoneID: zoneID
-        )
-        let scope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
-        let lifecycle = "\(identifier).BigSyncKit.ZoneLifecycle.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
-        let migration = "\(identifier).BigSyncKit.ChangeFeedMigration.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
-        let observedAt = Date(timeIntervalSince1970: 1_234)
-        store.set(value: "account-a", forKey: "\(identifier).BigSyncKitCloudKitAccountIdentifier")
-        store.set(boolValue: true, forKey: "\(lifecycle).established")
-        store.set(value: CloudKitZoneDeletionKind.purged.rawValue, forKey: "\(lifecycle).terminal")
-        store.set(value: observedAt, forKey: "\(lifecycle).terminalObservedAt")
-        store.set(value: ["version": 1, "phase": "prepared", "epoch": 7], forKey: migration)
-
-        try await synchronizer._test_validateSynchronizationAccount()
-
-        let currentLifecycle = synchronizer.durableStateKey(
-            "ZoneLifecycle.v2.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
-        )
-        XCTAssertTrue(store.bool(forKey: "\(currentLifecycle).established"))
-        XCTAssertEqual(store.value(forKey: "\(currentLifecycle).terminal") as? String, CloudKitZoneDeletionKind.purged.rawValue)
-        XCTAssertEqual(store.value(forKey: "\(currentLifecycle).terminalObservedAt") as? Date, observedAt)
-        let currentMigration = store.value(forKey: synchronizer.durableStateKey(
-            "ChangeFeedMigration.v2.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
-        )) as? [String: Any]
-        XCTAssertEqual((currentMigration?["version"] as? NSNumber)?.intValue, 2)
-        XCTAssertEqual(currentMigration?["phase"] as? String, "requested")
-        XCTAssertEqual(currentMigration?["mode"] as? String, "serverReconciliation")
-        XCTAssertGreaterThanOrEqual((currentMigration?["epoch"] as? NSNumber)?.intValue ?? 0, 2_000_000_001)
-        XCTAssertTrue(store.bool(forKey:
-            "\(identifier).BigSyncKit.LegacyStateImport.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName).consumed"
-        ))
-    }
-
-    @BigSyncBackgroundActor
-    func testLegacySafetyConsumptionIsPerZoneAndPreventsResurrection() async throws {
-        let store = AccountFencingStore()
-        let identifier = "legacy-consumption-\(UUID().uuidString)"
-        let zoneA = makeZoneID()
-        let zoneB = makeZoneID()
-        let first = makeSynchronizer(transport: AccountFencingTransport(), store: store, identifier: identifier, recordZoneID: zoneA)
-        let second = makeSynchronizer(transport: AccountFencingTransport(), store: store, identifier: identifier, recordZoneID: zoneB)
-        let scope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
-        store.set(value: "account-a", forKey: "\(identifier).BigSyncKitCloudKitAccountIdentifier")
-        for zoneID in [zoneA, zoneB] {
-            store.set(boolValue: true, forKey:
-                "\(identifier).BigSyncKit.ZoneLifecycle.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName).established"
-            )
-        }
-
-        try await first._test_validateSynchronizationAccount()
-        try await second._test_validateSynchronizationAccount()
-
-        let firstCurrent = first.durableStateKey("ZoneLifecycle.v2.\(scope).\(zoneA.ownerName).\(zoneA.zoneName).established")
-        let secondCurrent = second.durableStateKey("ZoneLifecycle.v2.\(scope).\(zoneB.ownerName).\(zoneB.zoneName).established")
-        XCTAssertTrue(store.bool(forKey: firstCurrent))
-        XCTAssertTrue(store.bool(forKey: secondCurrent))
-
-        store.removeObject(forKey: first.durableStateKey("CloudKitAccountIdentifier"))
-        store.removeObject(forKey: firstCurrent)
-        try await first._test_validateSynchronizationAccount()
-        XCTAssertFalse(store.bool(forKey: firstCurrent))
-        XCTAssertTrue(store.bool(forKey: secondCurrent))
-    }
-
-    @BigSyncBackgroundActor
-    func testCurrentNamespaceWinsOverMatchingLegacySafetyEvidence() async throws {
-        let store = AccountFencingStore()
-        let zoneID = makeZoneID()
-        let identifier = "legacy-current-wins-\(UUID().uuidString)"
-        let synchronizer = makeSynchronizer(transport: AccountFencingTransport(), store: store, identifier: identifier, recordZoneID: zoneID)
-        let scope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
-        let currentTerminal = synchronizer.durableStateKey("ZoneLifecycle.v2.\(scope).\(zoneID.ownerName).\(zoneID.zoneName).terminal")
-        store.set(value: "account-a", forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier"))
-        store.set(value: CloudKitZoneDeletionKind.deleted.rawValue, forKey: currentTerminal)
-        store.set(value: "account-a", forKey: "\(identifier).BigSyncKitCloudKitAccountIdentifier")
-        store.set(value: CloudKitZoneDeletionKind.purged.rawValue, forKey:
-            "\(identifier).BigSyncKit.ZoneLifecycle.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName).terminal"
-        )
-
-        try await synchronizer._test_validateSynchronizationAccount()
-
-        XCTAssertEqual(store.value(forKey: currentTerminal) as? String, CloudKitZoneDeletionKind.deleted.rawValue)
         XCTAssertFalse(store.bool(forKey:
             "\(identifier).BigSyncKit.LegacyStateImport.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName).consumed"
         ))
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountReplacementDoesNotPublishNewAccountWhenRecoveryEnvelopeIsNotDurable()
+    async throws {
+        let store = AccountFencingStore()
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            store: store,
+            recordZoneID: zoneID,
+            accountIdentifierProvider: { "account-b" }
+        )
+        store.set(
+            value: "account-a",
+            forKey: synchronizer.durableStateKey(
+                "CloudKitAccountIdentifier"
+            )
+        )
+        let oldScope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        synchronizer.storedDatabaseToken = DatabaseChangeCursor(
+            serializedData: Data("old-account-cursor".utf8)
+        )
+        synchronizer.databaseSubscriptionID = "old-account-subscription"
+        synchronizer.persistTransientRetryState(
+            context: .init(
+                attemptID: synchronizer.synchronizationAttemptID,
+                runID: synchronizer.synchronizationRunID,
+                accountIdentifier: "account-a",
+                accountScopeIdentifier: oldScope
+            ),
+            notBefore: Date().addingTimeInterval(60),
+            consecutiveFailures: 1
+        )
+        store.synchronizesDurably = false
+
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected the migration durability fence to fail")
+        } catch let error as ChangeFeedMigrationPersistenceError {
+            XCTAssertEqual(error, .stateNotDurable)
+        }
+
+        XCTAssertEqual(
+            store.value(forKey: synchronizer.durableStateKey(
+                "CloudKitAccountIdentifier"
+            )) as? String,
+            "account-a"
+        )
+        XCTAssertTrue(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v2")
+        ).isEmpty)
+        XCTAssertEqual(
+            synchronizer.storedDatabaseToken?.serializedData,
+            Data("old-account-cursor".utf8)
+        )
+        XCTAssertEqual(
+            synchronizer.databaseSubscriptionID,
+            "old-account-subscription"
+        )
+        XCTAssertNotNil(synchronizer._test_persistedTransientRetryNotBefore(
+            accountScopeIdentifier: oldScope
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testUndurableZoneLifecycleWriteRollsBackInProcessState() throws {
+        let store = AccountFencingStore()
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            store: store,
+            recordZoneID: zoneID
+        )
+        let scope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        synchronizer.activeRunContext = .init(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier: scope
+        )
+        store.synchronizesDurably = false
+
+        XCTAssertThrowsError(try synchronizer.markConfiguredZoneEstablished(
+            zoneID,
+            accountScopeIdentifier: scope
+        ))
+        XCTAssertFalse(synchronizer.configuredZoneIsEstablished(zoneID))
+        XCTAssertNil(store.value(forKey: synchronizer.durableStateKey(
+            "ZoneLifecycle.v3.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
+        )))
     }
 
     @BigSyncBackgroundActor

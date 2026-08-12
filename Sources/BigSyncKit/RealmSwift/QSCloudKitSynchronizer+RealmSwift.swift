@@ -31,6 +31,7 @@ extension CloudKitSynchronizer {
         recordZoneID: CKRecordZone.ID? = nil,
         localState: BigSyncLocalStateConfiguration? = nil,
         accountIdentifierProvider: AccountIdentifierProvider? = nil,
+        accountStatusProvider: AccountStatusProvider? = nil,
         progressHandler: ProgressHandler? = nil,
         changeFeed: (any CloudKitChangeFeed)? = nil,
         recordStore: (any CloudKitRecordStore)? = nil,
@@ -46,17 +47,36 @@ extension CloudKitSynchronizer {
             zoneID: zoneID,
             appGroup: suiteName,
             persistenceNamespace:
-                "\(containerName)|\(synchronizerName)|private",
+                "\(containerName)|\(synchronizerName)|private|\(zoneID.ownerName)|\(zoneID.zoneName)",
             persistenceDirectoryURL: localState?.trackingRealmDirectoryURL,
             assetDirectoryURL: localState?.assetDirectoryURL,
+            // The synchronizer must establish backup/account recovery mode
+            // before Realm setup is allowed to perform broad initial discovery.
+            startSetupTask: false,
             logger: logger
         )
         let keyValueStore: any KeyValueStore
+        let backupDetectionBaseURL: URL?
         if let localState {
             keyValueStore = localState.keyValueStore
+            backupDetectionBaseURL = localState.trackingRealmDirectoryURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("BigSyncKitBackupDetection", isDirectory: true)
         } else {
             let userDefaults = UserDefaults(suiteName: suiteName)!
             keyValueStore = UserDefaultsAdapter(userDefaults: userDefaults)
+            if let suiteName,
+               let groupContainerURL = FileManager.default
+                   .containerURL(
+                       forSecurityApplicationGroupIdentifier: suiteName
+                   ) {
+                backupDetectionBaseURL = groupContainerURL
+                    .appendingPathComponent("Library", isDirectory: true)
+                    .appendingPathComponent("Application Support", isDirectory: true)
+                    .appendingPathComponent("BigSyncKit", isDirectory: true)
+            } else {
+                backupDetectionBaseURL = nil
+            }
         }
         let container = CKContainer(identifier: containerName)
         let database = DefaultCloudKitDatabaseAdapter(
@@ -66,13 +86,15 @@ extension CloudKitSynchronizer {
             identifier: synchronizerName,
             containerIdentifier: containerName,
             database: database,
-            adapterProvider: provider,
+            recordZoneID: zoneID,
             keyValueStore: keyValueStore,
             compatibilityVersion: compatibilityVersion,
             accountIdentifierProvider: accountIdentifierProvider,
+            accountStatusProvider: accountStatusProvider,
             progressHandler: progressHandler,
             changeFeed: changeFeed ?? database,
             recordStore: recordStore ?? database,
+            backupDetectionBaseURL: backupDetectionBaseURL,
             logger: logger
         )
 #if DEBUG

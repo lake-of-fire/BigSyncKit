@@ -172,6 +172,11 @@ public actor BigSyncBackgroundActor {
         )
         logger = configuration.logger
 
+        let accountStatusProvider:
+            CloudKitSynchronizer.AccountStatusProvider? =
+                configuration.performsAccountAvailabilityPreflight
+                    ? nil
+                    : { @Sendable in .available }
         let synchronizer = CloudKitSynchronizer.privateSynchronizer(
             synchronizerName: configuration.synchronizerName,
             containerName: configuration.containerName,
@@ -182,6 +187,7 @@ public actor BigSyncBackgroundActor {
             recordZoneID: configuration.recordZoneID,
             localState: configuration.localState,
             accountIdentifierProvider: configuration.accountIdentifierProvider,
+            accountStatusProvider: accountStatusProvider,
             progressHandler: configuration.progressHandler,
             changeFeed: configuration.changeFeedOverride,
             recordStore: configuration.recordStoreOverride,
@@ -277,10 +283,10 @@ public actor BigSyncBackgroundActor {
     private func synchronizeCloudKit(
         expectedSynchronizer: CloudKitSynchronizer
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
-        guard realmSynchronizer === expectedSynchronizer,
-              let containerIdentifier = expectedSynchronizer.containerIdentifier else {
+        guard realmSynchronizer === expectedSynchronizer else {
             return nil
         }
+        let containerIdentifier = expectedSynchronizer.containerIdentifier
 
         if performsAccountAvailabilityPreflight {
             switch await accountAvailabilityGate.availability(
@@ -289,13 +295,19 @@ public actor BigSyncBackgroundActor {
             case .available:
                 accountAvailabilityRetryTask?.cancel()
                 accountAvailabilityRetryTask = nil
+                expectedSynchronizer.accountValidationRequired = false
                 expectedSynchronizer.cancelledDueToUnauthentication = false
             case .unavailable(let status):
                 logger?.info(
                     "QSCloudKitSynchronizer >> Synchronization deferred because iCloud account status is \(status.rawValue)"
                 )
-                if status == .temporarilyUnavailable
-                    || status == .couldNotDetermine {
+                // Apple requires accountTemporarilyUnavailable to remain
+                // quiescent until CKAccountChanged. The synchronizer observes
+                // that notification and revalidates status before doing any
+                // database work. `couldNotDetermine` is different: it may be
+                // a transient status-query/network failure with no account
+                // transition notification, so retain its bounded poll.
+                if status == .couldNotDetermine {
                     scheduleAccountAvailabilityRetry(
                         expectedSynchronizer: expectedSynchronizer
                     )
@@ -314,6 +326,7 @@ public actor BigSyncBackgroundActor {
             // account-status preflight in that case; synchronize() still
             // fetches and fences the exact account identifier before any work.
             expectedSynchronizer.cancelledDueToUnauthentication = false
+            expectedSynchronizer.accountValidationRequired = false
         }
 
         guard !Task.isCancelled,

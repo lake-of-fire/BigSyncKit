@@ -66,7 +66,7 @@ public extension CloudKitSynchronizer {
         let source = [
             "BigSyncKit.Subscription.v2",
             identifier,
-            containerIdentifier ?? "default-container",
+            containerIdentifier,
             String(database.databaseScope.rawValue),
             kind,
             zoneComponent,

@@ -13,6 +13,7 @@ public struct CloudKitSyncHealthSnapshot: Sendable, Equatable {
         case succeeded
         case transientRetry
         case notAuthenticated
+        case accountTemporarilyUnavailable
         case higherModelVersion
         case terminalZoneUnavailable
         case failed
@@ -91,7 +92,7 @@ public let cloudKitSynchronizerSyncHealthSnapshotKey =
 
 extension CloudKitSynchronizer {
     private var syncHealthSnapshotKey: String {
-        "\(identifier).BigSyncKitCloudKitSyncHealth.v1"
+        durableStateKey("CloudKitSyncHealth.v2")
     }
 
     private func persistedSyncHealthSnapshot() -> CloudKitSyncHealthSnapshot? {

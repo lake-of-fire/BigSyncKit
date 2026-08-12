@@ -14,6 +14,7 @@
 		0E70FD2BCF232F256224F70D /* DisposableZoneAuthorizationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E66F905B1BB45D6FD8B1CFC /* DisposableZoneAuthorizationTests.swift */; };
 		0F7AFD763CDA892F5630A9EC /* TuistBundle+BigSyncKit.swift in Sources */ = {isa = PBXBuildFile; fileRef = D67DD8D570E84ABE46CAEB8B /* TuistBundle+BigSyncKit.swift */; };
 		0F94B5F5C1645FA2C7D6CB7E /* QSCoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9DA41E8C89F30EE659F89CD /* QSCoder.swift */; };
+		2283F6BCF197679484C48935 /* ModelAdapterDeletionConflictSafetyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 573C544F6B0039442FD4222A /* ModelAdapterDeletionConflictSafetyTests.swift */; };
 		2903950443D1BBCFD05BCB1B /* RebuildProvenance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9871614820D729F0CB2D9925 /* RebuildProvenance.swift */; };
 		316D9A9305E452F821839289 /* SyncedEntityState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5900E8EA44C1DBD7E8733C77 /* SyncedEntityState.swift */; };
 		321963E53133632A9C35A162 /* RealmSwiftAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7461825A00D368BA1B328E9 /* RealmSwiftAdapter.swift */; };
@@ -28,6 +29,7 @@
 		53131BAF6668D87817B2C483 /* CloudKitZoneStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8ADEA8D03946E37E24253B0 /* CloudKitZoneStore.swift */; };
 		555740A729D68758CC69E42A /* SyncedEntityProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D7E1C6F12C321A94EABEF49 /* SyncedEntityProtocol.swift */; };
 		5A6D8A0DC6ABB060CABE7AD7 /* CloudKitSynchronizer+Subscriptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */; };
+		5DA94DE008BDD629A4FEBE98 /* CloudKitSynchronizerAccountFencingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B357AAD7AFFD76A14129C866 /* CloudKitSynchronizerAccountFencingTests.swift */; };
 		66E970ECB20D9971EEF458CB /* SwiftUtilities.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = 375A2DE5459AEC32DBEA009C /* SwiftUtilities.framework */; };
 		6F46C9C9A74FA828EF4E2530 /* Algorithms.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = 94DDE581A883BAE50A2BCF02 /* Algorithms.framework */; };
 		6F49F75D55B4F53322FA6EDC /* CloudKitSynchronizer+RecordMutations.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE750B9FB808E3C4EA4F3D4E /* CloudKitSynchronizer+RecordMutations.swift */; };
@@ -36,6 +38,7 @@
 		7C682BC17579FAE3B914DFDE /* libRealmSwiftGaps.a in Dependencies */ = {isa = PBXBuildFile; fileRef = F1B215E4FDB5FE4BF55E7C7D /* libRealmSwiftGaps.a */; };
 		8102352285F6375B3D37A86A /* CloudKitSynchronizer+Sync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AD94190617E4A1CA211C2CA /* CloudKitSynchronizer+Sync.swift */; };
 		829679DBEB9D2764FEA063D5 /* BigSyncKit_BigSyncKit.bundle in Dependencies */ = {isa = PBXBuildFile; fileRef = F83E22060AF164CC8308EC28 /* BigSyncKit_BigSyncKit.bundle */; };
+		88465D379534B49E20A7C9B0 /* CloudKitLossClassifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32B479C89A3CF64C487F3AEA /* CloudKitLossClassifier.swift */; };
 		88A374E034B19339A140C999 /* ServerToken.swift in Sources */ = {isa = PBXBuildFile; fileRef = F505BB8B89E2E9BF10241774 /* ServerToken.swift */; };
 		90E99801CAF3EC8227C36131 /* RealmSwift.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 334E77EAA11F1D8A3C955A4A /* RealmSwift.framework */; };
 		9A1BF58FA7646A413503C6AC /* QSCloudKitSynchronizer+RealmSwift.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58CDB4D39314DDAFE352E728 /* QSCloudKitSynchronizer+RealmSwift.swift */; };
@@ -161,6 +164,7 @@
 		2EECD71DF78701438239CEC2 /* BackupDetection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupDetection.swift; sourceTree = "<group>"; };
 		2F69716F0991001F6F0BC10F /* BigSyncKit.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = BigSyncKit.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		31F48253723925F072D7A193 /* ModelAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelAdapter.swift; sourceTree = "<group>"; };
+		32B479C89A3CF64C487F3AEA /* CloudKitLossClassifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitLossClassifier.swift; sourceTree = "<group>"; };
 		334E77EAA11F1D8A3C955A4A /* RealmSwift.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = RealmSwift.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		36B6AAAAC2954D84D0086505 /* OrderedCollections.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = OrderedCollections.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		375A2DE5459AEC32DBEA009C /* SwiftUtilities.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = SwiftUtilities.framework; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -171,6 +175,7 @@
 		519B578D9E23C6ED68EE4C36 /* SyncedDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedDevice.swift; sourceTree = "<group>"; };
 		56895A4BBBE9211A556CEF07 /* DequeModule.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = DequeModule.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		57073F22EFD596BFE2391A92 /* CloudKitAccountAvailabilityGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitAccountAvailabilityGate.swift; sourceTree = "<group>"; };
+		573C544F6B0039442FD4222A /* ModelAdapterDeletionConflictSafetyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelAdapterDeletionConflictSafetyTests.swift; sourceTree = "<group>"; };
 		58CDB4D39314DDAFE352E728 /* QSCloudKitSynchronizer+RealmSwift.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "QSCloudKitSynchronizer+RealmSwift.swift"; sourceTree = "<group>"; };
 		58D570E7392F6EF23738E4F4 /* KeyValueStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyValueStore.swift; sourceTree = "<group>"; };
 		5900E8EA44C1DBD7E8733C77 /* SyncedEntityState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedEntityState.swift; sourceTree = "<group>"; };
@@ -191,6 +196,7 @@
 		9E200B95C5A241D0E2E6A036 /* CloudKitSynchronizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitSynchronizer.swift; sourceTree = "<group>"; };
 		ABEE9A26F724BE99A3697C23 /* PrimaryKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrimaryKey.swift; sourceTree = "<group>"; };
 		AE750B9FB808E3C4EA4F3D4E /* CloudKitSynchronizer+RecordMutations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudKitSynchronizer+RecordMutations.swift"; sourceTree = "<group>"; };
+		B357AAD7AFFD76A14129C866 /* CloudKitSynchronizerAccountFencingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitSynchronizerAccountFencingTests.swift; sourceTree = "<group>"; };
 		B40AA4BA688C03337C4ADCBF /* zstd */ = {isa = PBXFileReference; path = zstd; sourceTree = "<group>"; };
 		B9DA41E8C89F30EE659F89CD /* QSCoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QSCoder.swift; sourceTree = "<group>"; };
 		BB1D76F79B24C9BF8D3491CF /* BigSyncKit_BigSyncKit-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "BigSyncKit_BigSyncKit-Info.plist"; sourceTree = "<group>"; };
@@ -264,7 +270,9 @@
 				0C9ACA3FFFA7672B261644D0 /* BigSyncKitTests.swift */,
 				4E8A869A61FBDA8CD4ADAF76 /* ChangeFeedMigrationResumeTests.swift */,
 				1EE0B8BCD3020870B8A5EF17 /* CloudKitAccountAvailabilityGateTests.swift */,
+				B357AAD7AFFD76A14129C866 /* CloudKitSynchronizerAccountFencingTests.swift */,
 				5E66F905B1BB45D6FD8B1CFC /* DisposableZoneAuthorizationTests.swift */,
+				573C544F6B0039442FD4222A /* ModelAdapterDeletionConflictSafetyTests.swift */,
 			);
 			path = BigSyncKitTests;
 			sourceTree = "<group>";
@@ -303,6 +311,7 @@
 				57073F22EFD596BFE2391A92 /* CloudKitAccountAvailabilityGate.swift */,
 				7A23A3D639AD4B86CE5DCB0A /* CloudKitChangeFeed.swift */,
 				FF4BAFDCBEC068C8D560EFFC /* CloudKitDatabase.swift */,
+				32B479C89A3CF64C487F3AEA /* CloudKitLossClassifier.swift */,
 				10DB81744AFCC79F7822D814 /* CloudKitRecordStore.swift */,
 				14EC661E8AC22672B05EA44B /* CloudKitSubscriptionStore.swift */,
 				3C4F3C0C4CF2D9CFDF2931CB /* CloudKitSyncHealth.swift */,
@@ -547,6 +556,7 @@
 				C57E722A1349DEBD0932E8B1 /* CloudKitAccountAvailabilityGate.swift in Sources */,
 				41827599F5782941F64DBF57 /* CloudKitChangeFeed.swift in Sources */,
 				CE4CDE06370BD24A2B72AF77 /* CloudKitDatabase.swift in Sources */,
+				88465D379534B49E20A7C9B0 /* CloudKitLossClassifier.swift in Sources */,
 				0DF5B8B602888761E338938A /* CloudKitRecordStore.swift in Sources */,
 				C990911670A720B92E033CC0 /* CloudKitSubscriptionStore.swift in Sources */,
 				5269A91F04D9F07B736237C7 /* CloudKitSyncHealth.swift in Sources */,
@@ -593,7 +603,9 @@
 				F960F4D9C6C49DBE8C886F7B /* BigSyncKitTests.swift in Sources */,
 				AC82E3ABBF139A593221D712 /* ChangeFeedMigrationResumeTests.swift in Sources */,
 				D16089D105F52266A902BCB9 /* CloudKitAccountAvailabilityGateTests.swift in Sources */,
+				5DA94DE008BDD629A4FEBE98 /* CloudKitSynchronizerAccountFencingTests.swift in Sources */,
 				0E70FD2BCF232F256224F70D /* DisposableZoneAuthorizationTests.swift in Sources */,
+				2283F6BCF197679484C48935 /* ModelAdapterDeletionConflictSafetyTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Darwin
 
 
 /// Interface for persisting and loading values.
@@ -35,6 +36,14 @@ import Foundation
     /// Removes the value of the specified default key.
     /// - Parameter defaultName: The key whose value you want to remove.
     func removeObject(forKey defaultName: String)
+
+    /// Flushes pending mutations to durable storage.
+    ///
+    /// CloudKit lifecycle/reset envelopes use this as a crash-consistency
+    /// boundary before clearing cursors or tracking state. Custom stores that
+    /// don't implement it fail closed for those operations rather than
+    /// claiming that an in-memory read-back is durable.
+    @objc optional func synchronize() -> Bool
 }
 
 
@@ -83,6 +92,10 @@ import Foundation
     /// - Parameter defaultName: The key whose value you want to remove.
     @objc public func removeObject(forKey defaultName: String) {
         userDefaults.removeObject(forKey: defaultName)
+    }
+
+    @objc public func synchronize() -> Bool {
+        userDefaults.synchronize()
     }
 }
 
@@ -139,6 +152,37 @@ import Foundation
             var updatedStorage = storage
             updatedStorage.removeValue(forKey: defaultName)
             persist(updatedStorage)
+        }
+    }
+
+    @objc public func synchronize() -> Bool {
+        lock.withLock {
+            do {
+                guard FileManager.default.fileExists(atPath: fileURL.path) else {
+                    return storage.isEmpty
+                }
+                let handle = try FileHandle(forWritingTo: fileURL)
+                try handle.synchronize()
+                try handle.close()
+                // `Data.write(.atomic)` publishes with a same-directory
+                // rename. Flushing only the file contents does not make that
+                // directory entry crash-durable, so a power loss could still
+                // restore the previous plist after this method returned true.
+                let directoryDescriptor = Darwin.open(
+                    fileURL.deletingLastPathComponent().path,
+                    O_RDONLY
+                )
+                guard directoryDescriptor >= 0 else { return false }
+                defer { Darwin.close(directoryDescriptor) }
+                guard Darwin.fsync(directoryDescriptor) == 0 else {
+                    return false
+                }
+                return NSDictionary(
+                    dictionary: Self.loadStorage(from: fileURL)
+                ).isEqual(to: storage)
+            } catch {
+                return false
+            }
         }
     }
 

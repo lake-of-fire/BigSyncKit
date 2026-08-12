@@ -32,9 +32,17 @@ public protocol ModelAdapterDelegate: AnyObject {
 /// synchronizer owns account fencing and phase ordering; adapters own durable
 /// tracking/provenance storage.
 public enum ChangeFeedResetMode: String, Sendable {
+    /// The one bounded import of objects that predate BigSyncKit's durable
+    /// mutation journal. This is the only mode allowed to discover an
+    /// untracked, unjournaled target object as new upload work.
+    case initialImport
     /// Reconcile a full server bootstrap conservatively. A previously
     /// server-backed record that is now absent must not be resurrected.
     case serverReconciliation
+    /// A device/app backup contains a historical snapshot of the local outbox.
+    /// Keep target Realm user objects, but do not replay copied mutation
+    /// generations or rediscover untracked objects as current local intent.
+    case backupRestore
     /// CloudKit explicitly reset the account's encrypted data. The direct
     /// database API documents that locally retained live data may be
     /// re-uploaded, so rebuild durable upload generations without changing the
@@ -49,7 +57,6 @@ public protocol ChangeFeedResetMigrating: AnyObject {
     func hasChangeFeedEstablishedServerEvidence() async throws -> Bool
     func prepareChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
     func beginChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
-    func promoteChangeFeedResetToEncryptedDataReset(accountScopeIdentifier: String, epoch: Int) async throws
     func isChangeFeedServerBootstrapActive() async -> Bool
     func reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
     func finishChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
@@ -170,6 +177,16 @@ public protocol ModelAdapter: AnyObject, Sendable {
         matchingPreparedGenerations: [String: String]
     ) async throws
 
+    /// Rebases only the cached CloudKit system fields for local deletions that
+    /// lost a server-record conflict. Implementations must preserve both the
+    /// local tombstone and the exact prepared mutation generation; this is not
+    /// an inbound model-value merge.
+    @BigSyncBackgroundActor
+    func rebasePendingDeletionMetadata(
+        using serverRecords: [CKRecord],
+        matchingPreparedGenerations: [String: String]
+    ) async throws
+
     /// Asks the model adapter whether it has a local object for the given record identifier.
     /// - Parameter recordID: Record identifier.
     /// - Returns: Whether there is a corresponding object for this identifier.
@@ -221,6 +238,25 @@ public extension ModelAdapter {
     var priorityEntityTypeNames: [String] { [] }
 
     func waitForCancellation() async {}
+
+    @BigSyncBackgroundActor
+    func rebasePendingDeletionMetadata(
+        using serverRecords: [CKRecord],
+        matchingPreparedGenerations: [String: String]
+    ) async throws {
+        // There is no safe generic implementation: applying an inbound server
+        // record can overwrite the local tombstone this conflict is supposed
+        // to preserve. Fail closed; the bounded mutation drain returns the
+        // conflict and leaves the exact deletion generation pending.
+        _ = serverRecords
+        _ = matchingPreparedGenerations
+        throw ModelAdapterDeletionConflictError
+            .tombstonePreservingRebaseNotImplemented
+    }
+}
+
+public enum ModelAdapterDeletionConflictError: Error, Equatable {
+    case tombstonePreservingRebaseNotImplemented
 }
 
 public struct PreparedRecordUpload: @unchecked Sendable {

@@ -202,7 +202,7 @@ extension CloudKitSynchronizer {
             )
             shouldRetry = true
             retryDelay = 0
-        } else if let error = error as? BigSyncKit.CloudKitSynchronizer.SyncError {
+        } else if let error = error as? CloudKitSynchronizer.SyncError {
             switch error {
                 //                    case .callFailed:
                 //                        print("Sync error: \(error.localizedDescription) This error could be returned by completion block when no success and no error were produced.")
@@ -221,30 +221,51 @@ extension CloudKitSynchronizer {
             let codes = Set(errors.map(\.code))
             if codes.contains(.changeTokenExpired) {
                 logger.info("QSCloudKitSynchronizer >> Change token expired, requesting a fenced server-first tracking rebuild...")
+                var recoveryRequestIsDurable = false
                 if let context = activeRunContext {
-                    requestChangeFeedRecovery(context: context)
-                }
-                self.resetDatabaseToken()
-                do {
-                    for adapter in modelAdapters {
-                        try await adapter.saveToken(nil)
+                    do {
+                        try requestChangeFeedRecovery(context: context)
+                        recoveryRequestIsDurable = true
+                    } catch {
+                        logger.error(
+                            "QSCloudKitSynchronizer >> Could not durably request change-token recovery: \(error)"
+                        )
                     }
-                    shouldRetry = true
-                } catch {
-                    logger.error("QSCloudKitSynchronizer >> Failed to clear expired adapter token: \(error)")
+                }
+                if recoveryRequestIsDurable {
+                    self.resetDatabaseToken()
+                    do {
+                        for adapter in modelAdapters {
+                            try await adapter.saveToken(nil)
+                        }
+                        shouldRetry = true
+                    } catch {
+                        logger.error("QSCloudKitSynchronizer >> Failed to clear expired adapter token: \(error)")
+                    }
                 }
             } else if codes.contains(.notAuthenticated) {
                 logger.error("QSCloudKitSynchronizer >> Not Authenticated. Aborting sync")
                 changeRequestProcessor.reset()
                 cancelledDueToUnauthentication = true
+                accountValidationRequired = true
                 terminalHealthCategory = .notAuthenticated
+            } else if codes.contains(.accountTemporarilyUnavailable) {
+                // Apple explicitly requires waiting for CKAccountChanged and
+                // rechecking account availability. Do not enqueue another
+                // database/zone/record operation on the generic retry timer.
+                logger.info(
+                    "QSCloudKitSynchronizer >> iCloud account is temporarily unavailable; waiting for account status to change"
+                )
+                changeRequestProcessor.reset()
+                accountValidationRequired = true
+                clearPersistedTransientRetryState()
+                terminalHealthCategory = .accountTemporarilyUnavailable
             } else if !codes.isDisjoint(with: [
                 .serviceUnavailable,
                 .requestRateLimited,
                 .zoneBusy,
                 .networkFailure,
                 .networkUnavailable,
-                .accountTemporarilyUnavailable,
             ]) {
                 let requestedDelays = errors.compactMap {
                     ($0.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
@@ -274,19 +295,29 @@ extension CloudKitSynchronizer {
             logger.warning(
                 "QSCloudKitSynchronizer >> Persisted CloudKit cursor was corrupt; requesting a fenced server-first tracking rebuild."
             )
+            var recoveryRequestIsDurable = false
             if let context = activeRunContext {
-                requestChangeFeedRecovery(context: context)
-            }
-            resetDatabaseToken()
-            do {
-                for adapter in modelAdapters {
-                    try await adapter.saveToken(nil)
+                do {
+                    try requestChangeFeedRecovery(context: context)
+                    recoveryRequestIsDurable = true
+                } catch {
+                    logger.error(
+                        "QSCloudKitSynchronizer >> Could not durably request corrupt-cursor recovery: \(error)"
+                    )
                 }
-                shouldRetry = true
-            } catch {
-                logger.error(
-                    "QSCloudKitSynchronizer >> Failed to clear corrupt adapter cursor: \(error)"
-                )
+            }
+            if recoveryRequestIsDurable {
+                resetDatabaseToken()
+                do {
+                    for adapter in modelAdapters {
+                        try await adapter.saveToken(nil)
+                    }
+                    shouldRetry = true
+                } catch {
+                    logger.error(
+                        "QSCloudKitSynchronizer >> Failed to clear corrupt adapter cursor: \(error)"
+                    )
+                }
             }
         }
 
@@ -336,6 +367,7 @@ extension CloudKitSynchronizer {
                 !(error is CancellationError) &&
                 !(error is ChangeFeedMigrationError) &&
                 (error as? SyncError) != .cancelled &&
+                terminalHealthCategory != .accountTemporarilyUnavailable &&
                 !cancelledDueToUnauthentication
             syncing = false
             finishSynchronizationDrain(with: .failure(error))
@@ -346,7 +378,7 @@ extension CloudKitSynchronizer {
         }
 
         retrySleepUntil = Date().addingTimeInterval(retryDelay)
-        synchronizationTask = Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+        synchronizationTask = Task(priority: .utility) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
             if retryDelay > 0 {
                 do {
@@ -402,6 +434,114 @@ enum CloudKitRetryBackoff {
 // MARK: - Utilities
 
 extension CloudKitSynchronizer {
+    /// Converts every CloudKit zone-loss shape into the synchronizer's single
+    /// supported zone lifecycle. Recovery intent is persisted before the
+    /// terminal fence so a process death can never leave an encrypted reset
+    /// permanently blocked without a resumable migration.
+    @BigSyncBackgroundActor
+    func applyCloudKitLoss(
+        _ disposition: CloudKitLossClassifier.ZoneDisposition,
+        zoneID: CKRecordZone.ID,
+        context: RunContext,
+        allowsEncryptedBootstrapAbsence: Bool = false
+    ) -> Error? {
+        switch disposition {
+        case .encryptedDataReset:
+            let recoveryWasActive = isEncryptedDataResetRecoveryActive
+                || hasPendingEncryptedDataResetRecovery(context: context)
+            if !recoveryWasActive {
+                do {
+                    try requestChangeFeedRecovery(
+                        context: context,
+                        mode: .encryptedDataReset
+                    )
+                } catch {
+                    // Do not publish a terminal fence unless its recovery
+                    // envelope is durably readable. The current feed cursor is
+                    // not committed, so CloudKit can replay the loss event.
+                    return error
+                }
+            }
+            do {
+                try markConfiguredZoneTerminal(
+                    zoneID,
+                    kind: .encryptedDataReset,
+                    accountScopeIdentifier: context.accountScopeIdentifier
+                )
+            } catch {
+                return error
+            }
+            if recoveryWasActive && allowsEncryptedBootstrapAbsence {
+                return nil
+            }
+            return ChangeFeedMigrationError.establishedZoneUnavailable(
+                zoneID,
+                .encryptedDataReset
+            )
+
+        case .terminal(let kind):
+            do {
+                try markConfiguredZoneTerminal(
+                    zoneID,
+                    kind: kind,
+                    accountScopeIdentifier: context.accountScopeIdentifier
+                )
+            } catch {
+                return error
+            }
+            return ChangeFeedMigrationError.establishedZoneUnavailable(
+                zoneID,
+                kind
+            )
+
+        case .missing:
+            if allowsEncryptedBootstrapAbsence {
+                // After CloudKit has reported the encrypted-key reset, later
+                // zone-scoped calls may surface only ordinary zoneNotFound.
+                // The already-fenced encrypted migration is the sole context
+                // in which an established zone may be treated as authoritatively
+                // empty and recreated.
+                return nil
+            }
+            guard configuredZoneIsEstablished(zoneID) else { return nil }
+            do {
+                try markConfiguredZoneTerminal(
+                    zoneID,
+                    kind: .unknown,
+                    accountScopeIdentifier: context.accountScopeIdentifier
+                )
+            } catch {
+                return error
+            }
+            return ChangeFeedMigrationError.establishedZoneUnavailable(
+                zoneID,
+                .unknown
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func applyCloudKitLoss(
+        error: Error,
+        defaultZoneID: CKRecordZone.ID,
+        context: RunContext,
+        allowsEncryptedBootstrapAbsence: Bool = false
+    ) -> Error? {
+        let classification = CloudKitLossClassifier.classify(
+            error: error,
+            defaultZoneID: defaultZoneID
+        )
+        guard let disposition = classification.zoneDispositions[defaultZoneID]
+        else { return nil }
+        return applyCloudKitLoss(
+            disposition,
+            zoneID: defaultZoneID,
+            context: context,
+            allowsEncryptedBootstrapAbsence:
+                allowsEncryptedBootstrapAbsence
+        )
+    }
+
 //    @BigSyncBackgroundActor
     func postNotification(_ notification: Notification.Name, object: Any? = nil, userInfo: [AnyHashable: Any]? = nil) {
         let object = object ?? self
@@ -411,18 +551,14 @@ extension CloudKitSynchronizer {
     }
 
     @BigSyncBackgroundActor
-    func notifyProviderForDeletedZoneIDs(
+    func notifyDelegateForDeletedZoneIDs(
         _ zoneIDs: [CKRecordZone.ID],
         attemptID: UUID
     ) async throws {
         for zoneID in zoneIDs {
-            // A deleted-zone callback must not clear tracking metadata after
-            // CloudKit has switched accounts.
-            try await revalidateActiveRunContext(for: attemptID)
-            try await self.adapterProvider.cloudKitSynchronizer(
-                self,
-                zoneWasDeletedWithZoneID: zoneID
-            )
+            // Lifecycle state and tracking recovery are owned exclusively by
+            // the fenced migration. The delegate receives an informational
+            // notification only after the account/run has been revalidated.
             try await revalidateActiveRunContext(for: attemptID)
             self.delegate?.synchronizer(self, zoneIDWasDeleted: zoneID)
         }
@@ -601,10 +737,25 @@ extension CloudKitSynchronizer {
 
         while moreComing {
             try await revalidateActiveRunContext(for: attemptID)
-            let page = try await changeFeed.databaseChanges(
-                since: pageCursor,
-                resultsLimit: 200
-            )
+            let page: CloudKitDatabaseChangePage
+            do {
+                page = try await changeFeed.databaseChanges(
+                    since: pageCursor,
+                    resultsLimit: 200
+                )
+            } catch {
+                if let context = activeRunContext,
+                   let lifecycleError = applyCloudKitLoss(
+                    error: error,
+                    defaultZoneID: recordZoneID,
+                    context: context,
+                    allowsEncryptedBootstrapAbsence:
+                        isEncryptedDataResetRecoveryActive
+                   ) {
+                    throw lifecycleError
+                }
+                throw error
+            }
             try await revalidateActiveRunContext(for: attemptID)
             changedZoneIDs.formUnion(page.changedZoneIDs)
             deletedZoneIDs.formUnion(page.deletions.map(\.zoneID))
@@ -614,67 +765,40 @@ extension CloudKitSynchronizer {
         }
 
         reportProgress("database-fetch-completion")
-        let configuredZoneIDs = Set(modelAdapters.map(\.recordZoneID))
-        let encryptedResetDeletions = pageDeletions.filter {
-            configuredZoneIDs.contains($0.zoneID)
-                && $0.kind == .encryptedDataReset
-        }
-        var encryptedRecoveryIsActive =
-            isEncryptedDataResetRecoveryActive
-        if let context = activeRunContext {
-            for deletion in pageDeletions
-            where configuredZoneIDs.contains(deletion.zoneID) {
-                markConfiguredZoneTerminal(
-                    deletion.zoneID,
-                    kind: deletion.kind,
-                    accountScopeIdentifier: context.accountScopeIdentifier
-                )
+        let configuredZoneID = recordZoneID
+        let configuredZoneIDs: Set<CKRecordZone.ID> = [configuredZoneID]
+        var recoverableEncryptedZoneIDs = Set<CKRecordZone.ID>()
+        let deletionClassification = CloudKitLossClassifier.classify(
+            deletions: pageDeletions
+        )
+        if let disposition = deletionClassification
+            .zoneDispositions[configuredZoneID],
+           let context = activeRunContext {
+            let encryptedRecoveryWasActive =
+                isEncryptedDataResetRecoveryActive
+            if let lifecycleError = applyCloudKitLoss(
+                disposition,
+                zoneID: configuredZoneID,
+                context: context,
+                allowsEncryptedBootstrapAbsence:
+                    encryptedRecoveryWasActive
+            ) {
+                throw lifecycleError
             }
-            if !encryptedResetDeletions.isEmpty,
-               !encryptedRecoveryIsActive {
-                if isChangeFeedMigrationActive {
-                    try await
-                        promoteActiveChangeFeedMigrationToEncryptedDataReset(
-                            context: context
-                        )
-                    encryptedRecoveryIsActive = true
-                } else {
-                    requestChangeFeedRecovery(
-                        context: context,
-                        mode: .encryptedDataReset
-                    )
-                }
+            if disposition == .encryptedDataReset,
+               encryptedRecoveryWasActive {
+                recoverableEncryptedZoneIDs.insert(configuredZoneID)
             }
         }
 
-        if let requestedRecovery = encryptedResetDeletions.first,
-           !encryptedRecoveryIsActive {
-            // End this attempt before the deleted-zone provider clears
-            // tracking. The next account-fenced attempt owns the dedicated
-            // encrypted-reset rebuild from its durable requested marker.
-            throw ChangeFeedMigrationError.establishedZoneUnavailable(
-                requestedRecovery.zoneID,
-                .encryptedDataReset
-            )
-        }
-
-        let recoverableEncryptedZoneIDs = encryptedRecoveryIsActive
-            ? Set(encryptedResetDeletions.map(\.zoneID))
-            : []
-        let unavailableConfiguredZones = deletedZoneIDs
+        // This synchronizer owns exactly one configured zone. Database history
+        // may contain unrelated private-database zones from other clients;
+        // never publish those to this adapter provider or delegate.
+        let configuredDeletedZoneIDs = deletedZoneIDs
             .intersection(configuredZoneIDs)
             .subtracting(recoverableEncryptedZoneIDs)
-        if isChangeFeedMigrationActive,
-           let unavailableZone = unavailableConfiguredZones.first {
-            let kind = pageDeletions.first {
-                $0.zoneID == unavailableZone
-            }?.kind ?? .unknown
-            throw ChangeFeedMigrationError
-                .establishedZoneUnavailable(unavailableZone, kind)
-        }
-
-        try await notifyProviderForDeletedZoneIDs(
-            Array(deletedZoneIDs.subtracting(recoverableEncryptedZoneIDs)),
+        try await notifyDelegateForDeletedZoneIDs(
+            Array(configuredDeletedZoneIDs),
             attemptID: attemptID
         )
         try await revalidateActiveRunContext(for: attemptID)
@@ -740,23 +864,28 @@ extension CloudKitSynchronizer {
                         resultsLimit: 200
                     )
                 } catch {
-                    guard isChangeFeedMigrationActive,
-                          isZoneNotFoundOrDeletedError(error) else {
+                    guard let context = activeRunContext else {
                         throw error
                     }
-                    if configuredZoneIsEstablished(zoneID)
-                        && !isEncryptedDataResetRecoveryActive {
-                        if let context = activeRunContext {
-                            markConfiguredZoneTerminal(
-                                zoneID,
-                                kind: .unknown,
-                                accountScopeIdentifier:
-                                    context.accountScopeIdentifier
-                            )
-                        }
-                        throw ChangeFeedMigrationError
-                            .establishedZoneUnavailable(zoneID, .unknown)
+                    let classification = CloudKitLossClassifier.classify(
+                        error: error,
+                        defaultZoneID: zoneID
+                    )
+                    guard let disposition = classification
+                        .zoneDispositions[zoneID] else {
+                        throw error
                     }
+                    if let lifecycleError = applyCloudKitLoss(
+                        disposition,
+                        zoneID: zoneID,
+                        context: context,
+                        allowsEncryptedBootstrapAbsence:
+                            isChangeFeedMigrationActive
+                                && isEncryptedDataResetRecoveryActive
+                    ) {
+                        throw lifecycleError
+                    }
+                    guard isChangeFeedMigrationActive else { throw error }
                     // A never-established zone is an empty authoritative
                     // bootstrap. Reconcile local journal work, then let the
                     // ordinary upload path create the zone.
@@ -833,17 +962,22 @@ extension CloudKitSynchronizer {
                 try await adapter.persistImportedChanges()
                 try await revalidateActiveRunContext(for: attemptID)
 
-                // Token-last: a failed import refetches this exact page.
-                try await adapter.saveToken(page.cursor)
-                try await revalidateActiveRunContext(for: attemptID)
-                activeZoneTokens[zoneID] = page.cursor
+                // Establishment proof is durable before the zone cursor. If
+                // that safety write fails, this exact page is replayed rather
+                // than advancing past a zone whose later disappearance might
+                // otherwise be mistaken for a never-created zone.
                 if let context = activeRunContext {
-                    markConfiguredZoneEstablished(
+                    try markConfiguredZoneEstablished(
                         zoneID,
                         accountScopeIdentifier:
                             context.accountScopeIdentifier
                     )
                 }
+                // Token-last: a failed import or lifecycle write refetches this
+                // exact page.
+                try await adapter.saveToken(page.cursor)
+                try await revalidateActiveRunContext(for: attemptID)
+                activeZoneTokens[zoneID] = page.cursor
                 pageCursor = page.cursor
                 moreComing = page.moreComing
             }
@@ -893,6 +1027,15 @@ extension CloudKitSynchronizer {
                   synchronizationAttemptID == attemptID else { return }
             
             if let error = error as? NSError {
+                if let context = activeRunContext,
+                   let lifecycleError = applyCloudKitLoss(
+                    error: error,
+                    defaultZoneID: recordZoneID,
+                    context: context
+                   ) {
+                    await failSynchronization(error: lifecycleError)
+                    return
+                }
                 if isZoneNotFoundOrDeletedError(error) {
                     for adapter in modelAdapters {
                         try await revalidateActiveRunContext(for: attemptID)
@@ -961,6 +1104,16 @@ extension CloudKitSynchronizer {
                 return
             }
             guard error == nil else {
+                if let error,
+                   let context = activeRunContext,
+                   let lifecycleError = applyCloudKitLoss(
+                    error: error,
+                    defaultZoneID: adapter.recordZoneID,
+                    context: context
+                   ) {
+                    try await completion(lifecycleError)
+                    return
+                }
                 try await completion(error)
                 return
             }
@@ -1021,6 +1174,12 @@ extension CloudKitSynchronizer {
             try await revalidateActiveRunContext(for: attemptID)
             _ = try await zoneStore.recordZone(withID: zoneID)
             try await revalidateActiveRunContext(for: attemptID)
+            if let context = activeRunContext {
+                try markConfiguredZoneEstablished(
+                    zoneID,
+                    accountScopeIdentifier: context.accountScopeIdentifier
+                )
+            }
             try await completion(nil)
         } catch {
             do {
@@ -1032,33 +1191,27 @@ extension CloudKitSynchronizer {
                 return
             }
 
-            guard isZoneNotFoundOrDeletedError(error) else {
+            guard let context = activeRunContext else {
                 try await completion(error)
                 return
             }
-            guard !configuredZoneIsTerminal(zoneID) else {
-                let terminalKind = configuredZoneTerminalState(zoneID)?
-                    .deletionKind ?? .unknown
-                if terminalKind == .encryptedDataReset,
-                   isEncryptedDataResetRecoveryActive {
-                    let newZone = CKRecordZone(zoneID: zoneID)
-                    try await revalidateActiveRunContext(for: attemptID)
-                    let savedZone = try await zoneStore.save(
-                        recordZone: newZone
-                    )
-                    try await revalidateActiveRunContext(for: attemptID)
-                    guard savedZone.zoneID == zoneID else {
-                        throw CocoaError(.coderValueNotFound)
-                    }
-                    try await completion(nil)
-                    return
-                }
-                try await completion(
-                    ChangeFeedMigrationError.establishedZoneUnavailable(
-                        zoneID,
-                        terminalKind
-                    )
-                )
+            let classification = CloudKitLossClassifier.classify(
+                error: error,
+                defaultZoneID: zoneID
+            )
+            guard let disposition = classification.zoneDispositions[zoneID]
+            else {
+                try await completion(error)
+                return
+            }
+            if let lifecycleError = applyCloudKitLoss(
+                disposition,
+                zoneID: zoneID,
+                context: context,
+                allowsEncryptedBootstrapAbsence:
+                    isEncryptedDataResetRecoveryActive
+            ) {
+                try await completion(lifecycleError)
                 return
             }
 
@@ -1070,12 +1223,25 @@ extension CloudKitSynchronizer {
                 guard savedZone.zoneID == zoneID else {
                     throw CocoaError(.coderValueNotFound)
                 }
+                try markConfiguredZoneEstablished(
+                    zoneID,
+                    accountScopeIdentifier: context.accountScopeIdentifier
+                )
                 logger.info(
                     "QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)"
                 )
                 try await completion(nil)
             } catch {
-                try await completion(error)
+                if let lifecycleError = applyCloudKitLoss(
+                    error: error,
+                    defaultZoneID: zoneID,
+                    context: context,
+                    allowsEncryptedBootstrapAbsence: false
+                ) {
+                    try await completion(lifecycleError)
+                } else {
+                    try await completion(error)
+                }
             }
         }
     }
