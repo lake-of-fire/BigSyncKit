@@ -4,6 +4,34 @@ import RealmSwift
 import Combine
 import Logging
 
+enum BigSyncDeadlineOutcome: Sendable {
+    case completed(CloudKitSynchronizer.SynchronizationResult?)
+    case timedOut
+}
+
+actor BigSyncDeadlineRace {
+    private var outcome: BigSyncDeadlineOutcome?
+    private var continuation: CheckedContinuation<BigSyncDeadlineOutcome, Never>?
+
+    func resolve(_ outcome: BigSyncDeadlineOutcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        continuation?.resume(returning: outcome)
+        continuation = nil
+    }
+
+    func value() async -> BigSyncDeadlineOutcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { continuation in
+            if let outcome {
+                continuation.resume(returning: outcome)
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+}
+
 public struct BigSyncBackgroundWorkerConfiguration {
     let synchronizerName: String
     let containerName: String
@@ -138,6 +166,47 @@ public actor BigSyncBackgroundActor {
         }
 
         return await synchronizeCloudKit(expectedSynchronizer: realmSynchronizer)
+    }
+
+    /// Bounds lifecycle callers even when an underlying CloudKit await does not
+    /// cooperate with Swift task cancellation.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func synchronizeCloudKit(
+        deadlineNanoseconds: UInt64
+    ) async -> CloudKitSynchronizer.SynchronizationResult? {
+        let race = BigSyncDeadlineRace()
+        let synchronizationTask = Task { @BigSyncBackgroundActor [weak self] in
+            let result = await self?.synchronizeCloudKit()
+            await race.resolve(.completed(result))
+        }
+        let deadlineTask = Task.detached { [race, deadlineNanoseconds] in
+            do {
+                try await Task.sleep(nanoseconds: deadlineNanoseconds)
+            } catch {
+                return
+            }
+            await race.resolve(.timedOut)
+        }
+
+        let outcome = await withTaskCancellationHandler {
+            await race.value()
+        } onCancel: {
+            synchronizationTask.cancel()
+            Task { await race.resolve(.timedOut) }
+        }
+        synchronizationTask.cancel()
+        deadlineTask.cancel()
+
+        switch outcome {
+        case .completed(let result):
+            return result
+        case .timedOut:
+            logger?.warning(
+                "QSCloudKitSynchronizer >> Lifecycle synchronization deadline elapsed"
+            )
+            return nil
+        }
     }
 
     @BigSyncBackgroundActor

@@ -27,6 +27,41 @@ private enum TestSynchronizationError: Error {
     case importedPersistenceCacheFailed
 }
 
+final class BigSyncDeadlineRaceTests: XCTestCase {
+    func testFirstDeadlineOutcomeRemainsAuthoritative() async {
+        let race = BigSyncDeadlineRace()
+        let completedResult = CloudKitSynchronizer.SynchronizationResult(
+            didImportChanges: true
+        )
+
+        await race.resolve(.timedOut)
+        await race.resolve(.completed(completedResult))
+
+        switch await race.value() {
+        case .timedOut:
+            break
+        case .completed:
+            XCTFail("A later completion replaced the deadline outcome")
+        }
+    }
+
+    func testCompletionCanWinDeadlineRace() async {
+        let race = BigSyncDeadlineRace()
+        let completedResult = CloudKitSynchronizer.SynchronizationResult(
+            didImportChanges: true
+        )
+
+        await race.resolve(.completed(completedResult))
+
+        switch await race.value() {
+        case .completed(let result):
+            XCTAssertEqual(result, completedResult)
+        case .timedOut:
+            XCTFail("The completed result was not retained")
+        }
+    }
+}
+
 @BigSyncBackgroundActor
 private final class TerminalCallbackObservation: NSObject {
     private let synchronizer: CloudKitSynchronizer
