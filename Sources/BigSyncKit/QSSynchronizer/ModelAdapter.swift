@@ -55,7 +55,12 @@ public protocol ChangeFeedResetMigrating: AnyObject {
     /// valid server record.  It protects an established zone from accidental
     /// recreation after a deletion lifecycle event.
     func hasChangeFeedEstablishedServerEvidence() async throws -> Bool
-    func prepareChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
+    func prepareChangeFeedReset(
+        accountScopeIdentifier: String,
+        epoch: Int,
+        mode: ChangeFeedResetMode,
+        preservingMutationsChangedAfter cutoff: Date?
+    ) async throws
     func beginChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
     func isChangeFeedServerBootstrapActive() async -> Bool
     func reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
@@ -72,7 +77,21 @@ public extension ChangeFeedResetMigrating {
         try await prepareChangeFeedReset(
             accountScopeIdentifier: accountScopeIdentifier,
             epoch: epoch,
-            mode: .serverReconciliation
+            mode: .serverReconciliation,
+            preservingMutationsChangedAfter: nil
+        )
+    }
+
+    func prepareChangeFeedReset(
+        accountScopeIdentifier: String,
+        epoch: Int,
+        mode: ChangeFeedResetMode
+    ) async throws {
+        try await prepareChangeFeedReset(
+            accountScopeIdentifier: accountScopeIdentifier,
+            epoch: epoch,
+            mode: mode,
+            preservingMutationsChangedAfter: nil
         )
     }
 

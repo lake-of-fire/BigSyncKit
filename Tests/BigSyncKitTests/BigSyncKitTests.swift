@@ -2648,6 +2648,100 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testRestoredBackupKeepsPostDetectionMutationFromAnotherProcessSession()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let store = DictionaryKeyValueStore()
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let identifier = "restore-shared-host-mutation-\(UUID().uuidString)"
+        let installedBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let restoredBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let installed = makeSynchronizer(
+            database: database,
+            keyValueStore: store,
+            identifier: identifier,
+            recordZoneID: fixture.adapter.recordZoneID,
+            backupDetectionBaseURL: installedBase
+        )
+        let installedSentinel = BackupDetection.defaultSentinelURL(
+            namespace: installed.durableStateNamespace,
+            sharedBaseURL: installedBase
+        )
+        let restoredSentinel = BackupDetection.defaultSentinelURL(
+            namespace: installed.durableStateNamespace,
+            sharedBaseURL: restoredBase
+        )
+        let restoredMarker = BackupDetection.markerURL(
+            sentinelURL: restoredSentinel
+        )
+        try FileManager.default.createDirectory(
+            at: restoredMarker.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.copyItem(
+            at: BackupDetection.markerURL(sentinelURL: installedSentinel),
+            to: restoredMarker
+        )
+
+        // Constructing the restored synchronizer durably publishes the shared
+        // restore boundary before any adapter setup. Model a mutation written
+        // afterwards by an app extension or by a process that then relaunched:
+        // its generation is intentionally not this process's prefix, so only
+        // the durable event timestamp protects it from historical-outbox
+        // retirement.
+        let restored = makeSynchronizer(
+            database: database,
+            keyValueStore: store,
+            identifier: identifier,
+            recordZoneID: fixture.adapter.recordZoneID,
+            backupDetectionBaseURL: restoredBase
+        )
+        let cutoff = try XCTUnwrap(BackupDetection.restoreResetEventDate(
+            namespace: restored.durableStateNamespace,
+            sharedSentinelBaseURL: restoredBase
+        ))
+        let object = BigSyncTrackedObject(
+            id: "shared-host-post-restore-edit",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        object.tags.append("shared-host-edit")
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let generation = "different-process-generation"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            fixture.targetRealm.add(BigSyncPendingMutation(
+                recordName: recordName,
+                entityType: BigSyncTrackedObject.className(),
+                objectIdentifier: object.id,
+                generation: generation,
+                changedAt: cutoff.addingTimeInterval(1)
+            ))
+        }
+        restored.addModelAdapter(fixture.adapter)
+
+        let result = try await restored.synchronize()
+
+        XCTAssertNotNil(result.receipt)
+        XCTAssertGreaterThanOrEqual(database.modifyRecordsOperationCount, 1)
+        XCTAssertEqual(
+            database.record(for: CKRecord.ID(
+                recordName: recordName,
+                zoneID: fixture.adapter.recordZoneID
+            ))?["tags"] as? [String],
+            ["shared-host-edit"]
+        )
+        XCTAssertNil(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+    }
+
+    @BigSyncBackgroundActor
     func testInitialImportDiscoversPreexistingUnjournaledObjectOnce()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
@@ -2710,6 +2804,49 @@ final class BigSyncKitTests: XCTestCase {
 
         XCTAssertNotEqual(restored.deviceIdentifier, firstIdentifier)
         XCTAssertEqual(first.deviceUUID, firstIdentifier)
+    }
+
+    @BigSyncBackgroundActor
+    func testFreshRestoreEventSupersedesCopiedPendingRestoreEnvelope()
+    throws {
+        let store = DictionaryKeyValueStore()
+        let synchronizer = makeSynchronizer(keyValueStore: store)
+        let context = CloudKitSynchronizer.RunContext(
+            attemptID: UUID(),
+            runID: UUID(),
+            accountIdentifier: "restore-account",
+            accountScopeIdentifier: CloudKitSynchronizer
+                .accountScopeIdentifier(for: "restore-account")
+        )
+        let firstCutoff = Date(timeIntervalSinceReferenceDate: 100)
+        let secondCutoff = Date(timeIntervalSinceReferenceDate: 200)
+        try synchronizer.requestChangeFeedRecovery(
+            context: context,
+            mode: .backupRestore,
+            backupRestoreMutationCutoff: firstCutoff
+        )
+        let first = try XCTUnwrap(store.propertyListEntries.first(where: {
+            $0.key.contains("ChangeFeedMigration.v2")
+        })?.value)
+        let firstEpoch = try XCTUnwrap(
+            (first["epoch"] as? NSNumber)?.intValue
+        )
+
+        try synchronizer.requestChangeFeedRecovery(
+            context: context,
+            mode: .backupRestore,
+            backupRestoreMutationCutoff: secondCutoff
+        )
+        let replaced = try XCTUnwrap(store.propertyListEntries.first(where: {
+            $0.key.contains("ChangeFeedMigration.v2")
+        })?.value)
+
+        XCTAssertEqual(replaced["backupRestoreMutationCutoff"] as? Date, secondCutoff)
+        XCTAssertEqual(
+            (replaced["epoch"] as? NSNumber)?.intValue,
+            firstEpoch + 1
+        )
+        XCTAssertEqual(replaced["phase"] as? String, "requested")
     }
 
     @BigSyncBackgroundActor
@@ -6971,10 +7108,14 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         try await adapter.prepareChangeFeedReset(
-            accountScopeIdentifier: "account-a", epoch: 1
+            accountScopeIdentifier: "account-a",
+            epoch: 1,
+            mode: .initialImport
         )
         try await adapter.beginChangeFeedServerBootstrap(
-            accountScopeIdentifier: "account-a", epoch: 1
+            accountScopeIdentifier: "account-a",
+            epoch: 1,
+            mode: .initialImport
         )
         let persistenceRealm = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
         let priorServerRecordName = BigSyncTrackedObject.className() + ".await-server-evidence"
@@ -6993,7 +7134,9 @@ final class BigSyncKitTests: XCTestCase {
         // No remote pages are applied: this exercises exactly the post-nil-
         // token reconciliation boundary.
         try await adapter.reconcileAfterChangeFeedServerBootstrap(
-            accountScopeIdentifier: "account-a", epoch: 1
+            accountScopeIdentifier: "account-a",
+            epoch: 1,
+            mode: .initialImport
         )
         let localOnlyRecordName = BigSyncTrackedObject.className() + ".local-only"
         let tombstoneRecordName = BigSyncTrackedObject.className() + ".acknowledged-tombstone"
@@ -7014,7 +7157,9 @@ final class BigSyncKitTests: XCTestCase {
             .awaitingServerEvidence
         )
         try await adapter.finishChangeFeedReset(
-            accountScopeIdentifier: "account-a", epoch: 1
+            accountScopeIdentifier: "account-a",
+            epoch: 1,
+            mode: .initialImport
         )
         XCTAssertNil(
             persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: priorServerRecordName)

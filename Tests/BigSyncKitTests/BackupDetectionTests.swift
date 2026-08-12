@@ -53,6 +53,9 @@ final class BackupDetectionTests: XCTestCase {
             .restoredFromBackup
         )
         XCTAssertNotNil(BackupDetection.restoreResetEventIdentifier(sentinelURL: restored))
+        XCTAssertNotNil(BackupDetection.restoreResetEventDate(
+            sentinelURL: restored
+        ))
         XCTAssertTrue(FileManager.default.fileExists(atPath: restored.path))
     }
 
@@ -77,6 +80,57 @@ final class BackupDetectionTests: XCTestCase {
 
         try BackupDetection.markRestoreResetCompleted(sentinelURL: restored)
         XCTAssertNil(BackupDetection.restoreResetEventIdentifier(sentinelURL: restored))
+    }
+
+    func testASecondRestoreReplacesTheCopiedRecoveryEvent() throws {
+        let namespace = "container.private.owner.zone"
+        let installed = temporaryRoot().appendingPathComponent("installed")
+        let firstRestore = temporaryRoot().appendingPathComponent("restored-1")
+        let secondRestore = temporaryRoot().appendingPathComponent("restored-2")
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sentinelURL: installed
+        )
+        try simulateRestoredMarker(from: installed, to: firstRestore)
+        XCTAssertEqual(try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sentinelURL: firstRestore
+        ), .restoredFromBackup)
+        let firstEvent = try XCTUnwrap(
+            BackupDetection.restoreResetEventIdentifier(
+                sentinelURL: firstRestore
+            )
+        )
+
+        let secondMarker = BackupDetection.markerURL(
+            sentinelURL: secondRestore
+        )
+        try FileManager.default.createDirectory(
+            at: secondMarker.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.copyItem(
+            at: BackupDetection.markerURL(sentinelURL: firstRestore),
+            to: secondMarker
+        )
+        try FileManager.default.copyItem(
+            at: BackupDetection.restoreEventURL(sentinelURL: firstRestore),
+            to: BackupDetection.restoreEventURL(sentinelURL: secondRestore)
+        )
+
+        XCTAssertEqual(try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sentinelURL: secondRestore
+        ), .restoredFromBackup)
+        XCTAssertNotEqual(
+            BackupDetection.restoreResetEventIdentifier(
+                sentinelURL: secondRestore
+            ),
+            firstEvent
+        )
     }
 
     func testFailedRestoreEventAcknowledgementRemainsRequired() throws {
@@ -133,6 +187,9 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertTrue(BackupDetection.restoreResetIsRequired(
             namespace: namespace,
             sharedSentinelBaseURL: base
+        ))
+        XCTAssertNil(BackupDetection.restoreResetEventDate(
+            sentinelURL: sentinel
         ))
     }
 

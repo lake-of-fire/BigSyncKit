@@ -165,7 +165,7 @@ enum BackupDetection {
         }
 
         if result == .restoredFromBackup {
-            try persistRestoreEventIfNeeded(
+            try persistRestoreEvent(
                 at: restoreEventURL(sentinelURL: sentinelURL),
                 fileManager: fileManager,
                 eventWriter: eventWriter
@@ -267,6 +267,52 @@ enum BackupDetection {
             return nil
         }
         return value
+    }
+
+    /// The restore event is published before the new installation sentinel.
+    /// Its filesystem timestamp is therefore a durable lower bound for local
+    /// mutations made after restore recovery began, including mutations from
+    /// another process sharing the same app-group Realm.
+    static func restoreResetEventDate(
+        namespace: String,
+        sharedSentinelBaseURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) -> Date? {
+        restoreResetEventDate(
+            sentinelURL: defaultSentinelURL(
+                namespace: namespace,
+                sharedBaseURL: sharedSentinelBaseURL
+            ),
+            fileManager: fileManager
+        )
+    }
+
+    static func restoreResetEventDate(
+        sentinelURL: URL,
+        fileManager: FileManager = .default
+    ) -> Date? {
+        let eventURL = restoreEventURL(sentinelURL: sentinelURL)
+        guard let data = try? Data(contentsOf: eventURL),
+              let value = String(data: data, encoding: .utf8),
+              let encodedIdentifier = value.split(separator: "\n").first,
+              UUID(uuidString: String(encodedIdentifier)) != nil else {
+            return nil
+        }
+        if let encodedDate = value.split(separator: "\n").dropFirst().first,
+           let interval = TimeInterval(encodedDate),
+           interval.isFinite {
+            return Date(timeIntervalSinceReferenceDate: interval)
+        }
+        // Accept an event created by the earlier v4 implementation during an
+        // interrupted in-place upgrade. Its atomic file publication timestamp
+        // is still a conservative recovery boundary.
+        guard let attributes = try? fileManager.attributesOfItem(
+            atPath: eventURL.path
+        ),
+        let date = attributes[.modificationDate] as? Date else {
+            return nil
+        }
+        return date
     }
 
     /// Acknowledgement is scoped to one durable client. Other clients retain
@@ -375,17 +421,24 @@ enum BackupDetection {
         try synchronizePublishedFile(at: publishedURL)
     }
 
-    private static func persistRestoreEventIfNeeded(
+    private static func persistRestoreEvent(
         at url: URL,
         fileManager: FileManager,
         eventWriter: ((URL, Data) throws -> Void)?
     ) throws {
-        if let data = try? Data(contentsOf: url),
-           let event = String(data: data, encoding: .utf8),
-           !event.isEmpty {
-            return
-        }
-        let data = Data(UUID().uuidString.utf8)
+        // A restore-event file is intentionally backup eligible. If an
+        // interrupted recovery is itself backed up and restored again, the
+        // copied event describes the older installation and cannot delimit
+        // the new installation's mutations. Every actual restore detection
+        // (marker present, valid excluded sentinel absent) publishes a fresh
+        // event before exposing the new sentinel. Ordinary crash resume keeps
+        // the event because the already-published excluded sentinel makes the
+        // next run a regular launch.
+        let createdAt = Date()
+        let data = Data(
+            "\(UUID().uuidString)\n\(createdAt.timeIntervalSinceReferenceDate)"
+                .utf8
+        )
         try fileManager.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true

@@ -147,8 +147,10 @@ private final class AccountFencingModelAdapter:
     func prepareChangeFeedReset(
         accountScopeIdentifier: String,
         epoch: Int,
-        mode: ChangeFeedResetMode
+        mode: ChangeFeedResetMode,
+        preservingMutationsChangedAfter cutoff: Date?
     ) async throws {
+        _ = cutoff
         _ = accountScopeIdentifier
         _ = epoch
         _ = mode

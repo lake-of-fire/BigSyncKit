@@ -3520,7 +3520,8 @@ public final class RealmSwiftAdapter:
     public func prepareChangeFeedReset(
         accountScopeIdentifier: String,
         epoch: Int,
-        mode: ChangeFeedResetMode
+        mode: ChangeFeedResetMode,
+        preservingMutationsChangedAfter cutoff: Date?
     ) async throws {
         let persistenceRealm = try await Realm(
             configuration: persistenceRealmConfiguration,
@@ -3572,13 +3573,20 @@ public final class RealmSwiftAdapter:
             // truth or resurrect a remotely deleted record. Target objects are
             // deliberately retained and become uploadable again only after a
             // genuine post-restore user mutation creates a fresh generation.
-            try await retireRestoredMutationJournal()
+            guard let cutoff else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            try await retireRestoredMutationJournal(
+                preservingMutationsChangedAfter: cutoff
+            )
         }
         try await resetSyncCaches()
     }
 
     @BigSyncBackgroundActor
-    private func retireRestoredMutationJournal() async throws {
+    private func retireRestoredMutationJournal(
+        preservingMutationsChangedAfter cutoff: Date
+    ) async throws {
         var openedRealmIdentities = Set<String>()
         for configuration in targetRealmConfigurations {
             let identity = configuration.inMemoryIdentifier
@@ -3596,6 +3604,7 @@ public final class RealmSwiftAdapter:
                     !BigSyncPendingMutation.wasCreatedInCurrentProcess(
                         $0.generation
                     )
+                    && $0.changedAt < cutoff
                 }
             )
             guard !restoredMutations.isEmpty else { continue }

@@ -89,6 +89,7 @@ private struct ChangeFeedMigrationState {
     let epoch: Int
     var mode: ChangeFeedResetMode
     var phase: Phase
+    let backupRestoreMutationCutoff: Date?
 
     init(
         key: String,
@@ -96,7 +97,8 @@ private struct ChangeFeedMigrationState {
         zoneID: CKRecordZone.ID,
         epoch: Int,
         mode: ChangeFeedResetMode,
-        phase: Phase
+        phase: Phase,
+        backupRestoreMutationCutoff: Date? = nil
     ) {
         self.key = key
         self.accountScopeIdentifier = accountScopeIdentifier
@@ -105,6 +107,7 @@ private struct ChangeFeedMigrationState {
         self.epoch = epoch
         self.mode = mode
         self.phase = phase
+        self.backupRestoreMutationCutoff = backupRestoreMutationCutoff
     }
 
     init?(
@@ -126,18 +129,26 @@ private struct ChangeFeedMigrationState {
               let phase = Phase(rawValue: rawPhase) else {
             return nil
         }
+        let backupRestoreMutationCutoff = propertyList[
+            "backupRestoreMutationCutoff"
+        ] as? Date
+        guard mode != .backupRestore
+            || backupRestoreMutationCutoff != nil else {
+            return nil
+        }
         self.init(
             key: key,
             accountScopeIdentifier: accountScopeIdentifier,
             zoneID: zoneID,
             epoch: epoch,
             mode: mode,
-            phase: phase
+            phase: phase,
+            backupRestoreMutationCutoff: backupRestoreMutationCutoff
         )
     }
 
     var propertyList: [String: Any] {
-        [
+        var value: [String: Any] = [
             "version": Self.version,
             "accountScopeIdentifier": accountScopeIdentifier,
             "zoneName": zoneName,
@@ -146,6 +157,11 @@ private struct ChangeFeedMigrationState {
             "mode": mode.rawValue,
             "phase": phase.rawValue,
         ]
+        if let backupRestoreMutationCutoff {
+            value["backupRestoreMutationCutoff"] =
+                backupRestoreMutationCutoff
+        }
+        return value
     }
 }
 
@@ -1182,6 +1198,15 @@ public class CloudKitSynchronizer: NSObject {
         guard backupRestoreDetected else {
             return
         }
+        guard let mutationCutoff = BackupDetection.restoreResetEventDate(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: backupDetectionBaseURL
+        ) else {
+            // An unreadable event remains restore evidence, but without its
+            // publication boundary BigSync cannot safely distinguish copied
+            // outbox generations from edits made by this installation.
+            throw CocoaError(.fileReadCorruptFile)
+        }
 
         try await revalidateRunContext(context)
         // Do not reset adapter tracking here. The durable migration activates
@@ -1195,7 +1220,8 @@ public class CloudKitSynchronizer: NSObject {
         lastDatabaseChangesEmptyAt = nil
         try requestChangeFeedRecovery(
             context: context,
-            mode: .backupRestore
+            mode: .backupRestore,
+            backupRestoreMutationCutoff: mutationCutoff
         )
         guard let recovery = storedChangeFeedMigrationState(for: context),
               recovery.phase != .completed,
@@ -1745,7 +1771,9 @@ public class CloudKitSynchronizer: NSObject {
               ),
               persisted.epoch == state.epoch,
               persisted.mode == state.mode,
-              persisted.phase == state.phase else {
+              persisted.phase == state.phase,
+              persisted.backupRestoreMutationCutoff
+                == state.backupRestoreMutationCutoff else {
             if let previousValue {
                 keyValueStore.set(value: previousValue, forKey: state.key)
             } else {
@@ -1772,8 +1800,15 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     internal func requestChangeFeedRecovery(
         context: RunContext,
-        mode: ChangeFeedResetMode = .serverReconciliation
+        mode: ChangeFeedResetMode = .serverReconciliation,
+        backupRestoreMutationCutoff: Date? = nil
     ) throws {
+        precondition(
+            mode == .backupRestore
+                ? backupRestoreMutationCutoff != nil
+                : backupRestoreMutationCutoff == nil,
+            "Only backup-restore recovery carries a local mutation cutoff"
+        )
         let stateKey = changeFeedMigrationStateKey(for: context)
         let current = storedChangeFeedMigrationState(for: context)
 
@@ -1781,7 +1816,15 @@ public class CloudKitSynchronizer: NSObject {
         // epoch. Restarting its nil-token bootstrap is idempotent; incrementing
         // here would discard evidence captured before the interrupted fetch.
         if let current, current.phase != .completed, current.mode == mode {
-            return
+            if mode != .backupRestore
+                || current.backupRestoreMutationCutoff
+                    == backupRestoreMutationCutoff {
+                return
+            }
+            // A fresh restore event supersedes an unfinished backup-recovery
+            // envelope copied from an older installation. Allocate a new
+            // epoch below so its copied cutoff cannot classify that older
+            // installation's mutations as current local intent.
         }
 
         // A verified restore event describes the provenance of every migration
@@ -1815,7 +1858,8 @@ public class CloudKitSynchronizer: NSObject {
             zoneID: recordZoneID,
             epoch: max(previousEpoch + 1, ChangeFeedMigrationState.initialEpoch),
             mode: mode,
-            phase: .requested
+            phase: .requested,
+            backupRestoreMutationCutoff: backupRestoreMutationCutoff
         )
         try persistChangeFeedMigrationState(requested)
         activeChangeFeedMigration = nil
@@ -1894,7 +1938,9 @@ public class CloudKitSynchronizer: NSObject {
         try await migratingAdapter.prepareChangeFeedReset(
             accountScopeIdentifier: context.accountScopeIdentifier,
             epoch: migration.epoch,
-            mode: migration.mode
+            mode: migration.mode,
+            preservingMutationsChangedAfter:
+                migration.backupRestoreMutationCutoff
         )
         try await revalidateRunContext(context)
         migration.phase = .prepared
