@@ -115,6 +115,27 @@ extension CloudKitSynchronizer {
                 "BigSyncKit requires a durable local-state store before provider setup"
             )
         }
+        // Retain this process's shared restore lease before an adapter can
+        // open either target or tracking Realm state. Manabi also prepares
+        // the same identity from its mutation-policy bootstrap, but the
+        // library factory must be safe for clients that use it directly.
+        let clientIdentity = BigSyncClientIdentity(
+            synchronizerName: synchronizerName,
+            containerName: containerName,
+            recordZoneID: zoneID,
+            databaseScope: .private,
+            sharedStateBaseURL: backupDetectionBaseURL
+                ?? BackupDetection.defaultSentinelURL(
+                    namespace: durableStateNamespace
+                ).deletingLastPathComponent()
+        )
+        do {
+            _ = try clientIdentity.prepareInstallation()
+        } catch {
+            preconditionFailure(
+                "BigSyncKit installation identity failed before provider setup: \(error)"
+            )
+        }
         let provider = DefaultRealmSwiftAdapterProvider(
             targetConfigurations: configurations,
             excludedClassNames: excludedClassNames,
@@ -156,16 +177,6 @@ extension CloudKitSynchronizer {
         // platform-specific default when the client has no shared app-group
         // state, while production app/extension clients share the explicit
         // app-group base computed above.
-        let clientIdentity = BigSyncClientIdentity(
-            synchronizerName: synchronizerName,
-            containerName: containerName,
-            recordZoneID: zoneID,
-            databaseScope: .private,
-            sharedStateBaseURL: backupDetectionBaseURL
-                ?? BackupDetection.defaultSentinelURL(
-                    namespace: durableStateNamespace
-                ).deletingLastPathComponent()
-        )
         precondition(
             clientIdentity.durableStateNamespace == durableStateNamespace,
             "BigSyncKit mutation and synchronizer durable namespaces diverged"

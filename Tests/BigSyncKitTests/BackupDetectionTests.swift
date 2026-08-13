@@ -373,6 +373,103 @@ final class BackupDetectionTests: XCTestCase {
         )
     }
 
+    func testDurableIntentFencesPeerBeforeReplacementOrEvent() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-pre-replacement-fence",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+        let intent = try BackupDetection.prepareManualRestoreIntent(
+            namespace: identity.durableStateNamespace,
+            transactionIdentifier: transactionIdentifier,
+            sharedSentinelBaseURL: base
+        )
+
+        let peer = BigSyncClientIdentity(
+            synchronizerName: "manual-pre-replacement-fence",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        XCTAssertNil(peer.currentInstallationIdentifier())
+        XCTAssertThrowsError(try peer.prepareInstallation()) { error in
+            guard let restoreError = error as? BigSyncManualBackupRestoreError,
+                  restoreError == .stateAmbiguous else {
+                return XCTFail("Expected the durable intent to fence the peer")
+            }
+        }
+
+        try BackupDetection.cancelManualRestoreIntent(
+            namespace: identity.durableStateNamespace,
+            receipt: intent,
+            sharedSentinelBaseURL: base
+        )
+        XCTAssertNotNil(try peer.prepareInstallation())
+    }
+
+    func testPendingManualRestoreIntentFencesIdentityUntilRollbackCancelsIt() throws {
+        struct ReplacementFailure: Error {}
+
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-intent-fence",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        let originalInstallationIdentifier = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+        _ = try BackupDetection.prepareManualRestoreIntent(
+            namespace: identity.durableStateNamespace,
+            transactionIdentifier: transactionIdentifier,
+            sharedSentinelBaseURL: base
+        )
+
+        XCTAssertNil(identity.currentInstallationIdentifier())
+        XCTAssertThrowsError(try identity.prepareInstallation()) { error in
+            XCTAssertEqual(
+                error as? BigSyncManualBackupRestoreError,
+                .stateAmbiguous
+            )
+        }
+
+        var rollbackCount = 0
+        XCTAssertThrowsError(try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {
+                throw ReplacementFailure()
+            },
+            rollback: {
+                rollbackCount += 1
+            }
+        )) { error in
+            XCTAssertTrue(error is ReplacementFailure)
+        }
+
+        XCTAssertEqual(rollbackCount, 1)
+        XCTAssertFalse(BackupDetection.manualRestoreIntentIsRequired(
+            namespace: identity.durableStateNamespace,
+            sharedSentinelBaseURL: base
+        ))
+        XCTAssertEqual(
+            try identity.prepareInstallation(),
+            originalInstallationIdentifier
+        )
+    }
+
     func testClientIdentityRejectsMismatchedTransactionBeforeReplacement() throws {
         let base = temporaryRoot()
         let identity = BigSyncClientIdentity(
@@ -751,8 +848,45 @@ final class BackupDetectionTests: XCTestCase {
         )
         XCTAssertEqual(BackupDetection.restoreResetEventIdentifier(sentinelURL: restored), event)
 
-        try BackupDetection.markRestoreResetCompleted(sentinelURL: restored)
+        try BackupDetection.markRestoreResetCompleted(
+            sentinelURL: restored,
+            expectedEventIdentifier: event
+        )
         XCTAssertNil(BackupDetection.restoreResetEventIdentifier(sentinelURL: restored))
+    }
+
+    func testRestoreAcknowledgementCannotDeleteANewerEvent() throws {
+        let namespace = "container.private.owner.zone"
+        let installed = temporaryRoot().appendingPathComponent("installed")
+        let restored = temporaryRoot().appendingPathComponent("restored")
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sentinelURL: installed
+        )
+        try simulateRestoredMarker(from: installed, to: restored)
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sentinelURL: restored
+        )
+        let first = try XCTUnwrap(
+            BackupDetection.restoreResetEventIdentifier(sentinelURL: restored)
+        )
+        let second = UUID().uuidString.lowercased()
+        try Data("\(second)\n".utf8).write(
+            to: BackupDetection.restoreEventURL(sentinelURL: restored),
+            options: .atomic
+        )
+
+        XCTAssertThrowsError(try BackupDetection.markRestoreResetCompleted(
+            sentinelURL: restored,
+            expectedEventIdentifier: first
+        ))
+        XCTAssertEqual(
+            BackupDetection.restoreResetEventIdentifier(sentinelURL: restored),
+            second
+        )
     }
 
     func testASecondRestoreReplacesTheCopiedRecoveryEvent() throws {
@@ -827,6 +961,7 @@ final class BackupDetectionTests: XCTestCase {
 
         XCTAssertThrowsError(try BackupDetection.markRestoreResetCompleted(
             sentinelURL: restored,
+            expectedEventIdentifier: event,
             completionSynchronizer: { _ in throw CocoaError(.fileWriteUnknown) }
         )) { error in
             XCTAssertEqual(
@@ -877,8 +1012,15 @@ final class BackupDetectionTests: XCTestCase {
             try BackupDetection.run(store: store, namespace: first, sharedSentinelBaseURL: restoredBase),
             .restoredFromBackup
         )
+        let firstEvent = try XCTUnwrap(
+            BackupDetection.restoreResetEventIdentifier(
+                namespace: first,
+                sharedSentinelBaseURL: restoredBase
+            )
+        )
         try BackupDetection.markRestoreResetCompleted(
             namespace: first,
+            expectedEventIdentifier: firstEvent,
             sharedSentinelBaseURL: restoredBase
         )
 
@@ -910,8 +1052,15 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertEqual(try BackupDetection.run(
             store: store, namespace: first, sharedSentinelBaseURL: restoredBase
         ), .restoredFromBackup)
+        let firstEvent = try XCTUnwrap(
+            BackupDetection.restoreResetEventIdentifier(
+                namespace: first,
+                sharedSentinelBaseURL: restoredBase
+            )
+        )
         try BackupDetection.markRestoreResetCompleted(
             namespace: first,
+            expectedEventIdentifier: firstEvent,
             sharedSentinelBaseURL: restoredBase
         )
 

@@ -976,6 +976,31 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    func testFileKeyValueStorePrepareForUseCannotEraseFailedMutation() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+            .appendingPathComponent("state.plist")
+        let initial = FileKeyValueStore(fileURL: fileURL)
+        try initial.setDurably(value: "old", forKey: "value")
+        let store = FileKeyValueStore(
+            fileURL: fileURL,
+            beforeAtomicReplace: {
+                throw NSError(domain: "BigSyncKitTests.AtomicReplace", code: 9)
+            }
+        )
+        XCTAssertThrowsError(
+            try store.setDurably(value: "new", forKey: "value")
+        )
+
+        XCTAssertThrowsError(try store.prepareForUse())
+        XCTAssertThrowsError(try store.validateDurability())
+        XCTAssertEqual(
+            try FileKeyValueStore(fileURL: fileURL)
+                .durableObject(forKey: "value") as? String,
+            "old"
+        )
+    }
+
     func testFileKeyValueStoreAtomicFailurePreservesOldSnapshotAndCleansTemporaryFile()
     throws {
         let rootURL = FileManager.default.temporaryDirectory

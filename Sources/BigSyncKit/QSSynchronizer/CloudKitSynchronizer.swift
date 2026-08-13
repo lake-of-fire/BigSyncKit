@@ -1245,11 +1245,22 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     @BigSyncBackgroundActor
-    private func completeRestoredBackupRecoveryIfNeeded() throws {
+    private func completeRestoredBackupRecoveryIfNeeded(
+        expectedEventIdentifier: String? = nil
+    ) throws {
         refreshBackupRestoreRequirement()
         guard backupRestoreDetected else { return }
+        guard let expectedEventIdentifier = expectedEventIdentifier
+            ?? activeChangeFeedMigration?.backupRestoreEventIdentifier
+            ?? activeRunContext.flatMap({ context in
+                storedChangeFeedMigrationState(for: context)?
+                    .backupRestoreEventIdentifier
+            }) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
         try BackupDetection.markRestoreResetCompleted(
             namespace: durableStateNamespace,
+            expectedEventIdentifier: expectedEventIdentifier,
             sharedSentinelBaseURL: backupDetectionBaseURL
         )
         refreshBackupRestoreRequirement()
@@ -1902,7 +1913,10 @@ public class CloudKitSynchronizer: NSObject {
             stored = initial
         }
         guard var migration = stored, migration.phase != .completed else {
-            try completeRestoredBackupRecoveryIfNeeded()
+            try completeRestoredBackupRecoveryIfNeeded(
+                expectedEventIdentifier: stored?
+                    .backupRestoreEventIdentifier
+            )
             return
         }
         // `finishing` is the only cross-store ambiguous window: all adapters
@@ -1924,7 +1938,10 @@ public class CloudKitSynchronizer: NSObject {
                 migration.phase = .completed
                 try persistChangeFeedMigrationState(migration)
                 activeChangeFeedMigration = nil
-                try completeRestoredBackupRecoveryIfNeeded()
+                try completeRestoredBackupRecoveryIfNeeded(
+                    expectedEventIdentifier: migration
+                        .backupRestoreEventIdentifier
+                )
                 return
             }
             migration.phase = .requested
@@ -2027,7 +2044,9 @@ public class CloudKitSynchronizer: NSObject {
         migration.phase = .completed
         try persistChangeFeedMigrationState(migration)
         activeChangeFeedMigration = nil
-        try completeRestoredBackupRecoveryIfNeeded()
+        try completeRestoredBackupRecoveryIfNeeded(
+            expectedEventIdentifier: migration.backupRestoreEventIdentifier
+        )
     }
 
 #if DEBUG

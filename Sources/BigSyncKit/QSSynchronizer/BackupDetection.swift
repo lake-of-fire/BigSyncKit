@@ -55,7 +55,10 @@ enum BackupDetection {
 
     enum ManualRestorePreflight: Equatable, Sendable {
         case newTransaction
-        case resume(ManualRestoreReceipt)
+        /// Replacement may be incomplete and rollback is still permitted.
+        case resumeIntent(ManualRestoreReceipt)
+        /// The restore event is durable; rollback is no longer permitted.
+        case resumeEvent(ManualRestoreReceipt)
     }
 
     private static var applicationSupportDirectory: URL {
@@ -74,21 +77,9 @@ enum BackupDetection {
     }
 
     private static func synchronizeParentDirectory(of url: URL) throws {
-        let directoryURL = url.deletingLastPathComponent()
-        let descriptor = Darwin.open(directoryURL.path, O_RDONLY)
-        guard descriptor >= 0 else {
-            throw NSError(
-                domain: NSPOSIXErrorDomain,
-                code: Int(errno)
-            )
-        }
-        defer { Darwin.close(descriptor) }
-        guard Darwin.fsync(descriptor) == 0 else {
-            throw NSError(
-                domain: NSPOSIXErrorDomain,
-                code: Int(errno)
-            )
-        }
+        try bigSyncSynchronizeDirectory(
+            at: url.deletingLastPathComponent()
+        )
     }
 
     private static func synchronizePublishedFile(at url: URL) throws {
@@ -130,6 +121,17 @@ enum BackupDetection {
         sentinelURL.appendingPathExtension("restore-event")
     }
 
+    /// Written before the caller replaces any Realm file. Its presence fences
+    /// peer processes even if the replacing process dies before it can publish
+    /// the restore event and rotate the installation sentinel.
+    static func manualRestoreIntentURL(sentinelURL: URL) -> URL {
+        sentinelURL.appendingPathExtension("restore-intent")
+    }
+
+    private static func restoreEventLockURL(sentinelURL: URL) -> URL {
+        sentinelURL.appendingPathExtension("restore-event-lock")
+    }
+
     /// This ordinary file intentionally remains eligible for backup. It is
     /// paired with the backup-excluded sentinel to distinguish a restored
     /// installation from a first launch. Keeping the pair in the same
@@ -162,6 +164,33 @@ enum BackupDetection {
         )
     }
 
+    static func manualRestoreIntentIsRequired(
+        namespace: String,
+        sharedSentinelBaseURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        let sentinelURL = defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: sharedSentinelBaseURL
+        )
+        return fileManager.fileExists(
+            atPath: manualRestoreIntentURL(sentinelURL: sentinelURL).path
+        )
+    }
+
+    static func manualRestoreIntentReceipt(
+        namespace: String,
+        sharedSentinelBaseURL: URL? = nil
+    ) -> ManualRestoreReceipt? {
+        let sentinelURL = defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: sharedSentinelBaseURL
+        )
+        return manualRestoreReceipt(
+            at: manualRestoreIntentURL(sentinelURL: sentinelURL)
+        )
+    }
+
     /// Detects a restored installation by pairing a backed-up per-client
     /// marker file with a per-client filesystem sentinel excluded from backup.
     ///
@@ -175,6 +204,29 @@ enum BackupDetection {
         sentinelURL: URL,
         eventWriter: ((URL, Data) throws -> Void)? = nil,
         markerWriter: ((URL, Data) throws -> Void)? = nil
+    ) throws -> DetectionResult {
+        try withRestoreStateLock(
+            sentinelURL: sentinelURL,
+            fileManager: fileManager
+        ) {
+            try runLocked(
+                store: store,
+                namespace: namespace,
+                fileManager: fileManager,
+                sentinelURL: sentinelURL,
+                eventWriter: eventWriter,
+                markerWriter: markerWriter
+            )
+        }
+    }
+
+    private static func runLocked(
+        store: KeyValueStore,
+        namespace: String,
+        fileManager: FileManager,
+        sentinelURL: URL,
+        eventWriter: ((URL, Data) throws -> Void)?,
+        markerWriter: ((URL, Data) throws -> Void)?
     ) throws -> DetectionResult {
         precondition(!namespace.isEmpty, "BackupDetection requires a durable client namespace")
 
@@ -298,62 +350,112 @@ enum BackupDetection {
             namespace: namespace,
             sharedBaseURL: sharedSentinelBaseURL
         )
-        let eventURL = restoreEventURL(sentinelURL: sentinelURL)
-        let receipt: ManualRestoreReceipt
-        switch try manualRestorePreflight(
-            namespace: namespace,
-            transactionIdentifier: transactionIdentifier,
-            sharedSentinelBaseURL: sharedSentinelBaseURL,
+        return try withRestoreStateLock(
+            sentinelURL: sentinelURL,
             fileManager: fileManager
         ) {
-        case .resume(let existingReceipt):
-            receipt = existingReceipt
-        case .newTransaction:
-            guard let oldInstallationIdentifier = installationIdentifier(
+            let receipt = try prepareManualRestoreIntentLocked(
+                transactionIdentifier: transactionIdentifier,
                 sentinelURL: sentinelURL,
                 fileManager: fileManager
-            ) else {
+            )
+            let eventURL = restoreEventURL(sentinelURL: sentinelURL)
+            if !fileManager.fileExists(atPath: eventURL.path) {
+                try persistManualRestoreEvent(
+                    receipt,
+                    at: eventURL,
+                    fileManager: fileManager
+                )
+            }
+
+            let currentInstallationIdentifier = installationIdentifier(
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
+            )
+            if currentInstallationIdentifier != receipt.newInstallationIdentifier {
+                guard currentInstallationIdentifier
+                        == receipt.oldInstallationIdentifier else {
+                    throw Error.manualRestoreStateAmbiguous
+                }
+                if let sentinelPublisher {
+                    try sentinelPublisher(sentinelURL, fileManager)
+                } else {
+                    try replaceExcludedSentinel(
+                        at: sentinelURL,
+                        fileManager: fileManager,
+                        data: sentinelData(
+                            installationIdentifier:
+                                receipt.newInstallationIdentifier
+                        )
+                    )
+                }
+            }
+            guard installationIdentifier(
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
+            ) == receipt.newInstallationIdentifier else {
                 throw Error.manualRestoreStateAmbiguous
             }
-            receipt = ManualRestoreReceipt(
-                transactionIdentifier: transactionIdentifier,
-                restoreEventIdentifier: UUID(),
-                oldInstallationIdentifier: oldInstallationIdentifier,
-                newInstallationIdentifier: UUID().uuidString.lowercased()
-            )
-            try persistManualRestoreEvent(
+            try removeManualRestoreIntentLocked(
                 receipt,
-                at: eventURL,
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
+            )
+            return receipt
+        }
+    }
+
+    /// Publishes the cross-process fence before a caller touches Realm files.
+    static func prepareManualRestoreIntent(
+        namespace: String,
+        transactionIdentifier: UUID,
+        sharedSentinelBaseURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) throws -> ManualRestoreReceipt {
+        let sentinelURL = defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: sharedSentinelBaseURL
+        )
+        return try withRestoreStateLock(
+            sentinelURL: sentinelURL,
+            fileManager: fileManager
+        ) {
+            try prepareManualRestoreIntentLocked(
+                transactionIdentifier: transactionIdentifier,
+                sentinelURL: sentinelURL,
                 fileManager: fileManager
             )
         }
+    }
 
-        let currentInstallationIdentifier = installationIdentifier(
+    static func cancelManualRestoreIntent(
+        namespace: String,
+        receipt: ManualRestoreReceipt,
+        sharedSentinelBaseURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) throws {
+        let sentinelURL = defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: sharedSentinelBaseURL
+        )
+        try withRestoreStateLock(
             sentinelURL: sentinelURL,
             fileManager: fileManager
-        )
-        if currentInstallationIdentifier == receipt.newInstallationIdentifier {
-            return receipt
-        }
-        guard currentInstallationIdentifier == receipt.oldInstallationIdentifier else {
-            throw Error.manualRestoreStateAmbiguous
-        }
-        if let sentinelPublisher {
-            try sentinelPublisher(sentinelURL, fileManager)
-        } else {
-            try replaceExcludedSentinel(
-                at: sentinelURL,
-                fileManager: fileManager,
-                data: sentinelData(installationIdentifier: receipt.newInstallationIdentifier)
+        ) {
+            guard !fileManager.fileExists(
+                atPath: restoreEventURL(sentinelURL: sentinelURL).path
+            ), installationIdentifier(
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
+            ) == receipt.oldInstallationIdentifier else {
+                throw Error.manualRestoreStateAmbiguous
+            }
+            try removeManualRestoreIntentLocked(
+                receipt,
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
             )
         }
-        guard installationIdentifier(
-            sentinelURL: sentinelURL,
-            fileManager: fileManager
-        ) == receipt.newInstallationIdentifier else {
-            throw Error.manualRestoreStateAmbiguous
-        }
-        return receipt
     }
 
     /// Inspects only the durable handoff event. Call this while holding the
@@ -370,17 +472,95 @@ enum BackupDetection {
             namespace: namespace,
             sharedBaseURL: sharedSentinelBaseURL
         )
-        let eventURL = restoreEventURL(sentinelURL: sentinelURL)
-        guard fileManager.fileExists(atPath: eventURL.path) else {
-            return .newTransaction
+        return try withRestoreStateLock(
+            sentinelURL: sentinelURL,
+            fileManager: fileManager
+        ) {
+            try manualRestorePreflightLocked(
+                transactionIdentifier: transactionIdentifier,
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
+            )
         }
-        guard let receipt = manualRestoreReceipt(at: eventURL) else {
+    }
+
+    private static func manualRestorePreflightLocked(
+        transactionIdentifier: UUID,
+        sentinelURL: URL,
+        fileManager: FileManager
+    ) throws -> ManualRestorePreflight {
+        let intentURL = manualRestoreIntentURL(sentinelURL: sentinelURL)
+        let eventURL = restoreEventURL(sentinelURL: sentinelURL)
+        let intentExists = fileManager.fileExists(atPath: intentURL.path)
+        let eventExists = fileManager.fileExists(atPath: eventURL.path)
+        guard intentExists || eventExists else { return .newTransaction }
+
+        let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
+        let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil
+        if intentExists && intent == nil || eventExists && event == nil {
+            throw Error.manualRestoreStateAmbiguous
+        }
+        if let intent, let event, intent != event {
+            throw Error.manualRestoreStateAmbiguous
+        }
+        guard let receipt = event ?? intent else {
             throw Error.manualRestoreStateAmbiguous
         }
         guard receipt.transactionIdentifier == transactionIdentifier else {
             throw Error.manualRestoreTransactionMismatch
         }
-        return .resume(receipt)
+        return event != nil ? .resumeEvent(receipt) : .resumeIntent(receipt)
+    }
+
+    private static func prepareManualRestoreIntentLocked(
+        transactionIdentifier: UUID,
+        sentinelURL: URL,
+        fileManager: FileManager
+    ) throws -> ManualRestoreReceipt {
+        switch try manualRestorePreflightLocked(
+            transactionIdentifier: transactionIdentifier,
+            sentinelURL: sentinelURL,
+            fileManager: fileManager
+        ) {
+        case .resumeIntent(let receipt), .resumeEvent(let receipt):
+            return receipt
+        case .newTransaction:
+            guard let oldInstallationIdentifier = installationIdentifier(
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
+            ) else {
+                throw Error.manualRestoreStateAmbiguous
+            }
+            let receipt = ManualRestoreReceipt(
+                transactionIdentifier: transactionIdentifier,
+                restoreEventIdentifier: UUID(),
+                oldInstallationIdentifier: oldInstallationIdentifier,
+                newInstallationIdentifier: UUID().uuidString.lowercased()
+            )
+            try persistManualRestoreIntent(
+                receipt,
+                at: manualRestoreIntentURL(sentinelURL: sentinelURL),
+                fileManager: fileManager
+            )
+            return receipt
+        }
+    }
+
+    private static func removeManualRestoreIntentLocked(
+        _ receipt: ManualRestoreReceipt,
+        sentinelURL: URL,
+        fileManager: FileManager
+    ) throws {
+        let intentURL = manualRestoreIntentURL(sentinelURL: sentinelURL)
+        guard fileManager.fileExists(atPath: intentURL.path) else { return }
+        guard manualRestoreReceipt(at: intentURL) == receipt else {
+            throw Error.manualRestoreStateAmbiguous
+        }
+        try fileManager.removeItem(at: intentURL)
+        try synchronizeParentDirectory(of: intentURL)
+        guard !fileManager.fileExists(atPath: intentURL.path) else {
+            throw Error.manualRestoreStateAmbiguous
+        }
     }
 
     /// Compatibility entry point for internal callers that do not have a
@@ -473,6 +653,7 @@ enum BackupDetection {
     /// their own events even if they share a defaults store and sentinel base.
     static func markRestoreResetCompleted(
         namespace: String,
+        expectedEventIdentifier: String,
         sharedSentinelBaseURL: URL? = nil,
         fileManager: FileManager = .default,
         completionSynchronizer: ((URL) throws -> Void)? = nil
@@ -482,6 +663,7 @@ enum BackupDetection {
                 namespace: namespace,
                 sharedBaseURL: sharedSentinelBaseURL
             ),
+            expectedEventIdentifier: expectedEventIdentifier,
             fileManager: fileManager,
             completionSynchronizer: completionSynchronizer
         )
@@ -489,34 +671,53 @@ enum BackupDetection {
 
     static func markRestoreResetCompleted(
         sentinelURL: URL,
+        expectedEventIdentifier: String,
         fileManager: FileManager = .default,
         completionSynchronizer: ((URL) throws -> Void)? = nil
     ) throws {
-        let url = restoreEventURL(sentinelURL: sentinelURL)
-        guard fileManager.fileExists(atPath: url.path) else { return }
-        guard let eventData = try? Data(contentsOf: url) else {
-            throw Error.restoreEventAcknowledgementVerificationFailed
-        }
-        do {
-            try fileManager.removeItem(at: url)
-            if let completionSynchronizer {
-                try completionSynchronizer(url)
-            } else {
-                try synchronizeParentDirectory(of: url)
-            }
-            guard !fileManager.fileExists(atPath: url.path) else {
+        try withRestoreStateLock(
+            sentinelURL: sentinelURL,
+            fileManager: fileManager
+        ) {
+            let url = restoreEventURL(sentinelURL: sentinelURL)
+            guard fileManager.fileExists(atPath: url.path) else { return }
+            guard let eventData = try? Data(contentsOf: url),
+                  restoreResetEventIdentifier(
+                    sentinelURL: sentinelURL,
+                    fileManager: fileManager
+                  ) == expectedEventIdentifier else {
                 throw Error.restoreEventAcknowledgementVerificationFailed
             }
-        } catch {
-            // Best-effort restoration keeps this process fail-closed as well
-            // as protecting the next launch when the removal cannot be proven
-            // durable. The caller still receives the failure even if repair
-            // succeeds, so it never reports an unverified acknowledgement.
-            if !fileManager.fileExists(atPath: url.path) {
-                try? eventData.write(to: url, options: .atomic)
-                try? synchronizePublishedFile(at: url)
+            do {
+                if let intent = manualRestoreReceipt(
+                    at: manualRestoreIntentURL(sentinelURL: sentinelURL)
+                ), intent.restoreEventIdentifier.uuidString.lowercased()
+                    == expectedEventIdentifier {
+                    try removeManualRestoreIntentLocked(
+                        intent,
+                        sentinelURL: sentinelURL,
+                        fileManager: fileManager
+                    )
+                }
+                try fileManager.removeItem(at: url)
+                if let completionSynchronizer {
+                    try completionSynchronizer(url)
+                } else {
+                    try synchronizeParentDirectory(of: url)
+                }
+                guard !fileManager.fileExists(atPath: url.path) else {
+                    throw Error.restoreEventAcknowledgementVerificationFailed
+                }
+            } catch {
+                // The common event lock prevents a newer writer from being
+                // overwritten by this repair. Restore only the exact event
+                // whose acknowledgement failed.
+                if !fileManager.fileExists(atPath: url.path) {
+                    try? eventData.write(to: url, options: .atomic)
+                    try? synchronizePublishedFile(at: url)
+                }
+                throw Error.restoreEventAcknowledgementVerificationFailed
             }
-            throw Error.restoreEventAcknowledgementVerificationFailed
         }
     }
 
@@ -526,9 +727,9 @@ enum BackupDetection {
         data: Data? = nil
     ) throws {
         let parentURL = sentinelURL.deletingLastPathComponent()
-        try fileManager.createDirectory(
+        try bigSyncCreateDirectoryDurably(
             at: parentURL,
-            withIntermediateDirectories: true
+            fileManager: fileManager
         )
         // Apply and verify the backup-exclusion attribute before the sentinel
         // becomes visible at its final path. An atomic same-directory rename
@@ -589,9 +790,9 @@ enum BackupDetection {
         data: Data? = nil
     ) throws {
         let parentURL = sentinelURL.deletingLastPathComponent()
-        try fileManager.createDirectory(
+        try bigSyncCreateDirectoryDurably(
             at: parentURL,
-            withIntermediateDirectories: true
+            fileManager: fileManager
         )
         let temporaryURL = parentURL.appendingPathComponent(
             ".\(sentinelURL.lastPathComponent).\(UUID().uuidString).replacement"
@@ -639,9 +840,9 @@ enum BackupDetection {
         // the event because the already-published excluded sentinel makes the
         // next run a regular launch.
         let data = Data("\(UUID().uuidString.lowercased())\n".utf8)
-        try fileManager.createDirectory(
+        try bigSyncCreateDirectoryDurably(
             at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+            fileManager: fileManager
         )
         do {
             if let eventWriter {
@@ -660,6 +861,36 @@ enum BackupDetection {
 
     private static func sentinelData(installationIdentifier: String) -> Data {
         Data("\(sentinelHeader)\n\(installationIdentifier)\n".utf8)
+    }
+
+    private static func withRestoreStateLock<T>(
+        sentinelURL: URL,
+        fileManager: FileManager,
+        _ operation: () throws -> T
+    ) throws -> T {
+        let lockURL = restoreEventLockURL(sentinelURL: sentinelURL)
+        try bigSyncCreateDirectoryDurably(
+            at: lockURL.deletingLastPathComponent(),
+            fileManager: fileManager
+        )
+        let descriptor = Darwin.open(
+            lockURL.path,
+            O_CREAT | O_RDWR,
+            S_IRUSR | S_IWUSR
+        )
+        guard descriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        defer { Darwin.close(descriptor) }
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableLockURL = lockURL
+        try mutableLockURL.setResourceValues(values)
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try operation()
     }
 
     static func manualRestoreReceipt(at url: URL) -> ManualRestoreReceipt? {
@@ -681,15 +912,53 @@ enum BackupDetection {
         )
     }
 
+    private static func persistManualRestoreIntent(
+        _ receipt: ManualRestoreReceipt,
+        at url: URL,
+        fileManager: FileManager
+    ) throws {
+        let data = manualRestoreData(receipt)
+        let directory = url.deletingLastPathComponent()
+        try bigSyncCreateDirectoryDurably(
+            at: directory,
+            fileManager: fileManager
+        )
+        let temporaryURL = directory.appendingPathComponent(
+            ".\(url.lastPathComponent).\(UUID().uuidString).tmp"
+        )
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+        try data.write(to: temporaryURL, options: .atomic)
+        try synchronizePublishedFile(at: temporaryURL)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableTemporaryURL = temporaryURL
+        try mutableTemporaryURL.setResourceValues(values)
+        try synchronizeFile(at: temporaryURL)
+        guard try temporaryURL.resourceValues(
+            forKeys: [.isExcludedFromBackupKey]
+        ).isExcludedFromBackup == true,
+        Darwin.rename(temporaryURL.path, url.path) == 0 else {
+            throw Error.restoreEventPersistenceVerificationFailed
+        }
+        try synchronizePublishedFile(at: url)
+        guard manualRestoreReceipt(at: url) == receipt,
+              try url.resourceValues(
+                forKeys: [.isExcludedFromBackupKey]
+              ).isExcludedFromBackup == true else {
+            throw Error.restoreEventPersistenceVerificationFailed
+        }
+    }
+
     private static func persistManualRestoreEvent(
         _ receipt: ManualRestoreReceipt,
         at url: URL,
         fileManager: FileManager
     ) throws {
-        let data = Data(
-            "BigSyncKit manual restore v1\n\(receipt.transactionIdentifier.uuidString.lowercased())\n\(receipt.restoreEventIdentifier.uuidString.lowercased())\n\(receipt.oldInstallationIdentifier)\n\(receipt.newInstallationIdentifier)\nend\n".utf8
+        let data = manualRestoreData(receipt)
+        try bigSyncCreateDirectoryDurably(
+            at: url.deletingLastPathComponent(),
+            fileManager: fileManager
         )
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         do {
             try data.write(to: url, options: .atomic)
             try synchronizePublishedFile(at: url)
@@ -701,14 +970,22 @@ enum BackupDetection {
         }
     }
 
+    private static func manualRestoreData(
+        _ receipt: ManualRestoreReceipt
+    ) -> Data {
+        Data(
+            "BigSyncKit manual restore v1\n\(receipt.transactionIdentifier.uuidString.lowercased())\n\(receipt.restoreEventIdentifier.uuidString.lowercased())\n\(receipt.oldInstallationIdentifier)\n\(receipt.newInstallationIdentifier)\nend\n".utf8
+        )
+    }
+
     private static func persistMarker(
         at url: URL,
         fileManager: FileManager,
         markerWriter: ((URL, Data) throws -> Void)?
     ) throws {
-        try fileManager.createDirectory(
+        try bigSyncCreateDirectoryDurably(
             at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+            fileManager: fileManager
         )
         do {
             if let markerWriter {

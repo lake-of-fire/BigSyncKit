@@ -17,7 +17,7 @@ private let databaseServerChangeTokenKey = "QSDatabaseServerChangeTokenKey"
 
 extension CloudKitSynchronizer {
     
-    static var defaultCustomZoneID: CKRecordZone.ID {
+    nonisolated static var defaultCustomZoneID: CKRecordZone.ID {
         return CKRecordZone.ID(zoneName: customZoneName, ownerName: CKCurrentUserDefaultName)
     }
 

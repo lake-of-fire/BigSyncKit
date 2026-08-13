@@ -66,7 +66,63 @@ public struct BigSyncBackgroundWorkerConfiguration {
         progressHandler: CloudKitSynchronizer.ProgressHandler? = nil,
         logger: Logging.Logger
     ) {
-        mutationPolicy.install(configurations: configurations)
+        let zoneID = recordZoneID ?? CloudKitSynchronizer.defaultCustomZoneID
+        let namespace = CloudKitSynchronizer.makeDurableStateNamespace(
+            identifier: synchronizerName,
+            containerIdentifier: containerName,
+            databaseScope: .private,
+            recordZoneID: zoneID
+        )
+        let sharedStateBaseURL: URL
+        if let localState {
+            sharedStateBaseURL = localState.trackingRealmDirectoryURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(
+                    "BigSyncKitBackupDetection",
+                    isDirectory: true
+                )
+        } else if let suiteName {
+            guard let groupContainerURL = FileManager.default
+                .containerURL(
+                    forSecurityApplicationGroupIdentifier: suiteName
+                ) else {
+                preconditionFailure(
+                    "BigSyncKit cannot resolve the configured App Group \(suiteName)"
+                )
+            }
+            sharedStateBaseURL = groupContainerURL
+                .appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent(
+                    "Application Support",
+                    isDirectory: true
+                )
+                .appendingPathComponent("BigSyncKit", isDirectory: true)
+        } else {
+            sharedStateBaseURL = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            )[0].appendingPathComponent("BigSyncKit", isDirectory: true)
+        }
+        let clientIdentity = BigSyncClientIdentity(
+            synchronizerName: synchronizerName,
+            containerName: containerName,
+            recordZoneID: zoneID,
+            databaseScope: .private,
+            sharedStateBaseURL: sharedStateBaseURL
+        )
+        do {
+            _ = try clientIdentity.prepareInstallation()
+        } catch {
+            preconditionFailure(
+                "BigSyncKit installation identity failed before worker configuration: \(error)"
+            )
+        }
+        mutationPolicy.install(
+            configurations: configurations,
+            installationIdentifierProvider: {
+                clientIdentity.currentInstallationIdentifier()
+            }
+        )
         self.synchronizerName = synchronizerName
         self.containerName = containerName
         self.configurations = configurations

@@ -130,9 +130,8 @@ private enum BigSyncClientIdentityLeaseRegistry {
     private static func lease(at url: URL) throws -> Lease {
         let key = url.standardizedFileURL.path
         if let lease = leases[key] { return lease }
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        try bigSyncCreateDirectoryDurably(
+            at: url.deletingLastPathComponent()
         )
         let descriptor = Darwin.open(url.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else {
@@ -197,10 +196,41 @@ public struct BigSyncClientIdentity: Sendable {
         guard let identifier = publishedInstallationIdentifier() else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        if let pendingManualRestore = BackupDetection.manualRestoreReceipt(
+        let pendingManualEvent = BackupDetection.manualRestoreReceipt(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL
+        )
+        let pendingManualIntent = BackupDetection.manualRestoreIntentReceipt(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL
+        )
+        if BackupDetection.manualRestoreIntentIsRequired(
             namespace: durableStateNamespace,
             sharedSentinelBaseURL: sharedStateBaseURL
         ) {
+            // An intent is the pre-replacement fence. Even if the event and
+            // sentinel were subsequently written, the caller has not proved
+            // its handoff cleanup finished. Do not let another process open
+            // the target Realm until that same transaction resumes it.
+            guard let pendingManualIntent else {
+                throw BigSyncManualBackupRestoreError.stateAmbiguous
+            }
+            guard pendingManualEvent == nil
+                    || pendingManualEvent == pendingManualIntent else {
+                throw BigSyncManualBackupRestoreError.stateAmbiguous
+            }
+            if let pendingManualEvent {
+                // Once the matching event is durable, rollback is no longer
+                // permitted. Surface the exact resumable receipt even though
+                // intent cleanup is still pending, so the owning coordinator
+                // can finish this handoff without guessing.
+                throw BigSyncManualBackupRestoreError.handoffPending(
+                    makeManualRestoreReceipt(pendingManualEvent)
+                )
+            }
+            throw BigSyncManualBackupRestoreError.stateAmbiguous
+        }
+        if let pendingManualRestore = pendingManualEvent {
             let receipt = makeManualRestoreReceipt(pendingManualRestore)
             if identifier == receipt.oldInstallationIdentifier {
                 // The target Realm was replaced under an exclusive lease, but
@@ -209,7 +239,8 @@ public struct BigSyncClientIdentity: Sendable {
                 // replacement with the old installation identity.
                 throw BigSyncManualBackupRestoreError.handoffPending(receipt)
             }
-            guard identifier == receipt.newInstallationIdentifier else {
+            guard identifier == receipt.newInstallationIdentifier,
+                  pendingManualEvent != nil else {
                 throw BigSyncManualBackupRestoreError.stateAmbiguous
             }
         } else if BackupDetection.restoreResetIsRequired(
@@ -231,15 +262,27 @@ public struct BigSyncClientIdentity: Sendable {
         guard let identifier = publishedInstallationIdentifier() else {
             return nil
         }
-        if let pendingManualRestore = BackupDetection.manualRestoreReceipt(
+        let pendingManualEvent = BackupDetection.manualRestoreReceipt(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL
+        )
+        if BackupDetection.manualRestoreIntentIsRequired(
             namespace: durableStateNamespace,
             sharedSentinelBaseURL: sharedStateBaseURL
         ) {
+            // See `prepareInstallation()`: an intent deliberately fences all
+            // mutation attribution until its owning transaction resumes or
+            // cancels it. An event alongside it is still not enough; cleanup
+            // must be durably completed first.
+            return nil
+        }
+        if let pendingManualRestore = pendingManualEvent {
             // A dynamic mutation-generation provider may be called after a
             // runtime handoff failure. Return no identity until the sentinel
             // proves the event's new installation, making such a write fail
             // closed instead of attributing it to the old installation.
-            guard identifier == pendingManualRestore.newInstallationIdentifier
+            guard identifier == pendingManualRestore.newInstallationIdentifier,
+                  pendingManualEvent != nil
             else { return nil }
         } else if BackupDetection.restoreResetIsRequired(
             namespace: durableStateNamespace,
@@ -261,6 +304,42 @@ public struct BigSyncClientIdentity: Sendable {
         transactionIdentifier: UUID
     ) throws -> BigSyncManualBackupRestoreReceipt {
         try withManualBackupRestore(transactionIdentifier: transactionIdentifier) {}
+    }
+
+    /// Removes only a matching pre-replacement intent after the caller has
+    /// durably verified rollback. A durable restore event can never be
+    /// cancelled through this API because it already owns the replacement.
+    public func cancelManualBackupRestoreIntent(
+        transactionIdentifier: UUID
+    ) throws {
+        try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
+            let preflight: BackupDetection.ManualRestorePreflight
+            do {
+                preflight = try BackupDetection.manualRestorePreflight(
+                    namespace: durableStateNamespace,
+                    transactionIdentifier: transactionIdentifier,
+                    sharedSentinelBaseURL: sharedStateBaseURL
+                )
+            } catch BackupDetection.Error.manualRestoreTransactionMismatch {
+                throw BigSyncManualBackupRestoreError.transactionMismatch
+            } catch {
+                throw BigSyncManualBackupRestoreError.stateAmbiguous
+            }
+            switch preflight {
+            case .newTransaction:
+                return
+            case .resumeIntent(let receipt):
+                try BackupDetection.cancelManualRestoreIntent(
+                    namespace: durableStateNamespace,
+                    receipt: receipt,
+                    sharedSentinelBaseURL: sharedStateBaseURL
+                )
+            case .resumeEvent(let receipt):
+                throw BigSyncManualBackupRestoreError.handoffPending(
+                    makeManualRestoreReceipt(receipt)
+                )
+            }
+        }
     }
 
     @available(*, deprecated, message: "Supply a stable transactionIdentifier and persist the returned receipt.")
@@ -308,7 +387,7 @@ public struct BigSyncClientIdentity: Sendable {
             }
 
             switch preflight {
-            case .resume(let existingReceipt):
+            case .resumeEvent(let existingReceipt):
                 let publicReceipt = makeManualRestoreReceipt(existingReceipt)
                 // The caller's journal determines whether this closure is an
                 // idempotent verification/no-op or must finish installing the
@@ -343,15 +422,28 @@ public struct BigSyncClientIdentity: Sendable {
                     )
                 }
 
-            case .newTransaction:
-                guard let installationBeforeReplacement =
-                        publishedInstallationIdentifier() else {
-                    throw BigSyncManualBackupRestoreError.stateAmbiguous
-                }
+            case .newTransaction, .resumeIntent(_):
                 do {
+                    _ = try BackupDetection.prepareManualRestoreIntent(
+                            namespace: durableStateNamespace,
+                            transactionIdentifier: transactionIdentifier,
+                            sharedSentinelBaseURL: sharedStateBaseURL
+                        )
                     try replacement()
                 } catch {
                     try rollback()
+                    if let receipt = try? BackupDetection
+                        .prepareManualRestoreIntent(
+                            namespace: durableStateNamespace,
+                            transactionIdentifier: transactionIdentifier,
+                            sharedSentinelBaseURL: sharedStateBaseURL
+                        ) {
+                        try BackupDetection.cancelManualRestoreIntent(
+                            namespace: durableStateNamespace,
+                            receipt: receipt,
+                            sharedSentinelBaseURL: sharedStateBaseURL
+                        )
+                    }
                     throw error
                 }
 
@@ -365,10 +457,9 @@ public struct BigSyncClientIdentity: Sendable {
                         )
                     )
                 } catch let publicationError {
-                    // Determine whether beginManualRestore made the event
-                    // durable before failing. Only an event-free failure may
-                    // restore the old files. A matching or unreadable event
-                    // requires retaining the replacement and fail-stop resume.
+                    // Determine whether event publication crossed its durable
+                    // boundary. An intent alone still permits verified
+                    // rollback; a durable event never does.
                     let stateAfterFailure: BackupDetection.ManualRestorePreflight
                     do {
                         stateAfterFailure = try BackupDetection.manualRestorePreflight(
@@ -382,7 +473,7 @@ public struct BigSyncClientIdentity: Sendable {
                         throw BigSyncManualBackupRestoreError.stateAmbiguous
                     }
                     switch stateAfterFailure {
-                    case .resume(let receipt):
+                    case .resumeEvent(let receipt):
                         let publicReceipt = makeManualRestoreReceipt(receipt)
                         let currentIdentifier = publishedInstallationIdentifier()
                         guard currentIdentifier
@@ -394,13 +485,18 @@ public struct BigSyncClientIdentity: Sendable {
                         throw BigSyncManualBackupRestoreError.handoffPending(
                             publicReceipt
                         )
-                    case .newTransaction:
-                        guard publishedInstallationIdentifier()
-                                == installationBeforeReplacement else {
-                            throw BigSyncManualBackupRestoreError.stateAmbiguous
-                        }
+                    case .resumeIntent(let receipt):
                         try rollback()
+                        try BackupDetection.cancelManualRestoreIntent(
+                            namespace: durableStateNamespace,
+                            receipt: receipt,
+                            sharedSentinelBaseURL: sharedStateBaseURL
+                        )
                         throw publicationError
+                    case .newTransaction:
+                        // The intent was durably published before replacement;
+                        // losing it without a matching event is ambiguous.
+                        throw BigSyncManualBackupRestoreError.stateAmbiguous
                     }
                 }
             }

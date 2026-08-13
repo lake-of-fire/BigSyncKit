@@ -8,6 +8,66 @@
 import Foundation
 import Darwin
 
+/// Creates every missing path component and durably publishes each directory
+/// entry in its parent before returning. A leaf-directory fsync alone cannot
+/// prove that a newly-created namespace survives power loss: the entry that
+/// names that directory belongs to its parent.
+internal func bigSyncCreateDirectoryDurably(
+    at directoryURL: URL,
+    fileManager: FileManager = .default
+) throws {
+    let targetURL = directoryURL.standardizedFileURL
+    var missingDirectories = [URL]()
+    var cursor = targetURL
+    var isDirectory: ObjCBool = false
+
+    while !fileManager.fileExists(
+        atPath: cursor.path,
+        isDirectory: &isDirectory
+    ) {
+        missingDirectories.append(cursor)
+        let parent = cursor.deletingLastPathComponent().standardizedFileURL
+        guard parent.path != cursor.path else {
+            throw POSIXError(.ENOENT)
+        }
+        cursor = parent
+    }
+    guard isDirectory.boolValue else {
+        throw CocoaError(.fileWriteFileExists)
+    }
+
+    for directory in missingDirectories.reversed() {
+        do {
+            try fileManager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false
+            )
+        } catch {
+            var racedDirectory: ObjCBool = false
+            guard fileManager.fileExists(
+                atPath: directory.path,
+                isDirectory: &racedDirectory
+            ), racedDirectory.boolValue else {
+                throw error
+            }
+        }
+        try bigSyncSynchronizeDirectory(
+            at: directory.deletingLastPathComponent()
+        )
+    }
+}
+
+internal func bigSyncSynchronizeDirectory(at directoryURL: URL) throws {
+    let descriptor = Darwin.open(directoryURL.path, O_RDONLY | O_DIRECTORY)
+    guard descriptor >= 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    defer { Darwin.close(descriptor) }
+    guard Darwin.fsync(descriptor) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+}
+
 
 /// Interface for persisting and loading values.
 @objc public protocol KeyValueStore {
@@ -317,6 +377,10 @@ extension KeyValueStore {
         try lock.withLock {
             try withFileLockThrowing(mode: LOCK_EX) {
                 let storage = try reloadStorageLockedThrowing()
+                if hasUncommittedMutationFailure {
+                    throw lastPersistenceError
+                        ?? DurableKeyValueStoreError.mutationNotDurable
+                }
                 try persistThrowing(storage)
             }
         }
@@ -404,9 +468,8 @@ extension KeyValueStore {
         mode: Int32,
         _ body: () throws -> T
     ) throws -> T {
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        try bigSyncCreateDirectoryDurably(
+            at: fileURL.deletingLastPathComponent()
         )
         let descriptor = Darwin.open(
             lockFileURL.path,
@@ -531,10 +594,9 @@ extension KeyValueStore {
     }
 
     private func synchronizeDirectory() throws {
-        let descriptor = Darwin.open(fileURL.deletingLastPathComponent().path, O_RDONLY)
-        guard descriptor >= 0 else { throw POSIXError(.EIO) }
-        defer { Darwin.close(descriptor) }
-        guard Darwin.fsync(descriptor) == 0 else { throw POSIXError(.EIO) }
+        try bigSyncSynchronizeDirectory(
+            at: fileURL.deletingLastPathComponent()
+        )
     }
 
     private static func loadStorage(from fileURL: URL) -> LoadedStorage {
