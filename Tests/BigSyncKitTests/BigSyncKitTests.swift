@@ -3192,12 +3192,22 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Expected restore recovery durability failure")
         } catch let error as ChangeFeedMigrationPersistenceError {
             XCTAssertEqual(error, .stateNotDurable)
+        } catch let error as DurableKeyValueStoreError {
+            guard case .unavailable = error else {
+                return XCTFail("Expected an unavailable durable store, got \(error)")
+            }
         }
 
         XCTAssertTrue(BackupDetection.restoreResetIsRequired(
             namespace: restored.durableStateNamespace,
             sharedSentinelBaseURL: restoredBase
         ))
+        restored.activeRunContext = CloudKitSynchronizer.RunContext(
+            attemptID: restored.synchronizationAttemptID,
+            runID: restored.synchronizationRunID,
+            accountIdentifier: database.accountIdentifier,
+            accountScopeIdentifier: scope
+        )
         XCTAssertTrue(restored.configuredZoneIsTerminal(zoneID))
         XCTAssertEqual(database.subscriptionFetchCount, 0)
         XCTAssertEqual(database.databaseChangeFetchCount, 0)
