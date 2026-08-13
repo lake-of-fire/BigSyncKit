@@ -689,6 +689,12 @@ enum BackupDetection {
                 throw Error.restoreEventAcknowledgementVerificationFailed
             }
             do {
+                // Retire the optional pre-replacement intent first. A crash
+                // after this point still leaves the authoritative recovery
+                // event in place, so a later synchronization must reconcile
+                // CloudKit again before acknowledging that exact event. The
+                // inverse order can strand an intent with no event and no
+                // owning restore coordinator left to resume it.
                 if let intent = manualRestoreReceipt(
                     at: manualRestoreIntentURL(sentinelURL: sentinelURL)
                 ), intent.restoreEventIdentifier.uuidString.lowercased()
@@ -955,12 +961,21 @@ enum BackupDetection {
         fileManager: FileManager
     ) throws {
         let data = manualRestoreData(receipt)
+        let directory = url.deletingLastPathComponent()
         try bigSyncCreateDirectoryDurably(
-            at: url.deletingLastPathComponent(),
+            at: directory,
             fileManager: fileManager
         )
+        let temporaryURL = directory.appendingPathComponent(
+            ".\(url.lastPathComponent).\(UUID().uuidString).tmp"
+        )
+        defer { try? fileManager.removeItem(at: temporaryURL) }
         do {
-            try data.write(to: url, options: .atomic)
+            try data.write(to: temporaryURL, options: .withoutOverwriting)
+            try synchronizeFile(at: temporaryURL)
+            guard Darwin.rename(temporaryURL.path, url.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
             try synchronizePublishedFile(at: url)
         } catch {
             throw Error.restoreEventPersistenceVerificationFailed

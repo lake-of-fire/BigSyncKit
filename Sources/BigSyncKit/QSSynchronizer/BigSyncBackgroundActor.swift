@@ -67,12 +67,6 @@ public struct BigSyncBackgroundWorkerConfiguration {
         logger: Logging.Logger
     ) {
         let zoneID = recordZoneID ?? CloudKitSynchronizer.defaultCustomZoneID
-        let namespace = CloudKitSynchronizer.makeDurableStateNamespace(
-            identifier: synchronizerName,
-            containerIdentifier: containerName,
-            databaseScope: .private,
-            recordZoneID: zoneID
-        )
         let sharedStateBaseURL: URL
         if let localState {
             sharedStateBaseURL = localState.trackingRealmDirectoryURL
