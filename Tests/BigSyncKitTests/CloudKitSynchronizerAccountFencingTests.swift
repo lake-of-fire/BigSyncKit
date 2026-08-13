@@ -147,10 +147,8 @@ private final class AccountFencingModelAdapter:
     func prepareChangeFeedReset(
         accountScopeIdentifier: String,
         epoch: Int,
-        mode: ChangeFeedResetMode,
-        preservingMutationsChangedAfter cutoff: Date?
+        mode: ChangeFeedResetMode
     ) async throws {
-        _ = cutoff
         _ = accountScopeIdentifier
         _ = epoch
         _ = mode
@@ -460,7 +458,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             "ZoneLifecycle.v3.\(scope).\(zoneB.ownerName).\(zoneB.zoneName)"
         )))
         XCTAssertNil(store.value(forKey: second.durableStateKey(
-            "ChangeFeedMigration.v2.\(scope).\(zoneB.ownerName).\(zoneB.zoneName)"
+            "ChangeFeedMigration.v3.\(scope).\(zoneB.ownerName).\(zoneB.zoneName)"
         )))
 
         XCTAssertNotNil(first.storedDatabaseToken)
@@ -510,7 +508,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             "ZoneLifecycle.v3.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
         )))
         XCTAssertNil(store.value(forKey: synchronizer.durableStateKey(
-            "ChangeFeedMigration.v2.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
+            "ChangeFeedMigration.v3.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
         )))
         XCTAssertEqual(
             store.value(forKey: synchronizer.durableStateKey(
@@ -571,7 +569,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             "account-a"
         )
         XCTAssertTrue(store.valuesWithPrefix(
-            synchronizer.durableStateKey("ChangeFeedMigration.v2")
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
         ).isEmpty)
         XCTAssertEqual(
             synchronizer.storedDatabaseToken?.serializedData,

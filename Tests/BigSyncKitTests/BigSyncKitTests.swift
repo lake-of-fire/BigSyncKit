@@ -2443,7 +2443,8 @@ final class BigSyncKitTests: XCTestCase {
                 recordName: copiedOutboxRecordName,
                 entityType: BigSyncTrackedObject.className(),
                 objectIdentifier: copiedOutboxObject.id,
-                generation: copiedGeneration
+                generation: copiedGeneration,
+                changedAt: .distantFuture
             ))
         }
         try await fixture.persistenceRealm.asyncWrite {
@@ -2686,12 +2687,10 @@ final class BigSyncKitTests: XCTestCase {
             to: restoredMarker
         )
 
-        // Constructing the restored synchronizer durably publishes the shared
-        // restore boundary before any adapter setup. Model a mutation written
-        // afterwards by an app extension or by a process that then relaunched:
-        // its generation is intentionally not this process's prefix, so only
-        // the durable event timestamp protects it from historical-outbox
-        // retirement.
+        // Constructing the restored synchronizer publishes the restore event
+        // and a fresh backup-excluded installation identity. Model a mutation
+        // written afterwards by another process in the same app group: its
+        // process differs, but its installation identity is shared.
         let restored = makeSynchronizer(
             database: database,
             keyValueStore: store,
@@ -2699,10 +2698,17 @@ final class BigSyncKitTests: XCTestCase {
             recordZoneID: fixture.adapter.recordZoneID,
             backupDetectionBaseURL: restoredBase
         )
-        let cutoff = try XCTUnwrap(BackupDetection.restoreResetEventDate(
+        let restoredInstallationIdentifier = try XCTUnwrap(
+            BackupDetection.installationIdentifier(
             namespace: restored.durableStateNamespace,
             sharedSentinelBaseURL: restoredBase
-        ))
+            )
+        )
+        BigSyncMutationTracking.install(
+            configurations: [fixture.targetRealm.configuration],
+            excludedClassNames: [],
+            installationIdentifier: restoredInstallationIdentifier
+        )
         let object = BigSyncTrackedObject(
             id: "shared-host-post-restore-edit",
             createdAt: Date(),
@@ -2711,7 +2717,9 @@ final class BigSyncKitTests: XCTestCase {
         )
         object.tags.append("shared-host-edit")
         let recordName = BigSyncTrackedObject.className() + "." + object.id
-        let generation = "different-process-generation"
+        let generation = BigSyncPendingMutation.makeGeneration(
+            installationIdentifier: restoredInstallationIdentifier
+        )
         try await fixture.targetRealm.asyncWrite {
             fixture.targetRealm.add(object)
             fixture.targetRealm.add(BigSyncPendingMutation(
@@ -2719,7 +2727,7 @@ final class BigSyncKitTests: XCTestCase {
                 entityType: BigSyncTrackedObject.className(),
                 objectIdentifier: object.id,
                 generation: generation,
-                changedAt: cutoff.addingTimeInterval(1)
+                changedAt: .distantPast
             ))
         }
         restored.addModelAdapter(fixture.adapter)
@@ -2818,15 +2826,15 @@ final class BigSyncKitTests: XCTestCase {
             accountScopeIdentifier: CloudKitSynchronizer
                 .accountScopeIdentifier(for: "restore-account")
         )
-        let firstCutoff = Date(timeIntervalSinceReferenceDate: 100)
-        let secondCutoff = Date(timeIntervalSinceReferenceDate: 200)
+        let firstEventIdentifier = UUID().uuidString
+        let secondEventIdentifier = UUID().uuidString
         try synchronizer.requestChangeFeedRecovery(
             context: context,
             mode: .backupRestore,
-            backupRestoreMutationCutoff: firstCutoff
+            backupRestoreEventIdentifier: firstEventIdentifier
         )
         let first = try XCTUnwrap(store.propertyListEntries.first(where: {
-            $0.key.contains("ChangeFeedMigration.v2")
+            $0.key.contains("ChangeFeedMigration.v3")
         })?.value)
         let firstEpoch = try XCTUnwrap(
             (first["epoch"] as? NSNumber)?.intValue
@@ -2835,13 +2843,16 @@ final class BigSyncKitTests: XCTestCase {
         try synchronizer.requestChangeFeedRecovery(
             context: context,
             mode: .backupRestore,
-            backupRestoreMutationCutoff: secondCutoff
+            backupRestoreEventIdentifier: secondEventIdentifier
         )
         let replaced = try XCTUnwrap(store.propertyListEntries.first(where: {
-            $0.key.contains("ChangeFeedMigration.v2")
+            $0.key.contains("ChangeFeedMigration.v3")
         })?.value)
 
-        XCTAssertEqual(replaced["backupRestoreMutationCutoff"] as? Date, secondCutoff)
+        XCTAssertEqual(
+            replaced["backupRestoreEventIdentifier"] as? String,
+            secondEventIdentifier
+        )
         XCTAssertEqual(
             (replaced["epoch"] as? NSNumber)?.intValue,
             firstEpoch + 1
@@ -2981,6 +2992,77 @@ final class BigSyncKitTests: XCTestCase {
             ofType: SyncedEntity.self,
             forPrimaryKey: recordName
         ))
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountReplacementFollowedBySchemaRevisionDoesNotRediscoverPriorAccountObject()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let store = DictionaryKeyValueStore()
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-b"
+        database.completesEmptyZoneChangeOperation = true
+        let object = BigSyncTrackedObject(
+            id: "account-a-retained-across-schema-revision",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(SyncedEntity(
+                entityType: BigSyncTrackedObject.className(),
+                identifier: recordName,
+                state: SyncedEntityState.synced.rawValue
+            ))
+        }
+        let synchronizer = makeSynchronizer(
+            database: database,
+            keyValueStore: store,
+            recordZoneID: fixture.adapter.recordZoneID,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        store.set(
+            value: "account-a",
+            forKey: synchronizer.durableStateKey(
+                "CloudKitAccountIdentifier"
+            )
+        )
+        synchronizer.addModelAdapter(fixture.adapter)
+        _ = try await synchronizer.synchronize()
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: recordName
+        ))
+
+        var revisedTargetConfiguration = fixture.targetRealm.configuration
+        revisedTargetConfiguration.schemaVersion += 1
+        let replacement = RealmSwiftAdapter(
+            persistenceRealmConfiguration:
+                fixture.persistenceRealm.configuration,
+            targetRealmConfigurations: [revisedTargetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: fixture.adapter.recordZoneID,
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        try await replacement._test_setup()
+        let reopenedPersistenceRealm = try XCTUnwrap(
+            replacement.realmProvider?.persistenceRealm
+        )
+
+        XCTAssertNotNil(fixture.targetRealm.object(
+            ofType: BigSyncTrackedObject.self,
+            forPrimaryKey: object.id
+        ))
+        XCTAssertNil(reopenedPersistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(database.modifyRecordsOperationCount, 0)
     }
 
     @BigSyncBackgroundActor
@@ -3489,7 +3571,7 @@ final class BigSyncKitTests: XCTestCase {
         // next synchronization attempt performs the adapter reset/capture.
         XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
         let migration = try XCTUnwrap(store.propertyListEntries.first(where: {
-            $0.key.contains("ChangeFeedMigration.v2")
+            $0.key.contains("ChangeFeedMigration.v3")
         })?.value)
         XCTAssertEqual(migration["phase"] as? String, "requested")
         XCTAssertEqual(migration["mode"] as? String, "serverReconciliation")
@@ -8214,7 +8296,7 @@ final class BigSyncKitTests: XCTestCase {
         let migration = try XCTUnwrap(
             (synchronizer.keyValueStore as? DictionaryKeyValueStore)?
                 .propertyListEntries.first(where: {
-                    $0.key.contains("ChangeFeedMigration.v2")
+                    $0.key.contains("ChangeFeedMigration.v3")
                 })?.value
         )
         let epoch = try XCTUnwrap(
@@ -8396,7 +8478,7 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testVersionedRecoveryFindsPreJournalObjects() async throws {
+    func testVersionedRecoveryDoesNotRediscoverUnjournaledObjects() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let date = Date(timeIntervalSinceReferenceDate: 20_000)
         try await fixture.targetRealm.asyncWrite {
@@ -8420,7 +8502,7 @@ final class BigSyncKitTests: XCTestCase {
 
         try await fixture.adapter._test_setup()
 
-        XCTAssertNotNil(
+        XCTAssertNil(
             fixture.persistenceRealm.object(
                 ofType: SyncedEntity.self,
                 forPrimaryKey: BigSyncTrackedObject.className() + ".pre-journal"
@@ -8438,7 +8520,7 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testCompletedResetAtomicallyMarksRecoveryAndDoesNotSuppressANewSignature()
+    func testCompletedResetAtomicallyMarksRecoveryWithoutRediscoveringOnNewSignature()
     async throws {
         let identifier = UUID().uuidString
         var persistenceConfiguration = RealmSwiftAdapter
@@ -8564,7 +8646,7 @@ final class BigSyncKitTests: XCTestCase {
         let reopenedPersistenceRealm = try XCTUnwrap(
             replacement.realmProvider?.persistenceRealm
         )
-        XCTAssertNotNil(reopenedPersistenceRealm.object(
+        XCTAssertNil(reopenedPersistenceRealm.object(
             ofType: SyncedEntity.self,
             forPrimaryKey: BigSyncTrackedObject.className()
                 + ".discovered-by-new-signature"
@@ -8632,7 +8714,14 @@ final class BigSyncKitTests: XCTestCase {
             startSetupTask: false
         )
 
-        try await adapter._test_setup()
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let synchronizer = makeSynchronizer(
+            database: database,
+            recordZoneID: adapter.recordZoneID
+        )
+        synchronizer.addModelAdapter(adapter)
+        _ = try await synchronizer.synchronize()
         let persistenceRealm = try XCTUnwrap(
             adapter.realmProvider?.persistenceRealm
         )
@@ -8649,6 +8738,14 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: BigSyncTrackedObject.className() + ".cache-only"
             )
         )
+        XCTAssertNotNil(database.record(for: CKRecord.ID(
+            recordName: BigSyncTrackedObject.className() + ".eligible",
+            zoneID: adapter.recordZoneID
+        )))
+        XCTAssertNil(database.record(for: CKRecord.ID(
+            recordName: BigSyncTrackedObject.className() + ".cache-only",
+            zoneID: adapter.recordZoneID
+        )))
     }
 
     @BigSyncBackgroundActor
@@ -9019,7 +9116,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertFalse(synchronizer.configuredZoneIsTerminal(zoneID))
         XCTAssertTrue(store.propertyListEntries.keys.allSatisfy {
-            !$0.contains("ChangeFeedMigration.v2")
+            !$0.contains("ChangeFeedMigration.v3")
         })
     }
 
@@ -9154,7 +9251,7 @@ final class BigSyncKitTests: XCTestCase {
             accountScopeIdentifier: accountScope
         )
         let envelopes = store.propertyListEntries.filter {
-            $0.key.contains("ChangeFeedMigration.v2")
+            $0.key.contains("ChangeFeedMigration.v3")
         }
         XCTAssertEqual(envelopes.count, 1)
         let envelope = try XCTUnwrap(envelopes.values.first)
@@ -9216,7 +9313,7 @@ final class BigSyncKitTests: XCTestCase {
             accountScopeIdentifier: accountScope
         )
         XCTAssertTrue(store.propertyListEntries.keys.allSatisfy {
-            !$0.contains("ChangeFeedMigration.v2")
+            !$0.contains("ChangeFeedMigration.v3")
         })
 
         let reopened = makeSynchronizer(
@@ -9273,7 +9370,7 @@ final class BigSyncKitTests: XCTestCase {
                 mode: .encryptedDataReset
             )
             let entry = try XCTUnwrap(store.propertyListEntries.first(where: {
-                $0.key.contains("ChangeFeedMigration.v2")
+                $0.key.contains("ChangeFeedMigration.v3")
             }))
             var envelope = entry.value
             let epoch = try XCTUnwrap((envelope["epoch"] as? NSNumber)?.intValue)
@@ -9393,12 +9490,12 @@ final class BigSyncKitTests: XCTestCase {
         }
 
         let envelope = try XCTUnwrap(store.propertyListEntries.first(where: {
-            $0.key.contains("ChangeFeedMigration.v2")
+            $0.key.contains("ChangeFeedMigration.v3")
         })?.value)
         XCTAssertEqual(envelope["phase"] as? String, "completed")
         XCTAssertEqual(
             (envelope["epoch"] as? NSNumber)?.intValue,
-            2_000_000_002
+            3_000_000_002
         )
     }
 
@@ -9435,7 +9532,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         try first.requestChangeFeedRecovery(context: context)
         let entry = try XCTUnwrap(store.propertyListEntries.first(where: {
-            $0.key.contains("ChangeFeedMigration.v2")
+            $0.key.contains("ChangeFeedMigration.v3")
         }))
         let epoch = try XCTUnwrap((entry.value["epoch"] as? NSNumber)?.intValue)
         try await fixture.adapter.prepareChangeFeedReset(

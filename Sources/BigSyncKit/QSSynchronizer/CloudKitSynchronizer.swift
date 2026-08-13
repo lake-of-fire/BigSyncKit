@@ -64,7 +64,7 @@ internal func awaitCancellableCloudKitCallback<Value>(
 /// migration can be resumed after a process death before an adapter has opened
 /// its tracking Realm.
 private struct ChangeFeedMigrationState {
-    static let version = 2
+    static let version = 3
     // Epochs are durable adapter identities, not merely counters inside one KVS
     // key. Reserve a disjoint range for each future migration version so a v2
     // reset can never be mistaken for an already-completed v1 reset.
@@ -89,7 +89,7 @@ private struct ChangeFeedMigrationState {
     let epoch: Int
     var mode: ChangeFeedResetMode
     var phase: Phase
-    let backupRestoreMutationCutoff: Date?
+    let backupRestoreEventIdentifier: String?
 
     init(
         key: String,
@@ -98,7 +98,7 @@ private struct ChangeFeedMigrationState {
         epoch: Int,
         mode: ChangeFeedResetMode,
         phase: Phase,
-        backupRestoreMutationCutoff: Date? = nil
+        backupRestoreEventIdentifier: String? = nil
     ) {
         self.key = key
         self.accountScopeIdentifier = accountScopeIdentifier
@@ -107,7 +107,7 @@ private struct ChangeFeedMigrationState {
         self.epoch = epoch
         self.mode = mode
         self.phase = phase
-        self.backupRestoreMutationCutoff = backupRestoreMutationCutoff
+        self.backupRestoreEventIdentifier = backupRestoreEventIdentifier
     }
 
     init?(
@@ -129,11 +129,11 @@ private struct ChangeFeedMigrationState {
               let phase = Phase(rawValue: rawPhase) else {
             return nil
         }
-        let backupRestoreMutationCutoff = propertyList[
-            "backupRestoreMutationCutoff"
-        ] as? Date
+        let backupRestoreEventIdentifier = propertyList[
+            "backupRestoreEventIdentifier"
+        ] as? String
         guard mode != .backupRestore
-            || backupRestoreMutationCutoff != nil else {
+            || backupRestoreEventIdentifier.flatMap(UUID.init(uuidString:)) != nil else {
             return nil
         }
         self.init(
@@ -143,7 +143,7 @@ private struct ChangeFeedMigrationState {
             epoch: epoch,
             mode: mode,
             phase: phase,
-            backupRestoreMutationCutoff: backupRestoreMutationCutoff
+            backupRestoreEventIdentifier: backupRestoreEventIdentifier
         )
     }
 
@@ -157,9 +157,9 @@ private struct ChangeFeedMigrationState {
             "mode": mode.rawValue,
             "phase": phase.rawValue,
         ]
-        if let backupRestoreMutationCutoff {
-            value["backupRestoreMutationCutoff"] =
-                backupRestoreMutationCutoff
+        if let backupRestoreEventIdentifier {
+            value["backupRestoreEventIdentifier"] =
+                backupRestoreEventIdentifier
         }
         return value
     }
@@ -642,7 +642,7 @@ public class CloudKitSynchronizer: NSObject {
     private var allowsRecordZoneRebindingForTesting = false
 #endif
 
-    private static func makeDurableStateNamespace(
+    nonisolated internal static func makeDurableStateNamespace(
         identifier: String,
         containerIdentifier: String,
         databaseScope: CKDatabase.Scope,
@@ -1198,13 +1198,13 @@ public class CloudKitSynchronizer: NSObject {
         guard backupRestoreDetected else {
             return
         }
-        guard let mutationCutoff = BackupDetection.restoreResetEventDate(
+        guard let restoreEventIdentifier = BackupDetection
+            .restoreResetEventIdentifier(
             namespace: durableStateNamespace,
             sharedSentinelBaseURL: backupDetectionBaseURL
         ) else {
-            // An unreadable event remains restore evidence, but without its
-            // publication boundary BigSync cannot safely distinguish copied
-            // outbox generations from edits made by this installation.
+            // An unreadable event remains restore evidence, but cannot safely
+            // identify an idempotent recovery epoch.
             throw CocoaError(.fileReadCorruptFile)
         }
 
@@ -1221,7 +1221,7 @@ public class CloudKitSynchronizer: NSObject {
         try requestChangeFeedRecovery(
             context: context,
             mode: .backupRestore,
-            backupRestoreMutationCutoff: mutationCutoff
+            backupRestoreEventIdentifier: restoreEventIdentifier
         )
         guard let recovery = storedChangeFeedMigrationState(for: context),
               recovery.phase != .completed,
@@ -1772,8 +1772,8 @@ public class CloudKitSynchronizer: NSObject {
               persisted.epoch == state.epoch,
               persisted.mode == state.mode,
               persisted.phase == state.phase,
-              persisted.backupRestoreMutationCutoff
-                == state.backupRestoreMutationCutoff else {
+              persisted.backupRestoreEventIdentifier
+                == state.backupRestoreEventIdentifier else {
             if let previousValue {
                 keyValueStore.set(value: previousValue, forKey: state.key)
             } else {
@@ -1801,13 +1801,13 @@ public class CloudKitSynchronizer: NSObject {
     internal func requestChangeFeedRecovery(
         context: RunContext,
         mode: ChangeFeedResetMode = .serverReconciliation,
-        backupRestoreMutationCutoff: Date? = nil
+        backupRestoreEventIdentifier: String? = nil
     ) throws {
         precondition(
             mode == .backupRestore
-                ? backupRestoreMutationCutoff != nil
-                : backupRestoreMutationCutoff == nil,
-            "Only backup-restore recovery carries a local mutation cutoff"
+                ? backupRestoreEventIdentifier.flatMap(UUID.init(uuidString:)) != nil
+                : backupRestoreEventIdentifier == nil,
+            "Only backup-restore recovery carries a restore event identifier"
         )
         let stateKey = changeFeedMigrationStateKey(for: context)
         let current = storedChangeFeedMigrationState(for: context)
@@ -1817,14 +1817,14 @@ public class CloudKitSynchronizer: NSObject {
         // here would discard evidence captured before the interrupted fetch.
         if let current, current.phase != .completed, current.mode == mode {
             if mode != .backupRestore
-                || current.backupRestoreMutationCutoff
-                    == backupRestoreMutationCutoff {
+                || current.backupRestoreEventIdentifier
+                    == backupRestoreEventIdentifier {
                 return
             }
             // A fresh restore event supersedes an unfinished backup-recovery
             // envelope copied from an older installation. Allocate a new
-            // epoch below so its copied cutoff cannot classify that older
-            // installation's mutations as current local intent.
+            // epoch below so a copied envelope cannot consume the newer
+            // installation's restore event.
         }
 
         // A verified restore event describes the provenance of every migration
@@ -1859,7 +1859,7 @@ public class CloudKitSynchronizer: NSObject {
             epoch: max(previousEpoch + 1, ChangeFeedMigrationState.initialEpoch),
             mode: mode,
             phase: .requested,
-            backupRestoreMutationCutoff: backupRestoreMutationCutoff
+            backupRestoreEventIdentifier: backupRestoreEventIdentifier
         )
         try persistChangeFeedMigrationState(requested)
         activeChangeFeedMigration = nil
@@ -1938,9 +1938,7 @@ public class CloudKitSynchronizer: NSObject {
         try await migratingAdapter.prepareChangeFeedReset(
             accountScopeIdentifier: context.accountScopeIdentifier,
             epoch: migration.epoch,
-            mode: migration.mode,
-            preservingMutationsChangedAfter:
-                migration.backupRestoreMutationCutoff
+            mode: migration.mode
         )
         try await revalidateRunContext(context)
         migration.phase = .prepared

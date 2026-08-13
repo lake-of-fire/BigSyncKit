@@ -19,6 +19,7 @@ import Darwin
 /// treating another client's marker as authoritative.
 enum BackupDetection {
     private static let markerData = Data("BigSyncKit backup marker v4\n".utf8)
+    private static let sentinelHeader = "BigSyncKit installation v1"
 
     enum DetectionResult: Int {
         case firstRun
@@ -179,9 +180,24 @@ enum BackupDetection {
             // only this BigSyncKit tracking file after any required restore
             // event has been made durable.
             if sentinelExists {
-                try fileManager.removeItem(at: sentinelURL)
+                try replaceExcludedSentinel(
+                    at: sentinelURL,
+                    fileManager: fileManager
+                )
+            } else {
+                try createExcludedSentinel(
+                    at: sentinelURL,
+                    fileManager: fileManager
+                )
             }
-            try createExcludedSentinel(
+        } else if installationIdentifier(
+            sentinelURL: sentinelURL,
+            fileManager: fileManager
+        ) == nil {
+            // Cleanly upgrade the old constant-content sentinel. It is
+            // sync-only, backup-excluded state, so replacing it cannot alter
+            // user data or fabricate a restore event.
+            try replaceExcludedSentinel(
                 at: sentinelURL,
                 fileManager: fileManager
             )
@@ -206,6 +222,109 @@ enum BackupDetection {
         }
 
         return result
+    }
+
+    static func installationIdentifier(
+        namespace: String,
+        sharedSentinelBaseURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) -> String? {
+        installationIdentifier(
+            sentinelURL: defaultSentinelURL(
+                namespace: namespace,
+                sharedBaseURL: sharedSentinelBaseURL
+            ),
+            fileManager: fileManager
+        )
+    }
+
+    static func installationIdentifier(
+        sentinelURL: URL,
+        fileManager: FileManager = .default
+    ) -> String? {
+        guard fileManager.fileExists(atPath: sentinelURL.path),
+              let data = try? Data(contentsOf: sentinelURL),
+              let value = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        let lines = value.split(separator: "\n")
+        guard lines.first.map(String.init) == sentinelHeader,
+              lines.count >= 2,
+              let identifier = UUID(uuidString: String(lines[1])) else {
+            return nil
+        }
+        return identifier.uuidString.lowercased()
+    }
+
+    static func beginManualRestore(
+        namespace: String,
+        sharedSentinelBaseURL: URL? = nil,
+        fileManager: FileManager = .default,
+        sentinelPublisher: ((URL, FileManager) throws -> Void)? = nil
+    ) throws -> String {
+        let sentinelURL = defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: sharedSentinelBaseURL
+        )
+        let oldSentinelData = try? Data(contentsOf: sentinelURL)
+        let eventURL = restoreEventURL(sentinelURL: sentinelURL)
+        do {
+            try persistRestoreEvent(
+                at: eventURL,
+                fileManager: fileManager,
+                eventWriter: nil
+            )
+            if let sentinelPublisher {
+                try sentinelPublisher(sentinelURL, fileManager)
+            } else {
+                try replaceExcludedSentinel(
+                    at: sentinelURL,
+                    fileManager: fileManager
+                )
+            }
+            guard let identifier = installationIdentifier(
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
+            ) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            return identifier
+        } catch {
+            let publicationError = error
+            // A failed handoff must not turn the still-current user Realm into
+            // a restored installation. Repair both files before reporting the
+            // failure so the app can roll its Realm replacement back safely.
+            // Keep the recovery event unless the old excluded sentinel has
+            // been republished and verified first.
+            var restoredPreviousInstallation = false
+            if let oldSentinelData {
+                do {
+                    try replaceExcludedSentinel(
+                        at: sentinelURL,
+                        fileManager: fileManager,
+                        data: oldSentinelData
+                    )
+                    let publishedURL = URL(fileURLWithPath: sentinelURL.path)
+                    let publishedData = try Data(contentsOf: publishedURL)
+                    let isExcluded = try publishedURL.resourceValues(
+                        forKeys: [.isExcludedFromBackupKey]
+                    ).isExcludedFromBackup == true
+                    restoredPreviousInstallation = publishedData == oldSentinelData
+                        && isExcluded
+                } catch {
+                    restoredPreviousInstallation = false
+                }
+            }
+            if restoredPreviousInstallation {
+                // This helper restores the event on an unverified removal, so
+                // ignoring its error remains fail-closed for the next launch.
+                try? markRestoreResetCompleted(
+                    sentinelURL: sentinelURL,
+                    fileManager: fileManager
+                )
+            }
+            throw publicationError
+        }
     }
 
     static func run(
@@ -263,56 +382,11 @@ enum BackupDetection {
         let url = restoreEventURL(sentinelURL: sentinelURL)
         guard let data = try? Data(contentsOf: url),
               let value = String(data: data, encoding: .utf8),
-              !value.isEmpty else {
+              let firstLine = value.split(separator: "\n").first,
+              let identifier = UUID(uuidString: String(firstLine)) else {
             return nil
         }
-        return value
-    }
-
-    /// The restore event is published before the new installation sentinel.
-    /// Its filesystem timestamp is therefore a durable lower bound for local
-    /// mutations made after restore recovery began, including mutations from
-    /// another process sharing the same app-group Realm.
-    static func restoreResetEventDate(
-        namespace: String,
-        sharedSentinelBaseURL: URL? = nil,
-        fileManager: FileManager = .default
-    ) -> Date? {
-        restoreResetEventDate(
-            sentinelURL: defaultSentinelURL(
-                namespace: namespace,
-                sharedBaseURL: sharedSentinelBaseURL
-            ),
-            fileManager: fileManager
-        )
-    }
-
-    static func restoreResetEventDate(
-        sentinelURL: URL,
-        fileManager: FileManager = .default
-    ) -> Date? {
-        let eventURL = restoreEventURL(sentinelURL: sentinelURL)
-        guard let data = try? Data(contentsOf: eventURL),
-              let value = String(data: data, encoding: .utf8),
-              let encodedIdentifier = value.split(separator: "\n").first,
-              UUID(uuidString: String(encodedIdentifier)) != nil else {
-            return nil
-        }
-        if let encodedDate = value.split(separator: "\n").dropFirst().first,
-           let interval = TimeInterval(encodedDate),
-           interval.isFinite {
-            return Date(timeIntervalSinceReferenceDate: interval)
-        }
-        // Accept an event created by the earlier v4 implementation during an
-        // interrupted in-place upgrade. Its atomic file publication timestamp
-        // is still a conservative recovery boundary.
-        guard let attributes = try? fileManager.attributesOfItem(
-            atPath: eventURL.path
-        ),
-        let date = attributes[.modificationDate] as? Date else {
-            return nil
-        }
-        return date
+        return identifier.uuidString.lowercased()
     }
 
     /// Acknowledgement is scoped to one durable client. Other clients retain
@@ -368,7 +442,8 @@ enum BackupDetection {
 
     private static func createExcludedSentinel(
         at sentinelURL: URL,
-        fileManager: FileManager
+        fileManager: FileManager,
+        data: Data? = nil
     ) throws {
         let parentURL = sentinelURL.deletingLastPathComponent()
         try fileManager.createDirectory(
@@ -384,7 +459,10 @@ enum BackupDetection {
             ".\(sentinelURL.lastPathComponent).\(UUID().uuidString).tmp"
         )
         defer { try? fileManager.removeItem(at: temporaryURL) }
-        try Data("Backup detection file\n".utf8).write(
+        let sentinelData = data ?? Data(
+            "\(sentinelHeader)\n\(UUID().uuidString.lowercased())\n".utf8
+        )
+        try sentinelData.write(
             to: temporaryURL,
             options: .atomic
         )
@@ -421,6 +499,52 @@ enum BackupDetection {
         try synchronizePublishedFile(at: publishedURL)
     }
 
+    /// Atomically rotates an existing installation sentinel. The replacement
+    /// receives and verifies its backup-exclusion attribute before the POSIX
+    /// rename, so another app-group process never observes a missing identity
+    /// or a final-path sentinel that is temporarily backup eligible.
+    private static func replaceExcludedSentinel(
+        at sentinelURL: URL,
+        fileManager: FileManager,
+        data: Data? = nil
+    ) throws {
+        let parentURL = sentinelURL.deletingLastPathComponent()
+        try fileManager.createDirectory(
+            at: parentURL,
+            withIntermediateDirectories: true
+        )
+        let temporaryURL = parentURL.appendingPathComponent(
+            ".\(sentinelURL.lastPathComponent).\(UUID().uuidString).replacement"
+        )
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+        let sentinelData = data ?? Data(
+            "\(sentinelHeader)\n\(UUID().uuidString.lowercased())\n".utf8
+        )
+        try sentinelData.write(to: temporaryURL, options: .atomic)
+        try synchronizePublishedFile(at: temporaryURL)
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        var mutableTemporaryURL = temporaryURL
+        try mutableTemporaryURL.setResourceValues(resourceValues)
+        try synchronizeFile(at: temporaryURL)
+        guard try temporaryURL.resourceValues(
+            forKeys: [.isExcludedFromBackupKey]
+        ).isExcludedFromBackup == true else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        guard Darwin.rename(temporaryURL.path, sentinelURL.path) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let publishedURL = URL(fileURLWithPath: sentinelURL.path)
+        try synchronizePublishedFile(at: publishedURL)
+        guard try publishedURL.resourceValues(
+            forKeys: [.isExcludedFromBackupKey]
+        ).isExcludedFromBackup == true,
+        try Data(contentsOf: publishedURL) == sentinelData else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
     private static func persistRestoreEvent(
         at url: URL,
         fileManager: FileManager,
@@ -428,17 +552,13 @@ enum BackupDetection {
     ) throws {
         // A restore-event file is intentionally backup eligible. If an
         // interrupted recovery is itself backed up and restored again, the
-        // copied event describes the older installation and cannot delimit
-        // the new installation's mutations. Every actual restore detection
+        // copied UUID describes the older installation and cannot acknowledge
+        // the new installation's recovery. Every actual restore detection
         // (marker present, valid excluded sentinel absent) publishes a fresh
         // event before exposing the new sentinel. Ordinary crash resume keeps
         // the event because the already-published excluded sentinel makes the
         // next run a regular launch.
-        let createdAt = Date()
-        let data = Data(
-            "\(UUID().uuidString)\n\(createdAt.timeIntervalSinceReferenceDate)"
-                .utf8
-        )
+        let data = Data("\(UUID().uuidString.lowercased())\n".utf8)
         try fileManager.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true

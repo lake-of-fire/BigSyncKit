@@ -58,8 +58,7 @@ public protocol ChangeFeedResetMigrating: AnyObject {
     func prepareChangeFeedReset(
         accountScopeIdentifier: String,
         epoch: Int,
-        mode: ChangeFeedResetMode,
-        preservingMutationsChangedAfter cutoff: Date?
+        mode: ChangeFeedResetMode
     ) async throws
     func beginChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
     func isChangeFeedServerBootstrapActive() async -> Bool
@@ -77,8 +76,7 @@ public extension ChangeFeedResetMigrating {
         try await prepareChangeFeedReset(
             accountScopeIdentifier: accountScopeIdentifier,
             epoch: epoch,
-            mode: .serverReconciliation,
-            preservingMutationsChangedAfter: nil
+            mode: .serverReconciliation
         )
     }
 
@@ -90,8 +88,7 @@ public extension ChangeFeedResetMigrating {
         try await prepareChangeFeedReset(
             accountScopeIdentifier: accountScopeIdentifier,
             epoch: epoch,
-            mode: mode,
-            preservingMutationsChangedAfter: nil
+            mode: mode
         )
     }
 

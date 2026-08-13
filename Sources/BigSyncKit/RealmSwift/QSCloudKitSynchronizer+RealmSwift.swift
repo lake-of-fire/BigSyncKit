@@ -97,6 +97,18 @@ extension CloudKitSynchronizer {
             backupDetectionBaseURL: backupDetectionBaseURL,
             logger: logger
         )
+        let durableStateNamespace = synchronizer.durableStateNamespace
+        BigSyncMutationPolicy(
+            excludedClassNames: excludedClassNames
+        ).install(
+            configurations: configurations,
+            installationIdentifierProvider: {
+                BackupDetection.installationIdentifier(
+                    namespace: durableStateNamespace,
+                    sharedSentinelBaseURL: backupDetectionBaseURL
+                )
+            }
+        )
 #if DEBUG
         if allowsDisposableZoneDeletion, localState != nil {
             synchronizer._enableDisposableZoneDeletionForTesting()

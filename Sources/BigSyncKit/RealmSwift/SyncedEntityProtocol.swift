@@ -77,7 +77,7 @@ public extension ChangeMetadataRecordable {
             usingPrimaryKey: primaryKey
         )
         let recordName = entityType + "." + objectIdentifier
-        let generation = BigSyncPendingMutation.makeGeneration()
+        let generation = BigSyncMutationTrackingRegistry.makeGeneration(in: realm)
 
         let mutation = realm.object(
             ofType: BigSyncPendingMutation.self,

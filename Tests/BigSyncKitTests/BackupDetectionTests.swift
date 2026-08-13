@@ -1,6 +1,19 @@
+import CloudKit
+import Darwin
 import Foundation
+import RealmSwift
 import XCTest
 @testable import BigSyncKit
+
+@objc(InstallationIdentityMutationObject)
+private final class InstallationIdentityMutationObject: Object,
+    ChangeMetadataRecordable {
+    @Persisted(primaryKey: true) var id = ""
+    @Persisted var isDeleted = false
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+}
 
 final class BackupDetectionTests: XCTestCase {
     private final class Store: NSObject, KeyValueStore {
@@ -53,10 +66,281 @@ final class BackupDetectionTests: XCTestCase {
             .restoredFromBackup
         )
         XCTAssertNotNil(BackupDetection.restoreResetEventIdentifier(sentinelURL: restored))
-        XCTAssertNotNil(BackupDetection.restoreResetEventDate(
-            sentinelURL: restored
-        ))
         XCTAssertTrue(FileManager.default.fileExists(atPath: restored.path))
+    }
+
+    func testInstallationIdentityIsStableUntilRestoreAndThenRotates() throws {
+        let namespace = "container.private.owner.zone"
+        let installed = temporaryRoot().appendingPathComponent("installed")
+        let restored = temporaryRoot().appendingPathComponent("restored")
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sentinelURL: installed
+        )
+        let installedIdentifier = try XCTUnwrap(
+            BackupDetection.installationIdentifier(sentinelURL: installed)
+        )
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sentinelURL: installed
+        )
+        XCTAssertEqual(
+            BackupDetection.installationIdentifier(sentinelURL: installed),
+            installedIdentifier
+        )
+
+        try simulateRestoredMarker(from: installed, to: restored)
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sentinelURL: restored
+        )
+        let restoredIdentifier = try XCTUnwrap(
+            BackupDetection.installationIdentifier(sentinelURL: restored)
+        )
+        XCTAssertNotEqual(restoredIdentifier, installedIdentifier)
+    }
+
+    func testManualRestorePublishesEventAndRotatesInstallationIdentity() throws {
+        let namespace = "container.private.owner.zone"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        )
+        let oldIdentifier = try XCTUnwrap(
+            BackupDetection.installationIdentifier(
+                namespace: namespace,
+                sharedSentinelBaseURL: base
+            )
+        )
+
+        let newIdentifier = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        )
+
+        XCTAssertNotEqual(newIdentifier, oldIdentifier)
+        XCTAssertEqual(
+            BackupDetection.installationIdentifier(
+                namespace: namespace,
+                sharedSentinelBaseURL: base
+            ),
+            newIdentifier
+        )
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        ))
+    }
+
+    func testManualRestoreDefersWhileAnotherClientHoldsSharedLease() throws {
+        let namespace = "container.private.owner.zone"
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "lease-test",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: namespace,
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let leaseURL = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace,
+            sharedBaseURL: base
+        ).appendingPathExtension("lease")
+        let peerDescriptor = Darwin.open(leaseURL.path, O_RDWR)
+        XCTAssertGreaterThanOrEqual(peerDescriptor, 0)
+        defer { Darwin.close(peerDescriptor) }
+        XCTAssertEqual(flock(peerDescriptor, LOCK_SH), 0)
+
+        var replacementRan = false
+        XCTAssertThrowsError(try identity.withManualBackupRestore {
+            replacementRan = true
+        }) { error in
+            XCTAssertEqual(
+                error as? BigSyncClientIdentityLeaseError,
+                .restoreInProgress
+            )
+        }
+        XCTAssertFalse(replacementRan)
+
+        XCTAssertEqual(flock(peerDescriptor, LOCK_UN), 0)
+        let replacementInstallation = try identity.withManualBackupRestore {
+            replacementRan = true
+        }
+        XCTAssertTrue(replacementRan)
+        XCTAssertEqual(
+            identity.currentInstallationIdentifier(),
+            replacementInstallation
+        )
+    }
+
+    func testFailedReplacementRollsBackBeforeExclusiveLeaseIsReleased() throws {
+        struct ExpectedFailure: Error {}
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "rollback-lease-test",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let leaseURL = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace,
+            sharedBaseURL: base
+        ).appendingPathExtension("lease")
+        var rollbackRanUnderExclusiveLease = false
+
+        XCTAssertThrowsError(try identity.withManualBackupRestore({
+            throw ExpectedFailure()
+        }, rollback: {
+            let peerDescriptor = Darwin.open(leaseURL.path, O_RDWR)
+            XCTAssertGreaterThanOrEqual(peerDescriptor, 0)
+            defer { Darwin.close(peerDescriptor) }
+            rollbackRanUnderExclusiveLease = flock(
+                peerDescriptor,
+                LOCK_SH | LOCK_NB
+            ) == -1
+        }))
+
+        XCTAssertTrue(rollbackRanUnderExclusiveLease)
+        let peerDescriptor = Darwin.open(leaseURL.path, O_RDWR)
+        XCTAssertGreaterThanOrEqual(peerDescriptor, 0)
+        defer { Darwin.close(peerDescriptor) }
+        XCTAssertEqual(flock(peerDescriptor, LOCK_SH | LOCK_NB), 0)
+    }
+
+    func testMutationGenerationObservesInstallationRotationAcrossProcesses()
+    throws {
+        let namespace = "container.private.owner.zone"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        )
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = UUID().uuidString
+        configuration.objectTypes = [
+            InstallationIdentityMutationObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationTracking.install(
+            configurations: [configuration],
+            excludedClassNames: [],
+            installationIdentifierProvider: {
+                BackupDetection.installationIdentifier(
+                    namespace: namespace,
+                    sharedSentinelBaseURL: base
+                )
+            }
+        )
+        let realm = try Realm(configuration: configuration)
+        let object = InstallationIdentityMutationObject()
+        object.id = "object"
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let firstGeneration = try XCTUnwrap(
+            realm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: InstallationIdentityMutationObject.className()
+                    + ".object"
+            )?.generation
+        )
+        let firstInstallation = try XCTUnwrap(
+            BackupDetection.installationIdentifier(
+                namespace: namespace,
+                sharedSentinelBaseURL: base
+            )
+        )
+        XCTAssertTrue(BigSyncPendingMutation.wasCreatedInInstallation(
+            firstGeneration,
+            installationIdentifier: firstInstallation
+        ))
+
+        let secondInstallation = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        )
+        try realm.write {
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let secondGeneration = try XCTUnwrap(
+            realm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: InstallationIdentityMutationObject.className()
+                    + ".object"
+            )?.generation
+        )
+
+        XCTAssertNotEqual(secondInstallation, firstInstallation)
+        XCTAssertTrue(BigSyncPendingMutation.wasCreatedInInstallation(
+            secondGeneration,
+            installationIdentifier: secondInstallation
+        ))
+        XCTAssertFalse(BigSyncPendingMutation.wasCreatedInInstallation(
+            secondGeneration,
+            installationIdentifier: firstInstallation
+        ))
+    }
+
+    func testFailedManualRestoreRestoresExcludedInstallationBeforeClearingEvent() throws {
+        let namespace = "container.private.owner.zone"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        )
+        let sentinelURL = BackupDetection.defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: base
+        )
+        let oldIdentifier = try XCTUnwrap(
+            BackupDetection.installationIdentifier(sentinelURL: sentinelURL)
+        )
+
+        XCTAssertThrowsError(try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            sharedSentinelBaseURL: base,
+            sentinelPublisher: { _, _ in
+                throw CocoaError(.fileWriteUnknown)
+            }
+        ))
+
+        XCTAssertEqual(
+            BackupDetection.installationIdentifier(sentinelURL: sentinelURL),
+            oldIdentifier
+        )
+        XCTAssertEqual(
+            try sentinelURL.resourceValues(
+                forKeys: [.isExcludedFromBackupKey]
+            ).isExcludedFromBackup,
+            true
+        )
+        XCTAssertFalse(BackupDetection.restoreResetIsRequired(
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        ))
+        XCTAssertEqual(
+            try BackupDetection.run(
+                store: store,
+                namespace: namespace,
+                sharedSentinelBaseURL: base
+            ),
+            .regularLaunch
+        )
     }
 
     func testRestoreEventPersistsUntilThatNamespaceAcknowledgesIt() throws {
@@ -187,9 +471,6 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertTrue(BackupDetection.restoreResetIsRequired(
             namespace: namespace,
             sharedSentinelBaseURL: base
-        ))
-        XCTAssertNil(BackupDetection.restoreResetEventDate(
-            sentinelURL: sentinel
         ))
     }
 

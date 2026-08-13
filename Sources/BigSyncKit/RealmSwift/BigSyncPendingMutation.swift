@@ -14,12 +14,27 @@ public final class BigSyncPendingMutation: Object {
     /// synchronizer finishes configuring.
     private static let processGenerationPrefix = UUID().uuidString + ":"
 
+    private static let installationGenerationPrefix = "installation:"
+
     static func makeGeneration() -> String {
         processGenerationPrefix + UUID().uuidString
     }
 
+    static func makeGeneration(installationIdentifier: String) -> String {
+        installationGenerationPrefix + installationIdentifier + ":" + UUID().uuidString
+    }
+
     static func wasCreatedInCurrentProcess(_ generation: String) -> Bool {
         generation.hasPrefix(processGenerationPrefix)
+    }
+
+    static func wasCreatedInInstallation(
+        _ generation: String,
+        installationIdentifier: String
+    ) -> Bool {
+        generation.hasPrefix(
+            installationGenerationPrefix + installationIdentifier + ":"
+        )
     }
 
     @Persisted(primaryKey: true) public var recordName = ""
@@ -53,7 +68,17 @@ public struct BigSyncMutationPolicy: Sendable, Equatable {
         self.excludedClassNames = Array(Set(excludedClassNames)).sorted()
     }
 
-    public func install(configurations: [Realm.Configuration]) {
+    public func install(
+        configurations: [Realm.Configuration],
+        installationIdentifier: String? = nil,
+        installationIdentifierProvider:
+            (@Sendable () -> String?)? = nil
+    ) {
+        precondition(
+            installationIdentifier == nil
+                || installationIdentifierProvider == nil,
+            "Provide either a fixed installation identity or a provider"
+        )
         for configuration in configurations {
             precondition(
                 configuration.objectTypes?.contains(where: {
@@ -64,7 +89,12 @@ public struct BigSyncMutationPolicy: Sendable, Equatable {
         }
         BigSyncMutationTracking.install(
             configurations: configurations,
-            excludedClassNames: excludedClassNames
+            excludedClassNames: excludedClassNames,
+            installationIdentifierProvider:
+                installationIdentifierProvider
+                ?? installationIdentifier.map { identifier in
+                    { @Sendable in identifier }
+                }
         )
     }
 }
@@ -80,7 +110,11 @@ struct BigSyncPendingMutationSnapshot: Sendable {
 
 enum BigSyncMutationTrackingRegistry {
     private static let lock = NSLock()
-    private static var trackedClassNamesByRealm = [String: Set<String>]()
+    private struct Registration {
+        let classNames: Set<String>
+        var installationIdentifierProvider: (@Sendable () -> String?)?
+    }
+    private static var registrationsByRealm = [String: Registration]()
 
     static func identity(for configuration: Realm.Configuration) -> String {
         if let inMemoryIdentifier = configuration.inMemoryIdentifier {
@@ -94,7 +128,8 @@ enum BigSyncMutationTrackingRegistry {
 
     static func register(
         configurations: [Realm.Configuration],
-        excluding excludedClassNames: Set<String>
+        excluding excludedClassNames: Set<String>,
+        installationIdentifierProvider: (@Sendable () -> String?)?
     ) {
         lock.withLock {
             for configuration in configurations {
@@ -104,13 +139,22 @@ enum BigSyncMutationTrackingRegistry {
                         .filter { !excludedClassNames.contains($0) }
                 )
                 let realmIdentity = identity(for: configuration)
-                if let registeredClassNames = trackedClassNamesByRealm[realmIdentity] {
+                if var registration = registrationsByRealm[realmIdentity] {
                     precondition(
-                        registeredClassNames == classNames,
+                        registration.classNames == classNames,
                         "Conflicting BigSync mutation policies registered for \(realmIdentity)"
                     )
+                    if let installationIdentifierProvider {
+                        registration.installationIdentifierProvider =
+                            installationIdentifierProvider
+                        registrationsByRealm[realmIdentity] = registration
+                    }
                 } else {
-                    trackedClassNamesByRealm[realmIdentity] = classNames
+                    registrationsByRealm[realmIdentity] = Registration(
+                        classNames: classNames,
+                        installationIdentifierProvider:
+                            installationIdentifierProvider
+                    )
                 }
             }
         }
@@ -124,13 +168,51 @@ enum BigSyncMutationTrackingRegistry {
 
     static func trackingStatus(className: String, in realm: Realm) -> TrackingStatus {
         lock.withLock {
-            guard let classNames = trackedClassNamesByRealm[
+            guard let classNames = registrationsByRealm[
                 identity(for: realm.configuration)
-            ] else {
+            ]?.classNames else {
                 return .unregistered
             }
             return classNames.contains(className) ? .tracked : .excluded
         }
+    }
+
+    static func makeGeneration(in realm: Realm) -> String {
+        let provider = lock.withLock {
+            registrationsByRealm[
+                identity(for: realm.configuration)
+            ]?.installationIdentifierProvider
+        }
+        guard let provider else {
+            return BigSyncPendingMutation.makeGeneration()
+        }
+        guard let installationIdentifier = provider() else {
+            fatalError(
+                "BigSync installation identity is unavailable for a registered target Realm"
+            )
+        }
+        return BigSyncPendingMutation.makeGeneration(
+            installationIdentifier: installationIdentifier
+        )
+    }
+
+    static func generationWasCreatedInCurrentInstallation(
+        _ generation: String,
+        realm: Realm
+    ) -> Bool {
+        let provider = lock.withLock {
+            registrationsByRealm[
+                identity(for: realm.configuration)
+            ]?.installationIdentifierProvider
+        }
+        guard let provider else {
+            return BigSyncPendingMutation.wasCreatedInCurrentProcess(generation)
+        }
+        guard let installationIdentifier = provider() else { return false }
+        return BigSyncPendingMutation.wasCreatedInInstallation(
+            generation,
+            installationIdentifier: installationIdentifier
+        )
     }
 
 }
@@ -145,13 +227,26 @@ enum BigSyncMutationTrackingRegistry {
 public enum BigSyncMutationTracking {
     public static func install(
         configurations: [Realm.Configuration],
-        excludedClassNames: [String]
+        excludedClassNames: [String],
+        installationIdentifier: String? = nil,
+        installationIdentifierProvider:
+            (@Sendable () -> String?)? = nil
     ) {
+        precondition(
+            installationIdentifier == nil
+                || installationIdentifierProvider == nil,
+            "Provide either a fixed installation identity or a provider"
+        )
         BigSyncMutationTrackingRegistry.register(
             configurations: configurations,
             excluding: Set(
                 excludedClassNames + [BigSyncPendingMutation.className()]
-            )
+            ),
+            installationIdentifierProvider:
+                installationIdentifierProvider
+                ?? installationIdentifier.map { identifier in
+                    { @Sendable in identifier }
+                }
         )
     }
 }

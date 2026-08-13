@@ -857,8 +857,10 @@ public final class RealmSwiftAdapter:
             ofType: RebuildProvenanceState.self,
             forPrimaryKey: RebuildProvenanceState.primaryKeyValue
         )
-        // Completed reset state is historical. A later schema/exclusion
-        // signature change must still receive one broad recovery pass.
+        // Broad object discovery belongs exclusively to the synchronizer's
+        // explicit `.initialImport` migration. A schema/exclusion change,
+        // account replacement, or tracking loss cannot infer new user intent
+        // from the mere continued existence of a target object.
         let skipsBroadDiscovery = rebuildState?.isActive == true
         let syncEmpty = persistenceRealm.objects(SyncedEntity.self).isEmpty
         // A reset is server-first. It must not turn all surviving target
@@ -929,33 +931,6 @@ public final class RealmSwiftAdapter:
                     fatalError("\(objectClass.className()) must conform to ChangeMetadataRecordable in order to sync with iCloud via BigSyncKit")
                 }
                 
-                if needsInitialSetup {
-                    beforeInitialSetup?()
-                    
-                    var results = targetReaderRealm.objects(objectClass)
-                    if let eligibilityType = objectClass
-                        as? CloudKitInitialSyncEligibilityModel.Type {
-                        results = results.filter(
-                            eligibilityType.initialCloudKitSyncEligibilityPredicate
-                        )
-                    }
-                    let entityTypePrefix = schema.className + "."
-                    let primaryKey = (objectClass.primaryKey() ?? objectClass.sharedSchema()?.primaryKeyProperty?.name)!
-                    var identifiers: [String] = []
-                    identifiers.reserveCapacity(results.count)
-                    for result in results {
-                        identifiers.append(entityTypePrefix + Self.getTargetObjectStringIdentifier(for: result, usingPrimaryKey: primaryKey))
-                    }
-                    do {
-                        try await createSyncedEntities(entityType: schema.className, identifiers: identifiers)
-                    } catch is CancellationError {
-                        isSetupInterrupted = true
-                        throw CancellationError()
-                    } catch {
-                        isSetupInterrupted = true
-                        throw error
-                    }
-                }
             }
         }
         
@@ -965,28 +940,16 @@ public final class RealmSwiftAdapter:
         observeRealmChanges()
 
         if needsInitialSetup {
+            beforeInitialSetup?()
             try await updateCreatedAndModified(notifyDelegate: false)
             try await markMutationJournalRecoveryComplete(
                 in: persistenceRealm,
                 markerIDs: recoveryMarkerIDs
             )
         } else if needsMutationJournalRecovery && !skipsBroadDiscovery {
-            // This is the only broad scan for clients that carry the journal
-            // schema. It recovers changes made by older builds and records that
-            // predate durable changed-ID tracking.
-            do {
-                try await createMissingSyncedEntities()
-            } catch is CancellationError {
-                isSetupInterrupted = true
-                throw CancellationError()
-            } catch {
-                isSetupInterrupted = true
-                throw error
-            }
-            await enqueueCreatedAndModified(
-                includeOnlyInitialSyncEligible: true
-            )
-            try await processEnqueuedChanges(notifyDelegate: false)
+            // A new schema/exclusion signature records ownership only. Existing
+            // target objects become upload work solely through their durable
+            // mutation journal, never through a later whole-Realm scan.
             try await updateCreatedAndModified(notifyDelegate: false)
             try await markMutationJournalRecoveryComplete(
                 in: persistenceRealm,
@@ -3520,8 +3483,7 @@ public final class RealmSwiftAdapter:
     public func prepareChangeFeedReset(
         accountScopeIdentifier: String,
         epoch: Int,
-        mode: ChangeFeedResetMode,
-        preservingMutationsChangedAfter cutoff: Date?
+        mode: ChangeFeedResetMode
     ) async throws {
         let persistenceRealm = try await Realm(
             configuration: persistenceRealmConfiguration,
@@ -3573,20 +3535,13 @@ public final class RealmSwiftAdapter:
             // truth or resurrect a remotely deleted record. Target objects are
             // deliberately retained and become uploadable again only after a
             // genuine post-restore user mutation creates a fresh generation.
-            guard let cutoff else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            try await retireRestoredMutationJournal(
-                preservingMutationsChangedAfter: cutoff
-            )
+            try await retireRestoredMutationJournal()
         }
         try await resetSyncCaches()
     }
 
     @BigSyncBackgroundActor
-    private func retireRestoredMutationJournal(
-        preservingMutationsChangedAfter cutoff: Date
-    ) async throws {
+    private func retireRestoredMutationJournal() async throws {
         var openedRealmIdentities = Set<String>()
         for configuration in targetRealmConfigurations {
             let identity = configuration.inMemoryIdentifier
@@ -3601,10 +3556,11 @@ public final class RealmSwiftAdapter:
             )
             let restoredMutations = Array(
                 targetRealm.objects(BigSyncPendingMutation.self).filter {
-                    !BigSyncPendingMutation.wasCreatedInCurrentProcess(
-                        $0.generation
-                    )
-                    && $0.changedAt < cutoff
+                    !BigSyncMutationTrackingRegistry
+                        .generationWasCreatedInCurrentInstallation(
+                            $0.generation,
+                            realm: targetRealm
+                        )
                 }
             )
             guard !restoredMutations.isEmpty else { continue }
@@ -3761,6 +3717,8 @@ public final class RealmSwiftAdapter:
                             recordName: candidate.identifier,
                             entityType: candidate.entityType,
                             objectIdentifier: candidate.objectIdentifier,
+                            generation: BigSyncMutationTrackingRegistry
+                                .makeGeneration(in: targetRealm),
                             changedAt: changedAt
                         ))
                     }
