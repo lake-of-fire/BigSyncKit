@@ -186,6 +186,88 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertEqual(resumed, first)
     }
 
+    func testManualRestoreReturnsSameReceiptAfterPeerAcknowledgesEventBeforeCallerJournal()
+    throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-event-ack-before-journal",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+        var replacementCount = 0
+
+        let first = try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {
+                replacementCount += 1
+            }
+        )
+        let sentinelURL = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace,
+            sharedBaseURL: base
+        )
+        let completedReceiptURL = BackupDetection
+            .completedManualRestoreReceiptURL(sentinelURL: sentinelURL)
+        XCTAssertEqual(
+            try completedReceiptURL.resourceValues(
+                forKeys: [.isExcludedFromBackupKey]
+            ).isExcludedFromBackup,
+            true
+        )
+        try BackupDetection.markRestoreResetCompleted(
+            namespace: identity.durableStateNamespace,
+            expectedEventIdentifier:
+                first.restoreEventIdentifier.uuidString.lowercased(),
+            sharedSentinelBaseURL: base
+        )
+        XCTAssertFalse(BackupDetection.restoreResetIsRequired(
+            namespace: identity.durableStateNamespace,
+            sharedSentinelBaseURL: base
+        ))
+        XCTAssertThrowsError(try identity.cancelManualBackupRestoreIntent(
+            transactionIdentifier: transactionIdentifier
+        )) { error in
+            guard let restoreError = error as? BigSyncManualBackupRestoreError,
+                  case .handoffPending(let receipt) = restoreError else {
+                return XCTFail("A completed handoff must never authorize rollback")
+            }
+            XCTAssertEqual(receipt, first)
+        }
+
+        let resumed = try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {
+                replacementCount += 1
+            }
+        )
+
+        XCTAssertEqual(resumed, first)
+        XCTAssertEqual(replacementCount, 1)
+        XCTAssertEqual(
+            identity.currentInstallationIdentifier(),
+            first.newInstallationIdentifier
+        )
+
+        let next = try identity.withManualBackupRestore(
+            transactionIdentifier: UUID(),
+            {
+                replacementCount += 1
+            }
+        )
+        XCTAssertNotEqual(next, first)
+        XCTAssertEqual(
+            next.oldInstallationIdentifier,
+            first.newInstallationIdentifier
+        )
+        XCTAssertEqual(replacementCount, 2)
+    }
+
     func testManualRestoreRejectsMismatchedTransactionWithoutRotatingIdentity() throws {
         let namespace = "manual-mismatched-transaction"
         let base = temporaryRoot()

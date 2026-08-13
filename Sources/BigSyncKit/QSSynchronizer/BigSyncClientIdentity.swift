@@ -334,7 +334,7 @@ public struct BigSyncClientIdentity: Sendable {
                     receipt: receipt,
                     sharedSentinelBaseURL: sharedStateBaseURL
                 )
-            case .resumeEvent(let receipt):
+            case .resumeEvent(let receipt), .completed(let receipt):
                 throw BigSyncManualBackupRestoreError.handoffPending(
                     makeManualRestoreReceipt(receipt)
                 )
@@ -387,6 +387,9 @@ public struct BigSyncClientIdentity: Sendable {
             }
 
             switch preflight {
+            case .completed(let existingReceipt):
+                return makeManualRestoreReceipt(existingReceipt)
+
             case .resumeEvent(let existingReceipt):
                 let publicReceipt = makeManualRestoreReceipt(existingReceipt)
                 // The caller's journal determines whether this closure is an
@@ -473,6 +476,8 @@ public struct BigSyncClientIdentity: Sendable {
                         throw BigSyncManualBackupRestoreError.stateAmbiguous
                     }
                     switch stateAfterFailure {
+                    case .completed(let receipt):
+                        return makeManualRestoreReceipt(receipt)
                     case .resumeEvent(let receipt):
                         let publicReceipt = makeManualRestoreReceipt(receipt)
                         let currentIdentifier = publishedInstallationIdentifier()

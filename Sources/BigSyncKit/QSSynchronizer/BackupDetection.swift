@@ -59,6 +59,10 @@ enum BackupDetection {
         case resumeIntent(ManualRestoreReceipt)
         /// The restore event is durable; rollback is no longer permitted.
         case resumeEvent(ManualRestoreReceipt)
+        /// CloudKit already acknowledged the event, but the caller may have
+        /// crashed before recording the returned receipt. The excluded local
+        /// receipt makes that exact transaction permanently idempotent.
+        case completed(ManualRestoreReceipt)
     }
 
     private static var applicationSupportDirectory: URL {
@@ -126,6 +130,14 @@ enum BackupDetection {
     /// the restore event and rotate the installation sentinel.
     static func manualRestoreIntentURL(sentinelURL: URL) -> URL {
         sentinelURL.appendingPathExtension("restore-intent")
+    }
+
+    /// Backup-excluded proof retained after CloudKit acknowledges the restore
+    /// event. Without it, a caller crash between BigSync returning and its own
+    /// journal commit could later look like a brand-new restore after a peer
+    /// process consumes the event.
+    static func completedManualRestoreReceiptURL(sentinelURL: URL) -> URL {
+        sentinelURL.appendingPathExtension("manual-restore-receipt")
     }
 
     private static func restoreEventLockURL(sentinelURL: URL) -> URL {
@@ -354,6 +366,13 @@ enum BackupDetection {
             sentinelURL: sentinelURL,
             fileManager: fileManager
         ) {
+            if case .completed(let receipt) = try manualRestorePreflightLocked(
+                transactionIdentifier: transactionIdentifier,
+                sentinelURL: sentinelURL,
+                fileManager: fileManager
+            ) {
+                return receipt
+            }
             let receipt = try prepareManualRestoreIntentLocked(
                 transactionIdentifier: transactionIdentifier,
                 sentinelURL: sentinelURL,
@@ -396,6 +415,13 @@ enum BackupDetection {
             ) == receipt.newInstallationIdentifier else {
                 throw Error.manualRestoreStateAmbiguous
             }
+            try persistManualRestoreReceiptExcludingBackup(
+                receipt,
+                at: completedManualRestoreReceiptURL(
+                    sentinelURL: sentinelURL
+                ),
+                fileManager: fileManager
+            )
             try removeManualRestoreIntentLocked(
                 receipt,
                 sentinelURL: sentinelURL,
@@ -458,10 +484,10 @@ enum BackupDetection {
         }
     }
 
-    /// Inspects only the durable handoff event. Call this while holding the
-    /// client lease before touching a target Realm: a matching event proves a
-    /// previous invocation completed its replacement, while a mismatch must
-    /// fail before another replacement can begin.
+    /// Inspects the durable intent, event, and last completed receipt. Call
+    /// this while holding the client lease before touching a target Realm: a
+    /// matching record proves which phase owns the replacement, while a
+    /// mismatch must fail before another replacement can begin.
     static func manualRestorePreflight(
         namespace: String,
         transactionIdentifier: UUID,
@@ -493,7 +519,24 @@ enum BackupDetection {
         let eventURL = restoreEventURL(sentinelURL: sentinelURL)
         let intentExists = fileManager.fileExists(atPath: intentURL.path)
         let eventExists = fileManager.fileExists(atPath: eventURL.path)
-        guard intentExists || eventExists else { return .newTransaction }
+        if !intentExists && !eventExists {
+            let completedURL = completedManualRestoreReceiptURL(
+                sentinelURL: sentinelURL
+            )
+            guard fileManager.fileExists(atPath: completedURL.path) else {
+                return .newTransaction
+            }
+            guard let completed = manualRestoreReceipt(at: completedURL),
+                  installationIdentifier(
+                    sentinelURL: sentinelURL,
+                    fileManager: fileManager
+                  ) == completed.newInstallationIdentifier else {
+                throw Error.manualRestoreStateAmbiguous
+            }
+            return completed.transactionIdentifier == transactionIdentifier
+                ? .completed(completed)
+                : .newTransaction
+        }
 
         let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
         let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil
@@ -522,7 +565,8 @@ enum BackupDetection {
             sentinelURL: sentinelURL,
             fileManager: fileManager
         ) {
-        case .resumeIntent(let receipt), .resumeEvent(let receipt):
+        case .resumeIntent(let receipt), .resumeEvent(let receipt),
+             .completed(let receipt):
             return receipt
         case .newTransaction:
             guard let oldInstallationIdentifier = installationIdentifier(
@@ -919,6 +963,18 @@ enum BackupDetection {
     }
 
     private static func persistManualRestoreIntent(
+        _ receipt: ManualRestoreReceipt,
+        at url: URL,
+        fileManager: FileManager
+    ) throws {
+        try persistManualRestoreReceiptExcludingBackup(
+            receipt,
+            at: url,
+            fileManager: fileManager
+        )
+    }
+
+    private static func persistManualRestoreReceiptExcludingBackup(
         _ receipt: ManualRestoreReceipt,
         at url: URL,
         fileManager: FileManager
