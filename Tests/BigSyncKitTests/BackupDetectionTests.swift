@@ -445,8 +445,12 @@ final class BackupDetectionTests: XCTestCase {
 
         XCTAssertEqual(replacementInvocationCount, 0)
         XCTAssertEqual(rollbackInvocationCount, 0)
+        XCTAssertNil(identity.currentInstallationIdentifier())
         XCTAssertEqual(
-            identity.currentInstallationIdentifier(),
+            BackupDetection.installationIdentifier(
+                namespace: identity.durableStateNamespace,
+                sharedSentinelBaseURL: base
+            ),
             originalInstallationIdentifier
         )
         XCTAssertTrue(BackupDetection.restoreResetIsRequired(
