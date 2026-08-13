@@ -219,6 +219,48 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertEqual(flock(peerDescriptor, LOCK_SH | LOCK_NB), 0)
     }
 
+    func testRollbackFailurePropagatesWhileExclusiveLeaseIsHeld() throws {
+        struct ReplacementFailure: Error {}
+        struct RollbackFailure: Error {}
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "throwing-rollback-lease-test",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let leaseURL = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace,
+            sharedBaseURL: base
+        ).appendingPathExtension("lease")
+        var rollbackHeldExclusiveLease = false
+
+        XCTAssertThrowsError(try identity.withManualBackupRestore({
+            throw ReplacementFailure()
+        }, rollback: {
+            let peerDescriptor = Darwin.open(leaseURL.path, O_RDWR)
+            XCTAssertGreaterThanOrEqual(peerDescriptor, 0)
+            defer { Darwin.close(peerDescriptor) }
+            rollbackHeldExclusiveLease = flock(
+                peerDescriptor,
+                LOCK_SH | LOCK_NB
+            ) == -1
+            throw RollbackFailure()
+        })) { error in
+            XCTAssertTrue(error is RollbackFailure)
+        }
+
+        XCTAssertTrue(rollbackHeldExclusiveLease)
+        let peerDescriptor = Darwin.open(leaseURL.path, O_RDWR)
+        XCTAssertGreaterThanOrEqual(peerDescriptor, 0)
+        defer { Darwin.close(peerDescriptor) }
+        XCTAssertEqual(flock(peerDescriptor, LOCK_SH | LOCK_NB), 0)
+    }
+
     func testMutationGenerationObservesInstallationRotationAcrossProcesses()
     throws {
         let namespace = "container.private.owner.zone"

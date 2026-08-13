@@ -180,7 +180,7 @@ public struct BigSyncClientIdentity: Sendable {
     @discardableResult
     public func withManualBackupRestore<T>(
         _ replacement: () throws -> T,
-        rollback: () -> Void = {}
+        rollback: () throws -> Void = {}
     ) throws -> String {
         try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
             do {
@@ -190,11 +190,15 @@ public struct BigSyncClientIdentity: Sendable {
                     sharedSentinelBaseURL: sharedStateBaseURL
                 )
             } catch {
+                let replacementError = error
                 // The caller's target Realm rollback must complete before the
                 // exclusive app-group lease is downgraded. Otherwise a peer
                 // could journal a write into the transient replacement.
-                rollback()
-                throw error
+                // A throwing rollback deliberately replaces the original
+                // error: callers must treat an unverified repair as the
+                // terminal failure and must not continue into Realm startup.
+                try rollback()
+                throw replacementError
             }
         }
     }
