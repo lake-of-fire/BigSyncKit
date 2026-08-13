@@ -470,6 +470,57 @@ final class BackupDetectionTests: XCTestCase {
         )
     }
 
+    func testManualRestorePublishesIntentBeforeReplacementAndCancelsAfterRollback()
+    throws {
+        struct ReplacementFailure: Error {}
+
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-intent-order",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        let original = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+        var replacementObservedFence = false
+        var rollbackObservedFence = false
+
+        XCTAssertThrowsError(try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {
+                replacementObservedFence =
+                    identity.currentInstallationIdentifier() == nil
+                    && BackupDetection.manualRestoreIntentIsRequired(
+                        namespace: identity.durableStateNamespace,
+                        sharedSentinelBaseURL: base
+                    )
+                throw ReplacementFailure()
+            },
+            rollback: {
+                rollbackObservedFence =
+                    identity.currentInstallationIdentifier() == nil
+                    && BackupDetection.manualRestoreIntentIsRequired(
+                        namespace: identity.durableStateNamespace,
+                        sharedSentinelBaseURL: base
+                    )
+            }
+        )) { error in
+            XCTAssertTrue(error is ReplacementFailure)
+        }
+
+        XCTAssertTrue(replacementObservedFence)
+        XCTAssertTrue(rollbackObservedFence)
+        XCTAssertFalse(BackupDetection.manualRestoreIntentIsRequired(
+            namespace: identity.durableStateNamespace,
+            sharedSentinelBaseURL: base
+        ))
+        XCTAssertEqual(identity.currentInstallationIdentifier(), original)
+    }
+
     func testClientIdentityRejectsMismatchedTransactionBeforeReplacement() throws {
         let base = temporaryRoot()
         let identity = BigSyncClientIdentity(

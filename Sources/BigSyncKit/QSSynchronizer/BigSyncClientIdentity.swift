@@ -423,28 +423,28 @@ public struct BigSyncClientIdentity: Sendable {
                 }
 
             case .newTransaction, .resumeIntent(_):
+                let intentReceipt: BackupDetection.ManualRestoreReceipt
                 do {
-                    _ = try BackupDetection.prepareManualRestoreIntent(
-                            namespace: durableStateNamespace,
-                            transactionIdentifier: transactionIdentifier,
-                            sharedSentinelBaseURL: sharedStateBaseURL
-                        )
+                    intentReceipt = try BackupDetection.prepareManualRestoreIntent(
+                        namespace: durableStateNamespace,
+                        transactionIdentifier: transactionIdentifier,
+                        sharedSentinelBaseURL: sharedStateBaseURL
+                    )
+                } catch BackupDetection.Error.manualRestoreTransactionMismatch {
+                    throw BigSyncManualBackupRestoreError.transactionMismatch
+                } catch BackupDetection.Error.manualRestoreStateAmbiguous {
+                    throw BigSyncManualBackupRestoreError.stateAmbiguous
+                }
+                do {
                     try replacement()
-                } catch {
+                } catch let replacementError {
                     try rollback()
-                    if let receipt = try? BackupDetection
-                        .prepareManualRestoreIntent(
-                            namespace: durableStateNamespace,
-                            transactionIdentifier: transactionIdentifier,
-                            sharedSentinelBaseURL: sharedStateBaseURL
-                        ) {
-                        try BackupDetection.cancelManualRestoreIntent(
-                            namespace: durableStateNamespace,
-                            receipt: receipt,
-                            sharedSentinelBaseURL: sharedStateBaseURL
-                        )
-                    }
-                    throw error
+                    try BackupDetection.cancelManualRestoreIntent(
+                        namespace: durableStateNamespace,
+                        receipt: intentReceipt,
+                        sharedSentinelBaseURL: sharedStateBaseURL
+                    )
+                    throw replacementError
                 }
 
                 do {
