@@ -12,6 +12,50 @@ public enum BigSyncClientIdentityLeaseError: Error, Equatable, Sendable {
     case leaseUnavailable(Int32)
 }
 
+/// The durable identity handoff for one caller-owned backup restore.
+/// Persist this receipt with the caller's restore journal; passing the same
+/// transaction identifier again is the only supported way to resume a crash
+/// after event publication and before that journal commit.
+public struct BigSyncManualBackupRestoreReceipt: Equatable, Sendable {
+    public let transactionIdentifier: UUID
+    public let restoreEventIdentifier: UUID
+    public let oldInstallationIdentifier: String
+    public let newInstallationIdentifier: String
+
+    public init(
+        transactionIdentifier: UUID,
+        restoreEventIdentifier: UUID,
+        oldInstallationIdentifier: String,
+        newInstallationIdentifier: String
+    ) {
+        self.transactionIdentifier = transactionIdentifier
+        self.restoreEventIdentifier = restoreEventIdentifier
+        self.oldInstallationIdentifier = oldInstallationIdentifier
+        self.newInstallationIdentifier = newInstallationIdentifier
+    }
+}
+
+/// A manual restore reached a state in which BigSyncKit can no longer safely
+/// ask the caller to restore the old Realm files.
+///
+/// In particular, once the restore event is durable, rolling the replacement
+/// back would make that event describe a Realm installation that is no longer
+/// present. Callers must retain their replacement, persist their own
+/// transaction as incomplete, and retry with the same transaction identifier.
+public enum BigSyncManualBackupRestoreError: Error, Equatable, Sendable {
+    /// The replacement is installed and its restore event is durable, but
+    /// installation-identity publication has not yet been proven complete.
+    case handoffPending(BigSyncManualBackupRestoreReceipt)
+
+    /// Durable state cannot prove which installation owns the current Realm.
+    /// Continuing or rolling back would both be guesses, so the host must stop
+    /// before opening the target Realm and surface repair/retry diagnostics.
+    case stateAmbiguous
+
+    /// Another durable manual-restore transaction already owns this client.
+    case transactionMismatch
+}
+
 private enum BigSyncClientIdentityLeaseRegistry {
     private enum Mode {
         case shared
@@ -170,37 +214,179 @@ public struct BigSyncClientIdentity: Sendable {
     /// is discarded. The returned fresh installation identity must be installed
     /// for every restored target configuration before it is reopened.
     @discardableResult
+    public func beginManualBackupRestore(
+        transactionIdentifier: UUID
+    ) throws -> BigSyncManualBackupRestoreReceipt {
+        try withManualBackupRestore(transactionIdentifier: transactionIdentifier) {}
+    }
+
+    @available(*, deprecated, message: "Supply a stable transactionIdentifier and persist the returned receipt.")
     public func beginManualBackupRestore() throws -> String {
-        try withManualBackupRestore {}
+        try beginManualBackupRestore(transactionIdentifier: UUID()).newInstallationIdentifier
     }
 
     /// Runs a replacement while no other configured app-group process can
     /// commit a Realm mutation. The fresh identity is published only after the
     /// replacement closure succeeds.
     @discardableResult
+    public func withManualBackupRestore(
+        transactionIdentifier: UUID,
+        _ replacement: () throws -> Void,
+        rollback: () throws -> Void = {}
+    ) throws -> BigSyncManualBackupRestoreReceipt {
+        try withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            replacement,
+            rollback: rollback,
+            sentinelPublisher: nil
+        )
+    }
+
+    /// Test seam for the event-before-sentinel crash prefix. Production always
+    /// uses BackupDetection's atomic excluded-sentinel publisher.
+    func withManualBackupRestore(
+        transactionIdentifier: UUID,
+        _ replacement: () throws -> Void,
+        rollback: () throws -> Void = {},
+        sentinelPublisher: ((URL, FileManager) throws -> Void)?
+    ) throws -> BigSyncManualBackupRestoreReceipt {
+        try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
+            let preflight: BackupDetection.ManualRestorePreflight
+            do {
+                preflight = try BackupDetection.manualRestorePreflight(
+                    namespace: durableStateNamespace,
+                    transactionIdentifier: transactionIdentifier,
+                    sharedSentinelBaseURL: sharedStateBaseURL
+                )
+            } catch BackupDetection.Error.manualRestoreTransactionMismatch {
+                throw BigSyncManualBackupRestoreError.transactionMismatch
+            } catch BackupDetection.Error.manualRestoreStateAmbiguous {
+                throw BigSyncManualBackupRestoreError.stateAmbiguous
+            }
+
+            switch preflight {
+            case .resume(let existingReceipt):
+                let publicReceipt = makeManualRestoreReceipt(existingReceipt)
+                // The caller's journal determines whether this closure is an
+                // idempotent verification/no-op or must finish installing the
+                // replacement. The durable event means rollback is no longer
+                // safe, even if this closure or sentinel publication fails.
+                do {
+                    try replacement()
+                } catch {
+                    throw BigSyncManualBackupRestoreError.handoffPending(
+                        publicReceipt
+                    )
+                }
+                do {
+                    return try makeManualRestoreReceipt(
+                        BackupDetection.beginManualRestore(
+                            namespace: durableStateNamespace,
+                            transactionIdentifier: transactionIdentifier,
+                            sharedSentinelBaseURL: sharedStateBaseURL,
+                            sentinelPublisher: sentinelPublisher
+                        )
+                    )
+                } catch {
+                    let currentIdentifier = currentInstallationIdentifier()
+                    guard currentIdentifier
+                            == publicReceipt.oldInstallationIdentifier
+                            || currentIdentifier
+                            == publicReceipt.newInstallationIdentifier else {
+                        throw BigSyncManualBackupRestoreError.stateAmbiguous
+                    }
+                    throw BigSyncManualBackupRestoreError.handoffPending(
+                        publicReceipt
+                    )
+                }
+
+            case .newTransaction:
+                guard let installationBeforeReplacement =
+                        currentInstallationIdentifier() else {
+                    throw BigSyncManualBackupRestoreError.stateAmbiguous
+                }
+                do {
+                    try replacement()
+                } catch {
+                    try rollback()
+                    throw error
+                }
+
+                do {
+                    return try makeManualRestoreReceipt(
+                        BackupDetection.beginManualRestore(
+                            namespace: durableStateNamespace,
+                            transactionIdentifier: transactionIdentifier,
+                            sharedSentinelBaseURL: sharedStateBaseURL,
+                            sentinelPublisher: sentinelPublisher
+                        )
+                    )
+                } catch let publicationError {
+                    // Determine whether beginManualRestore made the event
+                    // durable before failing. Only an event-free failure may
+                    // restore the old files. A matching or unreadable event
+                    // requires retaining the replacement and fail-stop resume.
+                    let stateAfterFailure: BackupDetection.ManualRestorePreflight
+                    do {
+                        stateAfterFailure = try BackupDetection.manualRestorePreflight(
+                            namespace: durableStateNamespace,
+                            transactionIdentifier: transactionIdentifier,
+                            sharedSentinelBaseURL: sharedStateBaseURL
+                        )
+                    } catch BackupDetection.Error.manualRestoreTransactionMismatch {
+                        throw BigSyncManualBackupRestoreError.transactionMismatch
+                    } catch {
+                        throw BigSyncManualBackupRestoreError.stateAmbiguous
+                    }
+                    switch stateAfterFailure {
+                    case .resume(let receipt):
+                        let publicReceipt = makeManualRestoreReceipt(receipt)
+                        let currentIdentifier = currentInstallationIdentifier()
+                        guard currentIdentifier
+                                == publicReceipt.oldInstallationIdentifier
+                                || currentIdentifier
+                                == publicReceipt.newInstallationIdentifier else {
+                            throw BigSyncManualBackupRestoreError.stateAmbiguous
+                        }
+                        throw BigSyncManualBackupRestoreError.handoffPending(
+                            publicReceipt
+                        )
+                    case .newTransaction:
+                        guard currentInstallationIdentifier()
+                                == installationBeforeReplacement else {
+                            throw BigSyncManualBackupRestoreError.stateAmbiguous
+                        }
+                        try rollback()
+                        throw publicationError
+                    }
+                }
+            }
+        }
+    }
+
+    private func makeManualRestoreReceipt(
+        _ receipt: BackupDetection.ManualRestoreReceipt
+    ) -> BigSyncManualBackupRestoreReceipt {
+        BigSyncManualBackupRestoreReceipt(
+            transactionIdentifier: receipt.transactionIdentifier,
+            restoreEventIdentifier: receipt.restoreEventIdentifier,
+            oldInstallationIdentifier: receipt.oldInstallationIdentifier,
+            newInstallationIdentifier: receipt.newInstallationIdentifier
+        )
+    }
+
+    @available(*, deprecated, message: "Supply a stable transactionIdentifier and persist the returned receipt.")
     public func withManualBackupRestore<T>(
         _ replacement: () throws -> T,
         rollback: () throws -> Void = {}
     ) throws -> String {
-        try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
-            do {
+        try withManualBackupRestore(
+            transactionIdentifier: UUID(),
+            {
                 _ = try replacement()
-                return try BackupDetection.beginManualRestore(
-                    namespace: durableStateNamespace,
-                    sharedSentinelBaseURL: sharedStateBaseURL
-                )
-            } catch {
-                let replacementError = error
-                // The caller's target Realm rollback must complete before the
-                // exclusive app-group lease is downgraded. Otherwise a peer
-                // could journal a write into the transient replacement.
-                // A throwing rollback deliberately replaces the original
-                // error: callers must treat an unverified repair as the
-                // terminal failure and must not continue into Realm startup.
-                try rollback()
-                throw replacementError
-            }
-        }
+            },
+            rollback: rollback
+        ).newInstallationIdentifier
     }
 
     private var leaseURL: URL {

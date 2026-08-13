@@ -38,6 +38,24 @@ enum BackupDetection {
         /// Recovery completed, but removing its durable event could not be
         /// committed to the containing directory.
         case restoreEventAcknowledgementVerificationFailed
+        /// A caller attempted to continue a restore with a transaction other
+        /// than the one durably recorded before identity publication.
+        case manualRestoreTransactionMismatch
+        /// A partial/corrupt handoff cannot prove which Realm installation
+        /// owns the current sentinel. Leave it recoverable, but never guess.
+        case manualRestoreStateAmbiguous
+    }
+
+    struct ManualRestoreReceipt: Equatable, Sendable {
+        let transactionIdentifier: UUID
+        let restoreEventIdentifier: UUID
+        let oldInstallationIdentifier: String
+        let newInstallationIdentifier: String
+    }
+
+    enum ManualRestorePreflight: Equatable, Sendable {
+        case newTransaction
+        case resume(ManualRestoreReceipt)
     }
 
     private static var applicationSupportDirectory: URL {
@@ -258,73 +276,116 @@ enum BackupDetection {
 
     static func beginManualRestore(
         namespace: String,
+        transactionIdentifier: UUID,
         sharedSentinelBaseURL: URL? = nil,
         fileManager: FileManager = .default,
         sentinelPublisher: ((URL, FileManager) throws -> Void)? = nil
-    ) throws -> String {
+    ) throws -> ManualRestoreReceipt {
         let sentinelURL = defaultSentinelURL(
             namespace: namespace,
             sharedBaseURL: sharedSentinelBaseURL
         )
-        let oldSentinelData = try? Data(contentsOf: sentinelURL)
         let eventURL = restoreEventURL(sentinelURL: sentinelURL)
-        do {
-            try persistRestoreEvent(
-                at: eventURL,
-                fileManager: fileManager,
-                eventWriter: nil
-            )
-            if let sentinelPublisher {
-                try sentinelPublisher(sentinelURL, fileManager)
-            } else {
-                try replaceExcludedSentinel(
-                    at: sentinelURL,
-                    fileManager: fileManager
-                )
-            }
-            guard let identifier = installationIdentifier(
+        let receipt: ManualRestoreReceipt
+        switch try manualRestorePreflight(
+            namespace: namespace,
+            transactionIdentifier: transactionIdentifier,
+            sharedSentinelBaseURL: sharedSentinelBaseURL,
+            fileManager: fileManager
+        ) {
+        case .resume(let existingReceipt):
+            receipt = existingReceipt
+        case .newTransaction:
+            guard let oldInstallationIdentifier = installationIdentifier(
                 sentinelURL: sentinelURL,
                 fileManager: fileManager
             ) else {
-                throw CocoaError(.fileReadCorruptFile)
+                throw Error.manualRestoreStateAmbiguous
             }
-            return identifier
-        } catch {
-            let publicationError = error
-            // A failed handoff must not turn the still-current user Realm into
-            // a restored installation. Repair both files before reporting the
-            // failure so the app can roll its Realm replacement back safely.
-            // Keep the recovery event unless the old excluded sentinel has
-            // been republished and verified first.
-            var restoredPreviousInstallation = false
-            if let oldSentinelData {
-                do {
-                    try replaceExcludedSentinel(
-                        at: sentinelURL,
-                        fileManager: fileManager,
-                        data: oldSentinelData
-                    )
-                    let publishedURL = URL(fileURLWithPath: sentinelURL.path)
-                    let publishedData = try Data(contentsOf: publishedURL)
-                    let isExcluded = try publishedURL.resourceValues(
-                        forKeys: [.isExcludedFromBackupKey]
-                    ).isExcludedFromBackup == true
-                    restoredPreviousInstallation = publishedData == oldSentinelData
-                        && isExcluded
-                } catch {
-                    restoredPreviousInstallation = false
-                }
-            }
-            if restoredPreviousInstallation {
-                // This helper restores the event on an unverified removal, so
-                // ignoring its error remains fail-closed for the next launch.
-                try? markRestoreResetCompleted(
-                    sentinelURL: sentinelURL,
-                    fileManager: fileManager
-                )
-            }
-            throw publicationError
+            receipt = ManualRestoreReceipt(
+                transactionIdentifier: transactionIdentifier,
+                restoreEventIdentifier: UUID(),
+                oldInstallationIdentifier: oldInstallationIdentifier,
+                newInstallationIdentifier: UUID().uuidString.lowercased()
+            )
+            try persistManualRestoreEvent(
+                receipt,
+                at: eventURL,
+                fileManager: fileManager
+            )
         }
+
+        let currentInstallationIdentifier = installationIdentifier(
+            sentinelURL: sentinelURL,
+            fileManager: fileManager
+        )
+        if currentInstallationIdentifier == receipt.newInstallationIdentifier {
+            return receipt
+        }
+        guard currentInstallationIdentifier == receipt.oldInstallationIdentifier else {
+            throw Error.manualRestoreStateAmbiguous
+        }
+        if let sentinelPublisher {
+            try sentinelPublisher(sentinelURL, fileManager)
+        } else {
+            try replaceExcludedSentinel(
+                at: sentinelURL,
+                fileManager: fileManager,
+                data: sentinelData(installationIdentifier: receipt.newInstallationIdentifier)
+            )
+        }
+        guard installationIdentifier(
+            sentinelURL: sentinelURL,
+            fileManager: fileManager
+        ) == receipt.newInstallationIdentifier else {
+            throw Error.manualRestoreStateAmbiguous
+        }
+        return receipt
+    }
+
+    /// Inspects only the durable handoff event. Call this while holding the
+    /// client lease before touching a target Realm: a matching event proves a
+    /// previous invocation completed its replacement, while a mismatch must
+    /// fail before another replacement can begin.
+    static func manualRestorePreflight(
+        namespace: String,
+        transactionIdentifier: UUID,
+        sharedSentinelBaseURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) throws -> ManualRestorePreflight {
+        let sentinelURL = defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: sharedSentinelBaseURL
+        )
+        let eventURL = restoreEventURL(sentinelURL: sentinelURL)
+        guard fileManager.fileExists(atPath: eventURL.path) else {
+            return .newTransaction
+        }
+        guard let receipt = manualRestoreReceipt(at: eventURL) else {
+            throw Error.manualRestoreStateAmbiguous
+        }
+        guard receipt.transactionIdentifier == transactionIdentifier else {
+            throw Error.manualRestoreTransactionMismatch
+        }
+        return .resume(receipt)
+    }
+
+    /// Compatibility entry point for internal callers that do not have a
+    /// caller journal. New restore coordinators must supply their own stable
+    /// transaction identifier and retain the full receipt.
+    static func beginManualRestore(
+        namespace: String,
+        sharedSentinelBaseURL: URL? = nil,
+        fileManager: FileManager = .default,
+        sentinelPublisher: ((URL, FileManager) throws -> Void)? = nil
+    ) throws -> String {
+        try beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: UUID(),
+            sharedSentinelBaseURL: sharedSentinelBaseURL,
+            fileManager: fileManager,
+            sentinelPublisher: sentinelPublisher
+        ).newInstallationIdentifier
     }
 
     static func run(
@@ -381,11 +442,17 @@ enum BackupDetection {
     ) -> String? {
         let url = restoreEventURL(sentinelURL: sentinelURL)
         guard let data = try? Data(contentsOf: url),
-              let value = String(data: data, encoding: .utf8),
-              let firstLine = value.split(separator: "\n").first,
-              let identifier = UUID(uuidString: String(firstLine)) else {
+              let value = String(data: data, encoding: .utf8) else {
             return nil
         }
+        let lines = value.split(separator: "\n").map(String.init)
+        if lines.first == "BigSyncKit manual restore v1",
+           lines.count >= 3,
+           let identifier = UUID(uuidString: lines[2]) {
+            return identifier.uuidString.lowercased()
+        }
+        guard let firstLine = lines.first,
+              let identifier = UUID(uuidString: firstLine) else { return nil }
         return identifier.uuidString.lowercased()
     }
 
@@ -574,6 +641,49 @@ enum BackupDetection {
             throw Error.restoreEventPersistenceVerificationFailed
         }
         guard let persisted = try? Data(contentsOf: url), persisted == data else {
+            throw Error.restoreEventPersistenceVerificationFailed
+        }
+    }
+
+    private static func sentinelData(installationIdentifier: String) -> Data {
+        Data("\(sentinelHeader)\n\(installationIdentifier)\n".utf8)
+    }
+
+    private static func manualRestoreReceipt(at url: URL) -> ManualRestoreReceipt? {
+        guard let data = try? Data(contentsOf: url),
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        let lines = value.split(separator: "\n").map(String.init)
+        guard lines.count == 6,
+              lines[0] == "BigSyncKit manual restore v1",
+              let transactionIdentifier = UUID(uuidString: lines[1]),
+              let restoreEventIdentifier = UUID(uuidString: lines[2]),
+              let oldInstallationIdentifier = UUID(uuidString: lines[3]),
+              let newInstallationIdentifier = UUID(uuidString: lines[4]),
+              lines[5] == "end" else { return nil }
+        return ManualRestoreReceipt(
+            transactionIdentifier: transactionIdentifier,
+            restoreEventIdentifier: restoreEventIdentifier,
+            oldInstallationIdentifier: oldInstallationIdentifier.uuidString.lowercased(),
+            newInstallationIdentifier: newInstallationIdentifier.uuidString.lowercased()
+        )
+    }
+
+    private static func persistManualRestoreEvent(
+        _ receipt: ManualRestoreReceipt,
+        at url: URL,
+        fileManager: FileManager
+    ) throws {
+        let data = Data(
+            "BigSyncKit manual restore v1\n\(receipt.transactionIdentifier.uuidString.lowercased())\n\(receipt.restoreEventIdentifier.uuidString.lowercased())\n\(receipt.oldInstallationIdentifier)\n\(receipt.newInstallationIdentifier)\nend\n".utf8
+        )
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        do {
+            try data.write(to: url, options: .atomic)
+            try synchronizePublishedFile(at: url)
+        } catch {
+            throw Error.restoreEventPersistenceVerificationFailed
+        }
+        guard (try? Data(contentsOf: url)) == data else {
             throw Error.restoreEventPersistenceVerificationFailed
         }
     }

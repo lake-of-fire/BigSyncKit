@@ -141,7 +141,10 @@ extension CloudKitSynchronizer {
             terminalZoneDeletionKind: terminalZoneDeletionKind,
             updatedAt: now
         )
-        keyValueStore.set(value: snapshot.propertyList, forKey: syncHealthSnapshotKey)
+        try keyValueStore.bigSyncSetDurably(
+            value: snapshot.propertyList,
+            forKey: syncHealthSnapshotKey
+        )
         postNotification(
             .SynchronizerSyncHealthDidChange,
             userInfo: [cloudKitSynchronizerSyncHealthSnapshotKey: snapshot]

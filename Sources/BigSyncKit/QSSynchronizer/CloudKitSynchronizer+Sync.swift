@@ -159,6 +159,16 @@ extension CloudKitSynchronizer {
                 return
             }
         }
+        do {
+            // Cursor/account/retry setters retain a mutation failure in the
+            // production file store. Revalidate after every terminal write so
+            // an attempt can never mint a success receipt when any critical
+            // local-state commit failed.
+            try keyValueStore.bigSyncValidateDurability()
+        } catch {
+            await failSynchronization(error: error)
+            return
+        }
         reportProgress("terminal-receipt")
         finishSynchronizationDrain(with: .success(result))
         postNotification(.SynchronizerDidSynchronize)
@@ -233,8 +243,8 @@ extension CloudKitSynchronizer {
                     }
                 }
                 if recoveryRequestIsDurable {
-                    self.resetDatabaseToken()
                     do {
+                        try self.resetDatabaseToken()
                         for adapter in modelAdapters {
                             try await adapter.saveToken(nil)
                         }
@@ -307,8 +317,8 @@ extension CloudKitSynchronizer {
                 }
             }
             if recoveryRequestIsDurable {
-                resetDatabaseToken()
                 do {
+                    try resetDatabaseToken()
                     for adapter in modelAdapters {
                         try await adapter.saveToken(nil)
                     }
@@ -707,7 +717,7 @@ extension CloudKitSynchronizer {
                     // change-feed pass advances through the server's response.
                     // When that pass leaves no durable adapter work, its
                     // database cursor is the quiescent commit boundary.
-                    storedDatabaseToken = token
+                    try persistDatabaseToken(token)
                     await changesFinishedSynchronizing()
                 } else {
                     try await uploadChanges()
@@ -715,7 +725,7 @@ extension CloudKitSynchronizer {
             } else {
                 try await processFetchedChanges()
                 try await revalidateActiveRunContext(for: attemptID)
-                storedDatabaseToken = token
+                try persistDatabaseToken(token)
                 await changesFinishedSynchronizing()
             }
         } catch {
@@ -1057,7 +1067,7 @@ extension CloudKitSynchronizer {
                 // announced. Persist it only after every downloaded zone change
                 // has been applied and its zone token has been saved.
                 try await revalidateActiveRunContext(for: attemptID)
-                storedDatabaseToken = serverChangeToken
+                try persistDatabaseToken(serverChangeToken)
                 reportProgress("upload-completed")
                 // Always re-fetch after upload. The next fetch either imports
                 // concurrent server changes or reaches the terminal receipt.

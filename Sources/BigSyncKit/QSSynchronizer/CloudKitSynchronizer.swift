@@ -1130,9 +1130,10 @@ public class CloudKitSynchronizer: NSObject {
     }
     
     internal func clearDeviceIdentifier() {
-        // Retire the legacy persisted optimization value. It is deliberately
-        // never read by the modern transport.
-        deviceUUID = nil
+        // The modern transport's echo tag is deliberately process-scoped.
+        // Do not mutate the obsolete persisted key: it is never read, and a
+        // best-effort deletion must not introduce a durable-state failure into
+        // an otherwise unrelated recovery transaction.
         _deviceIdentifier = nil
     }
     
@@ -1158,7 +1159,7 @@ public class CloudKitSynchronizer: NSObject {
         includingAdapters: Bool
     ) async throws {
         clearDeviceIdentifier()
-        resetDatabaseToken()
+        try resetDatabaseToken()
         resetActiveTokens()
         lastDatabaseChangesEmptyAt = nil
 
@@ -1213,7 +1214,7 @@ public class CloudKitSynchronizer: NSObject {
         // provenance before clearing tracking, so a restored local object that
         // has since been deleted remotely cannot be rediscovered as new work.
         clearDeviceIdentifier()
-        resetDatabaseToken()
+        try resetDatabaseToken()
         resetActiveTokens()
         clearAllStoredSubscriptionIDs()
         clearPersistedTransientRetryState()
@@ -1295,6 +1296,14 @@ public class CloudKitSynchronizer: NSObject {
             do {
                 await waitForRunCallbacksToFinish()
                 try checkSynchronizationAttempt(attemptID)
+                // Fail before the first CloudKit/account request if durable
+                // local state is corrupt, unreadable, or carries an
+                // uncommitted mutation from an earlier attempt. Treating that
+                // state as empty could advance a fresh cursor over an old
+                // namespace.
+                if let durableStore = keyValueStore as? any DurableKeyValueStore {
+                    try durableStore.validateDurability()
+                }
                 try await validateAccountAvailabilityIfNeeded(
                     attemptID: attemptID
                 )
@@ -1610,7 +1619,7 @@ public class CloudKitSynchronizer: NSObject {
                 mode: .serverReconciliation
             )
             changeRequestProcessor.reset()
-            resetDatabaseToken()
+            try resetDatabaseToken()
             resetActiveTokens()
             clearAllStoredSubscriptionIDs()
             clearPersistedTransientRetryState()
@@ -1620,7 +1629,7 @@ public class CloudKitSynchronizer: NSObject {
         // still sees the old account and idempotently requests the same reset;
         // it can never observe a new account paired with an old completed
         // migration and rediscover retained user data as fresh uploads.
-        keyValueStore.set(
+        try keyValueStore.bigSyncSetDurably(
             value: confirmedAccountIdentifier,
             forKey: cloudKitAccountIdentifierKey
         )
@@ -1953,7 +1962,7 @@ public class CloudKitSynchronizer: NSObject {
 
         // A nil database and zone token is the explicit full-server bootstrap
         // contract.  Do not reuse a token left by the legacy transport.
-        resetDatabaseToken()
+        try resetDatabaseToken()
         resetActiveTokens()
         try await modelAdapter.saveToken(nil)
         try await revalidateRunContext(context)
@@ -2081,8 +2090,8 @@ public class CloudKitSynchronizer: NSObject {
      * This does not reset tokens stored by model adapters.
      */
     @BigSyncBackgroundActor
-    @objc internal func resetDatabaseToken() {
-        storedDatabaseToken = nil
+    @objc internal func resetDatabaseToken() throws {
+        try persistDatabaseToken(nil)
     }
     
     internal func activeZoneToken(zoneID: CKRecordZone.ID) -> RecordZoneChangeCursor? {

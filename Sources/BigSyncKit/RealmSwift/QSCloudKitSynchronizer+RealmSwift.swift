@@ -40,20 +40,11 @@ extension CloudKitSynchronizer {
         logger: Logging.Logger
     ) -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
-        let provider = DefaultRealmSwiftAdapterProvider(
-            targetConfigurations: configurations,
-            excludedClassNames: excludedClassNames,
-            priorityClassNames: priorityClassNames,
-            zoneID: zoneID,
-            appGroup: suiteName,
-            persistenceNamespace:
-                "\(containerName)|\(synchronizerName)|private|\(zoneID.ownerName)|\(zoneID.zoneName)",
-            persistenceDirectoryURL: localState?.trackingRealmDirectoryURL,
-            assetDirectoryURL: localState?.assetDirectoryURL,
-            // The synchronizer must establish backup/account recovery mode
-            // before Realm setup is allowed to perform broad initial discovery.
-            startSetupTask: false,
-            logger: logger
+        let durableStateNamespace = makeDurableStateNamespace(
+            identifier: synchronizerName,
+            containerIdentifier: containerName,
+            databaseScope: .private,
+            recordZoneID: zoneID
         )
         let keyValueStore: any KeyValueStore
         let backupDetectionBaseURL: URL?
@@ -63,21 +54,71 @@ extension CloudKitSynchronizer {
                 .deletingLastPathComponent()
                 .appendingPathComponent("BigSyncKitBackupDetection", isDirectory: true)
         } else {
-            let userDefaults = UserDefaults(suiteName: suiteName)!
-            keyValueStore = UserDefaultsAdapter(userDefaults: userDefaults)
-            if let suiteName,
-               let groupContainerURL = FileManager.default
-                   .containerURL(
-                       forSecurityApplicationGroupIdentifier: suiteName
-                   ) {
-                backupDetectionBaseURL = groupContainerURL
+            // Do not migrate the former UserDefaults state. Its writes are
+            // not a durable cross-process boundary and borrowing it would
+            // revive tokens from a different client identity. The target
+            // Realm remains intact; normal reconciliation repopulates this
+            // fresh namespace on the first production launch.
+            let applicationSupportURL: URL
+            if let suiteName {
+                guard let groupContainerURL = FileManager.default
+                    .containerURL(forSecurityApplicationGroupIdentifier: suiteName) else {
+                    preconditionFailure(
+                        "BigSyncKit cannot resolve the configured App Group \(suiteName); refusing to create process-local sync state"
+                    )
+                }
+                applicationSupportURL = groupContainerURL
                     .appendingPathComponent("Library", isDirectory: true)
                     .appendingPathComponent("Application Support", isDirectory: true)
-                    .appendingPathComponent("BigSyncKit", isDirectory: true)
             } else {
-                backupDetectionBaseURL = nil
+                applicationSupportURL = FileManager.default.urls(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask
+                )[0]
             }
+            let localStateDirectory = applicationSupportURL
+                .appendingPathComponent("BigSyncKit", isDirectory: true)
+                .appendingPathComponent("LocalState", isDirectory: true)
+                .appendingPathComponent(durableStateNamespace, isDirectory: true)
+            let fileStore = FileKeyValueStore(
+                fileURL: localStateDirectory.appendingPathComponent("state.plist")
+            )
+            keyValueStore = fileStore
+            backupDetectionBaseURL = applicationSupportURL
+                .appendingPathComponent("BigSyncKit", isDirectory: true)
         }
+        if let durableStore = keyValueStore as? any DurableKeyValueStore {
+            do {
+                // Construction itself is a durability boundary. Prove the
+                // complete current snapshot can be read and atomically
+                // rewritten before Realm setup or CloudKit transport objects
+                // exist. This also covers explicit integration-test stores.
+                try durableStore.prepareForUse()
+            } catch {
+                preconditionFailure(
+                    "BigSyncKit durable local state failed validation before provider setup: \(error)"
+                )
+            }
+        } else {
+            precondition(
+                keyValueStore.synchronize?() == true,
+                "BigSyncKit requires a durable local-state store before provider setup"
+            )
+        }
+        let provider = DefaultRealmSwiftAdapterProvider(
+            targetConfigurations: configurations,
+            excludedClassNames: excludedClassNames,
+            priorityClassNames: priorityClassNames,
+            zoneID: zoneID,
+            appGroup: suiteName,
+            persistenceNamespace: durableStateNamespace,
+            persistenceDirectoryURL: localState?.trackingRealmDirectoryURL,
+            assetDirectoryURL: localState?.assetDirectoryURL,
+            // The synchronizer must establish backup/account recovery mode
+            // before Realm setup is allowed to perform broad initial discovery.
+            startSetupTask: false,
+            logger: logger
+        )
         let container = CKContainer(identifier: containerName)
         let database = DefaultCloudKitDatabaseAdapter(
             database: container.privateCloudDatabase
@@ -97,7 +138,10 @@ extension CloudKitSynchronizer {
             backupDetectionBaseURL: backupDetectionBaseURL,
             logger: logger
         )
-        let durableStateNamespace = synchronizer.durableStateNamespace
+        precondition(
+            synchronizer.durableStateNamespace == durableStateNamespace,
+            "BigSyncKit provider and synchronizer durable namespaces diverged"
+        )
         BigSyncMutationPolicy(
             excludedClassNames: excludedClassNames
         ).install(

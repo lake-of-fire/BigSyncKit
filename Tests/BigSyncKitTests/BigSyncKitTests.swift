@@ -1,5 +1,6 @@
 import XCTest
 import CloudKit
+import CryptoKit
 import Logging
 @testable import BigSyncKit
 import RealmSwift
@@ -868,6 +869,201 @@ final class BigSyncKitTests: XCTestCase {
             FileKeyValueStore(fileURL: fileURL).object(forKey: "key") as? String,
             "value"
         )
+    }
+
+    func testFileKeyValueStoreReloadsPeerWritesAndMergesIndependentMutations() {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+            .appendingPathComponent("state.plist")
+        let firstStore = FileKeyValueStore(fileURL: fileURL)
+        let secondStore = FileKeyValueStore(fileURL: fileURL)
+
+        firstStore.set(value: "first", forKey: "first")
+        XCTAssertEqual(secondStore.object(forKey: "first") as? String, "first")
+
+        secondStore.set(value: "second", forKey: "second")
+        XCTAssertEqual(firstStore.object(forKey: "second") as? String, "second")
+
+        DispatchQueue.concurrentPerform(iterations: 32) { index in
+            let store = index.isMultiple(of: 2) ? firstStore : secondStore
+            store.set(value: index, forKey: "concurrent-\(index)")
+        }
+        let reopenedStore = FileKeyValueStore(fileURL: fileURL)
+        XCTAssertEqual(reopenedStore.object(forKey: "first") as? String, "first")
+        XCTAssertEqual(reopenedStore.object(forKey: "second") as? String, "second")
+        for index in 0..<32 {
+            XCTAssertEqual(
+                reopenedStore.object(forKey: "concurrent-\(index)") as? Int,
+                index
+            )
+        }
+    }
+
+    func testFileKeyValueStoreFailsClosedForMalformedExistingPlist() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+            .appendingPathComponent("state.plist")
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("not a property list".utf8).write(to: fileURL)
+
+        let store = FileKeyValueStore(fileURL: fileURL)
+        XCTAssertNotNil(store.object(forKey: "missing"))
+        XCTAssertFalse(store.synchronize())
+        XCTAssertNotNil(store.lastPersistenceError)
+
+        store.set(value: "must not overwrite corrupt state", forKey: "new")
+        XCTAssertEqual(try Data(contentsOf: fileURL), Data("not a property list".utf8))
+        XCTAssertFalse(store.synchronize())
+    }
+
+    func testFileKeyValueStoreRecoversAfterMalformedPlistIsRepairedExternally() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+            .appendingPathComponent("state.plist")
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("not a property list".utf8).write(to: fileURL)
+        let store = FileKeyValueStore(fileURL: fileURL)
+        XCTAssertFalse(store.synchronize())
+
+        let repaired = try PropertyListSerialization.data(
+            fromPropertyList: ["key": "value"],
+            format: .binary,
+            options: 0
+        )
+        try repaired.write(to: fileURL, options: .atomic)
+
+        XCTAssertTrue(store.synchronize())
+        XCTAssertNil(store.lastPersistenceError)
+        XCTAssertEqual(store.object(forKey: "key") as? String, "value")
+    }
+
+    func testFileKeyValueStoreSurfacesWriteFailureInsteadOfOnlyAsserting() throws {
+        let parentFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+        try Data().write(to: parentFile)
+        let store = FileKeyValueStore(
+            fileURL: parentFile.appendingPathComponent("state.plist")
+        )
+
+        store.set(value: "value", forKey: "key")
+
+        XCTAssertFalse(store.synchronize())
+        XCTAssertNotNil(store.lastPersistenceError)
+    }
+
+    func testFileKeyValueStorePrepareForUseProvesMissingNamespaceWritable() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+            .appendingPathComponent("state.plist")
+        let store = FileKeyValueStore(fileURL: fileURL)
+
+        try store.prepareForUse()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+        XCTAssertNoThrow(try store.validateDurability())
+        XCTAssertNotNil(
+            try PropertyListSerialization.propertyList(
+                from: Data(contentsOf: fileURL),
+                options: [],
+                format: nil
+            ) as? [String: Any]
+        )
+    }
+
+    func testFileKeyValueStoreAtomicFailurePreservesOldSnapshotAndCleansTemporaryFile()
+    throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+        let fileURL = rootURL.appendingPathComponent("state.plist")
+        let initialStore = FileKeyValueStore(fileURL: fileURL)
+        try initialStore.setDurably(value: "old", forKey: "value")
+        let expectedFailure = NSError(
+            domain: "BigSyncKitTests.AtomicReplace",
+            code: 1
+        )
+        let failingStore = FileKeyValueStore(
+            fileURL: fileURL,
+            beforeAtomicReplace: { throw expectedFailure }
+        )
+
+        XCTAssertThrowsError(
+            try failingStore.setDurably(value: "new", forKey: "value")
+        )
+        XCTAssertEqual(
+            try FileKeyValueStore(fileURL: fileURL)
+                .durableObject(forKey: "value") as? String,
+            "old"
+        )
+        XCTAssertFalse(failingStore.synchronize())
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: rootURL.path)
+                .contains { $0.hasPrefix(".state.plist.") && $0.hasSuffix(".tmp") }
+        )
+    }
+
+    func testFileKeyValueStoreExternalRepairDoesNotMaskFailedMutation() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+            .appendingPathComponent("state.plist")
+        let store = FileKeyValueStore(
+            fileURL: fileURL,
+            beforeAtomicReplace: {
+                throw NSError(domain: "BigSyncKitTests.AtomicReplace", code: 2)
+            }
+        )
+        XCTAssertThrowsError(
+            try store.setDurably(value: "uncommitted", forKey: "value")
+        )
+        let repairedData = try PropertyListSerialization.data(
+            fromPropertyList: ["value": "external-repair"],
+            format: .binary,
+            options: 0
+        )
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try repairedData.write(to: fileURL, options: .atomic)
+
+        XCTAssertEqual(store.object(forKey: "value") as? String, "external-repair")
+        XCTAssertFalse(store.synchronize())
+        XCTAssertThrowsError(try store.validateDurability())
+    }
+
+    func testCanonicalDurableNamespaceDrivesTrackingAndFileStatePaths() {
+        let zoneID = CKRecordZone.ID(
+            zoneName: "canonical-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let namespace = CloudKitSynchronizer.makeDurableStateNamespace(
+            identifier: "canonical-client",
+            containerIdentifier: "iCloud.canonical",
+            databaseScope: .private,
+            recordZoneID: zoneID
+        )
+        let trackingPath = DefaultRealmSwiftAdapterProvider.realmPath(
+            appGroup: nil,
+            zoneID: zoneID,
+            persistenceNamespace: namespace
+        )
+        let expectedTrackingDigest = SHA256.hash(data: Data(namespace.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let stateDirectory = URL(fileURLWithPath: "/ApplicationSupport")
+            .appendingPathComponent("BigSyncKit", isDirectory: true)
+            .appendingPathComponent("LocalState", isDirectory: true)
+            .appendingPathComponent(namespace, isDirectory: true)
+
+        XCTAssertTrue(trackingPath.hasSuffix(
+            "/\(expectedTrackingDigest)-\(zoneID.zoneName).realm"
+        ))
+        XCTAssertEqual(stateDirectory.lastPathComponent, namespace)
     }
 
     func testServerComparisonTreatsOmittedEmptyCollectionsAsEqual() {

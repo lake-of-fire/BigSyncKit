@@ -137,6 +137,266 @@ final class BackupDetectionTests: XCTestCase {
         ))
     }
 
+    func testManualRestoreResumesEventBeforeSentinelForSameTransaction() throws {
+        let namespace = "manual-event-before-sentinel"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(store: store, namespace: namespace, sharedSentinelBaseURL: base)
+        let transactionIdentifier = UUID()
+
+        XCTAssertThrowsError(try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: transactionIdentifier,
+            sharedSentinelBaseURL: base,
+            sentinelPublisher: { _, _ in throw CocoaError(.fileWriteUnknown) }
+        ))
+        let eventIdentifier = try XCTUnwrap(BackupDetection.restoreResetEventIdentifier(
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        ))
+
+        let receipt = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: transactionIdentifier,
+            sharedSentinelBaseURL: base
+        )
+        XCTAssertEqual(receipt.transactionIdentifier, transactionIdentifier)
+        XCTAssertEqual(receipt.restoreEventIdentifier.uuidString.lowercased(), eventIdentifier)
+        XCTAssertEqual(
+            BackupDetection.installationIdentifier(namespace: namespace, sharedSentinelBaseURL: base),
+            receipt.newInstallationIdentifier
+        )
+    }
+
+    func testManualRestoreReturnsSameReceiptAfterSentinelBeforeCallerJournal() throws {
+        let namespace = "manual-sentinel-before-journal"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(store: store, namespace: namespace, sharedSentinelBaseURL: base)
+        let transactionIdentifier = UUID()
+
+        let first = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: transactionIdentifier,
+            sharedSentinelBaseURL: base
+        )
+        let resumed = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: transactionIdentifier,
+            sharedSentinelBaseURL: base
+        )
+        XCTAssertEqual(resumed, first)
+    }
+
+    func testManualRestoreRejectsMismatchedTransactionWithoutRotatingIdentity() throws {
+        let namespace = "manual-mismatched-transaction"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(store: store, namespace: namespace, sharedSentinelBaseURL: base)
+        let first = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: UUID(),
+            sharedSentinelBaseURL: base
+        )
+
+        XCTAssertThrowsError(try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: UUID(),
+            sharedSentinelBaseURL: base
+        )) { error in
+            XCTAssertEqual(
+                error as? BackupDetection.Error,
+                .manualRestoreTransactionMismatch
+            )
+        }
+        XCTAssertEqual(
+            BackupDetection.installationIdentifier(namespace: namespace, sharedSentinelBaseURL: base),
+            first.newInstallationIdentifier
+        )
+    }
+
+    func testClientIdentityLetsCallerJournalRestoreReplacementForResumedTransaction() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-resume",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+
+        // Fault-inject the prefix where the durable event exists but sentinel
+        // rotation has not yet completed.
+        XCTAssertThrowsError(try BackupDetection.beginManualRestore(
+            namespace: identity.durableStateNamespace,
+            transactionIdentifier: transactionIdentifier,
+            sharedSentinelBaseURL: base,
+            sentinelPublisher: { _, _ in throw CocoaError(.fileWriteUnknown) }
+        ))
+        var replacementInvocationCount = 0
+        let receipt = try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {
+                replacementInvocationCount += 1
+            }
+        )
+        XCTAssertEqual(replacementInvocationCount, 1)
+        XCTAssertEqual(identity.currentInstallationIdentifier(), receipt.newInstallationIdentifier)
+
+        // BigSync cannot infer whether a caller rolled the replacement back.
+        // Its stable-token resume therefore invokes the caller's phase-aware
+        // closure; a caller whose journal says it is installed supplies a no-op.
+        _ = try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {
+                replacementInvocationCount += 1
+            }
+        )
+        XCTAssertEqual(replacementInvocationCount, 2)
+    }
+
+    func testClientIdentityNeverRollsBackAfterRestoreEventPublication() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-event-publication-failure",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+        var replacementCount = 0
+        var rollbackCount = 0
+        var pendingReceipt: BigSyncManualBackupRestoreReceipt?
+
+        XCTAssertThrowsError(try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {
+                replacementCount += 1
+            },
+            rollback: {
+                rollbackCount += 1
+            },
+            sentinelPublisher: { _, _ in
+                throw CocoaError(.fileWriteUnknown)
+            }
+        )) { error in
+            guard let restoreError = error as? BigSyncManualBackupRestoreError,
+                  case .handoffPending(let receipt) = restoreError else {
+                return XCTFail("Expected a resumable handoff-pending error")
+            }
+            pendingReceipt = receipt
+        }
+
+        XCTAssertEqual(replacementCount, 1)
+        XCTAssertEqual(rollbackCount, 0)
+        XCTAssertEqual(pendingReceipt?.transactionIdentifier, transactionIdentifier)
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(
+            namespace: identity.durableStateNamespace,
+            sharedSentinelBaseURL: base
+        ))
+
+        let resumed = try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {
+                // A caller whose durable journal says replacementInstalled
+                // supplies this no-op closure on resume.
+            },
+            rollback: {
+                rollbackCount += 1
+            }
+        )
+        XCTAssertEqual(resumed, pendingReceipt)
+        XCTAssertEqual(rollbackCount, 0)
+        XCTAssertEqual(
+            identity.currentInstallationIdentifier(),
+            resumed.newInstallationIdentifier
+        )
+    }
+
+    func testClientIdentityRejectsMismatchedTransactionBeforeReplacement() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-mismatch",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        _ = try identity.withManualBackupRestore(
+            transactionIdentifier: UUID(),
+            {}
+        )
+        var replacementInvocationCount = 0
+        XCTAssertThrowsError(try identity.withManualBackupRestore(
+            transactionIdentifier: UUID(),
+            {
+                replacementInvocationCount += 1
+            }
+        )) { error in
+            XCTAssertEqual(
+                error as? BigSyncManualBackupRestoreError,
+                .transactionMismatch
+            )
+        }
+        XCTAssertEqual(replacementInvocationCount, 0)
+    }
+
+    func testClientIdentityRejectsMalformedRestoreEventBeforeReplacement() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-malformed-event",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let originalInstallationIdentifier = try XCTUnwrap(
+            identity.currentInstallationIdentifier()
+        )
+        let sentinelURL = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace,
+            sharedBaseURL: base
+        )
+        let eventURL = BackupDetection.restoreEventURL(sentinelURL: sentinelURL)
+        try Data("incomplete manual restore receipt".utf8).write(
+            to: eventURL,
+            options: .atomic
+        )
+        var replacementInvocationCount = 0
+        var rollbackInvocationCount = 0
+
+        XCTAssertThrowsError(try identity.withManualBackupRestore(
+            transactionIdentifier: UUID(),
+            {
+                replacementInvocationCount += 1
+            },
+            rollback: {
+                rollbackInvocationCount += 1
+            }
+        )) { error in
+            XCTAssertEqual(
+                error as? BigSyncManualBackupRestoreError,
+                .stateAmbiguous
+            )
+        }
+
+        XCTAssertEqual(replacementInvocationCount, 0)
+        XCTAssertEqual(rollbackInvocationCount, 0)
+        XCTAssertEqual(
+            identity.currentInstallationIdentifier(),
+            originalInstallationIdentifier
+        )
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(
+            namespace: identity.durableStateNamespace,
+            sharedSentinelBaseURL: base
+        ))
+    }
+
     func testManualRestoreDefersWhileAnotherClientHoldsSharedLease() throws {
         let namespace = "container.private.owner.zone"
         let base = temporaryRoot()
@@ -362,7 +622,7 @@ final class BackupDetectionTests: XCTestCase {
         ))
     }
 
-    func testFailedManualRestoreRestoresExcludedInstallationBeforeClearingEvent() throws {
+    func testFailedLegacyManualRestoreLeavesDurableRecoveryEvidence() throws {
         let namespace = "container.private.owner.zone"
         let base = temporaryRoot()
         _ = try BackupDetection.run(
@@ -396,7 +656,7 @@ final class BackupDetectionTests: XCTestCase {
             ).isExcludedFromBackup,
             true
         )
-        XCTAssertFalse(BackupDetection.restoreResetIsRequired(
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(
             namespace: namespace,
             sharedSentinelBaseURL: base
         ))
