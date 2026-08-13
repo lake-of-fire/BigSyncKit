@@ -171,6 +171,15 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertFalse(replacementRan)
 
         XCTAssertEqual(flock(peerDescriptor, LOCK_UN), 0)
+        let exclusiveProbeDescriptor = Darwin.open(leaseURL.path, O_RDWR)
+        XCTAssertGreaterThanOrEqual(exclusiveProbeDescriptor, 0)
+        XCTAssertEqual(
+            flock(exclusiveProbeDescriptor, LOCK_EX | LOCK_NB),
+            -1,
+            "A failed upgrade must immediately restore this process's shared lease"
+        )
+        Darwin.close(exclusiveProbeDescriptor)
+
         let replacementInstallation = try identity.withManualBackupRestore {
             replacementRan = true
         }
@@ -194,15 +203,20 @@ final class BackupDetectionTests: XCTestCase {
             sharedStateBaseURL: base
         )
         _ = try identity.prepareInstallation()
+        let originalInstallationIdentifier = try XCTUnwrap(
+            identity.currentInstallationIdentifier()
+        )
         let leaseURL = BackupDetection.defaultSentinelURL(
             namespace: identity.durableStateNamespace,
             sharedBaseURL: base
         ).appendingPathExtension("lease")
         var rollbackRanUnderExclusiveLease = false
+        var rollbackCount = 0
 
         XCTAssertThrowsError(try identity.withManualBackupRestore({
             throw ExpectedFailure()
         }, rollback: {
+            rollbackCount += 1
             let peerDescriptor = Darwin.open(leaseURL.path, O_RDWR)
             XCTAssertGreaterThanOrEqual(peerDescriptor, 0)
             defer { Darwin.close(peerDescriptor) }
@@ -210,9 +224,20 @@ final class BackupDetectionTests: XCTestCase {
                 peerDescriptor,
                 LOCK_SH | LOCK_NB
             ) == -1
-        }))
+        })) { error in
+            XCTAssertTrue(error is ExpectedFailure)
+        }
 
         XCTAssertTrue(rollbackRanUnderExclusiveLease)
+        XCTAssertEqual(rollbackCount, 1)
+        XCTAssertEqual(
+            identity.currentInstallationIdentifier(),
+            originalInstallationIdentifier
+        )
+        XCTAssertFalse(BackupDetection.restoreResetIsRequired(
+            namespace: identity.durableStateNamespace,
+            sharedSentinelBaseURL: base
+        ))
         let peerDescriptor = Darwin.open(leaseURL.path, O_RDWR)
         XCTAssertGreaterThanOrEqual(peerDescriptor, 0)
         defer { Darwin.close(peerDescriptor) }
