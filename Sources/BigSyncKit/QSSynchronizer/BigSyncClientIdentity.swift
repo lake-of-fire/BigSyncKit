@@ -84,7 +84,7 @@ private enum BigSyncClientIdentityLeaseRegistry {
         defer { lock.unlock() }
         let lease = try lease(at: url)
         guard lease.mode != .shared else { return }
-        guard flock(lease.descriptor, LOCK_SH) == 0 else {
+        guard bigSyncFlock(lease.descriptor, LOCK_SH) == 0 else {
             throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
         }
         lease.mode = .shared
@@ -98,16 +98,16 @@ private enum BigSyncClientIdentityLeaseRegistry {
         defer { lock.unlock() }
         let lease = try lease(at: url)
         if lease.mode == .shared {
-            guard flock(lease.descriptor, LOCK_UN) == 0 else {
+            guard bigSyncFlock(lease.descriptor, LOCK_UN) == 0 else {
                 throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
             }
         }
-        guard flock(lease.descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        guard bigSyncFlock(lease.descriptor, LOCK_EX | LOCK_NB) == 0 else {
             let lockError = Int32(errno)
             // Restore the process-lifetime writer lease before reporting a
             // competing app/extension holder. A later launch can retry the
             // staged restore without a window for an unfenced local write.
-            guard flock(lease.descriptor, LOCK_SH) == 0 else {
+            guard bigSyncFlock(lease.descriptor, LOCK_SH) == 0 else {
                 throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
             }
             lease.mode = .shared
@@ -120,7 +120,7 @@ private enum BigSyncClientIdentityLeaseRegistry {
         defer {
             // Downgrading before returning prevents subsequent mutations in
             // this process from escaping the cross-process restore fence.
-            if flock(lease.descriptor, LOCK_SH) == 0 {
+            if bigSyncFlock(lease.descriptor, LOCK_SH) == 0 {
                 lease.mode = .shared
             }
         }
@@ -146,7 +146,7 @@ private enum BigSyncClientIdentityLeaseRegistry {
             Darwin.close(descriptor)
             throw error
         }
-        guard flock(descriptor, LOCK_SH) == 0 else {
+        guard bigSyncFlock(descriptor, LOCK_SH) == 0 else {
             let lockError = Int32(errno)
             Darwin.close(descriptor)
             throw BigSyncClientIdentityLeaseError.leaseUnavailable(lockError)

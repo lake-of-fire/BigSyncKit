@@ -892,10 +892,10 @@ enum BackupDetection {
         values.isExcludedFromBackup = true
         var mutableLockURL = lockURL
         try mutableLockURL.setResourceValues(values)
-        guard flock(descriptor, LOCK_EX) == 0 else {
+        guard bigSyncFlock(descriptor, LOCK_EX) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
-        defer { _ = flock(descriptor, LOCK_UN) }
+        defer { _ = bigSyncFlock(descriptor, LOCK_UN) }
         return try operation()
     }
 

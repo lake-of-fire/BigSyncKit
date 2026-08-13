@@ -8,6 +8,19 @@
 import Foundation
 import Darwin
 
+@discardableResult
+internal func bigSyncFlock(
+    _ descriptor: Int32,
+    _ operation: Int32
+) -> Int32 {
+    while true {
+        let result = flock(descriptor, operation)
+        if result == 0 || errno != EINTR {
+            return result
+        }
+    }
+}
+
 /// Creates every missing path component and durably publishes each directory
 /// entry in its parent before returning. A leaf-directory fsync alone cannot
 /// prove that a newly-created namespace survives power loss: the entry that
@@ -481,10 +494,10 @@ extension KeyValueStore {
         }
         defer { Darwin.close(descriptor) }
         try markExcludedFromBackup(lockFileURL)
-        guard flock(descriptor, mode) == 0 else {
+        guard bigSyncFlock(descriptor, mode) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        defer { _ = flock(descriptor, LOCK_UN) }
+        defer { _ = bigSyncFlock(descriptor, LOCK_UN) }
         return try body()
     }
 
