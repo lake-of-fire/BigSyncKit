@@ -19,6 +19,7 @@ public extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     private func makeSubscriptionAccountFence() async throws
         -> CloudKitSubscriptionAccountFence {
+        try keyValueStore.bigSyncValidateDurability()
         let runContext = activeRunContext
         let accountIdentifier = try await accountIdentifierProvider()
         if let runContext {
@@ -124,7 +125,7 @@ public extension CloudKitSynchronizer {
             guard storedSubscriptionID == expectedSubscriptionID else {
                 // Do not perpetuate an older arbitrary ID: it may have been
                 // adopted from another CloudKit client by pre-v2 code.
-                databaseSubscriptionID = nil
+                try persistDatabaseSubscriptionID(nil)
                 return try await subscribeForChangesInDatabase()
             }
             return
@@ -135,7 +136,7 @@ public extension CloudKitSynchronizer {
         )
         try await revalidateSubscriptionAccountFence(accountFence)
         if let existing = existing as? CKDatabaseSubscription {
-            databaseSubscriptionID = existing.subscriptionID
+            try persistDatabaseSubscriptionID(existing.subscriptionID)
             return
         }
 
@@ -150,7 +151,7 @@ public extension CloudKitSynchronizer {
         guard saved.subscriptionID == expectedSubscriptionID else {
             throw CocoaError(.coderValueNotFound)
         }
-        databaseSubscriptionID = expectedSubscriptionID
+        try persistDatabaseSubscriptionID(expectedSubscriptionID)
     }
     
     /// Creates a new subscription with CloudKit so the application can receive notifications when new changes happen. The application is responsible for registering for remote notifications and initiating synchronization when a notification is received. @see `CKSubscription`
@@ -184,7 +185,7 @@ public extension CloudKitSynchronizer {
                 // See the database-subscription equivalent above. Clear only
                 // local metadata; an unknown server subscription is not ours
                 // to delete.
-                clearStoredSubscriptionID(for: zoneID)
+                try persistSubscriptionID(nil, for: zoneID)
                 return try await subscribeForChanges(in: zoneID)
             }
             return
@@ -196,7 +197,7 @@ public extension CloudKitSynchronizer {
         try await revalidateSubscriptionAccountFence(accountFence)
         if let existing = existing as? CKRecordZoneSubscription,
            existing.zoneID == zoneID {
-            storeSubscriptionID(existing.subscriptionID, for: zoneID)
+            try persistSubscriptionID(existing.subscriptionID, for: zoneID)
             return
         }
 
@@ -212,7 +213,7 @@ public extension CloudKitSynchronizer {
         guard saved.subscriptionID == expectedSubscriptionID else {
             throw CocoaError(.coderValueNotFound)
         }
-        storeSubscriptionID(expectedSubscriptionID, for: zoneID)
+        try persistSubscriptionID(expectedSubscriptionID, for: zoneID)
     }
     
     /**
@@ -251,7 +252,7 @@ public extension CloudKitSynchronizer {
                 // Pre-v2 code may have persisted another client's ID. Clear
                 // only our local pointer; never delete an unowned server
                 // subscription.
-                databaseSubscriptionID = nil
+                try persistDatabaseSubscriptionID(nil)
                 subscriptionID = try await subscriptionStore.subscription(
                     withID: expectedSubscriptionID
                 ).flatMap { $0 is CKDatabaseSubscription ? $0.subscriptionID : nil }
@@ -304,7 +305,7 @@ public extension CloudKitSynchronizer {
             if stored == expectedSubscriptionID {
                 resolvedSubscriptionID = stored
             } else {
-                clearStoredSubscriptionID(for: zoneID)
+                try persistSubscriptionID(nil, for: zoneID)
                 resolvedSubscriptionID = try await subscriptionStore.subscription(
                     withID: expectedSubscriptionID
                 ).flatMap { subscription in
@@ -359,6 +360,6 @@ public extension CloudKitSynchronizer {
         try await revalidateSubscriptionAccountFence(accountFence)
         try await subscriptionStore.deleteSubscription(withID: identifier)
         try await revalidateSubscriptionAccountFence(accountFence)
-        clearSubscriptionID(identifier)
+        try persistRemovingSubscriptionID(identifier)
     }
 }

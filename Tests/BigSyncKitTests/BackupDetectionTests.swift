@@ -315,6 +315,64 @@ final class BackupDetectionTests: XCTestCase {
         )
     }
 
+    func testPeerInstallationCannotOpenReplacementUnderOldIdentity() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "manual-peer-publication-fence",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+        var pendingReceipt: BigSyncManualBackupRestoreReceipt?
+
+        XCTAssertThrowsError(try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {},
+            sentinelPublisher: { _, _ in
+                throw CocoaError(.fileWriteUnknown)
+            }
+        )) { error in
+            guard let restoreError = error as? BigSyncManualBackupRestoreError,
+                  case .handoffPending(let receipt) = restoreError else {
+                return XCTFail("Expected handoffPending")
+            }
+            pendingReceipt = receipt
+        }
+
+        let peerIdentity = BigSyncClientIdentity(
+            synchronizerName: "manual-peer-publication-fence",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        XCTAssertNil(peerIdentity.currentInstallationIdentifier())
+        XCTAssertThrowsError(try peerIdentity.prepareInstallation()) { error in
+            guard let restoreError = error as? BigSyncManualBackupRestoreError,
+                  case .handoffPending(let receipt) = restoreError else {
+                return XCTFail("Expected the peer to be fenced by handoffPending")
+            }
+            XCTAssertEqual(receipt, pendingReceipt)
+        }
+
+        let completed = try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {}
+        )
+        XCTAssertEqual(completed, pendingReceipt)
+        XCTAssertEqual(
+            try peerIdentity.prepareInstallation(),
+            completed.newInstallationIdentifier
+        )
+    }
+
     func testClientIdentityRejectsMismatchedTransactionBeforeReplacement() throws {
         let base = temporaryRoot()
         let identity = BigSyncClientIdentity(

@@ -1216,7 +1216,7 @@ public class CloudKitSynchronizer: NSObject {
         clearDeviceIdentifier()
         try resetDatabaseToken()
         resetActiveTokens()
-        clearAllStoredSubscriptionIDs()
+        try clearAllStoredSubscriptionIDs()
         clearPersistedTransientRetryState()
         lastDatabaseChangesEmptyAt = nil
         try requestChangeFeedRecovery(
@@ -1621,7 +1621,7 @@ public class CloudKitSynchronizer: NSObject {
             changeRequestProcessor.reset()
             try resetDatabaseToken()
             resetActiveTokens()
-            clearAllStoredSubscriptionIDs()
+            try clearAllStoredSubscriptionIDs()
             clearPersistedTransientRetryState()
         }
         // Publish the new account identity only after its server-first rebuild

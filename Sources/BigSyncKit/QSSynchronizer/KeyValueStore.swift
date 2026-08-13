@@ -127,7 +127,7 @@ extension KeyValueStore {
         case (nil, nil):
             return true
         case let (lhs?, rhs?):
-            return (lhs as AnyObject).isEqual(rhs)
+            return (lhs as? NSObject)?.isEqual(rhs) == true
         default:
             return false
         }
@@ -274,6 +274,7 @@ extension KeyValueStore {
         lock.withLock {
             let acquiredLock = withFileLock(mode: LOCK_EX) {
                 guard var updatedStorage = reloadStorageLocked() else { return }
+                guard !hasUncommittedMutationFailure else { return }
                 if let value {
                     updatedStorage[defaultName] = value
                 } else {
@@ -295,6 +296,7 @@ extension KeyValueStore {
         lock.withLock {
             let acquiredLock = withFileLock(mode: LOCK_EX) {
                 guard var updatedStorage = reloadStorageLocked() else { return }
+                guard !hasUncommittedMutationFailure else { return }
                 updatedStorage.removeValue(forKey: defaultName)
                 persist(updatedStorage)
             }
@@ -350,6 +352,10 @@ extension KeyValueStore {
             do {
                 try withFileLockThrowing(mode: LOCK_EX) {
                     var storage = try reloadStorageLockedThrowing()
+                    if hasUncommittedMutationFailure {
+                        throw lastPersistenceError
+                            ?? DurableKeyValueStoreError.mutationNotDurable
+                    }
                     if let value {
                         storage[defaultName] = value
                     } else {
@@ -410,8 +416,8 @@ extension KeyValueStore {
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        markExcludedFromBackup(lockFileURL)
         defer { Darwin.close(descriptor) }
+        try markExcludedFromBackup(lockFileURL)
         guard flock(descriptor, mode) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
@@ -484,7 +490,7 @@ extension KeyValueStore {
                     }
                 }
                 try data.write(to: temporaryURL)
-                markExcludedFromBackup(temporaryURL)
+                try markExcludedFromBackup(temporaryURL)
                 let handle = try FileHandle(forWritingTo: temporaryURL)
                 try handle.synchronize()
                 try handle.close()
@@ -517,11 +523,11 @@ extension KeyValueStore {
         }
     }
 
-    private func markExcludedFromBackup(_ url: URL) {
+    private func markExcludedFromBackup(_ url: URL) throws {
         var mutableURL = url
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
-        try? mutableURL.setResourceValues(values)
+        try mutableURL.setResourceValues(values)
     }
 
     private func synchronizeDirectory() throws {

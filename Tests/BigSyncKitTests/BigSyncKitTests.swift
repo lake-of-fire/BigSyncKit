@@ -1055,15 +1055,60 @@ final class BigSyncKitTests: XCTestCase {
         let expectedTrackingDigest = SHA256.hash(data: Data(namespace.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
-        let stateDirectory = URL(fileURLWithPath: "/ApplicationSupport")
-            .appendingPathComponent("BigSyncKit", isDirectory: true)
-            .appendingPathComponent("LocalState", isDirectory: true)
-            .appendingPathComponent(namespace, isDirectory: true)
+        let applicationSupportURL = URL(fileURLWithPath: "/ApplicationSupport")
+        let stateDirectory = CloudKitSynchronizer
+            .productionLocalStateDirectoryURL(
+                applicationSupportURL: applicationSupportURL,
+                durableStateNamespace: namespace
+            )
 
         XCTAssertTrue(trackingPath.hasSuffix(
             "/\(expectedTrackingDigest)-\(zoneID.zoneName).realm"
         ))
+        XCTAssertEqual(
+            stateDirectory.deletingLastPathComponent().lastPathComponent,
+            "LocalState"
+        )
         XCTAssertEqual(stateDirectory.lastPathComponent, namespace)
+    }
+
+    @BigSyncBackgroundActor
+    func testDurableAccountCommitFailureStopsBeforeCloudKitTransport() async throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+            .appendingPathComponent("state.plist")
+        try FileKeyValueStore(fileURL: fileURL).prepareForUse()
+        let failingStore = FileKeyValueStore(
+            fileURL: fileURL,
+            beforeAtomicReplace: {
+                throw NSError(domain: "BigSyncKitTests.AtomicReplace", code: 3)
+            }
+        )
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            keyValueStore: failingStore
+        )
+        synchronizer.addModelAdapter(FakeModelAdapter(
+            zoneID: synchronizer.recordZoneID,
+            priorities: []
+        ))
+
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("Expected the durable account publication to fail")
+        } catch {
+            XCTAssertEqual(
+                (error as NSError).domain,
+                "BigSyncKitTests.AtomicReplace"
+            )
+        }
+
+        XCTAssertEqual(database.subscriptionFetchCount, 0)
+        XCTAssertEqual(database.databaseChangeFetchCount, 0)
+        XCTAssertEqual(database.recordZoneChangeFetchCount, 0)
+        XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+        XCTAssertFalse(failingStore.synchronize())
     }
 
     func testServerComparisonTreatsOmittedEmptyCollectionsAsEqual() {

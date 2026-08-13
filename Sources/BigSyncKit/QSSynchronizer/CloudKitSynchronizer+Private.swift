@@ -9,7 +9,9 @@ import Foundation
 import CloudKit
 
 private let customZoneName = "BigSyncKit"
+#if DEBUG
 private let storedDeviceUUIDKey = "QSCloudKitStoredDeviceUUIDKey"
+#endif
 private let subscriptionIdentifierKey = "QSSubscriptionIdentifierKey"
 private let databaseServerChangeTokenKey = "QSDatabaseServerChangeTokenKey"
 
@@ -18,22 +20,31 @@ extension CloudKitSynchronizer {
     static var defaultCustomZoneID: CKRecordZone.ID {
         return CKRecordZone.ID(zoneName: customZoneName, ownerName: CKCurrentUserDefaultName)
     }
-    
-//    @BigSyncBackgroundActor
+
+#if DEBUG
+    /// Fixture-only access to the obsolete persisted echo tag. Production
+    /// uses a process-scoped tag and never publishes this value.
     var deviceUUID: String? {
         get {
-            return keyValueStore.object(forKey: userDefaultsKey(for: storedDeviceUUIDKey)) as? String
+            keyValueStore.object(
+                forKey: userDefaultsKey(for: storedDeviceUUIDKey)
+            ) as? String
         }
         set {
             let key = userDefaultsKey(for: storedDeviceUUIDKey)
-            if let value = newValue {
-                keyValueStore.set(value: value, forKey: key)
+            if let newValue {
+                keyValueStore.set(value: newValue, forKey: key)
             } else {
                 keyValueStore.removeObject(forKey: key)
             }
         }
     }
+#endif
     
+#if DEBUG
+    /// Fixture-only nonthrowing token seam. Production commits every cursor
+    /// through `persistDatabaseToken(_:)` so a disk failure cannot be reported
+    /// as a completed CloudKit page.
     @BigSyncBackgroundActor
     var storedDatabaseToken: DatabaseChangeCursor? {
         get {
@@ -51,20 +62,57 @@ extension CloudKitSynchronizer {
             }
         }
     }
+#else
+    @BigSyncBackgroundActor
+    var storedDatabaseToken: DatabaseChangeCursor? {
+        guard let encodedToken = keyValueStore.object(
+            forKey: userDefaultsKey(for: databaseServerChangeTokenKey)
+        ) as? Data else { return nil }
+        return DatabaseChangeCursor(serializedData: encodedToken)
+    }
+#endif
+
+    @BigSyncBackgroundActor
+    func persistDatabaseToken(_ token: DatabaseChangeCursor?) throws {
+        let key = userDefaultsKey(for: databaseServerChangeTokenKey)
+        if let token {
+            try keyValueStore.bigSyncSetDurably(
+                value: token.serializedData,
+                forKey: key
+            )
+        } else {
+            try keyValueStore.bigSyncRemoveDurably(forKey: key)
+        }
+    }
     
+#if DEBUG
     @BigSyncBackgroundActor
     var databaseSubscriptionID: String? {
         get {
-            return getStoredSubscriptionIDsDictionary()?[storeKey(for: database)]
+            getStoredSubscriptionIDsDictionary()?[storeKey(for: database)]
         }
         set {
-            var dictionary: [String: String]! = getStoredSubscriptionIDsDictionary()
-            if dictionary == nil {
-                dictionary = [String: String]()
-            }
+            var dictionary = getStoredSubscriptionIDsDictionary() ?? [:]
             dictionary[storeKey(for: database)] = newValue
-            setStoredSubscriptionIDsDictionary(dictionary)
+            setStoredSubscriptionIDsDictionaryForTesting(
+                dictionary.isEmpty ? nil : dictionary
+            )
         }
+    }
+#else
+    @BigSyncBackgroundActor
+    var databaseSubscriptionID: String? {
+        getStoredSubscriptionIDsDictionary()?[storeKey(for: database)]
+    }
+#endif
+
+    @BigSyncBackgroundActor
+    func persistDatabaseSubscriptionID(_ subscriptionID: String?) throws {
+        var dictionary = getStoredSubscriptionIDsDictionary() ?? [:]
+        dictionary[storeKey(for: database)] = subscriptionID
+        try persistStoredSubscriptionIDsDictionary(
+            dictionary.isEmpty ? nil : dictionary
+        )
     }
     
     @BigSyncBackgroundActor
@@ -73,32 +121,32 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func storeSubscriptionID(_ subscriptionID: String, for recordZoneID: CKRecordZone.ID) {
-        var dictionary: [String: String]! = getStoredSubscriptionIDsDictionary()
-        if dictionary == nil {
-            dictionary = [String: String]()
-        }
+    func persistSubscriptionID(
+        _ subscriptionID: String?,
+        for recordZoneID: CKRecordZone.ID
+    ) throws {
+        var dictionary = getStoredSubscriptionIDsDictionary() ?? [:]
         dictionary[storeKey(for: recordZoneID)] = subscriptionID
-        setStoredSubscriptionIDsDictionary(dictionary)
+        try persistStoredSubscriptionIDsDictionary(
+            dictionary.isEmpty ? nil : dictionary
+        )
     }
 
+#if DEBUG
     @BigSyncBackgroundActor
-    func clearStoredSubscriptionID(for recordZoneID: CKRecordZone.ID) {
-        var dictionary = getStoredSubscriptionIDsDictionary()
-        dictionary?.removeValue(forKey: storeKey(for: recordZoneID))
-        setStoredSubscriptionIDsDictionary(dictionary)
+    func storeSubscriptionID(
+        _ subscriptionID: String,
+        for recordZoneID: CKRecordZone.ID
+    ) {
+        var dictionary = getStoredSubscriptionIDsDictionary() ?? [:]
+        dictionary[storeKey(for: recordZoneID)] = subscriptionID
+        setStoredSubscriptionIDsDictionaryForTesting(dictionary)
     }
-    
+#endif
+
     @BigSyncBackgroundActor
-    func clearSubscriptionID(_ subscriptionID: String) {
-        var dictionary: [String: String]? = getStoredSubscriptionIDsDictionary()
-        dictionary = dictionary?.filter { $0.value != subscriptionID}
-        setStoredSubscriptionIDsDictionary(dictionary)
-    }
-    
-    @BigSyncBackgroundActor
-    func clearAllStoredSubscriptionIDs() {
-        setStoredSubscriptionIDsDictionary(nil)
+    func clearAllStoredSubscriptionIDs() throws {
+        try persistStoredSubscriptionIDsDictionary(nil)
     }
     
     @BigSyncBackgroundActor
@@ -117,13 +165,41 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    fileprivate func setStoredSubscriptionIDsDictionary(_ dict: [String: String]?) {
+    fileprivate func persistStoredSubscriptionIDsDictionary(
+        _ dictionary: [String: String]?
+    ) throws {
         let key = userDefaultsKey(for: subscriptionIdentifierKey)
-        if dict != nil {
-            keyValueStore.set(value: dict, forKey: key)
+        if let dictionary {
+            try keyValueStore.bigSyncSetDurably(
+                value: dictionary,
+                forKey: key
+            )
+        } else {
+            try keyValueStore.bigSyncRemoveDurably(forKey: key)
+        }
+    }
+
+#if DEBUG
+    @BigSyncBackgroundActor
+    fileprivate func setStoredSubscriptionIDsDictionaryForTesting(
+        _ dictionary: [String: String]?
+    ) {
+        let key = userDefaultsKey(for: subscriptionIdentifierKey)
+        if let dictionary {
+            keyValueStore.set(value: dictionary, forKey: key)
         } else {
             keyValueStore.removeObject(forKey: key)
         }
+    }
+#endif
+
+    @BigSyncBackgroundActor
+    func persistRemovingSubscriptionID(_ identifier: String) throws {
+        let dictionary = getStoredSubscriptionIDsDictionary()?
+            .filter { $0.value != identifier }
+        try persistStoredSubscriptionIDsDictionary(
+            dictionary?.isEmpty == true ? nil : dictionary
+        )
     }
     
     fileprivate func userDefaultsKey(for key: String) -> String {

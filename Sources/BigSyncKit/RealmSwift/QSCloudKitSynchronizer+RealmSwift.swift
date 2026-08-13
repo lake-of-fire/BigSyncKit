@@ -12,6 +12,16 @@ import CloudKit
 import Logging
 
 extension CloudKitSynchronizer {
+    nonisolated internal static func productionLocalStateDirectoryURL(
+        applicationSupportURL: URL,
+        durableStateNamespace: String
+    ) -> URL {
+        applicationSupportURL
+            .appendingPathComponent("BigSyncKit", isDirectory: true)
+            .appendingPathComponent("LocalState", isDirectory: true)
+            .appendingPathComponent(durableStateNamespace, isDirectory: true)
+    }
+
     /**
      *  Creates a new `QSCloudKitSynchronizer` prepared to work with a Realm model and the SyncKit default record zone in the private database.
      - Parameters:
@@ -76,10 +86,10 @@ extension CloudKitSynchronizer {
                     in: .userDomainMask
                 )[0]
             }
-            let localStateDirectory = applicationSupportURL
-                .appendingPathComponent("BigSyncKit", isDirectory: true)
-                .appendingPathComponent("LocalState", isDirectory: true)
-                .appendingPathComponent(durableStateNamespace, isDirectory: true)
+            let localStateDirectory = productionLocalStateDirectoryURL(
+                applicationSupportURL: applicationSupportURL,
+                durableStateNamespace: durableStateNamespace
+            )
             let fileStore = FileKeyValueStore(
                 fileURL: localStateDirectory.appendingPathComponent("state.plist")
             )
@@ -142,15 +152,30 @@ extension CloudKitSynchronizer {
             synchronizer.durableStateNamespace == durableStateNamespace,
             "BigSyncKit provider and synchronizer durable namespaces diverged"
         )
+        // Passing the exact optional base preserves BackupDetection's
+        // platform-specific default when the client has no shared app-group
+        // state, while production app/extension clients share the explicit
+        // app-group base computed above.
+        let clientIdentity = BigSyncClientIdentity(
+            synchronizerName: synchronizerName,
+            containerName: containerName,
+            recordZoneID: zoneID,
+            databaseScope: .private,
+            sharedStateBaseURL: backupDetectionBaseURL
+                ?? BackupDetection.defaultSentinelURL(
+                    namespace: durableStateNamespace
+                ).deletingLastPathComponent()
+        )
+        precondition(
+            clientIdentity.durableStateNamespace == durableStateNamespace,
+            "BigSyncKit mutation and synchronizer durable namespaces diverged"
+        )
         BigSyncMutationPolicy(
             excludedClassNames: excludedClassNames
         ).install(
             configurations: configurations,
             installationIdentifierProvider: {
-                BackupDetection.installationIdentifier(
-                    namespace: durableStateNamespace,
-                    sharedSentinelBaseURL: backupDetectionBaseURL
-                )
+                clientIdentity.currentInstallationIdentifier()
             }
         )
 #if DEBUG

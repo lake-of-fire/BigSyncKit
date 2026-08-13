@@ -149,6 +149,19 @@ enum BackupDetection {
         ))
     }
 
+    static func manualRestoreReceipt(
+        namespace: String,
+        sharedSentinelBaseURL: URL? = nil
+    ) -> ManualRestoreReceipt? {
+        let sentinelURL = defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: sharedSentinelBaseURL
+        )
+        return manualRestoreReceipt(
+            at: restoreEventURL(sentinelURL: sentinelURL)
+        )
+    }
+
     /// Detects a restored installation by pairing a backed-up per-client
     /// marker file with a per-client filesystem sentinel excluded from backup.
     ///
@@ -649,7 +662,7 @@ enum BackupDetection {
         Data("\(sentinelHeader)\n\(installationIdentifier)\n".utf8)
     }
 
-    private static func manualRestoreReceipt(at url: URL) -> ManualRestoreReceipt? {
+    static func manualRestoreReceipt(at url: URL) -> ManualRestoreReceipt? {
         guard let data = try? Data(contentsOf: url),
               let value = String(data: data, encoding: .utf8) else { return nil }
         let lines = value.split(separator: "\n").map(String.init)

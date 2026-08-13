@@ -194,20 +194,63 @@ public struct BigSyncClientIdentity: Sendable {
             namespace: durableStateNamespace,
             sharedSentinelBaseURL: sharedStateBaseURL
         )
-        guard let identifier = BackupDetection.installationIdentifier(
+        guard let identifier = publishedInstallationIdentifier() else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        if let pendingManualRestore = BackupDetection.manualRestoreReceipt(
             namespace: durableStateNamespace,
             sharedSentinelBaseURL: sharedStateBaseURL
-        ) else {
-            throw CocoaError(.fileReadCorruptFile)
+        ) {
+            let receipt = makeManualRestoreReceipt(pendingManualRestore)
+            if identifier == receipt.oldInstallationIdentifier {
+                // The target Realm was replaced under an exclusive lease, but
+                // the new identity has not reached the sentinel yet. Refuse to
+                // let a newly launched app/extension attribute writes to the
+                // replacement with the old installation identity.
+                throw BigSyncManualBackupRestoreError.handoffPending(receipt)
+            }
+            guard identifier == receipt.newInstallationIdentifier else {
+                throw BigSyncManualBackupRestoreError.stateAmbiguous
+            }
+        } else if BackupDetection.restoreResetIsRequired(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL
+        ), BackupDetection.restoreResetEventIdentifier(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL
+        ) == nil {
+            // An unreadable restore event cannot prove whether it is an
+            // automatic backup restore or a partially published manual
+            // replacement. Never open a target Realm on that ambiguity.
+            throw BigSyncManualBackupRestoreError.stateAmbiguous
         }
         return identifier
     }
 
     public func currentInstallationIdentifier() -> String? {
-        BackupDetection.installationIdentifier(
+        guard let identifier = publishedInstallationIdentifier() else {
+            return nil
+        }
+        if let pendingManualRestore = BackupDetection.manualRestoreReceipt(
             namespace: durableStateNamespace,
             sharedSentinelBaseURL: sharedStateBaseURL
-        )
+        ) {
+            // A dynamic mutation-generation provider may be called after a
+            // runtime handoff failure. Return no identity until the sentinel
+            // proves the event's new installation, making such a write fail
+            // closed instead of attributing it to the old installation.
+            guard identifier == pendingManualRestore.newInstallationIdentifier
+            else { return nil }
+        } else if BackupDetection.restoreResetIsRequired(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL
+        ), BackupDetection.restoreResetEventIdentifier(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL
+        ) == nil {
+            return nil
+        }
+        return identifier
     }
 
     /// Publishes a manual Realm-backup restore before synchronization metadata
@@ -288,7 +331,7 @@ public struct BigSyncClientIdentity: Sendable {
                         )
                     )
                 } catch {
-                    let currentIdentifier = currentInstallationIdentifier()
+                    let currentIdentifier = publishedInstallationIdentifier()
                     guard currentIdentifier
                             == publicReceipt.oldInstallationIdentifier
                             || currentIdentifier
@@ -302,7 +345,7 @@ public struct BigSyncClientIdentity: Sendable {
 
             case .newTransaction:
                 guard let installationBeforeReplacement =
-                        currentInstallationIdentifier() else {
+                        publishedInstallationIdentifier() else {
                     throw BigSyncManualBackupRestoreError.stateAmbiguous
                 }
                 do {
@@ -341,7 +384,7 @@ public struct BigSyncClientIdentity: Sendable {
                     switch stateAfterFailure {
                     case .resume(let receipt):
                         let publicReceipt = makeManualRestoreReceipt(receipt)
-                        let currentIdentifier = currentInstallationIdentifier()
+                        let currentIdentifier = publishedInstallationIdentifier()
                         guard currentIdentifier
                                 == publicReceipt.oldInstallationIdentifier
                                 || currentIdentifier
@@ -352,7 +395,7 @@ public struct BigSyncClientIdentity: Sendable {
                             publicReceipt
                         )
                     case .newTransaction:
-                        guard currentInstallationIdentifier()
+                        guard publishedInstallationIdentifier()
                                 == installationBeforeReplacement else {
                             throw BigSyncManualBackupRestoreError.stateAmbiguous
                         }
@@ -372,6 +415,13 @@ public struct BigSyncClientIdentity: Sendable {
             restoreEventIdentifier: receipt.restoreEventIdentifier,
             oldInstallationIdentifier: receipt.oldInstallationIdentifier,
             newInstallationIdentifier: receipt.newInstallationIdentifier
+        )
+    }
+
+    private func publishedInstallationIdentifier() -> String? {
+        BackupDetection.installationIdentifier(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL
         )
     }
 
