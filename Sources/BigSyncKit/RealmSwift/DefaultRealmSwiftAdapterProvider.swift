@@ -16,6 +16,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
     let persistenceConfiguration: Realm.Configuration
     let targetConfigurations: [Realm.Configuration]
     let excludedClassNames: [String]
+    let accountScopePropertyByClassName: [String: String]
     let priorityClassNames: [String]
     let appGroup: String?
     let assetDirectoryURL: URL?
@@ -32,6 +33,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
     public init(
         targetConfigurations: [Realm.Configuration],
         excludedClassNames: [String],
+        accountScopePropertyByClassName: [String: String] = [:],
         priorityClassNames: [String] = [],
         zoneID: CKRecordZone.ID,
         appGroup: String? = nil,
@@ -43,6 +45,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
     ) {
         self.targetConfigurations = targetConfigurations
         self.excludedClassNames = excludedClassNames
+        self.accountScopePropertyByClassName =
+            accountScopePropertyByClassName
         self.priorityClassNames = priorityClassNames
         self.zoneID = zoneID
         self.appGroup = appGroup
@@ -64,6 +68,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
         persistenceConfiguration = adapter.persistenceRealmConfiguration
         targetConfigurations = adapter.targetRealmConfigurations
         excludedClassNames = adapter.excludedClassNames
+        accountScopePropertyByClassName =
+            adapter.accountScopePropertyByClassName
         priorityClassNames = adapter.priorityEntityTypeNames
         appGroup = nil
         assetDirectoryURL = nil
@@ -78,6 +84,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
             persistenceRealmConfiguration: persistenceConfiguration,
             targetRealmConfigurations: targetConfigurations,
             excludedClassNames: excludedClassNames,
+            accountScopePropertyByClassName:
+                accountScopePropertyByClassName,
             priorityEntityTypeNames: priorityClassNames,
             recordZoneID: zoneID,
             logger: logger,

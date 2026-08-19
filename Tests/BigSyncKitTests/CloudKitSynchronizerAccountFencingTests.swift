@@ -237,7 +237,108 @@ private actor AccountFencingStatusSequence {
     }
 }
 
+private actor AccountScopeInvalidationRecorder {
+    private(set) var reasons = [BigSyncAccountScopeInvalidationReason]()
+
+    func record(_ reason: BigSyncAccountScopeInvalidationReason) {
+        reasons.append(reason)
+    }
+}
+
 final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
+    @BigSyncBackgroundActor
+    func testAccountChangeNotifiesDomainInvalidationAfterLeaseIsDurable()
+    async throws {
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { "account-a" }
+        )
+        let recorder = AccountScopeInvalidationRecorder()
+        synchronizer.accountScopeInvalidationHandler = { reason in
+            let lease: BigSyncAccountScopeLease?
+            do {
+                lease = try synchronizer.accountScopeLease()
+            } catch {
+                XCTFail("Could not read invalidated account lease: \(error)")
+                return
+            }
+            XCTAssertNil(lease)
+            await recorder.record(reason)
+        }
+        try await synchronizer._test_validateSynchronizationAccount()
+
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        for _ in 0..<100 {
+            if !(await recorder.reasons).isEmpty { break }
+            await Task.yield()
+        }
+
+        let reasons = await recorder.reasons
+        XCTAssertEqual(reasons, [.accountChanged])
+        XCTAssertNil(try synchronizer.accountScopeLease())
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountScopeLeaseIsStableUntilDurableInvalidation()
+    async throws {
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { "account-a" }
+        )
+
+        try await synchronizer._test_validateSynchronizationAccount()
+        let first = try XCTUnwrap(synchronizer.accountScopeLease())
+        XCTAssertEqual(
+            first.accountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+
+        try await synchronizer._test_validateSynchronizationAccount()
+        let routineRevalidation = try XCTUnwrap(
+            synchronizer.accountScopeLease()
+        )
+        XCTAssertEqual(
+            routineRevalidation.invalidationGeneration,
+            first.invalidationGeneration
+        )
+
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        for _ in 0..<100 where try synchronizer.accountScopeLease() != nil {
+            await Task.yield()
+        }
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertThrowsError(
+            try synchronizer.validateAccountScopeLease(first)
+        ) { error in
+            XCTAssertEqual(
+                error as? BigSyncAccountScopeLeaseError,
+                .unavailable
+            )
+        }
+
+        try await synchronizer._test_validateSynchronizationAccount()
+        let restored = try XCTUnwrap(synchronizer.accountScopeLease())
+        XCTAssertEqual(
+            restored.accountScopeIdentifier,
+            first.accountScopeIdentifier
+        )
+        XCTAssertEqual(
+            restored.invalidationGeneration,
+            first.invalidationGeneration + 1
+        )
+        XCTAssertThrowsError(
+            try synchronizer.validateAccountScopeLease(first)
+        ) { error in
+            XCTAssertEqual(
+                error as? BigSyncAccountScopeLeaseError,
+                .stale
+            )
+        }
+        XCTAssertNoThrow(
+            try synchronizer.validateAccountScopeLease(restored)
+        )
+    }
+
     @BigSyncBackgroundActor
     func testUnavailableAccountStatusPreventsEveryCloudKitOperation() async {
         let transport = AccountFencingTransport()

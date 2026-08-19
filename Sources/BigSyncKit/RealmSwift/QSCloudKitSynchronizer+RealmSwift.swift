@@ -36,6 +36,7 @@ extension CloudKitSynchronizer {
         containerName: String,
         configurations: [Realm.Configuration],
         excludedClassNames: [String],
+        accountScopePropertyByClassName: [String: String] = [:],
         priorityClassNames: [String] = [],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
@@ -139,6 +140,8 @@ extension CloudKitSynchronizer {
         let provider = DefaultRealmSwiftAdapterProvider(
             targetConfigurations: configurations,
             excludedClassNames: excludedClassNames,
+            accountScopePropertyByClassName:
+                accountScopePropertyByClassName,
             priorityClassNames: priorityClassNames,
             zoneID: zoneID,
             appGroup: suiteName,
@@ -182,7 +185,9 @@ extension CloudKitSynchronizer {
             "BigSyncKit mutation and synchronizer durable namespaces diverged"
         )
         BigSyncMutationPolicy(
-            excludedClassNames: excludedClassNames
+            excludedClassNames: excludedClassNames,
+            accountScopePropertyByClassName:
+                accountScopePropertyByClassName
         ).install(
             configurations: configurations,
             installationIdentifierProvider: {

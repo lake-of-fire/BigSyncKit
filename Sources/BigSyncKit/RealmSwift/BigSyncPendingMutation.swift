@@ -40,6 +40,11 @@ public final class BigSyncPendingMutation: Object {
     @Persisted(primaryKey: true) public var recordName = ""
     @Persisted(indexed: true) public var entityType = ""
     @Persisted public var objectIdentifier = ""
+    /// Opaque CloudKit account scope captured from the domain object at the
+    /// same transaction boundary as this generation. `nil` is reserved for
+    /// legacy or explicitly unscoped model types and is never rebound to a
+    /// later account by convenience.
+    @Persisted(indexed: true) public var accountScopeIdentifier: String?
     @Persisted public var generation = ""
     @Persisted public var changedAt = Date()
 
@@ -47,6 +52,7 @@ public final class BigSyncPendingMutation: Object {
         recordName: String,
         entityType: String,
         objectIdentifier: String,
+        accountScopeIdentifier: String? = nil,
         generation: String? = nil,
         changedAt: Date = Date()
     ) {
@@ -54,6 +60,7 @@ public final class BigSyncPendingMutation: Object {
         self.recordName = recordName
         self.entityType = entityType
         self.objectIdentifier = objectIdentifier
+        self.accountScopeIdentifier = accountScopeIdentifier
         self.generation = generation ?? Self.makeGeneration()
         self.changedAt = changedAt
     }
@@ -63,9 +70,24 @@ public final class BigSyncPendingMutation: Object {
 /// worker, preventing their exclusion lists from drifting apart.
 public struct BigSyncMutationPolicy: Sendable, Equatable {
     public let excludedClassNames: [String]
+    /// Maps a synchronized Realm class name to its immutable CloudKit account
+    /// scope property. The same map is installed for local journaling and
+    /// passed to the worker adapter; configuration drift is a programmer error.
+    public let accountScopePropertyByClassName: [String: String]
 
-    public init(excludedClassNames: [String]) {
+    public init(
+        excludedClassNames: [String],
+        accountScopePropertyByClassName: [String: String] = [:]
+    ) {
         self.excludedClassNames = Array(Set(excludedClassNames)).sorted()
+        precondition(
+            accountScopePropertyByClassName.allSatisfy {
+                !$0.key.isEmpty && !$0.value.isEmpty
+            },
+            "BigSync account-scope policy names must be non-empty"
+        )
+        self.accountScopePropertyByClassName =
+            accountScopePropertyByClassName
     }
 
     public func install(
@@ -90,6 +112,8 @@ public struct BigSyncMutationPolicy: Sendable, Equatable {
         BigSyncMutationTracking.install(
             configurations: configurations,
             excludedClassNames: excludedClassNames,
+            accountScopePropertyByClassName:
+                accountScopePropertyByClassName,
             installationIdentifierProvider:
                 installationIdentifierProvider
                 ?? installationIdentifier.map { identifier in
@@ -103,6 +127,7 @@ struct BigSyncPendingMutationSnapshot: Sendable {
     let recordName: String
     let entityType: String
     let objectIdentifier: String
+    let accountScopeIdentifier: String?
     let generation: String
     let changedAt: Date
     let isDeletion: Bool
@@ -112,6 +137,7 @@ enum BigSyncMutationTrackingRegistry {
     private static let lock = NSLock()
     private struct Registration {
         let classNames: Set<String>
+        let accountScopePropertyByClassName: [String: String]
         var installationIdentifierProvider: (@Sendable () -> String?)?
     }
     private static var registrationsByRealm = [String: Registration]()
@@ -129,6 +155,7 @@ enum BigSyncMutationTrackingRegistry {
     static func register(
         configurations: [Realm.Configuration],
         excluding excludedClassNames: Set<String>,
+        accountScopePropertyByClassName: [String: String],
         installationIdentifierProvider: (@Sendable () -> String?)?
     ) {
         lock.withLock {
@@ -144,6 +171,11 @@ enum BigSyncMutationTrackingRegistry {
                         registration.classNames == classNames,
                         "Conflicting BigSync mutation policies registered for \(realmIdentity)"
                     )
+                    precondition(
+                        registration.accountScopePropertyByClassName
+                            == accountScopePropertyByClassName,
+                        "Conflicting BigSync account-scope policies registered for \(realmIdentity)"
+                    )
                     if let installationIdentifierProvider {
                         registration.installationIdentifierProvider =
                             installationIdentifierProvider
@@ -152,6 +184,8 @@ enum BigSyncMutationTrackingRegistry {
                 } else {
                     registrationsByRealm[realmIdentity] = Registration(
                         classNames: classNames,
+                        accountScopePropertyByClassName:
+                            accountScopePropertyByClassName,
                         installationIdentifierProvider:
                             installationIdentifierProvider
                     )
@@ -196,6 +230,33 @@ enum BigSyncMutationTrackingRegistry {
         )
     }
 
+    static func accountScopeIdentifier(
+        for object: Object,
+        entityType: String,
+        in realm: Realm
+    ) -> String? {
+        let propertyName = lock.withLock {
+            registrationsByRealm[
+                identity(for: realm.configuration)
+            ]?.accountScopePropertyByClassName[entityType]
+        }
+        guard let propertyName else { return nil }
+        guard object.objectSchema.properties.contains(where: {
+            $0.name == propertyName && $0.type == .string
+        }) else {
+            preconditionFailure(
+                "BigSync account-scope property \(entityType).\(propertyName) is missing or not a String"
+            )
+        }
+        guard let value = object[propertyName] as? String,
+              !value.isEmpty else {
+            preconditionFailure(
+                "BigSync account-scoped mutation for \(entityType) has no immutable account scope"
+            )
+        }
+        return value
+    }
+
     static func generationWasCreatedInCurrentInstallation(
         _ generation: String,
         realm: Realm
@@ -228,6 +289,7 @@ public enum BigSyncMutationTracking {
     public static func install(
         configurations: [Realm.Configuration],
         excludedClassNames: [String],
+        accountScopePropertyByClassName: [String: String] = [:],
         installationIdentifier: String? = nil,
         installationIdentifierProvider:
             (@Sendable () -> String?)? = nil
@@ -242,6 +304,8 @@ public enum BigSyncMutationTracking {
             excluding: Set(
                 excludedClassNames + [BigSyncPendingMutation.className()]
             ),
+            accountScopePropertyByClassName:
+                accountScopePropertyByClassName,
             installationIdentifierProvider:
                 installationIdentifierProvider
                 ?? installationIdentifier.map { identifier in

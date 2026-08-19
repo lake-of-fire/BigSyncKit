@@ -31,21 +31,36 @@ final class DisposableZoneAuthorizationTests: XCTestCase {
         )
     }
 
+    func testNonCleanupE2EPhaseCannotAcquireDeletionCapability() {
+        let runID = UUID()
+        let canonicalRunID = runID.uuidString.lowercased()
+        var configuration = makeConfiguration(
+            runID: runID,
+            zoneName: "ManabiPlatform.e2e.v2.\(canonicalRunID)",
+            phase: "writer-b"
+        )
+
+        XCTAssertFalse(
+            configuration.authorizeDisposableZoneDeletionForE2E(runID: runID)
+        )
+    }
+
     private func makeConfiguration(
         runID: UUID,
-        zoneName: String
+        zoneName: String,
+        phase: String = "cleanup"
     ) -> BigSyncBackgroundWorkerConfiguration {
         let canonicalRunID = runID.uuidString.lowercased()
         let phaseRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("CloudKitE2E", isDirectory: true)
             .appendingPathComponent(canonicalRunID, isDirectory: true)
-            .appendingPathComponent("cleanup", isDirectory: true)
+            .appendingPathComponent(phase, isDirectory: true)
         let realmConfiguration = Realm.Configuration(
             inMemoryIdentifier: UUID().uuidString,
             objectTypes: [BigSyncPendingMutation.self]
         )
         return BigSyncBackgroundWorkerConfiguration(
-            synchronizerName: "\(zoneName).cleanup",
+            synchronizerName: "\(zoneName).\(phase)",
             containerName: "iCloud.io.manabi.ManabiPlatform.v2",
             configurations: [realmConfiguration],
             mutationPolicy: BigSyncMutationPolicy(

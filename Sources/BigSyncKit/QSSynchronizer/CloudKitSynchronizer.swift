@@ -638,6 +638,9 @@ public class CloudKitSynchronizer: NSObject {
     /// private-zone adapter, so this namespace is also the complete transport
     /// identity for reset, token, retry, health, and lifecycle state.
     internal private(set) var durableStateNamespace: String
+    @BigSyncBackgroundActor
+    var accountScopeInvalidationHandler:
+        BigSyncBackgroundWorkerConfiguration.AccountScopeInvalidationHandler?
 #if DEBUG
     private var allowsRecordZoneRebindingForTesting = false
 #endif
@@ -670,6 +673,10 @@ public class CloudKitSynchronizer: NSObject {
 
     private var cloudKitAccountIdentifierKey: String {
         durableStateKey("CloudKitAccountIdentifier")
+    }
+
+    private var accountScopeLeaseKey: String {
+        durableStateKey("AccountScopeLease.v1")
     }
 
     private var transientRetryStateKey: String {
@@ -898,6 +905,14 @@ public class CloudKitSynchronizer: NSObject {
         ) { [weak self] _ in
             Task { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
+                do {
+                    try invalidateAccountScopeLeaseDurably()
+                    await accountScopeInvalidationHandler?(.accountChanged)
+                } catch {
+                    logger.error(
+                        "QSCloudKitSynchronizer >> Failed to durably invalidate the account lease: \(error)"
+                    )
+                }
                 accountValidationRequired = true
                 cancelSynchronization()
                 // CloudKit's account-change contract requires a fresh account
@@ -918,6 +933,7 @@ public class CloudKitSynchronizer: NSObject {
             refreshBackupRestoreRequirement()
             if result == .restoredFromBackup || backupRestoreDetected {
                 clearDeviceIdentifier()
+                try invalidateAccountScopeLeaseDurably()
             }
         } catch {
             backupDetectionError = error
@@ -1331,6 +1347,12 @@ public class CloudKitSynchronizer: NSObject {
                     )
                 )
                 activeRunContext = context
+                for adapter in modelAdapters {
+                    try await adapter.activateAccountScope(
+                        context.accountScopeIdentifier
+                    )
+                    try checkRunContext(context)
+                }
                 // A verified restored-backup event invalidates copied sync-only
                 // lifecycle markers. Establish its durable reconciliation
                 // request before consulting those stale markers. A deletion
@@ -1635,6 +1657,13 @@ public class CloudKitSynchronizer: NSObject {
             try clearAllStoredSubscriptionIDs()
             clearPersistedTransientRetryState()
         }
+        try establishAccountScopeLeaseDurably(
+            accountIdentifier: confirmedAccountIdentifier,
+            forceInvalidation: didReplaceAccount
+        )
+        if didReplaceAccount {
+            await accountScopeInvalidationHandler?(.accountReplaced)
+        }
         // Publish the new account identity only after its server-first rebuild
         // request is durable. If the process dies first, the next validation
         // still sees the old account and idempotently requests the same reset;
@@ -1648,6 +1677,130 @@ public class CloudKitSynchronizer: NSObject {
         cancelSync = false
         cancelledDueToUnauthentication = false
         return confirmedAccountIdentifier
+    }
+
+    /// Returns the last durably validated CloudKit account lease. Temporary
+    /// network or account-status failures do not invalidate this value;
+    /// `.CKAccountChanged`, restore, and a proved account replacement do.
+    @BigSyncBackgroundActor
+    public func accountScopeLease() throws -> BigSyncAccountScopeLease? {
+        try readAccountScopeLeaseDurably().lease
+    }
+
+    /// Revalidates a captured lease after suspension. Domain writers should
+    /// also mirror this epoch into their local Realm and compare it inside the
+    /// final non-suspending write transaction.
+    @BigSyncBackgroundActor
+    public func validateAccountScopeLease(
+        _ expected: BigSyncAccountScopeLease
+    ) throws {
+        guard let current = try accountScopeLease() else {
+            throw BigSyncAccountScopeLeaseError.unavailable
+        }
+        guard current.accountScopeIdentifier
+                == expected.accountScopeIdentifier,
+              current.invalidationGeneration
+                == expected.invalidationGeneration else {
+            throw BigSyncAccountScopeLeaseError.stale
+        }
+    }
+
+    private struct PersistedAccountScopeLease {
+        let generation: Int64
+        let lease: BigSyncAccountScopeLease?
+    }
+
+    private func readAccountScopeLeaseDurably() throws
+        -> PersistedAccountScopeLease {
+        guard let raw = try keyValueStore.bigSyncDurableObject(
+            forKey: accountScopeLeaseKey
+        ) else {
+            return PersistedAccountScopeLease(generation: 0, lease: nil)
+        }
+        guard let value = raw as? [String: Any],
+              (value["version"] as? NSNumber)?.intValue == 1,
+              let generationNumber = value["generation"] as? NSNumber,
+              generationNumber.int64Value >= 0,
+              let isValid = value["isValid"] as? Bool else {
+            throw BigSyncAccountScopeLeaseError.corrupt
+        }
+        let generation = generationNumber.int64Value
+        guard isValid else {
+            return PersistedAccountScopeLease(
+                generation: generation,
+                lease: nil
+            )
+        }
+        guard let accountScopeIdentifier =
+                value["accountScopeIdentifier"] as? String,
+              !accountScopeIdentifier.isEmpty,
+              let validatedAt = value["validatedAt"] as? Date else {
+            throw BigSyncAccountScopeLeaseError.corrupt
+        }
+        return PersistedAccountScopeLease(
+            generation: generation,
+            lease: BigSyncAccountScopeLease(
+                accountScopeIdentifier: accountScopeIdentifier,
+                invalidationGeneration: generation,
+                validatedAt: validatedAt
+            )
+        )
+    }
+
+    private func persistAccountScopeLease(
+        generation: Int64,
+        accountScopeIdentifier: String?,
+        validatedAt: Date?
+    ) throws {
+        var value: [String: Any] = [
+            "version": 1,
+            "generation": NSNumber(value: generation),
+            "isValid": accountScopeIdentifier != nil,
+        ]
+        if let accountScopeIdentifier, let validatedAt {
+            value["accountScopeIdentifier"] = accountScopeIdentifier
+            value["validatedAt"] = validatedAt
+        }
+        try keyValueStore.bigSyncSetDurably(
+            value: value,
+            forKey: accountScopeLeaseKey
+        )
+    }
+
+    private func invalidateAccountScopeLeaseDurably() throws {
+        let persisted = try readAccountScopeLeaseDurably()
+        guard persisted.lease != nil else { return }
+        guard persisted.generation < Int64.max else {
+            throw BigSyncAccountScopeLeaseError.corrupt
+        }
+        try persistAccountScopeLease(
+            generation: persisted.generation + 1,
+            accountScopeIdentifier: nil,
+            validatedAt: nil
+        )
+    }
+
+    private func establishAccountScopeLeaseDurably(
+        accountIdentifier: String,
+        forceInvalidation: Bool
+    ) throws {
+        let scope = Self.accountScopeIdentifier(for: accountIdentifier)
+        var persisted = try readAccountScopeLeaseDurably()
+        if forceInvalidation || (
+            persisted.lease != nil
+                && persisted.lease?.accountScopeIdentifier != scope
+        ) {
+            try invalidateAccountScopeLeaseDurably()
+            persisted = try readAccountScopeLeaseDurably()
+        }
+        if persisted.lease?.accountScopeIdentifier == scope {
+            return
+        }
+        try persistAccountScopeLease(
+            generation: persisted.generation,
+            accountScopeIdentifier: scope,
+            validatedAt: Date()
+        )
     }
 
     private func persistedTransientRetryState() -> (

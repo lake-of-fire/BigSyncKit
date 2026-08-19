@@ -136,6 +136,13 @@ public protocol ModelAdapter: AnyObject, Sendable {
     var priorityEntityTypeNames: [String] { get }
     
     var modelAdapterDelegate: ModelAdapterDelegate? { get set }
+
+    /// Binds adapter discovery, preparation, inbound validation, and
+    /// acknowledgement to the CloudKit account already validated for this
+    /// synchronization run. Implementations that do not own account-scoped
+    /// models may use the default no-op.
+    @BigSyncBackgroundActor
+    func activateAccountScope(_ accountScopeIdentifier: String) async throws
     
     func cleanUp() async throws
     
@@ -254,6 +261,11 @@ public extension ModelAdapter {
     var priorityEntityTypeNames: [String] { [] }
 
     func waitForCancellation() async {}
+
+    @BigSyncBackgroundActor
+    func activateAccountScope(_ accountScopeIdentifier: String) async throws {
+        _ = accountScopeIdentifier
+    }
 
     @BigSyncBackgroundActor
     func rebasePendingDeletionMetadata(

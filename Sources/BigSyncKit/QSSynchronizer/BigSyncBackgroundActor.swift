@@ -34,10 +34,20 @@ private actor BigSyncDeadlineRace {
 }
 
 public struct BigSyncBackgroundWorkerConfiguration {
+    public typealias SynchronizationCompletionHandler =
+        @BigSyncBackgroundActor @Sendable (
+            CloudKitSynchronizer.SynchronizationResult
+        ) async -> Void
+    public typealias AccountScopeInvalidationHandler =
+        @BigSyncBackgroundActor @Sendable (
+            BigSyncAccountScopeInvalidationReason
+        ) async -> Void
+
     let synchronizerName: String
     let containerName: String
     let configurations: [Realm.Configuration]
     let excludedClassNames: [String]
+    let accountScopePropertyByClassName: [String: String]
     let priorityClassNames: [String]
     let suiteName: String?
     let recordZoneID: CKRecordZone.ID?
@@ -46,6 +56,8 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let performsAccountAvailabilityPreflight: Bool
     let accountIdentifierProvider: CloudKitSynchronizer.AccountIdentifierProvider?
     let progressHandler: CloudKitSynchronizer.ProgressHandler?
+    let synchronizationCompletionHandler: SynchronizationCompletionHandler?
+    let accountScopeInvalidationHandler: AccountScopeInvalidationHandler?
     var changeFeedOverride: (any CloudKitChangeFeed)?
     var recordStoreOverride: (any CloudKitRecordStore)?
     /// Production synchronizers never delete CloudKit zones. Only an isolated
@@ -64,6 +76,8 @@ public struct BigSyncBackgroundWorkerConfiguration {
         performsAccountAvailabilityPreflight: Bool = true,
         accountIdentifierProvider: CloudKitSynchronizer.AccountIdentifierProvider? = nil,
         progressHandler: CloudKitSynchronizer.ProgressHandler? = nil,
+        synchronizationCompletionHandler: SynchronizationCompletionHandler? = nil,
+        accountScopeInvalidationHandler: AccountScopeInvalidationHandler? = nil,
         logger: Logging.Logger
     ) {
         let zoneID = recordZoneID ?? CloudKitSynchronizer.defaultCustomZoneID
@@ -121,6 +135,8 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.containerName = containerName
         self.configurations = configurations
         self.excludedClassNames = mutationPolicy.excludedClassNames
+        self.accountScopePropertyByClassName =
+            mutationPolicy.accountScopePropertyByClassName
         self.priorityClassNames = priorityObjectTypes.map { $0.className() }
         self.suiteName = suiteName
         self.recordZoneID = recordZoneID
@@ -129,6 +145,8 @@ public struct BigSyncBackgroundWorkerConfiguration {
             performsAccountAvailabilityPreflight
         self.accountIdentifierProvider = accountIdentifierProvider
         self.progressHandler = progressHandler
+        self.synchronizationCompletionHandler = synchronizationCompletionHandler
+        self.accountScopeInvalidationHandler = accountScopeInvalidationHandler
         self.changeFeedOverride = nil
         self.recordStoreOverride = nil
         self.allowsDisposableZoneDeletion = false
@@ -159,9 +177,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
         guard let recordZoneID,
               recordZoneID.ownerName == CKCurrentUserDefaultName,
               recordZoneID.zoneName == expectedZoneName,
-              synchronizerName == "\(expectedZoneName).source"
-                || synchronizerName == "\(expectedZoneName).restore"
-                || synchronizerName == "\(expectedZoneName).cleanup",
+              synchronizerName == "\(expectedZoneName).cleanup",
               let localState else {
             return false
         }
@@ -175,7 +191,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
         let phase = trackingParent.lastPathComponent
         let runRoot = trackingParent.deletingLastPathComponent()
         guard trackingParent == assetParent,
-              ["source", "restore", "cleanup"].contains(phase),
+              phase == "cleanup",
               runRoot.lastPathComponent == canonicalRunID,
               runRoot.deletingLastPathComponent().lastPathComponent == "CloudKitE2E" else {
             return false
@@ -200,6 +216,9 @@ public actor BigSyncBackgroundActor {
     private var accountAvailabilityRetryTask: Task<Void, Never>?
     @BigSyncBackgroundActor
     private var performsAccountAvailabilityPreflight = true
+    @BigSyncBackgroundActor
+    private var synchronizationCompletionHandler:
+        BigSyncBackgroundWorkerConfiguration.SynchronizationCompletionHandler?
 
     @BigSyncBackgroundActor
     public private(set) var realmSynchronizer: CloudKitSynchronizer?
@@ -232,6 +251,8 @@ public actor BigSyncBackgroundActor {
             containerName: configuration.containerName,
             configurations: configuration.configurations,
             excludedClassNames: configuration.excludedClassNames,
+            accountScopePropertyByClassName:
+                configuration.accountScopePropertyByClassName,
             priorityClassNames: configuration.priorityClassNames,
             suiteName: configuration.suiteName,
             recordZoneID: configuration.recordZoneID,
@@ -247,8 +268,18 @@ public actor BigSyncBackgroundActor {
         )
 
         realmSynchronizer = synchronizer
+        synchronizer.accountScopeInvalidationHandler =
+            configuration.accountScopeInvalidationHandler
+        if synchronizer.backupRestoreDetected,
+           let handler = configuration.accountScopeInvalidationHandler {
+            Task { @BigSyncBackgroundActor in
+                await handler(.restoreDetected)
+            }
+        }
         performsAccountAvailabilityPreflight =
             configuration.performsAccountAvailabilityPreflight
+        synchronizationCompletionHandler =
+            configuration.synchronizationCompletionHandler
 
         (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
 
@@ -264,6 +295,73 @@ public actor BigSyncBackgroundActor {
             }
             _ = await self.synchronizeCloudKit(expectedSynchronizer: synchronizer)
         }
+    }
+
+    @BigSyncBackgroundActor
+    public func hasInboundSemanticQuarantine(
+        entityType: String,
+        accountScopeIdentifier: String
+    ) throws -> Bool {
+        guard let adapter = realmSynchronizer?.modelAdapters.first
+                as? RealmSwiftAdapter else {
+            return false
+        }
+        return try adapter.hasInboundSemanticQuarantine(
+            entityType: entityType,
+            accountScopeIdentifier: accountScopeIdentifier
+        )
+    }
+
+    @BigSyncBackgroundActor
+    public func serverRecordEvidence(
+        recordName: String,
+        expectedEntityType: String
+    ) throws -> BigSyncServerRecordEvidence? {
+        guard let adapter = realmSynchronizer?.modelAdapters.first
+                as? RealmSwiftAdapter else {
+            return nil
+        }
+        return try adapter.serverRecordEvidence(
+            recordName: recordName,
+            expectedEntityType: expectedEntityType
+        )
+    }
+
+    /// Current-account membership catalog at the latest consumed server
+    /// boundary. Target-Realm presence is deliberately not consulted.
+    @BigSyncBackgroundActor
+    public func serverRecordEvidence(
+        entityTypes: Set<String>
+    ) throws -> [BigSyncServerRecordEvidence] {
+        guard let adapter = realmSynchronizer?.modelAdapters.first
+                as? RealmSwiftAdapter else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
+        return try adapter.serverRecordEvidence(entityTypes: entityTypes)
+    }
+
+    @BigSyncBackgroundActor
+    public func currentServerBoundaryIdentifier() throws -> String? {
+        guard let adapter = realmSynchronizer?.modelAdapters.first
+                as? RealmSwiftAdapter else {
+            return nil
+        }
+        return try adapter.currentServerBoundaryIdentifier()
+    }
+
+    /// Read-only inventory used by account-fenced model cutovers. The
+    /// inventory never clears or acknowledges the sole mutation journal.
+    @BigSyncBackgroundActor
+    public func pendingMutationInventory(
+        entityTypes: Set<String>
+    ) throws -> [BigSyncPendingMutationInventoryItem] {
+        guard let adapter = realmSynchronizer?.modelAdapters.first
+                as? RealmSwiftAdapter else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
+        return try adapter.pendingMutationInventory(
+            entityTypes: entityTypes
+        )
     }
 
     @BigSyncBackgroundActor
@@ -382,7 +480,13 @@ public actor BigSyncBackgroundActor {
         guard !Task.isCancelled,
               realmSynchronizer === expectedSynchronizer else { return nil }
         do {
-            return try await expectedSynchronizer.synchronize()
+            let result = try await expectedSynchronizer.synchronize()
+            guard !Task.isCancelled,
+                  realmSynchronizer === expectedSynchronizer else {
+                return nil
+            }
+            await synchronizationCompletionHandler?(result)
+            return result
         } catch is CancellationError {
             return nil
         } catch {
@@ -439,6 +543,27 @@ public actor BigSyncBackgroundActor {
         return try? await realmSynchronizer.syncHealthSnapshot()
     }
 
+    /// Returns the durable account authority used by account-scoped domain
+    /// writers. The lease remains usable while offline until an account,
+    /// restore, or installation boundary durably invalidates its generation.
+    @BigSyncBackgroundActor
+    public func accountScopeLease() throws -> BigSyncAccountScopeLease? {
+        guard let realmSynchronizer else { return nil }
+        return try realmSynchronizer.accountScopeLease()
+    }
+
+    /// Revalidates a lease captured before suspension against the currently
+    /// configured synchronizer.
+    @BigSyncBackgroundActor
+    public func validateAccountScopeLease(
+        _ expected: BigSyncAccountScopeLease
+    ) throws {
+        guard let realmSynchronizer else {
+            throw BigSyncAccountScopeLeaseError.unavailable
+        }
+        try realmSynchronizer.validateAccountScopeLease(expected)
+    }
+
 #if DEBUG
     @BigSyncBackgroundActor
     var _test_hasScheduledInitialSynchronization: Bool {
@@ -453,13 +578,18 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     func _test_installSynchronizer(
         _ synchronizer: CloudKitSynchronizer,
-        performsAccountAvailabilityPreflight: Bool = true
+        performsAccountAvailabilityPreflight: Bool = true,
+        synchronizationCompletionHandler:
+            BigSyncBackgroundWorkerConfiguration
+                .SynchronizationCompletionHandler? = nil
     ) {
         initialSynchronizationTask?.cancel()
         initialSynchronizationTask = nil
         realmSynchronizer = synchronizer
         self.performsAccountAvailabilityPreflight =
             performsAccountAvailabilityPreflight
+        self.synchronizationCompletionHandler =
+            synchronizationCompletionHandler
     }
 
     @BigSyncBackgroundActor

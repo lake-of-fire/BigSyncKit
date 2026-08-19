@@ -78,6 +78,12 @@ public extension ChangeMetadataRecordable {
         )
         let recordName = entityType + "." + objectIdentifier
         let generation = BigSyncMutationTrackingRegistry.makeGeneration(in: realm)
+        let accountScopeIdentifier = BigSyncMutationTrackingRegistry
+            .accountScopeIdentifier(
+                for: object,
+                entityType: entityType,
+                in: realm
+            )
 
         let mutation = realm.object(
             ofType: BigSyncPendingMutation.self,
@@ -85,8 +91,19 @@ public extension ChangeMetadataRecordable {
         ) ?? BigSyncPendingMutation(
             recordName: recordName,
             entityType: entityType,
-            objectIdentifier: objectIdentifier
+            objectIdentifier: objectIdentifier,
+            accountScopeIdentifier: accountScopeIdentifier
         )
+        if let existingScope = mutation.accountScopeIdentifier,
+           let accountScopeIdentifier,
+           existingScope != accountScopeIdentifier {
+            preconditionFailure(
+                "BigSync account scope changed for immutable record \(recordName)"
+            )
+        }
+        if let accountScopeIdentifier {
+            mutation.accountScopeIdentifier = accountScopeIdentifier
+        }
         mutation.generation = generation
         mutation.changedAt = timestamp
         realm.add(mutation, update: .modified)
