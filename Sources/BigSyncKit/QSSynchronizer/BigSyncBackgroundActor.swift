@@ -38,10 +38,25 @@ public struct BigSyncBackgroundWorkerConfiguration {
         @BigSyncBackgroundActor @Sendable (
             CloudKitSynchronizer.SynchronizationResult
         ) async -> Void
+    public typealias SynchronizationWillConsumeServerChangesHandler =
+        CloudKitSynchronizer
+            .SynchronizationWillConsumeServerChangesHandler
+    public typealias DomainPrepublicationHandler =
+        CloudKitSynchronizer.DomainPrepublicationHandler
+    public typealias DomainPublicationScopeIdentifierProvider =
+        CloudKitSynchronizer.DomainPublicationScopeIdentifierProvider
+    public typealias DurablePublicationEvidenceHandler =
+        @BigSyncBackgroundActor @Sendable (
+            BigSyncDurablePublicationEvidence?
+        ) async throws -> Void
     public typealias AccountScopeInvalidationHandler =
         @BigSyncBackgroundActor @Sendable (
             BigSyncAccountScopeInvalidationReason
-        ) async -> Void
+        ) async throws -> Void
+    public typealias InitialReplicaBindingAdmissionHandler =
+        @BigSyncBackgroundActor @Sendable (
+            BigSyncInitialReplicaBindingContext
+        ) async throws -> Void
 
     let synchronizerName: String
     let containerName: String
@@ -51,13 +66,26 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let priorityClassNames: [String]
     let suiteName: String?
     let recordZoneID: CKRecordZone.ID?
+    /// Optional stable identity for durable local state while the active
+    /// CloudKit transport zone is replaced or migrated.
+    let durableStateRecordZoneID: CKRecordZone.ID?
     let logger: Logging.Logger
     let localState: BigSyncLocalStateConfiguration?
     let performsAccountAvailabilityPreflight: Bool
     let accountIdentifierProvider: CloudKitSynchronizer.AccountIdentifierProvider?
     let progressHandler: CloudKitSynchronizer.ProgressHandler?
     let synchronizationCompletionHandler: SynchronizationCompletionHandler?
+    let synchronizationWillConsumeServerChangesHandler:
+        SynchronizationWillConsumeServerChangesHandler?
+    let domainPrepublicationHandler: DomainPrepublicationHandler?
+    let domainPublicationScopeIdentifierProvider:
+        DomainPublicationScopeIdentifierProvider?
+    let durablePublicationEvidenceHandler:
+        DurablePublicationEvidenceHandler?
     let accountScopeInvalidationHandler: AccountScopeInvalidationHandler?
+    let initialReplicaBindingAdmissionHandler:
+        InitialReplicaBindingAdmissionHandler?
+    let accountReplacementPolicy: BigSyncCloudAccountReplacementPolicy
     var changeFeedOverride: (any CloudKitChangeFeed)?
     var recordStoreOverride: (any CloudKitRecordStore)?
     /// Production synchronizers never delete CloudKit zones. Only an isolated
@@ -72,15 +100,28 @@ public struct BigSyncBackgroundWorkerConfiguration {
         priorityObjectTypes: [RealmSwift.Object.Type] = [],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
+        durableStateRecordZoneID: CKRecordZone.ID? = nil,
         localState: BigSyncLocalStateConfiguration? = nil,
         performsAccountAvailabilityPreflight: Bool = true,
         accountIdentifierProvider: CloudKitSynchronizer.AccountIdentifierProvider? = nil,
         progressHandler: CloudKitSynchronizer.ProgressHandler? = nil,
+        synchronizationWillConsumeServerChangesHandler:
+            SynchronizationWillConsumeServerChangesHandler? = nil,
+        domainPrepublicationHandler: DomainPrepublicationHandler? = nil,
+        domainPublicationScopeIdentifierProvider:
+            DomainPublicationScopeIdentifierProvider? = nil,
+        durablePublicationEvidenceHandler:
+            DurablePublicationEvidenceHandler? = nil,
         synchronizationCompletionHandler: SynchronizationCompletionHandler? = nil,
         accountScopeInvalidationHandler: AccountScopeInvalidationHandler? = nil,
+        initialReplicaBindingAdmissionHandler:
+            InitialReplicaBindingAdmissionHandler? = nil,
+        accountReplacementPolicy: BigSyncCloudAccountReplacementPolicy =
+            .serverReconciliation,
         logger: Logging.Logger
     ) {
         let zoneID = recordZoneID ?? CloudKitSynchronizer.defaultCustomZoneID
+        let durableStateZoneID = durableStateRecordZoneID ?? zoneID
         let sharedStateBaseURL: URL
         if let localState {
             sharedStateBaseURL = localState.trackingRealmDirectoryURL
@@ -114,23 +155,71 @@ public struct BigSyncBackgroundWorkerConfiguration {
         let clientIdentity = BigSyncClientIdentity(
             synchronizerName: synchronizerName,
             containerName: containerName,
-            recordZoneID: zoneID,
+            recordZoneID: durableStateZoneID,
             databaseScope: .private,
             sharedStateBaseURL: sharedStateBaseURL
         )
+        let installationIdentifier: String
         do {
-            _ = try clientIdentity.prepareInstallation()
+            installationIdentifier = try clientIdentity.prepareInstallation()
         } catch {
             preconditionFailure(
                 "BigSyncKit installation identity failed before worker configuration: \(error)"
             )
         }
-        mutationPolicy.install(
-            configurations: configurations,
-            installationIdentifierProvider: {
-                clientIdentity.currentInstallationIdentifier()
+        let mutationJournalIdentityProvider:
+            (@Sendable () -> BigSyncMutationJournalIdentity?)?
+        if accountReplacementPolicy.usesDatasetReplicaBinding {
+            let replicaBindingStore: any KeyValueStore =
+                localState?.keyValueStore
+                ?? FileKeyValueStore(
+                    fileURL: clientIdentity.synchronizationStateFileURL
+                )
+            let replicaBindingKey = clientIdentity.durableStateNamespace
+                + ".ReplicaBinding.v1"
+            do {
+                if let durableStore = replicaBindingStore
+                    as? any DurableKeyValueStore {
+                    try durableStore.prepareForUse()
+                } else {
+                    try replicaBindingStore.bigSyncValidateDurability()
+                }
+                _ = try BigSyncReplicaBindingStateStore.prepare(
+                    store: replicaBindingStore,
+                    key: replicaBindingKey,
+                    installationIdentifier: installationIdentifier
+                )
+            } catch {
+                preconditionFailure(
+                    "BigSyncKit replica binding failed before worker configuration: \(error)"
+                )
             }
-        )
+            let mutationIdentityReader =
+                BigSyncMutationJournalIdentityReader(
+                    clientIdentity: clientIdentity,
+                    store: replicaBindingStore,
+                    key: replicaBindingKey
+                )
+            mutationJournalIdentityProvider = {
+                mutationIdentityReader.current()
+            }
+        } else {
+            mutationJournalIdentityProvider = nil
+        }
+        if let mutationJournalIdentityProvider {
+            mutationPolicy.install(
+                configurations: configurations,
+                mutationJournalIdentityProvider:
+                    mutationJournalIdentityProvider
+            )
+        } else {
+            mutationPolicy.install(
+                configurations: configurations,
+                installationIdentifierProvider: {
+                    clientIdentity.currentInstallationIdentifier()
+                }
+            )
+        }
         self.synchronizerName = synchronizerName
         self.containerName = containerName
         self.configurations = configurations
@@ -140,13 +229,24 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.priorityClassNames = priorityObjectTypes.map { $0.className() }
         self.suiteName = suiteName
         self.recordZoneID = recordZoneID
+        self.durableStateRecordZoneID = durableStateRecordZoneID
         self.localState = localState
         self.performsAccountAvailabilityPreflight =
             performsAccountAvailabilityPreflight
         self.accountIdentifierProvider = accountIdentifierProvider
         self.progressHandler = progressHandler
+        self.synchronizationWillConsumeServerChangesHandler =
+            synchronizationWillConsumeServerChangesHandler
+        self.domainPrepublicationHandler = domainPrepublicationHandler
+        self.domainPublicationScopeIdentifierProvider =
+            domainPublicationScopeIdentifierProvider
+        self.durablePublicationEvidenceHandler =
+            durablePublicationEvidenceHandler
         self.synchronizationCompletionHandler = synchronizationCompletionHandler
         self.accountScopeInvalidationHandler = accountScopeInvalidationHandler
+        self.initialReplicaBindingAdmissionHandler =
+            initialReplicaBindingAdmissionHandler
+        self.accountReplacementPolicy = accountReplacementPolicy
         self.changeFeedOverride = nil
         self.recordStoreOverride = nil
         self.allowsDisposableZoneDeletion = false
@@ -215,6 +315,8 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     private var accountAvailabilityRetryTask: Task<Void, Never>?
     @BigSyncBackgroundActor
+    private var publicationRestorationTask: Task<Void, Never>?
+    @BigSyncBackgroundActor
     private var performsAccountAvailabilityPreflight = true
     @BigSyncBackgroundActor
     private var synchronizationCompletionHandler:
@@ -256,6 +358,8 @@ public actor BigSyncBackgroundActor {
             priorityClassNames: configuration.priorityClassNames,
             suiteName: configuration.suiteName,
             recordZoneID: configuration.recordZoneID,
+            durableStateRecordZoneID:
+                configuration.durableStateRecordZoneID,
             localState: configuration.localState,
             accountIdentifierProvider: configuration.accountIdentifierProvider,
             accountStatusProvider: accountStatusProvider,
@@ -263,23 +367,46 @@ public actor BigSyncBackgroundActor {
             changeFeed: configuration.changeFeedOverride,
             recordStore: configuration.recordStoreOverride,
             allowsDisposableZoneDeletion: configuration.allowsDisposableZoneDeletion,
+            initialReplicaBindingAdmissionHandler:
+                configuration.initialReplicaBindingAdmissionHandler,
+            accountReplacementPolicy: configuration.accountReplacementPolicy,
             compatibilityVersion: Int(configuration.configurations.map { $0.schemaVersion } .reduce(0, +)),
             logger: configuration.logger
         )
 
         realmSynchronizer = synchronizer
+        synchronizer.synchronizationWillConsumeServerChangesHandler =
+            configuration.synchronizationWillConsumeServerChangesHandler
+        synchronizer.domainPrepublicationHandler =
+            configuration.domainPrepublicationHandler
+        synchronizer.domainPublicationScopeIdentifierProvider =
+            configuration.domainPublicationScopeIdentifierProvider
         synchronizer.accountScopeInvalidationHandler =
             configuration.accountScopeInvalidationHandler
-        if synchronizer.backupRestoreDetected,
-           let handler = configuration.accountScopeInvalidationHandler {
-            Task { @BigSyncBackgroundActor in
-                await handler(.restoreDetected)
-            }
-        }
         performsAccountAvailabilityPreflight =
             configuration.performsAccountAvailabilityPreflight
         synchronizationCompletionHandler =
             configuration.synchronizationCompletionHandler
+
+        if let restorationHandler =
+            configuration.durablePublicationEvidenceHandler {
+            publicationRestorationTask = Task(
+                priority: .utility
+            ) { @BigSyncBackgroundActor in
+                do {
+                    try await restorationHandler(
+                        try await synchronizer
+                            .restoredDurablePublicationEvidence()
+                    )
+                } catch {
+                    configuration.logger.error(
+                        "QSCloudKitSynchronizer >> Could not restore terminal publication evidence: \(error)"
+                    )
+                }
+            }
+        } else {
+            publicationRestorationTask = nil
+        }
 
         (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
 
@@ -300,7 +427,8 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     public func hasInboundSemanticQuarantine(
         entityType: String,
-        accountScopeIdentifier: String
+        accountScopeIdentifier: String,
+        semanticScopeIdentifier: String? = nil
     ) throws -> Bool {
         guard let adapter = realmSynchronizer?.modelAdapters.first
                 as? RealmSwiftAdapter else {
@@ -308,7 +436,8 @@ public actor BigSyncBackgroundActor {
         }
         return try adapter.hasInboundSemanticQuarantine(
             entityType: entityType,
-            accountScopeIdentifier: accountScopeIdentifier
+            accountScopeIdentifier: accountScopeIdentifier,
+            semanticScopeIdentifier: semanticScopeIdentifier
         )
     }
 
@@ -342,11 +471,15 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     public func currentServerBoundaryIdentifier() throws -> String? {
-        guard let adapter = realmSynchronizer?.modelAdapters.first
+        guard let synchronizer = realmSynchronizer,
+              let adapter = synchronizer.modelAdapters.first
                 as? RealmSwiftAdapter else {
             return nil
         }
-        return try adapter.currentServerBoundaryIdentifier()
+        return try adapter.currentServerBoundaryIdentifier(
+            containerIdentifier: synchronizer.containerIdentifier,
+            databaseScope: synchronizer.database.databaseScope
+        )
     }
 
     /// Read-only inventory used by account-fenced model cutovers. The
@@ -434,7 +567,18 @@ public actor BigSyncBackgroundActor {
         guard realmSynchronizer === expectedSynchronizer else {
             return nil
         }
+        await publicationRestorationTask?.value
+        publicationRestorationTask = nil
         let containerIdentifier = expectedSynchronizer.containerIdentifier
+
+        // Explicit lifecycle requests share the same cheap durable gate used
+        // by ordinary journal wakeups. A real CKAccountChanged notification
+        // enters the synchronizer directly and can still refresh the pending
+        // destination account before stopping again.
+        guard !expectedSynchronizer
+            .reportPendingCloudAccountPortIfNeeded() else {
+            return nil
+        }
 
         if performsAccountAvailabilityPreflight {
             switch await accountAvailabilityGate.availability(
@@ -550,6 +694,22 @@ public actor BigSyncBackgroundActor {
     public func accountScopeLease() throws -> BigSyncAccountScopeLease? {
         guard let realmSynchronizer else { return nil }
         return try realmSynchronizer.accountScopeLease()
+    }
+
+    @BigSyncBackgroundActor
+    public func pendingCloudAccountPortRequirement() throws
+        -> BigSyncCloudAccountPortRequirement? {
+        try realmSynchronizer?.pendingCloudAccountPortRequirement()
+    }
+
+    @BigSyncBackgroundActor
+    public func activateCloudAccountPort(
+        _ expected: BigSyncCloudAccountPortRequirement
+    ) async throws {
+        guard let realmSynchronizer else {
+            throw BigSyncCloudAccountPortError.corruptRequirement
+        }
+        try await realmSynchronizer.activateCloudAccountPort(expected)
     }
 
     /// Revalidates a lease captured before suspension against the currently

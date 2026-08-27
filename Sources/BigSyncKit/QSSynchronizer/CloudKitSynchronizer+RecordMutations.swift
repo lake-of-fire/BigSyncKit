@@ -1,9 +1,71 @@
 import CloudKit
 import Foundation
 
+struct PreparedMutationRetryKey: Hashable, Sendable {
+    let recordID: CKRecord.ID
+    let generation: String?
+}
+
+enum BigSyncHandledMutationRetryError: Error, Equatable, Sendable {
+    case generationBudgetExceeded(PreparedMutationRetryKey)
+    case drainBudgetExceeded
+}
+
+struct HandledMutationRetryBudget {
+    private(set) var attemptsByKey = [PreparedMutationRetryKey: Int]()
+    private(set) var totalAttempts = 0
+
+    mutating func register(
+        _ key: PreparedMutationRetryKey,
+        maximumPerGeneration: Int,
+        maximumPerDrain: Int
+    ) throws {
+        guard totalAttempts < maximumPerDrain else {
+            throw BigSyncHandledMutationRetryError.drainBudgetExceeded
+        }
+        let attempts = attemptsByKey[key, default: 0]
+        guard attempts < maximumPerGeneration else {
+            throw BigSyncHandledMutationRetryError
+                .generationBudgetExceeded(key)
+        }
+        attemptsByKey[key] = attempts + 1
+        totalAttempts += 1
+    }
+
+    mutating func retire(_ key: PreparedMutationRetryKey) {
+        attemptsByKey.removeValue(forKey: key)
+    }
+}
+
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
 extension CloudKitSynchronizer {
+    @BigSyncBackgroundActor
+    func validateInboundLiveResults(
+        _ results: [InboundLiveResult],
+        records: [CKRecord]
+    ) throws {
+        try ChangeRequestProcessor.validateInboundLiveResults(
+            results,
+            records: records
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func validateInboundDeletionResults(
+        _ results: [InboundDeletionResult],
+        recordIDs: [CKRecord.ID]
+    ) throws {
+        try ChangeRequestProcessor.validateInboundDeletionResults(
+            results,
+            recordIDs: recordIDs
+        )
+    }
+
     private static let maximumHandledRecordRetries = 5
+    /// A stream of continually replaced generations must not keep one drain
+    /// alive forever even though every individual generation has a fresh
+    /// retry allowance.
+    private static let maximumHandledRetriesPerDrain = 1_000
 
     private func partialMutationError(
         _ failures: [CKRecord.ID: NSError]
@@ -39,7 +101,7 @@ extension CloudKitSynchronizer {
         restrictedToEntityType: String?,
         attemptID: UUID
     ) async throws {
-        var handledRetryCounts = [CKRecord.ID: Int]()
+        var retryBudget = HandledMutationRetryBudget()
         while true {
             try checkSynchronizationAttempt(attemptID)
             let requestedBatchSize = batchSize
@@ -83,6 +145,10 @@ extension CloudKitSynchronizer {
             var unresolvedFailures = [CKRecord.ID: NSError]()
 
             for record in records {
+                let retryKey = PreparedMutationRetryKey(
+                    recordID: record.recordID,
+                    generation: generations[record.recordID.recordName]
+                )
                 guard let result = mutationResults.saveResults[record.recordID] else {
                     unresolvedFailures[record.recordID] = CocoaError(
                         .coderValueNotFound
@@ -91,7 +157,7 @@ extension CloudKitSynchronizer {
                 }
                 switch result {
                 case .success(let savedRecord):
-                    handledRetryCounts.removeValue(forKey: record.recordID)
+                    retryBudget.retire(retryKey)
                     savedRecords.append(savedRecord)
                 case .failure(let error):
                     let nsError = error as NSError
@@ -104,12 +170,22 @@ extension CloudKitSynchronizer {
                         unresolvedFailures[record.recordID] = nsError
                         continue
                     }
-                    let retryCount = handledRetryCounts[record.recordID, default: 0] + 1
-                    guard retryCount <= Self.maximumHandledRecordRetries else {
+                    do {
+                        try retryBudget.register(
+                            retryKey,
+                            maximumPerGeneration:
+                                Self.maximumHandledRecordRetries,
+                            maximumPerDrain:
+                                Self.maximumHandledRetriesPerDrain
+                        )
+                    } catch is BigSyncHandledMutationRetryError {
+                        // Preserve the existing partial-failure contract when
+                        // a handled conflict exhausts its retry budget. The
+                        // prepared journal generation remains pending because
+                        // no acknowledgement is sent for this record.
                         unresolvedFailures[record.recordID] = nsError
                         continue
                     }
-                    handledRetryCounts[record.recordID] = retryCount
                     if code == .unknownItem {
                         missingRecordIDs.insert(record.recordID)
                     } else if let serverRecord = nsError.userInfo[
@@ -137,9 +213,17 @@ extension CloudKitSynchronizer {
                 try await revalidateActiveRunContext(for: attemptID)
             }
             if !conflictedRecordsByID.isEmpty {
-                try await adapter.saveChanges(
-                    in: Array(conflictedRecordsByID.values),
+                let conflictedRecords = Array(conflictedRecordsByID.values)
+                    .sorted {
+                        $0.recordID.recordName < $1.recordID.recordName
+                    }
+                let results = try await adapter.saveChanges(
+                    in: conflictedRecords,
                     forceSave: true
+                )
+                try ChangeRequestProcessor.validateInboundLiveResults(
+                    results,
+                    records: conflictedRecords
                 )
                 try await revalidateActiveRunContext(for: attemptID)
                 try await adapter.persistImportedChanges()
@@ -193,7 +277,7 @@ extension CloudKitSynchronizer {
         restrictedToEntityType: String?,
         attemptID: UUID
     ) async throws {
-        var handledRetryCounts = [CKRecord.ID: Int]()
+        var retryBudget = HandledMutationRetryBudget()
         while true {
             try checkSynchronizationAttempt(attemptID)
             let requestedBatchSize = batchSize
@@ -223,6 +307,10 @@ extension CloudKitSynchronizer {
             var conflictedRecordsByID = [CKRecord.ID: CKRecord]()
             var unresolvedFailures = [CKRecord.ID: NSError]()
             for recordID in recordIDs {
+                let retryKey = PreparedMutationRetryKey(
+                    recordID: recordID,
+                    generation: generations[recordID.recordName]
+                )
                 guard let result = mutationResults.deleteResults[recordID] else {
                     unresolvedFailures[recordID] = CocoaError(
                         .coderValueNotFound
@@ -231,25 +319,34 @@ extension CloudKitSynchronizer {
                 }
                 switch result {
                 case .success:
-                    handledRetryCounts.removeValue(forKey: recordID)
+                    retryBudget.retire(retryKey)
                     acknowledged.append(recordID)
                 case .failure(let error):
                     let nsError = error as NSError
                     if nsError.domain == CKErrorDomain,
                        nsError.code == CKError.unknownItem.rawValue {
-                        handledRetryCounts.removeValue(forKey: recordID)
+                        retryBudget.retire(retryKey)
                         acknowledged.append(recordID)
                     } else if nsError.domain == CKErrorDomain,
                               nsError.code == CKError.serverRecordChanged.rawValue,
                               let serverRecord = nsError.userInfo[
                                   CKRecordChangedErrorServerRecordKey
                               ] as? CKRecord {
-                        let retryCount = handledRetryCounts[recordID, default: 0] + 1
-                        guard retryCount <= Self.maximumHandledRecordRetries else {
+                        do {
+                            try retryBudget.register(
+                                retryKey,
+                                maximumPerGeneration:
+                                    Self.maximumHandledRecordRetries,
+                                maximumPerDrain:
+                                    Self.maximumHandledRetriesPerDrain
+                            )
+                        } catch is BigSyncHandledMutationRetryError {
+                            // Keep the tombstone pending and surface a normal
+                            // partial failure once this generation cannot be
+                            // safely rebased any further.
                             unresolvedFailures[recordID] = nsError
                             continue
                         }
-                        handledRetryCounts[recordID] = retryCount
                         conflictedRecordsByID[recordID] = serverRecord
                     } else {
                         unresolvedFailures[recordID] = nsError

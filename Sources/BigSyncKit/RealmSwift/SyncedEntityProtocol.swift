@@ -44,10 +44,11 @@ public extension ChangeMetadataRecordable {
             return
         }
 
-        switch BigSyncMutationTrackingRegistry.trackingStatus(
+        let mutationContext = BigSyncMutationTrackingRegistry.mutationContext(
             className: entityType,
             in: realm
-        ) {
+        )
+        switch mutationContext.trackingStatus {
         case .unregistered:
             assertionFailure(
                 "No BigSync mutation policy was installed before opening Realm containing \(entityType)"
@@ -77,13 +78,16 @@ public extension ChangeMetadataRecordable {
             usingPrimaryKey: primaryKey
         )
         let recordName = entityType + "." + objectIdentifier
-        let generation = BigSyncMutationTrackingRegistry.makeGeneration(in: realm)
+        let mutationGeneration = BigSyncMutationTrackingRegistry
+            .makeMutationGeneration(context: mutationContext)
         let accountScopeIdentifier = BigSyncMutationTrackingRegistry
             .accountScopeIdentifier(
                 for: object,
                 entityType: entityType,
-                in: realm
+                propertyName: mutationContext.accountScopePropertyName
             )
+        let replicaBindingGenerationIdentifier =
+            mutationGeneration.replicaBindingGenerationIdentifier
 
         let mutation = realm.object(
             ofType: BigSyncPendingMutation.self,
@@ -92,7 +96,9 @@ public extension ChangeMetadataRecordable {
             recordName: recordName,
             entityType: entityType,
             objectIdentifier: objectIdentifier,
-            accountScopeIdentifier: accountScopeIdentifier
+            accountScopeIdentifier: accountScopeIdentifier,
+            replicaBindingGenerationIdentifier:
+                replicaBindingGenerationIdentifier
         )
         if let existingScope = mutation.accountScopeIdentifier,
            let accountScopeIdentifier,
@@ -104,7 +110,9 @@ public extension ChangeMetadataRecordable {
         if let accountScopeIdentifier {
             mutation.accountScopeIdentifier = accountScopeIdentifier
         }
-        mutation.generation = generation
+        mutation.replicaBindingGenerationIdentifier =
+            replicaBindingGenerationIdentifier
+        mutation.generation = mutationGeneration.generation
         mutation.changedAt = timestamp
         realm.add(mutation, update: .modified)
     }
@@ -123,6 +131,64 @@ public extension ChangeMetadataRecordable {
 /// filtered through this protocol.
 public protocol CloudKitInitialSyncEligibilityModel {
     static var initialCloudKitSyncEligibilityPredicate: NSPredicate { get }
+}
+
+/// Opts selected scalar Realm integer properties into a canonical decimal-
+/// string CloudKit representation.
+///
+/// CloudKit can infer a newly introduced numeric field containing only zero or
+/// one as a Boolean even when `CKRecord` receives an integer-shaped
+/// `NSNumber`. Models whose semantic validation requires an exact integer use
+/// this transport representation while retaining integer storage and queries
+/// in Realm.
+public protocol BigSyncStringEncodedIntegerModel {
+    static var bigSyncStringEncodedIntegerPropertyNames: Set<String> { get }
+}
+
+public enum BigSyncStringEncodedIntegerCodec {
+    public static func encode(_ value: Int64) -> String {
+        String(value)
+    }
+
+    /// Decodes only the unique canonical spelling emitted by `encode`.
+    /// Whitespace, leading zeroes, a leading plus, and negative zero are
+    /// rejected so semantically equal values have one wire representation.
+    public static func decode(_ value: Any?) -> Int64? {
+        guard let string = value as? String,
+              let integer = Int64(string),
+              encode(integer) == string else {
+            return nil
+        }
+        return integer
+    }
+}
+
+/// Decodes the two representations a CloudKit Boolean can have at an inbound
+/// boundary. Synthetic/local `CKRecord`s retain `CFBoolean`, while a value
+/// fetched back from CloudKit is commonly an integer-shaped `NSNumber`.
+/// Accept only exact integral zero or one so a floating-point or arbitrary
+/// numeric field cannot be admitted as a Boolean semantic fact.
+public enum BigSyncCloudKitBooleanCodec {
+    public static func decode(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber else { return nil }
+        if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            return number.boolValue
+        }
+
+        switch String(cString: number.objCType) {
+        case "c", "C", "s", "S", "i", "I", "l", "L", "q", "Q", "B":
+            switch number.int64Value {
+            case 0:
+                return false
+            case 1:
+                return true
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
+    }
 }
 
 /// Used for syncing with app servers, not just CloudKit.

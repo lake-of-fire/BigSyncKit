@@ -56,7 +56,7 @@ public enum BigSyncManualBackupRestoreError: Error, Equatable, Sendable {
     case transactionMismatch
 }
 
-private enum BigSyncClientIdentityLeaseRegistry {
+enum BigSyncClientIdentityLeaseRegistry {
     private enum Mode {
         case shared
         case exclusive
@@ -65,6 +65,7 @@ private enum BigSyncClientIdentityLeaseRegistry {
     private final class Lease {
         let descriptor: Int32
         var mode: Mode
+        var cachedInstallationIdentifier: String?
 
         init(descriptor: Int32, mode: Mode) {
             self.descriptor = descriptor
@@ -76,7 +77,11 @@ private enum BigSyncClientIdentityLeaseRegistry {
         }
     }
 
-    private static let lock = NSLock()
+    // Identity validation may be queried by a replacement/rollback closure
+    // while `withExclusive` owns this registry on the same thread. Recursive
+    // locking keeps that fail-closed probe from deadlocking; cross-thread
+    // callers still wait until the restore boundary finishes.
+    private static let lock = NSRecursiveLock()
     private static var leases = [String: Lease]()
 
     static func retainShared(at url: URL) throws {
@@ -88,6 +93,31 @@ private enum BigSyncClientIdentityLeaseRegistry {
             throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
         }
         lease.mode = .shared
+    }
+
+    static func cachedInstallationIdentifier(at url: URL) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return leases[url.standardizedFileURL.path]?
+            .cachedInstallationIdentifier
+    }
+
+    static func publishInstallationIdentifier(
+        _ identifier: String,
+        at url: URL
+    ) {
+        guard !identifier.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        leases[url.standardizedFileURL.path]?
+            .cachedInstallationIdentifier = identifier
+    }
+
+    static func invalidateInstallationIdentifier(at url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        leases[url.standardizedFileURL.path]?
+            .cachedInstallationIdentifier = nil
     }
 
     static func withExclusive<T>(
@@ -117,6 +147,10 @@ private enum BigSyncClientIdentityLeaseRegistry {
             throw BigSyncClientIdentityLeaseError.leaseUnavailable(lockError)
         }
         lease.mode = .exclusive
+        // No mutation may reuse the pre-restore identity after this boundary.
+        // The durable intent publication below also invalidates this cache for
+        // callers that exercise BackupDetection directly.
+        lease.cachedInstallationIdentifier = nil
         defer {
             // Downgrading before returning prevents subsequent mutations in
             // this process from escaping the cross-process restore fence.
@@ -166,6 +200,19 @@ private enum BigSyncClientIdentityLeaseRegistry {
 public struct BigSyncClientIdentity: Sendable {
     public let durableStateNamespace: String
     public let sharedStateBaseURL: URL
+
+    /// File used by the production synchronizer's durable key-value store.
+    /// Mutation writers resolve the same path before the worker is configured
+    /// so every app-group process captures one replica-binding generation.
+    public var synchronizationStateFileURL: URL {
+        sharedStateBaseURL
+            .appendingPathComponent("LocalState", isDirectory: true)
+            .appendingPathComponent(
+                durableStateNamespace,
+                isDirectory: true
+            )
+            .appendingPathComponent("state.plist")
+    }
 
     public init(
         synchronizerName: String,
@@ -255,10 +302,18 @@ public struct BigSyncClientIdentity: Sendable {
             // replacement. Never open a target Realm on that ambiguity.
             throw BigSyncManualBackupRestoreError.stateAmbiguous
         }
+        BigSyncClientIdentityLeaseRegistry.publishInstallationIdentifier(
+            identifier,
+            at: leaseURL
+        )
         return identifier
     }
 
     public func currentInstallationIdentifier() -> String? {
+        if let cached = BigSyncClientIdentityLeaseRegistry
+            .cachedInstallationIdentifier(at: leaseURL) {
+            return cached
+        }
         guard let identifier = publishedInstallationIdentifier() else {
             return nil
         }
@@ -293,7 +348,58 @@ public struct BigSyncClientIdentity: Sendable {
         ) == nil {
             return nil
         }
+        BigSyncClientIdentityLeaseRegistry.publishInstallationIdentifier(
+            identifier,
+            at: leaseURL
+        )
         return identifier
+    }
+
+    /// Establishes and returns the binding generation used by new mutation
+    /// journal rows before the CloudKit worker starts.
+    @discardableResult
+    public func prepareReplicaBindingGenerationIdentifier() throws -> String {
+        let installationIdentifier = try prepareInstallation()
+        let store = FileKeyValueStore(
+            fileURL: synchronizationStateFileURL
+        )
+        try store.prepareForUse()
+        return try BigSyncReplicaBindingStateStore.prepare(
+            store: store,
+            key: durableStateNamespace + ".ReplicaBinding.v1",
+            installationIdentifier: installationIdentifier
+        ).mutationGenerationIdentifier
+    }
+
+    public func currentReplicaBindingGenerationIdentifier() -> String? {
+        currentMutationJournalIdentity()?
+            .replicaBindingGenerationIdentifier
+    }
+
+    /// Creates a live journal-identity provider that reuses its thread-safe
+    /// replica-binding store. Every invocation still reloads and validates the
+    /// durable state, so another process's restore or binding rotation is
+    /// observed before a mutation is attributed. Reusing the reader only
+    /// avoids constructing a store (and its eager plist read) for every Realm
+    /// object mutation.
+    public func makeMutationJournalIdentityProvider()
+        -> @Sendable () -> BigSyncMutationJournalIdentity? {
+        let reader = BigSyncMutationJournalIdentityReader(
+            clientIdentity: self,
+            store: FileKeyValueStore(
+                fileURL: synchronizationStateFileURL
+            ),
+            key: durableStateNamespace + ".ReplicaBinding.v1"
+        )
+        return { reader.current() }
+    }
+
+    /// Reads installation and replica-binding identity as one verified
+    /// snapshot. A restore or partial handoff returns nil instead of combining
+    /// fields from opposite sides of the identity boundary.
+    public func currentMutationJournalIdentity()
+        -> BigSyncMutationJournalIdentity? {
+        makeMutationJournalIdentityProvider()()
     }
 
     /// Publishes a manual Realm-backup restore before synchronization metadata

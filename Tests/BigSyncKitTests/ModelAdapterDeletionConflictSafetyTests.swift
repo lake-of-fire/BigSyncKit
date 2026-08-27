@@ -23,13 +23,39 @@ private final class DefaultDeletionConflictAdapter: NSObject, ModelAdapter, @unc
     func resetSyncCaches() async throws {}
     func hasChanges(record: CKRecord, object: Object) -> Bool { true }
 
-    func saveChanges(in records: [CKRecord], forceSave: Bool) async throws {
+    func saveChanges(
+        in records: [CKRecord],
+        forceSave: Bool
+    ) async throws -> [InboundLiveResult] {
         inboundSaveCount += records.count
         localTombstoneIsDeleted = false
         localTombstoneGeneration = "server-overwrote-local-generation"
+        return records.enumerated().map {
+            .init(
+                event: .init(
+                    ordinal: $0.offset,
+                    entityType: $0.element.recordType,
+                    recordID: $0.element.recordID
+                ),
+                disposition: .applied
+            )
+        }
     }
 
-    func deleteRecords(with recordIDs: [CKRecord.ID]) async throws {}
+    func deleteRecords(
+        with recordIDs: [CKRecord.ID]
+    ) async throws -> [InboundDeletionResult] {
+        recordIDs.enumerated().map {
+            .init(
+                event: .init(
+                    ordinal: $0.offset,
+                    entityType: "DefaultDeletionConflictObject",
+                    recordID: $0.element
+                ),
+                disposition: .appliedTombstone
+            )
+        }
+    }
     func persistImportedChanges() async throws {}
 
     @BigSyncBackgroundActor

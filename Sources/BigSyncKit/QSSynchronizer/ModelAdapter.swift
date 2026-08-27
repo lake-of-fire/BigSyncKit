@@ -48,6 +48,14 @@ public enum ChangeFeedResetMode: String, Sendable {
     /// re-uploaded, so rebuild durable upload generations without changing the
     /// target objects themselves.
     case encryptedDataReset
+    /// The authenticated account changed while the application retained one
+    /// admitted local dataset. Rebuild the destination replica from local
+    /// rows without copying an old CloudKit zone.
+    case localDatasetRebootstrap
+
+    var reuploadsRetainedLocalData: Bool {
+        self == .encryptedDataReset || self == .localDatasetRebootstrap
+    }
 }
 
 public protocol ChangeFeedResetMigrating: AnyObject {
@@ -62,6 +70,13 @@ public protocol ChangeFeedResetMigrating: AnyObject {
     ) async throws
     func beginChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
     func isChangeFeedServerBootstrapActive() async -> Bool
+    /// Proves that this exact reset reached its durable terminal state.
+    /// Failure to open the persistence store must throw, not look complete.
+    func changeFeedResetCompletionIsDurable(
+        accountScopeIdentifier: String,
+        epoch: Int,
+        mode: ChangeFeedResetMode
+    ) async throws -> Bool
     func reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
     func finishChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws
 }
@@ -77,18 +92,6 @@ public extension ChangeFeedResetMigrating {
             accountScopeIdentifier: accountScopeIdentifier,
             epoch: epoch,
             mode: .serverReconciliation
-        )
-    }
-
-    func prepareChangeFeedReset(
-        accountScopeIdentifier: String,
-        epoch: Int,
-        mode: ChangeFeedResetMode
-    ) async throws {
-        try await prepareChangeFeedReset(
-            accountScopeIdentifier: accountScopeIdentifier,
-            epoch: epoch,
-            mode: mode
         )
     }
 
@@ -126,6 +129,122 @@ public extension ChangeFeedResetMigrating {
     }
 }
 
+public struct InboundEventIdentity: Sendable, Equatable, Hashable {
+    public let ordinal: Int
+    public let entityType: String
+    public let recordName: String
+    public let zoneName: String
+    public let zoneOwnerName: String
+
+    public init(
+        ordinal: Int,
+        entityType: String,
+        recordID: CKRecord.ID
+    ) {
+        self.ordinal = ordinal
+        self.entityType = entityType
+        recordName = recordID.recordName
+        zoneName = recordID.zoneID.zoneName
+        zoneOwnerName = recordID.zoneID.ownerName
+    }
+
+    public func matches(
+        ordinal: Int,
+        entityType: String,
+        recordID: CKRecord.ID
+    ) -> Bool {
+        self == InboundEventIdentity(
+            ordinal: ordinal,
+            entityType: entityType,
+            recordID: recordID
+        )
+    }
+
+    public func matches(ordinal: Int, recordID: CKRecord.ID) -> Bool {
+        self.ordinal == ordinal
+            && recordName == recordID.recordName
+            && zoneName == recordID.zoneID.zoneName
+            && zoneOwnerName == recordID.zoneID.ownerName
+    }
+}
+
+public enum InboundLiveDisposition: Sendable, Equatable {
+    case applied
+    case unchanged
+    /// The server change is the authoritative echo of this replica's upload.
+    /// Its semantic payload was validated without applying it back to the local
+    /// model, so it can prove supersession of older quarantined evidence.
+    case validatedAuthoritativeOwnUpload
+    case preservedPendingLocal(generation: String)
+    case preservedImmutable
+    case deferred(relationshipCount: Int)
+    case quarantined(lineageID: String)
+    case ignoredExplicitAuthority
+}
+
+public enum InboundDeletionDisposition: Sendable, Equatable {
+    case appliedTombstone
+    case alreadyDeleted
+    case preservedNewerLive(generation: String)
+    case quarantined(lineageID: String)
+    case ignoredExplicitAuthority
+}
+
+public struct InboundLiveResult: Sendable, Equatable {
+    public let event: InboundEventIdentity
+    public let disposition: InboundLiveDisposition
+
+    public init(
+        event: InboundEventIdentity,
+        disposition: InboundLiveDisposition
+    ) {
+        self.event = event
+        self.disposition = disposition
+    }
+}
+
+public struct InboundDeletionResult: Sendable, Equatable {
+    public let event: InboundEventIdentity
+    public let disposition: InboundDeletionDisposition
+
+    public init(
+        event: InboundEventIdentity,
+        disposition: InboundDeletionDisposition
+    ) {
+        self.event = event
+        self.disposition = disposition
+    }
+}
+
+/// Complete durable outcome of one CloudKit record-zone page. The adapter
+/// commits this receipt together with the page cursor so cursor advancement
+/// can never become detached from the exact accepted-event postimage.
+public struct InboundPageCommit: Sendable, Equatable {
+    public let previousCursor: RecordZoneChangeCursor?
+    public let nextCursor: RecordZoneChangeCursor
+    public let liveResults: [InboundLiveResult]
+    public let deletionResults: [InboundDeletionResult]
+
+    public init(
+        previousCursor: RecordZoneChangeCursor?,
+        nextCursor: RecordZoneChangeCursor,
+        liveResults: [InboundLiveResult],
+        deletionResults: [InboundDeletionResult]
+    ) {
+        self.previousCursor = previousCursor
+        self.nextCursor = nextCursor
+        self.liveResults = liveResults
+        self.deletionResults = deletionResults
+    }
+}
+
+public enum InboundDispositionValidationError: Error, Equatable {
+    case cardinality(expected: Int, actual: Int)
+    case identityMismatch(ordinal: Int, expectedRecordName: String)
+    case eventOutsideExpectedZone(recordName: String)
+    case duplicateInboundEvent(recordName: String)
+}
+
 /// An object conforming to `ModelAdapter` will track the local model, provide changes to upload to CloudKit and import downloaded changes.
 //@objc public protocol ModelAdapter: AnyObject {
 public protocol ModelAdapter: AnyObject, Sendable {
@@ -137,12 +256,36 @@ public protocol ModelAdapter: AnyObject, Sendable {
     
     var modelAdapterDelegate: ModelAdapterDelegate? { get set }
 
+    /// Supplies the exact CloudKit transport namespace used by inbound
+    /// semantic lineage. Adapters must receive this before accepting events.
+    @BigSyncBackgroundActor
+    func activateTransportNamespace(
+        containerIdentifier: String,
+        databaseScope: CKDatabase.Scope
+    ) async throws
+
+    /// Durable adapter-owned conditions that make transport quiescent but
+    /// semantic publication incomplete.
+    @BigSyncBackgroundActor
+    func semanticPublicationBlockers() async throws
+        -> [CloudKitSynchronizer.DomainBlocker]
+
     /// Binds adapter discovery, preparation, inbound validation, and
     /// acknowledgement to the CloudKit account already validated for this
     /// synchronization run. Implementations that do not own account-scoped
     /// models may use the default no-op.
     @BigSyncBackgroundActor
     func activateAccountScope(_ accountScopeIdentifier: String) async throws
+
+    /// Activates the exact local transport generation authorized for this
+    /// synchronization run. Implementations without a durable mutation journal
+    /// may use the default account-only activation.
+    @BigSyncBackgroundActor
+    func activateReplicaBinding(
+        accountScopeIdentifier: String,
+        replicaBindingGenerationIdentifier: String?,
+        acceptsLegacyUnboundMutations: Bool
+    ) async throws
     
     func cleanUp() async throws
     
@@ -153,11 +296,23 @@ public protocol ModelAdapter: AnyObject, Sendable {
     /// Apply changes in the provided record to the local model objects and save the records.
     /// - Parameter records: Array of `CKRecord` that were obtained from CloudKit.
     /// - Parameter forceSave: Use especially for saving conflicted CKRecords which may have a newer record change tag from the server regardless of whether they have changes.
-    func saveChanges(in records: [CKRecord], forceSave: Bool) async throws
+    func saveChanges(
+        in records: [CKRecord],
+        forceSave: Bool
+    ) async throws -> [InboundLiveResult]
+
+    /// Semantically validates server-authoritative echoes of this replica's
+    /// uploads without applying their fields back to the local model. The
+    /// returned outcomes remain part of the exact inbound page receipt.
+    func validateAuthoritativeOwnUploadRecords(
+        _ records: [CKRecord]
+    ) async throws -> [InboundLiveResult]
     
     /// Delete the local model objects corresponding to the given record IDs.
     /// - Parameter recordIDs: Array of identifiers of records that were deleted on CloudKit.
-    func deleteRecords(with recordIDs: [CKRecord.ID]) async throws
+    func deleteRecords(
+        with recordIDs: [CKRecord.ID]
+    ) async throws -> [InboundDeletionResult]
     
     /// Tells the model adapter to persist all downloaded changes in the current import operation.
     func persistImportedChanges() async throws
@@ -227,6 +382,27 @@ public protocol ModelAdapter: AnyObject, Sendable {
     /// Save given token for future use by this adapter.
     /// - Parameter token: opaque record-zone history cursor.
     func saveToken(_ token: RecordZoneChangeCursor?) async throws
+
+    /// Atomically publishes one accepted page's exact outcome receipt and its
+    /// next cursor. Adapters without page-receipt storage retain the token-last
+    /// behavior through the default implementation.
+    func commitInboundPage(_ page: InboundPageCommit) async throws
+
+    /// Stable identifier for the latest record-zone cursor durably consumed by
+    /// this adapter for the validated account. A terminal synchronization
+    /// receipt uses this to distinguish a complete server snapshot from target
+    /// rows that became visible while a page was still being imported.
+    @BigSyncBackgroundActor
+    func consumedServerBoundaryIdentifier(
+        accountScopeIdentifier: String,
+        replicaBindingGenerationIdentifier: String?,
+        containerIdentifier: String,
+        databaseScope: CKDatabase.Scope
+    ) throws -> String?
+
+    /// Durable reset/rebuild epoch that namespaces the consumed cursor.
+    @BigSyncBackgroundActor
+    func changeFeedEpoch() throws -> Int?
     
     /// Merge policy in case of conflicts. Default is `server`.
     var mergePolicy: MergePolicy { get set }
@@ -258,6 +434,38 @@ public protocol ModelAdapter: AnyObject, Sendable {
 }
 
 public extension ModelAdapter {
+    func commitInboundPage(_ page: InboundPageCommit) async throws {
+        try await saveToken(page.nextCursor)
+    }
+
+    func validateAuthoritativeOwnUploadRecords(
+        _ records: [CKRecord]
+    ) async throws -> [InboundLiveResult] {
+        records.enumerated().map { ordinal, record in
+            InboundLiveResult(
+                event: InboundEventIdentity(
+                    ordinal: ordinal,
+                    entityType: record.recordType,
+                    recordID: record.recordID
+                ),
+                disposition: .ignoredExplicitAuthority
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func activateTransportNamespace(
+        containerIdentifier: String,
+        databaseScope: CKDatabase.Scope
+    ) async throws {
+        _ = containerIdentifier
+        _ = databaseScope
+    }
+
+    @BigSyncBackgroundActor
+    func semanticPublicationBlockers() async throws
+        -> [CloudKitSynchronizer.DomainBlocker] { [] }
+
     var priorityEntityTypeNames: [String] { [] }
 
     func waitForCancellation() async {}
@@ -266,6 +474,37 @@ public extension ModelAdapter {
     func activateAccountScope(_ accountScopeIdentifier: String) async throws {
         _ = accountScopeIdentifier
     }
+
+    /// Activates the exact local transport generation authorized for this
+    /// synchronization run. Implementations without a durable mutation
+    /// journal may continue using account-only activation.
+    @BigSyncBackgroundActor
+    func activateReplicaBinding(
+        accountScopeIdentifier: String,
+        replicaBindingGenerationIdentifier: String?,
+        acceptsLegacyUnboundMutations: Bool
+    ) async throws {
+        _ = replicaBindingGenerationIdentifier
+        _ = acceptsLegacyUnboundMutations
+        try await activateAccountScope(accountScopeIdentifier)
+    }
+
+    @BigSyncBackgroundActor
+    func consumedServerBoundaryIdentifier(
+        accountScopeIdentifier: String,
+        replicaBindingGenerationIdentifier: String?,
+        containerIdentifier: String,
+        databaseScope: CKDatabase.Scope
+    ) throws -> String? {
+        _ = accountScopeIdentifier
+        _ = replicaBindingGenerationIdentifier
+        _ = containerIdentifier
+        _ = databaseScope
+        return nil
+    }
+
+    @BigSyncBackgroundActor
+    func changeFeedEpoch() throws -> Int? { nil }
 
     @BigSyncBackgroundActor
     func rebasePendingDeletionMetadata(

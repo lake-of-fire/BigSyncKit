@@ -7,6 +7,106 @@ import XCTest
 
 final class ChangeFeedMigrationResumeTests: XCTestCase {
     @BigSyncBackgroundActor
+    func testDurableCompletionRequiresExactTerminalProvenance() async throws {
+        let account = "durable-completion-account"
+        let epoch = 29
+        let adapter = try makeAdapter(label: "durable-completion")
+
+        try await adapter.prepareChangeFeedReset(
+            accountScopeIdentifier: account,
+            epoch: epoch,
+            mode: .encryptedDataReset
+        )
+        try await adapter.beginChangeFeedServerBootstrap(
+            accountScopeIdentifier: account,
+            epoch: epoch,
+            mode: .encryptedDataReset
+        )
+        try await adapter.reconcileAfterChangeFeedServerBootstrap(
+            accountScopeIdentifier: account,
+            epoch: epoch,
+            mode: .encryptedDataReset
+        )
+        let incomplete = try await adapter.changeFeedResetCompletionIsDurable(
+            accountScopeIdentifier: account,
+            epoch: epoch,
+            mode: .encryptedDataReset
+        )
+        XCTAssertFalse(incomplete)
+
+        try await adapter.finishChangeFeedReset(
+            accountScopeIdentifier: account,
+            epoch: epoch,
+            mode: .encryptedDataReset
+        )
+
+        let completed = try await adapter.changeFeedResetCompletionIsDurable(
+            accountScopeIdentifier: account,
+            epoch: epoch,
+            mode: .encryptedDataReset
+        )
+        let wrongAccount = try await adapter.changeFeedResetCompletionIsDurable(
+            accountScopeIdentifier: "another-account",
+            epoch: epoch,
+            mode: .encryptedDataReset
+        )
+        let wrongEpoch = try await adapter.changeFeedResetCompletionIsDurable(
+            accountScopeIdentifier: account,
+            epoch: epoch + 1,
+            mode: .encryptedDataReset
+        )
+        let wrongMode = try await adapter.changeFeedResetCompletionIsDurable(
+            accountScopeIdentifier: account,
+            epoch: epoch,
+            mode: .backupRestore
+        )
+        XCTAssertTrue(completed)
+        XCTAssertFalse(wrongAccount)
+        XCTAssertFalse(wrongEpoch)
+        XCTAssertFalse(wrongMode)
+    }
+
+    @BigSyncBackgroundActor
+    func testDurableCompletionThrowsWhenPersistenceRealmCannotOpen() async throws {
+        let nonce = UUID().uuidString
+        let persistenceDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "change-feed-unopenable-persistence-\(nonce)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: persistenceDirectory,
+            withIntermediateDirectories: true
+        )
+        var persistence = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        persistence.fileURL = persistenceDirectory
+        var target = Realm.Configuration()
+        target.inMemoryIdentifier = "change-feed-unopenable-target-\(nonce)"
+        target.objectTypes = [MigrationPeerObject.self, BigSyncPendingMutation.self]
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistence,
+            targetRealmConfigurations: [target],
+            excludedClassNames: [],
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "change-feed-unopenable-\(nonce)"
+            ),
+            logger: Logger(label: "ChangeFeedMigrationResumeTests"),
+            startSetupTask: false
+        )
+
+        do {
+            _ = try await adapter.changeFeedResetCompletionIsDurable(
+                accountScopeIdentifier: "account",
+                epoch: 1,
+                mode: .initialImport
+            )
+            XCTFail("An unavailable persistence Realm cannot prove completion")
+        } catch {
+            XCTAssertFalse(error is CancellationError)
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testCompletedAdapterRemainsNoOpWhenPeerResumesFinishingMigration()
     async throws {
         let account = "migration-account"

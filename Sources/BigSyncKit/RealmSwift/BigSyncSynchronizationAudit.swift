@@ -144,6 +144,15 @@ extension RealmSwiftAdapter {
             issues.append("pending-relationships:\(pendingRelationshipCount)")
         }
 
+        let ownedQuarantines = persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).filter("entityType IN %@", Array(ownedTypeNames))
+        for quarantine in ownedQuarantines {
+            issues.append(
+                "inbound-semantic-quarantine:\(quarantine.recordName):\(quarantine.validationCode)"
+            )
+        }
+
         return BigSyncSynchronizationAudit(
             serverRecordCount: serverRecords.count,
             ownedServerRecordCount: ownedServerRecords.count,

@@ -11,6 +11,7 @@ public struct CloudKitSyncHealthSnapshot: Sendable, Equatable {
         case idle
         case syncing
         case succeeded
+        case semanticBlocked
         case transientRetry
         case notAuthenticated
         case accountTemporarilyUnavailable
@@ -131,7 +132,10 @@ extension CloudKitSynchronizer {
             $0.accountScopeIdentifier == context.accountScopeIdentifier ? $0 : nil
         }
         let didSucceed = category == .succeeded
-        let didFail = category != .idle && category != .syncing && !didSucceed
+        let didFail = category != .idle
+            && category != .syncing
+            && category != .semanticBlocked
+            && !didSucceed
         let snapshot = CloudKitSyncHealthSnapshot(
             category: category,
             accountScopeIdentifier: context.accountScopeIdentifier,

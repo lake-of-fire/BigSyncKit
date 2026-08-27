@@ -362,6 +362,9 @@ enum BackupDetection {
             namespace: namespace,
             sharedBaseURL: sharedSentinelBaseURL
         )
+        BigSyncClientIdentityLeaseRegistry.invalidateInstallationIdentifier(
+            at: sentinelURL.appendingPathExtension("lease")
+        )
         return try withRestoreStateLock(
             sentinelURL: sentinelURL,
             fileManager: fileManager
@@ -442,6 +445,9 @@ enum BackupDetection {
             namespace: namespace,
             sharedBaseURL: sharedSentinelBaseURL
         )
+        BigSyncClientIdentityLeaseRegistry.invalidateInstallationIdentifier(
+            at: sentinelURL.appendingPathExtension("lease")
+        )
         return try withRestoreStateLock(
             sentinelURL: sentinelURL,
             fileManager: fileManager
@@ -519,28 +525,48 @@ enum BackupDetection {
         let eventURL = restoreEventURL(sentinelURL: sentinelURL)
         let intentExists = fileManager.fileExists(atPath: intentURL.path)
         let eventExists = fileManager.fileExists(atPath: eventURL.path)
-        if !intentExists && !eventExists {
-            let completedURL = completedManualRestoreReceiptURL(
-                sentinelURL: sentinelURL
-            )
-            guard fileManager.fileExists(atPath: completedURL.path) else {
-                return .newTransaction
-            }
-            guard let completed = manualRestoreReceipt(at: completedURL),
+        let completedURL = completedManualRestoreReceiptURL(
+            sentinelURL: sentinelURL
+        )
+        let completedExists = fileManager.fileExists(atPath: completedURL.path)
+        let completed: ManualRestoreReceipt?
+        if completedExists {
+            guard let receipt = manualRestoreReceipt(at: completedURL),
                   installationIdentifier(
                     sentinelURL: sentinelURL,
                     fileManager: fileManager
-                  ) == completed.newInstallationIdentifier else {
+                  ) == receipt.newInstallationIdentifier else {
                 throw Error.manualRestoreStateAmbiguous
             }
-            return completed.transactionIdentifier == transactionIdentifier
-                ? .completed(completed)
-                : .newTransaction
+            completed = receipt
+        } else {
+            completed = nil
+        }
+
+        // A matching completion receipt proves the replacement finished.
+        // Matching intent/event files are residue from cleanup interrupted by
+        // a crash; conflicting or unreadable residue remains ambiguous.
+        if let completed,
+           completed.transactionIdentifier == transactionIdentifier {
+            let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
+            let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil
+            if (intentExists && intent == nil)
+                || (eventExists && event == nil)
+                || intent.map({ $0 != completed }) == true
+                || event.map({ $0 != completed }) == true {
+                throw Error.manualRestoreStateAmbiguous
+            }
+            return .completed(completed)
+        }
+
+        if !intentExists && !eventExists {
+            return .newTransaction
         }
 
         let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
         let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil
-        if intentExists && intent == nil || eventExists && event == nil {
+        if (intentExists && intent == nil)
+            || (eventExists && event == nil) {
             throw Error.manualRestoreStateAmbiguous
         }
         if let intent, let event, intent != event {
@@ -560,14 +586,15 @@ enum BackupDetection {
         sentinelURL: URL,
         fileManager: FileManager
     ) throws -> ManualRestoreReceipt {
+        let receipt: ManualRestoreReceipt
         switch try manualRestorePreflightLocked(
             transactionIdentifier: transactionIdentifier,
             sentinelURL: sentinelURL,
             fileManager: fileManager
         ) {
-        case .resumeIntent(let receipt), .resumeEvent(let receipt),
-             .completed(let receipt):
-            return receipt
+        case .resumeIntent(let existing), .resumeEvent(let existing),
+             .completed(let existing):
+            receipt = existing
         case .newTransaction:
             guard let oldInstallationIdentifier = installationIdentifier(
                 sentinelURL: sentinelURL,
@@ -575,7 +602,7 @@ enum BackupDetection {
             ) else {
                 throw Error.manualRestoreStateAmbiguous
             }
-            let receipt = ManualRestoreReceipt(
+            receipt = ManualRestoreReceipt(
                 transactionIdentifier: transactionIdentifier,
                 restoreEventIdentifier: UUID(),
                 oldInstallationIdentifier: oldInstallationIdentifier,
@@ -586,8 +613,8 @@ enum BackupDetection {
                 at: manualRestoreIntentURL(sentinelURL: sentinelURL),
                 fileManager: fileManager
             )
-            return receipt
         }
+        return receipt
     }
 
     private static func removeManualRestoreIntentLocked(

@@ -1,5 +1,6 @@
 import XCTest
 import CloudKit
+import CoreFoundation
 import CryptoKit
 import Logging
 @testable import BigSyncKit
@@ -24,6 +25,8 @@ private final class DictionaryKeyValueStore: NSObject, KeyValueStore {
 
 private enum TestSynchronizationError: Error {
     case initialSetupFailed
+    case backupDetectionFailed
+    case accountScopeInvalidationFailed
     case terminalForwardingFailed
     case importedPersistenceCacheFailed
     case subscriptionMutationFailed
@@ -164,8 +167,13 @@ extension FakeCloudKitDatabase: CloudKitSubscriptionStore {
             throw subscriptionLookupError
         }
         guard completesSubscriptionFetches else {
-            return try await withCheckedThrowingContinuation {
-                (_: CheckedContinuation<CKSubscription?, Error>) in
+            // Some cancellation-barrier tests deliberately model a CloudKit
+            // callback that never arrives, even after its owning task is
+            // cancelled. An unsafe continuation is intentional here: a
+            // checked continuation would diagnose the simulated abandonment
+            // as an implementation bug when the test fixture is released.
+            return try await withUnsafeThrowingContinuation {
+                (_: UnsafeContinuation<CKSubscription?, Error>) in
             }
         }
         let subscription = fetchedSubscriptions.first {
@@ -345,7 +353,9 @@ extension FakeCloudKitDatabase: CloudKitChangeFeed {
             throw nextDatabaseChangesError
         }
         guard completesFetchDatabaseChanges else {
-            return try await withCheckedThrowingContinuation { (_: CheckedContinuation<CloudKitDatabaseChangePage, Error>) in }
+            return try await withUnsafeThrowingContinuation {
+                (_: UnsafeContinuation<CloudKitDatabaseChangePage, Error>) in
+            }
         }
         if let nextAccountIdentifier = accountIdentifierAfterNextDatabaseChangesFetch {
             accountIdentifier = nextAccountIdentifier
@@ -380,7 +390,9 @@ extension FakeCloudKitDatabase: CloudKitChangeFeed {
             throw CKError(.zoneNotFound)
         }
         guard !zoneChangePages.isEmpty || completesEmptyZoneChangeOperation else {
-            return try await withCheckedThrowingContinuation { (_: CheckedContinuation<CloudKitRecordZoneChangePage, Error>) in }
+            return try await withUnsafeThrowingContinuation {
+                (_: UnsafeContinuation<CloudKitRecordZoneChangePage, Error>) in
+            }
         }
         recordZoneChangeFetchCount += 1
         let page = zoneChangePages.isEmpty
@@ -506,6 +518,8 @@ private final class FakeModelAdapter:
     var saveChangesHandler: (@Sendable () async throws -> Void)?
     var recordsToUploadHandler: (@Sendable () async throws -> Void)?
     var terminalPendingChanges = false
+    var semanticBlockers = [CloudKitSynchronizer.DomainBlocker]()
+    var domainHookInvocationCount = 0
     var repeatsPreparedUploads = false
     var repeatsPreparedDeletions = false
 
@@ -536,16 +550,41 @@ private final class FakeModelAdapter:
     }
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool { true }
 
-    func saveChanges(in records: [CKRecord], forceSave: Bool) async throws {
+    func saveChanges(
+        in records: [CKRecord],
+        forceSave: Bool
+    ) async throws -> [InboundLiveResult] {
         savedBatchSizes.append(records.count)
         let recordTypes = records.map { $0.recordType }.joined(separator: ",")
         events.append("save:\(recordTypes)")
         try await saveChangesHandler?()
+        return records.enumerated().map {
+            InboundLiveResult(
+                event: .init(
+                    ordinal: $0.offset,
+                    entityType: $0.element.recordType,
+                    recordID: $0.element.recordID
+                ),
+                disposition: .applied
+            )
+        }
     }
 
-    func deleteRecords(with recordIDs: [CKRecord.ID]) async throws {
+    func deleteRecords(
+        with recordIDs: [CKRecord.ID]
+    ) async throws -> [InboundDeletionResult] {
         let recordNames = recordIDs.map { $0.recordName }.joined(separator: ",")
         events.append("deleteRemote:\(recordNames)")
+        return recordIDs.enumerated().map {
+            InboundDeletionResult(
+                event: .init(
+                    ordinal: $0.offset,
+                    entityType: "FakeDeletedObject",
+                    recordID: $0.element
+                ),
+                disposition: .appliedTombstone
+            )
+        }
     }
 
     func persistImportedChanges() async throws {
@@ -641,6 +680,28 @@ private final class FakeModelAdapter:
         events.append("saveToken")
     }
 
+    @BigSyncBackgroundActor
+    func consumedServerBoundaryIdentifier(
+        accountScopeIdentifier: String,
+        replicaBindingGenerationIdentifier: String?,
+        containerIdentifier: String,
+        databaseScope: CKDatabase.Scope
+    ) throws -> String? {
+        guard !accountScopeIdentifier.isEmpty,
+              let token = storedServerChangeToken?.serializedData else {
+            return nil
+        }
+        return CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+            containerIdentifier: containerIdentifier,
+            databaseScope: databaseScope,
+            accountScopeIdentifier: accountScopeIdentifier,
+            replicaBindingGenerationIdentifier:
+                replicaBindingGenerationIdentifier,
+            recordZoneID: recordZoneID,
+            cursorData: token
+        )
+    }
+
     func didFinishImport() async throws {
         didFinishImportCount += 1
         try await didFinishImportHandler?()
@@ -656,6 +717,12 @@ private final class FakeModelAdapter:
         return terminalPendingChanges || hasChanges
     }
 
+    @BigSyncBackgroundActor
+    func semanticPublicationBlockers() async throws
+        -> [CloudKitSynchronizer.DomainBlocker] {
+        semanticBlockers
+    }
+
     private func nextEntityTypeWithPendingUploads() -> String? {
         priorityEntityTypeNames.first(where: { !(uploadedByEntity[$0] ?? []).isEmpty }) ??
         uploadedByEntity.keys.sorted().first(where: { !(uploadedByEntity[$0] ?? []).isEmpty })
@@ -669,7 +736,7 @@ private final class FakeModelAdapter:
 
 @objc(BigSyncTrackedObject)
 private final class BigSyncTrackedObject: Object, ChangeMetadataRecordable,
-CloudKitInitialSyncEligibilityModel {
+CloudKitInitialSyncEligibilityModel, BigSyncStringEncodedIntegerModel {
     @Persisted(primaryKey: true) var id: String
     @Persisted var createdAt: Date
     @Persisted var modifiedAt: Date
@@ -680,12 +747,20 @@ CloudKitInitialSyncEligibilityModel {
     @Persisted var urls: List<URL>
     @Persisted var scores: MutableSet<Int>
     @Persisted var attributes: Map<String, String>
+    @Persisted var ordinaryScalarInteger: Int64 = 0
+    @Persisted var scalarInteger: Int64 = 0
+    @Persisted var optionalScalarInteger: Int?
     @Persisted var payload: Data?
     @Persisted var initialCloudKitSyncEligible = true
 
     static var initialCloudKitSyncEligibilityPredicate: NSPredicate {
         NSPredicate(format: "initialCloudKitSyncEligible == true")
     }
+
+    static let bigSyncStringEncodedIntegerPropertyNames: Set<String> = [
+        "scalarInteger",
+        "optionalScalarInteger",
+    ]
 
     convenience init(id: String, createdAt: Date, modifiedAt: Date, explicitlyModifiedAt: Date?) {
         self.init()
@@ -694,6 +769,16 @@ CloudKitInitialSyncEligibilityModel {
         self.modifiedAt = modifiedAt
         self.explicitlyModifiedAt = explicitlyModifiedAt
     }
+}
+
+@objc(BigSyncIntegerKeyedObject)
+private final class BigSyncIntegerKeyedObject: Object,
+    ChangeMetadataRecordable {
+    @Persisted(primaryKey: true) var id = 0
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
 }
 
 private enum TestInboundSemanticFailure: Error,
@@ -706,7 +791,8 @@ private enum TestInboundSemanticFailure: Error,
 @objc(BigSyncSemanticallyValidatedObject)
 private final class BigSyncSemanticallyValidatedObject: Object,
     ChangeMetadataRecordable, BigSyncInboundSemanticRecordValidating,
-    BigSyncInboundSemanticReplacementValidating {
+    BigSyncInboundSemanticReplacementValidating,
+    BigSyncInboundSemanticDeletionValidating {
     @Persisted(primaryKey: true) var id = ""
     @Persisted var semanticValue = ""
     @Persisted var immutableNonce = ""
@@ -721,6 +807,14 @@ private final class BigSyncSemanticallyValidatedObject: Object,
         }
     }
 
+    static func inboundSemanticQuarantineScopeIdentifier(
+        _ record: CKRecord
+    ) -> String? {
+        guard let value = record["semanticScope"] as? String,
+              !value.isEmpty else { return nil }
+        return value
+    }
+
     static func validateInboundSemanticReplacement(
         _ record: CKRecord,
         existingObject: Object?
@@ -731,6 +825,49 @@ private final class BigSyncSemanticallyValidatedObject: Object,
                 == existing.immutableNonce else {
             throw TestInboundSemanticFailure.rejected
         }
+    }
+
+    static func inboundSemanticReplacementDisposition(
+        _ record: CKRecord,
+        existingObject: Object?
+    ) throws -> BigSyncInboundSemanticReplacementDisposition {
+        try validateInboundSemanticReplacement(
+            record,
+            existingObject: existingObject
+        )
+        return existingObject == nil
+            ? .applyIncomingRecord
+            : .preserveExistingObject
+    }
+
+    static func validateInboundSemanticDeletion(
+        _ recordID: CKRecord.ID,
+        existingObject: Object?
+    ) throws {
+        throw TestInboundSemanticFailure.rejected
+    }
+
+    static func inboundSemanticDeletionQuarantineScopeIdentifier(
+        _ recordID: CKRecord.ID,
+        existingObject: Object?
+    ) -> String? {
+        guard let existing = existingObject as? Self,
+              !existing.immutableNonce.isEmpty else { return nil }
+        return existing.immutableNonce
+    }
+}
+
+@objc(BigSyncSecondSemanticallyValidatedObject)
+private final class BigSyncSecondSemanticallyValidatedObject: Object,
+    ChangeMetadataRecordable, BigSyncInboundSemanticRecordValidating {
+    @Persisted(primaryKey: true) var id = ""
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+
+    static func validateInboundSemanticRecord(_ record: CKRecord) throws {
+        throw TestInboundSemanticFailure.rejected
     }
 }
 
@@ -769,12 +906,118 @@ private actor SynchronizationResultRecorder {
     }
 }
 
+private actor SynchronizationBoundaryEventRecorder {
+    private var events = [String]()
+    private var context:
+        CloudKitSynchronizer.SynchronizationBoundaryContext?
+
+    func recordWillConsume(
+        _ context: CloudKitSynchronizer.SynchronizationBoundaryContext
+    ) {
+        self.context = context
+        events.append("will-consume")
+    }
+
+    func recordImport() {
+        events.append("import")
+    }
+
+    func snapshot() -> (
+        events: [String],
+        context: CloudKitSynchronizer.SynchronizationBoundaryContext?
+    ) {
+        (events, context)
+    }
+}
+
+private actor RestoreAuthorityBarrierRecorder {
+    struct Event: Sendable, Equatable {
+        let reason: BigSyncAccountScopeInvalidationReason
+        let leaseWasInvalidated: Bool
+        let cloudKitOperationCount: Int
+    }
+
+    private var events = [Event]()
+    private var failuresRemaining: Int
+
+    init(failuresRemaining: Int = 0) {
+        self.failuresRemaining = failuresRemaining
+    }
+
+    func record(
+        reason: BigSyncAccountScopeInvalidationReason,
+        leaseWasInvalidated: Bool,
+        cloudKitOperationCount: Int
+    ) throws {
+        events.append(Event(
+            reason: reason,
+            leaseWasInvalidated: leaseWasInvalidated,
+            cloudKitOperationCount: cloudKitOperationCount
+        ))
+        if failuresRemaining > 0 {
+            failuresRemaining -= 1
+            throw TestSynchronizationError.accountScopeInvalidationFailed
+        }
+    }
+
+    func snapshot() -> [Event] { events }
+}
+
+private final class MutationJournalIdentitySequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let identities: [BigSyncMutationJournalIdentity]
+    private var nextIndex = 0
+
+    init(_ identities: [BigSyncMutationJournalIdentity]) {
+        precondition(!identities.isEmpty)
+        self.identities = identities
+    }
+
+    func next() -> BigSyncMutationJournalIdentity {
+        lock.lock()
+        defer {
+            nextIndex += 1
+            lock.unlock()
+        }
+        return identities[min(nextIndex, identities.count - 1)]
+    }
+
+    var invocationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return nextIndex
+    }
+}
+
 final class BigSyncKitTests: XCTestCase {
+
+    func testCloudKitBooleanCodecAcceptsOnlyBooleanOrIntegralZeroAndOne() {
+        XCTAssertEqual(BigSyncCloudKitBooleanCodec.decode(false), false)
+        XCTAssertEqual(BigSyncCloudKitBooleanCodec.decode(true), true)
+        XCTAssertEqual(
+            BigSyncCloudKitBooleanCodec.decode(NSNumber(value: Int64(0))),
+            false
+        )
+        XCTAssertEqual(
+            BigSyncCloudKitBooleanCodec.decode(NSNumber(value: Int64(1))),
+            true
+        )
+
+        XCTAssertNil(
+            BigSyncCloudKitBooleanCodec.decode(NSNumber(value: Int64(2)))
+        )
+        XCTAssertNil(
+            BigSyncCloudKitBooleanCodec.decode(NSNumber(value: 0.0))
+        )
+        XCTAssertNil(BigSyncCloudKitBooleanCodec.decode("0"))
+    }
 
     @BigSyncBackgroundActor
     func testInboundSemanticFailureIsQuarantinedWithoutBlockingValidRecord()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
+        let activeAccountScope = "active-transport-account"
+        try await fixture.adapter.activateAccountScope(activeAccountScope)
         fixture.adapter.mergePolicy = .server
         let valid = makeRecord(
             type: BigSyncTrackedObject.className(),
@@ -794,11 +1037,12 @@ final class BigSyncKitTests: XCTestCase {
             zoneID: fixture.adapter.recordZoneID
         )
         malformed["semanticValue"] = "invalid" as CKRecordValue
+        malformed["semanticScope"] = "activation-a" as CKRecordValue
         malformed["createdAt"] = timestamp as CKRecordValue
         malformed["modifiedAt"] = timestamp as CKRecordValue
         malformed["isDeleted"] = false as CKRecordValue
 
-        try await fixture.adapter.saveChanges(
+        _ = try await fixture.adapter.saveChanges(
             in: [malformed, valid],
             forceSave: true
         )
@@ -820,16 +1064,65 @@ final class BigSyncKitTests: XCTestCase {
         let recordName = BigSyncSemanticallyValidatedObject.className()
             + ".malformed"
         let quarantine = try XCTUnwrap(
-            fixture.persistenceRealm.object(
-                ofType: BigSyncInboundSemanticQuarantine.self,
-                forPrimaryKey: recordName
-            )
+            fixture.persistenceRealm.objects(
+                BigSyncInboundSemanticQuarantine.self
+            ).where { $0.recordName == recordName }.first
         )
         XCTAssertEqual(quarantine.validationCode, "test-semantic-rejection")
+        XCTAssertEqual(
+            quarantine.accountScopeIdentifier,
+            activeAccountScope,
+            "Dataset-scoped records must still block readiness for the importing account"
+        )
+        XCTAssertEqual(
+            quarantine.semanticScopeIdentifier,
+            "activation-a"
+        )
         XCTAssertEqual(quarantine.receivedRecordDigestHex.count, 64)
+        XCTAssertTrue(try fixture.adapter.hasInboundSemanticQuarantine(
+            entityType: BigSyncSemanticallyValidatedObject.className(),
+            accountScopeIdentifier: activeAccountScope,
+            semanticScopeIdentifier: "activation-a"
+        ))
+        XCTAssertFalse(try fixture.adapter.hasInboundSemanticQuarantine(
+            entityType: BigSyncSemanticallyValidatedObject.className(),
+            accountScopeIdentifier: activeAccountScope,
+            semanticScopeIdentifier: "activation-b"
+        ))
+
+        let audit = try await fixture.adapter.auditSynchronizationState(
+            serverRecords: [malformed, valid]
+        )
+        XCTAssertTrue(
+            audit.issues.contains(
+                "inbound-semantic-quarantine:\(recordName):test-semantic-rejection"
+            )
+        )
+
+        let unknownScope = BigSyncInboundSemanticQuarantine()
+        unknownScope.lineageID = "legacy-test-unknown-scope"
+        unknownScope.recordName = "unknown-scope"
+        unknownScope.entityType = BigSyncSemanticallyValidatedObject
+            .className()
+        unknownScope.accountScopeIdentifier = activeAccountScope
+        unknownScope.containerIdentifier = ""
+        unknownScope.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        unknownScope.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+        unknownScope.zoneName = fixture.adapter.recordZoneID.zoneName
+        unknownScope.replicaActivationIdentifier = "legacy-unbound"
+        unknownScope.changeFeedEpoch = 0
+        unknownScope.validationCode = "unknown-scope"
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(unknownScope)
+        }
+        XCTAssertTrue(try fixture.adapter.hasInboundSemanticQuarantine(
+            entityType: BigSyncSemanticallyValidatedObject.className(),
+            accountScopeIdentifier: activeAccountScope,
+            semanticScopeIdentifier: "activation-b"
+        ))
 
         malformed["semanticValue"] = "valid" as CKRecordValue
-        try await fixture.adapter.saveChanges(
+        _ = try await fixture.adapter.saveChanges(
             in: [malformed],
             forceSave: true
         )
@@ -843,12 +1136,1338 @@ final class BigSyncKitTests: XCTestCase {
             )?.semanticValue,
             "valid"
         )
-        XCTAssertNil(
-            fixture.persistenceRealm.object(
-                ofType: BigSyncInboundSemanticQuarantine.self,
-                forPrimaryKey: recordName
+        XCTAssertNotNil(
+            fixture.persistenceRealm.objects(
+                BigSyncInboundSemanticQuarantine.self
+            ).where { $0.recordName == recordName }.first
+        )
+        // Validation alone is not a durable supersession boundary. The
+        // quarantine remains until the page receipt and cursor that represent
+        // the corrected event commit atomically.
+    }
+
+    @BigSyncBackgroundActor
+    func testQuarantineFromPriorFeedEpochDoesNotBlockCurrentNamespace()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let account = "quarantine-epoch-account"
+        let container = "quarantine-epoch-container"
+        let binding = "quarantine-epoch-binding"
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: account,
+            replicaBindingGenerationIdentifier: binding,
+            acceptsLegacyUnboundMutations: false
+        )
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: container,
+            databaseScope: .private
+        )
+
+        let old = BigSyncInboundSemanticQuarantine()
+        old.lineageID = "old-feed-quarantine"
+        old.recordName = "old-record"
+        old.entityType = BigSyncSemanticallyValidatedObject.className()
+        old.accountScopeIdentifier = account
+        old.semanticScopeIdentifier = "scope"
+        old.containerIdentifier = container
+        old.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        old.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+        old.zoneName = fixture.adapter.recordZoneID.zoneName
+        old.replicaActivationIdentifier = binding
+        old.changeFeedEpoch = 1
+        old.validationCode = "old-feed"
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(old)
+        }
+
+        XCTAssertFalse(try fixture.adapter.hasInboundSemanticQuarantine(
+            entityType: BigSyncSemanticallyValidatedObject.className(),
+            accountScopeIdentifier: account,
+            semanticScopeIdentifier: "scope"
+        ))
+        let blockers = try await fixture.adapter.semanticPublicationBlockers()
+        XCTAssertFalse(blockers.contains {
+            $0.code == "inbound-semantic-quarantine"
+        })
+    }
+
+    @BigSyncBackgroundActor
+    func testQuarantineLineageSeparatesTransportNamespaces() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter.mergePolicy = .server
+        let timestamp = Date(timeIntervalSinceReferenceDate: 23_456)
+        let recordName = BigSyncSemanticallyValidatedObject.className()
+            + ".namespace-collision"
+
+        func malformedRecord(zoneID: CKRecordZone.ID) -> CKRecord {
+            let record = makeRecord(
+                type: BigSyncSemanticallyValidatedObject.className(),
+                id: "namespace-collision",
+                zoneID: zoneID
+            )
+            record["semanticValue"] = "invalid" as CKRecordValue
+            record["semanticScope"] = "activation-a" as CKRecordValue
+            record["createdAt"] = timestamp as CKRecordValue
+            record["modifiedAt"] = timestamp as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            return record
+        }
+
+        func importMalformed(
+            account: String,
+            container: String,
+            databaseScope: CKDatabase.Scope,
+            zoneID: CKRecordZone.ID
+        ) async throws {
+            try await fixture.adapter.activateAccountScope(account)
+            try await fixture.adapter.activateTransportNamespace(
+                containerIdentifier: container,
+                databaseScope: databaseScope
+            )
+            _ = try await fixture.adapter.saveChanges(
+                in: [malformedRecord(zoneID: zoneID)],
+                forceSave: true
+            )
+        }
+
+        let baseZone = fixture.adapter.recordZoneID
+        try await importMalformed(
+            account: "account-a",
+            container: "container-a",
+            databaseScope: .private,
+            zoneID: baseZone
+        )
+        try await importMalformed(
+            account: "account-a",
+            container: "container-b",
+            databaseScope: .private,
+            zoneID: baseZone
+        )
+        try await importMalformed(
+            account: "account-a",
+            container: "container-a",
+            databaseScope: .public,
+            zoneID: baseZone
+        )
+        try await importMalformed(
+            account: "account-b",
+            container: "container-a",
+            databaseScope: .private,
+            zoneID: baseZone
+        )
+        try await importMalformed(
+            account: "account-a",
+            container: "container-a",
+            databaseScope: .private,
+            zoneID: CKRecordZone.ID(
+                zoneName: "other-zone",
+                ownerName: CKCurrentUserDefaultName
             )
         )
+        fixture.persistenceRealm.refresh()
+
+        let quarantines = fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where { $0.recordName == recordName }
+        XCTAssertEqual(quarantines.count, 5)
+        XCTAssertEqual(Set(quarantines.map(\.lineageID)).count, 5)
+    }
+
+    @BigSyncBackgroundActor
+    func testQuarantineLineageSeparatesEntityTypesSharingARecordID()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter.mergePolicy = .server
+        try await fixture.adapter.activateAccountScope("account-a")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "container-a",
+            databaseScope: .private
+        )
+
+        let recordID = CKRecord.ID(
+            recordName: "malformed-shared-record-name",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let first = CKRecord(
+            recordType: BigSyncSemanticallyValidatedObject.className(),
+            recordID: recordID
+        )
+        first["semanticValue"] = "invalid" as CKRecordValue
+        let second = CKRecord(
+            recordType: BigSyncSecondSemanticallyValidatedObject.className(),
+            recordID: recordID
+        )
+
+        let firstResults = try await fixture.adapter.saveChanges(
+            in: [first],
+            forceSave: true
+        )
+        let firstCursor = RecordZoneChangeCursor(
+            serializedData: Data("entity-lineage-first".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: firstCursor,
+            liveResults: firstResults,
+            deletionResults: []
+        ))
+
+        let secondResults = try await fixture.adapter.saveChanges(
+            in: [second],
+            forceSave: true
+        )
+        let secondCursor = RecordZoneChangeCursor(
+            serializedData: Data("entity-lineage-second".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: firstCursor,
+            nextCursor: secondCursor,
+            liveResults: secondResults,
+            deletionResults: []
+        ))
+        fixture.persistenceRealm.refresh()
+
+        var quarantines = fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where { $0.recordName == recordID.recordName }
+        XCTAssertEqual(quarantines.count, 2)
+        XCTAssertEqual(Set(quarantines.map(\.entityType)), Set([
+            BigSyncSemanticallyValidatedObject.className(),
+            BigSyncSecondSemanticallyValidatedObject.className(),
+        ]))
+        XCTAssertEqual(Set(quarantines.map(\.lineageID)).count, 2)
+
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: secondCursor,
+            nextCursor: .init(
+                serializedData: Data("entity-lineage-third".utf8)
+            ),
+            liveResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType:
+                        BigSyncSemanticallyValidatedObject.className(),
+                    recordID: recordID
+                ),
+                disposition: .unchanged
+            )],
+            deletionResults: []
+        ))
+        fixture.persistenceRealm.refresh()
+
+        quarantines = fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where { $0.recordName == recordID.recordName }
+        XCTAssertEqual(quarantines.count, 1)
+        XCTAssertEqual(
+            quarantines.first?.entityType,
+            BigSyncSecondSemanticallyValidatedObject.className()
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDispositionValidationRejectsWrongCardinalityAndIdentity()
+    throws {
+        let synchronizer = makeSynchronizer()
+        let zoneID = CKRecordZone.ID(zoneName: "disposition-validation")
+        let first = makeRecord(type: "First", id: "first", zoneID: zoneID)
+        let second = makeRecord(type: "Second", id: "second", zoneID: zoneID)
+
+        XCTAssertThrowsError(try synchronizer.validateInboundLiveResults(
+            [InboundLiveResult(
+                event: .init(
+                    ordinal: 0,
+                    entityType: first.recordType,
+                    recordID: first.recordID
+                ),
+                disposition: .applied
+            )],
+            records: [first, second]
+        )) { error in
+            XCTAssertEqual(
+                error as? InboundDispositionValidationError,
+                .cardinality(expected: 2, actual: 1)
+            )
+        }
+        XCTAssertThrowsError(try synchronizer.validateInboundLiveResults(
+            [
+                InboundLiveResult(
+                    event: .init(
+                        ordinal: 0,
+                        entityType: second.recordType,
+                        recordID: second.recordID
+                    ),
+                    disposition: .applied
+                ),
+                InboundLiveResult(
+                    event: .init(
+                        ordinal: 1,
+                        entityType: first.recordType,
+                        recordID: first.recordID
+                    ),
+                    disposition: .unchanged
+                ),
+            ],
+            records: [first, second]
+        )) { error in
+            XCTAssertEqual(
+                error as? InboundDispositionValidationError,
+                .identityMismatch(ordinal: 0, expectedRecordName:
+                    first.recordID.recordName)
+            )
+        }
+
+        let foreign = makeRecord(
+            type: "Foreign",
+            id: "foreign",
+            zoneID: CKRecordZone.ID(zoneName: "foreign-zone")
+        )
+        XCTAssertThrowsError(
+            try ChangeRequestProcessor.validateInboundPageIdentities(
+                records: [foreign],
+                deletedRecordIDs: [],
+                expectedZoneID: zoneID
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? InboundDispositionValidationError,
+                .eventOutsideExpectedZone(
+                    recordName: foreign.recordID.recordName
+                )
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedChangeFeedPageFailsBeforeAdapterMutation() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let zoneID = CKRecordZone.ID(
+            zoneName: "malformed-page-preflight",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let record = makeRecord(
+            type: "Article",
+            id: "duplicate",
+            zoneID: zoneID
+        )
+        database.databaseChangePages = [FakeDatabaseChangePage(
+            changedZoneIDs: [zoneID],
+            deletions: [],
+            moreComing: false
+        )]
+        database.zoneChangePages = [FakeZoneChangePage(
+            zoneID: zoneID,
+            records: [record],
+            deletedRecordIDs: [record.recordID],
+            moreComing: false
+        )]
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        let synchronizer = makeSynchronizer(
+            database: database,
+            recordZoneID: zoneID
+        )
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("Expected a duplicate page identity to fail closed")
+        } catch let error as InboundDispositionValidationError {
+            XCTAssertEqual(
+                error,
+                .duplicateInboundEvent(
+                    recordName: record.recordID.recordName
+                )
+            )
+        }
+
+        XCTAssertTrue(adapter.savedBatchSizes.isEmpty)
+        XCTAssertFalse(adapter.events.contains(where: {
+            $0.hasPrefix("deleteRemote:") || $0 == "persist"
+        }))
+        let cursor = await adapter.serverChangeToken
+        XCTAssertNil(cursor)
+    }
+
+    @BigSyncBackgroundActor
+    func testMixedChangeFeedDurablyQuarantinesMalformedRecordAndAdvancesCursor()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter.mergePolicy = .server
+        let zoneID = fixture.adapter.recordZoneID
+        let timestamp = Date(timeIntervalSinceReferenceDate: 12_346)
+        let malformed = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(),
+            id: "malformed-change-feed",
+            zoneID: zoneID
+        )
+        malformed["semanticValue"] = "invalid" as CKRecordValue
+        malformed["semanticScope"] = "activation-a" as CKRecordValue
+        malformed["immutableNonce"] = "malformed-nonce" as CKRecordValue
+        malformed["createdAt"] = timestamp as CKRecordValue
+        malformed["modifiedAt"] = timestamp as CKRecordValue
+        malformed["isDeleted"] = false as CKRecordValue
+
+        let valid = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(),
+            id: "valid-change-feed-neighbor",
+            zoneID: zoneID
+        )
+        valid["semanticValue"] = "valid" as CKRecordValue
+        valid["semanticScope"] = "activation-a" as CKRecordValue
+        valid["immutableNonce"] = "valid-nonce" as CKRecordValue
+        valid["createdAt"] = timestamp as CKRecordValue
+        valid["modifiedAt"] = timestamp as CKRecordValue
+        valid["isDeleted"] = false as CKRecordValue
+
+        let database = FakeCloudKitDatabase()
+        // A fresh Realm adapter performs the normal change-feed bootstrap.
+        // After importing this page, the synchronizer makes its required
+        // post-upload poll of the same zone; let the fake transport return the
+        // terminal empty page instead of deliberately suspending forever.
+        database.completesEmptyZoneChangeOperation = true
+        database.databaseChangePages = [FakeDatabaseChangePage(
+            changedZoneIDs: [zoneID],
+            deletions: [],
+            moreComing: false
+        )]
+        database.zoneChangePages = [FakeZoneChangePage(
+            zoneID: zoneID,
+            records: [malformed, valid],
+            deletedRecordIDs: [],
+            moreComing: false
+        )]
+        let synchronizer = makeSynchronizer(
+            database: database,
+            recordZoneID: zoneID
+        )
+        synchronizer.addModelAdapter(fixture.adapter)
+
+        let result = try await synchronizer.synchronize()
+        fixture.targetRealm.refresh()
+        fixture.persistenceRealm.refresh()
+
+        XCTAssertTrue(result.didImportChanges)
+        XCTAssertNil(result.receipt)
+        XCTAssertEqual(
+            result.publicationState,
+            .blocked([.init(
+                code: "inbound-semantic-quarantine",
+                detail: "1"
+            )])
+        )
+        XCTAssertNil(fixture.targetRealm.object(
+            ofType: BigSyncSemanticallyValidatedObject.self,
+            forPrimaryKey: "malformed-change-feed"
+        ))
+        XCTAssertEqual(
+            fixture.targetRealm.object(
+                ofType: BigSyncSemanticallyValidatedObject.self,
+                forPrimaryKey: "valid-change-feed-neighbor"
+            )?.semanticValue,
+            "valid"
+        )
+        let quarantineRecordName =
+            BigSyncSemanticallyValidatedObject.className()
+            + ".malformed-change-feed"
+        let quarantine = try XCTUnwrap(fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where { $0.recordName == quarantineRecordName }.first)
+        XCTAssertEqual(quarantine.validationCode, "test-semantic-rejection")
+        XCTAssertEqual(quarantine.semanticScopeIdentifier, "activation-a")
+        XCTAssertGreaterThan(quarantine.committedPageSequence, 0)
+        XCTAssertEqual(
+            quarantine.committedPageOutcomeDigestHex.count,
+            64
+        )
+
+        let pageReceipt = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: quarantine.committedPageReceiptID
+        ))
+        XCTAssertEqual(pageReceipt.acceptedEventCount, 2)
+        XCTAssertFalse(pageReceipt.isHead)
+        XCTAssertEqual(pageReceipt.outcomeDigestHex.count, 64)
+        XCTAssertEqual(
+            quarantine.committedPageOutcomeDigestHex,
+            pageReceipt.outcomeDigestHex
+        )
+
+        let receivedZoneCursor = await fixture.adapter.serverChangeToken
+        let zoneCursor = try XCTUnwrap(receivedZoneCursor)
+        XCTAssertFalse(zoneCursor.serializedData.isEmpty)
+        XCTAssertNotNil(synchronizer.storedDatabaseToken)
+
+        try await fixture.adapter.saveToken(nil)
+        fixture.persistenceRealm.refresh()
+        XCTAssertEqual(quarantine.committedPageSequence, 0)
+        XCTAssertTrue(quarantine.committedPageReceiptID.isEmpty)
+        XCTAssertTrue(quarantine.committedPageOutcomeDigestHex.isEmpty)
+        XCTAssertTrue(fixture.persistenceRealm.objects(
+            BigSyncInboundPageReceipt.self
+        ).isEmpty)
+        let resetCursor = await fixture.adapter.serverChangeToken
+        XCTAssertNil(resetCursor)
+    }
+
+    @BigSyncBackgroundActor
+    func testResetSyncCachesInvalidatesQuarantinePageProof() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let account = "reset-proof-account"
+        let container = "reset-proof-container"
+        try await fixture.adapter.activateAccountScope(account)
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: container,
+            databaseScope: .private
+        )
+
+        let recordName = BigSyncSemanticallyValidatedObject.className()
+            + ".reset-proof-subject"
+        let receiptID = "semantic-reset-proof"
+        let quarantine = BigSyncInboundSemanticQuarantine()
+        quarantine.lineageID = "reset-proof-lineage"
+        quarantine.recordName = recordName
+        quarantine.entityType = BigSyncSemanticallyValidatedObject.className()
+        quarantine.accountScopeIdentifier = account
+        quarantine.semanticScopeIdentifier = "reset-proof-scope"
+        quarantine.containerIdentifier = container
+        quarantine.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        quarantine.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+        quarantine.zoneName = fixture.adapter.recordZoneID.zoneName
+        quarantine.replicaActivationIdentifier = "legacy-unbound"
+        quarantine.committedPageSequence = 7
+        quarantine.committedPageReceiptID = receiptID
+        quarantine.committedPageOutcomeDigestHex = String(repeating: "a", count: 64)
+
+        let receipt = BigSyncInboundPageReceipt()
+        receipt.id = receiptID
+        receipt.accountScopeIdentifier = account
+        receipt.containerIdentifier = container
+        receipt.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        receipt.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+        receipt.zoneName = fixture.adapter.recordZoneID.zoneName
+        receipt.replicaActivationIdentifier = "legacy-unbound"
+        receipt.pageSequence = 7
+        receipt.outcomeDigestHex = quarantine.committedPageOutcomeDigestHex
+
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(quarantine)
+            fixture.persistenceRealm.add(receipt)
+        }
+
+        try await fixture.adapter.resetSyncCaches()
+        fixture.persistenceRealm.refresh()
+
+        let retained = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: quarantine.lineageID
+        ))
+        XCTAssertEqual(retained.committedPageSequence, 0)
+        XCTAssertTrue(retained.committedPageReceiptID.isEmpty)
+        XCTAssertTrue(retained.committedPageOutcomeDigestHex.isEmpty)
+        XCTAssertTrue(fixture.persistenceRealm.objects(
+            BigSyncInboundPageReceipt.self
+        ).isEmpty)
+
+        // A page committed after the reset must not retire the retained
+        // quarantine merely because it names the same record.
+        try await fixture.adapter.activateAccountScope(account)
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: container,
+            databaseScope: .private
+        )
+        let recordID = CKRecord.ID(
+            recordName: recordName,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: .init(serializedData: Data("after-reset".utf8)),
+            liveResults: [InboundLiveResult(
+                event: .init(
+                    ordinal: 0,
+                    entityType: BigSyncSemanticallyValidatedObject.className(),
+                    recordID: recordID
+                ),
+                disposition: .applied
+            )],
+            deletionResults: []
+        ))
+        fixture.persistenceRealm.refresh()
+        XCTAssertNotNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: quarantine.lineageID
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testValidatedOwnUploadEchoRetiresQuarantineWithoutApplyingInbound()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter.mergePolicy = .server
+        let zoneID = fixture.adapter.recordZoneID
+        let timestamp = Date(timeIntervalSinceReferenceDate: 12_347)
+        let malformed = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(),
+            id: "own-echo-recovery",
+            zoneID: zoneID
+        )
+        malformed["semanticValue"] = "invalid" as CKRecordValue
+        malformed["semanticScope"] = "activation-a" as CKRecordValue
+        malformed["immutableNonce"] = "own-echo-nonce" as CKRecordValue
+        malformed["createdAt"] = timestamp as CKRecordValue
+        malformed["modifiedAt"] = timestamp as CKRecordValue
+        malformed["isDeleted"] = false as CKRecordValue
+
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        database.databaseChangePages = [FakeDatabaseChangePage(
+            changedZoneIDs: [zoneID],
+            deletions: [],
+            moreComing: false
+        )]
+        database.zoneChangePages = [FakeZoneChangePage(
+            zoneID: zoneID,
+            records: [malformed],
+            deletedRecordIDs: [],
+            moreComing: false
+        )]
+        let synchronizer = makeSynchronizer(
+            database: database,
+            recordZoneID: zoneID
+        )
+        synchronizer.addModelAdapter(fixture.adapter)
+
+        let blocked = try await synchronizer.synchronize()
+        XCTAssertNil(blocked.receipt)
+        fixture.persistenceRealm.refresh()
+        let quarantine = try XCTUnwrap(fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where {
+            $0.recordName == malformed.recordID.recordName
+        }.first)
+        let quarantinedLineageID = quarantine.lineageID
+        let quarantinedPageSequence = quarantine.committedPageSequence
+        XCTAssertGreaterThan(quarantinedPageSequence, 0)
+
+        let corrected = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(),
+            id: "own-echo-recovery",
+            zoneID: zoneID
+        )
+        corrected["semanticValue"] = "valid" as CKRecordValue
+        corrected["semanticScope"] = "activation-a" as CKRecordValue
+        corrected["immutableNonce"] = "own-echo-nonce" as CKRecordValue
+        corrected["createdAt"] = timestamp as CKRecordValue
+        corrected["modifiedAt"] = timestamp as CKRecordValue
+        corrected["isDeleted"] = false as CKRecordValue
+        corrected[cloudKitSynchronizerDeviceUUIDKey] =
+            synchronizer.deviceIdentifier as CKRecordValue
+        database.databaseChangePages = [FakeDatabaseChangePage(
+            changedZoneIDs: [zoneID],
+            deletions: [],
+            moreComing: false
+        )]
+        database.zoneChangePages = [FakeZoneChangePage(
+            zoneID: zoneID,
+            records: [corrected],
+            deletedRecordIDs: [],
+            moreComing: false
+        )]
+
+        let recovered = try await synchronizer.synchronize()
+        fixture.targetRealm.refresh()
+        fixture.persistenceRealm.refresh()
+
+        XCTAssertTrue(recovered.didImportChanges)
+        XCTAssertNotNil(recovered.receipt)
+        XCTAssertNil(fixture.targetRealm.object(
+            ofType: BigSyncSemanticallyValidatedObject.self,
+            forPrimaryKey: "own-echo-recovery"
+        ))
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: quarantinedLineageID
+        ))
+        XCTAssertTrue(fixture.persistenceRealm.objects(
+            BigSyncInboundPageReceipt.self
+        ).where { !$0.isHead }.isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testLaterCommittedPageRetiresOnlyReceiptBoundQuarantine()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let account = "page-receipt-account"
+        try await fixture.adapter.activateAccountScope(account)
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "page-receipt-container",
+            databaseScope: .private
+        )
+        let object = BigSyncSemanticallyValidatedObject()
+        object.id = "page-receipt-subject"
+        object.semanticValue = "valid"
+        object.immutableNonce = "stable-nonce"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        let recordName = BigSyncSemanticallyValidatedObject.className()
+            + "." + object.id
+        let recordID = CKRecord.ID(
+            recordName: recordName,
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        let deletionResults = try await fixture.adapter.deleteRecords(
+            with: [recordID]
+        )
+        let lineageID: String
+        if case let .quarantined(value) = try XCTUnwrap(
+            deletionResults.first
+        ).disposition {
+            lineageID = value
+        } else {
+            XCTFail("Expected semantic deletion quarantine")
+            return
+        }
+        let firstCursor = RecordZoneChangeCursor(
+            serializedData: Data("page-1".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: firstCursor,
+            liveResults: [],
+            deletionResults: deletionResults
+        ))
+        fixture.persistenceRealm.refresh()
+        let committedQuarantine = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: BigSyncInboundSemanticQuarantine.self,
+                forPrimaryKey: lineageID
+            )
+        )
+        XCTAssertEqual(committedQuarantine.committedPageSequence, 1)
+        let sharedReceiptID = committedQuarantine.committedPageReceiptID
+        let sharedOutcomeDigest = committedQuarantine
+            .committedPageOutcomeDigestHex
+        let siblingLineageID = "page-receipt-sibling-lineage"
+        let siblingRecordName = BigSyncSemanticallyValidatedObject.className()
+            + ".page-receipt-sibling"
+        try await fixture.persistenceRealm.asyncWrite {
+            let sibling = BigSyncInboundSemanticQuarantine()
+            sibling.lineageID = siblingLineageID
+            sibling.recordName = siblingRecordName
+            sibling.entityType = BigSyncSemanticallyValidatedObject.className()
+            sibling.accountScopeIdentifier = account
+            sibling.containerIdentifier = "page-receipt-container"
+            sibling.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+            sibling.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+            sibling.zoneName = fixture.adapter.recordZoneID.zoneName
+            sibling.replicaActivationIdentifier = "legacy-unbound"
+            sibling.committedPageSequence = 1
+            sibling.committedPageReceiptID = sharedReceiptID
+            sibling.committedPageOutcomeDigestHex = sharedOutcomeDigest
+            fixture.persistenceRealm.add(sibling)
+        }
+
+        let live = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let timestamp = Date(timeIntervalSinceReferenceDate: 77_777)
+        live["semanticValue"] = "valid" as CKRecordValue
+        live["semanticScope"] = "activation-a" as CKRecordValue
+        live["immutableNonce"] = "stable-nonce" as CKRecordValue
+        live["createdAt"] = timestamp as CKRecordValue
+        live["modifiedAt"] = timestamp as CKRecordValue
+        live["isDeleted"] = false as CKRecordValue
+        let liveResults = try await fixture.adapter.saveChanges(
+            in: [live],
+            forceSave: true
+        )
+        try await fixture.adapter.persistImportedChanges()
+        do {
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: nil,
+                nextCursor: .init(
+                    serializedData: Data("wrong-page-2".utf8)
+                ),
+                liveResults: liveResults,
+                deletionResults: []
+            ))
+            XCTFail("Expected the stale page cursor to fail closed")
+        } catch let error as RealmSwiftInboundPageCommitError {
+            XCTAssertEqual(error, .previousCursorMismatch)
+        }
+        fixture.persistenceRealm.refresh()
+        XCTAssertNotNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: lineageID
+        ))
+        let secondCursor = RecordZoneChangeCursor(
+            serializedData: Data("page-2".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: firstCursor,
+            nextCursor: secondCursor,
+            liveResults: liveResults,
+            deletionResults: []
+        ))
+        fixture.persistenceRealm.refresh()
+
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: lineageID
+        ))
+        let receipt = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: BigSyncInboundPageReceipt.canonicalID
+        ))
+        XCTAssertEqual(receipt.pageSequence, 2)
+        XCTAssertEqual(Array(receipt.supersededLineageIDs), [lineageID])
+        XCTAssertEqual(receipt.acceptedEventCount, 1)
+        XCTAssertNotNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: sharedReceiptID
+        ))
+        XCTAssertNotNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: siblingLineageID
+        ))
+
+        let siblingRecordID = CKRecord.ID(
+            recordName: siblingRecordName,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: secondCursor,
+            nextCursor: .init(serializedData: Data("page-3".utf8)),
+            liveResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: BigSyncSemanticallyValidatedObject.className(),
+                    recordID: siblingRecordID
+                ),
+                disposition: .unchanged
+            )],
+            deletionResults: []
+        ))
+        fixture.persistenceRealm.refresh()
+
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: siblingLineageID
+        ))
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: sharedReceiptID
+        ))
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(
+                BigSyncInboundPageReceipt.self
+            ).count,
+            1,
+            "Retiring the last quarantine must remove its proof receipt"
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundPageRejectsQuarantineBoundToAnotherEvent()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope(
+            "quarantine-event-account"
+        )
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "quarantine-event-container",
+            databaseScope: .private
+        )
+        let object = BigSyncSemanticallyValidatedObject()
+        object.id = "quarantined-subject"
+        object.semanticValue = "valid"
+        object.immutableNonce = "stable-nonce"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        let quarantinedRecordID = CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className()
+                + "." + object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let deletionResults = try await fixture.adapter.deleteRecords(
+            with: [quarantinedRecordID]
+        )
+        let result = try XCTUnwrap(deletionResults.first)
+        let lineageID: String
+        if case let .quarantined(value) = result.disposition {
+            lineageID = value
+        } else {
+            XCTFail("Expected semantic deletion quarantine")
+            return
+        }
+        let unrelatedRecordID = CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className()
+                + ".another-subject",
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        do {
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: nil,
+                nextCursor: .init(
+                    serializedData: Data("mismatched-event".utf8)
+                ),
+                liveResults: [],
+                deletionResults: [.init(
+                    event: .init(
+                        ordinal: 0,
+                        entityType: BigSyncSemanticallyValidatedObject.className(),
+                        recordID: unrelatedRecordID
+                    ),
+                    disposition: .quarantined(lineageID: lineageID)
+                )]
+            ))
+            XCTFail("Expected quarantine/event mismatch")
+        } catch let error as RealmSwiftInboundPageCommitError {
+            XCTAssertEqual(
+                error,
+                .quarantineEventMismatch(lineageID: lineageID)
+            )
+        }
+
+        fixture.persistenceRealm.refresh()
+        let committedCursor = await fixture.adapter.serverChangeToken
+        XCTAssertNil(committedCursor)
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: BigSyncInboundSemanticQuarantine.self,
+                forPrimaryKey: lineageID
+            )?.committedPageSequence,
+            0
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundPageRejectsMalformedOrDuplicateEventIdentities()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope("page-shape-account")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "page-shape-container",
+            databaseScope: .private
+        )
+        let recordID = CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className()
+                + ".page-shape-subject",
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        do {
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: nil,
+                nextCursor: .init(serializedData: Data("bad-ordinal".utf8)),
+                liveResults: [.init(
+                    event: .init(
+                        ordinal: 1,
+                        entityType: BigSyncSemanticallyValidatedObject.className(),
+                        recordID: recordID
+                    ),
+                    disposition: .unchanged
+                )],
+                deletionResults: []
+            ))
+            XCTFail("Expected a non-contiguous live ordinal to fail closed")
+        } catch let error as RealmSwiftInboundPageCommitError {
+            XCTAssertEqual(error, .invalidEventOrdinal(
+                eventKind: "live",
+                expected: 0,
+                actual: 1
+            ))
+        }
+
+        do {
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: nil,
+                nextCursor: .init(serializedData: Data("duplicate".utf8)),
+                liveResults: [.init(
+                    event: .init(
+                        ordinal: 0,
+                        entityType: BigSyncSemanticallyValidatedObject.className(),
+                        recordID: recordID
+                    ),
+                    disposition: .unchanged
+                )],
+                deletionResults: [.init(
+                    event: .init(
+                        ordinal: 0,
+                        entityType: BigSyncSemanticallyValidatedObject.className(),
+                        recordID: recordID
+                    ),
+                    disposition: .alreadyDeleted
+                )]
+            ))
+            XCTFail("Expected a duplicate page event to fail closed")
+        } catch let error as RealmSwiftInboundPageCommitError {
+            XCTAssertEqual(
+                error,
+                .duplicateInboundEvent(recordName: recordID.recordName)
+            )
+        }
+
+        let committedCursor = await fixture.adapter.serverChangeToken
+        XCTAssertNil(committedCursor)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundPageRejectsDeferredDispositionWithoutDurableRelationship()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope("deferred-proof-account")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "deferred-proof-container",
+            databaseScope: .private
+        )
+        let recordID = CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className()
+                + ".deferred-proof-subject",
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        do {
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: nil,
+                nextCursor: .init(
+                    serializedData: Data("forged-deferred".utf8)
+                ),
+                liveResults: [.init(
+                    event: .init(
+                        ordinal: 0,
+                        entityType: BigSyncSemanticallyValidatedObject.className(),
+                        recordID: recordID
+                    ),
+                    disposition: .deferred(relationshipCount: 1)
+                )],
+                deletionResults: []
+            ))
+            XCTFail("Expected unbacked deferred work to fail closed")
+        } catch let error as RealmSwiftInboundPageCommitError {
+            XCTAssertEqual(
+                error,
+                .deferredRelationshipBackingMismatch(
+                    recordName: recordID.recordName,
+                    expectedCount: 1,
+                    actualCount: 0
+                )
+            )
+        }
+
+        let committedCursor = await fixture.adapter.serverChangeToken
+        XCTAssertNil(committedCursor)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundPageCommitsDeferredDispositionWithDurableEmptyRelationship()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope("deferred-proof-account")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "deferred-proof-container",
+            databaseScope: .private
+        )
+        let recordName = BigSyncSemanticallyValidatedObject.className()
+            + ".deferred-proof-subject"
+        let recordID = CKRecord.ID(
+            recordName: recordName,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.persistenceRealm.asyncWrite {
+            let entity = SyncedEntity(
+                entityType: BigSyncSemanticallyValidatedObject.className(),
+                identifier: recordName,
+                state: SyncedEntityState.synced.rawValue
+            )
+            let relationship = PendingRelationship()
+            relationship.relationshipName = "children"
+            relationship.targetIdentifier = nil
+            relationship.forSyncedEntity = entity
+            fixture.persistenceRealm.add(entity)
+            fixture.persistenceRealm.add(relationship)
+        }
+
+        let cursor = RecordZoneChangeCursor(
+            serializedData: Data("durable-deferred".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: cursor,
+            liveResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: BigSyncSemanticallyValidatedObject.className(),
+                    recordID: recordID
+                ),
+                disposition: .deferred(relationshipCount: 1)
+            )],
+            deletionResults: []
+        ))
+
+        fixture.persistenceRealm.refresh()
+        let committedCursor = await fixture.adapter.serverChangeToken
+        XCTAssertEqual(committedCursor, cursor)
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: BigSyncInboundPageReceipt.self,
+                forPrimaryKey: BigSyncInboundPageReceipt.canonicalID
+            )?.acceptedEventCount,
+            1
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredDispositionReportsCompleteDurableRelationshipBacking()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope(
+            "deferred-complete-account"
+        )
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "deferred-complete-container",
+            databaseScope: .private
+        )
+        let parent = BigSyncRelationshipParent()
+        parent.id = "deferred-complete-parent"
+        let recordName = BigSyncRelationshipParent.className() + "."
+            + parent.id
+        try await fixture.persistenceRealm.asyncWrite {
+            let entity = SyncedEntity(
+                entityType: BigSyncRelationshipParent.className(),
+                identifier: recordName,
+                state: SyncedEntityState.synced.rawValue
+            )
+            let olderRelationship = PendingRelationship()
+            olderRelationship.relationshipName = "legacyRelationship"
+            olderRelationship.targetIdentifier = "legacy-target"
+            olderRelationship.forSyncedEntity = entity
+            fixture.persistenceRealm.add(entity)
+            fixture.persistenceRealm.add(olderRelationship)
+        }
+
+        let record = makeRecord(
+            type: BigSyncRelationshipParent.className(),
+            id: parent.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["children"] = [
+            BigSyncRelationshipChild.className() + ".missing"
+        ] as CKRecordValue
+        let remoteTimestamp = Date().addingTimeInterval(60)
+        record["createdAt"] = remoteTimestamp as CKRecordValue
+        record["modifiedAt"] = remoteTimestamp as CKRecordValue
+        record["explicitlyModifiedAt"] = remoteTimestamp as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        let results = try await fixture.adapter.saveChanges(
+            in: [record],
+            forceSave: true
+        )
+        let durableCount = fixture.persistenceRealm.objects(
+            PendingRelationship.self
+        ).filter("forSyncedEntity.identifier == %@", recordName).count
+        XCTAssertEqual(durableCount, 4)
+        XCTAssertEqual(
+            results.map(\.disposition),
+            [.deferred(relationshipCount: durableCount)]
+        )
+
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: .init(
+                serializedData: Data("complete-deferred-proof".utf8)
+            ),
+            liveResults: results,
+            deletionResults: []
+        ))
+        let committedCursor = await fixture.adapter.serverChangeToken
+        XCTAssertNotNil(committedCursor)
+    }
+
+    @BigSyncBackgroundActor
+    func testLaterPageRequiresExactReceiptProofToRetireQuarantine()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let account = "receipt-proof-account"
+        let container = "receipt-proof-container"
+        try await fixture.adapter.activateAccountScope(account)
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: container,
+            databaseScope: .private
+        )
+        let firstCursor = RecordZoneChangeCursor(
+            serializedData: Data("receipt-proof-page-1".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: firstCursor,
+            liveResults: [],
+            deletionResults: []
+        ))
+
+        let recordName = BigSyncSemanticallyValidatedObject.className()
+            + ".receipt-proof-subject"
+        let recordID = CKRecord.ID(
+            recordName: recordName,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let quarantine = BigSyncInboundSemanticQuarantine()
+        quarantine.lineageID = "receipt-proof-lineage"
+        quarantine.recordName = recordName
+        quarantine.entityType = BigSyncSemanticallyValidatedObject.className()
+        quarantine.accountScopeIdentifier = account
+        quarantine.semanticScopeIdentifier = "receipt-proof-scope"
+        quarantine.containerIdentifier = container
+        quarantine.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        quarantine.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+        quarantine.zoneName = fixture.adapter.recordZoneID.zoneName
+        quarantine.replicaActivationIdentifier = "legacy-unbound"
+        quarantine.committedPageSequence = 1
+        quarantine.committedPageReceiptID = "missing-semantic-receipt"
+        quarantine.committedPageOutcomeDigestHex = String(
+            repeating: "a",
+            count: 64
+        )
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(quarantine)
+        }
+
+        let secondCursor = RecordZoneChangeCursor(
+            serializedData: Data("receipt-proof-page-2".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: firstCursor,
+            nextCursor: secondCursor,
+            liveResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: BigSyncSemanticallyValidatedObject.className(),
+                    recordID: recordID
+                ),
+                disposition: .unchanged
+            )],
+            deletionResults: []
+        ))
+        fixture.persistenceRealm.refresh()
+        XCTAssertNotNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: quarantine.lineageID
+        ))
+
+        let mismatchedReceipt = BigSyncInboundPageReceipt()
+        mismatchedReceipt.id = quarantine.committedPageReceiptID
+        mismatchedReceipt.accountScopeIdentifier = account
+        mismatchedReceipt.containerIdentifier = container
+        mismatchedReceipt.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        mismatchedReceipt.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+        mismatchedReceipt.zoneName = fixture.adapter.recordZoneID.zoneName
+        mismatchedReceipt.replicaActivationIdentifier = "legacy-unbound"
+        mismatchedReceipt.pageSequence = quarantine.committedPageSequence
+        mismatchedReceipt.outcomeDigestHex = String(repeating: "b", count: 64)
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(mismatchedReceipt)
+        }
+
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: secondCursor,
+            nextCursor: .init(
+                serializedData: Data("receipt-proof-page-3".utf8)
+            ),
+            liveResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: BigSyncSemanticallyValidatedObject.className(),
+                    recordID: recordID
+                ),
+                disposition: .unchanged
+            )],
+            deletionResults: []
+        ))
+        fixture.persistenceRealm.refresh()
+        XCTAssertNotNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: quarantine.lineageID
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testUnreceiptedQuarantineCannotBeRetiredByLaterPage()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope("crash-prefix-account")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "crash-prefix-container",
+            databaseScope: .private
+        )
+        let object = BigSyncSemanticallyValidatedObject()
+        object.id = "crash-prefix-subject"
+        object.semanticValue = "valid"
+        object.immutableNonce = "stable-nonce"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        let recordName = BigSyncSemanticallyValidatedObject.className()
+            + "." + object.id
+        let recordID = CKRecord.ID(
+            recordName: recordName,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let deletionResults = try await fixture.adapter.deleteRecords(
+            with: [recordID]
+        )
+        let lineageID: String
+        if case let .quarantined(value) = try XCTUnwrap(
+            deletionResults.first
+        ).disposition {
+            lineageID = value
+        } else {
+            XCTFail("Expected semantic deletion quarantine")
+            return
+        }
+
+        let live = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let timestamp = Date(timeIntervalSinceReferenceDate: 88_888)
+        live["semanticValue"] = "valid" as CKRecordValue
+        live["semanticScope"] = "activation-a" as CKRecordValue
+        live["immutableNonce"] = "stable-nonce" as CKRecordValue
+        live["createdAt"] = timestamp as CKRecordValue
+        live["modifiedAt"] = timestamp as CKRecordValue
+        live["isDeleted"] = false as CKRecordValue
+        let liveResults = try await fixture.adapter.saveChanges(
+            in: [live],
+            forceSave: true
+        )
+        try await fixture.adapter.persistImportedChanges()
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: .init(serializedData: Data("first-receipt".utf8)),
+            liveResults: liveResults,
+            deletionResults: []
+        ))
+        fixture.persistenceRealm.refresh()
+
+        let retained = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: lineageID
+        ))
+        XCTAssertEqual(retained.committedPageSequence, 0)
+        XCTAssertTrue(retained.committedPageOutcomeDigestHex.isEmpty)
+        XCTAssertTrue(try fixture.adapter.hasInboundSemanticQuarantine(
+            entityType: BigSyncSemanticallyValidatedObject.className(),
+            accountScopeIdentifier: "crash-prefix-account",
+            semanticScopeIdentifier: "stable-nonce"
+        ))
     }
 
     @BigSyncBackgroundActor
@@ -876,7 +2495,7 @@ final class BigSyncKitTests: XCTestCase {
         incoming["modifiedAt"] = timestamp as CKRecordValue
         incoming["isDeleted"] = false as CKRecordValue
 
-        try await fixture.adapter.saveChanges(
+        _ = try await fixture.adapter.saveChanges(
             in: [incoming],
             forceSave: true
         )
@@ -892,10 +2511,386 @@ final class BigSyncKitTests: XCTestCase {
         )
         let recordName = BigSyncSemanticallyValidatedObject.className()
             + "." + local.id
-        XCTAssertNotNil(fixture.persistenceRealm.object(
-            ofType: BigSyncInboundSemanticQuarantine.self,
+        XCTAssertNotNil(fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where { $0.recordName == recordName }.first)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundImmutableRetryPreservesTargetAndAdvancesTrackingRecord()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter.mergePolicy = .server
+        let localTimestamp = Date(timeIntervalSinceReferenceDate: 100)
+        let serverTimestamp = Date(timeIntervalSinceReferenceDate: 200)
+        let local = BigSyncSemanticallyValidatedObject()
+        local.id = "immutable-retry"
+        local.semanticValue = "valid"
+        local.immutableNonce = "same-semantic-fact"
+        local.createdAt = localTimestamp
+        local.modifiedAt = localTimestamp
+        local.explicitlyModifiedAt = localTimestamp
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(local)
+        }
+
+        let incoming = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(),
+            id: local.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        incoming["semanticValue"] = "valid" as CKRecordValue
+        incoming["immutableNonce"] = "same-semantic-fact" as CKRecordValue
+        incoming["createdAt"] = serverTimestamp as CKRecordValue
+        incoming["modifiedAt"] = serverTimestamp as CKRecordValue
+        incoming["explicitlyModifiedAt"] = serverTimestamp as CKRecordValue
+        incoming["isDeleted"] = false as CKRecordValue
+
+        _ = try await fixture.adapter.saveChanges(
+            in: [incoming],
+            forceSave: true
+        )
+        fixture.targetRealm.refresh()
+        fixture.persistenceRealm.refresh()
+
+        let preserved = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncSemanticallyValidatedObject.self,
+            forPrimaryKey: local.id
+        ))
+        XCTAssertEqual(preserved.createdAt, localTimestamp)
+        XCTAssertEqual(preserved.modifiedAt, localTimestamp)
+        XCTAssertEqual(preserved.explicitlyModifiedAt, localTimestamp)
+
+        let recordName = BigSyncSemanticallyValidatedObject.className()
+            + "." + local.id
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
             forPrimaryKey: recordName
         ))
+        let trackedRecord = try XCTUnwrap(
+            fixture.adapter.getRecord(for: tracking)
+        )
+        XCTAssertEqual(
+            trackedRecord.recordID,
+            incoming.recordID
+        )
+        XCTAssertNotNil(tracking.encodedRecord)
+        XCTAssertNil(fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where { $0.recordName == recordName }.first)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundSemanticDeletionIsQuarantinedWithoutBlockingNeighbors()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let accountScope = "active-transport-account"
+        try await fixture.adapter.activateAccountScope(accountScope)
+
+        let immutable = BigSyncSemanticallyValidatedObject()
+        immutable.id = "immutable-delete"
+        immutable.semanticValue = "valid"
+        immutable.immutableNonce = "activation-a"
+        let ordinary = BigSyncTrackedObject(
+            id: "ordinary-delete",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(immutable)
+            fixture.targetRealm.add(ordinary)
+        }
+
+        let immutableRecordName = BigSyncSemanticallyValidatedObject
+            .className() + "." + immutable.id
+        let unknownRecordName = BigSyncSemanticallyValidatedObject
+            .className() + ".unknown-delete"
+        let ordinaryRecordName = BigSyncTrackedObject.className()
+            + "." + ordinary.id
+        let immutableRecordID = CKRecord.ID(
+            recordName: immutableRecordName,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        _ = try await fixture.adapter.deleteRecords(with: [
+            immutableRecordID,
+            CKRecord.ID(
+                recordName: unknownRecordName,
+                zoneID: fixture.adapter.recordZoneID
+            ),
+            CKRecord.ID(
+                recordName: ordinaryRecordName,
+                zoneID: fixture.adapter.recordZoneID
+            ),
+        ])
+        fixture.targetRealm.refresh()
+        fixture.persistenceRealm.refresh()
+
+        XCTAssertFalse(immutable.isDeleted)
+        XCTAssertTrue(ordinary.isDeleted)
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: immutableRecordName
+        ))
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: ordinaryRecordName
+            )?.entityState,
+            .deletedRemotely
+        )
+
+        let quarantine = try XCTUnwrap(
+            fixture.persistenceRealm.objects(
+                BigSyncInboundSemanticQuarantine.self
+            ).where { $0.recordName == immutableRecordName }.first
+        )
+        XCTAssertEqual(quarantine.entityType,
+                       BigSyncSemanticallyValidatedObject.className())
+        XCTAssertEqual(quarantine.accountScopeIdentifier, accountScope)
+        XCTAssertEqual(quarantine.semanticScopeIdentifier, "activation-a")
+        XCTAssertNil(quarantine.recordChangeTag)
+        XCTAssertEqual(quarantine.validationCode,
+                       "test-semantic-rejection")
+        XCTAssertEqual(quarantine.receivedRecordDigestHex.count, 64)
+        let firstDeletionDigest = quarantine.receivedRecordDigestHex
+
+        let unknownQuarantine = try XCTUnwrap(
+            fixture.persistenceRealm.objects(
+                BigSyncInboundSemanticQuarantine.self
+            ).where { $0.recordName == unknownRecordName }.first
+        )
+        XCTAssertNil(unknownQuarantine.semanticScopeIdentifier)
+        XCTAssertTrue(try fixture.adapter.hasInboundSemanticQuarantine(
+            entityType: BigSyncSemanticallyValidatedObject.className(),
+            accountScopeIdentifier: accountScope,
+            semanticScopeIdentifier: "activation-b"
+        ))
+
+        // Replayed deletion evidence is deterministic even though its local
+        // import-run receipt and detection time are refreshed.
+        _ = try await fixture.adapter.deleteRecords(with: [immutableRecordID])
+        fixture.persistenceRealm.refresh()
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(
+                BigSyncInboundSemanticQuarantine.self
+            ).where {
+                $0.recordName == immutableRecordName
+            }.first?.receivedRecordDigestHex,
+            firstDeletionDigest
+        )
+        XCTAssertFalse(immutable.isDeleted)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionQuarantineLineageUsesPreviousCursorAndIsReplayStable()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope(
+            "deletion-lineage-account"
+        )
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "deletion-lineage-container",
+            databaseScope: .private
+        )
+
+        let immutable = BigSyncSemanticallyValidatedObject()
+        immutable.id = "deletion-lineage-subject"
+        immutable.semanticValue = "valid"
+        immutable.immutableNonce = "deletion-lineage-nonce"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(immutable)
+        }
+        let recordID = CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className()
+                + "." + immutable.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        let firstResults = try await fixture.adapter.deleteRecords(
+            with: [recordID]
+        )
+        let firstResult = try XCTUnwrap(firstResults.first)
+        let firstLineageID: String
+        if case let .quarantined(lineageID) = firstResult.disposition {
+            firstLineageID = lineageID
+        } else {
+            XCTFail("Expected the first deletion to be quarantined")
+            return
+        }
+
+        let firstCursor = RecordZoneChangeCursor(
+            serializedData: Data("deletion-page-1".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: firstCursor,
+            liveResults: [],
+            deletionResults: [firstResult]
+        ))
+
+        let secondResults = try await fixture.adapter.deleteRecords(
+            with: [recordID]
+        )
+        let secondResult = try XCTUnwrap(secondResults.first)
+        let secondLineageID: String
+        if case let .quarantined(lineageID) = secondResult.disposition {
+            secondLineageID = lineageID
+        } else {
+            XCTFail("Expected the second deletion to be quarantined")
+            return
+        }
+        XCTAssertNotEqual(
+            firstLineageID,
+            secondLineageID,
+            "A later deletion feed page must have distinct lineage"
+        )
+
+        let replayResults = try await fixture.adapter.deleteRecords(
+            with: [recordID]
+        )
+        let replayResult = try XCTUnwrap(replayResults.first)
+        guard case let .quarantined(replayLineageID) = replayResult.disposition
+        else {
+            XCTFail("Expected the replayed deletion to be quarantined")
+            return
+        }
+        XCTAssertEqual(
+            replayLineageID,
+            secondLineageID,
+            "Replaying the same page must retain deletion lineage"
+        )
+
+        fixture.persistenceRealm.refresh()
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(
+                BigSyncInboundSemanticQuarantine.self
+            ).where {
+                $0.recordName == recordID.recordName
+            }.count,
+            2
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testTaglessLiveQuarantineLineageUsesCursorAndRecordDigest()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope(
+            "tagless-live-lineage-account"
+        )
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "tagless-live-lineage-container",
+            databaseScope: .private
+        )
+
+        func malformedRecord(value: String) -> CKRecord {
+            let record = makeRecord(
+                type: BigSyncSemanticallyValidatedObject.className(),
+                id: "tagless-live-lineage-subject",
+                zoneID: fixture.adapter.recordZoneID
+            )
+            record["semanticValue"] = value as CKRecordValue
+            record["semanticScope"] = "tagless-live-scope" as CKRecordValue
+            record["immutableNonce"] = "tagless-live-nonce" as CKRecordValue
+            record["createdAt"] = Date(timeIntervalSinceReferenceDate: 1)
+                as CKRecordValue
+            record["modifiedAt"] = Date(timeIntervalSinceReferenceDate: 1)
+                as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            return record
+        }
+
+        let firstRecord = malformedRecord(value: "invalid-first")
+        XCTAssertNil(firstRecord.recordChangeTag)
+        let firstResults = try await fixture.adapter.saveChanges(
+            in: [firstRecord],
+            forceSave: true
+        )
+        let firstResult = try XCTUnwrap(firstResults.first)
+        let firstLineageID: String
+        if case let .quarantined(lineageID) = firstResult.disposition {
+            firstLineageID = lineageID
+        } else {
+            XCTFail("Expected the first live record to be quarantined")
+            return
+        }
+
+        let firstCursor = RecordZoneChangeCursor(
+            serializedData: Data("tagless-live-page-1".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: firstCursor,
+            liveResults: [firstResult],
+            deletionResults: []
+        ))
+
+        let secondRecord = malformedRecord(value: "invalid-second")
+        let secondResults = try await fixture.adapter.saveChanges(
+            in: [secondRecord],
+            forceSave: true
+        )
+        let secondResult = try XCTUnwrap(secondResults.first)
+        let secondLineageID: String
+        if case let .quarantined(lineageID) = secondResult.disposition {
+            secondLineageID = lineageID
+        } else {
+            XCTFail("Expected the second live record to be quarantined")
+            return
+        }
+        XCTAssertNotEqual(
+            firstLineageID,
+            secondLineageID,
+            "A changed tagless payload on a later page must not overwrite prior evidence"
+        )
+
+        let replayResults = try await fixture.adapter.saveChanges(
+            in: [secondRecord],
+            forceSave: true
+        )
+        let replayResult = try XCTUnwrap(replayResults.first)
+        guard case let .quarantined(replayLineageID) = replayResult.disposition
+        else {
+            XCTFail("Expected the replayed live record to be quarantined")
+            return
+        }
+        XCTAssertEqual(
+            replayLineageID,
+            secondLineageID,
+            "Replaying the same tagless page must retain lineage"
+        )
+
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: firstCursor,
+            nextCursor: .init(
+                serializedData: Data("tagless-live-page-2".utf8)
+            ),
+            liveResults: [secondResult],
+            deletionResults: []
+        ))
+
+        fixture.persistenceRealm.refresh()
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: firstLineageID
+        ))
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: BigSyncInboundSemanticQuarantine.self,
+                forPrimaryKey: secondLineageID
+            )?.committedPageSequence,
+            2
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(
+                BigSyncInboundSemanticQuarantine.self
+            ).where {
+                $0.recordName == firstRecord.recordID.recordName
+            }.count,
+            1,
+            "A committed newer malformed revision replaces older proof"
+        )
     }
 
     @BigSyncBackgroundActor
@@ -1075,6 +3070,747 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testReplicaBindingRotationReplacesTrackingGenerationAndFencesOldAck()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let bindingA = String(repeating: "a", count: 64)
+        let bindingB = String(repeating: "b", count: 64)
+        let policy = BigSyncMutationPolicy(excludedClassNames: [])
+        policy.install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: "binding-test-installation",
+                    replicaBindingGenerationIdentifier: bindingA
+                )
+            }
+        )
+        let transportAdapter: any ModelAdapter = fixture.adapter
+        try await transportAdapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: bindingA,
+            acceptsLegacyUnboundMutations: false
+        )
+
+        let object = BigSyncTrackedObject(
+            id: "binding-rotation",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className()
+            + ".binding-rotation"
+        let firstMutation = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(
+            firstMutation.replicaBindingGenerationIdentifier,
+            bindingA
+        )
+        XCTAssertTrue(firstMutation.generation.contains(":binding:\(bindingA):"))
+
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        let firstGeneration = firstMutation.generation
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingReplicaBindingGenerationIdentifier,
+            bindingA
+        )
+        let firstBatch = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 10,
+            restrictedToEntityType: nil
+        )
+        XCTAssertEqual(firstBatch.map(\.generation), [firstGeneration])
+
+        policy.install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: "binding-test-installation",
+                    replicaBindingGenerationIdentifier: bindingB
+                )
+            }
+        )
+        try await transportAdapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: bindingB,
+            acceptsLegacyUnboundMutations: false
+        )
+        XCTAssertFalse(
+            try fixture.adapter.hasPendingChangesAtTerminalBoundary()
+        )
+        let staleBindingUploads = try await fixture.adapter
+            .preparedRecordsToUpload(
+            limit: 10,
+            restrictedToEntityType: nil
+        )
+        XCTAssertTrue(staleBindingUploads.isEmpty)
+
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("new-binding")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let secondMutation = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+        let secondGeneration = secondMutation.generation
+        XCTAssertNotEqual(secondGeneration, firstGeneration)
+        XCTAssertEqual(
+            secondMutation.replicaBindingGenerationIdentifier,
+            bindingB
+        )
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingReplicaBindingGenerationIdentifier,
+            bindingB
+        )
+
+        try await fixture.adapter.didUpload(
+            savedRecords: firstBatch.map(\.record),
+            matchingGenerations: [recordName: firstGeneration]
+        )
+        XCTAssertEqual(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )?.generation,
+            secondGeneration
+        )
+
+        let secondBatch = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 10,
+            restrictedToEntityType: nil
+        )
+        XCTAssertEqual(secondBatch.map(\.generation), [secondGeneration])
+        try await fixture.adapter.didUpload(
+            savedRecords: secondBatch.map(\.record),
+            matchingGenerations: [recordName: secondGeneration]
+        )
+        XCTAssertNil(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+        let acknowledgedTracking = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNil(acknowledgedTracking.pendingGeneration)
+        XCTAssertNil(
+            acknowledgedTracking
+                .pendingReplicaBindingGenerationIdentifier
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testCombinedMutationJournalIdentityIsSampledOncePerMutation()
+    async throws {
+        let bindingA = String(repeating: "a", count: 64)
+        let bindingB = String(repeating: "b", count: 64)
+        let identities = MutationJournalIdentitySequence([
+            BigSyncMutationJournalIdentity(
+                installationIdentifier: "installation-a",
+                replicaBindingGenerationIdentifier: bindingA
+            ),
+            BigSyncMutationJournalIdentity(
+                installationIdentifier: "installation-b",
+                replicaBindingGenerationIdentifier: bindingB
+            ),
+        ])
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier =
+            "combined-journal-identity-\(UUID().uuidString)"
+        configuration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration],
+            mutationJournalIdentityProvider: { identities.next() }
+        )
+        let realm = try await Realm(
+            configuration: configuration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let object = BigSyncTrackedObject(
+            id: "combined-journal-identity",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+
+        try await realm.asyncWrite {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className()
+            + ".combined-journal-identity"
+        let firstMutation = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(identities.invocationCount, 1)
+        XCTAssertEqual(
+            firstMutation.replicaBindingGenerationIdentifier,
+            bindingA
+        )
+        XCTAssertTrue(firstMutation.generation.hasPrefix(
+            "installation:installation-a:binding:\(bindingA):"
+        ))
+
+        try await realm.asyncWrite {
+            object.tags.append("second-mutation")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let secondMutation = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(identities.invocationCount, 2)
+        XCTAssertEqual(
+            secondMutation.replicaBindingGenerationIdentifier,
+            bindingB
+        )
+        XCTAssertTrue(secondMutation.generation.hasPrefix(
+            "installation:installation-b:binding:\(bindingB):"
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testBoundUploadAcknowledgesPreparedGenerationAndForwardsNewerEdit()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let binding = String(repeating: "f", count: 64)
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: "same-binding-installation",
+                    replicaBindingGenerationIdentifier: binding
+                )
+            }
+        )
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: binding,
+            acceptsLegacyUnboundMutations: false
+        )
+        let object = BigSyncTrackedObject(
+            id: "same-binding-newer-edit",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className()
+            + ".same-binding-newer-edit"
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        let firstBatch = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 1,
+            restrictedToEntityType: nil
+        )
+        let first = try XCTUnwrap(firstBatch.first)
+        let firstGeneration = try XCTUnwrap(first.generation)
+
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("newer-edit")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let secondGeneration = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.generation)
+        XCTAssertNotEqual(secondGeneration, firstGeneration)
+
+        try await fixture.adapter.didUpload(
+            savedRecords: [first.record],
+            matchingGenerations: [recordName: firstGeneration]
+        )
+
+        XCTAssertEqual(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.generation, secondGeneration)
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(tracking.pendingGeneration, secondGeneration)
+        XCTAssertEqual(
+            tracking.pendingReplicaBindingGenerationIdentifier,
+            binding
+        )
+        let secondBatch = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 1,
+            restrictedToEntityType: nil
+        )
+        XCTAssertEqual(secondBatch.map(\.generation), [secondGeneration])
+    }
+
+    @BigSyncBackgroundActor
+    func testReplicaBindingRotationFencesDeletionPreparationAndOldAck()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let bindingA = String(repeating: "1", count: 64)
+        let bindingB = String(repeating: "2", count: 64)
+        let policy = BigSyncMutationPolicy(excludedClassNames: [])
+        policy.install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier:
+                        "deletion-binding-installation",
+                    replicaBindingGenerationIdentifier: bindingA
+                )
+            }
+        )
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: bindingA,
+            acceptsLegacyUnboundMutations: false
+        )
+
+        let object = BigSyncTrackedObject(
+            id: "binding-deletion",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        object.isDeleted = true
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className()
+            + ".binding-deletion"
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        let firstGeneration = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.generation)
+        let firstDeletions = try await fixture.adapter
+            .preparedRecordDeletions(
+                limit: 10,
+                restrictedToEntityType: nil
+            )
+        XCTAssertEqual(firstDeletions.map(\.generation), [firstGeneration])
+
+        policy.install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier:
+                        "deletion-binding-installation",
+                    replicaBindingGenerationIdentifier: bindingB
+                )
+            }
+        )
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: bindingB,
+            acceptsLegacyUnboundMutations: false
+        )
+        let staleBindingDeletions = try await fixture.adapter
+            .preparedRecordDeletions(
+                limit: 10,
+                restrictedToEntityType: nil
+            )
+        XCTAssertTrue(staleBindingDeletions.isEmpty)
+
+        try await fixture.targetRealm.asyncWrite {
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let secondGeneration = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.generation)
+        XCTAssertNotEqual(secondGeneration, firstGeneration)
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+
+        try await fixture.adapter.didDelete(
+            recordIDs: firstDeletions.map(\.recordID),
+            matchingGenerations: [recordName: firstGeneration]
+        )
+        XCTAssertEqual(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.generation, secondGeneration)
+
+        let secondDeletions = try await fixture.adapter
+            .preparedRecordDeletions(
+                limit: 10,
+                restrictedToEntityType: nil
+            )
+        XCTAssertEqual(secondDeletions.map(\.generation), [secondGeneration])
+        try await fixture.adapter.didDelete(
+            recordIDs: secondDeletions.map(\.recordID),
+            matchingGenerations: [recordName: secondGeneration]
+        )
+        XCTAssertNil(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertNil(tracking.pendingGeneration)
+        XCTAssertNil(
+            tracking.pendingReplicaBindingGenerationIdentifier
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testStalePriorityBindingDoesNotStarveCurrentUnprioritizedWork()
+    async throws {
+        let priorityType = BigSyncTrackedObject.className()
+        let fixture = try await makeRealmAdapterFixture(
+            priorityEntityTypeNames: [priorityType]
+        )
+        let activeBinding = String(repeating: "c", count: 64)
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: "priority-binding-installation",
+                    replicaBindingGenerationIdentifier: activeBinding
+                )
+            }
+        )
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: activeBinding,
+            acceptsLegacyUnboundMutations: false
+        )
+
+        let current = BigSyncSemanticallyValidatedObject()
+        current.id = "current-unprioritized"
+        current.semanticValue = "valid"
+        current.immutableNonce = "nonce"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(current)
+            current.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+
+        let stale = SyncedEntity(
+            entityType: priorityType,
+            identifier: priorityType + ".stale-priority",
+            state: SyncedEntityState.new.rawValue
+        )
+        stale.setPendingMutation(
+            generation: "stale-generation",
+            replicaBindingGenerationIdentifier:
+                String(repeating: "d", count: 64)
+        )
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(stale)
+        }
+        fixture.adapter.updateHasChanges(realm: fixture.persistenceRealm)
+
+        XCTAssertEqual(fixture.adapter.hasChangesCount, 1)
+        let prepared = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 10,
+            restrictedToEntityType: nil
+        )
+        XCTAssertEqual(
+            prepared.map(\.record.recordID.recordName),
+            [
+                BigSyncSemanticallyValidatedObject.className()
+                    + ".current-unprioritized",
+            ]
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testLegacyUnboundMutationIsEligibleOnlyDuringMigrationWindow()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let activeBinding = String(repeating: "e", count: 64)
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: activeBinding,
+            acceptsLegacyUnboundMutations: true
+        )
+        let object = BigSyncTrackedObject(
+            id: "legacy-unbound",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className()
+            + ".legacy-unbound"
+        XCTAssertNil(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.replicaBindingGenerationIdentifier)
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        let legacyUploads = try await fixture.adapter
+            .preparedRecordsToUpload(
+                limit: 10,
+                restrictedToEntityType: nil
+            )
+        XCTAssertEqual(
+            legacyUploads.map(\.record.recordID.recordName),
+            [recordName]
+        )
+
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: activeBinding,
+            acceptsLegacyUnboundMutations: false
+        )
+        let postMigrationUploads = try await fixture.adapter
+            .preparedRecordsToUpload(
+            limit: 10,
+            restrictedToEntityType: nil
+        )
+        XCTAssertTrue(postMigrationUploads.isEmpty)
+        XCTAssertFalse(
+            try fixture.adapter.hasPendingChangesAtTerminalBoundary()
+        )
+        XCTAssertNotNil(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testPendingPortGenerationOwnsSubsequentLocalMutations()
+    async throws {
+        let store = DictionaryKeyValueStore()
+        let key = "pending-port-local-mutations"
+        let installation = "pending-port-installation"
+        let initial = try BigSyncReplicaBindingStateStore.prepare(
+            store: store,
+            key: key,
+            installationIdentifier: installation
+        )
+        _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+            "account-a",
+            store: store,
+            key: key
+        )
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier =
+            "pending-port-local-mutations-\(UUID().uuidString)"
+        configuration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration],
+            mutationJournalIdentityProvider: {
+                guard let binding = try? BigSyncReplicaBindingStateStore.load(
+                    store: store,
+                    key: key
+                ) else { return nil }
+                return BigSyncMutationJournalIdentity(
+                    installationIdentifier: installation,
+                    replicaBindingGenerationIdentifier:
+                        binding.mutationGenerationIdentifier
+                )
+            }
+        )
+        let realm = try await Realm(
+            configuration: configuration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let object = BigSyncTrackedObject(
+            id: "pending-port-local-mutations",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await realm.asyncWrite {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className()
+            + ".pending-port-local-mutations"
+        let prePortGeneration = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+        let prePortGenerationID = prePortGeneration.generation
+        XCTAssertEqual(
+            prePortGeneration.replicaBindingGenerationIdentifier,
+            initial.activeGenerationIdentifier
+        )
+
+        let port = try BigSyncReplicaBindingStateStore.requirePort(
+            sourceAccountScopeIdentifier: "account-a",
+            destinationAccountScopeIdentifier: "account-b",
+            store: store,
+            key: key
+        )
+        try await realm.asyncWrite {
+            object.tags.append("written-while-port-is-pending")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let pendingPortGeneration = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+
+        XCTAssertNotEqual(
+            pendingPortGeneration.generation,
+            prePortGenerationID
+        )
+        XCTAssertEqual(
+            pendingPortGeneration.replicaBindingGenerationIdentifier,
+            port.bindingGenerationIdentifier
+        )
+        XCTAssertTrue(pendingPortGeneration.generation.contains(
+            ":binding:\(port.bindingGenerationIdentifier):"
+        ))
+    }
+
+    func testPendingPortRejectsSemanticallyAlteredBindingGeneration()
+    throws {
+        let store = DictionaryKeyValueStore()
+        let key = "pending-port-corrupt-generation"
+        _ = try BigSyncReplicaBindingStateStore.prepare(
+            store: store,
+            key: key,
+            installationIdentifier: "pending-port-installation"
+        )
+        _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+            "account-a",
+            store: store,
+            key: key
+        )
+        _ = try BigSyncReplicaBindingStateStore.requirePort(
+            sourceAccountScopeIdentifier: "account-a",
+            destinationAccountScopeIdentifier: "account-b",
+            store: store,
+            key: key
+        )
+
+        var persisted = try XCTUnwrap(
+            store.object(forKey: key) as? [String: Any]
+        )
+        persisted["pendingBindingGenerationIdentifier"] =
+            String(repeating: "0", count: 64)
+        store.set(value: persisted, forKey: key)
+
+        XCTAssertThrowsError(
+            try BigSyncReplicaBindingStateStore.load(
+                store: store,
+                key: key
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? BigSyncReplicaBindingError,
+                .corrupt
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRestoreRotatesReplicaBindingAndNewMutationUsesIt()
+    async throws {
+        let store = DictionaryKeyValueStore()
+        let key = "replica-binding-restore"
+        let first = try BigSyncReplicaBindingStateStore.prepare(
+            store: store,
+            key: key,
+            installationIdentifier: "installation-before-restore"
+        )
+        _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+            "account-before-restore",
+            store: store,
+            key: key
+        )
+        let restored = try BigSyncReplicaBindingStateStore.prepare(
+            store: store,
+            key: key,
+            installationIdentifier: "installation-after-restore"
+        )
+        XCTAssertNotEqual(
+            restored.activeGenerationIdentifier,
+            first.activeGenerationIdentifier
+        )
+        XCTAssertNil(restored.activeAccountScopeIdentifier)
+        XCTAssertNil(restored.pendingPort)
+        XCTAssertFalse(restored.acceptsLegacyUnboundMutations)
+
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier =
+            "restored-binding-journal-\(UUID().uuidString)"
+        configuration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: "installation-after-restore",
+                    replicaBindingGenerationIdentifier:
+                        restored.activeGenerationIdentifier
+                )
+            }
+        )
+        let realm = try await Realm(
+            configuration: configuration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let object = BigSyncTrackedObject(
+            id: "post-restore-mutation",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await realm.asyncWrite {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let mutation = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: BigSyncTrackedObject.className()
+                + ".post-restore-mutation"
+        ))
+        XCTAssertEqual(
+            mutation.replicaBindingGenerationIdentifier,
+            restored.activeGenerationIdentifier
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testInboundRecordWithForeignAccountScopeIsRejected()
     async throws {
         let fixture = try await makeRealmAdapterFixture(
@@ -1097,7 +3833,7 @@ final class BigSyncKitTests: XCTestCase {
             "account-b" as CKRecordValue
 
         do {
-            try await fixture.adapter.saveChanges(
+            _ = try await fixture.adapter.saveChanges(
                 in: [record],
                 forceSave: false
             )
@@ -1277,6 +4013,40 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    func testInterruptedDurableOperationRetriesWrappedPOSIXError() throws {
+        var attempts = 0
+        let value: String = try bigSyncRetryingInterruptedOperation {
+            attempts += 1
+            if attempts < 3 {
+                throw NSError(
+                    domain: NSCocoaErrorDomain,
+                    code: CocoaError.fileWriteUnknown.rawValue,
+                    userInfo: [
+                        NSUnderlyingErrorKey: NSError(
+                            domain: NSPOSIXErrorDomain,
+                            code: Int(EINTR)
+                        )
+                    ]
+                )
+            }
+            return "durable"
+        }
+
+        XCTAssertEqual(value, "durable")
+        XCTAssertEqual(attempts, 3)
+    }
+
+    func testInterruptedDurableOperationDoesNotRetryOtherFailures() {
+        var attempts = 0
+        XCTAssertThrowsError(
+            try bigSyncRetryingInterruptedOperation {
+                attempts += 1
+                throw POSIXError(.EIO)
+            }
+        )
+        XCTAssertEqual(attempts, 1)
+    }
+
     func testFileKeyValueStoreReloadsPeerWritesAndMergesIndependentMutations() {
         let fileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
@@ -1303,6 +4073,46 @@ final class BigSyncKitTests: XCTestCase {
                 index
             )
         }
+    }
+
+    func testFileKeyValueStoreRejoinsLockDomainAfterExternalReplacement()
+    throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-\(UUID().uuidString)")
+        let fileURL = rootURL.appendingPathComponent("state.plist")
+        let firstStore = FileKeyValueStore(fileURL: fileURL)
+        let secondStore = FileKeyValueStore(fileURL: fileURL)
+        firstStore.set(value: "initial", forKey: "initial")
+
+        let lockURL = fileURL.appendingPathExtension("lock")
+        let displacedLockURL = rootURL.appendingPathComponent(
+            "displaced-state.plist.lock"
+        )
+        try FileManager.default.moveItem(
+            at: lockURL,
+            to: displacedLockURL
+        )
+        try Data().write(to: lockURL)
+
+        // Both live stores still hold the displaced inode. Each must detect
+        // the path replacement after flock, reopen the current lock file, and
+        // preserve the peer's independent mutation.
+        firstStore.set(value: "first", forKey: "first")
+        secondStore.set(value: "second", forKey: "second")
+
+        let reopenedStore = FileKeyValueStore(fileURL: fileURL)
+        XCTAssertEqual(
+            reopenedStore.object(forKey: "initial") as? String,
+            "initial"
+        )
+        XCTAssertEqual(
+            reopenedStore.object(forKey: "first") as? String,
+            "first"
+        )
+        XCTAssertEqual(
+            reopenedStore.object(forKey: "second") as? String,
+            "second"
+        )
     }
 
     func testFileKeyValueStoreFailsClosedForMalformedExistingPlist() throws {
@@ -1625,8 +4435,11 @@ final class BigSyncKitTests: XCTestCase {
         record["isDeleted"] = false as CKRecordValue
         record["initialCloudKitSyncEligible"] = true as CKRecordValue
         record["cloudKitAccountScopeIdentifier"] = "" as CKRecordValue
+        record["ordinaryScalarInteger"] = NSNumber(value: Int64(0))
+        record["scalarInteger"] = BigSyncStringEncodedIntegerCodec.encode(0)
+            as CKRecordValue
 
-        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
         let audit = try await fixture.adapter.auditSynchronizationState(
             serverRecords: [record]
         )
@@ -1799,7 +4612,7 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         do {
-            try await fixture.adapter.saveChanges(
+            _ = try await fixture.adapter.saveChanges(
                 in: [record],
                 forceSave: true
             )
@@ -1820,6 +4633,37 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertTrue(
             fixture.targetRealm.objects(BigSyncTrackedObject.self).isEmpty
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedInboundDeletionPrimaryKeyFailsWithoutPublishingTrackingState()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let entityType = BigSyncIntegerKeyedObject.className()
+        let malformedRecordName = entityType + ".not-an-integer"
+        let recordID = CKRecord.ID(
+            recordName: malformedRecordName,
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        do {
+            _ = try await fixture.adapter.deleteRecords(with: [recordID])
+            XCTFail("Expected the malformed deletion identifier to fail")
+        } catch RealmSwiftAdapterError.malformedRecordIdentifier(
+            let recordName,
+            let reportedEntityType
+        ) {
+            XCTAssertEqual(recordName, malformedRecordName)
+            XCTAssertEqual(reportedEntityType, entityType)
+        }
+
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: malformedRecordName
+        ))
+        XCTAssertTrue(
+            fixture.targetRealm.objects(BigSyncIntegerKeyedObject.self).isEmpty
         )
     }
 
@@ -1852,7 +4696,7 @@ final class BigSyncKitTests: XCTestCase {
             zoneID: adapter.recordZoneID
         )
 
-        try await adapter.saveChanges(in: [record], forceSave: true)
+        _ = try await adapter.saveChanges(in: [record], forceSave: true)
 
         let targetRealm = try XCTUnwrap(
             adapter.realmProvider?.targetReaderRealms?.first
@@ -2197,7 +5041,7 @@ final class BigSyncKitTests: XCTestCase {
         record["payload"] = CKAsset(fileURL: missingURL)
 
         do {
-            try await fixture.adapter.saveChanges(
+            _ = try await fixture.adapter.saveChanges(
                 in: [record],
                 forceSave: true
             )
@@ -2298,14 +5142,146 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testTerminalNotificationReentrancyStartsAnIndependentDrain() async {
-        let synchronizer = makeSynchronizer()
+    func testBlockedDomainPublicationWithholdsTerminalReceipt() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "blocked-publication"),
+            priorities: []
+        ))
+        synchronizer.domainPrepublicationHandler = { context in
+            XCTAssertTrue(synchronizer.syncing)
+            XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+            XCTAssertNotNil(synchronizer.activeRunContext)
+            XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
+            return [.init(code: "test-blocker")]
+        }
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        await synchronizer.changesFinishedSynchronizing()
+        let result = try await synchronization.value
+
+        XCTAssertNil(result.receipt)
+        XCTAssertEqual(
+            result.publicationState,
+            .blocked([.init(code: "test-blocker")])
+        )
+        XCTAssertFalse(synchronizer.syncing)
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+    }
+
+    @BigSyncBackgroundActor
+    func testPrepublicationMutationDrainsBeforeBlockedPublication()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "blocked-after-tail-drain"),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.domainPrepublicationHandler = { _ in
+            adapter.domainHookInvocationCount += 1
+            if adapter.domainHookInvocationCount == 1 {
+                adapter.terminalPendingChanges = true
+            }
+            return [.init(code: "domain-blocker")]
+        }
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let firstAttemptID = synchronizer.synchronizationAttemptID
+
+        await synchronizer.changesFinishedSynchronizing()
+
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        XCTAssertNotEqual(
+            synchronizer.synchronizationAttemptID,
+            firstAttemptID
+        )
+        XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
+
+        for _ in 0..<1_000 where synchronizer.activeRunContext?.attemptID
+                != synchronizer.synchronizationAttemptID {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertEqual(
+            synchronizer.activeRunContext?.attemptID,
+            synchronizer.synchronizationAttemptID
+        )
+
+        adapter.terminalPendingChanges = false
+        await synchronizer.changesFinishedSynchronizing()
+        let result = try await synchronization.value
+
+        XCTAssertEqual(adapter.domainHookInvocationCount, 2)
+        XCTAssertNil(result.receipt)
+        XCTAssertEqual(
+            result.publicationState,
+            .blocked([.init(code: "domain-blocker")])
+        )
+        XCTAssertFalse(synchronizer.syncing)
+    }
+
+    @BigSyncBackgroundActor
+    func testPublicationCombinesDomainAndAdapterBlockers() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "combined-blockers"),
+            priorities: []
+        )
+        adapter.semanticBlockers = [.init(code: "adapter-blocker")]
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.domainPrepublicationHandler = { _ in
+            [.init(code: "domain-blocker")]
+        }
+        let synchronization = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        await synchronizer.changesFinishedSynchronizing()
+        let result = try await synchronization.value
+
+        XCTAssertNil(result.receipt)
+        XCTAssertEqual(
+            result.publicationState,
+            .blocked([
+                .init(code: "domain-blocker"),
+                .init(code: "adapter-blocker"),
+            ])
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalNotificationReentrancyStartsAnIndependentDrain() async
+    throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
         synchronizer.addModelAdapter(FakeModelAdapter(
             zoneID: CKRecordZone.ID(zoneName: "terminal-reentrancy"),
             priorities: []
         ))
-        synchronizer.syncing = true
-        synchronizer.synchronizationDrainIsActive = true
+        synchronizer.beginSynchronization()
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNotNil(synchronizer.activeRunContext)
         let firstAttemptID = synchronizer.synchronizationAttemptID
         let observation = TerminalCallbackObservation(synchronizer: synchronizer)
         NotificationCenter.default.addObserver(
@@ -2426,6 +5402,37 @@ final class BigSyncKitTests: XCTestCase {
         await synchronizer.cancelSynchronizationAndWait()
     }
 
+    @BigSyncBackgroundActor
+    func testPendingDatasetPortDoesNotStartDoomedTailDrain() async {
+        let synchronizer = makeSynchronizer()
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "pending-port-tail"),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(adapter)
+        adapter.didFinishImportHandler = { [weak adapter] in
+            await adapter?.modelAdapterDelegate?.hasChangesToUpload()
+        }
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+        let failedAttemptID = synchronizer.synchronizationAttemptID
+        let requirement = BigSyncCloudAccountPortRequirement(
+            transitionID: UUID(),
+            bindingGenerationIdentifier: String(repeating: "f", count: 64),
+            sourceAccountScopeIdentifier: "account-a",
+            destinationAccountScopeIdentifier: "account-b",
+            detectedAt: Date()
+        )
+
+        await synchronizer.failSynchronization(
+            error: BigSyncCloudAccountPortError.required(requirement)
+        )
+
+        XCTAssertEqual(synchronizer.synchronizationAttemptID, failedAttemptID)
+        XCTAssertFalse(synchronizer.syncing)
+        XCTAssertFalse(synchronizer.synchronizationRequestedWhileRunning)
+    }
+
     func testCloudKitRetryBackoffNeverUndercutsServerRetryAfter() {
         XCTAssertEqual(
             CloudKitRetryBackoff.delay(
@@ -2533,6 +5540,12 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.syncing = true
         synchronizer.synchronizationDrainIsActive = true
         synchronizer.consecutiveTransientCloudKitFailures = 4
+        synchronizer.activeRunContext = CloudKitSynchronizer.RunContext(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "test-account",
+            accountScopeIdentifier: "test-account-scope"
+        )
 
         await synchronizer.changesFinishedSynchronizing()
 
@@ -3222,6 +6235,133 @@ final class BigSyncKitTests: XCTestCase {
             namespace: restored.durableStateNamespace,
             sharedSentinelBaseURL: restoredBase
         ))
+    }
+
+    @BigSyncBackgroundActor
+    func testBackupDetectionRetryInvalidatesAuthorityBeforeCloudKitWork()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let store = DictionaryKeyValueStore()
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let identifier = "restore-retry-authority-\(UUID().uuidString)"
+        let installedBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let restoredBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+
+        let installed = makeSynchronizer(
+            database: database,
+            keyValueStore: store,
+            identifier: identifier,
+            recordZoneID: fixture.adapter.recordZoneID,
+            backupDetectionBaseURL: installedBase
+        )
+        try await installed._test_validateSynchronizationAccount()
+        let copiedLease = try XCTUnwrap(installed.accountScopeLease())
+        let installedSentinel = BackupDetection.defaultSentinelURL(
+            namespace: installed.durableStateNamespace,
+            sharedBaseURL: installedBase
+        )
+        let restoredSentinel = BackupDetection.defaultSentinelURL(
+            namespace: installed.durableStateNamespace,
+            sharedBaseURL: restoredBase
+        )
+        let restoredMarker = BackupDetection.markerURL(
+            sentinelURL: restoredSentinel
+        )
+        try FileManager.default.createDirectory(
+            at: restoredMarker.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.copyItem(
+            at: BackupDetection.markerURL(sentinelURL: installedSentinel),
+            to: restoredMarker
+        )
+
+        let restored = makeSynchronizer(
+            database: database,
+            keyValueStore: store,
+            identifier: identifier,
+            recordZoneID: fixture.adapter.recordZoneID,
+            backupDetectionBaseURL: restoredBase
+        )
+        // Construction-time restore detection now revokes the copied lease
+        // immediately. A later retry must keep authority unavailable before
+        // entering the application-domain invalidation handler.
+        XCTAssertNil(try restored.accountScopeLease())
+        restored._test_requireBackupDetectionRetry(
+            TestSynchronizationError.backupDetectionFailed
+        )
+        let barrierRecorder = RestoreAuthorityBarrierRecorder(
+            failuresRemaining: 1
+        )
+        restored.accountScopeInvalidationHandler = { reason in
+            let leaseWasInvalidated: Bool
+            do {
+                leaseWasInvalidated = try restored.accountScopeLease() == nil
+            } catch {
+                leaseWasInvalidated = false
+            }
+            let operationCount = database.databaseChangeFetchCount
+                + database.recordZoneChangeFetchCount
+                + database.modifyRecordsOperationCount
+                + database.recordZoneFetchCount
+                + database.savedZoneCount
+                + database.subscriptionFetchCount
+                + database.modifySubscriptionOperationCount
+            try await barrierRecorder.record(
+                reason: reason,
+                leaseWasInvalidated: leaseWasInvalidated,
+                cloudKitOperationCount: operationCount
+            )
+        }
+        restored.addModelAdapter(fixture.adapter)
+
+        do {
+            _ = try await restored.synchronize()
+            XCTFail("Expected restore-domain invalidation to fail closed")
+        } catch TestSynchronizationError.accountScopeInvalidationFailed {
+        }
+        XCTAssertNil(try restored.accountScopeLease())
+        XCTAssertEqual(database.databaseChangeFetchCount, 0)
+        XCTAssertEqual(database.recordZoneChangeFetchCount, 0)
+        XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+        XCTAssertEqual(database.recordZoneFetchCount, 0)
+        XCTAssertEqual(database.savedZoneCount, 0)
+        XCTAssertEqual(database.subscriptionFetchCount, 0)
+        XCTAssertEqual(database.modifySubscriptionOperationCount, 0)
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(
+            namespace: restored.durableStateNamespace,
+            sharedSentinelBaseURL: restoredBase
+        ))
+
+        let result = try await restored.synchronize()
+
+        XCTAssertNotNil(result.receipt)
+        let barrierEvents = await barrierRecorder.snapshot()
+        XCTAssertEqual(
+            barrierEvents,
+            Array(repeating: .init(
+                reason: .restoreDetected,
+                leaseWasInvalidated: true,
+                cloudKitOperationCount: 0
+            ), count: 2)
+        )
+        let freshLease = try XCTUnwrap(restored.accountScopeLease())
+        XCTAssertEqual(
+            freshLease.invalidationGeneration,
+            copiedLease.invalidationGeneration + 1
+        )
+        XCTAssertNoThrow(try restored.validateAccountScopeLease(freshLease))
+        XCTAssertThrowsError(
+            try restored.validateAccountScopeLease(copiedLease)
+        ) { error in
+            XCTAssertEqual(
+                error as? BigSyncAccountScopeLeaseError,
+                .stale
+            )
+        }
     }
 
     @BigSyncBackgroundActor
@@ -4089,11 +7229,158 @@ final class BigSyncKitTests: XCTestCase {
             authorizationID: authorizationID
         )
 
-        let deleted = try await synchronizer.deleteActiveRecordZoneForDisposableClient(
+        try await synchronizer.deleteActiveRecordZoneForDisposableClient(
             using: receipt
         )
-        XCTAssertTrue(deleted)
         XCTAssertEqual(database.deletedZoneIDs, [activeZoneID])
+        XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testDisposableClientTreatsAlreadyMissingZoneAsCompletedCleanup()
+    async throws {
+        for errorCode in [CKError.zoneNotFound, CKError.userDeletedZone] {
+            let database = FakeCloudKitDatabase()
+            database.deleteZoneError = CKError(errorCode)
+            let synchronizer = makeSynchronizer(
+                database: database,
+                accountIdentifierProvider: { database.accountIdentifier }
+            )
+            let activeZoneID = CKRecordZone.ID(
+                zoneName: "disposable-already-missing-\(errorCode.rawValue)"
+            )
+            synchronizer.addModelAdapter(
+                FakeModelAdapter(zoneID: activeZoneID, priorities: [])
+            )
+            let authorizationID = UUID()
+            synchronizer.activeReceiptAuthorizationID = authorizationID
+            let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+                context: .init(
+                    attemptID: UUID(),
+                    runID: UUID(),
+                    accountIdentifier: database.accountIdentifier,
+                    accountScopeIdentifier:
+                        try await synchronizer
+                            .cloudKitAccountScopeIdentifier()
+                ),
+                issuerID: synchronizer.synchronizationReceiptIssuerID,
+                authorizationID: authorizationID
+            )
+
+            try await synchronizer
+                .deleteActiveRecordZoneForDisposableClient(using: receipt)
+
+            XCTAssertEqual(database.deletedZoneIDs, [activeZoneID])
+            XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+            XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDisposableClientRetainsAuthorizationAfterTransientZoneFailure()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        database.deleteZoneError = CKError(.networkFailure)
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let activeZoneID = CKRecordZone.ID(
+            zoneName: "disposable-transient-zone-failure"
+        )
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: activeZoneID, priorities: [])
+        )
+        let authorizationID = UUID()
+        synchronizer.activeReceiptAuthorizationID = authorizationID
+        let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+            context: .init(
+                attemptID: UUID(),
+                runID: UUID(),
+                accountIdentifier: database.accountIdentifier,
+                accountScopeIdentifier:
+                    try await synchronizer.cloudKitAccountScopeIdentifier()
+            ),
+            issuerID: synchronizer.synchronizationReceiptIssuerID,
+            authorizationID: authorizationID
+        )
+
+        do {
+            try await synchronizer
+                .deleteActiveRecordZoneForDisposableClient(using: receipt)
+            XCTFail("Expected transient zone deletion failure")
+        } catch let error as CKError {
+            XCTAssertEqual(error.code, .networkFailure)
+        }
+        XCTAssertEqual(
+            synchronizer.activeReceiptAuthorizationID,
+            authorizationID
+        )
+
+        database.deleteZoneError = nil
+        try await synchronizer
+            .deleteActiveRecordZoneForDisposableClient(using: receipt)
+        XCTAssertEqual(
+            database.deletedZoneIDs,
+            [activeZoneID, activeZoneID]
+        )
+        XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
+    }
+
+    @BigSyncBackgroundActor
+    func testDisposableClientRejectsAccountChangeAfterZoneDeletion()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            accountIdentifierProvider: { database.accountIdentifier }
+        )
+        let activeZoneID = CKRecordZone.ID(
+            zoneName: "disposable-account-change-zone"
+        )
+        synchronizer.addModelAdapter(
+            FakeModelAdapter(zoneID: activeZoneID, priorities: [])
+        )
+        let authorizationID = UUID()
+        synchronizer.activeReceiptAuthorizationID = authorizationID
+        let receipt = CloudKitSynchronizer.SynchronizationReceipt(
+            context: .init(
+                attemptID: UUID(),
+                runID: UUID(),
+                accountIdentifier: database.accountIdentifier,
+                accountScopeIdentifier:
+                    try await synchronizer.cloudKitAccountScopeIdentifier()
+            ),
+            issuerID: synchronizer.synchronizationReceiptIssuerID,
+            authorizationID: authorizationID
+        )
+        database.accountIdentifierAfterNextZoneDeletion = "different-account"
+
+        do {
+            try await synchronizer
+                .deleteActiveRecordZoneForDisposableClient(using: receipt)
+            XCTFail("Expected post-delete account replacement rejection")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+        }
+
+        XCTAssertEqual(database.deletedZoneIDs, [activeZoneID])
+        XCTAssertEqual(
+            synchronizer.activeReceiptAuthorizationID,
+            authorizationID
+        )
+
+        // Returning to the receipt's exact account must make the same
+        // authorization retryable. Success proves the failed attempt released
+        // its in-flight reservation without exposing that private state to the
+        // test target.
+        database.accountIdentifier = receipt.accountIdentifier
+        try await synchronizer
+            .deleteActiveRecordZoneForDisposableClient(using: receipt)
+        XCTAssertEqual(
+            database.deletedZoneIDs,
+            [activeZoneID, activeZoneID]
+        )
+        XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
     }
 
     @BigSyncBackgroundActor
@@ -4135,7 +7422,7 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         do {
-            _ = try await synchronizer.deleteActiveRecordZoneForDisposableClient(
+            try await synchronizer.deleteActiveRecordZoneForDisposableClient(
                 using: wrongReceipt
             )
             XCTFail("Expected foreign receipt rejection")
@@ -4145,7 +7432,7 @@ final class BigSyncKitTests: XCTestCase {
 
         database.accountIdentifier = "different-account"
         do {
-            _ = try await synchronizer.deleteActiveRecordZoneForDisposableClient(
+            try await synchronizer.deleteActiveRecordZoneForDisposableClient(
                 using: receipt
             )
             XCTFail("Expected account replacement rejection")
@@ -4287,8 +7574,11 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.addModelAdapter(adapter)
         try await synchronizer._test_validateSynchronizationAccount()
 
+        let replacementAttemptID = synchronizer.synchronizationAttemptID
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
-        await Task.yield()
+        while synchronizer.synchronizationAttemptID == replacementAttemptID {
+            await Task.yield()
+        }
 
         let validation = Task { @BigSyncBackgroundActor in
             try await synchronizer._test_validateSynchronizationAccount()
@@ -4297,8 +7587,11 @@ final class BigSyncKitTests: XCTestCase {
             await Task.yield()
         }
 
+        let confirmationAttemptID = synchronizer.synchronizationAttemptID
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
-        await Task.yield()
+        while synchronizer.synchronizationAttemptID == confirmationAttemptID {
+            await Task.yield()
+        }
         await releaseConfirmation.open()
 
         do {
@@ -4358,6 +7651,81 @@ final class BigSyncKitTests: XCTestCase {
 
         let availability = await gate.availability(for: "iCloud.test")
         XCTAssertEqual(availability, .available)
+    }
+
+    func testHandledMutationRetryBudgetIsExactPerPreparedGeneration() throws {
+        let zoneID = CKRecordZone.ID(zoneName: "retry-generation-zone")
+        let recordID = CKRecord.ID(
+            recordName: "Bookmark.retry-generation",
+            zoneID: zoneID
+        )
+        let first = PreparedMutationRetryKey(
+            recordID: recordID,
+            generation: "generation-1"
+        )
+        let second = PreparedMutationRetryKey(
+            recordID: recordID,
+            generation: "generation-2"
+        )
+        var budget = HandledMutationRetryBudget()
+
+        try budget.register(
+            first,
+            maximumPerGeneration: 1,
+            maximumPerDrain: 2
+        )
+        XCTAssertThrowsError(try budget.register(
+            first,
+            maximumPerGeneration: 1,
+            maximumPerDrain: 2
+        )) { error in
+            XCTAssertEqual(
+                error as? BigSyncHandledMutationRetryError,
+                .generationBudgetExceeded(first)
+            )
+        }
+
+        try budget.register(
+            second,
+            maximumPerGeneration: 1,
+            maximumPerDrain: 2
+        )
+        XCTAssertEqual(budget.totalAttempts, 2)
+    }
+
+    func testHandledMutationRetryBudgetCapsSuccessiveGenerationsPerDrain()
+    throws {
+        let zoneID = CKRecordZone.ID(zoneName: "retry-drain-zone")
+        let recordID = CKRecord.ID(
+            recordName: "Bookmark.retry-drain",
+            zoneID: zoneID
+        )
+        var budget = HandledMutationRetryBudget()
+
+        for generation in 0..<3 {
+            let key = PreparedMutationRetryKey(
+                recordID: recordID,
+                generation: "generation-\(generation)"
+            )
+            if generation < 2 {
+                try budget.register(
+                    key,
+                    maximumPerGeneration: 1,
+                    maximumPerDrain: 2
+                )
+            } else {
+                XCTAssertThrowsError(try budget.register(
+                    key,
+                    maximumPerGeneration: 1,
+                    maximumPerDrain: 2
+                )) { error in
+                    XCTAssertEqual(
+                        error as? BigSyncHandledMutationRetryError,
+                        .drainBudgetExceeded
+                    )
+                }
+            }
+        }
     }
 
     @BigSyncBackgroundActor
@@ -5391,6 +8759,142 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testExactScalarIntegersUploadAsCanonicalDecimalStrings() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let zero = BigSyncTrackedObject(
+            id: "integer-zero",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        zero.scalarInteger = 0
+        zero.optionalScalarInteger = 0
+        zero.ordinaryScalarInteger = 0
+        let one = BigSyncTrackedObject(
+            id: "integer-one",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        one.scalarInteger = 1
+        one.optionalScalarInteger = 1
+        one.ordinaryScalarInteger = 1
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add([zero, one])
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        for expected in [zero.id: Int64(0), one.id: Int64(1)] {
+            let recordName = BigSyncTrackedObject.className() + "." + expected.key
+            let record = try XCTUnwrap(batch.records.first {
+                $0.recordID.recordName == recordName
+            })
+            XCTAssertEqual(
+                record["scalarInteger"] as? String,
+                String(expected.value)
+            )
+            XCTAssertEqual(
+                record["optionalScalarInteger"] as? String,
+                String(expected.value)
+            )
+            let ordinaryNumber = try XCTUnwrap(
+                record["ordinaryScalarInteger"] as? NSNumber
+            )
+            XCTAssertEqual(ordinaryNumber.int64Value, expected.value)
+            XCTAssertNotEqual(
+                CFGetTypeID(ordinaryNumber),
+                CFBooleanGetTypeID()
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testExactScalarIntegerDownloadRequiresCanonicalDecimalStrings()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "integer-download",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        let scalarProperty = try XCTUnwrap(
+            object.objectSchema.properties.first {
+                $0.name == "scalarInteger"
+            }
+        )
+        let optionalProperty = try XCTUnwrap(
+            object.objectSchema.properties.first {
+                $0.name == "optionalScalarInteger"
+            }
+        )
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        record["scalarInteger"] = "-7" as CKRecordValue
+        record["optionalScalarInteger"] = "1" as CKRecordValue
+
+        try await fixture.targetRealm.asyncWrite {
+            try fixture.adapter.applyChange(
+                property: scalarProperty,
+                record: record,
+                object: object,
+                syncedEntityIdentifier: record.recordID.recordName
+            )
+            try fixture.adapter.applyChange(
+                property: optionalProperty,
+                record: record,
+                object: object,
+                syncedEntityIdentifier: record.recordID.recordName
+            )
+        }
+        XCTAssertEqual(object.scalarInteger, -7)
+        XCTAssertEqual(object.optionalScalarInteger, 1)
+
+        for malformed in ["01", "+1", "-0", " 1", "1 "] {
+            record["scalarInteger"] = malformed as CKRecordValue
+            do {
+                try await fixture.targetRealm.asyncWrite {
+                    try fixture.adapter.applyChange(
+                        property: scalarProperty,
+                        record: record,
+                        object: object,
+                        syncedEntityIdentifier: record.recordID.recordName
+                    )
+                }
+                XCTFail("Expected \(malformed) to be rejected")
+            } catch is RealmSwiftRemoteRecordDecodingError {
+                // Expected.
+            }
+            XCTAssertEqual(object.scalarInteger, -7)
+        }
+
+        record["scalarInteger"] = 1 as CKRecordValue
+        do {
+            try await fixture.targetRealm.asyncWrite {
+                try fixture.adapter.applyChange(
+                    property: scalarProperty,
+                    record: record,
+                    object: object,
+                    syncedEntityIdentifier: record.recordID.recordName
+                )
+            }
+            XCTFail("Expected a numeric CloudKit field to be rejected")
+        } catch is RealmSwiftRemoteRecordDecodingError {
+            // Expected.
+        }
+        XCTAssertEqual(object.scalarInteger, -7)
+    }
+
+    @BigSyncBackgroundActor
     func testRemoteMapRequiresACompleteValidPayload() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let object = BigSyncTrackedObject(
@@ -5498,7 +9002,7 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         do {
-            try await fixture.adapter.saveChanges(
+            _ = try await fixture.adapter.saveChanges(
                 in: [validRecord, malformedRecord],
                 forceSave: true
             )
@@ -5524,7 +9028,7 @@ final class BigSyncKitTests: XCTestCase {
             format: .binary,
             options: 0
         ) as CKRecordValue
-        try await fixture.adapter.saveChanges(
+        _ = try await fixture.adapter.saveChanges(
             in: [validRecord, malformedRecord],
             forceSave: true
         )
@@ -5572,7 +9076,7 @@ final class BigSyncKitTests: XCTestCase {
         }
 
         do {
-            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
             XCTFail("Expected interruption after target publication")
         } catch is CancellationError {
             // Expected.
@@ -5602,7 +9106,7 @@ final class BigSyncKitTests: XCTestCase {
         // CloudKit has not advanced its token, so the same record is
         // redelivered. Even though the target now matches, cache finalization
         // must run and publish the system fields.
-        try await fixture.adapter.saveChanges(in: [record], forceSave: false)
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: false)
         XCTAssertNotNil(
             fixture.persistenceRealm.object(
                 ofType: SyncedEntity.self,
@@ -5671,7 +9175,7 @@ final class BigSyncKitTests: XCTestCase {
         record["tags"] = [42] as CKRecordValue
 
         do {
-            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
             XCTFail("Expected malformed collection decoding to fail")
         } catch is RealmSwiftRemoteRecordDecodingError {
             // Expected.
@@ -5709,7 +9213,7 @@ final class BigSyncKitTests: XCTestCase {
         record["initialCloudKitSyncEligible"] = "not-a-boolean" as CKRecordValue
 
         do {
-            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
             XCTFail("Expected malformed scalar decoding to fail")
         } catch is RealmSwiftRemoteRecordDecodingError {
             // Expected.
@@ -5745,7 +9249,7 @@ final class BigSyncKitTests: XCTestCase {
         record["children"] = ["not-a-cloudkit-record-name"] as CKRecordValue
 
         do {
-            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
             XCTFail("Expected malformed relationship decoding to fail")
         } catch is RealmSwiftRemoteRecordDecodingError {
             // Expected.
@@ -5872,7 +9376,7 @@ final class BigSyncKitTests: XCTestCase {
         record[field] = value
 
         do {
-            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
             XCTFail("Expected invalid relationship reference to fail")
         } catch is RealmSwiftRemoteRecordDecodingError {
             // Expected.
@@ -5967,7 +9471,7 @@ final class BigSyncKitTests: XCTestCase {
         record["explicitlyModifiedAt"] =
             Date().addingTimeInterval(60) as CKRecordValue
 
-        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
         try await fixture.adapter.persistImportedChanges()
         await fixture.targetRealm.asyncRefresh()
 
@@ -6489,7 +9993,7 @@ final class BigSyncKitTests: XCTestCase {
             object.tags.append("offline-edit")
             object.refreshChangeMetadata(explicitlyModified: true)
         }
-        try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
+        _ = try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
         await fixture.targetRealm.asyncRefresh()
 
         XCTAssertFalse(object.isDeleted)
@@ -6544,7 +10048,7 @@ final class BigSyncKitTests: XCTestCase {
             )
         )
 
-        try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
+        _ = try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
 
         let tracking = try XCTUnwrap(
             fixture.persistenceRealm.object(
@@ -6606,7 +10110,7 @@ final class BigSyncKitTests: XCTestCase {
             }
         }
 
-        try await fixture.adapter.saveChanges(
+        let results = try await fixture.adapter.saveChanges(
             in: [remoteRecord],
             forceSave: true
         )
@@ -6620,6 +10124,10 @@ final class BigSyncKitTests: XCTestCase {
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
             )
+        )
+        XCTAssertEqual(
+            results.map(\.disposition),
+            [.preservedPendingLocal(generation: mutation.generation)]
         )
         _ = try await fixture.adapter._test_forwardPendingMutations(
             in: fixture.targetRealm
@@ -6677,7 +10185,10 @@ final class BigSyncKitTests: XCTestCase {
             )
         }
 
-        try await fixture.adapter.saveChanges(in: [remoteRecord], forceSave: true)
+        let results = try await fixture.adapter.saveChanges(
+            in: [remoteRecord],
+            forceSave: true
+        )
 
         let recordName = BigSyncTrackedObject.className() + "." + object.id
         let mutation = try XCTUnwrap(
@@ -6685,6 +10196,10 @@ final class BigSyncKitTests: XCTestCase {
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
             )
+        )
+        XCTAssertEqual(
+            results.map(\.disposition),
+            [.preservedPendingLocal(generation: mutation.generation)]
         )
         let tracking = try XCTUnwrap(
             fixture.persistenceRealm.object(
@@ -6729,7 +10244,7 @@ final class BigSyncKitTests: XCTestCase {
             throw TestSynchronizationError.importedPersistenceCacheFailed
         }
         do {
-            try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
             XCTFail("Expected persistence-cache publication to fail")
         } catch TestSynchronizationError.importedPersistenceCacheFailed {
             // Expected. The target Realm has already committed, but no
@@ -6745,7 +10260,7 @@ final class BigSyncKitTests: XCTestCase {
             )
         )
 
-        try await fixture.adapter.saveChanges(in: [record], forceSave: false)
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: false)
 
         let tracking = try XCTUnwrap(
             fixture.persistenceRealm.object(
@@ -6785,7 +10300,9 @@ final class BigSyncKitTests: XCTestCase {
                 object.refreshChangeMetadata(explicitlyModified: true)
             }
         }
-        try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
+        let results = try await fixture.adapter.deleteRecords(
+            with: [uploaded.recordID]
+        )
         await fixture.targetRealm.asyncRefresh()
 
         XCTAssertFalse(object.isDeleted)
@@ -6795,6 +10312,10 @@ final class BigSyncKitTests: XCTestCase {
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: uploaded.recordID.recordName
             )
+        )
+        XCTAssertEqual(
+            results.map(\.disposition),
+            [.preservedNewerLive(generation: mutation.generation)]
         )
         let tracking = try XCTUnwrap(
             fixture.persistenceRealm.object(
@@ -6828,7 +10349,7 @@ final class BigSyncKitTests: XCTestCase {
             [uploaded],
             from: uploadBatch
         )
-        try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
+        _ = try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
         XCTAssertTrue(object.isDeleted)
 
         fixture.adapter._testBeforeCleanupTargetWrite = {
@@ -6887,7 +10408,7 @@ final class BigSyncKitTests: XCTestCase {
             )
         )
 
-        try await fixture.adapter.deleteRecords(
+        _ = try await fixture.adapter.deleteRecords(
             with: [
                 CKRecord.ID(
                     recordName: recordName,
@@ -6909,6 +10430,77 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: recordName
             )?.entityState,
             .deletedRemotely
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testLiveRecordAfterDurableRemoteDeletionCancelsCleanupAndRecreatesTarget()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let originalDate = Date(timeIntervalSinceReferenceDate: 15_000)
+        let object = BigSyncTrackedObject(
+            id: "remote-recreation",
+            createdAt: originalDate,
+            modifiedAt: originalDate,
+            explicitlyModifiedAt: originalDate
+        )
+        object.tags.append("original")
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let upload = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        let uploaded = try XCTUnwrap(upload.records.first)
+        try await fixture.adapter.acknowledgeUploadedRecords(
+            [uploaded],
+            from: upload
+        )
+
+        // The deletion and recreation are deliberately separate adapter calls:
+        // the first call represents a committed change-feed page and the
+        // durable `.deletedRemotely` state that survives process death.
+        _ = try await fixture.adapter.deleteRecords(with: [uploaded.recordID])
+        XCTAssertTrue(object.isDeleted)
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: uploaded.recordID.recordName
+            )?.entityState,
+            .deletedRemotely
+        )
+
+        let recreatedDate = originalDate.addingTimeInterval(60)
+        let recreated = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        recreated["createdAt"] = recreatedDate as CKRecordValue
+        recreated["modifiedAt"] = recreatedDate as CKRecordValue
+        recreated["explicitlyModifiedAt"] = recreatedDate as CKRecordValue
+        recreated["isDeleted"] = false as CKRecordValue
+        recreated["tags"] = ["recreated"] as CKRecordValue
+
+        _ = try await fixture.adapter.saveChanges(in: [recreated], forceSave: true)
+        try await fixture.adapter.cleanUp()
+        await fixture.targetRealm.asyncRefresh()
+
+        let restored = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncTrackedObject.self,
+                forPrimaryKey: object.id
+            )
+        )
+        XCTAssertFalse(restored.isDeleted)
+        XCTAssertEqual(Array(restored.tags), ["recreated"])
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recreated.recordID.recordName
+            )?.entityState,
+            .synced
         )
     }
 
@@ -6953,7 +10545,7 @@ final class BigSyncKitTests: XCTestCase {
         record["explicitlyModifiedAt"] =
             Date().addingTimeInterval(60) as CKRecordValue
 
-        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
         try await fixture.adapter.persistImportedChanges()
         await fixture.targetRealm.asyncRefresh()
 
@@ -7006,7 +10598,7 @@ final class BigSyncKitTests: XCTestCase {
         record["explicitlyModifiedAt"] =
             Date().addingTimeInterval(60) as CKRecordValue
 
-        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
         try await fixture.adapter.persistImportedChanges()
         await fixture.targetRealm.asyncRefresh()
         XCTAssertEqual(
@@ -7075,7 +10667,7 @@ final class BigSyncKitTests: XCTestCase {
         record["modifiedAt"] = remoteDate as CKRecordValue
         record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
 
-        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
         try await fixture.adapter.persistImportedChanges()
         XCTAssertEqual(
             fixture.persistenceRealm.objects(PendingRelationship.self).count,
@@ -7129,7 +10721,7 @@ final class BigSyncKitTests: XCTestCase {
         relationshipRecord["modifiedAt"] = remoteDate as CKRecordValue
         relationshipRecord["explicitlyModifiedAt"] = remoteDate as CKRecordValue
 
-        try await fixture.adapter.saveChanges(
+        _ = try await fixture.adapter.saveChanges(
             in: [relationshipRecord],
             forceSave: true
         )
@@ -7149,9 +10741,17 @@ final class BigSyncKitTests: XCTestCase {
         )
         clearedRecord["modifiedAt"] = remoteDate as CKRecordValue
         clearedRecord["explicitlyModifiedAt"] = remoteDate as CKRecordValue
-        try await fixture.adapter.saveChanges(
+        let clearedResults = try await fixture.adapter.saveChanges(
             in: [clearedRecord],
             forceSave: true
+        )
+        XCTAssertEqual(
+            clearedResults.map(\.disposition),
+            [.deferred(relationshipCount: 3)]
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self).count,
+            3
         )
         try await fixture.adapter.persistImportedChanges()
         XCTAssertTrue(parent.children.isEmpty)
@@ -7196,7 +10796,7 @@ final class BigSyncKitTests: XCTestCase {
         record["explicitlyModifiedAt"] =
             Date().addingTimeInterval(60) as CKRecordValue
 
-        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
         try await fixture.adapter.persistImportedChanges()
         try await fixture.persistenceRealm.asyncWrite {
             let alreadyOrphaned = PendingRelationship()
@@ -7210,7 +10810,7 @@ final class BigSyncKitTests: XCTestCase {
             2
         )
 
-        try await fixture.adapter.deleteRecords(with: [record.recordID])
+        _ = try await fixture.adapter.deleteRecords(with: [record.recordID])
         try await fixture.adapter.cleanUp()
         await fixture.targetRealm.asyncRefresh()
 
@@ -8067,6 +11667,25 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testChangeFeedEstablishedEvidenceSurvivesMissingCachedSystemFields()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let established = SyncedEntity(
+            entityType: BigSyncTrackedObject.className(),
+            identifier: "established-without-system-fields",
+            state: SyncedEntityState.synced.rawValue
+        )
+        established.encodedRecord = Data("corrupt-system-fields".utf8)
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(established)
+        }
+
+        let hasEstablishedEvidence = try await fixture.adapter
+            .hasChangeFeedEstablishedServerEvidence()
+        XCTAssertTrue(hasEstablishedEvidence)
+    }
+
+    @BigSyncBackgroundActor
     func testAsyncChangeFeedConsumesEveryDatabaseAndZonePageBeforeReceipt()
     async throws {
         let database = FakeCloudKitDatabase()
@@ -8093,11 +11712,19 @@ final class BigSyncKitTests: XCTestCase {
         ]
         let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
         let synchronizer = makeSynchronizer(database: database)
+        let boundaryEvents = SynchronizationBoundaryEventRecorder()
+        synchronizer.synchronizationWillConsumeServerChangesHandler = {
+            context in
+            await boundaryEvents.recordWillConsume(context)
+        }
+        adapter.saveChangesHandler = {
+            await boundaryEvents.recordImport()
+        }
         synchronizer.addModelAdapter(adapter)
 
         let result = try await synchronizer.synchronize()
 
-        XCTAssertNotNil(result.receipt)
+        let receipt = try XCTUnwrap(result.receipt)
         // The terminal post-upload poll is a third, empty database page. The
         // receipt therefore cannot be issued at the first terminal page of
         // the original database listing.
@@ -8109,6 +11736,31 @@ final class BigSyncKitTests: XCTestCase {
         )
         let storedZoneCursor = await adapter.serverChangeToken
         XCTAssertEqual(storedZoneCursor?.serializedData, Data("zone-2".utf8))
+        let recordedBoundary = await boundaryEvents.snapshot()
+        XCTAssertEqual(recordedBoundary.events.first, "will-consume")
+        XCTAssertEqual(
+            recordedBoundary.events.filter { $0 == "import" }.count,
+            2
+        )
+        XCTAssertEqual(
+            recordedBoundary.context?.accountScopeIdentifier,
+            receipt.accountScopeIdentifier
+        )
+        XCTAssertEqual(recordedBoundary.context?.runID, receipt.runID)
+        let expectedBoundary = CloudKitSynchronizer
+            .makeConsumedServerBoundaryIdentifier(
+                containerIdentifier: synchronizer.containerIdentifier,
+                databaseScope: database.databaseScope,
+                accountScopeIdentifier: receipt.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier:
+                    receipt.replicaBindingGenerationIdentifier,
+                recordZoneID: zoneID,
+                cursorData: Data("zone-2".utf8)
+            )
+        XCTAssertEqual(
+            receipt.consumedServerBoundaryIdentifier,
+            expectedBoundary
+        )
         XCTAssertGreaterThanOrEqual(
             adapter.events.filter { $0 == "saveToken" }.count,
             2
@@ -8117,6 +11769,145 @@ final class BigSyncKitTests: XCTestCase {
             adapter.events.filter { $0.hasPrefix("save:") },
             ["save:FirstPage", "save:SecondPage"]
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testNoChangeDrainReceiptsTheExistingConsumedZoneBoundary()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(zoneName: "no-change-boundary")
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        try await adapter.saveToken(RecordZoneChangeCursor(
+            serializedData: Data("existing-zone-cursor".utf8)
+        ))
+        let synchronizer = makeSynchronizer(
+            database: database,
+            recordZoneID: zoneID
+        )
+        synchronizer.storedDatabaseToken = DatabaseChangeCursor(
+            serializedData: Data("existing-database-cursor".utf8)
+        )
+        let boundaryEvents = SynchronizationBoundaryEventRecorder()
+        synchronizer.synchronizationWillConsumeServerChangesHandler = {
+            context in
+            await boundaryEvents.recordWillConsume(context)
+        }
+        synchronizer.addModelAdapter(adapter)
+
+        let result = try await synchronizer.synchronize()
+
+        XCTAssertFalse(result.didImportChanges)
+        let receipt = try XCTUnwrap(result.receipt)
+        let recordedBoundary = await boundaryEvents.snapshot()
+        XCTAssertEqual(recordedBoundary.events, ["will-consume"])
+        XCTAssertEqual(recordedBoundary.context?.runID, receipt.runID)
+        XCTAssertEqual(
+            receipt.consumedServerBoundaryIdentifier,
+            CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+                containerIdentifier: synchronizer.containerIdentifier,
+                databaseScope: database.databaseScope,
+                accountScopeIdentifier: receipt.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier:
+                    receipt.replicaBindingGenerationIdentifier,
+                recordZoneID: zoneID,
+                cursorData: Data("existing-zone-cursor".utf8)
+            )
+        )
+    }
+
+    func testConsumedServerBoundaryIdentityFencesEveryReplicaNamespace()
+    throws {
+        let zone = CKRecordZone.ID(
+            zoneName: "zone-a",
+            ownerName: CKCurrentUserDefaultName
+        )
+        func boundary(
+            container: String = "container-a",
+            databaseScope: CKDatabase.Scope = .private,
+            account: String = "account-a",
+            binding: String? = "binding-a",
+            zoneID: CKRecordZone.ID = zone,
+            cursor: Data = Data("cursor-a".utf8)
+        ) -> String? {
+            CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+                containerIdentifier: container,
+                databaseScope: databaseScope,
+                accountScopeIdentifier: account,
+                replicaBindingGenerationIdentifier: binding,
+                recordZoneID: zoneID,
+                cursorData: cursor
+            )
+        }
+
+        let baseline = try XCTUnwrap(boundary())
+        XCTAssertEqual(baseline.count, 64)
+        XCTAssertNotEqual(baseline, boundary(container: "container-b"))
+        XCTAssertNotEqual(baseline, boundary(databaseScope: .shared))
+        XCTAssertNotEqual(baseline, boundary(account: "account-b"))
+        XCTAssertNotEqual(baseline, boundary(binding: "binding-b"))
+        XCTAssertNotEqual(baseline, boundary(binding: nil))
+        XCTAssertNotEqual(
+            baseline,
+            boundary(zoneID: CKRecordZone.ID(
+                zoneName: "zone-b",
+                ownerName: CKCurrentUserDefaultName
+            ))
+        )
+        XCTAssertNotEqual(
+            baseline,
+            boundary(zoneID: CKRecordZone.ID(
+                zoneName: "zone-a",
+                ownerName: "owner-b"
+            ))
+        )
+        XCTAssertNotEqual(
+            baseline,
+            boundary(cursor: Data("cursor-b".utf8))
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testRejectedWillConsumeHookPreventsDownloadedTargetVisibility()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(zoneName: "rejected-boundary-hook")
+        database.databaseChangePages = [
+            FakeDatabaseChangePage(
+                changedZoneIDs: [zoneID],
+                deletions: [],
+                moreComing: false
+            ),
+        ]
+        database.zoneChangePages = [
+            FakeZoneChangePage(
+                zoneID: zoneID,
+                records: [makeRecord(
+                    type: "MustRemainInvisible",
+                    id: "one",
+                    zoneID: zoneID
+                )],
+                deletedRecordIDs: [],
+                moreComing: false
+            ),
+        ]
+        let adapter = FakeModelAdapter(zoneID: zoneID, priorities: [])
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.synchronizationWillConsumeServerChangesHandler = { _ in
+            throw TestSynchronizationError.importedPersistenceCacheFailed
+        }
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("Expected the pre-consumption hook to reject the run")
+        } catch TestSynchronizationError.importedPersistenceCacheFailed {
+        }
+
+        XCTAssertEqual(database.databaseChangeFetchCount, 0)
+        XCTAssertEqual(database.recordZoneChangeFetchCount, 0)
+        XCTAssertFalse(adapter.events.contains {
+            $0.hasPrefix("save:")
+        })
     }
 
     @BigSyncBackgroundActor
@@ -8797,7 +12588,7 @@ final class BigSyncKitTests: XCTestCase {
         remoteRecord["tags"] = ["remote"] as CKRecordValue
 
         fixture.adapter.mergePolicy = .custom
-        try await fixture.adapter.saveChanges(
+        _ = try await fixture.adapter.saveChanges(
             in: [remoteRecord],
             forceSave: true
         )
@@ -8927,7 +12718,7 @@ final class BigSyncKitTests: XCTestCase {
         olderSameDeviceRecord["tags"] = ["server"] as CKRecordValue
         olderSameDeviceRecord[cloudKitSynchronizerDeviceUUIDKey] = "this-device" as CKRecordValue
 
-        try await fixture.adapter.saveChanges(
+        _ = try await fixture.adapter.saveChanges(
             in: [olderSameDeviceRecord], forceSave: true
         )
         try await fixture.adapter.reconcileAfterChangeFeedServerBootstrap(
@@ -9725,7 +13516,8 @@ final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
     private func makeRealmAdapterFixture(
-        accountScopePropertyByClassName: [String: String] = [:]
+        accountScopePropertyByClassName: [String: String] = [:],
+        priorityEntityTypeNames: [String] = []
     ) async throws -> (
         adapter: RealmSwiftAdapter,
         persistenceRealm: Realm,
@@ -9739,7 +13531,9 @@ final class BigSyncKitTests: XCTestCase {
         targetConfiguration.inMemoryIdentifier = "target-\(identifier)"
         targetConfiguration.objectTypes = [
             BigSyncTrackedObject.self,
+            BigSyncIntegerKeyedObject.self,
             BigSyncSemanticallyValidatedObject.self,
+            BigSyncSecondSemanticallyValidatedObject.self,
             BigSyncRelationshipChild.self,
             BigSyncRelationshipParent.self,
             BigSyncPendingMutation.self,
@@ -9751,6 +13545,7 @@ final class BigSyncKitTests: XCTestCase {
             excludedClassNames: [],
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName,
+            priorityEntityTypeNames: priorityEntityTypeNames,
             recordZoneID: CKRecordZone.ID(zoneName: "realm-adapter-zone", ownerName: CKCurrentUserDefaultName),
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false,
@@ -9801,6 +13596,86 @@ final class BigSyncKitTests: XCTestCase {
             )?.generation
         )
         return (fixture.adapter, fixture.targetRealm, recordName, generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testLocalDatasetRebootstrapRebasesRetainedRowsToDestinationBinding()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let targetConfiguration = fixture.targetRealm.configuration
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [targetConfiguration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: "current-installation",
+                    replicaBindingGenerationIdentifier: "destination-binding"
+                )
+            }
+        )
+        let object = BigSyncTrackedObject(
+            id: "retained-for-destination",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            fixture.targetRealm.add(BigSyncPendingMutation(
+                recordName: recordName,
+                entityType: BigSyncTrackedObject.className(),
+                objectIdentifier: object.id,
+                replicaBindingGenerationIdentifier: "source-binding",
+                generation: "source-generation"
+            ))
+        }
+
+        let scope = "destination-account"
+        let epoch = 4_000_000_001
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "iCloud.test",
+            databaseScope: .private
+        )
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: scope,
+            replicaBindingGenerationIdentifier: "destination-binding",
+            acceptsLegacyUnboundMutations: false
+        )
+        try await fixture.adapter.prepareChangeFeedReset(
+            accountScopeIdentifier: scope,
+            epoch: epoch,
+            mode: .localDatasetRebootstrap
+        )
+        try await fixture.adapter.beginChangeFeedServerBootstrap(
+            accountScopeIdentifier: scope,
+            epoch: epoch,
+            mode: .localDatasetRebootstrap
+        )
+        try await fixture.adapter.reconcileAfterChangeFeedServerBootstrap(
+            accountScopeIdentifier: scope,
+            epoch: epoch,
+            mode: .localDatasetRebootstrap
+        )
+
+        let pending = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(
+            pending.replicaBindingGenerationIdentifier,
+            "destination-binding"
+        )
+        XCTAssertNotEqual(pending.generation, "source-generation")
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(tracking.entityState, .new)
+        XCTAssertEqual(tracking.pendingGeneration, pending.generation)
+        XCTAssertEqual(
+            tracking.pendingReplicaBindingGenerationIdentifier,
+            "destination-binding"
+        )
     }
 
     func testCloudKitLossClassifierRecognizesTopLevelEncryptedDataReset() {

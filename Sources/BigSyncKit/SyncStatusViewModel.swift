@@ -47,10 +47,21 @@ public class SyncStatusViewModel: ObservableObject {
     /// Durable, account-scoped state restored independently from the transient
     /// notification-driven status above.
     @Published public private(set) var cloudKitSyncHealth: CloudKitSyncHealthSnapshot?
+    /// A durable account change that requires an explicit dataset port before
+    /// CloudKit synchronization may resume. BigSyncKit only surfaces the gate;
+    /// the host application owns any future confirmation and port workflow.
+    @Published public private(set) var cloudAccountPortRequirement:
+        BigSyncCloudAccountPortRequirement?
 //    @Published public var lastSeenDevices: [LastSeenDevice]?
     @Published public var changesRemainingToUpload: Int?
 
     private var cancellables = Set<AnyCancellable>()
+    private var cloudKitHealthRefreshTask: Task<Void, Never>?
+    private var cloudKitHealthRefreshGeneration = 0
+#if DEBUG
+    var _testCloudKitSyncHealthSnapshotProvider:
+        (@MainActor @Sendable () async -> CloudKitSyncHealthSnapshot?)?
+#endif
     
     public init(realmConfiguration: Realm.Configuration) {
         self.realmConfiguration = realmConfiguration
@@ -68,12 +79,10 @@ public class SyncStatusViewModel: ObservableObject {
 
         NotificationCenter.default.publisher(for: .SynchronizerSyncHealthDidChange)
             .receive(on: RunLoop.main)
-            .sink { @Sendable @MainActor [weak self] notification in
-                guard let self,
-                      let snapshot = notification.userInfo?[
-                        cloudKitSynchronizerSyncHealthSnapshotKey
-                      ] as? CloudKitSyncHealthSnapshot else { return }
-                cloudKitSyncHealth = snapshot
+            .sink { @Sendable @MainActor [weak self] _ in
+                // Treat notifications as wakeups. Their payload can belong to
+                // a synchronizer/account that has already been replaced.
+                self?.reloadCloudKitSyncHealth()
             }
             .store(in: &cancellables)
         
@@ -114,6 +123,7 @@ public class SyncStatusViewModel: ObservableObject {
                 } else {
                     syncStatus = "Synchronization Completed"
                 }
+                refreshCloudAccountPortRequirement()
                 syncFailed = false
                 syncIsOver()
             }
@@ -123,33 +133,10 @@ public class SyncStatusViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { @Sendable @MainActor [weak self] notification in
                 guard let self else { return }
-                let userInfo = notification.userInfo
-                var syncFailed = true
-                if let error = userInfo?[cloudKitSynchronizerErrorKey] as? Error {
-                    if let error = error as? CKError {
-                        switch error.code {
-                        case .changeTokenExpired:
-                            syncStatus = "Reloading Synchronization"
-                            syncFailed = false
-                        case .accountTemporarilyUnavailable:
-                            syncStatus = "Account Temporarily Unavailable"
-                        case .constraintViolation:
-                            syncStatus = "Synchronization Failed: Constraint Violation"
-                        case .limitExceeded:
-                            // It restarts...
-                            syncFailed = false
-                        default:
-                            syncStatus = "Synchronization Failed: \(String(describing: error).prefix(150))"
-                        }
-                    } else if error is CancellationError {
-                        syncFailed = false
-                    } else {
-                        syncStatus = "Synchronization Failed: \(error.localizedDescription)"
-                    }
-                } else {
-                    syncStatus = "Synchronization Failed: Unknown Error"
-                }
-                self.syncFailed = syncFailed
+                applySynchronizationFailure(
+                    notification.userInfo?[cloudKitSynchronizerErrorKey]
+                        as? Error
+                )
                 syncIsOver()
             }
             .store(in: &cancellables)
@@ -158,14 +145,53 @@ public class SyncStatusViewModel: ObservableObject {
     /// Reload after the BigSync worker is configured. The worker verifies the
     /// current account scope before returning persisted state.
     public func restoreCloudKitSyncHealth() {
+        reloadCloudKitSyncHealth()
         Task { @MainActor [weak self] in
-            let snapshot = await BigSyncBackgroundActor.shared
+            let portRequirement = try? await BigSyncBackgroundActor.shared
+                .pendingCloudAccountPortRequirement()
+            self?.cloudAccountPortRequirement = portRequirement
+        }
+    }
+
+    private func reloadCloudKitSyncHealth() {
+        cloudKitHealthRefreshGeneration &+= 1
+        let generation = cloudKitHealthRefreshGeneration
+        cloudKitHealthRefreshTask?.cancel()
+        cloudKitHealthRefreshTask = Task { @MainActor [weak self] in
+            let snapshot: CloudKitSyncHealthSnapshot?
+#if DEBUG
+            if let provider = self?._testCloudKitSyncHealthSnapshotProvider {
+                snapshot = await provider()
+            } else {
+                snapshot = await BigSyncBackgroundActor.shared
+                    .cloudKitSyncHealthSnapshot()
+            }
+#else
+            snapshot = await BigSyncBackgroundActor.shared
                 .cloudKitSyncHealthSnapshot()
-            self?.cloudKitSyncHealth = snapshot
+#endif
+            guard !Task.isCancelled,
+                  let self,
+                  cloudKitHealthRefreshGeneration == generation else {
+                return
+            }
+            cloudKitSyncHealth = snapshot
+            cloudKitHealthRefreshTask = nil
+        }
+    }
+
+    private func refreshCloudAccountPortRequirement() {
+        Task { @MainActor [weak self] in
+            self?.cloudAccountPortRequirement = try? await
+                BigSyncBackgroundActor.shared
+                    .pendingCloudAccountPortRequirement()
         }
     }
 
     public var cloudKitSyncHealthText: String? {
+        if cloudAccountPortRequirement != nil {
+            return "Your iCloud account changed; Manabi data must be moved before sync can resume"
+        }
         guard let cloudKitSyncHealth else { return nil }
         switch cloudKitSyncHealth.terminalZoneDeletionKind {
         case .purged:
@@ -186,6 +212,8 @@ public class SyncStatusViewModel: ObservableObject {
         case .idle: return "Idle"
         case .syncing: return "Synchronizing"
         case .succeeded: return "Last sync succeeded"
+        case .semanticBlocked:
+            return "Cloud transport is current; application recovery is incomplete"
         case .transientRetry:
             if let retryNotBefore = cloudKitSyncHealth.retryNotBefore {
                 return "Retrying after \(retryNotBefore.formatted(date: .abbreviated, time: .shortened))"
@@ -198,6 +226,51 @@ public class SyncStatusViewModel: ObservableObject {
         case .terminalZoneUnavailable: return "Cloud sync recovery required"
         case .failed: return "Last sync failed"
         }
+    }
+
+    func applySynchronizationFailure(_ error: Error?) {
+        var didFail = true
+        if let error {
+            if let portError = error as? BigSyncCloudAccountPortError {
+                switch portError {
+                case .required(let requirement):
+                    cloudAccountPortRequirement = requirement
+                    syncStatus = "iCloud Account Change Requires Data Transfer"
+                case .corruptRequirement:
+                    cloudAccountPortRequirement = nil
+                    syncStatus = "iCloud Account Change Requires Recovery"
+                case .initialDatasetAdmissionUnavailable:
+                    cloudAccountPortRequirement = nil
+                    syncStatus = "iCloud Dataset Admission Unavailable"
+                case .workerRestartRequired:
+                    cloudAccountPortRequirement = nil
+                    syncStatus = "Restarting iCloud Synchronization"
+                    didFail = false
+                }
+            } else if let error = error as? CKError {
+                switch error.code {
+                case .changeTokenExpired:
+                    syncStatus = "Reloading Synchronization"
+                    didFail = false
+                case .accountTemporarilyUnavailable:
+                    syncStatus = "Account Temporarily Unavailable"
+                case .constraintViolation:
+                    syncStatus = "Synchronization Failed: Constraint Violation"
+                case .limitExceeded:
+                    // It restarts...
+                    didFail = false
+                default:
+                    syncStatus = "Synchronization Failed: \(String(describing: error).prefix(150))"
+                }
+            } else if error is CancellationError {
+                didFail = false
+            } else {
+                syncStatus = "Synchronization Failed: \(error.localizedDescription)"
+            }
+        } else {
+            syncStatus = "Synchronization Failed: Unknown Error"
+        }
+        syncFailed = didFail
     }
     
     private func syncBegan() {

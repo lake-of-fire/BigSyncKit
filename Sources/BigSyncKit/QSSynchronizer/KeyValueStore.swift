@@ -8,6 +8,41 @@
 import Foundation
 import Darwin
 
+private let bigSyncInterruptedOperationAttemptLimit = 8
+
+/// Retries only operations that failed because a syscall was interrupted
+/// before completion. Foundation commonly wraps `EINTR` in a Cocoa error, so
+/// inspect the underlying-error chain rather than only the outer domain.
+/// Other failures remain fail-closed and are returned immediately.
+internal func bigSyncRetryingInterruptedOperation<T>(
+    _ operation: () throws -> T
+) throws -> T {
+    for attempt in 1 ... bigSyncInterruptedOperationAttemptLimit {
+        do {
+            return try operation()
+        } catch {
+            guard attempt < bigSyncInterruptedOperationAttemptLimit,
+                  bigSyncErrorWasInterrupted(error) else {
+                throw error
+            }
+        }
+    }
+    preconditionFailure("Interrupted-operation retry loop exhausted unexpectedly")
+}
+
+private func bigSyncErrorWasInterrupted(_ error: Error) -> Bool {
+    var candidate: NSError? = error as NSError
+    for _ in 0 ..< 8 {
+        guard let current = candidate else { return false }
+        if current.domain == NSPOSIXErrorDomain,
+           current.code == Int(EINTR) {
+            return true
+        }
+        candidate = current.userInfo[NSUnderlyingErrorKey] as? NSError
+    }
+    return false
+}
+
 @discardableResult
 internal func bigSyncFlock(
     _ descriptor: Int32,
@@ -282,6 +317,13 @@ extension KeyValueStore {
 
     private let lockFileURL: URL
     private let beforeAtomicReplace: (() throws -> Void)?
+    /// Reuse the namespace lock descriptor instead of reopening the same file
+    /// for every durable read. We still verify the path's device/inode after
+    /// acquiring the lock, so an external lock-file replacement cannot split
+    /// cooperating stores across two lock domains.
+    private var lockFileDescriptor: Int32 = -1
+    private var lockFileDevice: dev_t?
+    private var lockFileInode: ino_t?
 
     private final class UnreadableValue: NSObject {
         static let shared = UnreadableValue()
@@ -302,6 +344,12 @@ extension KeyValueStore {
         super.init()
         lock.withLock {
             _ = reloadStorage(lockMode: LOCK_SH)
+        }
+    }
+
+    deinit {
+        if lockFileDescriptor >= 0 {
+            Darwin.close(lockFileDescriptor)
         }
     }
 
@@ -481,6 +529,31 @@ extension KeyValueStore {
         mode: Int32,
         _ body: () throws -> T
     ) throws -> T {
+        // A lock file is never intentionally replaced, but validate the path
+        // after flock so external cleanup/recreation cannot leave this store
+        // locking an unlinked inode while a peer locks the replacement.
+        for _ in 0 ..< 3 {
+            let descriptor = try preparedLockFileDescriptor()
+            guard bigSyncFlock(descriptor, mode) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard lockFileIdentityMatchesPath() else {
+                _ = bigSyncFlock(descriptor, LOCK_UN)
+                closePreparedLockFileDescriptor()
+                continue
+            }
+            defer { _ = bigSyncFlock(descriptor, LOCK_UN) }
+            return try body()
+        }
+        throw POSIXError(.EBUSY)
+    }
+
+    private func preparedLockFileDescriptor() throws -> Int32 {
+        if lockFileDescriptor >= 0,
+           lockFileDevice != nil,
+           lockFileInode != nil {
+            return lockFileDescriptor
+        }
         try bigSyncCreateDirectoryDurably(
             at: fileURL.deletingLastPathComponent()
         )
@@ -492,13 +565,41 @@ extension KeyValueStore {
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        defer { Darwin.close(descriptor) }
-        try markExcludedFromBackup(lockFileURL)
-        guard bigSyncFlock(descriptor, mode) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        do {
+            try markExcludedFromBackup(lockFileURL)
+            var fileInformation = stat()
+            guard Darwin.fstat(descriptor, &fileInformation) == 0 else {
+                throw POSIXError(
+                    POSIXErrorCode(rawValue: errno) ?? .EIO
+                )
+            }
+            lockFileDescriptor = descriptor
+            lockFileDevice = fileInformation.st_dev
+            lockFileInode = fileInformation.st_ino
+            return descriptor
+        } catch {
+            Darwin.close(descriptor)
+            throw error
         }
-        defer { _ = bigSyncFlock(descriptor, LOCK_UN) }
-        return try body()
+    }
+
+    private func lockFileIdentityMatchesPath() -> Bool {
+        guard let lockFileDevice, let lockFileInode else { return false }
+        var pathInformation = stat()
+        guard Darwin.lstat(lockFileURL.path, &pathInformation) == 0 else {
+            return false
+        }
+        return pathInformation.st_dev == lockFileDevice
+            && pathInformation.st_ino == lockFileInode
+    }
+
+    private func closePreparedLockFileDescriptor() {
+        if lockFileDescriptor >= 0 {
+            Darwin.close(lockFileDescriptor)
+        }
+        lockFileDescriptor = -1
+        lockFileDevice = nil
+        lockFileInode = nil
     }
 
     private func reloadStorageLocked() -> [String: Any]? {
@@ -565,10 +666,16 @@ extension KeyValueStore {
                         try? FileManager.default.removeItem(at: temporaryURL)
                     }
                 }
-                try data.write(to: temporaryURL)
-                try markExcludedFromBackup(temporaryURL)
+                try bigSyncRetryingInterruptedOperation {
+                    try data.write(to: temporaryURL)
+                }
+                try bigSyncRetryingInterruptedOperation {
+                    try markExcludedFromBackup(temporaryURL)
+                }
                 let handle = try FileHandle(forWritingTo: temporaryURL)
-                try handle.synchronize()
+                try bigSyncRetryingInterruptedOperation {
+                    try handle.synchronize()
+                }
                 try handle.close()
                 try beforeAtomicReplace?()
                 guard Darwin.rename(temporaryURL.path, fileURL.path) == 0 else {
@@ -576,9 +683,13 @@ extension KeyValueStore {
                 }
                 shouldRemoveTemporaryFile = false
             } else {
-                try data.write(to: fileURL)
+                try bigSyncRetryingInterruptedOperation {
+                    try data.write(to: fileURL)
+                }
                 let handle = try FileHandle(forWritingTo: fileURL)
-                try handle.synchronize()
+                try bigSyncRetryingInterruptedOperation {
+                    try handle.synchronize()
+                }
                 try handle.close()
             }
             try synchronizeDirectory()

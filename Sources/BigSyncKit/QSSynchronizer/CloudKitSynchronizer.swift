@@ -275,6 +275,16 @@ internal struct ChangeRequest: Sendable {
     }
 }
 
+internal struct InboundProcessingOutcomes: Sendable {
+    var liveResults = [InboundLiveResult]()
+    var deletionResults = [InboundDeletionResult]()
+
+    mutating func append(_ other: Self) {
+        liveResults.append(contentsOf: other.liveResults)
+        deletionResults.append(contentsOf: other.deletionResults)
+    }
+}
+
 public enum OneOffRecordZoneResetError: LocalizedError {
     case cloudKitAccountChanged
     case cloudKitAccountUnavailable
@@ -308,7 +318,7 @@ internal class ChangeRequestProcessor {
     private var changeRequests = [ChangeRequest]()
     private var localErrors: [Error] = []
     private var activeRunID = UUID()
-    private var processingTask: Task<Void, Error>?
+    private var processingTask: Task<InboundProcessingOutcomes, Error>?
     private var processingTaskID: UUID?
     internal var fetchedChangeBatchSize = ChangeRequestProcessor.defaultFetchedChangeBatchSize
     
@@ -368,12 +378,12 @@ internal class ChangeRequestProcessor {
     private func runProcessFetchedChangeRequests(
         for adapter: ModelAdapter,
         restrictedToEntityType restrictedEntityType: String?
-    ) async throws {
+    ) async throws -> InboundProcessingOutcomes {
         let runID = activeRunID
         let taskID = UUID()
         let task = Task { @BigSyncBackgroundActor [weak self] in
             guard let self else { throw CancellationError() }
-            try await processFetchedChangeRequests(
+            return try await processFetchedChangeRequests(
                 for: adapter,
                 restrictedToEntityType: restrictedEntityType,
                 runID: runID
@@ -387,15 +397,16 @@ internal class ChangeRequestProcessor {
                 processingTaskID = nil
             }
         }
-        try await task.value
+        return try await task.value
     }
     
     private func processFetchedChangeRequests(
         for adapter: ModelAdapter,
         restrictedToEntityType restrictedEntityType: String?,
         runID: UUID
-    ) async throws {
+    ) async throws -> InboundProcessingOutcomes {
         try Task.checkCancellation()
+        var outcomes = InboundProcessingOutcomes()
         
         while true {
             try Task.checkCancellation()
@@ -407,7 +418,7 @@ internal class ChangeRequestProcessor {
                 restrictedToEntityType: restrictedEntityType,
                 runID: runID
             )
-            guard !batch.isEmpty else { return }
+            guard !batch.isEmpty else { return outcomes }
             
             do {
                 let downloadedRecords = try batch.compactMap {
@@ -416,7 +427,15 @@ internal class ChangeRequestProcessor {
                 }
                 
                 if !downloadedRecords.isEmpty {
-                    try await batch.first?.adapter.saveChanges(in: downloadedRecords, forceSave: false)
+                    let results = try await batch.first?.adapter.saveChanges(
+                        in: downloadedRecords,
+                        forceSave: false
+                    ) ?? []
+                    try Self.validateInboundLiveResults(
+                        results,
+                        records: downloadedRecords
+                    )
+                    outcomes.liveResults.append(contentsOf: results)
                     try Task.checkCancellation()
                     guard !cancelSync, activeRunID == runID else {
                         throw CancellationError()
@@ -428,7 +447,14 @@ internal class ChangeRequestProcessor {
                     return $0.deletedRecordID
                 }
                 if !deletedRecordIDs.isEmpty {
-                    try await batch.first?.adapter.deleteRecords(with: deletedRecordIDs)
+                    let results = try await batch.first?.adapter.deleteRecords(
+                        with: deletedRecordIDs
+                    ) ?? []
+                    try Self.validateInboundDeletionResults(
+                        results,
+                        recordIDs: deletedRecordIDs
+                    )
+                    outcomes.deletionResults.append(contentsOf: results)
                     try Task.checkCancellation()
                     guard !cancelSync, activeRunID == runID else {
                         throw CancellationError()
@@ -443,10 +469,83 @@ internal class ChangeRequestProcessor {
                 localErrors.append(error)
                 // As above, retaining a failed value batch is unnecessary because
                 // its page token has not advanced.
-                return
+                return outcomes
             }
             
             try await Task.sleep(nanoseconds: 500_000)
+        }
+    }
+
+    static func validateInboundLiveResults(
+        _ results: [InboundLiveResult],
+        records: [CKRecord]
+    ) throws {
+        guard results.count == records.count else {
+            throw InboundDispositionValidationError.cardinality(
+                expected: records.count,
+                actual: results.count
+            )
+        }
+        for (ordinal, pair) in zip(records.indices, zip(records, results)) {
+            guard pair.1.event.matches(
+                ordinal: ordinal,
+                entityType: pair.0.recordType,
+                recordID: pair.0.recordID
+            ) else {
+                throw InboundDispositionValidationError.identityMismatch(
+                    ordinal: ordinal,
+                    expectedRecordName: pair.0.recordID.recordName
+                )
+            }
+        }
+    }
+
+    static func validateInboundDeletionResults(
+        _ results: [InboundDeletionResult],
+        recordIDs: [CKRecord.ID]
+    ) throws {
+        guard results.count == recordIDs.count else {
+            throw InboundDispositionValidationError.cardinality(
+                expected: recordIDs.count,
+                actual: results.count
+            )
+        }
+        for (ordinal, pair) in zip(
+            recordIDs.indices,
+            zip(recordIDs, results)
+        ) {
+            guard pair.1.event.matches(
+                ordinal: ordinal,
+                recordID: pair.0
+            ) else {
+                throw InboundDispositionValidationError.identityMismatch(
+                    ordinal: ordinal,
+                    expectedRecordName: pair.0.recordName
+                )
+            }
+        }
+    }
+
+    /// Reject malformed transport pages before an adapter can publish any of
+    /// their target or tracking state. Commit-time receipt validation remains
+    /// as a second fence around cursor advancement.
+    static func validateInboundPageIdentities(
+        records: [CKRecord],
+        deletedRecordIDs: [CKRecord.ID],
+        expectedZoneID: CKRecordZone.ID
+    ) throws {
+        var representedRecordIDs = Set<CKRecord.ID>()
+        for recordID in records.map(\.recordID) + deletedRecordIDs {
+            guard recordID.zoneID == expectedZoneID else {
+                throw InboundDispositionValidationError
+                    .eventOutsideExpectedZone(
+                        recordName: recordID.recordName
+                    )
+            }
+            guard representedRecordIDs.insert(recordID).inserted else {
+                throw InboundDispositionValidationError
+                    .duplicateInboundEvent(recordName: recordID.recordName)
+            }
         }
     }
     
@@ -483,22 +582,26 @@ internal class ChangeRequestProcessor {
     }
 
     @BigSyncBackgroundActor
+    @discardableResult
     func finishProcessing(
         for adapter: ModelAdapter,
         restrictedToEntityType restrictedEntityType: String? = nil
-    ) async throws {
+    ) async throws -> InboundProcessingOutcomes {
         try Task.checkCancellation()
-        try await runProcessFetchedChangeRequests(
+        return try await runProcessFetchedChangeRequests(
             for: adapter,
             restrictedToEntityType: restrictedEntityType
         )
     }
 
     @BigSyncBackgroundActor
-    func finishProcessing() async throws {
+    @discardableResult
+    func finishProcessing() async throws -> InboundProcessingOutcomes {
+        var outcomes = InboundProcessingOutcomes()
         while let adapter = changeRequests.first?.adapter {
-            try await finishProcessing(for: adapter)
+            outcomes.append(try await finishProcessing(for: adapter))
         }
+        return outcomes
     }
 }
 
@@ -506,6 +609,40 @@ let cloudKitSynchronizerDeviceUUIDKey = "QSCloudKitDeviceUUIDKey"
 let cloudKitSynchronizerModelCompatibilityVersionKey = "QSCloudKitModelCompatibilityVersionKey"
 public let cloudKitSynchronizerErrorDomain = "CloudKitSynchronizerErrorDomain"
 public let cloudKitSynchronizerErrorKey = "CloudKitSynchronizerErrorKey"
+
+/// Revokes account authority immediately while actor-isolated durable
+/// invalidation catches up.
+final class AccountScopeAuthorityFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isPoisoned = true
+    private var rotatesGeneration = false
+
+    func poison(requiresGenerationRotation: Bool = true) {
+        lock.lock()
+        isPoisoned = true
+        rotatesGeneration = rotatesGeneration || requiresGenerationRotation
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        isPoisoned = false
+        rotatesGeneration = false
+        lock.unlock()
+    }
+
+    var rejectsAuthority: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isPoisoned
+    }
+
+    var requiresGenerationRotation: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return rotatesGeneration
+    }
+}
 
 ///  These keys will be added to CKRecords uploaded to CloudKit and are used by SyncKit internally.
 public let cloudKitSynchronizerMetadataKeys: [String] = [
@@ -527,16 +664,77 @@ public class CloudKitSynchronizer: NSObject {
     /// Optional, actor-isolated lifecycle observation for diagnostics. Production
     /// callers receive a no-op unless they explicitly provide a handler.
     public typealias ProgressHandler = @BigSyncBackgroundActor @Sendable (String) -> Void
+    public typealias SynchronizationWillConsumeServerChangesHandler =
+        @BigSyncBackgroundActor @Sendable (
+            SynchronizationBoundaryContext
+        ) async throws -> Void
+    public typealias DomainPrepublicationHandler =
+        @BigSyncBackgroundActor @Sendable (
+            PrepublicationBoundaryContext
+        ) async throws -> [DomainBlocker]
+    public typealias DomainPublicationScopeIdentifierProvider =
+        @BigSyncBackgroundActor @Sendable () async throws -> String?
+
+    public struct DomainBlocker: Sendable, Equatable, Hashable {
+        public let code: String
+        public let detail: String?
+
+        public init(code: String, detail: String? = nil) {
+            precondition(!code.isEmpty)
+            self.code = code
+            self.detail = detail
+        }
+    }
+
+    /// Fenced transport identity exposed immediately before a synchronization
+    /// run may make downloaded target rows visible.
+    public struct SynchronizationBoundaryContext: Sendable, Equatable {
+        public let accountScopeIdentifier: String
+        public let replicaBindingGenerationIdentifier: String?
+        public let runID: UUID
+
+        internal init(context: RunContext) {
+            accountScopeIdentifier = context.accountScopeIdentifier
+            replicaBindingGenerationIdentifier =
+                context.replicaBindingGenerationIdentifier
+            runID = context.runID
+        }
+    }
+
     internal struct RunContext: Sendable, Equatable {
         let attemptID: UUID
         let runID: UUID
         let accountIdentifier: String
         let accountScopeIdentifier: String
+        let replicaBindingGenerationIdentifier: String?
+        let acceptsLegacyUnboundMutations: Bool
+
+        init(
+            attemptID: UUID,
+            runID: UUID,
+            accountIdentifier: String,
+            accountScopeIdentifier: String,
+            replicaBindingGenerationIdentifier: String? = nil,
+            acceptsLegacyUnboundMutations: Bool = true
+        ) {
+            self.attemptID = attemptID
+            self.runID = runID
+            self.accountIdentifier = accountIdentifier
+            self.accountScopeIdentifier = accountScopeIdentifier
+            self.replicaBindingGenerationIdentifier =
+                replicaBindingGenerationIdentifier
+            self.acceptsLegacyUnboundMutations =
+                acceptsLegacyUnboundMutations
+        }
     }
 
     public struct SynchronizationReceipt: Sendable, Equatable {
         public let accountScopeIdentifier: String
+        public let replicaBindingGenerationIdentifier: String?
         public let runID: UUID
+        /// Latest record-zone cursor durably consumed by the terminal drain.
+        /// It is distinct from any domain activation/floor boundary.
+        public let consumedServerBoundaryIdentifier: String?
         internal let accountIdentifier: String
         internal let issuerID: UUID
         internal let authorizationID: UUID
@@ -544,10 +742,15 @@ public class CloudKitSynchronizer: NSObject {
         internal init(
             context: RunContext,
             issuerID: UUID,
-            authorizationID: UUID
+            authorizationID: UUID,
+            consumedServerBoundaryIdentifier: String? = nil
         ) {
             accountScopeIdentifier = context.accountScopeIdentifier
+            replicaBindingGenerationIdentifier =
+                context.replicaBindingGenerationIdentifier
             runID = context.runID
+            self.consumedServerBoundaryIdentifier =
+                consumedServerBoundaryIdentifier
             accountIdentifier = context.accountIdentifier
             self.issuerID = issuerID
             self.authorizationID = authorizationID
@@ -555,15 +758,51 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     public struct SynchronizationResult: Sendable, Equatable {
+        public enum PublicationState: Sendable, Equatable {
+            case complete
+            case blocked([DomainBlocker])
+        }
+
         public let didImportChanges: Bool
         public let receipt: SynchronizationReceipt?
+        public let publicationState: PublicationState
 
         public init(
             didImportChanges: Bool,
-            receipt: SynchronizationReceipt? = nil
+            receipt: SynchronizationReceipt? = nil,
+            publicationState: PublicationState = .complete
         ) {
+            precondition(
+                publicationState == .complete || receipt == nil,
+                "A semantically blocked synchronization cannot publish a terminal receipt"
+            )
             self.didImportChanges = didImportChanges
             self.receipt = receipt
+            self.publicationState = publicationState
+        }
+    }
+
+    /// Immutable causal boundary available to application reconciliation
+    /// before BigSync authorizes any terminal receipt.
+    public struct PrepublicationBoundaryContext: Sendable, Equatable {
+        public let accountScopeIdentifier: String
+        public let replicaBindingGenerationIdentifier: String?
+        public let runID: UUID
+        public let consumedServerBoundaryIdentifier: String?
+        public let didImportChanges: Bool
+
+        internal init(
+            context: RunContext,
+            consumedServerBoundaryIdentifier: String?,
+            didImportChanges: Bool
+        ) {
+            accountScopeIdentifier = context.accountScopeIdentifier
+            replicaBindingGenerationIdentifier =
+                context.replicaBindingGenerationIdentifier
+            runID = context.runID
+            self.consumedServerBoundaryIdentifier =
+                consumedServerBoundaryIdentifier
+            self.didImportChanges = didImportChanges
         }
     }
 
@@ -619,6 +858,11 @@ public class CloudKitSynchronizer: NSObject {
     internal let accountIdentifierProvider: AccountIdentifierProvider
     internal let accountStatusProvider: AccountStatusProvider
     private let progressHandler: ProgressHandler
+    internal var synchronizationWillConsumeServerChangesHandler:
+        SynchronizationWillConsumeServerChangesHandler?
+    internal var domainPrepublicationHandler: DomainPrepublicationHandler?
+    internal var domainPublicationScopeIdentifierProvider:
+        DomainPublicationScopeIdentifierProvider?
     private let backupDetectionBaseURL: URL?
     private var allowsDisposableZoneDeletion: Bool
     /// Page-oriented history transport. A non-default database adapter must
@@ -634,13 +878,17 @@ public class CloudKitSynchronizer: NSObject {
     internal let recordStore: any CloudKitRecordStore
     internal let synchronizationReceiptIssuerID = UUID()
     /// Every durable synchronizer value belongs to exactly one CloudKit
-    /// container and database scope. BigSyncKit deliberately supports one
-    /// private-zone adapter, so this namespace is also the complete transport
-    /// identity for reset, token, retry, health, and lifecycle state.
+    /// container and database scope. By default this namespace includes the
+    /// active private transport zone; callers replacing that zone may provide
+    /// a stable durable-state zone identity instead.
     internal private(set) var durableStateNamespace: String
     @BigSyncBackgroundActor
     var accountScopeInvalidationHandler:
         BigSyncBackgroundWorkerConfiguration.AccountScopeInvalidationHandler?
+    private var pendingAccountScopeInvalidation: (
+        id: UUID,
+        reason: BigSyncAccountScopeInvalidationReason
+    )?
 #if DEBUG
     private var allowsRecordZoneRebindingForTesting = false
 #endif
@@ -667,6 +915,60 @@ public class CloudKitSynchronizer: NSObject {
         return "BigSyncKit.v3.\(digest)"
     }
 
+    /// Canonical identity of one fully consumed record-zone cursor. The
+    /// cursor bytes are meaningful only inside their container, database,
+    /// account, zone, and replica-binding namespace, so all of those fields
+    /// participate in the digest.
+    nonisolated internal static func makeConsumedServerBoundaryIdentifier(
+        containerIdentifier: String,
+        databaseScope: CKDatabase.Scope,
+        accountScopeIdentifier: String,
+        replicaBindingGenerationIdentifier: String?,
+        recordZoneID: CKRecordZone.ID,
+        changeFeedEpoch: Int = 0,
+        cursorData: Data
+    ) -> String? {
+        guard !containerIdentifier.isEmpty,
+              !accountScopeIdentifier.isEmpty,
+              !recordZoneID.ownerName.isEmpty,
+              !recordZoneID.zoneName.isEmpty,
+              changeFeedEpoch >= 0,
+              !cursorData.isEmpty,
+              replicaBindingGenerationIdentifier?.isEmpty != true else {
+            return nil
+        }
+
+        var bytes = Data()
+        func append(_ value: Data) {
+            var length = UInt64(value.count).bigEndian
+            withUnsafeBytes(of: &length) {
+                bytes.append(contentsOf: $0)
+            }
+            bytes.append(value)
+        }
+        func append(_ value: String) {
+            append(Data(value.utf8))
+        }
+
+        append("BigSyncServerBoundary.v3")
+        append(containerIdentifier)
+        append(String(databaseScope.rawValue))
+        append(accountScopeIdentifier)
+        append(recordZoneID.ownerName)
+        append(recordZoneID.zoneName)
+        append(String(changeFeedEpoch))
+        if let replicaBindingGenerationIdentifier {
+            bytes.append(1)
+            append(replicaBindingGenerationIdentifier)
+        } else {
+            bytes.append(0)
+        }
+        append(cursorData)
+        return SHA256.hash(data: bytes).map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
     internal func durableStateKey(_ suffix: String) -> String {
         "\(durableStateNamespace).\(suffix)"
     }
@@ -679,10 +981,15 @@ public class CloudKitSynchronizer: NSObject {
         durableStateKey("AccountScopeLease.v1")
     }
 
+    private var replicaBindingStateKey: String {
+        durableStateKey("ReplicaBinding.v1")
+    }
+
     private var transientRetryStateKey: String {
         durableStateKey("TransientRetryState.v2")
     }
     internal var accountValidationRequired = true
+    let accountScopeAuthorityFence = AccountScopeAuthorityFence()
     private var accountChangeObserver: NSObjectProtocol?
     /// Set during construction when the local defaults marker survived a backup
     /// but the excluded-from-backup sentinel did not. The synchronization
@@ -741,6 +1048,7 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationRequestedWhileRunning = false
     internal var synchronizationDrainIsActive = false
     internal var synchronizationDrainDidImportChanges = false
+    private var portActivationRequiresWorkerRestart = false
     private var synchronizationWaiters = [
         UUID: CheckedContinuation<SynchronizationResult, Error>
     ]()
@@ -779,10 +1087,14 @@ public class CloudKitSynchronizer: NSObject {
     private var activeChangeFeedMigration: ChangeFeedMigrationState?
  
     internal let logger: Logging.Logger
+    public let accountReplacementPolicy: BigSyncCloudAccountReplacementPolicy
+    internal let initialReplicaBindingAdmissionHandler:
+        BigSyncBackgroundWorkerConfiguration
+            .InitialReplicaBindingAdmissionHandler?
     
     /// Default number of records to send in an upload operation.
-    public static let defaultInitialBatchSize = 300
-    public static let maxBatchSize = 400 // Apple's suggestion is 400
+    public nonisolated static let defaultInitialBatchSize = 300
+    public nonisolated static let maxBatchSize = 400 // Apple's suggestion is 400
     
     /// Initializes a newly allocated synchronizer.
     /// - Parameters:
@@ -797,6 +1109,7 @@ public class CloudKitSynchronizer: NSObject {
         containerIdentifier: String,
         database: CloudKitDatabaseAdapter,
         recordZoneID: CKRecordZone.ID,
+        durableStateRecordZoneID: CKRecordZone.ID? = nil,
         keyValueStore: KeyValueStore = UserDefaultsAdapter(userDefaults: UserDefaults.standard),
         compatibilityVersion: Int = 0,
         accountIdentifierProvider: AccountIdentifierProvider? = nil,
@@ -807,6 +1120,11 @@ public class CloudKitSynchronizer: NSObject {
         zoneStore: (any CloudKitZoneStore)? = nil,
         recordStore: (any CloudKitRecordStore)? = nil,
         backupDetectionBaseURL: URL? = nil,
+        initialReplicaBindingAdmissionHandler:
+            BigSyncBackgroundWorkerConfiguration
+                .InitialReplicaBindingAdmissionHandler? = nil,
+        accountReplacementPolicy: BigSyncCloudAccountReplacementPolicy =
+            .serverReconciliation,
         logger: Logging.Logger
     ) {
         precondition(
@@ -821,11 +1139,12 @@ public class CloudKitSynchronizer: NSObject {
         self.containerIdentifier = containerIdentifier
         self.recordZoneID = recordZoneID
         self.database = database
+        let durableStateZoneID = durableStateRecordZoneID ?? recordZoneID
         self.durableStateNamespace = Self.makeDurableStateNamespace(
             identifier: identifier,
             containerIdentifier: containerIdentifier,
             databaseScope: database.databaseScope,
-            recordZoneID: recordZoneID
+            recordZoneID: durableStateZoneID
         )
         self.keyValueStore = keyValueStore
         self.compatibilityVersion = compatibilityVersion
@@ -895,6 +1214,9 @@ public class CloudKitSynchronizer: NSObject {
             )
         }
         self.recordStore = resolvedRecordStore
+        self.initialReplicaBindingAdmissionHandler =
+            initialReplicaBindingAdmissionHandler
+        self.accountReplacementPolicy = accountReplacementPolicy
         self.logger = logger
         super.init()
 
@@ -903,18 +1225,24 @@ public class CloudKitSynchronizer: NSObject {
             object: nil,
             queue: nil
         ) { [weak self] _ in
+            // The notification can arrive while the background actor is busy.
+            // Revoke leases before queuing the durable invalidation work.
+            self?.accountScopeAuthorityFence.poison()
             Task { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
-                do {
-                    try invalidateAccountScopeLeaseDurably()
-                    await accountScopeInvalidationHandler?(.accountChanged)
-                } catch {
-                    logger.error(
-                        "QSCloudKitSynchronizer >> Failed to durably invalidate the account lease: \(error)"
-                    )
-                }
+                // Revoke run ownership before application invalidation can
+                // suspend and allow actor reentrancy.
                 accountValidationRequired = true
                 cancelSynchronization()
+                queueAccountScopeInvalidation(.accountChanged)
+                do {
+                    try await performPendingAccountScopeInvalidation()
+                } catch {
+                    logger.error(
+                        "QSCloudKitSynchronizer >> Failed to invalidate account-scoped authority: \(error)"
+                    )
+                    return
+                }
                 // CloudKit's account-change contract requires a fresh account
                 // validation. This entry point performs no record/zone work
                 // until the new account identity has been established.
@@ -932,10 +1260,13 @@ public class CloudKitSynchronizer: NSObject {
             )
             refreshBackupRestoreRequirement()
             if result == .restoredFromBackup || backupRestoreDetected {
+                accountScopeAuthorityFence.poison()
                 clearDeviceIdentifier()
                 try invalidateAccountScopeLeaseDurably()
+                queueAccountScopeInvalidation(.restoreDetected)
             }
         } catch {
+            accountScopeAuthorityFence.poison()
             backupDetectionError = error
             logger.error("QSCloudKitSynchronizer >> Backup detection failed: \(error)")
         }
@@ -1199,18 +1530,6 @@ public class CloudKitSynchronizer: NSObject {
     private func prepareRestoredBackupRecoveryIfNeeded(
         context: RunContext
     ) async throws {
-        if backupDetectionError != nil {
-            let result = try BackupDetection.run(
-                store: keyValueStore,
-                namespace: durableStateNamespace,
-                sharedSentinelBaseURL: backupDetectionBaseURL
-            )
-            backupDetectionError = nil
-            refreshBackupRestoreRequirement()
-            if result == .restoredFromBackup || backupRestoreDetected {
-                clearDeviceIdentifier()
-            }
-        }
         refreshBackupRestoreRequirement()
         guard backupRestoreDetected else {
             return
@@ -1260,6 +1579,37 @@ public class CloudKitSynchronizer: NSObject {
         try await revalidateRunContext(context)
     }
 
+    /// Retries construction-time backup detection before this attempt obtains
+    /// an account lease or creates a run context. A restored process must first
+    /// revoke the copied lease and let the application fence its copied domain
+    /// authority; only a subsequent fresh account validation may continue.
+    @BigSyncBackgroundActor
+    private func retryBackupDetectionBeforeAccountValidationIfNeeded(
+        attemptID: UUID
+    ) async throws {
+        guard backupDetectionError != nil else { return }
+        let result = try BackupDetection.run(
+            store: keyValueStore,
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: backupDetectionBaseURL
+        )
+        refreshBackupRestoreRequirement()
+        guard result == .restoredFromBackup || backupRestoreDetected else {
+            backupDetectionError = nil
+            return
+        }
+
+        clearDeviceIdentifier()
+        try invalidateAccountScopeLeaseDurably()
+        accountValidationRequired = true
+        queueAccountScopeInvalidation(.restoreDetected)
+        try await performPendingAccountScopeInvalidation()
+        try checkSynchronizationAttempt(attemptID)
+        // Clear only after both authority barriers completed. A failed durable
+        // invalidation or cancelled handler is retried idempotently next time.
+        backupDetectionError = nil
+    }
+
     @BigSyncBackgroundActor
     private func completeRestoredBackupRecoveryIfNeeded(
         expectedEventIdentifier: String? = nil
@@ -1295,6 +1645,7 @@ public class CloudKitSynchronizer: NSObject {
             modelAdapterDictionary.count == 1,
             "BigSyncKit requires exactly one model adapter before synchronization"
         )
+        guard !portActivationRequiresWorkerRestart else { return }
         guard !syncing else {
             synchronizationRequestedWhileRunning = true
             return
@@ -1310,6 +1661,7 @@ public class CloudKitSynchronizer: NSObject {
         retrySleepUntil = nil
         let attemptID = UUID()
         synchronizationAttemptID = attemptID
+        activeRunContext = nil
         activeReceiptAuthorizationID = nil
         reservedReceiptAuthorizationID = nil
 
@@ -1331,11 +1683,20 @@ public class CloudKitSynchronizer: NSObject {
                 if let durableStore = keyValueStore as? any DurableKeyValueStore {
                     try durableStore.validateDurability()
                 }
+                try await retryBackupDetectionBeforeAccountValidationIfNeeded(
+                    attemptID: attemptID
+                )
+                try await performPendingAccountScopeInvalidation()
                 try await validateAccountAvailabilityIfNeeded(
                     attemptID: attemptID
                 )
                 let accountIdentifier = try await validateSynchronizationAccount()
                 reportProgress("account-identity-validated")
+                let binding = try activeReplicaBindingForRun(
+                    accountScopeIdentifier: Self.accountScopeIdentifier(
+                        for: accountIdentifier
+                    )
+                )
                 let runID = await changeRequestProcessor.beginRun()
                 synchronizationRunID = runID
                 let context = RunContext(
@@ -1344,12 +1705,26 @@ public class CloudKitSynchronizer: NSObject {
                     accountIdentifier: accountIdentifier,
                     accountScopeIdentifier: Self.accountScopeIdentifier(
                         for: accountIdentifier
-                    )
+                    ),
+                    replicaBindingGenerationIdentifier:
+                        binding.generationIdentifier,
+                    acceptsLegacyUnboundMutations:
+                        binding.acceptsLegacyUnboundMutations
                 )
                 activeRunContext = context
                 for adapter in modelAdapters {
-                    try await adapter.activateAccountScope(
-                        context.accountScopeIdentifier
+                    try await adapter.activateTransportNamespace(
+                        containerIdentifier: containerIdentifier,
+                        databaseScope: database.databaseScope
+                    )
+                    try checkRunContext(context)
+                    try await adapter.activateReplicaBinding(
+                        accountScopeIdentifier:
+                            context.accountScopeIdentifier,
+                        replicaBindingGenerationIdentifier:
+                            context.replicaBindingGenerationIdentifier,
+                        acceptsLegacyUnboundMutations:
+                            context.acceptsLegacyUnboundMutations
                     )
                     try checkRunContext(context)
                 }
@@ -1408,6 +1783,16 @@ public class CloudKitSynchronizer: NSObject {
                     try checkRunContext(context)
                 }
                 reportProgress("adapters-ready")
+                // A new import attempt makes the previous terminal snapshot
+                // stale before its first page can become visible.
+                try clearDurablePublicationEvidence()
+                if let handler =
+                    synchronizationWillConsumeServerChangesHandler {
+                    try await handler(
+                        SynchronizationBoundaryContext(context: context)
+                    )
+                    try await revalidateRunContext(context)
+                }
                 try Task.checkCancellation()
                 await performSynchronization()
             } catch {
@@ -1421,6 +1806,9 @@ public class CloudKitSynchronizer: NSObject {
     /// only after the full fetch/import/upload drain has finished.
     @BigSyncBackgroundActor
     public func synchronize() async throws -> SynchronizationResult {
+        guard !portActivationRequiresWorkerRestart else {
+            throw BigSyncCloudAccountPortError.workerRestartRequired
+        }
         precondition(
             modelAdapterDictionary.count == 1,
             "BigSyncKit requires exactly one model adapter before synchronization"
@@ -1466,6 +1854,18 @@ public class CloudKitSynchronizer: NSObject {
               synchronizationRunID == context.runID,
               !cancelSync else {
             throw CancellationError()
+        }
+        if let expectedBinding =
+            context.replicaBindingGenerationIdentifier {
+            guard let binding = try BigSyncReplicaBindingStateStore.load(
+                store: keyValueStore,
+                key: replicaBindingStateKey
+            ), binding.pendingPort == nil,
+            binding.activeGenerationIdentifier == expectedBinding,
+            binding.activeAccountScopeIdentifier
+                == context.accountScopeIdentifier else {
+                throw CancellationError()
+            }
         }
     }
 
@@ -1611,45 +2011,226 @@ public class CloudKitSynchronizer: NSObject {
 
     @BigSyncBackgroundActor
     private func validateSynchronizationAccount() async throws -> String {
+        let previousAccountIdentifier: String?
+        if accountReplacementPolicy.usesDatasetReplicaBinding {
+            previousAccountIdentifier = try durableAccountIdentifier()
+            let preparedBinding = try prepareReplicaBindingState()
+            // Existing installations already have a durable CloudKit account
+            // but predate replica-binding generations. Bind that exact legacy
+            // replica before comparing it with the currently authenticated
+            // account; otherwise a first post-upgrade A -> B launch would look
+            // like a port from an unowned replica and fail as corrupt.
+            if preparedBinding.activeAccountScopeIdentifier == nil,
+               let previousAccountIdentifier {
+                _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+                    Self.accountScopeIdentifier(
+                        for: previousAccountIdentifier
+                    ),
+                    store: keyValueStore,
+                    key: replicaBindingStateKey
+                )
+            }
+        } else {
+            previousAccountIdentifier = keyValueStore.object(
+                forKey: cloudKitAccountIdentifierKey
+            ) as? String
+        }
         let validationAttemptID = synchronizationAttemptID
         let currentAccountIdentifier = try await accountIdentifierProvider()
         try checkAccountValidationAttempt(validationAttemptID)
         var confirmedAccountIdentifier = currentAccountIdentifier
         var didReplaceAccount = false
-        if let previousAccountIdentifier =
-            keyValueStore.object(forKey: cloudKitAccountIdentifierKey) as? String,
+        var requiresLocalDatasetRebootstrap = false
+        if let previousAccountIdentifier,
            previousAccountIdentifier != currentAccountIdentifier {
             didReplaceAccount = true
-            logger.info(
-                "QSCloudKitSynchronizer >> CloudKit account changed; rebuilding local sync metadata for the new account"
-            )
-            // Confirm the provider still reports the account whose metadata was
-            // prepared. The new account's tracking rebuild is requested only
-            // after this exact identity has been confirmed; it captures prior
-            // server provenance before clearing tracking and never touches
-            // target Realm user data or its durable mutation journal.
+            if accountReplacementPolicy == .requireExplicitDatasetPort {
+                logger.info(
+                    "QSCloudKitSynchronizer >> CloudKit account changed; an explicit local-dataset port is required"
+                )
+            } else {
+                logger.info(
+                    "QSCloudKitSynchronizer >> CloudKit account changed; rebuilding local sync metadata for the new account"
+                )
+            }
+            // Confirm the provider still reports the same replacement account
+            // before either publishing a port gate or preparing reconciliation.
             confirmedAccountIdentifier = try await accountIdentifierProvider()
             try checkAccountValidationAttempt(validationAttemptID)
         }
         guard confirmedAccountIdentifier == currentAccountIdentifier else {
             accountValidationRequired = true
+            accountScopeAuthorityFence.poison()
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
-        if didReplaceAccount {
+        if accountReplacementPolicy == .requireExplicitDatasetPort {
+            let currentScope = Self.accountScopeIdentifier(
+                for: confirmedAccountIdentifier
+            )
+            if let pendingPortRequirement = try
+                pendingCloudAccountPortRequirement() {
+                accountValidationRequired = true
+                try await invalidateAccountScope(.accountReplaced)
+                throw BigSyncCloudAccountPortError.required(
+                    pendingPortRequirement
+                )
+            }
+            if didReplaceAccount,
+               let binding = try BigSyncReplicaBindingStateStore.load(
+                    store: keyValueStore,
+                    key: replicaBindingStateKey
+               ), binding.pendingPort == nil,
+               binding.activeAccountScopeIdentifier == currentScope {
+                // A verified port activates the binding before publishing the
+                // legacy account-identifier key. Recover that crash window by
+                // accepting only the already-active destination scope.
+                didReplaceAccount = false
+            }
+            if didReplaceAccount {
+                let requirement = try BigSyncReplicaBindingStateStore
+                    .requirePort(
+                        sourceAccountScopeIdentifier:
+                            Self.accountScopeIdentifier(
+                                for: try requiredDurableAccountIdentifier()
+                            ),
+                        destinationAccountScopeIdentifier: currentScope,
+                        store: keyValueStore,
+                        key: replicaBindingStateKey
+                    )
+                accountValidationRequired = true
+                try await invalidateAccountScope(.accountReplaced)
+                throw BigSyncCloudAccountPortError.required(requirement)
+            }
+            try await admitInitialReplicaBindingIfNeeded(
+                accountIdentifier: confirmedAccountIdentifier,
+                accountScopeIdentifier: currentScope,
+                validationAttemptID: validationAttemptID
+            )
+            _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+                currentScope,
+                store: keyValueStore,
+                key: replicaBindingStateKey
+            )
+        } else if accountReplacementPolicy == .localDatasetRebootstrap {
+            let currentScope = Self.accountScopeIdentifier(
+                for: confirmedAccountIdentifier
+            )
+            guard var binding = try BigSyncReplicaBindingStateStore.load(
+                store: keyValueStore,
+                key: replicaBindingStateKey
+            ) else {
+                throw BigSyncReplicaBindingError.corrupt
+            }
+
+            if let pending = binding.pendingPort {
+                if currentScope == pending.sourceAccountScopeIdentifier {
+                    binding = try BigSyncReplicaBindingStateStore.cancelPort(
+                        pending,
+                        store: keyValueStore,
+                        key: replicaBindingStateKey
+                    )
+                    requiresLocalDatasetRebootstrap = true
+                } else if currentScope
+                            == pending.destinationAccountScopeIdentifier {
+                    try await admitReplicaBinding(
+                        accountIdentifier: confirmedAccountIdentifier,
+                        accountScopeIdentifier: currentScope,
+                        generationIdentifier:
+                            pending.bindingGenerationIdentifier,
+                        expectedBinding: binding,
+                        validationAttemptID: validationAttemptID
+                    )
+                    binding = try BigSyncReplicaBindingStateStore.activatePort(
+                        pending,
+                        store: keyValueStore,
+                        key: replicaBindingStateKey
+                    )
+                    requiresLocalDatasetRebootstrap = true
+                } else {
+                    throw BigSyncCloudAccountPortError.required(pending)
+                }
+            }
+
+            if binding.activeAccountScopeIdentifier == nil {
+                try await admitInitialReplicaBindingIfNeeded(
+                    accountIdentifier: confirmedAccountIdentifier,
+                    accountScopeIdentifier: currentScope,
+                    validationAttemptID: validationAttemptID
+                )
+                binding = try BigSyncReplicaBindingStateStore
+                    .bindInitialAccount(
+                        currentScope,
+                        store: keyValueStore,
+                        key: replicaBindingStateKey
+                    )
+            } else if binding.activeAccountScopeIdentifier != currentScope {
+                guard didReplaceAccount,
+                      let sourceScope =
+                        binding.activeAccountScopeIdentifier else {
+                    throw BigSyncReplicaBindingError.accountMismatch
+                }
+                let pending = try BigSyncReplicaBindingStateStore.requirePort(
+                    sourceAccountScopeIdentifier: sourceScope,
+                    destinationAccountScopeIdentifier: currentScope,
+                    store: keyValueStore,
+                    key: replicaBindingStateKey
+                )
+                binding = try BigSyncReplicaBindingStateStore.load(
+                    store: keyValueStore,
+                    key: replicaBindingStateKey
+                ) ?? binding
+                try await admitReplicaBinding(
+                    accountIdentifier: confirmedAccountIdentifier,
+                    accountScopeIdentifier: currentScope,
+                    generationIdentifier:
+                        pending.bindingGenerationIdentifier,
+                    expectedBinding: binding,
+                    validationAttemptID: validationAttemptID
+                )
+                binding = try BigSyncReplicaBindingStateStore.activatePort(
+                    pending,
+                    store: keyValueStore,
+                    key: replicaBindingStateKey
+                )
+                requiresLocalDatasetRebootstrap = true
+            } else if didReplaceAccount {
+                // Resume a process death after binding activation but before
+                // the destination recovery envelope was published.
+                requiresLocalDatasetRebootstrap = true
+            }
+            guard binding.activeAccountScopeIdentifier == currentScope,
+                  binding.pendingPort == nil else {
+                throw BigSyncReplicaBindingError.accountMismatch
+            }
+        }
+        if didReplaceAccount || requiresLocalDatasetRebootstrap {
+            accountValidationRequired = true
+            try await invalidateAccountScope(.accountReplaced)
+            try checkAccountValidationAttempt(validationAttemptID)
+            let currentScope = Self.accountScopeIdentifier(
+                for: confirmedAccountIdentifier
+            )
+            let activeBinding = try activeReplicaBindingForRun(
+                accountScopeIdentifier: currentScope
+            )
             let recoveryContext = RunContext(
                 attemptID: validationAttemptID,
                 runID: synchronizationRunID,
                 accountIdentifier: confirmedAccountIdentifier,
-                accountScopeIdentifier: Self.accountScopeIdentifier(
-                    for: confirmedAccountIdentifier
-                )
+                accountScopeIdentifier: currentScope,
+                replicaBindingGenerationIdentifier:
+                    activeBinding.generationIdentifier,
+                acceptsLegacyUnboundMutations:
+                    activeBinding.acceptsLegacyUnboundMutations
             )
             // The new account's recovery envelope is the durable hand-off.
             // Do not discard the old account's cursors, subscriptions, or
             // retry state until that hand-off is readable after a restart.
             try requestChangeFeedRecovery(
                 context: recoveryContext,
-                mode: .serverReconciliation
+                mode: requiresLocalDatasetRebootstrap
+                    ? .localDatasetRebootstrap
+                    : .serverReconciliation
             )
             changeRequestProcessor.reset()
             try resetDatabaseToken()
@@ -1659,13 +2240,11 @@ public class CloudKitSynchronizer: NSObject {
         }
         try establishAccountScopeLeaseDurably(
             accountIdentifier: confirmedAccountIdentifier,
-            forceInvalidation: didReplaceAccount
+            forceInvalidation:
+                didReplaceAccount || requiresLocalDatasetRebootstrap
+                    || accountScopeAuthorityFence.requiresGenerationRotation
         )
-        if didReplaceAccount {
-            await accountScopeInvalidationHandler?(.accountReplaced)
-        }
         // Publish the new account identity only after its server-first rebuild
-        // request is durable. If the process dies first, the next validation
         // still sees the old account and idempotently requests the same reset;
         // it can never observe a new account paired with an old completed
         // migration and rediscover retained user data as fresh uploads.
@@ -1676,7 +2255,223 @@ public class CloudKitSynchronizer: NSObject {
         accountValidationRequired = false
         cancelSync = false
         cancelledDueToUnauthentication = false
+        accountScopeAuthorityFence.clear()
         return confirmedAccountIdentifier
+    }
+
+    /// Resolves application-specific dataset identity before BigSync claims an
+    /// initial account. The callback may suspend for Realm and CloudKit work,
+    /// so the exact attempt, account, and binding generation are all sampled
+    /// again before account publication can continue.
+    private func admitInitialReplicaBindingIfNeeded(
+        accountIdentifier: String,
+        accountScopeIdentifier: String,
+        validationAttemptID: UUID
+    ) async throws {
+        guard let expectedBinding = try BigSyncReplicaBindingStateStore.load(
+            store: keyValueStore,
+            key: replicaBindingStateKey
+        ) else {
+            throw BigSyncReplicaBindingError.corrupt
+        }
+        guard expectedBinding.pendingPort == nil else {
+            throw BigSyncCloudAccountPortError.corruptRequirement
+        }
+        guard expectedBinding.activeAccountScopeIdentifier == nil else {
+            return
+        }
+        try await admitReplicaBinding(
+            accountIdentifier: accountIdentifier,
+            accountScopeIdentifier: accountScopeIdentifier,
+            generationIdentifier:
+                expectedBinding.activeGenerationIdentifier,
+            expectedBinding: expectedBinding,
+            validationAttemptID: validationAttemptID
+        )
+    }
+
+    private func admitReplicaBinding(
+        accountIdentifier: String,
+        accountScopeIdentifier: String,
+        generationIdentifier: String,
+        expectedBinding: BigSyncReplicaBindingSnapshot,
+        validationAttemptID: UUID
+    ) async throws {
+        guard let handler = initialReplicaBindingAdmissionHandler else {
+            throw BigSyncCloudAccountPortError
+                .initialDatasetAdmissionUnavailable
+        }
+
+        try await handler(BigSyncInitialReplicaBindingContext(
+            accountScopeIdentifier: accountScopeIdentifier,
+            replicaBindingGenerationIdentifier:
+                generationIdentifier
+        ))
+        try checkAccountValidationAttempt(validationAttemptID)
+        let revalidatedAccountIdentifier = try await accountIdentifierProvider()
+        try checkAccountValidationAttempt(validationAttemptID)
+        guard revalidatedAccountIdentifier == accountIdentifier else {
+            accountValidationRequired = true
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
+        }
+        guard try BigSyncReplicaBindingStateStore.load(
+            store: keyValueStore,
+            key: replicaBindingStateKey
+        ) == expectedBinding else {
+            throw CancellationError()
+        }
+    }
+
+    private func durableAccountIdentifier() throws -> String? {
+        guard let value = try keyValueStore.bigSyncDurableObject(
+            forKey: cloudKitAccountIdentifierKey
+        ) else {
+            return nil
+        }
+        guard let value = value as? String, !value.isEmpty else {
+            throw BigSyncCloudAccountPortError.corruptRequirement
+        }
+        return value
+    }
+
+    private func requiredDurableAccountIdentifier() throws -> String {
+        guard let value = try durableAccountIdentifier() else {
+            throw BigSyncCloudAccountPortError.corruptRequirement
+        }
+        return value
+    }
+
+    /// Returns the durable account-port gate, if one is active.
+    @BigSyncBackgroundActor
+    public func pendingCloudAccountPortRequirement() throws
+        -> BigSyncCloudAccountPortRequirement? {
+        try BigSyncReplicaBindingStateStore.load(
+            store: keyValueStore,
+            key: replicaBindingStateKey
+        )?.pendingPort
+    }
+
+    /// Publishes an exact destination binding for clients that implement the
+    /// optional explicit-transfer policy outside an ordinary sync run.
+    @BigSyncBackgroundActor
+    public func activateCloudAccountPort(
+        _ expected: BigSyncCloudAccountPortRequirement
+    ) async throws {
+        guard accountReplacementPolicy == .requireExplicitDatasetPort,
+              !syncing,
+              !synchronizationDrainIsActive,
+              try pendingCloudAccountPortRequirement() == expected else {
+            throw BigSyncCloudAccountPortError.corruptRequirement
+        }
+        let attemptID = synchronizationAttemptID
+        let accountIdentifier = try await accountIdentifierProvider()
+        try checkAccountValidationAttempt(attemptID)
+        guard Self.accountScopeIdentifier(for: accountIdentifier)
+                == expected.destinationAccountScopeIdentifier,
+              try pendingCloudAccountPortRequirement() == expected else {
+            throw BigSyncCloudAccountPortError.corruptRequirement
+        }
+        let confirmedAccountIdentifier = try await accountIdentifierProvider()
+        try checkAccountValidationAttempt(attemptID)
+        guard confirmedAccountIdentifier == accountIdentifier,
+              try pendingCloudAccountPortRequirement() == expected else {
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
+        }
+
+        _ = try BigSyncReplicaBindingStateStore.activatePort(
+            expected,
+            store: keyValueStore,
+            key: replicaBindingStateKey
+        )
+        try keyValueStore.bigSyncSetDurably(
+            value: confirmedAccountIdentifier,
+            forKey: cloudKitAccountIdentifierKey
+        )
+        accountValidationRequired = true
+        cancelSync = true
+        portActivationRequiresWorkerRestart = true
+    }
+
+    /// Stops an ordinary journal wakeup at the durable replica-binding gate.
+    /// Account-change notifications deliberately call `beginSynchronization`
+    /// directly so they can revalidate the current account while preserving
+    /// the first pending transition. Local writes use this helper through the
+    /// model-adapter delegate and never perform doomed account or CloudKit I/O.
+    @discardableResult
+    internal func reportPendingCloudAccountPortIfNeeded() -> Bool {
+        guard accountReplacementPolicy == .requireExplicitDatasetPort else {
+            return false
+        }
+        do {
+            guard let requirement = try
+                    pendingCloudAccountPortRequirement() else {
+                return false
+            }
+            postNotification(
+                .SynchronizerDidFailToSynchronize,
+                userInfo: [
+                    cloudKitSynchronizerErrorKey:
+                        BigSyncCloudAccountPortError.required(requirement),
+                ]
+            )
+            logger.info(
+                "QSCloudKitSynchronizer >> Synchronization remains paused for the pending local-dataset port"
+            )
+            return true
+        } catch {
+            let reportedError: Error =
+                error is BigSyncReplicaBindingError
+                    ? BigSyncCloudAccountPortError.corruptRequirement
+                    : error
+            postNotification(
+                .SynchronizerDidFailToSynchronize,
+                userInfo: [
+                    cloudKitSynchronizerErrorKey: reportedError,
+                ]
+            )
+            logger.error(
+                "QSCloudKitSynchronizer >> Pending account-port state is unreadable: \(error)"
+            )
+            return true
+        }
+    }
+
+    private func prepareReplicaBindingState() throws
+        -> BigSyncReplicaBindingSnapshot {
+        guard let installationIdentifier = BackupDetection
+            .installationIdentifier(
+                namespace: durableStateNamespace,
+                sharedSentinelBaseURL: backupDetectionBaseURL
+            ) else {
+            throw BigSyncReplicaBindingError.corrupt
+        }
+        return try BigSyncReplicaBindingStateStore.prepare(
+            store: keyValueStore,
+            key: replicaBindingStateKey,
+            installationIdentifier: installationIdentifier
+        )
+    }
+
+    internal func activeReplicaBindingForRun(
+        accountScopeIdentifier: String
+    ) throws -> (
+        generationIdentifier: String?,
+        acceptsLegacyUnboundMutations: Bool
+    ) {
+        guard accountReplacementPolicy.usesDatasetReplicaBinding else {
+            return (nil, true)
+        }
+        guard let binding = try BigSyncReplicaBindingStateStore.load(
+            store: keyValueStore,
+            key: replicaBindingStateKey
+        ), binding.pendingPort == nil,
+        binding.activeAccountScopeIdentifier == accountScopeIdentifier else {
+            throw BigSyncReplicaBindingError.accountMismatch
+        }
+        return (
+            binding.activeGenerationIdentifier,
+            binding.acceptsLegacyUnboundMutations
+        )
     }
 
     /// Returns the last durably validated CloudKit account lease. Temporary
@@ -1684,7 +2479,13 @@ public class CloudKitSynchronizer: NSObject {
     /// `.CKAccountChanged`, restore, and a proved account replacement do.
     @BigSyncBackgroundActor
     public func accountScopeLease() throws -> BigSyncAccountScopeLease? {
-        try readAccountScopeLeaseDurably().lease
+        guard !accountScopeAuthorityFence.rejectsAuthority,
+              !accountValidationRequired,
+              backupDetectionError == nil,
+              !backupRestoreDetected else {
+            return nil
+        }
+        return try readAccountScopeLeaseDurably().lease
     }
 
     /// Revalidates a captured lease after suspension. Domain writers should
@@ -1778,6 +2579,28 @@ public class CloudKitSynchronizer: NSObject {
             accountScopeIdentifier: nil,
             validatedAt: nil
         )
+    }
+
+    private func queueAccountScopeInvalidation(
+        _ reason: BigSyncAccountScopeInvalidationReason
+    ) {
+        pendingAccountScopeInvalidation = (UUID(), reason)
+    }
+
+    private func invalidateAccountScope(
+        _ reason: BigSyncAccountScopeInvalidationReason
+    ) async throws {
+        queueAccountScopeInvalidation(reason)
+        try await performPendingAccountScopeInvalidation()
+    }
+
+    private func performPendingAccountScopeInvalidation() async throws {
+        guard let pending = pendingAccountScopeInvalidation else { return }
+        try invalidateAccountScopeLeaseDurably()
+        try await accountScopeInvalidationHandler?(pending.reason)
+        if pendingAccountScopeInvalidation?.id == pending.id {
+            pendingAccountScopeInvalidation = nil
+        }
     }
 
     private func establishAccountScopeLeaseDurably(
@@ -2072,16 +2895,17 @@ public class CloudKitSynchronizer: NSObject {
             )
             return
         }
-        // `finishing` is the only cross-store ambiguous window: all adapters
-        // may have durably finished before the local KVS marker was written.
-        // In that case observing no active bootstrap is sufficient to publish
-        // completion.  If any adapter is still active, restart from requested;
-        // the adapter's provenance makes that restart idempotent.
+        // A cold or unavailable adapter is not completion evidence. Only the
+        // exact durable terminal marker can close the finishing crash window.
         if migration.phase == .finishing {
-            let bootstrapIsActive = await migratingAdapter
-                .isChangeFeedServerBootstrapActive()
+            let completionIsDurable = try await migratingAdapter
+                .changeFeedResetCompletionIsDurable(
+                    accountScopeIdentifier: migration.accountScopeIdentifier,
+                    epoch: migration.epoch,
+                    mode: migration.mode
+                )
             try await revalidateRunContext(context)
-            if !bootstrapIsActive {
+            if completionIsDurable {
                 if migration.mode == .encryptedDataReset {
                     try clearConfiguredZoneTerminal(
                         modelAdapter.recordZoneID,
@@ -2207,6 +3031,11 @@ public class CloudKitSynchronizer: NSObject {
     func _test_validateSynchronizationAccount() async throws {
         _ = try await validateSynchronizationAccount()
     }
+
+    @BigSyncBackgroundActor
+    func _test_requireBackupDetectionRetry(_ error: Error) {
+        backupDetectionError = error
+    }
 #endif
     
     /// Cancel synchronization. It will cause a current synchronization to end with a `cancelled` error.
@@ -2270,23 +3099,27 @@ public class CloudKitSynchronizer: NSObject {
         return activeZoneTokens[zoneID]
     }
     
-    /// Deletes the one active custom zone of a disposable synchronizer client.
+    /// Ensures that the one active custom zone of a disposable synchronizer
+    /// client no longer exists.
     ///
     /// The caller must discard the synchronizer and all of its adapters after
-    /// this succeeds: their local tracking state now refers to a deleted zone.
+    /// this succeeds: their local tracking state now refers to an absent zone.
     /// This is intentionally limited to a client whose every adapter targets
     /// one identical zone, such as an isolated end-to-end test client.
+    ///
+    /// CloudKit reporting the zone already absent is also success. That makes
+    /// a crash after remote delete but before the caller's local receipt
+    /// durably resumable.
     @BigSyncBackgroundActor
-    @discardableResult
     public func deleteActiveRecordZoneForDisposableClient(
         using receipt: SynchronizationReceipt
-    ) async throws -> Bool {
+    ) async throws {
         let activeZoneIDs = Set(modelAdapters.map(\.recordZoneID))
         guard activeZoneIDs.count == 1,
               let activeZoneID = activeZoneIDs.first else {
             throw OneOffRecordZoneResetError.disposableClientMustUseExactlyOneRecordZone
         }
-        return try await deleteDisposableRecordZoneIfPresent(
+        try await deleteDisposableRecordZoneIfPresent(
             activeZoneID,
             using: receipt
         )
@@ -2295,7 +3128,7 @@ public class CloudKitSynchronizer: NSObject {
     private func deleteDisposableRecordZoneIfPresent(
         _ zoneID: CKRecordZone.ID,
         using receipt: SynchronizationReceipt
-    ) async throws -> Bool {
+    ) async throws {
         guard allowsDisposableZoneDeletion else {
             throw OneOffRecordZoneResetError.disposableZoneDeletionNotAllowed
         }
@@ -2331,19 +3164,15 @@ public class CloudKitSynchronizer: NSObject {
         do {
             try await ensureCurrentAccount(receipt.accountIdentifier)
             try validateReservedAuthorization()
-            let deleted: Bool
             do {
                 try await deleteRecordZone(zoneID)
-                deleted = true
             } catch {
                 guard isMissingRecordZoneError(error) else { throw error }
-                deleted = false
             }
             try validateReservedAuthorization()
             try await ensureCurrentAccount(receipt.accountIdentifier)
             try validateReservedAuthorization()
             shouldConsumeAuthorization = true
-            return deleted
         } catch {
             throw error
         }
@@ -2432,6 +3261,7 @@ extension CloudKitSynchronizer: ModelAdapterDelegate {
     }
     
     public func hasChangesToUpload() async {
+        guard !reportPendingCloudAccountPortIfNeeded() else { return }
         beginSynchronization()
     }
 }

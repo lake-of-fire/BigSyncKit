@@ -17,6 +17,7 @@ class SyncedEntity: Object {
     @objc dynamic var share: SyncedEntity?
     @objc dynamic var encodedRecord: Data?
     @objc dynamic var pendingGeneration: String?
+    @objc dynamic var pendingReplicaBindingGenerationIdentifier: String?
 
     convenience init(entityType: String, identifier: String, state: Int) {
         self.init()
@@ -31,7 +32,25 @@ class SyncedEntity: Object {
     }
 
     override static func indexedProperties() -> [String] {
-        ["state", "entityType"]
+        [
+            "state",
+            "entityType",
+            "pendingReplicaBindingGenerationIdentifier",
+        ]
+    }
+
+    func setPendingMutation(
+        generation: String,
+        replicaBindingGenerationIdentifier: String?
+    ) {
+        pendingGeneration = generation
+        pendingReplicaBindingGenerationIdentifier =
+            replicaBindingGenerationIdentifier
+    }
+
+    func clearPendingMutation() {
+        pendingGeneration = nil
+        pendingReplicaBindingGenerationIdentifier = nil
     }
     
     var entityState: SyncedEntityState {

@@ -40,6 +40,7 @@ extension CloudKitSynchronizer {
         priorityClassNames: [String] = [],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
+        durableStateRecordZoneID: CKRecordZone.ID? = nil,
         localState: BigSyncLocalStateConfiguration? = nil,
         accountIdentifierProvider: AccountIdentifierProvider? = nil,
         accountStatusProvider: AccountStatusProvider? = nil,
@@ -47,15 +48,21 @@ extension CloudKitSynchronizer {
         changeFeed: (any CloudKitChangeFeed)? = nil,
         recordStore: (any CloudKitRecordStore)? = nil,
         allowsDisposableZoneDeletion: Bool = false,
+        initialReplicaBindingAdmissionHandler:
+            BigSyncBackgroundWorkerConfiguration
+                .InitialReplicaBindingAdmissionHandler? = nil,
+        accountReplacementPolicy: BigSyncCloudAccountReplacementPolicy =
+            .serverReconciliation,
         compatibilityVersion: Int = 0,
         logger: Logging.Logger
     ) -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
+        let durableStateZoneID = durableStateRecordZoneID ?? zoneID
         let durableStateNamespace = makeDurableStateNamespace(
             identifier: synchronizerName,
             containerIdentifier: containerName,
             databaseScope: .private,
-            recordZoneID: zoneID
+            recordZoneID: durableStateZoneID
         )
         let keyValueStore: any KeyValueStore
         let backupDetectionBaseURL: URL?
@@ -123,19 +130,48 @@ extension CloudKitSynchronizer {
         let clientIdentity = BigSyncClientIdentity(
             synchronizerName: synchronizerName,
             containerName: containerName,
-            recordZoneID: zoneID,
+            recordZoneID: durableStateZoneID,
             databaseScope: .private,
             sharedStateBaseURL: backupDetectionBaseURL
                 ?? BackupDetection.defaultSentinelURL(
                     namespace: durableStateNamespace
                 ).deletingLastPathComponent()
         )
+        let installationIdentifier: String
         do {
-            _ = try clientIdentity.prepareInstallation()
+            installationIdentifier = try clientIdentity.prepareInstallation()
         } catch {
             preconditionFailure(
                 "BigSyncKit installation identity failed before provider setup: \(error)"
             )
+        }
+        let mutationJournalIdentityProvider:
+            (@Sendable () -> BigSyncMutationJournalIdentity?)?
+        if accountReplacementPolicy.usesDatasetReplicaBinding {
+            let replicaBindingKey = durableStateNamespace
+                + ".ReplicaBinding.v1"
+            do {
+                _ = try BigSyncReplicaBindingStateStore.prepare(
+                    store: keyValueStore,
+                    key: replicaBindingKey,
+                    installationIdentifier: installationIdentifier
+                )
+            } catch {
+                preconditionFailure(
+                    "BigSyncKit replica binding failed before provider setup: \(error)"
+                )
+            }
+            let mutationIdentityReader =
+                BigSyncMutationJournalIdentityReader(
+                    clientIdentity: clientIdentity,
+                    store: keyValueStore,
+                    key: replicaBindingKey
+                )
+            mutationJournalIdentityProvider = {
+                mutationIdentityReader.current()
+            }
+        } else {
+            mutationJournalIdentityProvider = nil
         }
         let provider = DefaultRealmSwiftAdapterProvider(
             targetConfigurations: configurations,
@@ -162,6 +198,7 @@ extension CloudKitSynchronizer {
             containerIdentifier: containerName,
             database: database,
             recordZoneID: zoneID,
+            durableStateRecordZoneID: durableStateRecordZoneID,
             keyValueStore: keyValueStore,
             compatibilityVersion: compatibilityVersion,
             accountIdentifierProvider: accountIdentifierProvider,
@@ -170,6 +207,9 @@ extension CloudKitSynchronizer {
             changeFeed: changeFeed ?? database,
             recordStore: recordStore ?? database,
             backupDetectionBaseURL: backupDetectionBaseURL,
+            initialReplicaBindingAdmissionHandler:
+                initialReplicaBindingAdmissionHandler,
+            accountReplacementPolicy: accountReplacementPolicy,
             logger: logger
         )
         precondition(
@@ -184,16 +224,25 @@ extension CloudKitSynchronizer {
             clientIdentity.durableStateNamespace == durableStateNamespace,
             "BigSyncKit mutation and synchronizer durable namespaces diverged"
         )
-        BigSyncMutationPolicy(
+        let mutationPolicy = BigSyncMutationPolicy(
             excludedClassNames: excludedClassNames,
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName
-        ).install(
-            configurations: configurations,
-            installationIdentifierProvider: {
-                clientIdentity.currentInstallationIdentifier()
-            }
         )
+        if let mutationJournalIdentityProvider {
+            mutationPolicy.install(
+                configurations: configurations,
+                mutationJournalIdentityProvider:
+                    mutationJournalIdentityProvider
+            )
+        } else {
+            mutationPolicy.install(
+                configurations: configurations,
+                installationIdentifierProvider: {
+                    clientIdentity.currentInstallationIdentifier()
+                }
+            )
+        }
 #if DEBUG
         if allowsDisposableZoneDeletion, localState != nil {
             synchronizer._enableDisposableZoneDeletionForTesting()

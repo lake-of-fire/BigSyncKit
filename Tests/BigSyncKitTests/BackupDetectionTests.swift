@@ -27,6 +27,53 @@ final class BackupDetectionTests: XCTestCase {
 
     private let store = Store()
 
+    private final class CountingDurableStore: NSObject,
+        DurableKeyValueStore {
+        let base: FileKeyValueStore
+        private(set) var durableReadCount = 0
+
+        init(base: FileKeyValueStore) {
+            self.base = base
+        }
+
+        func object(forKey key: String) -> Any? {
+            base.object(forKey: key)
+        }
+
+        func bool(forKey key: String) -> Bool {
+            base.bool(forKey: key)
+        }
+
+        func set(value: Any?, forKey key: String) {
+            base.set(value: value, forKey: key)
+        }
+
+        func set(boolValue: Bool, forKey key: String) {
+            base.set(boolValue: boolValue, forKey: key)
+        }
+
+        func removeObject(forKey key: String) {
+            base.removeObject(forKey: key)
+        }
+
+        func synchronize() -> Bool { base.synchronize() }
+        func prepareForUse() throws { try base.prepareForUse() }
+        func validateDurability() throws { try base.validateDurability() }
+
+        func durableObject(forKey key: String) throws -> Any? {
+            durableReadCount += 1
+            return try base.durableObject(forKey: key)
+        }
+
+        func setDurably(value: Any?, forKey key: String) throws {
+            try base.setDurably(value: value, forKey: key)
+        }
+
+        func removeDurably(forKey key: String) throws {
+            try base.removeDurably(forKey: key)
+        }
+    }
+
     private func temporaryRoot() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -40,6 +87,171 @@ final class BackupDetectionTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try FileManager.default.copyItem(at: source, to: destination)
+    }
+
+    func testReusableMutationIdentityProviderObservesPeerBindingRotation()
+    throws {
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "reusable-mutation-identity",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: temporaryRoot()
+        )
+        let initialBinding = try identity
+            .prepareReplicaBindingGenerationIdentifier()
+        let provider = identity.makeMutationJournalIdentityProvider()
+        XCTAssertEqual(
+            provider()?.replicaBindingGenerationIdentifier,
+            initialBinding
+        )
+
+        let peerStore = FileKeyValueStore(
+            fileURL: identity.synchronizationStateFileURL
+        )
+        let key = identity.durableStateNamespace + ".ReplicaBinding.v1"
+        _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+            "account-a",
+            store: peerStore,
+            key: key
+        )
+        let port = try BigSyncReplicaBindingStateStore.requirePort(
+            sourceAccountScopeIdentifier: "account-a",
+            destinationAccountScopeIdentifier: "account-b",
+            store: peerStore,
+            key: key
+        )
+
+        XCTAssertEqual(
+            provider()?.replicaBindingGenerationIdentifier,
+            port.bindingGenerationIdentifier
+        )
+    }
+
+    func testMutationIdentityReaderLoadsOneBindingSnapshotPerGeneration()
+    throws {
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "counted-mutation-identity",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: temporaryRoot()
+        )
+        let binding = try identity
+            .prepareReplicaBindingGenerationIdentifier()
+        let store = CountingDurableStore(base: FileKeyValueStore(
+            fileURL: identity.synchronizationStateFileURL
+        ))
+        let reader = BigSyncMutationJournalIdentityReader(
+            clientIdentity: identity,
+            store: store,
+            key: identity.durableStateNamespace + ".ReplicaBinding.v1"
+        )
+
+        XCTAssertEqual(
+            reader.current()?.replicaBindingGenerationIdentifier,
+            binding
+        )
+        XCTAssertEqual(store.durableReadCount, 1)
+        XCTAssertEqual(
+            reader.current()?.replicaBindingGenerationIdentifier,
+            binding
+        )
+        XCTAssertEqual(store.durableReadCount, 2)
+    }
+
+    func testMutationJournalIdentityPerformanceBenchmark() throws {
+        guard ProcessInfo.processInfo.environment[
+            "BIGSYNC_RUN_MUTATION_BENCHMARK"
+        ] == "1" else {
+            throw XCTSkip(
+                "Set BIGSYNC_RUN_MUTATION_BENCHMARK=1 to measure mutation identity overhead."
+            )
+        }
+
+        let iterationCount = 1_000
+        let root = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "mutation-identity-benchmark",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: root
+        )
+        _ = try identity.prepareReplicaBindingGenerationIdentifier()
+        let countedStore = CountingDurableStore(base: FileKeyValueStore(
+            fileURL: identity.synchronizationStateFileURL
+        ))
+        let reader = BigSyncMutationJournalIdentityReader(
+            clientIdentity: identity,
+            store: countedStore,
+            key: identity.durableStateNamespace + ".ReplicaBinding.v1"
+        )
+
+        func measure(
+            label: String,
+            install: (Realm.Configuration) -> Void
+        ) throws -> UInt64 {
+            var configuration = Realm.Configuration()
+            configuration.inMemoryIdentifier =
+                "mutation-identity-benchmark-\(label)-\(UUID().uuidString)"
+            configuration.objectTypes = [
+                InstallationIdentityMutationObject.self,
+                BigSyncPendingMutation.self,
+            ]
+            install(configuration)
+            let realm = try Realm(configuration: configuration)
+            let object = InstallationIdentityMutationObject()
+            object.id = label
+            try realm.write {
+                realm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+
+            let start = DispatchTime.now().uptimeNanoseconds
+            try realm.write {
+                for offset in 1 ... iterationCount {
+                    object.modifiedAt = Date(
+                        timeIntervalSince1970: TimeInterval(offset)
+                    )
+                    object.refreshChangeMetadata(
+                        explicitlyModified: true,
+                        at: object.modifiedAt
+                    )
+                }
+            }
+            return DispatchTime.now().uptimeNanoseconds - start
+        }
+
+        let fixedDuration = try measure(label: "fixed") { configuration in
+            BigSyncMutationPolicy(excludedClassNames: []).install(
+                configurations: [configuration],
+                installationIdentifier: "fixed-installation"
+            )
+        }
+        let readsBeforeDurableMeasurement = countedStore.durableReadCount
+        let durableDuration = try measure(label: "durable") { configuration in
+            BigSyncMutationPolicy(excludedClassNames: []).install(
+                configurations: [configuration],
+                mutationJournalIdentityProvider: { reader.current() }
+            )
+        }
+        let measuredDurableReads = countedStore.durableReadCount
+            - readsBeforeDurableMeasurement
+
+        XCTAssertEqual(measuredDurableReads, iterationCount + 1)
+        print(
+            "BigSync mutation identity benchmark: iterations=\(iterationCount) "
+                + "fixed_ns_per_refresh=\(fixedDuration / UInt64(iterationCount)) "
+                + "durable_ns_per_refresh=\(durableDuration / UInt64(iterationCount)) "
+                + "durable_binding_reads=\(measuredDurableReads)"
+        )
     }
 
     func testFirstRunRegularLaunchAndRestoredBackup() throws {
@@ -268,6 +480,127 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertEqual(replacementCount, 2)
     }
 
+    func testCompletedManualRestoreOutranksMatchingCleanupResidue() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "completed-restore-residue",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(
+                zoneName: "zone",
+                ownerName: CKCurrentUserDefaultName
+            ),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+        var replacementCount = 0
+        let completed = try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            { replacementCount += 1 }
+        )
+        try BackupDetection.markRestoreResetCompleted(
+            namespace: identity.durableStateNamespace,
+            expectedEventIdentifier:
+                completed.restoreEventIdentifier.uuidString.lowercased(),
+            sharedSentinelBaseURL: base
+        )
+
+        let sentinelURL = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace,
+            sharedBaseURL: base
+        )
+        let completedURL = BackupDetection.completedManualRestoreReceiptURL(
+            sentinelURL: sentinelURL
+        )
+        try FileManager.default.copyItem(
+            at: completedURL,
+            to: BackupDetection.manualRestoreIntentURL(
+                sentinelURL: sentinelURL
+            )
+        )
+
+        let resumed = try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            { replacementCount += 1 }
+        )
+        XCTAssertEqual(resumed, completed)
+        XCTAssertEqual(replacementCount, 1)
+
+        try FileManager.default.copyItem(
+            at: completedURL,
+            to: BackupDetection.restoreEventURL(sentinelURL: sentinelURL)
+        )
+        guard case .completed(let preflight) = try BackupDetection
+            .manualRestorePreflight(
+                namespace: identity.durableStateNamespace,
+                transactionIdentifier: transactionIdentifier,
+                sharedSentinelBaseURL: base
+            ) else {
+            return XCTFail("Matching cleanup residue must retain completion")
+        }
+        XCTAssertEqual(
+            preflight.transactionIdentifier,
+            completed.transactionIdentifier
+        )
+        XCTAssertEqual(
+            preflight.restoreEventIdentifier,
+            completed.restoreEventIdentifier
+        )
+        XCTAssertEqual(
+            preflight.newInstallationIdentifier,
+            completed.newInstallationIdentifier
+        )
+    }
+
+    func testCompletedManualRestoreRejectsConflictingCleanupResidue() throws {
+        let namespace = "completed-restore-conflicting-residue"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        )
+        let completed = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: UUID(),
+            sharedSentinelBaseURL: base
+        )
+        try BackupDetection.markRestoreResetCompleted(
+            namespace: namespace,
+            expectedEventIdentifier:
+                completed.restoreEventIdentifier.uuidString.lowercased(),
+            sharedSentinelBaseURL: base
+        )
+        let sentinelURL = BackupDetection.defaultSentinelURL(
+            namespace: namespace,
+            sharedBaseURL: base
+        )
+        let conflictingReceipt = [
+            "BigSyncKit manual restore v1",
+            UUID().uuidString,
+            completed.restoreEventIdentifier.uuidString,
+            completed.oldInstallationIdentifier,
+            completed.newInstallationIdentifier,
+            "end",
+        ].joined(separator: "\n")
+        try Data(conflictingReceipt.utf8).write(
+            to: BackupDetection.manualRestoreIntentURL(
+                sentinelURL: sentinelURL
+            )
+        )
+
+        XCTAssertThrowsError(try BackupDetection.manualRestorePreflight(
+            namespace: namespace,
+            transactionIdentifier: completed.transactionIdentifier,
+            sharedSentinelBaseURL: base
+        )) { error in
+            XCTAssertEqual(
+                error as? BackupDetection.Error,
+                .manualRestoreStateAmbiguous
+            )
+        }
+    }
+
     func testManualRestoreRejectsMismatchedTransactionWithoutRotatingIdentity() throws {
         let namespace = "manual-mismatched-transaction"
         let base = temporaryRoot()
@@ -323,16 +656,15 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertEqual(replacementInvocationCount, 1)
         XCTAssertEqual(identity.currentInstallationIdentifier(), receipt.newInstallationIdentifier)
 
-        // BigSync cannot infer whether a caller rolled the replacement back.
-        // Its stable-token resume therefore invokes the caller's phase-aware
-        // closure; a caller whose journal says it is installed supplies a no-op.
+        // The completed receipt proves that replacement and identity
+        // publication finished. Retrying the token must not replace again.
         _ = try identity.withManualBackupRestore(
             transactionIdentifier: transactionIdentifier,
             {
                 replacementInvocationCount += 1
             }
         )
-        XCTAssertEqual(replacementInvocationCount, 2)
+        XCTAssertEqual(replacementInvocationCount, 1)
     }
 
     func testClientIdentityNeverRollsBackAfterRestoreEventPublication() throws {
@@ -513,6 +845,15 @@ final class BackupDetectionTests: XCTestCase {
             sharedStateBaseURL: base
         )
         let originalInstallationIdentifier = try identity.prepareInstallation()
+        let leaseURL = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace,
+            sharedBaseURL: base
+        ).appendingPathExtension("lease")
+        XCTAssertEqual(
+            BigSyncClientIdentityLeaseRegistry
+                .cachedInstallationIdentifier(at: leaseURL),
+            originalInstallationIdentifier
+        )
         let transactionIdentifier = UUID()
         _ = try BackupDetection.prepareManualRestoreIntent(
             namespace: identity.durableStateNamespace,
@@ -520,6 +861,10 @@ final class BackupDetectionTests: XCTestCase {
             sharedSentinelBaseURL: base
         )
 
+        XCTAssertNil(
+            BigSyncClientIdentityLeaseRegistry
+                .cachedInstallationIdentifier(at: leaseURL)
+        )
         XCTAssertNil(identity.currentInstallationIdentifier())
         XCTAssertThrowsError(try identity.prepareInstallation()) { error in
             XCTAssertEqual(
@@ -548,6 +893,11 @@ final class BackupDetectionTests: XCTestCase {
         ))
         XCTAssertEqual(
             try identity.prepareInstallation(),
+            originalInstallationIdentifier
+        )
+        XCTAssertEqual(
+            BigSyncClientIdentityLeaseRegistry
+                .cachedInstallationIdentifier(at: leaseURL),
             originalInstallationIdentifier
         )
     }

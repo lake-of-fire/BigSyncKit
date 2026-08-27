@@ -18,6 +18,7 @@ final class RebuildProvenance: Object {
     @objc dynamic var hadValidServerRecord = false
     @objc dynamic var priorState = 0
     @objc dynamic var priorPendingGeneration: String?
+    @objc dynamic var priorPendingReplicaBindingGenerationIdentifier: String?
     @objc dynamic var accountScopeIdentifier = ""
     @objc dynamic var epoch = 0
 
