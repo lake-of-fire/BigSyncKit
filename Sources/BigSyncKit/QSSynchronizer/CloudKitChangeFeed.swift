@@ -83,6 +83,11 @@ public enum CloudKitZoneDeletionKind: String, Sendable, Equatable, Codable {
 public struct CloudKitZoneDeletion: Sendable {
     public let zoneID: CKRecordZone.ID
     public let kind: CloudKitZoneDeletionKind
+
+    public init(zoneID: CKRecordZone.ID, kind: CloudKitZoneDeletionKind) {
+        self.zoneID = zoneID
+        self.kind = kind
+    }
 }
 
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
@@ -91,6 +96,18 @@ public struct CloudKitDatabaseChangePage: Sendable {
     public let changedZoneIDs: [CKRecordZone.ID]
     public let deletions: [CloudKitZoneDeletion]
     public let moreComing: Bool
+
+    public init(
+        cursor: DatabaseChangeCursor,
+        changedZoneIDs: [CKRecordZone.ID],
+        deletions: [CloudKitZoneDeletion],
+        moreComing: Bool
+    ) {
+        self.cursor = cursor
+        self.changedZoneIDs = changedZoneIDs
+        self.deletions = deletions
+        self.moreComing = moreComing
+    }
 }
 
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
@@ -99,6 +116,18 @@ public struct CloudKitRecordZoneChangePage: Sendable {
     public let records: [CKRecord]
     public let deletedRecordIDs: [CKRecord.ID]
     public let moreComing: Bool
+
+    public init(
+        cursor: RecordZoneChangeCursor,
+        records: [CKRecord],
+        deletedRecordIDs: [CKRecord.ID],
+        moreComing: Bool
+    ) {
+        self.cursor = cursor
+        self.records = records
+        self.deletedRecordIDs = deletedRecordIDs
+        self.moreComing = moreComing
+    }
 }
 
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
