@@ -649,7 +649,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testExplicitDatasetPortMigratesLegacyBindingBeforeReplacement()
+    func testAccountMarkerCannotCreateReplicaBindingAuthority()
     async throws {
         let transport = AccountFencingTransport()
         let store = AccountFencingStore()
@@ -667,27 +667,14 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             )
         )
 
-        let requirement: BigSyncCloudAccountPortRequirement
         do {
             try await synchronizer._test_validateSynchronizationAccount()
-            XCTFail("Expected the legacy account binding to require a port")
-            return
-        } catch BigSyncCloudAccountPortError.required(let value) {
-            requirement = value
+            XCTFail("Expected an account marker without binding authority to fail")
+        } catch BigSyncReplicaBindingError.corrupt {
+            // The marker is not replica authority.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
         }
-
-        XCTAssertEqual(
-            requirement.sourceAccountScopeIdentifier,
-            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
-        )
-        XCTAssertEqual(
-            requirement.destinationAccountScopeIdentifier,
-            CloudKitSynchronizer.accountScopeIdentifier(for: "account-b")
-        )
-        XCTAssertEqual(
-            try synchronizer.pendingCloudAccountPortRequirement(),
-            requirement
-        )
         XCTAssertNil(try synchronizer.accountScopeLease())
         XCTAssertEqual(transport.operationCount, 0)
     }
@@ -1748,11 +1735,11 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testAmbiguousLegacyStateIsIgnoredByZoneBoundNamespace() async throws {
+    func testUnqualifiedObsoleteStateIsIgnoredByZoneBoundNamespace() async throws {
         let store = AccountFencingStore()
         let transport = AccountFencingTransport()
         let zoneID = makeZoneID()
-        let identifier = "legacy-ignored-\(UUID().uuidString)"
+        let identifier = "obsolete-ignored-\(UUID().uuidString)"
         let synchronizer = makeSynchronizer(
             transport: transport,
             store: store,
@@ -1767,11 +1754,11 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             value: "account-a",
             forKey: "\(identifier).BigSyncKitCloudKitAccountIdentifier"
         )
-        let legacyPrefix = "\(identifier).BigSyncKit.ZoneLifecycle.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
-        store.set(boolValue: true, forKey: "\(legacyPrefix).established")
+        let obsoletePrefix = "\(identifier).BigSyncKit.ZoneLifecycle.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
+        store.set(boolValue: true, forKey: "\(obsoletePrefix).established")
         store.set(
             value: CloudKitZoneDeletionKind.purged.rawValue,
-            forKey: "\(legacyPrefix).terminal"
+            forKey: "\(obsoletePrefix).terminal"
         )
         store.set(
             value: ["version": 1, "phase": "prepared", "epoch": 7],
@@ -1794,9 +1781,6 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             )) as? String,
             "account-a"
         )
-        XCTAssertFalse(store.bool(forKey:
-            "\(identifier).BigSyncKit.LegacyStateImport.v1.\(scope).\(zoneID.ownerName).\(zoneID.zoneName).consumed"
-        ))
     }
 
     @BigSyncBackgroundActor

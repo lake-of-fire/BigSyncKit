@@ -2,7 +2,7 @@ import Foundation
 
 /// Current-account CloudKit system-field proof retained in BigSync's tracking
 /// Realm. Domain cutovers use this instead of treating target-Realm presence as
-/// evidence that an unscoped legacy object belongs to the active account.
+/// evidence that an account-unscoped object belongs to the active account.
 public struct BigSyncServerRecordEvidence: Equatable, Sendable {
     public let recordName: String
     public let entityType: String

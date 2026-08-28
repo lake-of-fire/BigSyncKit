@@ -31,8 +31,8 @@ public struct BigSyncPendingMutationInventoryItem: Equatable, Sendable {
 
 extension RealmSwiftAdapter {
     /// Returns exact durable pending rows for the requested model types.
-    /// Callers must decide whether legacy unscoped rows are safe to drain or
-    /// require a fail-closed cutover; this API never guesses their account.
+    /// Callers must decide whether explicitly unscoped rows are safe to drain;
+    /// this API never guesses their account.
     @BigSyncBackgroundActor
     public func pendingMutationInventory(
         entityTypes: Set<String>

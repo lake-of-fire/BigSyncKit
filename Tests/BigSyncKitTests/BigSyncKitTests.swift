@@ -1100,7 +1100,7 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         let unknownScope = BigSyncInboundSemanticQuarantine()
-        unknownScope.lineageID = "legacy-test-unknown-scope"
+        unknownScope.lineageID = "test-unknown-scope"
         unknownScope.recordName = "unknown-scope"
         unknownScope.entityType = BigSyncSemanticallyValidatedObject
             .className()
@@ -1109,7 +1109,7 @@ final class BigSyncKitTests: XCTestCase {
         unknownScope.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
         unknownScope.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
         unknownScope.zoneName = fixture.adapter.recordZoneID.zoneName
-        unknownScope.replicaActivationIdentifier = "legacy-unbound"
+        unknownScope.replicaActivationIdentifier = "unbound-replica"
         unknownScope.changeFeedEpoch = 0
         unknownScope.validationCode = "unknown-scope"
         try await fixture.persistenceRealm.asyncWrite {
@@ -1155,8 +1155,7 @@ final class BigSyncKitTests: XCTestCase {
         let binding = "quarantine-epoch-binding"
         try await fixture.adapter.activateReplicaBinding(
             accountScopeIdentifier: account,
-            replicaBindingGenerationIdentifier: binding,
-            acceptsLegacyUnboundMutations: false
+            replicaBindingGenerationIdentifier: binding
         )
         try await fixture.adapter.activateTransportNamespace(
             containerIdentifier: container,
@@ -1634,7 +1633,7 @@ final class BigSyncKitTests: XCTestCase {
         quarantine.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
         quarantine.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
         quarantine.zoneName = fixture.adapter.recordZoneID.zoneName
-        quarantine.replicaActivationIdentifier = "legacy-unbound"
+        quarantine.replicaActivationIdentifier = "unbound-replica"
         quarantine.committedPageSequence = 7
         quarantine.committedPageReceiptID = receiptID
         quarantine.committedPageOutcomeDigestHex = String(repeating: "a", count: 64)
@@ -1646,7 +1645,7 @@ final class BigSyncKitTests: XCTestCase {
         receipt.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
         receipt.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
         receipt.zoneName = fixture.adapter.recordZoneID.zoneName
-        receipt.replicaActivationIdentifier = "legacy-unbound"
+        receipt.replicaActivationIdentifier = "unbound-replica"
         receipt.pageSequence = 7
         receipt.outcomeDigestHex = quarantine.committedPageOutcomeDigestHex
 
@@ -1863,7 +1862,7 @@ final class BigSyncKitTests: XCTestCase {
             sibling.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
             sibling.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
             sibling.zoneName = fixture.adapter.recordZoneID.zoneName
-            sibling.replicaActivationIdentifier = "legacy-unbound"
+            sibling.replicaActivationIdentifier = "unbound-replica"
             sibling.committedPageSequence = 1
             sibling.committedPageReceiptID = sharedReceiptID
             sibling.committedPageOutcomeDigestHex = sharedOutcomeDigest
@@ -2246,8 +2245,8 @@ final class BigSyncKitTests: XCTestCase {
                 state: SyncedEntityState.synced.rawValue
             )
             let olderRelationship = PendingRelationship()
-            olderRelationship.relationshipName = "legacyRelationship"
-            olderRelationship.targetIdentifier = "legacy-target"
+            olderRelationship.relationshipName = "olderRelationship"
+            olderRelationship.targetIdentifier = "older-target"
             olderRelationship.forSyncedEntity = entity
             fixture.persistenceRealm.add(entity)
             fixture.persistenceRealm.add(olderRelationship)
@@ -2328,7 +2327,7 @@ final class BigSyncKitTests: XCTestCase {
         quarantine.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
         quarantine.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
         quarantine.zoneName = fixture.adapter.recordZoneID.zoneName
-        quarantine.replicaActivationIdentifier = "legacy-unbound"
+        quarantine.replicaActivationIdentifier = "unbound-replica"
         quarantine.committedPageSequence = 1
         quarantine.committedPageReceiptID = "missing-semantic-receipt"
         quarantine.committedPageOutcomeDigestHex = String(
@@ -2368,7 +2367,7 @@ final class BigSyncKitTests: XCTestCase {
         mismatchedReceipt.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
         mismatchedReceipt.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
         mismatchedReceipt.zoneName = fixture.adapter.recordZoneID.zoneName
-        mismatchedReceipt.replicaActivationIdentifier = "legacy-unbound"
+        mismatchedReceipt.replicaActivationIdentifier = "unbound-replica"
         mismatchedReceipt.pageSequence = quarantine.committedPageSequence
         mismatchedReceipt.outcomeDigestHex = String(repeating: "b", count: 64)
         try await fixture.persistenceRealm.asyncWrite {
@@ -3088,8 +3087,7 @@ final class BigSyncKitTests: XCTestCase {
         let transportAdapter: any ModelAdapter = fixture.adapter
         try await transportAdapter.activateReplicaBinding(
             accountScopeIdentifier: "transport-account",
-            replicaBindingGenerationIdentifier: bindingA,
-            acceptsLegacyUnboundMutations: false
+            replicaBindingGenerationIdentifier: bindingA
         )
 
         let object = BigSyncTrackedObject(
@@ -3142,8 +3140,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         try await transportAdapter.activateReplicaBinding(
             accountScopeIdentifier: "transport-account",
-            replicaBindingGenerationIdentifier: bindingB,
-            acceptsLegacyUnboundMutations: false
+            replicaBindingGenerationIdentifier: bindingB
         )
         XCTAssertFalse(
             try fixture.adapter.hasPendingChangesAtTerminalBoundary()
@@ -3308,8 +3305,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         try await fixture.adapter.activateReplicaBinding(
             accountScopeIdentifier: "transport-account",
-            replicaBindingGenerationIdentifier: binding,
-            acceptsLegacyUnboundMutations: false
+            replicaBindingGenerationIdentifier: binding
         )
         let object = BigSyncTrackedObject(
             id: "same-binding-newer-edit",
@@ -3387,8 +3383,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         try await fixture.adapter.activateReplicaBinding(
             accountScopeIdentifier: "transport-account",
-            replicaBindingGenerationIdentifier: bindingA,
-            acceptsLegacyUnboundMutations: false
+            replicaBindingGenerationIdentifier: bindingA
         )
 
         let object = BigSyncTrackedObject(
@@ -3430,8 +3425,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         try await fixture.adapter.activateReplicaBinding(
             accountScopeIdentifier: "transport-account",
-            replicaBindingGenerationIdentifier: bindingB,
-            acceptsLegacyUnboundMutations: false
+            replicaBindingGenerationIdentifier: bindingB
         )
         let staleBindingDeletions = try await fixture.adapter
             .preparedRecordDeletions(
@@ -3504,8 +3498,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         try await fixture.adapter.activateReplicaBinding(
             accountScopeIdentifier: "transport-account",
-            replicaBindingGenerationIdentifier: activeBinding,
-            acceptsLegacyUnboundMutations: false
+            replicaBindingGenerationIdentifier: activeBinding
         )
 
         let current = BigSyncSemanticallyValidatedObject()
@@ -3550,17 +3543,16 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testLegacyUnboundMutationIsEligibleOnlyDuringMigrationWindow()
+    func testUnattributedMutationIsRejectedWhenReplicaBindingIsActive()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
         let activeBinding = String(repeating: "e", count: 64)
         try await fixture.adapter.activateReplicaBinding(
             accountScopeIdentifier: "transport-account",
-            replicaBindingGenerationIdentifier: activeBinding,
-            acceptsLegacyUnboundMutations: true
+            replicaBindingGenerationIdentifier: activeBinding
         )
         let object = BigSyncTrackedObject(
-            id: "legacy-unbound",
+            id: "unattributed",
             createdAt: Date(),
             modifiedAt: Date(),
             explicitlyModifiedAt: nil
@@ -3570,7 +3562,7 @@ final class BigSyncKitTests: XCTestCase {
             object.refreshChangeMetadata(explicitlyModified: true)
         }
         let recordName = BigSyncTrackedObject.className()
-            + ".legacy-unbound"
+            + ".unattributed"
         XCTAssertNil(fixture.targetRealm.object(
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: recordName
@@ -3578,27 +3570,12 @@ final class BigSyncKitTests: XCTestCase {
         _ = try await fixture.adapter._test_forwardPendingMutations(
             in: fixture.targetRealm
         )
-        let legacyUploads = try await fixture.adapter
+        let uploads = try await fixture.adapter
             .preparedRecordsToUpload(
                 limit: 10,
                 restrictedToEntityType: nil
             )
-        XCTAssertEqual(
-            legacyUploads.map(\.record.recordID.recordName),
-            [recordName]
-        )
-
-        try await fixture.adapter.activateReplicaBinding(
-            accountScopeIdentifier: "transport-account",
-            replicaBindingGenerationIdentifier: activeBinding,
-            acceptsLegacyUnboundMutations: false
-        )
-        let postMigrationUploads = try await fixture.adapter
-            .preparedRecordsToUpload(
-            limit: 10,
-            restrictedToEntityType: nil
-        )
-        XCTAssertTrue(postMigrationUploads.isEmpty)
+        XCTAssertTrue(uploads.isEmpty)
         XCTAssertFalse(
             try fixture.adapter.hasPendingChangesAtTerminalBoundary()
         )
@@ -3766,7 +3743,6 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertNil(restored.activeAccountScopeIdentifier)
         XCTAssertNil(restored.pendingPort)
-        XCTAssertFalse(restored.acceptsLegacyUnboundMutations)
 
         var configuration = Realm.Configuration()
         configuration.inMemoryIdentifier =
@@ -11189,7 +11165,7 @@ final class BigSyncKitTests: XCTestCase {
                 persistenceRealm.add(
                     SyncedEntity(
                         entityType: BigSyncTrackedObject.className(),
-                        identifier: "\(BigSyncTrackedObject.className()).legacy-\(index)",
+                        identifier: "\(BigSyncTrackedObject.className()).unattributed-\(index)",
                         state: SyncedEntityState.changed.rawValue
                     )
                 )
@@ -13638,8 +13614,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         try await fixture.adapter.activateReplicaBinding(
             accountScopeIdentifier: scope,
-            replicaBindingGenerationIdentifier: "destination-binding",
-            acceptsLegacyUnboundMutations: false
+            replicaBindingGenerationIdentifier: "destination-binding"
         )
         try await fixture.adapter.prepareChangeFeedReset(
             accountScopeIdentifier: scope,

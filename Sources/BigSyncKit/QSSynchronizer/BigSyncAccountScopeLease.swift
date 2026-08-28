@@ -137,7 +137,6 @@ struct BigSyncReplicaBindingSnapshot: Sendable, Equatable {
     let installationIdentityDigest: String
     let activeGenerationIdentifier: String
     let activeAccountScopeIdentifier: String?
-    let acceptsLegacyUnboundMutations: Bool
     let pendingPort: BigSyncCloudAccountPortRequirement?
 
     var mutationGenerationIdentifier: String {
@@ -173,7 +172,6 @@ enum BigSyncReplicaBindingStateStore {
                     fields: [installationIdentifier]
                 ),
                 activeAccountScopeIdentifier: nil,
-                acceptsLegacyUnboundMutations: false,
                 pendingPort: nil
             )
             try persist(rotated, store: store, key: key)
@@ -189,7 +187,6 @@ enum BigSyncReplicaBindingStateStore {
                 fields: [installationIdentifier]
             ),
             activeAccountScopeIdentifier: nil,
-            acceptsLegacyUnboundMutations: true,
             pendingPort: nil
         )
         try persist(snapshot, store: store, key: key)
@@ -209,9 +206,7 @@ enum BigSyncReplicaBindingStateStore {
                 value["installationIdentityDigest"]
               ),
               let activeGenerationIdentifier =
-                validDigest(value["activeGenerationIdentifier"]),
-              let acceptsLegacyUnboundMutations =
-                value["acceptsLegacyUnboundMutations"] as? Bool else {
+                validDigest(value["activeGenerationIdentifier"]) else {
             throw BigSyncReplicaBindingError.corrupt
         }
         let activeAccountScopeIdentifier =
@@ -279,7 +274,6 @@ enum BigSyncReplicaBindingStateStore {
             installationIdentityDigest: installationIdentityDigest,
             activeGenerationIdentifier: activeGenerationIdentifier,
             activeAccountScopeIdentifier: activeAccountScopeIdentifier,
-            acceptsLegacyUnboundMutations: acceptsLegacyUnboundMutations,
             pendingPort: pendingPort
         )
     }
@@ -309,8 +303,6 @@ enum BigSyncReplicaBindingStateStore {
             activeGenerationIdentifier:
                 current.activeGenerationIdentifier,
             activeAccountScopeIdentifier: accountScopeIdentifier,
-            acceptsLegacyUnboundMutations:
-                current.acceptsLegacyUnboundMutations,
             pendingPort: nil
         )
         try persist(updated, store: store, key: key)
@@ -364,8 +356,6 @@ enum BigSyncReplicaBindingStateStore {
                 current.activeGenerationIdentifier,
             activeAccountScopeIdentifier:
                 current.activeAccountScopeIdentifier,
-            acceptsLegacyUnboundMutations:
-                current.acceptsLegacyUnboundMutations,
             pendingPort: requirement
         )
         try persist(updated, store: store, key: key)
@@ -396,7 +386,6 @@ enum BigSyncReplicaBindingStateStore {
                 expected.bindingGenerationIdentifier,
             activeAccountScopeIdentifier:
                 expected.destinationAccountScopeIdentifier,
-            acceptsLegacyUnboundMutations: false,
             pendingPort: nil
         )
         try persist(activated, store: store, key: key)
@@ -421,8 +410,6 @@ enum BigSyncReplicaBindingStateStore {
                 current.activeGenerationIdentifier,
             activeAccountScopeIdentifier:
                 current.activeAccountScopeIdentifier,
-            acceptsLegacyUnboundMutations:
-                current.acceptsLegacyUnboundMutations,
             pendingPort: nil
         )
         try persist(restored, store: store, key: key)
@@ -449,8 +436,6 @@ enum BigSyncReplicaBindingStateStore {
                 snapshot.installationIdentityDigest,
             "activeGenerationIdentifier":
                 snapshot.activeGenerationIdentifier,
-            "acceptsLegacyUnboundMutations":
-                snapshot.acceptsLegacyUnboundMutations,
         ]
         if let activeAccountScopeIdentifier =
             snapshot.activeAccountScopeIdentifier {

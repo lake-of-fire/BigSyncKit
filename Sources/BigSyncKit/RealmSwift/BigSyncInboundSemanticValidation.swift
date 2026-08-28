@@ -1,5 +1,4 @@
 import CloudKit
-import CryptoKit
 import Foundation
 import RealmSwift
 
@@ -117,23 +116,15 @@ final class BigSyncInboundSemanticQuarantine: Object {
     @Persisted var deletionFeedLineage = ""
     @Persisted var replicaActivationIdentifier = ""
     @Persisted var changeFeedEpoch = 0
-    @Persisted var isAmbiguousLegacyLineage = false
     @Persisted var validationCode = ""
     @Persisted var receivedRecordDigestHex = ""
     @Persisted var importRunIdentifier = ""
-    /// Zero denotes legacy or crash-prefix evidence that was never bound to a
-    /// committed page receipt and therefore cannot be retired by ordering.
+    /// Zero denotes crash-prefix evidence that was never bound to a committed
+    /// page receipt and therefore cannot be retired by ordering.
     @Persisted var committedPageSequence: Int64 = 0
     @Persisted var committedPageReceiptID = ""
     @Persisted var committedPageOutcomeDigestHex = ""
     @Persisted var detectedAt = Date()
-
-    static func legacyAmbiguousLineageID(recordName: String) -> String {
-        let digest = SHA256.hash(
-            data: Data("BigSyncQuarantineLegacy.v1|\(recordName)".utf8)
-        )
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
 }
 
 /// Receipt for a fully committed record-zone page in one adapter tracking

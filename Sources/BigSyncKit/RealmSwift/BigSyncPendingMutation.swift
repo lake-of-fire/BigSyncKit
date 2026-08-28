@@ -51,8 +51,8 @@ public final class BigSyncPendingMutation: Object {
     @Persisted public var objectIdentifier = ""
     /// Opaque CloudKit account scope captured from the domain object at the
     /// same transaction boundary as this generation. `nil` is reserved for
-    /// legacy or explicitly unscoped model types and is never rebound to a
-    /// later account by convenience.
+    /// explicitly unscoped model types and is never rebound to a later account
+    /// by convenience.
     @Persisted(indexed: true) public var accountScopeIdentifier: String?
     /// Local transport generation that owned this mutation when it was
     /// committed. Account ports create a new generation instead of relabeling

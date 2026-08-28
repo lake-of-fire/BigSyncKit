@@ -332,8 +332,9 @@ final class BackupDetectionTests: XCTestCase {
 
         let newIdentifier = try BackupDetection.beginManualRestore(
             namespace: namespace,
+            transactionIdentifier: UUID(),
             sharedSentinelBaseURL: base
-        )
+        ).newInstallationIdentifier
 
         XCTAssertNotEqual(newIdentifier, oldIdentifier)
         XCTAssertEqual(
@@ -1240,8 +1241,9 @@ final class BackupDetectionTests: XCTestCase {
 
         let secondInstallation = try BackupDetection.beginManualRestore(
             namespace: namespace,
+            transactionIdentifier: UUID(),
             sharedSentinelBaseURL: base
-        )
+        ).newInstallationIdentifier
         try realm.write {
             object.refreshChangeMetadata(explicitlyModified: true)
         }
@@ -1264,7 +1266,7 @@ final class BackupDetectionTests: XCTestCase {
         ))
     }
 
-    func testFailedLegacyManualRestoreLeavesDurableRecoveryEvidence() throws {
+    func testFailedManualRestoreLeavesDurableRecoveryEvidence() throws {
         let namespace = "container.private.owner.zone"
         let base = temporaryRoot()
         _ = try BackupDetection.run(
@@ -1282,6 +1284,7 @@ final class BackupDetectionTests: XCTestCase {
 
         XCTAssertThrowsError(try BackupDetection.beginManualRestore(
             namespace: namespace,
+            transactionIdentifier: UUID(),
             sharedSentinelBaseURL: base,
             sentinelPublisher: { _, _ in
                 throw CocoaError(.fileWriteUnknown)
@@ -1625,7 +1628,7 @@ final class BackupDetectionTests: XCTestCase {
         ).isExcludedFromBackup, true)
     }
 
-    func testLegacyUnexcludedSentinelWithMarkerFailsClosedAsRestore() throws {
+    func testPreviouslyShippedUnexcludedSentinelWithMarkerFailsClosedAsRestore() throws {
         let namespace = "container.private.owner.zone"
         let installed = temporaryRoot().appendingPathComponent("installed")
         let restored = temporaryRoot().appendingPathComponent("restored")
@@ -1635,7 +1638,7 @@ final class BackupDetectionTests: XCTestCase {
             sentinelURL: installed
         )
         try simulateRestoredMarker(from: installed, to: restored)
-        try Data("legacy unsafe sentinel".utf8).write(
+        try Data("previously shipped unsafe sentinel".utf8).write(
             to: restored,
             options: .atomic
         )

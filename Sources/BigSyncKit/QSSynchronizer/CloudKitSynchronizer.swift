@@ -707,15 +707,13 @@ public class CloudKitSynchronizer: NSObject {
         let accountIdentifier: String
         let accountScopeIdentifier: String
         let replicaBindingGenerationIdentifier: String?
-        let acceptsLegacyUnboundMutations: Bool
 
         init(
             attemptID: UUID,
             runID: UUID,
             accountIdentifier: String,
             accountScopeIdentifier: String,
-            replicaBindingGenerationIdentifier: String? = nil,
-            acceptsLegacyUnboundMutations: Bool = true
+            replicaBindingGenerationIdentifier: String? = nil
         ) {
             self.attemptID = attemptID
             self.runID = runID
@@ -723,8 +721,6 @@ public class CloudKitSynchronizer: NSObject {
             self.accountScopeIdentifier = accountScopeIdentifier
             self.replicaBindingGenerationIdentifier =
                 replicaBindingGenerationIdentifier
-            self.acceptsLegacyUnboundMutations =
-                acceptsLegacyUnboundMutations
         }
     }
 
@@ -1692,7 +1688,8 @@ public class CloudKitSynchronizer: NSObject {
                 )
                 let accountIdentifier = try await validateSynchronizationAccount()
                 reportProgress("account-identity-validated")
-                let binding = try activeReplicaBindingForRun(
+                let replicaBindingGenerationIdentifier = try
+                    activeReplicaBindingGenerationIdentifierForRun(
                     accountScopeIdentifier: Self.accountScopeIdentifier(
                         for: accountIdentifier
                     )
@@ -1707,9 +1704,7 @@ public class CloudKitSynchronizer: NSObject {
                         for: accountIdentifier
                     ),
                     replicaBindingGenerationIdentifier:
-                        binding.generationIdentifier,
-                    acceptsLegacyUnboundMutations:
-                        binding.acceptsLegacyUnboundMutations
+                        replicaBindingGenerationIdentifier
                 )
                 activeRunContext = context
                 for adapter in modelAdapters {
@@ -1722,9 +1717,7 @@ public class CloudKitSynchronizer: NSObject {
                         accountScopeIdentifier:
                             context.accountScopeIdentifier,
                         replicaBindingGenerationIdentifier:
-                            context.replicaBindingGenerationIdentifier,
-                        acceptsLegacyUnboundMutations:
-                            context.acceptsLegacyUnboundMutations
+                            context.replicaBindingGenerationIdentifier
                     )
                     try checkRunContext(context)
                 }
@@ -2014,22 +2007,7 @@ public class CloudKitSynchronizer: NSObject {
         let previousAccountIdentifier: String?
         if accountReplacementPolicy.usesDatasetReplicaBinding {
             previousAccountIdentifier = try durableAccountIdentifier()
-            let preparedBinding = try prepareReplicaBindingState()
-            // Existing installations already have a durable CloudKit account
-            // but predate replica-binding generations. Bind that exact legacy
-            // replica before comparing it with the currently authenticated
-            // account; otherwise a first post-upgrade A -> B launch would look
-            // like a port from an unowned replica and fail as corrupt.
-            if preparedBinding.activeAccountScopeIdentifier == nil,
-               let previousAccountIdentifier {
-                _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
-                    Self.accountScopeIdentifier(
-                        for: previousAccountIdentifier
-                    ),
-                    store: keyValueStore,
-                    key: replicaBindingStateKey
-                )
-            }
+            _ = try prepareReplicaBindingState()
         } else {
             previousAccountIdentifier = keyValueStore.object(
                 forKey: cloudKitAccountIdentifierKey
@@ -2081,9 +2059,9 @@ public class CloudKitSynchronizer: NSObject {
                     key: replicaBindingStateKey
                ), binding.pendingPort == nil,
                binding.activeAccountScopeIdentifier == currentScope {
-                // A verified port activates the binding before publishing the
-                // legacy account-identifier key. Recover that crash window by
-                // accepting only the already-active destination scope.
+                // Port activation commits the binding before updating the
+                // duplicate account marker. Recover that crash window only
+                // for the already-active destination scope.
                 didReplaceAccount = false
             }
             if didReplaceAccount {
@@ -2210,7 +2188,8 @@ public class CloudKitSynchronizer: NSObject {
             let currentScope = Self.accountScopeIdentifier(
                 for: confirmedAccountIdentifier
             )
-            let activeBinding = try activeReplicaBindingForRun(
+            let activeBindingGenerationIdentifier = try
+                activeReplicaBindingGenerationIdentifierForRun(
                 accountScopeIdentifier: currentScope
             )
             let recoveryContext = RunContext(
@@ -2219,9 +2198,7 @@ public class CloudKitSynchronizer: NSObject {
                 accountIdentifier: confirmedAccountIdentifier,
                 accountScopeIdentifier: currentScope,
                 replicaBindingGenerationIdentifier:
-                    activeBinding.generationIdentifier,
-                acceptsLegacyUnboundMutations:
-                    activeBinding.acceptsLegacyUnboundMutations
+                    activeBindingGenerationIdentifier
             )
             // The new account's recovery envelope is the durable hand-off.
             // Do not discard the old account's cursors, subscriptions, or
@@ -2452,14 +2429,11 @@ public class CloudKitSynchronizer: NSObject {
         )
     }
 
-    internal func activeReplicaBindingForRun(
+    internal func activeReplicaBindingGenerationIdentifierForRun(
         accountScopeIdentifier: String
-    ) throws -> (
-        generationIdentifier: String?,
-        acceptsLegacyUnboundMutations: Bool
-    ) {
+    ) throws -> String? {
         guard accountReplacementPolicy.usesDatasetReplicaBinding else {
-            return (nil, true)
+            return nil
         }
         guard let binding = try BigSyncReplicaBindingStateStore.load(
             store: keyValueStore,
@@ -2468,10 +2442,7 @@ public class CloudKitSynchronizer: NSObject {
         binding.activeAccountScopeIdentifier == accountScopeIdentifier else {
             throw BigSyncReplicaBindingError.accountMismatch
         }
-        return (
-            binding.activeGenerationIdentifier,
-            binding.acceptsLegacyUnboundMutations
-        )
+        return binding.activeGenerationIdentifier
     }
 
     /// Returns the last durably validated CloudKit account lease. Temporary
@@ -2955,7 +2926,7 @@ public class CloudKitSynchronizer: NSObject {
         try await revalidateRunContext(context)
 
         // A nil database and zone token is the explicit full-server bootstrap
-        // contract.  Do not reuse a token left by the legacy transport.
+        // contract. Do not reuse a token from the pre-change-feed transport.
         try resetDatabaseToken()
         resetActiveTokens()
         try await modelAdapter.saveToken(nil)

@@ -269,11 +269,11 @@ enum BackupDetection {
         }
 
         if !sentinelIsExcluded {
-            // A legacy/crash-prefix sentinel that lacks the exclusion bit is
-            // not valid installation proof. If its backed-up marker exists it
-            // is conservatively a restore; otherwise it is a first run. Replace
-            // only this BigSyncKit tracking file after any required restore
-            // event has been made durable.
+            // A previously shipped or crash-prefix sentinel that lacks the
+            // exclusion bit is not valid installation proof. If its backed-up
+            // marker exists it is conservatively a restore; otherwise it is a
+            // first run. Replace only this BigSyncKit tracking file after any
+            // required restore event has been made durable.
             if sentinelExists {
                 try replaceExcludedSentinel(
                     at: sentinelURL,
@@ -632,24 +632,6 @@ enum BackupDetection {
         guard !fileManager.fileExists(atPath: intentURL.path) else {
             throw Error.manualRestoreStateAmbiguous
         }
-    }
-
-    /// Compatibility entry point for internal callers that do not have a
-    /// caller journal. New restore coordinators must supply their own stable
-    /// transaction identifier and retain the full receipt.
-    static func beginManualRestore(
-        namespace: String,
-        sharedSentinelBaseURL: URL? = nil,
-        fileManager: FileManager = .default,
-        sentinelPublisher: ((URL, FileManager) throws -> Void)? = nil
-    ) throws -> String {
-        try beginManualRestore(
-            namespace: namespace,
-            transactionIdentifier: UUID(),
-            sharedSentinelBaseURL: sharedSentinelBaseURL,
-            fileManager: fileManager,
-            sentinelPublisher: sentinelPublisher
-        ).newInstallationIdentifier
     }
 
     static func run(

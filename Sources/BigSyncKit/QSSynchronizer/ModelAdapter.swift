@@ -283,8 +283,7 @@ public protocol ModelAdapter: AnyObject, Sendable {
     @BigSyncBackgroundActor
     func activateReplicaBinding(
         accountScopeIdentifier: String,
-        replicaBindingGenerationIdentifier: String?,
-        acceptsLegacyUnboundMutations: Bool
+        replicaBindingGenerationIdentifier: String?
     ) async throws
     
     func cleanUp() async throws
@@ -481,11 +480,9 @@ public extension ModelAdapter {
     @BigSyncBackgroundActor
     func activateReplicaBinding(
         accountScopeIdentifier: String,
-        replicaBindingGenerationIdentifier: String?,
-        acceptsLegacyUnboundMutations: Bool
+        replicaBindingGenerationIdentifier: String?
     ) async throws {
         _ = replicaBindingGenerationIdentifier
-        _ = acceptsLegacyUnboundMutations
         try await activateAccountScope(accountScopeIdentifier)
     }
 

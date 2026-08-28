@@ -153,11 +153,12 @@ extension CloudKitSynchronizer {
         guard evidence.accountScopeIdentifier == accountScopeIdentifier else {
             return nil
         }
-        let binding = try activeReplicaBindingForRun(
+        let replicaBindingGenerationIdentifier = try
+            activeReplicaBindingGenerationIdentifierForRun(
             accountScopeIdentifier: accountScopeIdentifier
         )
         guard evidence.replicaBindingGenerationIdentifier
-                == binding.generationIdentifier else {
+                == replicaBindingGenerationIdentifier else {
             return nil
         }
         for adapter in modelAdapters {
@@ -168,9 +169,7 @@ extension CloudKitSynchronizer {
             try await adapter.activateReplicaBinding(
                 accountScopeIdentifier: accountScopeIdentifier,
                 replicaBindingGenerationIdentifier:
-                    binding.generationIdentifier,
-                acceptsLegacyUnboundMutations:
-                    binding.acceptsLegacyUnboundMutations
+                    replicaBindingGenerationIdentifier
             )
         }
         guard try !adaptersHavePendingChangesAtTerminalBoundary() else {
@@ -180,7 +179,7 @@ extension CloudKitSynchronizer {
               try adapter.consumedServerBoundaryIdentifier(
                 accountScopeIdentifier: accountScopeIdentifier,
                 replicaBindingGenerationIdentifier:
-                    binding.generationIdentifier,
+                    replicaBindingGenerationIdentifier,
                 containerIdentifier: containerIdentifier,
                 databaseScope: database.databaseScope
               ) == evidence.consumedServerBoundaryIdentifier,

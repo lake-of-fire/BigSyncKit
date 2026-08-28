@@ -467,6 +467,9 @@ public final class RealmSwiftAdapter:
     private static let mutationJournalRecoveryEntityTypePrefix =
         "__BigSyncKitMutationJournalRecovery.v2."
     private static let mutationJournalRecoveryVersion = 2
+    /// Namespace identity for clients that intentionally do not bind their
+    /// dataset to a replica generation. Manabi always supplies a generation.
+    private static let unboundReplicaActivationIdentifier = "unbound-replica"
 
     private static var shouldSkipDebugDummySetup: Bool {
         let environment = ProcessInfo.processInfo.environment
@@ -506,8 +509,6 @@ public final class RealmSwiftAdapter:
     private var activeDatabaseScopeRawValue = CKDatabase.Scope.private.rawValue
     @BigSyncBackgroundActor
     private var activeReplicaBindingGenerationIdentifier: String?
-    @BigSyncBackgroundActor
-    private var acceptsLegacyUnboundMutations = true
 
     private lazy var persistentAssetManager: PersistentAssetManager = {
         PersistentAssetManager(
@@ -770,7 +771,7 @@ public final class RealmSwiftAdapter:
 
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 17
+        configuration.schemaVersion = 18
         configuration.shouldCompactOnLaunch = { totalBytes, usedBytes in
             // totalBytes refers to the size of the file on disk in bytes (data + free space)
             // usedBytes refers to the number of bytes used by data in the file
@@ -778,19 +779,6 @@ public final class RealmSwiftAdapter:
             // Compact if the file is over size and less than some % 'used'
             let targetBytes = 30 * 1024 * 1024
             return (totalBytes > targetBytes) && (Double(usedBytes) / Double(totalBytes)) < 0.8
-        }
-        configuration.migrationBlock = { migration, oldSchemaVersion in
-            if oldSchemaVersion < 16 {
-                migration.enumerateObjects(
-                    ofType: BigSyncInboundSemanticQuarantine.className()
-                ) { oldObject, newObject in
-                    let recordName = oldObject?["recordName"] as? String ?? ""
-                    newObject?["lineageID"] = BigSyncInboundSemanticQuarantine
-                        .legacyAmbiguousLineageID(recordName: recordName)
-                    newObject?["isAmbiguousLegacyLineage"] = true
-                    newObject?["eventKind"] = "legacy-ambiguous"
-                }
-            }
         }
         configuration.objectTypes = [
             SyncedEntity.self,
@@ -852,14 +840,11 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     public func activateReplicaBinding(
         accountScopeIdentifier: String,
-        replicaBindingGenerationIdentifier: String?,
-        acceptsLegacyUnboundMutations: Bool
+        replicaBindingGenerationIdentifier: String?
     ) async throws {
         try await activateAccountScope(accountScopeIdentifier)
         activeReplicaBindingGenerationIdentifier =
             replicaBindingGenerationIdentifier
-        self.acceptsLegacyUnboundMutations =
-            acceptsLegacyUnboundMutations
         if let persistenceRealm = realmProvider?.persistenceRealm {
             updateHasChanges(realm: persistenceRealm)
         }
@@ -948,7 +933,8 @@ public final class RealmSwiftAdapter:
         let zoneOwnerName = recordZoneID.ownerName
         let zoneName = recordZoneID.zoneName
         let replicaActivationIdentifier =
-            activeReplicaBindingGenerationIdentifier ?? "legacy-unbound"
+            activeReplicaBindingGenerationIdentifier
+                ?? Self.unboundReplicaActivationIdentifier
         let changeFeedEpoch = persistenceRealm.object(
             ofType: RebuildProvenanceState.self,
             forPrimaryKey: RebuildProvenanceState.primaryKeyValue
@@ -1012,7 +998,7 @@ public final class RealmSwiftAdapter:
     /// required (for example, immutable activation publication proof).
     ///
     /// This remains tracking-Realm-driven: target-Realm presence is never
-    /// evidence that an unscoped legacy object belongs to the active account.
+    /// evidence that an account-unscoped object belongs to the active account.
     @BigSyncBackgroundActor
     public func serverRecordEvidence(
         entityTypes: Set<String>
@@ -1160,13 +1146,7 @@ public final class RealmSwiftAdapter:
                 return false
             }
         }
-        guard let activeReplicaBindingGenerationIdentifier else {
-            return true
-        }
-        guard let mutationBinding = replicaBindingGenerationIdentifier else {
-            return acceptsLegacyUnboundMutations
-        }
-        return mutationBinding
+        return replicaBindingGenerationIdentifier
             == activeReplicaBindingGenerationIdentifier
     }
 
@@ -1193,14 +1173,8 @@ public final class RealmSwiftAdapter:
     private func trackingMutationIsEligibleForActiveTransport(
         _ entity: SyncedEntity
     ) -> Bool {
-        guard let activeReplicaBindingGenerationIdentifier else {
-            return true
-        }
-        guard let pendingBinding =
-                entity.pendingReplicaBindingGenerationIdentifier else {
-            return acceptsLegacyUnboundMutations
-        }
-        return pendingBinding == activeReplicaBindingGenerationIdentifier
+        entity.pendingReplicaBindingGenerationIdentifier
+            == activeReplicaBindingGenerationIdentifier
     }
 
     @BigSyncBackgroundActor
@@ -1208,13 +1182,8 @@ public final class RealmSwiftAdapter:
         _ entities: Results<SyncedEntity>
     ) -> Results<SyncedEntity> {
         guard let activeReplicaBindingGenerationIdentifier else {
-            return entities
-        }
-        if acceptsLegacyUnboundMutations {
             return entities.where {
-                $0.pendingReplicaBindingGenerationIdentifier
-                    == activeReplicaBindingGenerationIdentifier
-                    || $0.pendingReplicaBindingGenerationIdentifier == nil
+                $0.pendingReplicaBindingGenerationIdentifier == nil
             }
         }
         return entities.where {
@@ -1228,13 +1197,8 @@ public final class RealmSwiftAdapter:
         _ mutations: Results<BigSyncPendingMutation>
     ) -> Results<BigSyncPendingMutation> {
         guard let activeReplicaBindingGenerationIdentifier else {
-            return mutations
-        }
-        if acceptsLegacyUnboundMutations {
             return mutations.where {
-                $0.replicaBindingGenerationIdentifier
-                    == activeReplicaBindingGenerationIdentifier
-                    || $0.replicaBindingGenerationIdentifier == nil
+                $0.replicaBindingGenerationIdentifier == nil
             }
         }
         return mutations.where {
@@ -1415,7 +1379,8 @@ public final class RealmSwiftAdapter:
         let quarantine = BigSyncInboundSemanticQuarantine()
         let accountScopeIdentifier = activeAccountScopeIdentifier ?? ""
         let activationIdentifier =
-            activeReplicaBindingGenerationIdentifier ?? "legacy-unbound"
+            activeReplicaBindingGenerationIdentifier
+                ?? Self.unboundReplicaActivationIdentifier
         let changeFeedEpoch = realmProvider?.persistenceRealm?.object(
             ofType: RebuildProvenanceState.self,
             forPrimaryKey: RebuildProvenanceState.primaryKeyValue
@@ -1474,7 +1439,7 @@ public final class RealmSwiftAdapter:
             ?? ""
         let resolvedActivation = activationIdentifier
             ?? activeReplicaBindingGenerationIdentifier
-            ?? "legacy-unbound"
+            ?? Self.unboundReplicaActivationIdentifier
         let resolvedEpoch = changeFeedEpoch
             ?? realmProvider?.persistenceRealm?.object(
                 ofType: RebuildProvenanceState.self,
@@ -2522,8 +2487,8 @@ public final class RealmSwiftAdapter:
             }
 
             // The owning caller drains resultsChangeSet before returning. This
-            // keeps legacy scans inside the same cancellation barrier instead
-            // of launching a second debounced task.
+            // keeps pre-journal timestamp scans inside the same cancellation
+            // barrier instead of launching a second debounced task.
         }
     }
 
@@ -5334,7 +5299,7 @@ public final class RealmSwiftAdapter:
                         // Match Realm's other collection encodings: an empty
                         // collection is represented by an absent CloudKit
                         // field. The comparison and audit paths intentionally
-                        // also accept a legacy encoded empty map as equal.
+                        // also accept the previously emitted empty-map encoding.
                         record[property.name] = mapValue.isEmpty
                             ? nil
                             : try encodedCloudKitMap(mapValue) as CKRecordValue
@@ -6405,8 +6370,8 @@ public final class RealmSwiftAdapter:
                             forKey: entity.identifier
                         )
                     }
-                    // Journal-enabled Realms never use the legacy timestamp
-                    // scanner during normal operation. Once persistence
+                    // Journal-enabled Realms never use the pre-journal
+                    // timestamp scanner during normal operation. Once persistence
                     // publication succeeds, its temporary inbound suppression
                     // entry can be released immediately. Failed publication
                     // deliberately retains the marker until redelivery.
@@ -7507,7 +7472,8 @@ public final class RealmSwiftAdapter:
             zoneOwnerName: recordZoneID.ownerName,
             zoneName: recordZoneID.zoneName,
             replicaActivationIdentifier:
-                activeReplicaBindingGenerationIdentifier ?? "legacy-unbound",
+                activeReplicaBindingGenerationIdentifier
+                    ?? Self.unboundReplicaActivationIdentifier,
             changeFeedEpoch: persistenceRealm.object(
                 ofType: RebuildProvenanceState.self,
                 forPrimaryKey: RebuildProvenanceState.primaryKeyValue
@@ -7879,7 +7845,6 @@ public final class RealmSwiftAdapter:
                 Array(Set(supersedingRecords.map(\.recordName)))
             ).filter { quarantine in
                 !quarantinedLineageIDs.contains(quarantine.lineageID)
-                    && !quarantine.isAmbiguousLegacyLineage
                     && namespace.matches(quarantine)
                     && supersedingRecords.contains(
                         InboundRecordIdentity(quarantine)
