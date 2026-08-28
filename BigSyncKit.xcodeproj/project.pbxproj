@@ -48,6 +48,7 @@
 		9E08AD136CE32AB4796017F9 /* BigSyncClientIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = E580C33ABB8851D4E5D6B3AA /* BigSyncClientIdentity.swift */; };
 		A060857E8A137E811018F5FE /* SyncedEntityType.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7EC744C24DA41913CBC47C4B /* SyncedEntityType.swift */; };
 		A27109197DD310E8CB091873 /* SyncStatusViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 404173218AABA19A4C08DC5C /* SyncStatusViewModel.swift */; };
+		A4B736CBDA519F724728C9B0 /* CloudKitChangeFeedPublicAPITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90F522A5C3B1C836B6537459 /* CloudKitChangeFeedPublicAPITests.swift */; };
 		A968574EC7A0AF1043AC8189 /* AsyncAlgorithms.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = 8C60CB3051325C0C330FE48F /* AsyncAlgorithms.framework */; };
 		AB10CAD55E6330E005A2D7E2 /* libzstd.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = BBDD02968D432F5E6B3EFC72 /* libzstd.framework */; };
 		AC5DD77E159CBCFBCFBAAA72 /* DequeModule.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 56895A4BBBE9211A556CEF07 /* DequeModule.framework */; };
@@ -201,6 +202,7 @@
 		7EC744C24DA41913CBC47C4B /* SyncedEntityType.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedEntityType.swift; sourceTree = "<group>"; };
 		81AE000449FA79F1262C25F3 /* RealmDatabase_RealmCoreResources.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RealmDatabase_RealmCoreResources.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
 		8C60CB3051325C0C330FE48F /* AsyncAlgorithms.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = AsyncAlgorithms.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		90F522A5C3B1C836B6537459 /* CloudKitChangeFeedPublicAPITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitChangeFeedPublicAPITests.swift; sourceTree = "<group>"; };
 		94DDE581A883BAE50A2BCF02 /* Algorithms.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Algorithms.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		9871614820D729F0CB2D9925 /* RebuildProvenance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RebuildProvenance.swift; sourceTree = "<group>"; };
 		9D7E1C6F12C321A94EABEF49 /* SyncedEntityProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedEntityProtocol.swift; sourceTree = "<group>"; };
@@ -284,6 +286,7 @@
 				0C9ACA3FFFA7672B261644D0 /* BigSyncKitTests.swift */,
 				4E8A869A61FBDA8CD4ADAF76 /* ChangeFeedMigrationResumeTests.swift */,
 				1EE0B8BCD3020870B8A5EF17 /* CloudKitAccountAvailabilityGateTests.swift */,
+				90F522A5C3B1C836B6537459 /* CloudKitChangeFeedPublicAPITests.swift */,
 				B357AAD7AFFD76A14129C866 /* CloudKitSynchronizerAccountFencingTests.swift */,
 				5E66F905B1BB45D6FD8B1CFC /* DisposableZoneAuthorizationTests.swift */,
 				573C544F6B0039442FD4222A /* ModelAdapterDeletionConflictSafetyTests.swift */,
@@ -630,6 +633,7 @@
 				F960F4D9C6C49DBE8C886F7B /* BigSyncKitTests.swift in Sources */,
 				AC82E3ABBF139A593221D712 /* ChangeFeedMigrationResumeTests.swift in Sources */,
 				D16089D105F52266A902BCB9 /* CloudKitAccountAvailabilityGateTests.swift in Sources */,
+				A4B736CBDA519F724728C9B0 /* CloudKitChangeFeedPublicAPITests.swift in Sources */,
 				5DA94DE008BDD629A4FEBE98 /* CloudKitSynchronizerAccountFencingTests.swift in Sources */,
 				0E70FD2BCF232F256224F70D /* DisposableZoneAuthorizationTests.swift in Sources */,
 				2283F6BCF197679484C48935 /* ModelAdapterDeletionConflictSafetyTests.swift in Sources */,
