@@ -649,7 +649,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testAccountMarkerAloneDoesNotCreateReplicaBindingAuthority()
+    func testExistingAccountMarkerRequiresPortBeforeReplacement()
     async throws {
         let transport = AccountFencingTransport()
         let store = AccountFencingStore()
@@ -668,12 +668,82 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             )
         )
 
-        try await synchronizer._test_validateSynchronizationAccount()
+        let requirement: BigSyncCloudAccountPortRequirement
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected the installed account marker to fence replacement")
+            return
+        } catch BigSyncCloudAccountPortError.required(let pending) {
+            requirement = pending
+        }
         XCTAssertEqual(
-            try synchronizer.accountScopeLease()?.accountScopeIdentifier,
+            requirement.sourceAccountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        XCTAssertEqual(
+            requirement.destinationAccountScopeIdentifier,
             CloudKitSynchronizer.accountScopeIdentifier(for: "account-b")
         )
+        XCTAssertEqual(
+            try synchronizer.pendingCloudAccountPortRequirement(),
+            requirement
+        )
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertEqual(
+            store.value(forKey: synchronizer.durableStateKey(
+                "CloudKitAccountIdentifier"
+            )) as? String,
+            "account-a"
+        )
+        XCTAssertEqual(transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testExistingAccountMarkerBindsSameInstalledAccount()
+    async throws {
+        let transport = AccountFencingTransport()
+        let store = AccountFencingStore()
+        let admissions = InitialBindingAdmissionRecorder()
+        let synchronizer = makeSynchronizer(
+            transport: transport,
+            store: store,
+            accountIdentifierProvider: { "account-a" },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: {
+                await admissions.record($0)
+            }
+        )
+        store.set(
+            value: "account-a",
+            forKey: synchronizer.durableStateKey(
+                "CloudKitAccountIdentifier"
+            )
+        )
+
+        try await synchronizer._test_validateSynchronizationAccount()
+
+        let binding = try XCTUnwrap(
+            BigSyncReplicaBindingStateStore.load(
+                store: store,
+                key: synchronizer.durableStateKey("ReplicaBinding.v1")
+            )
+        )
+        XCTAssertEqual(
+            binding.activeAccountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        XCTAssertEqual(
+            binding.datasetOwnerAccountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        XCTAssertNil(binding.pendingPort)
         XCTAssertNil(try synchronizer.pendingCloudAccountPortRequirement())
+        XCTAssertEqual(
+            try synchronizer.accountScopeLease()?.accountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        let admissionContexts = await admissions.contexts
+        XCTAssertTrue(admissionContexts.isEmpty)
         XCTAssertEqual(transport.operationCount, 0)
     }
 

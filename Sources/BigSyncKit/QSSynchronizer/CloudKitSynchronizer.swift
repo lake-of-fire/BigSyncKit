@@ -2008,7 +2008,23 @@ public class CloudKitSynchronizer: NSObject {
         let preparedReplicaBinding: BigSyncReplicaBindingSnapshot?
         if accountReplacementPolicy.usesDatasetReplicaBinding {
             previousAccountIdentifier = try durableAccountIdentifier()
-            preparedReplicaBinding = try prepareReplicaBindingState()
+            var binding = try prepareReplicaBindingState()
+            // An existing installation can have an account marker but no
+            // replica binding yet. Record that account as the dataset owner
+            // before asking which account is signed in now. Otherwise an
+            // account switch could silently claim the existing local dataset.
+            if binding.datasetOwnerAccountScopeIdentifier == nil,
+               let previousAccountIdentifier {
+                binding = try BigSyncReplicaBindingStateStore
+                    .bindInitialAccount(
+                        Self.accountScopeIdentifier(
+                            for: previousAccountIdentifier
+                        ),
+                        store: keyValueStore,
+                        key: replicaBindingStateKey
+                    )
+            }
+            preparedReplicaBinding = binding
         } else {
             previousAccountIdentifier = keyValueStore.object(
                 forKey: cloudKitAccountIdentifierKey
