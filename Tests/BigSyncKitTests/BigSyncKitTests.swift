@@ -3742,6 +3742,10 @@ final class BigSyncKitTests: XCTestCase {
             first.activeGenerationIdentifier
         )
         XCTAssertNil(restored.activeAccountScopeIdentifier)
+        XCTAssertEqual(
+            restored.restoredDatasetOwnerAccountScopeIdentifier,
+            "account-before-restore"
+        )
         XCTAssertNil(restored.pendingPort)
 
         var configuration = Realm.Configuration()

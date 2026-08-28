@@ -2005,23 +2005,36 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     private func validateSynchronizationAccount() async throws -> String {
         let previousAccountIdentifier: String?
+        let preparedReplicaBinding: BigSyncReplicaBindingSnapshot?
         if accountReplacementPolicy.usesDatasetReplicaBinding {
             previousAccountIdentifier = try durableAccountIdentifier()
-            _ = try prepareReplicaBindingState()
+            preparedReplicaBinding = try prepareReplicaBindingState()
         } else {
             previousAccountIdentifier = keyValueStore.object(
                 forKey: cloudKitAccountIdentifierKey
             ) as? String
+            preparedReplicaBinding = nil
         }
         let validationAttemptID = synchronizationAttemptID
         let currentAccountIdentifier = try await accountIdentifierProvider()
         try checkAccountValidationAttempt(validationAttemptID)
         var confirmedAccountIdentifier = currentAccountIdentifier
-        var didReplaceAccount = false
+        let currentAccountScopeIdentifier = Self.accountScopeIdentifier(
+            for: currentAccountIdentifier
+        )
+        var didReplaceAccount: Bool
+        if let preparedReplicaBinding {
+            didReplaceAccount = preparedReplicaBinding
+                .datasetOwnerAccountScopeIdentifier
+                .map { $0 != currentAccountScopeIdentifier }
+                ?? false
+        } else {
+            didReplaceAccount = previousAccountIdentifier
+                .map { $0 != currentAccountIdentifier }
+                ?? false
+        }
         var requiresLocalDatasetRebootstrap = false
-        if let previousAccountIdentifier,
-           previousAccountIdentifier != currentAccountIdentifier {
-            didReplaceAccount = true
+        if didReplaceAccount {
             if accountReplacementPolicy == .requireExplicitDatasetPort {
                 logger.info(
                     "QSCloudKitSynchronizer >> CloudKit account changed; an explicit local-dataset port is required"
@@ -2042,9 +2055,7 @@ public class CloudKitSynchronizer: NSObject {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
         if accountReplacementPolicy == .requireExplicitDatasetPort {
-            let currentScope = Self.accountScopeIdentifier(
-                for: confirmedAccountIdentifier
-            )
+            let currentScope = currentAccountScopeIdentifier
             if let pendingPortRequirement = try
                 pendingCloudAccountPortRequirement() {
                 accountValidationRequired = true
@@ -2053,24 +2064,16 @@ public class CloudKitSynchronizer: NSObject {
                     pendingPortRequirement
                 )
             }
-            if didReplaceAccount,
-               let binding = try BigSyncReplicaBindingStateStore.load(
-                    store: keyValueStore,
-                    key: replicaBindingStateKey
-               ), binding.pendingPort == nil,
-               binding.activeAccountScopeIdentifier == currentScope {
-                // Port activation commits the binding before updating the
-                // duplicate account marker. Recover that crash window only
-                // for the already-active destination scope.
-                didReplaceAccount = false
-            }
             if didReplaceAccount {
+                guard let sourceAccountScopeIdentifier =
+                        preparedReplicaBinding?
+                            .datasetOwnerAccountScopeIdentifier else {
+                    throw BigSyncReplicaBindingError.corrupt
+                }
                 let requirement = try BigSyncReplicaBindingStateStore
                     .requirePort(
                         sourceAccountScopeIdentifier:
-                            Self.accountScopeIdentifier(
-                                for: try requiredDurableAccountIdentifier()
-                            ),
+                            sourceAccountScopeIdentifier,
                         destinationAccountScopeIdentifier: currentScope,
                         store: keyValueStore,
                         key: replicaBindingStateKey
@@ -2090,9 +2093,7 @@ public class CloudKitSynchronizer: NSObject {
                 key: replicaBindingStateKey
             )
         } else if accountReplacementPolicy == .localDatasetRebootstrap {
-            let currentScope = Self.accountScopeIdentifier(
-                for: confirmedAccountIdentifier
-            )
+            let currentScope = currentAccountScopeIdentifier
             guard var binding = try BigSyncReplicaBindingStateStore.load(
                 store: keyValueStore,
                 key: replicaBindingStateKey
@@ -2129,22 +2130,9 @@ public class CloudKitSynchronizer: NSObject {
                 }
             }
 
-            if binding.activeAccountScopeIdentifier == nil {
-                try await admitInitialReplicaBindingIfNeeded(
-                    accountIdentifier: confirmedAccountIdentifier,
-                    accountScopeIdentifier: currentScope,
-                    validationAttemptID: validationAttemptID
-                )
-                binding = try BigSyncReplicaBindingStateStore
-                    .bindInitialAccount(
-                        currentScope,
-                        store: keyValueStore,
-                        key: replicaBindingStateKey
-                    )
-            } else if binding.activeAccountScopeIdentifier != currentScope {
-                guard didReplaceAccount,
-                      let sourceScope =
-                        binding.activeAccountScopeIdentifier else {
+            if let sourceScope = binding.datasetOwnerAccountScopeIdentifier,
+               sourceScope != currentScope {
+                guard didReplaceAccount else {
                     throw BigSyncReplicaBindingError.accountMismatch
                 }
                 let pending = try BigSyncReplicaBindingStateStore.requirePort(
@@ -2171,7 +2159,21 @@ public class CloudKitSynchronizer: NSObject {
                     key: replicaBindingStateKey
                 )
                 requiresLocalDatasetRebootstrap = true
-            } else if didReplaceAccount {
+            } else if binding.activeAccountScopeIdentifier == nil {
+                try await admitInitialReplicaBindingIfNeeded(
+                    accountIdentifier: confirmedAccountIdentifier,
+                    accountScopeIdentifier: currentScope,
+                    validationAttemptID: validationAttemptID
+                )
+                binding = try BigSyncReplicaBindingStateStore
+                    .bindInitialAccount(
+                        currentScope,
+                        store: keyValueStore,
+                        key: replicaBindingStateKey
+                    )
+            } else if previousAccountIdentifier.map({
+                $0 != confirmedAccountIdentifier
+            }) == true {
                 // Resume a process death after binding activation but before
                 // the destination recovery envelope was published.
                 requiresLocalDatasetRebootstrap = true
@@ -2185,9 +2187,7 @@ public class CloudKitSynchronizer: NSObject {
             accountValidationRequired = true
             try await invalidateAccountScope(.accountReplaced)
             try checkAccountValidationAttempt(validationAttemptID)
-            let currentScope = Self.accountScopeIdentifier(
-                for: confirmedAccountIdentifier
-            )
+            let currentScope = currentAccountScopeIdentifier
             let activeBindingGenerationIdentifier = try
                 activeReplicaBindingGenerationIdentifierForRun(
                 accountScopeIdentifier: currentScope
@@ -2306,13 +2306,6 @@ public class CloudKitSynchronizer: NSObject {
             return nil
         }
         guard let value = value as? String, !value.isEmpty else {
-            throw BigSyncCloudAccountPortError.corruptRequirement
-        }
-        return value
-    }
-
-    private func requiredDurableAccountIdentifier() throws -> String {
-        guard let value = try durableAccountIdentifier() else {
             throw BigSyncCloudAccountPortError.corruptRequirement
         }
         return value

@@ -649,7 +649,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testAccountMarkerCannotCreateReplicaBindingAuthority()
+    func testAccountMarkerAloneDoesNotCreateReplicaBindingAuthority()
     async throws {
         let transport = AccountFencingTransport()
         let store = AccountFencingStore()
@@ -658,7 +658,8 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             transport: transport,
             store: store,
             accountIdentifierProvider: { await identity.current() },
-            accountReplacementPolicy: .requireExplicitDatasetPort
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { _ in }
         )
         store.set(
             value: "account-a",
@@ -667,15 +668,107 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             )
         )
 
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertEqual(
+            try synchronizer.accountScopeLease()?.accountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-b")
+        )
+        XCTAssertNil(try synchronizer.pendingCloudAccountPortRequirement())
+        XCTAssertEqual(transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testRestoredBindingRetainsDatasetOwnerForExplicitPort()
+    async throws {
+        let transport = AccountFencingTransport()
+        let store = AccountFencingStore()
+        let synchronizer = makeSynchronizer(
+            transport: transport,
+            store: store,
+            accountIdentifierProvider: { "account-b" },
+            accountReplacementPolicy: .requireExplicitDatasetPort
+        )
+        let bindingKey = synchronizer.durableStateKey("ReplicaBinding.v1")
+        _ = try BigSyncReplicaBindingStateStore.prepare(
+            store: store,
+            key: bindingKey,
+            installationIdentifier: "installation-before-restore"
+        )
+        _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a"),
+            store: store,
+            key: bindingKey
+        )
+        store.set(
+            value: "account-a",
+            forKey: synchronizer.durableStateKey(
+                "CloudKitAccountIdentifier"
+            )
+        )
+
+        let requirement: BigSyncCloudAccountPortRequirement
         do {
             try await synchronizer._test_validateSynchronizationAccount()
-            XCTFail("Expected an account marker without binding authority to fail")
-        } catch BigSyncReplicaBindingError.corrupt {
-            // The marker is not replica authority.
-        } catch {
-            XCTFail("Unexpected error: \(error)")
+            XCTFail("Expected the restored dataset to require an explicit port")
+            return
+        } catch BigSyncCloudAccountPortError.required(let pending) {
+            requirement = pending
         }
+
+        XCTAssertEqual(
+            requirement.sourceAccountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        XCTAssertEqual(
+            requirement.destinationAccountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-b")
+        )
         XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertEqual(transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testRestoredBindingReadmitsSameAccountWithoutPort() async throws {
+        let transport = AccountFencingTransport()
+        let store = AccountFencingStore()
+        let admissions = InitialBindingAdmissionRecorder()
+        let synchronizer = makeSynchronizer(
+            transport: transport,
+            store: store,
+            accountIdentifierProvider: { "account-a" },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: {
+                await admissions.record($0)
+            }
+        )
+        let bindingKey = synchronizer.durableStateKey("ReplicaBinding.v1")
+        _ = try BigSyncReplicaBindingStateStore.prepare(
+            store: store,
+            key: bindingKey,
+            installationIdentifier: "installation-before-restore"
+        )
+        _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a"),
+            store: store,
+            key: bindingKey
+        )
+
+        try await synchronizer._test_validateSynchronizationAccount()
+
+        let binding = try XCTUnwrap(
+            BigSyncReplicaBindingStateStore.load(
+                store: store,
+                key: bindingKey
+            )
+        )
+        XCTAssertEqual(
+            binding.activeAccountScopeIdentifier,
+            CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        XCTAssertNil(binding.restoredDatasetOwnerAccountScopeIdentifier)
+        XCTAssertNil(binding.pendingPort)
+        let admissionContexts = await admissions.contexts
+        XCTAssertEqual(admissionContexts.count, 1)
         XCTAssertEqual(transport.operationCount, 0)
     }
 

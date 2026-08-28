@@ -137,11 +137,20 @@ struct BigSyncReplicaBindingSnapshot: Sendable, Equatable {
     let installationIdentityDigest: String
     let activeGenerationIdentifier: String
     let activeAccountScopeIdentifier: String?
+    /// Exact owner retained while a restored installation awaits fresh
+    /// transport admission. This is current restore-transition state, not
+    /// compatibility with an unshipped binding format.
+    let restoredDatasetOwnerAccountScopeIdentifier: String?
     let pendingPort: BigSyncCloudAccountPortRequirement?
 
     var mutationGenerationIdentifier: String {
         pendingPort?.bindingGenerationIdentifier
             ?? activeGenerationIdentifier
+    }
+
+    var datasetOwnerAccountScopeIdentifier: String? {
+        activeAccountScopeIdentifier
+            ?? restoredDatasetOwnerAccountScopeIdentifier
     }
 }
 
@@ -172,6 +181,8 @@ enum BigSyncReplicaBindingStateStore {
                     fields: [installationIdentifier]
                 ),
                 activeAccountScopeIdentifier: nil,
+                restoredDatasetOwnerAccountScopeIdentifier:
+                    existing.datasetOwnerAccountScopeIdentifier,
                 pendingPort: nil
             )
             try persist(rotated, store: store, key: key)
@@ -187,6 +198,7 @@ enum BigSyncReplicaBindingStateStore {
                 fields: [installationIdentifier]
             ),
             activeAccountScopeIdentifier: nil,
+            restoredDatasetOwnerAccountScopeIdentifier: nil,
             pendingPort: nil
         )
         try persist(snapshot, store: store, key: key)
@@ -212,6 +224,15 @@ enum BigSyncReplicaBindingStateStore {
         let activeAccountScopeIdentifier =
             value["activeAccountScopeIdentifier"] as? String
         if activeAccountScopeIdentifier?.isEmpty == true {
+            throw BigSyncReplicaBindingError.corrupt
+        }
+        let restoredDatasetOwnerAccountScopeIdentifier =
+            value["restoredDatasetOwnerAccountScopeIdentifier"] as? String
+        if restoredDatasetOwnerAccountScopeIdentifier?.isEmpty == true
+            || (
+                activeAccountScopeIdentifier != nil
+                    && restoredDatasetOwnerAccountScopeIdentifier != nil
+            ) {
             throw BigSyncReplicaBindingError.corrupt
         }
 
@@ -263,7 +284,8 @@ enum BigSyncReplicaBindingStateStore {
                     destinationAccountScopeIdentifier,
                 ]
             )
-            guard activeAccountScopeIdentifier
+            guard (activeAccountScopeIdentifier
+                    ?? restoredDatasetOwnerAccountScopeIdentifier)
                     == sourceAccountScopeIdentifier,
                   bindingGenerationIdentifier
                     == expectedBindingGenerationIdentifier else {
@@ -274,6 +296,8 @@ enum BigSyncReplicaBindingStateStore {
             installationIdentityDigest: installationIdentityDigest,
             activeGenerationIdentifier: activeGenerationIdentifier,
             activeAccountScopeIdentifier: activeAccountScopeIdentifier,
+            restoredDatasetOwnerAccountScopeIdentifier:
+                restoredDatasetOwnerAccountScopeIdentifier,
             pendingPort: pendingPort
         )
     }
@@ -297,12 +321,19 @@ enum BigSyncReplicaBindingStateStore {
             }
             return current
         }
+        if let restoredDatasetOwnerAccountScopeIdentifier =
+            current.restoredDatasetOwnerAccountScopeIdentifier,
+           restoredDatasetOwnerAccountScopeIdentifier
+            != accountScopeIdentifier {
+            throw BigSyncReplicaBindingError.accountMismatch
+        }
         let updated = BigSyncReplicaBindingSnapshot(
             installationIdentityDigest:
                 current.installationIdentityDigest,
             activeGenerationIdentifier:
                 current.activeGenerationIdentifier,
             activeAccountScopeIdentifier: accountScopeIdentifier,
+            restoredDatasetOwnerAccountScopeIdentifier: nil,
             pendingPort: nil
         )
         try persist(updated, store: store, key: key)
@@ -320,7 +351,7 @@ enum BigSyncReplicaBindingStateStore {
               sourceAccountScopeIdentifier
                 != destinationAccountScopeIdentifier,
               let current = try load(store: store, key: key),
-              current.activeAccountScopeIdentifier
+              current.datasetOwnerAccountScopeIdentifier
                 == sourceAccountScopeIdentifier else {
             throw BigSyncReplicaBindingError.corrupt
         }
@@ -356,6 +387,8 @@ enum BigSyncReplicaBindingStateStore {
                 current.activeGenerationIdentifier,
             activeAccountScopeIdentifier:
                 current.activeAccountScopeIdentifier,
+            restoredDatasetOwnerAccountScopeIdentifier:
+                current.restoredDatasetOwnerAccountScopeIdentifier,
             pendingPort: requirement
         )
         try persist(updated, store: store, key: key)
@@ -373,7 +406,7 @@ enum BigSyncReplicaBindingStateStore {
     ) throws -> BigSyncReplicaBindingSnapshot {
         guard let current = try load(store: store, key: key),
               current.pendingPort == expected,
-              current.activeAccountScopeIdentifier
+              current.datasetOwnerAccountScopeIdentifier
                 == expected.sourceAccountScopeIdentifier,
               current.activeGenerationIdentifier
                 != expected.bindingGenerationIdentifier else {
@@ -386,6 +419,7 @@ enum BigSyncReplicaBindingStateStore {
                 expected.bindingGenerationIdentifier,
             activeAccountScopeIdentifier:
                 expected.destinationAccountScopeIdentifier,
+            restoredDatasetOwnerAccountScopeIdentifier: nil,
             pendingPort: nil
         )
         try persist(activated, store: store, key: key)
@@ -399,7 +433,7 @@ enum BigSyncReplicaBindingStateStore {
     ) throws -> BigSyncReplicaBindingSnapshot {
         guard let current = try load(store: store, key: key),
               current.pendingPort == expected,
-              current.activeAccountScopeIdentifier
+              current.datasetOwnerAccountScopeIdentifier
                 == expected.sourceAccountScopeIdentifier else {
             throw BigSyncCloudAccountPortError.corruptRequirement
         }
@@ -410,6 +444,8 @@ enum BigSyncReplicaBindingStateStore {
                 current.activeGenerationIdentifier,
             activeAccountScopeIdentifier:
                 current.activeAccountScopeIdentifier,
+            restoredDatasetOwnerAccountScopeIdentifier:
+                current.restoredDatasetOwnerAccountScopeIdentifier,
             pendingPort: nil
         )
         try persist(restored, store: store, key: key)
@@ -441,6 +477,11 @@ enum BigSyncReplicaBindingStateStore {
             snapshot.activeAccountScopeIdentifier {
             value["activeAccountScopeIdentifier"] =
                 activeAccountScopeIdentifier
+        }
+        if let restoredDatasetOwnerAccountScopeIdentifier =
+            snapshot.restoredDatasetOwnerAccountScopeIdentifier {
+            value["restoredDatasetOwnerAccountScopeIdentifier"] =
+                restoredDatasetOwnerAccountScopeIdentifier
         }
         if let pendingPort = snapshot.pendingPort {
             value["pendingTransitionID"] =
