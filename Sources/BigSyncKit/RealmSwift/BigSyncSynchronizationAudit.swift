@@ -75,14 +75,18 @@ extension RealmSwiftAdapter {
                 continue
             }
             for object in targetRealm.objects(objectClass) {
+                guard objectIsEligibleForActiveAccount(
+                    object,
+                    entityType: entityType
+                ) else { continue }
+                let recordName = "\(entityType).\(Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey))"
+                localRecordNames.insert(recordName)
                 if let softDeletable = object as? SoftDeletable,
                    softDeletable.isDeleted {
-                    issues.append("terminal-local-tombstone:\(entityType).\(Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey))")
+                    issues.append("terminal-local-tombstone:\(recordName)")
                     continue
                 }
                 localObjectCount += 1
-                let recordName = "\(entityType).\(Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey))"
-                localRecordNames.insert(recordName)
                 guard let serverRecord = serverRecordsByName[recordName] else {
                     issues.append("local-record-missing-on-server:\(recordName)")
                     continue
@@ -132,7 +136,9 @@ extension RealmSwiftAdapter {
             guard realm.schema.objectSchema.contains(where: {
                 $0.className == BigSyncPendingMutation.className()
             }) else { return }
-            total += realm.objects(BigSyncPendingMutation.self).count
+            total += realm.objects(BigSyncPendingMutation.self).filter {
+                pendingMutationIsEligibleForActiveTransport($0)
+            }.count
         }
         if pendingMutationCount > 0 {
             issues.append("pending-mutations:\(pendingMutationCount)")
@@ -144,13 +150,16 @@ extension RealmSwiftAdapter {
             issues.append("pending-relationships:\(pendingRelationshipCount)")
         }
 
-        let ownedQuarantines = persistenceRealm.objects(
-            BigSyncInboundSemanticQuarantine.self
-        ).filter("entityType IN %@", Array(ownedTypeNames))
-        for quarantine in ownedQuarantines {
-            issues.append(
-                "inbound-semantic-quarantine:\(quarantine.recordName):\(quarantine.validationCode)"
-            )
+        if let activeAccountScopeIdentifier {
+            let ownedQuarantines = activeInboundSemanticQuarantines(
+                accountScopeIdentifier: activeAccountScopeIdentifier,
+                in: persistenceRealm
+            ).filter("entityType IN %@", Array(ownedTypeNames))
+            for quarantine in ownedQuarantines {
+                issues.append(
+                    "inbound-semantic-quarantine:\(quarantine.recordName):\(quarantine.validationCode)"
+                )
+            }
         }
 
         return BigSyncSynchronizationAudit(

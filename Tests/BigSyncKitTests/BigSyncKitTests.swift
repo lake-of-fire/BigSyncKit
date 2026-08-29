@@ -1188,6 +1188,10 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertFalse(blockers.contains {
             $0.code == "inbound-semantic-quarantine"
         })
+        let audit = try await fixture.adapter.auditSynchronizationState(
+            serverRecords: []
+        )
+        XCTAssertTrue(audit.isClean, audit.issues.joined(separator: "\n"))
     }
 
     @BigSyncBackgroundActor
@@ -1696,6 +1700,107 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNotNil(fixture.persistenceRealm.object(
             ofType: BigSyncInboundSemanticQuarantine.self,
             forPrimaryKey: quarantine.lineageID
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testNilTokenResetPreservesOtherAccountQuarantineProof()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let activeAccount = "active-reset-account"
+        let otherAccount = "preserved-reset-account"
+        let container = "reset-proof-container"
+        try await fixture.adapter.activateAccountScope(activeAccount)
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: container,
+            databaseScope: .private
+        )
+
+        func makeQuarantine(
+            account: String,
+            lineageID: String,
+            receiptID: String
+        ) -> BigSyncInboundSemanticQuarantine {
+            let quarantine = BigSyncInboundSemanticQuarantine()
+            quarantine.lineageID = lineageID
+            quarantine.recordName = "record-\(lineageID)"
+            quarantine.entityType = BigSyncSemanticallyValidatedObject.className()
+            quarantine.accountScopeIdentifier = account
+            quarantine.containerIdentifier = container
+            quarantine.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+            quarantine.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+            quarantine.zoneName = fixture.adapter.recordZoneID.zoneName
+            quarantine.replicaActivationIdentifier = "unbound-replica"
+            quarantine.changeFeedEpoch = 0
+            quarantine.committedPageSequence = 1
+            quarantine.committedPageReceiptID = receiptID
+            quarantine.committedPageOutcomeDigestHex = String(
+                repeating: account == activeAccount ? "a" : "b",
+                count: 64
+            )
+            return quarantine
+        }
+
+        func makeReceipt(
+            account: String,
+            id: String,
+            digest: String
+        ) -> BigSyncInboundPageReceipt {
+            let receipt = BigSyncInboundPageReceipt()
+            receipt.id = id
+            receipt.accountScopeIdentifier = account
+            receipt.containerIdentifier = container
+            receipt.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+            receipt.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+            receipt.zoneName = fixture.adapter.recordZoneID.zoneName
+            receipt.replicaActivationIdentifier = "unbound-replica"
+            receipt.changeFeedEpoch = 0
+            receipt.pageSequence = 1
+            receipt.outcomeDigestHex = digest
+            return receipt
+        }
+
+        let active = makeQuarantine(
+            account: activeAccount,
+            lineageID: "active-lineage",
+            receiptID: "active-receipt"
+        )
+        let other = makeQuarantine(
+            account: otherAccount,
+            lineageID: "other-lineage",
+            receiptID: "other-receipt"
+        )
+        let activeReceipt = makeReceipt(
+            account: activeAccount,
+            id: active.committedPageReceiptID,
+            digest: active.committedPageOutcomeDigestHex
+        )
+        let otherReceipt = makeReceipt(
+            account: otherAccount,
+            id: other.committedPageReceiptID,
+            digest: other.committedPageOutcomeDigestHex
+        )
+        let activeReceiptID = activeReceipt.id
+        let otherReceiptID = otherReceipt.id
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add([active, other])
+            fixture.persistenceRealm.add([activeReceipt, otherReceipt])
+        }
+
+        try await fixture.adapter.saveToken(nil)
+        fixture.persistenceRealm.refresh()
+
+        XCTAssertEqual(active.committedPageSequence, 0)
+        XCTAssertTrue(active.committedPageReceiptID.isEmpty)
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: activeReceiptID
+        ))
+        XCTAssertEqual(other.committedPageSequence, 1)
+        XCTAssertEqual(other.committedPageReceiptID, otherReceiptID)
+        XCTAssertNotNil(fixture.persistenceRealm.object(
+            ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: otherReceiptID
         ))
     }
 
@@ -3147,10 +3252,16 @@ final class BigSyncKitTests: XCTestCase {
         )
         let staleBindingUploads = try await fixture.adapter
             .preparedRecordsToUpload(
-            limit: 10,
-            restrictedToEntityType: nil
-        )
+                limit: 10,
+                restrictedToEntityType: nil
+            )
         XCTAssertTrue(staleBindingUploads.isEmpty)
+        let rotatedBindingAudit = try await fixture.adapter
+            .auditSynchronizationState(serverRecords: [])
+        XCTAssertEqual(rotatedBindingAudit.pendingMutationCount, 0)
+        XCTAssertFalse(rotatedBindingAudit.issues.contains {
+            $0.hasPrefix("pending-mutations:")
+        })
 
         try await fixture.targetRealm.asyncWrite {
             object.tags.append("new-binding")
@@ -4475,6 +4586,56 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertFalse(audit.isClean)
         XCTAssertTrue(audit.issues.contains("server-record-missing-locally:\(recordName)"))
         XCTAssertTrue(audit.issues.contains("tracking-record-missing-locally:\(recordName)"))
+
+        let trackingOnlyAudit = try await fixture.adapter
+            .auditSynchronizationState(serverRecords: [])
+        XCTAssertEqual(trackingOnlyAudit.trackingRecordCount, 1)
+        XCTAssertTrue(
+            trackingOnlyAudit.issues.contains(
+                "tracking-record-missing-locally:\(recordName)"
+            )
+        )
+        XCTAssertTrue(
+            trackingOnlyAudit.issues.contains(
+                "tracking-record-missing-on-server:\(recordName)"
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testSynchronizationAuditIgnoresInactiveAccountObjectsAndJournal()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            accountScopePropertyByClassName: [
+                BigSyncTrackedObject.className():
+                    "cloudKitAccountScopeIdentifier",
+            ]
+        )
+        try await fixture.adapter.activateAccountScope("account-a")
+        let inactiveObject = BigSyncTrackedObject(
+            id: "inactive-account",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        inactiveObject.cloudKitAccountScopeIdentifier = "account-b"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(inactiveObject)
+            inactiveObject.refreshChangeMetadata(explicitlyModified: true)
+        }
+
+        let audit = try await fixture.adapter.auditSynchronizationState(
+            serverRecords: []
+        )
+
+        XCTAssertTrue(audit.isClean, audit.issues.joined(separator: "\n"))
+        XCTAssertEqual(audit.localObjectCount, 0)
+        XCTAssertEqual(audit.pendingMutationCount, 0)
+        XCTAssertEqual(
+            fixture.targetRealm.objects(BigSyncPendingMutation.self).count,
+            1,
+            "The audit must filter inactive work without mutating its journal"
+        )
     }
 
     func testRefreshChangeMetadataUsesSuppliedTimestampForJournalAndMetadata() throws {

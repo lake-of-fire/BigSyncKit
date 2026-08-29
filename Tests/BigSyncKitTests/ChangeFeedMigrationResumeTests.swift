@@ -7,6 +7,140 @@ import XCTest
 
 final class ChangeFeedMigrationResumeTests: XCTestCase {
     @BigSyncBackgroundActor
+    func testCompletedResetPrunesOnlyQuarantineAbsentFromItsNamespace()
+    async throws {
+        let account = "quarantine-account"
+        let epoch = 41
+        let binding = "current-binding"
+        let container = "iCloud.test.quarantine"
+        let adapter = try makeAdapter(label: "quarantine-retention")
+        try await adapter.activateReplicaBinding(
+            accountScopeIdentifier: account,
+            replicaBindingGenerationIdentifier: binding
+        )
+        try await adapter.activateTransportNamespace(
+            containerIdentifier: container,
+            databaseScope: .private
+        )
+        try await prepareForCompletion(
+            adapter,
+            account: account,
+            epoch: epoch
+        )
+        let realm = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let zone = adapter.recordZoneID
+        try await realm.asyncWrite {
+            addQuarantine(
+                id: "current",
+                account: account,
+                container: container,
+                zone: zone,
+                binding: binding,
+                epoch: epoch,
+                withReceipt: true,
+                to: realm
+            )
+            addQuarantine(
+                id: "old-epoch",
+                account: account,
+                container: container,
+                zone: zone,
+                binding: binding,
+                epoch: epoch - 1,
+                withReceipt: true,
+                to: realm
+            )
+            addQuarantine(
+                id: "old-binding",
+                account: account,
+                container: container,
+                zone: zone,
+                binding: "old-binding",
+                epoch: epoch,
+                withReceipt: true,
+                to: realm
+            )
+            addQuarantine(
+                id: "uncommitted-current",
+                account: account,
+                container: container,
+                zone: zone,
+                binding: binding,
+                epoch: epoch,
+                withReceipt: false,
+                to: realm
+            )
+            addQuarantine(
+                id: "other-account",
+                account: "other-account",
+                container: container,
+                zone: zone,
+                binding: binding,
+                epoch: epoch,
+                withReceipt: false,
+                to: realm
+            )
+            addQuarantine(
+                id: "other-zone",
+                account: account,
+                container: container,
+                zone: CKRecordZone.ID(
+                    zoneName: "other-zone",
+                    ownerName: zone.ownerName
+                ),
+                binding: binding,
+                epoch: epoch,
+                withReceipt: false,
+                to: realm
+            )
+        }
+
+        adapter._testBeforeChangeFeedResetCompletionMarkerWrite = {
+            throw NSError(domain: "rollback", code: 1)
+        }
+        do {
+            try await adapter.finishChangeFeedReset(
+                accountScopeIdentifier: account,
+                epoch: epoch
+            )
+            XCTFail("Expected the completion transaction to roll back")
+        } catch {
+            // Expected injected failure.
+        }
+        realm.refresh()
+        XCTAssertEqual(
+            Set(realm.objects(BigSyncInboundSemanticQuarantine.self)
+                .map(\.lineageID)),
+            [
+                "current", "old-epoch", "old-binding",
+                "uncommitted-current", "other-account", "other-zone",
+            ]
+        )
+
+        adapter._testBeforeChangeFeedResetCompletionMarkerWrite = nil
+        try await adapter.finishChangeFeedReset(
+            accountScopeIdentifier: account,
+            epoch: epoch
+        )
+        realm.refresh()
+        XCTAssertEqual(
+            Set(realm.objects(BigSyncInboundSemanticQuarantine.self)
+                .map(\.lineageID)),
+            ["current", "other-account", "other-zone"]
+        )
+        XCTAssertNotNil(realm.object(
+            ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: "receipt-current"
+        ))
+        for retiredID in ["old-epoch", "old-binding"] {
+            XCTAssertNil(realm.object(
+                ofType: BigSyncInboundPageReceipt.self,
+                forPrimaryKey: "receipt-\(retiredID)"
+            ))
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testDurableCompletionRequiresExactTerminalProvenance() async throws {
         let account = "durable-completion-account"
         let epoch = 29
@@ -221,6 +355,73 @@ final class ChangeFeedMigrationResumeTests: XCTestCase {
             logger: Logger(label: "ChangeFeedMigrationResumeTests"),
             startSetupTask: false
         )
+    }
+
+    @BigSyncBackgroundActor
+    private func prepareForCompletion(
+        _ adapter: RealmSwiftAdapter,
+        account: String,
+        epoch: Int
+    ) async throws {
+        try await adapter.prepareChangeFeedReset(
+            accountScopeIdentifier: account,
+            epoch: epoch
+        )
+        try await adapter.beginChangeFeedServerBootstrap(
+            accountScopeIdentifier: account,
+            epoch: epoch
+        )
+        try await adapter.reconcileAfterChangeFeedServerBootstrap(
+            accountScopeIdentifier: account,
+            epoch: epoch
+        )
+    }
+
+    private func addQuarantine(
+        id: String,
+        account: String,
+        container: String,
+        zone: CKRecordZone.ID,
+        binding: String,
+        epoch: Int,
+        withReceipt: Bool,
+        to realm: Realm
+    ) {
+        precondition(realm.isInWriteTransaction)
+        let quarantine = BigSyncInboundSemanticQuarantine()
+        quarantine.lineageID = id
+        quarantine.recordName = "record-\(id)"
+        quarantine.entityType = MigrationPeerObject.className()
+        quarantine.accountScopeIdentifier = account
+        quarantine.containerIdentifier = container
+        quarantine.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        quarantine.zoneOwnerName = zone.ownerName
+        quarantine.zoneName = zone.zoneName
+        quarantine.eventKind = "live"
+        quarantine.replicaActivationIdentifier = binding
+        quarantine.changeFeedEpoch = epoch
+        quarantine.validationCode = "test"
+        if withReceipt {
+            let receiptID = "receipt-\(id)"
+            let outcomeDigest = String(repeating: "a", count: 64)
+            quarantine.committedPageSequence = 1
+            quarantine.committedPageReceiptID = receiptID
+            quarantine.committedPageOutcomeDigestHex = outcomeDigest
+
+            let receipt = BigSyncInboundPageReceipt()
+            receipt.id = receiptID
+            receipt.accountScopeIdentifier = account
+            receipt.containerIdentifier = container
+            receipt.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+            receipt.zoneOwnerName = zone.ownerName
+            receipt.zoneName = zone.zoneName
+            receipt.replicaActivationIdentifier = binding
+            receipt.changeFeedEpoch = epoch
+            receipt.pageSequence = 1
+            receipt.outcomeDigestHex = outcomeDigest
+            realm.add(receipt)
+        }
+        realm.add(quarantine)
     }
 }
 
