@@ -502,7 +502,7 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     private var cancellationGeneration: UInt64 = 0
     @BigSyncBackgroundActor
-    private var activeAccountScopeIdentifier: String?
+    var activeAccountScopeIdentifier: String?
     @BigSyncBackgroundActor
     private var activeContainerIdentifier = ""
     @BigSyncBackgroundActor

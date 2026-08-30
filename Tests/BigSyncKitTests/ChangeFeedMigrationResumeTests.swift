@@ -145,6 +145,7 @@ final class ChangeFeedMigrationResumeTests: XCTestCase {
         let account = "durable-completion-account"
         let epoch = 29
         let adapter = try makeAdapter(label: "durable-completion")
+        try await activateChangeFeedNamespace(adapter, account: account)
 
         try await adapter.prepareChangeFeedReset(
             accountScopeIdentifier: account,
@@ -247,6 +248,8 @@ final class ChangeFeedMigrationResumeTests: XCTestCase {
         let epoch = 17
         let completed = try makeAdapter(label: "completed")
         let unfinished = try makeAdapter(label: "unfinished")
+        try await activateChangeFeedNamespace(completed, account: account)
+        try await activateChangeFeedNamespace(unfinished, account: account)
 
         // Model a process death in the synchronizer-wide `.finishing` phase:
         // the first adapter has committed completion while its peer has only
@@ -374,6 +377,21 @@ final class ChangeFeedMigrationResumeTests: XCTestCase {
         try await adapter.reconcileAfterChangeFeedServerBootstrap(
             accountScopeIdentifier: account,
             epoch: epoch
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func activateChangeFeedNamespace(
+        _ adapter: RealmSwiftAdapter,
+        account: String
+    ) async throws {
+        try await adapter.activateTransportNamespace(
+            containerIdentifier: "iCloud.test",
+            databaseScope: .private
+        )
+        try await adapter.activateReplicaBinding(
+            accountScopeIdentifier: account,
+            replicaBindingGenerationIdentifier: nil
         )
     }
 

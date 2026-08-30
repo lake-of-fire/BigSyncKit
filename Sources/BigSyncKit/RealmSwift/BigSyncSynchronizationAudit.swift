@@ -137,7 +137,7 @@ extension RealmSwiftAdapter {
                 $0.className == BigSyncPendingMutation.className()
             }) else { return }
             total += realm.objects(BigSyncPendingMutation.self).filter {
-                pendingMutationIsEligibleForActiveTransport($0)
+                self.pendingMutationIsEligibleForActiveTransport($0)
             }.count
         }
         if pendingMutationCount > 0 {

@@ -11721,6 +11721,11 @@ final class BigSyncKitTests: XCTestCase {
             targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: journalRecordName)?.generation
         )
 
+        try await activateChangeFeedNamespace(
+            adapter,
+            account: "account-a"
+        )
+
         try await adapter.prepareChangeFeedReset(
             accountScopeIdentifier: "account-a",
             epoch: 1,
@@ -12134,6 +12139,11 @@ final class BigSyncKitTests: XCTestCase {
                 state: SyncedEntityState.synced.rawValue
             ))
         }
+
+        try await activateChangeFeedNamespace(
+            adapter,
+            account: "resume-account"
+        )
 
         try await adapter.prepareChangeFeedReset(
             accountScopeIdentifier: "resume-account", epoch: 7
@@ -12841,6 +12851,11 @@ final class BigSyncKitTests: XCTestCase {
             )?.generation
         )
 
+        try await activateChangeFeedNamespace(
+            fixture.adapter,
+            account: "bootstrap-account"
+        )
+
         try await fixture.adapter.prepareChangeFeedReset(
             accountScopeIdentifier: "bootstrap-account", epoch: 1
         )
@@ -13025,9 +13040,14 @@ final class BigSyncKitTests: XCTestCase {
         let epoch = try XCTUnwrap(
             (migration["epoch"] as? NSNumber)?.intValue
         )
+        let destinationAccountScope = CloudKitSynchronizer
+            .accountScopeIdentifier(for: "account-b")
+        try await activateChangeFeedNamespace(
+            adapter,
+            account: destinationAccountScope
+        )
         try await adapter.prepareChangeFeedReset(
-            accountScopeIdentifier: CloudKitSynchronizer
-                .accountScopeIdentifier(for: "account-b"),
+            accountScopeIdentifier: destinationAccountScope,
             epoch: epoch,
             mode: .serverReconciliation
         )
@@ -13268,6 +13288,11 @@ final class BigSyncKitTests: XCTestCase {
             recordZoneID: zoneID,
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
+        )
+
+        try await activateChangeFeedNamespace(
+            adapter,
+            account: "signature-account"
         )
 
         try await adapter.prepareChangeFeedReset(
@@ -13605,6 +13630,23 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer._allowRecordZoneRebindingForTesting()
 #endif
         return synchronizer
+    }
+
+    @BigSyncBackgroundActor
+    private func activateChangeFeedNamespace(
+        _ adapter: RealmSwiftAdapter,
+        account: String,
+        replicaBindingGenerationIdentifier: String? = nil
+    ) async throws {
+        try await adapter.activateTransportNamespace(
+            containerIdentifier: "iCloud.test",
+            databaseScope: .private
+        )
+        try await adapter.activateReplicaBinding(
+            accountScopeIdentifier: account,
+            replicaBindingGenerationIdentifier:
+                replicaBindingGenerationIdentifier
+        )
     }
 
     private func makeRecord(type: String, id: String, zoneID: CKRecordZone.ID) -> CKRecord {
@@ -14176,6 +14218,11 @@ final class BigSyncKitTests: XCTestCase {
                 accountScopeIdentifier: accountScope
             )
 
+            try await activateChangeFeedNamespace(
+                fixture.adapter,
+                account: accountScope
+            )
+
             try first.requestChangeFeedRecovery(
                 context: context,
                 mode: .encryptedDataReset
@@ -14346,6 +14393,10 @@ final class BigSyncKitTests: XCTestCase {
             $0.key.contains("ChangeFeedMigration.v3")
         }))
         let epoch = try XCTUnwrap((entry.value["epoch"] as? NSNumber)?.intValue)
+        try await activateChangeFeedNamespace(
+            fixture.adapter,
+            account: scope
+        )
         try await fixture.adapter.prepareChangeFeedReset(
             accountScopeIdentifier: scope, epoch: epoch, mode: .serverReconciliation
         )
