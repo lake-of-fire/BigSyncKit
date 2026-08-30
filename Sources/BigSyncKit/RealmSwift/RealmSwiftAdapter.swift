@@ -1003,7 +1003,7 @@ public final class RealmSwiftAdapter:
     /// consumed change-token boundary. A record remains a server member while
     /// a newer local generation is pending, so this deliberately accepts a
     /// retained valid CKRecord for changed/deleted-locally tracking rows. Use
-    /// the single-record overload when an exact fully-uploaded postimage is
+    /// the single-record overload when an exact fully uploaded record state is
     /// required (for example, immutable activation publication proof).
     ///
     /// This remains tracking-Realm-driven: target-Realm presence is never
@@ -1526,7 +1526,7 @@ public final class RealmSwiftAdapter:
         // For unscoped models, the tracking row already carries every
         // transport fence needed to acknowledge this prepared generation.
         // The target journal may legitimately have advanced while CloudKit
-        // was saving the older postimage; acknowledge the old tracking row,
+        // was saving the older record state; acknowledge the old tracking row,
         // then forward the surviving newer journal generation below.
         guard accountScopePropertyByClassName[entityType] != nil else {
             return true

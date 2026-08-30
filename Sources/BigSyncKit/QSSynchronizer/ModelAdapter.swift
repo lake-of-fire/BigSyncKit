@@ -218,7 +218,7 @@ public struct InboundDeletionResult: Sendable, Equatable {
 
 /// Complete durable outcome of one CloudKit record-zone page. The adapter
 /// commits this receipt together with the page cursor so cursor advancement
-/// can never become detached from the exact accepted-event postimage.
+/// can never become detached from the exact committed event state.
 public struct InboundPageCommit: Sendable, Equatable {
     public let previousCursor: RecordZoneChangeCursor?
     public let nextCursor: RecordZoneChangeCursor
@@ -259,7 +259,7 @@ public struct CommittedInboundIdentity: Sendable, Equatable, Hashable, Codable {
     }
 }
 
-/// Durable, idempotently redeliverable target-Realm postimages accumulated
+/// Durable, idempotently redeliverable target-Realm states accumulated
 /// through a committed record-zone cursor boundary.
 public struct CommittedInboundIdentityBatch: Sendable, Equatable {
     public let deliveryID: String

@@ -60,7 +60,7 @@ public enum BigSyncCloudAccountReplacementPolicy: Sendable, Equatable {
 /// replica binding is admitted.
 ///
 /// The callback owns application-specific dataset-head discovery and its
-/// durable local postimage. BigSync revalidates the synchronization attempt,
+/// durable local state. BigSync revalidates the synchronization attempt,
 /// exact account, and unchanged binding generation after the callback returns
 /// and before it publishes the account binding or starts ordinary sync work.
 public struct BigSyncInitialReplicaBindingContext: Sendable, Equatable {
