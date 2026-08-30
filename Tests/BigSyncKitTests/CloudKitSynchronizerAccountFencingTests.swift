@@ -362,6 +362,29 @@ private actor InitialBindingAdmissionRecorder {
     }
 }
 
+private actor ApplicationBoundaryMutationRecorder {
+    private(set) var mutationCount = 0
+
+    func recordMutation() {
+        mutationCount += 1
+    }
+}
+
+private final class InitialAdmissionSynchronizerReference:
+    @unchecked Sendable {
+    weak var synchronizer: CloudKitSynchronizer?
+
+    @BigSyncBackgroundActor
+    func revalidate(
+        _ context: BigSyncInitialReplicaBindingContext
+    ) async throws {
+        guard let synchronizer else {
+            throw CancellationError()
+        }
+        try await synchronizer.revalidateInitialReplicaBindingContext(context)
+    }
+}
+
 private final class InitialBindingStateMutation: @unchecked Sendable {
     let store: AccountFencingStore
     var bindingKey = ""
@@ -2035,6 +2058,194 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         XCTAssertNil(store.value(forKey: synchronizer.durableStateKey(
             "ZoneLifecycle.v3.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"
         )))
+    }
+
+    @BigSyncBackgroundActor
+    func testSynchronizationBoundaryValidationRejectsAnotherRunOrAccount()
+    throws {
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport()
+        )
+        let accountScope = CloudKitSynchronizer.accountScopeIdentifier(
+            for: "account-a"
+        )
+        let active = CloudKitSynchronizer.RunContext(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier: accountScope
+        )
+        synchronizer.activeRunContext = active
+
+        XCTAssertNoThrow(try synchronizer.validateBoundaryContext(
+            .init(context: active)
+        ))
+
+        let otherRun = CloudKitSynchronizer.RunContext(
+            attemptID: active.attemptID,
+            runID: UUID(),
+            accountIdentifier: active.accountIdentifier,
+            accountScopeIdentifier: active.accountScopeIdentifier
+        )
+        XCTAssertThrowsError(try synchronizer.validateBoundaryContext(
+            .init(context: otherRun)
+        )) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        let otherAccount = CloudKitSynchronizer.RunContext(
+            attemptID: active.attemptID,
+            runID: active.runID,
+            accountIdentifier: "account-b",
+            accountScopeIdentifier: CloudKitSynchronizer
+                .accountScopeIdentifier(for: "account-b")
+        )
+        XCTAssertThrowsError(try synchronizer.validateBoundaryContext(
+            .init(context: otherAccount)
+        )) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPrepublicationBoundaryValidationRejectsStaleRun() throws {
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport()
+        )
+        let active = CloudKitSynchronizer.RunContext(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier: CloudKitSynchronizer
+                .accountScopeIdentifier(for: "account-a")
+        )
+        synchronizer.activeRunContext = active
+        let current = CloudKitSynchronizer.PrepublicationBoundaryContext(
+            context: active,
+            consumedServerBoundaryIdentifier: "cursor",
+            didImportChanges: true
+        )
+        XCTAssertNoThrow(try synchronizer.validateBoundaryContext(current))
+
+        synchronizer.activeRunContext = CloudKitSynchronizer.RunContext(
+            attemptID: active.attemptID,
+            runID: UUID(),
+            accountIdentifier: active.accountIdentifier,
+            accountScopeIdentifier: active.accountScopeIdentifier
+        )
+        XCTAssertThrowsError(try synchronizer.validateBoundaryContext(current)) {
+            error in
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testExactSynchronizationBoundaryRevalidationRejectsAccountChangeBeforeApplicationMutation()
+    async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let mutations = ApplicationBoundaryMutationRecorder()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { await identity.current() }
+        )
+        let active = CloudKitSynchronizer.RunContext(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier: CloudKitSynchronizer
+                .accountScopeIdentifier(for: "account-a")
+        )
+        synchronizer.activeRunContext = active
+        let boundary = CloudKitSynchronizer.SynchronizationBoundaryContext(
+            context: active
+        )
+
+        // Models an account replacement while the application is suspended
+        // fetching the dataset head.
+        await identity.replace(with: "account-b")
+        do {
+            try await synchronizer.revalidateBoundaryContext(boundary)
+            await mutations.recordMutation()
+            XCTFail("Expected the old head result to lose mutation authority")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+            // Expected.
+        }
+
+        let mutationCount = await mutations.mutationCount
+        XCTAssertEqual(mutationCount, 0)
+        XCTAssertTrue(synchronizer.accountValidationRequired)
+    }
+
+    @BigSyncBackgroundActor
+    func testExactPrepublicationRevalidationRejectsAccountChangeBeforeActivationMutation()
+    async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let mutations = ApplicationBoundaryMutationRecorder()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { await identity.current() }
+        )
+        let active = CloudKitSynchronizer.RunContext(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier: CloudKitSynchronizer
+                .accountScopeIdentifier(for: "account-a")
+        )
+        synchronizer.activeRunContext = active
+        let boundary = CloudKitSynchronizer.PrepublicationBoundaryContext(
+            context: active,
+            consumedServerBoundaryIdentifier: "cursor",
+            didImportChanges: true
+        )
+
+        await identity.replace(with: "account-b")
+        do {
+            try await synchronizer.revalidateBoundaryContext(boundary)
+            await mutations.recordMutation()
+            XCTFail("Expected stale activation recovery to be rejected")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+            // Expected.
+        }
+
+        let mutationCount = await mutations.mutationCount
+        XCTAssertEqual(mutationCount, 0)
+        XCTAssertTrue(synchronizer.accountValidationRequired)
+    }
+
+    @BigSyncBackgroundActor
+    func testInitialAdmissionExactRevalidationRejectsAccountChangeBeforeApplicationMutation()
+    async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let mutations = ApplicationBoundaryMutationRecorder()
+        let reference = InitialAdmissionSynchronizerReference()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { context in
+                // Models the dataset-head fetch returning after the signed-in
+                // account changed. Declaration, activation, and their
+                // automatically tracked journal generations all sit after
+                // this exact-account fence in the application.
+                await identity.replace(with: "account-b")
+                try await reference.revalidate(context)
+                await mutations.recordMutation()
+            }
+        )
+        reference.synchronizer = synchronizer
+
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected initial admission to reject the stale account")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
+            // Expected.
+        }
+
+        let mutationCount = await mutations.mutationCount
+        XCTAssertEqual(mutationCount, 0)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertTrue(synchronizer.accountValidationRequired)
     }
 
     @MainActor

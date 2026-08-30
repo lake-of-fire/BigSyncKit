@@ -726,6 +726,69 @@ public actor BigSyncBackgroundActor {
         try realmSynchronizer.validateAccountScopeLease(expected)
     }
 
+    /// Revalidates an application pre-inbound callback after suspension using
+    /// the currently configured synchronizer rather than a separately
+    /// reconstructed production identity. This also works for isolated E2E
+    /// synchronizers with their own durable local state.
+    @BigSyncBackgroundActor
+    public func validateSynchronizationBoundaryContext(
+        _ context: CloudKitSynchronizer.SynchronizationBoundaryContext
+    ) throws {
+        guard let realmSynchronizer else {
+            throw CancellationError()
+        }
+        try realmSynchronizer.validateBoundaryContext(context)
+    }
+
+    /// Revalidates an application terminal-prepublication callback after
+    /// suspension against the exact current synchronization run.
+    @BigSyncBackgroundActor
+    public func validatePrepublicationBoundaryContext(
+        _ context: CloudKitSynchronizer.PrepublicationBoundaryContext
+    ) throws {
+        guard let realmSynchronizer else {
+            throw CancellationError()
+        }
+        try realmSynchronizer.validateBoundaryContext(context)
+    }
+
+    /// Revalidates the active run, durable binding, and exact CloudKit account
+    /// across the account-provider suspension.
+    @BigSyncBackgroundActor
+    public func revalidateSynchronizationBoundaryContext(
+        _ context: CloudKitSynchronizer.SynchronizationBoundaryContext
+    ) async throws {
+        guard let realmSynchronizer else {
+            throw CancellationError()
+        }
+        try await realmSynchronizer.revalidateBoundaryContext(context)
+    }
+
+    /// Exact-account revalidation for terminal-prepublication application
+    /// mutations.
+    @BigSyncBackgroundActor
+    public func revalidatePrepublicationBoundaryContext(
+        _ context: CloudKitSynchronizer.PrepublicationBoundaryContext
+    ) async throws {
+        guard let realmSynchronizer else {
+            throw CancellationError()
+        }
+        try await realmSynchronizer.revalidateBoundaryContext(context)
+    }
+
+    /// Exact-account revalidation for local writes performed during initial
+    /// replica admission.
+    @BigSyncBackgroundActor
+    public func revalidateInitialReplicaBindingContext(
+        _ context: BigSyncInitialReplicaBindingContext
+    ) async throws {
+        guard let realmSynchronizer else {
+            throw CancellationError()
+        }
+        try await realmSynchronizer
+            .revalidateInitialReplicaBindingContext(context)
+    }
+
 #if DEBUG
     @BigSyncBackgroundActor
     var _test_hasScheduledInitialSynchronization: Bool {

@@ -66,6 +66,8 @@ public enum BigSyncCloudAccountReplacementPolicy: Sendable, Equatable {
 public struct BigSyncInitialReplicaBindingContext: Sendable, Equatable {
     public let accountScopeIdentifier: String
     public let replicaBindingGenerationIdentifier: String
+    internal let accountIdentifier: String?
+    internal let validationAttemptID: UUID?
 
     public init(
         accountScopeIdentifier: String,
@@ -74,6 +76,21 @@ public struct BigSyncInitialReplicaBindingContext: Sendable, Equatable {
         self.accountScopeIdentifier = accountScopeIdentifier
         self.replicaBindingGenerationIdentifier =
             replicaBindingGenerationIdentifier
+        accountIdentifier = nil
+        validationAttemptID = nil
+    }
+
+    internal init(
+        accountIdentifier: String,
+        accountScopeIdentifier: String,
+        replicaBindingGenerationIdentifier: String,
+        validationAttemptID: UUID
+    ) {
+        self.accountIdentifier = accountIdentifier
+        self.accountScopeIdentifier = accountScopeIdentifier
+        self.replicaBindingGenerationIdentifier =
+            replicaBindingGenerationIdentifier
+        self.validationAttemptID = validationAttemptID
     }
 }
 

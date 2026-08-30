@@ -1865,6 +1865,118 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
+    /// Revalidates application work performed from the pre-inbound callback
+    /// against this synchronizer's exact active run and durable replica
+    /// binding. This intentionally performs no network request: the enclosing
+    /// synchronization revalidates the CloudKit account after the callback,
+    /// while callers use this check on both sides of their own suspension.
+    internal func validateBoundaryContext(
+        _ context: SynchronizationBoundaryContext
+    ) throws {
+        guard let activeRunContext,
+              activeRunContext.runID == context.runID,
+              activeRunContext.accountScopeIdentifier
+                == context.accountScopeIdentifier,
+              activeRunContext.replicaBindingGenerationIdentifier
+                == context.replicaBindingGenerationIdentifier else {
+            throw CancellationError()
+        }
+        try checkRunContext(activeRunContext)
+    }
+
+    /// Revalidates application work performed from the terminal
+    /// prepublication callback. See the synchronization-boundary overload for
+    /// the account and suspension contract.
+    internal func validateBoundaryContext(
+        _ context: PrepublicationBoundaryContext
+    ) throws {
+        guard let activeRunContext,
+              activeRunContext.runID == context.runID,
+              activeRunContext.accountScopeIdentifier
+                == context.accountScopeIdentifier,
+              activeRunContext.replicaBindingGenerationIdentifier
+                == context.replicaBindingGenerationIdentifier else {
+            throw CancellationError()
+        }
+        try checkRunContext(activeRunContext)
+    }
+
+    /// Revalidates the exact CloudKit account as well as the active run and
+    /// durable replica binding. Application callbacks use this immediately
+    /// before an irreversible local mutation after suspended CloudKit work.
+    internal func revalidateBoundaryContext(
+        _ context: SynchronizationBoundaryContext
+    ) async throws {
+        try validateBoundaryContext(context)
+        guard let activeRunContext else {
+            throw CancellationError()
+        }
+        try await revalidateRunContext(activeRunContext)
+        try validateBoundaryContext(context)
+    }
+
+    /// Terminal-prepublication counterpart of the synchronization-boundary
+    /// exact-account revalidation.
+    internal func revalidateBoundaryContext(
+        _ context: PrepublicationBoundaryContext
+    ) async throws {
+        try validateBoundaryContext(context)
+        guard let activeRunContext else {
+            throw CancellationError()
+        }
+        try await revalidateRunContext(activeRunContext)
+        try validateBoundaryContext(context)
+    }
+
+    /// Revalidates the account-validation attempt that owns initial dataset
+    /// admission. A context manually constructed outside BigSync lacks this
+    /// private authority and is rejected.
+    internal func revalidateInitialReplicaBindingContext(
+        _ context: BigSyncInitialReplicaBindingContext
+    ) async throws {
+        guard let expectedAccountIdentifier = context.accountIdentifier,
+              let validationAttemptID = context.validationAttemptID else {
+            throw CancellationError()
+        }
+        try checkAccountValidationAttempt(validationAttemptID)
+        try validatePendingReplicaBinding(context)
+        let currentAccountIdentifier = try await accountIdentifierProvider()
+        try checkAccountValidationAttempt(validationAttemptID)
+        try validatePendingReplicaBinding(context)
+        guard currentAccountIdentifier == expectedAccountIdentifier,
+              Self.accountScopeIdentifier(for: currentAccountIdentifier)
+                == context.accountScopeIdentifier else {
+            accountValidationRequired = true
+            throw OneOffRecordZoneResetError.cloudKitAccountChanged
+        }
+    }
+
+    private func validatePendingReplicaBinding(
+        _ context: BigSyncInitialReplicaBindingContext
+    ) throws {
+        guard let binding = try BigSyncReplicaBindingStateStore.load(
+            store: keyValueStore,
+            key: replicaBindingStateKey
+        ), binding.mutationGenerationIdentifier
+            == context.replicaBindingGenerationIdentifier else {
+            throw CancellationError()
+        }
+        if let pending = binding.pendingPort {
+            guard pending.bindingGenerationIdentifier
+                    == context.replicaBindingGenerationIdentifier,
+                  pending.destinationAccountScopeIdentifier
+                    == context.accountScopeIdentifier else {
+                throw CancellationError()
+            }
+        } else if let activeAccountScopeIdentifier =
+                    binding.activeAccountScopeIdentifier {
+            guard activeAccountScopeIdentifier
+                    == context.accountScopeIdentifier else {
+                throw CancellationError()
+            }
+        }
+    }
+
     internal func revalidateRunContext(_ context: RunContext) async throws {
         try checkRunContext(context)
         let currentAccountIdentifier = try await accountIdentifierProvider()
@@ -2299,9 +2411,11 @@ public class CloudKitSynchronizer: NSObject {
         }
 
         try await handler(BigSyncInitialReplicaBindingContext(
+            accountIdentifier: accountIdentifier,
             accountScopeIdentifier: accountScopeIdentifier,
             replicaBindingGenerationIdentifier:
-                generationIdentifier
+                generationIdentifier,
+            validationAttemptID: validationAttemptID
         ))
         try checkAccountValidationAttempt(validationAttemptID)
         let revalidatedAccountIdentifier = try await accountIdentifierProvider()
