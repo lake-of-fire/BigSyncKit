@@ -389,27 +389,12 @@ private func maxDate(_ lhs: Date?, _ rhs: Date?) -> Date? {
 }
 
 private func decodedCloudKitMap(_ value: Any?) -> [String: Any]? {
-    if let data = value as? Data,
-       let propertyList = try? PropertyListSerialization.propertyList(
-            from: data,
-            options: [],
-            format: nil
-       ) as? [String: Any] {
-        return propertyList
-    }
-
-    // Read compatibility for records produced by early BigSyncKit builds.
-    if let arrays = value as? [NSArray],
-       arrays.count == 2,
-       let keys = arrays[0] as? [String],
-       let values = arrays[1] as? [Any],
-       keys.count == values.count,
-       Set(keys).count == keys.count {
-        return zip(keys, values).reduce(into: [String: Any]()) {
-            $0[$1.0] = $1.1
-        }
-    }
-    return nil
+    guard let data = value as? Data else { return nil }
+    return try? PropertyListSerialization.propertyList(
+        from: data,
+        options: [],
+        format: nil
+    ) as? [String: Any]
 }
 
 private func encodedCloudKitMap(_ value: [String: Any]) throws -> Data {
@@ -5663,8 +5648,8 @@ public final class RealmSwiftAdapter:
                     if let mapValue {
                         // Match Realm's other collection encodings: an empty
                         // collection is represented by an absent CloudKit
-                        // field. The comparison and audit paths intentionally
-                        // also accept the previously emitted empty-map encoding.
+                        // field. Comparison and audit paths normalize a remote
+                        // empty map to the same semantic value.
                         record[property.name] = mapValue.isEmpty
                             ? nil
                             : try encodedCloudKitMap(mapValue) as CKRecordValue
