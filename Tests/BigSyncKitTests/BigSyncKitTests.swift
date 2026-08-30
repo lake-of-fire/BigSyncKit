@@ -922,6 +922,10 @@ private actor SynchronizationBoundaryEventRecorder {
         events.append("import")
     }
 
+    func record(_ event: String) {
+        events.append(event)
+    }
+
     func snapshot() -> (
         events: [String],
         context: CloudKitSynchronizer.SynchronizationBoundaryContext?
@@ -11916,6 +11920,49 @@ final class BigSyncKitTests: XCTestCase {
             ["save:FirstPage", "save:SecondPage"]
         )
     }
+
+#if DEBUG
+    @BigSyncBackgroundActor
+    func testProcessKillCheckpointHooksBracketConfirmationAndCompletion()
+    async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(zoneName: "process-kill-boundaries")
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: [],
+            uploadedByEntity: [
+                "Bookmark": [makeRecord(type: "Bookmark", id: "one", zoneID: zoneID)]
+            ]
+        )
+        let synchronizer = makeSynchronizer(
+            database: database,
+            recordZoneID: zoneID
+        )
+        let events = SynchronizationBoundaryEventRecorder()
+        synchronizer.processKillCheckpointHandler = { checkpoint in
+            await events.record(
+                "\(checkpoint.rawValue):fetches=\(database.databaseChangeFetchCount)"
+            )
+        }
+        synchronizer.addModelAdapter(adapter)
+
+        let result = try await synchronizer.synchronize()
+        let checkpointEvents = await events.snapshot().events
+
+        XCTAssertNotNil(result.receipt)
+        XCTAssertEqual(
+            checkpointEvents,
+            [
+                "localAcknowledgementBeforeTerminalPublication:fetches=1",
+                "terminalEvidenceBeforeCompletionDelivery:fetches=2",
+            ]
+        )
+        XCTAssertTrue(
+            adapter.events.contains(where: { $0.hasPrefix("didUpload:") })
+        )
+        XCTAssertGreaterThanOrEqual(database.databaseChangeFetchCount, 2)
+    }
+#endif
 
     @BigSyncBackgroundActor
     func testNoChangeDrainReceiptsTheExistingConsumedZoneBoundary()

@@ -321,6 +321,18 @@ extension CloudKitSynchronizer {
             await failSynchronization(error: error)
             return
         }
+#if DEBUG
+        do {
+            try await processKillCheckpointHandler?(
+                .terminalEvidenceBeforeCompletionDelivery
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            await failSynchronization(error: error)
+            return
+        }
+#endif
         reportProgress("terminal-receipt")
         finishSynchronizationDrain(with: .success(result))
         // See the blocked path above: close the logical drain before allowing
@@ -1358,6 +1370,11 @@ extension CloudKitSynchronizer {
                 try await revalidateActiveRunContext(for: attemptID)
                 try persistDatabaseToken(serverChangeToken)
                 reportProgress("upload-completed")
+#if DEBUG
+                try await processKillCheckpointHandler?(
+                    .localAcknowledgementBeforeTerminalPublication
+                )
+#endif
                 // Always re-fetch after upload. The next fetch either imports
                 // concurrent server changes or reaches the terminal receipt.
                 await fetchChanges(afterUpload: true)

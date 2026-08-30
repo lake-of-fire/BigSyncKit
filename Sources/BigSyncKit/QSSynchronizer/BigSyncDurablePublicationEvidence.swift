@@ -188,4 +188,15 @@ extension CloudKitSynchronizer {
         }
         return evidence
     }
+
+#if DEBUG
+    /// Read-only E2E inventory of the exact durable bytes already validated by
+    /// the terminal path. This neither restores publication nor touches Realm.
+    @_spi(CloudKitE2E)
+    public func cloudKitE2EDurablePublicationEvidence() throws
+        -> BigSyncDurablePublicationEvidence? {
+        try keyValueStore.bigSyncValidateDurability()
+        return try persistedDurablePublicationEvidence()
+    }
+#endif
 }

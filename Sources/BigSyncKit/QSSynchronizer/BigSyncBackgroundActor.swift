@@ -34,6 +34,17 @@ private actor BigSyncDeadlineRace {
 }
 
 public struct BigSyncBackgroundWorkerConfiguration {
+#if DEBUG
+    @_spi(CloudKitE2E)
+    public enum ProcessKillCheckpoint: String, Sendable {
+        case localAcknowledgementBeforeTerminalPublication
+        case terminalEvidenceBeforeCompletionDelivery
+    }
+
+    @_spi(CloudKitE2E)
+    public typealias ProcessKillCheckpointHandler =
+        @BigSyncBackgroundActor @Sendable (ProcessKillCheckpoint) async throws -> Void
+#endif
     public typealias SynchronizationCompletionHandler =
         @BigSyncBackgroundActor @Sendable (
             CloudKitSynchronizer.SynchronizationResult
@@ -88,6 +99,9 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let accountReplacementPolicy: BigSyncCloudAccountReplacementPolicy
     var changeFeedOverride: (any CloudKitChangeFeed)?
     var recordStoreOverride: (any CloudKitRecordStore)?
+#if DEBUG
+    var processKillCheckpointHandler: ProcessKillCheckpointHandler?
+#endif
     /// Production synchronizers never delete CloudKit zones. Only an isolated
     /// per-run test client may opt into deleting its own disposable zone.
     private(set) var allowsDisposableZoneDeletion: Bool
@@ -249,6 +263,9 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.accountReplacementPolicy = accountReplacementPolicy
         self.changeFeedOverride = nil
         self.recordStoreOverride = nil
+#if DEBUG
+        self.processKillCheckpointHandler = nil
+#endif
         self.allowsDisposableZoneDeletion = false
         self.logger = logger
     }
@@ -263,6 +280,16 @@ public struct BigSyncBackgroundWorkerConfiguration {
     ) {
         changeFeedOverride = changeFeed
         recordStoreOverride = recordStore
+    }
+
+    /// Installs deterministic process-death pauses at already-durable BigSync
+    /// boundaries. The handler is E2E-only and production configurations have
+    /// no corresponding opt-in surface.
+    @_spi(CloudKitE2E)
+    public mutating func installCloudKitE2EProcessKillCheckpointHandler(
+        _ handler: @escaping ProcessKillCheckpointHandler
+    ) {
+        processKillCheckpointHandler = handler
     }
 
     /// Grants the destructive zone-deletion capability only to Manabi's
@@ -316,6 +343,11 @@ public actor BigSyncBackgroundActor {
     private var accountAvailabilityRetryTask: Task<Void, Never>?
     @BigSyncBackgroundActor
     private var publicationRestorationTask: Task<Void, Never>?
+#if DEBUG
+    @BigSyncBackgroundActor
+    private var cloudKitE2ELastRestoredPublicationEvidence:
+        BigSyncDurablePublicationEvidence?
+#endif
     @BigSyncBackgroundActor
     private var performsAccountAvailabilityPreflight = true
     @BigSyncBackgroundActor
@@ -385,10 +417,17 @@ public actor BigSyncBackgroundActor {
             configuration.domainPublicationScopeIdentifierProvider
         synchronizer.accountScopeInvalidationHandler =
             configuration.accountScopeInvalidationHandler
+#if DEBUG
+        synchronizer.processKillCheckpointHandler =
+            configuration.processKillCheckpointHandler
+#endif
         performsAccountAvailabilityPreflight =
             configuration.performsAccountAvailabilityPreflight
         synchronizationCompletionHandler =
             configuration.synchronizationCompletionHandler
+#if DEBUG
+        cloudKitE2ELastRestoredPublicationEvidence = nil
+#endif
 
         if let restorationHandler =
             configuration.durablePublicationEvidenceHandler {
@@ -396,10 +435,12 @@ public actor BigSyncBackgroundActor {
                 priority: .utility
             ) { @BigSyncBackgroundActor in
                 do {
-                    try await restorationHandler(
-                        try await synchronizer
-                            .restoredDurablePublicationEvidence()
-                    )
+                    let evidence = try await synchronizer
+                        .restoredDurablePublicationEvidence()
+#if DEBUG
+                    self.cloudKitE2ELastRestoredPublicationEvidence = evidence
+#endif
+                    try await restorationHandler(evidence)
                 } catch {
                     configuration.logger.error(
                         "QSCloudKitSynchronizer >> Could not restore terminal publication evidence: \(error)"
@@ -425,6 +466,18 @@ public actor BigSyncBackgroundActor {
             _ = await self.synchronizeCloudKit(expectedSynchronizer: synchronizer)
         }
     }
+
+#if DEBUG
+    /// Waits only for configuration's pre-sync restoration task. It does not
+    /// begin or request a synchronization drain.
+    @_spi(CloudKitE2E)
+    @BigSyncBackgroundActor
+    public func awaitCloudKitE2EPublicationRestoration()
+        async -> BigSyncDurablePublicationEvidence? {
+        await publicationRestorationTask?.value
+        return cloudKitE2ELastRestoredPublicationEvidence
+    }
+#endif
 
     @BigSyncBackgroundActor
     public func hasInboundSemanticQuarantine(
@@ -483,6 +536,15 @@ public actor BigSyncBackgroundActor {
             databaseScope: synchronizer.database.databaseScope
         )
     }
+
+#if DEBUG
+    @_spi(CloudKitE2E)
+    @BigSyncBackgroundActor
+    public func cloudKitE2EDurablePublicationEvidence() throws
+        -> BigSyncDurablePublicationEvidence? {
+        try realmSynchronizer?.cloudKitE2EDurablePublicationEvidence()
+    }
+#endif
 
     /// Read-only inventory used by account-fenced model cutovers. The
     /// inventory never clears or acknowledges the sole mutation journal.

@@ -1276,6 +1276,10 @@ public class CloudKitSynchronizer: NSObject {
     }
 
 #if DEBUG
+    @BigSyncBackgroundActor
+    internal var processKillCheckpointHandler:
+        BigSyncBackgroundWorkerConfiguration.ProcessKillCheckpointHandler?
+
     /// Test-only capability for an isolated synchronizer with a disposable
     /// CloudKit zone. Production construction always leaves deletion disabled.
     internal func _enableDisposableZoneDeletionForTesting() {
