@@ -38,6 +38,7 @@ extension CloudKitSynchronizer {
         excludedClassNames: [String],
         accountScopePropertyByClassName: [String: String] = [:],
         priorityClassNames: [String] = [],
+        committedInboundIdentityDeliveryEnabled: Bool = false,
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
         durableStateRecordZoneID: CKRecordZone.ID? = nil,
@@ -179,6 +180,8 @@ extension CloudKitSynchronizer {
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName,
             priorityClassNames: priorityClassNames,
+            committedInboundIdentityDeliveryEnabled:
+                committedInboundIdentityDeliveryEnabled,
             zoneID: zoneID,
             appGroup: suiteName,
             persistenceNamespace: durableStateNamespace,

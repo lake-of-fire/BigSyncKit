@@ -151,3 +151,13 @@ final class BigSyncInboundPageReceipt: Object {
     @Persisted var supersededLineageIDs = List<String>()
     @Persisted var committedAt = Date()
 }
+
+/// Unacknowledged application repair input. It is committed with the zone
+/// cursor and removed only after the fenced application callback succeeds.
+final class BigSyncPendingInboundIdentityDelivery: Object {
+    static let canonicalID = "pending-inbound-identity-delivery-v1"
+
+    @Persisted(primaryKey: true) var id = canonicalID
+    @Persisted var deliveryID = ""
+    @Persisted var encodedIdentities = Data()
+}

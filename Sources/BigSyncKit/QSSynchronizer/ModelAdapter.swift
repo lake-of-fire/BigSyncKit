@@ -238,6 +238,39 @@ public struct InboundPageCommit: Sendable, Equatable {
     }
 }
 
+public struct CommittedInboundIdentity: Sendable, Equatable, Hashable, Codable {
+    public enum Disposition: String, Sendable, Equatable, Hashable, Codable {
+        case upsert
+        case delete
+    }
+
+    public let entityType: String
+    public let recordName: String
+    public let disposition: Disposition
+
+    public init(
+        entityType: String,
+        recordName: String,
+        disposition: Disposition
+    ) {
+        self.entityType = entityType
+        self.recordName = recordName
+        self.disposition = disposition
+    }
+}
+
+/// Durable, idempotently redeliverable target-Realm postimages accumulated
+/// through a committed record-zone cursor boundary.
+public struct CommittedInboundIdentityBatch: Sendable, Equatable {
+    public let deliveryID: String
+    public let identities: [CommittedInboundIdentity]
+
+    public init(deliveryID: String, identities: [CommittedInboundIdentity]) {
+        self.deliveryID = deliveryID
+        self.identities = identities
+    }
+}
+
 public enum InboundDispositionValidationError: Error, Equatable {
     case cardinality(expected: Int, actual: Int)
     case identityMismatch(ordinal: Int, expectedRecordName: String)
@@ -387,6 +420,15 @@ public protocol ModelAdapter: AnyObject, Sendable {
     /// behavior through the default implementation.
     func commitInboundPage(_ page: InboundPageCommit) async throws
 
+    @BigSyncBackgroundActor
+    func pendingCommittedInboundIdentityBatch() throws
+        -> CommittedInboundIdentityBatch?
+
+    @BigSyncBackgroundActor
+    func acknowledgeCommittedInboundIdentityBatch(
+        deliveryID: String
+    ) async throws
+
     /// Stable identifier for the latest record-zone cursor durably consumed by
     /// this adapter for the validated account. A terminal synchronization
     /// receipt uses this to distinguish a complete server snapshot from target
@@ -435,6 +477,17 @@ public protocol ModelAdapter: AnyObject, Sendable {
 public extension ModelAdapter {
     func commitInboundPage(_ page: InboundPageCommit) async throws {
         try await saveToken(page.nextCursor)
+    }
+
+    @BigSyncBackgroundActor
+    func pendingCommittedInboundIdentityBatch() throws
+        -> CommittedInboundIdentityBatch? { nil }
+
+    @BigSyncBackgroundActor
+    func acknowledgeCommittedInboundIdentityBatch(
+        deliveryID: String
+    ) async throws {
+        _ = deliveryID
     }
 
     func validateAuthoritativeOwnUploadRecords(

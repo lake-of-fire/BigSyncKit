@@ -132,8 +132,17 @@ extension CloudKitSynchronizer {
         }
         var publicationBlockers = [DomainBlocker]()
         var domainPublicationScopeIdentifier: String?
+        var inboundIdentityDeliveries = [
+            (adapter: ModelAdapter, batch: CommittedInboundIdentityBatch)
+        ]()
         if let domainPrepublicationHandler {
             do {
+                for adapter in modelAdapters {
+                    if let batch = try adapter
+                        .pendingCommittedInboundIdentityBatch() {
+                        inboundIdentityDeliveries.append((adapter, batch))
+                    }
+                }
                 publicationBlockers.append(contentsOf:
                     try await domainPrepublicationHandler(
                     PrepublicationBoundaryContext(
@@ -141,10 +150,25 @@ extension CloudKitSynchronizer {
                         consumedServerBoundaryIdentifier:
                             consumedServerBoundaryIdentifier,
                         didImportChanges:
-                            synchronizationDrainDidImportChanges
+                            synchronizationDrainDidImportChanges,
+                        committedInboundIdentities: Array(Set(
+                            inboundIdentityDeliveries.flatMap {
+                                $0.batch.identities
+                            }
+                        )).sorted {
+                            ($0.entityType, $0.recordName)
+                                < ($1.entityType, $1.recordName)
+                        }
                     )
                 ))
                 try await revalidateRunContext(terminalContext)
+                for delivery in inboundIdentityDeliveries {
+                    try await delivery.adapter
+                        .acknowledgeCommittedInboundIdentityBatch(
+                            deliveryID: delivery.batch.deliveryID
+                        )
+                    try await revalidateRunContext(terminalContext)
+                }
             } catch is CancellationError {
                 return
             } catch {

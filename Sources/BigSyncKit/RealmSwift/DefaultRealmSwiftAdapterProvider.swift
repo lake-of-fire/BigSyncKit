@@ -18,6 +18,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
     let excludedClassNames: [String]
     let accountScopePropertyByClassName: [String: String]
     let priorityClassNames: [String]
+    let committedInboundIdentityDeliveryEnabled: Bool
     let appGroup: String?
     let assetDirectoryURL: URL?
     let logger: Logging.Logger
@@ -35,6 +36,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
         excludedClassNames: [String],
         accountScopePropertyByClassName: [String: String] = [:],
         priorityClassNames: [String] = [],
+        committedInboundIdentityDeliveryEnabled: Bool = false,
         zoneID: CKRecordZone.ID,
         appGroup: String? = nil,
         persistenceNamespace: String? = nil,
@@ -48,6 +50,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
         self.accountScopePropertyByClassName =
             accountScopePropertyByClassName
         self.priorityClassNames = priorityClassNames
+        self.committedInboundIdentityDeliveryEnabled =
+            committedInboundIdentityDeliveryEnabled
         self.zoneID = zoneID
         self.appGroup = appGroup
         self.assetDirectoryURL = assetDirectoryURL
@@ -71,6 +75,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
         accountScopePropertyByClassName =
             adapter.accountScopePropertyByClassName
         priorityClassNames = adapter.priorityEntityTypeNames
+        committedInboundIdentityDeliveryEnabled =
+            adapter.committedInboundIdentityDeliveryEnabled
         appGroup = nil
         assetDirectoryURL = nil
         startsSetupTask = false
@@ -87,6 +93,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject {
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName,
             priorityEntityTypeNames: priorityClassNames,
+            committedInboundIdentityDeliveryEnabled:
+                committedInboundIdentityDeliveryEnabled,
             recordZoneID: zoneID,
             logger: logger,
             startSetupTask: startsSetupTask,

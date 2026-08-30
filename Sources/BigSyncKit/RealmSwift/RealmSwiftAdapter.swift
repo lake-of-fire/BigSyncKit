@@ -470,6 +470,7 @@ public final class RealmSwiftAdapter:
     public let excludedClassNames: [String]
     public let accountScopePropertyByClassName: [String: String]
     public let priorityEntityTypeNames: [String]
+    public let committedInboundIdentityDeliveryEnabled: Bool
     public let zoneID: CKRecordZone.ID
     public var mergePolicy: MergePolicy = .custom
     public weak var delegate: RealmSwiftAdapterDelegate?
@@ -563,6 +564,7 @@ public final class RealmSwiftAdapter:
         excludedClassNames: [String],
         accountScopePropertyByClassName: [String: String] = [:],
         priorityEntityTypeNames: [String] = [],
+        committedInboundIdentityDeliveryEnabled: Bool = false,
         recordZoneID: CKRecordZone.ID,
         logger: Logging.Logger,
         startSetupTask: Bool = true,
@@ -583,6 +585,8 @@ public final class RealmSwiftAdapter:
         self.accountScopePropertyByClassName =
             accountScopePropertyByClassName
         self.priorityEntityTypeNames = priorityEntityTypeNames
+        self.committedInboundIdentityDeliveryEnabled =
+            committedInboundIdentityDeliveryEnabled
         self.zoneID = recordZoneID
         self.logger = logger
         self.assetDirectoryURL = assetDirectoryURL
@@ -775,7 +779,7 @@ public final class RealmSwiftAdapter:
 
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 18
+        configuration.schemaVersion = 19
         configuration.shouldCompactOnLaunch = { totalBytes, usedBytes in
             // totalBytes refers to the size of the file on disk in bytes (data + free space)
             // usedBytes refers to the number of bytes used by data in the file
@@ -792,7 +796,8 @@ public final class RealmSwiftAdapter:
             RebuildProvenance.self,
             RebuildProvenanceState.self,
             BigSyncInboundSemanticQuarantine.self,
-            BigSyncInboundPageReceipt.self
+            BigSyncInboundPageReceipt.self,
+            BigSyncPendingInboundIdentityDelivery.self
         ]
         return configuration
     }
@@ -7930,8 +7935,49 @@ public final class RealmSwiftAdapter:
                 namespace: namespace,
                 expectedPreviousCursor: expectedPreviousCursor,
                 nextCursor: nextCursor,
+                collectsCommittedInboundIdentities:
+                    committedInboundIdentityDeliveryEnabled,
                 in: persistenceRealm
             )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    public func pendingCommittedInboundIdentityBatch() throws
+        -> CommittedInboundIdentityBatch? {
+        guard let persistenceRealm = realmProvider?.persistenceRealm,
+              let delivery = persistenceRealm.object(
+                ofType: BigSyncPendingInboundIdentityDelivery.self,
+                forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+              ), !delivery.deliveryID.isEmpty else { return nil }
+        let identities = try JSONDecoder().decode(
+            [CommittedInboundIdentity].self,
+            from: delivery.encodedIdentities
+        )
+        return CommittedInboundIdentityBatch(
+            deliveryID: delivery.deliveryID,
+            identities: identities
+        )
+    }
+
+    @BigSyncBackgroundActor
+    public func acknowledgeCommittedInboundIdentityBatch(
+        deliveryID: String
+    ) async throws {
+        guard let persistenceRealm = realmProvider?.persistenceRealm else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
+        let expectedCancellationGeneration = cancellationGeneration
+        try await persistenceRealm.asyncWrite {
+            try Task.checkCancellation()
+            guard !cancelSync,
+                  cancellationGeneration == expectedCancellationGeneration
+            else { throw CancellationError() }
+            guard let delivery = persistenceRealm.object(
+                ofType: BigSyncPendingInboundIdentityDelivery.self,
+                forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+            ), delivery.deliveryID == deliveryID else { return }
+            persistenceRealm.delete(delivery)
         }
     }
 
@@ -8076,6 +8122,7 @@ public final class RealmSwiftAdapter:
         namespace: InboundPageNamespace,
         expectedPreviousCursor: Data?,
         nextCursor: Data,
+        collectsCommittedInboundIdentities: Bool,
         in realm: Realm
     ) throws {
         let liveCurrentCursor = realm.objects(ServerToken.self).first?.token
@@ -8179,6 +8226,71 @@ public final class RealmSwiftAdapter:
             realm.add(serverToken)
         }
         serverToken.token = nextCursor
+        if collectsCommittedInboundIdentities {
+            try appendPendingInboundIdentities(for: page, in: realm)
+        }
+    }
+
+    private static func appendPendingInboundIdentities(
+        for page: InboundPageCommit,
+        in realm: Realm
+    ) throws {
+        let pageIdentities = page.liveResults.compactMap { result ->
+            CommittedInboundIdentity? in
+            switch result.disposition {
+            case .applied, .unchanged, .preservedImmutable, .deferred:
+                return CommittedInboundIdentity(
+                    entityType: result.event.entityType,
+                    recordName: result.event.recordName,
+                    disposition: .upsert
+                )
+            case .validatedAuthoritativeOwnUpload, .preservedPendingLocal,
+                 .quarantined,
+                 .ignoredExplicitAuthority:
+                return nil
+            }
+        } + page.deletionResults.compactMap { result ->
+            CommittedInboundIdentity? in
+            switch result.disposition {
+            case .appliedTombstone, .alreadyDeleted:
+                return CommittedInboundIdentity(
+                    entityType: result.event.entityType,
+                    recordName: result.event.recordName,
+                    disposition: .delete
+                )
+            case .preservedNewerLive, .quarantined,
+                 .ignoredExplicitAuthority:
+                return nil
+            }
+        }
+        guard !pageIdentities.isEmpty else { return }
+
+        let delivery = realm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ) ?? BigSyncPendingInboundIdentityDelivery()
+        let existing: [CommittedInboundIdentity]
+        if delivery.realm == nil || delivery.encodedIdentities.isEmpty {
+            existing = []
+        } else {
+            existing = try JSONDecoder().decode(
+                [CommittedInboundIdentity].self,
+                from: delivery.encodedIdentities
+            )
+        }
+        var latest = Dictionary(uniqueKeysWithValues: existing.map {
+            ($0.entityType + "\0" + $0.recordName, $0)
+        })
+        for identity in pageIdentities {
+            latest[identity.entityType + "\0" + identity.recordName] = identity
+        }
+        delivery.deliveryID = UUID().uuidString
+        delivery.encodedIdentities = try JSONEncoder().encode(
+            latest.values.sorted {
+                ($0.entityType, $0.recordName) < ($1.entityType, $1.recordName)
+            }
+        )
+        realm.add(delivery, update: .modified)
     }
 
     /// A deferred disposition is durable only when its relationship work is

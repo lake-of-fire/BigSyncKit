@@ -356,6 +356,8 @@ public actor BigSyncBackgroundActor {
             accountScopePropertyByClassName:
                 configuration.accountScopePropertyByClassName,
             priorityClassNames: configuration.priorityClassNames,
+            committedInboundIdentityDeliveryEnabled:
+                configuration.domainPrepublicationHandler != nil,
             suiteName: configuration.suiteName,
             recordZoneID: configuration.recordZoneID,
             durableStateRecordZoneID:

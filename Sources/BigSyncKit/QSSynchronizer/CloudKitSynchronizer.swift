@@ -786,11 +786,13 @@ public class CloudKitSynchronizer: NSObject {
         public let runID: UUID
         public let consumedServerBoundaryIdentifier: String?
         public let didImportChanges: Bool
+        public let committedInboundIdentities: [CommittedInboundIdentity]
 
         internal init(
             context: RunContext,
             consumedServerBoundaryIdentifier: String?,
-            didImportChanges: Bool
+            didImportChanges: Bool,
+            committedInboundIdentities: [CommittedInboundIdentity] = []
         ) {
             accountScopeIdentifier = context.accountScopeIdentifier
             replicaBindingGenerationIdentifier =
@@ -799,6 +801,7 @@ public class CloudKitSynchronizer: NSObject {
             self.consumedServerBoundaryIdentifier =
                 consumedServerBoundaryIdentifier
             self.didImportChanges = didImportChanges
+            self.committedInboundIdentities = committedInboundIdentities
         }
     }
 

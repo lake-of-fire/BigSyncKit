@@ -13698,9 +13698,144 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testInboundPageCursorAndCrashRecoveryIdentitiesCommitTogether()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            committedInboundIdentityDeliveryEnabled: true
+        )
+        try await fixture.adapter.activateAccountScope("identity-account")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "identity-container",
+            databaseScope: .private
+        )
+        let live = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "identity-unchanged-redelivery",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let deleted = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "identity-already-deleted-redelivery",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let invalidCursor = RecordZoneChangeCursor(
+            serializedData: Data("identity-invalid-previous".utf8)
+        )
+        do {
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: invalidCursor,
+                nextCursor: .init(
+                    serializedData: Data("identity-rejected".utf8)
+                ),
+                liveResults: [.init(
+                    event: .init(
+                        ordinal: 0,
+                        entityType: live.recordType,
+                        recordID: live.recordID
+                    ),
+                    disposition: .unchanged
+                )],
+                deletionResults: []
+            ))
+            XCTFail("Expected stale cursor rejection")
+        } catch RealmSwiftInboundPageCommitError.previousCursorMismatch {}
+        XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+        let rejectedToken = await fixture.adapter.serverChangeToken
+        XCTAssertNil(rejectedToken)
+
+        let committedCursor = RecordZoneChangeCursor(
+            serializedData: Data("identity-committed".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: committedCursor,
+            liveResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: live.recordType,
+                    recordID: live.recordID
+                ),
+                disposition: .unchanged
+            )],
+            deletionResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: deleted.recordType,
+                    recordID: deleted.recordID
+                ),
+                disposition: .alreadyDeleted
+            )]
+        ))
+
+        let batch = try XCTUnwrap(
+            try fixture.adapter.pendingCommittedInboundIdentityBatch()
+        )
+        XCTAssertEqual(Set(batch.identities), Set([
+            .init(
+                entityType: live.recordType,
+                recordName: live.recordID.recordName,
+                disposition: .upsert
+            ),
+            .init(
+                entityType: deleted.recordType,
+                recordName: deleted.recordID.recordName,
+                disposition: .delete
+            ),
+        ]))
+        let storedToken = await fixture.adapter.serverChangeToken
+        XCTAssertEqual(storedToken, committedCursor)
+
+        try await fixture.adapter.saveToken(nil)
+        XCTAssertEqual(
+            try fixture.adapter.pendingCommittedInboundIdentityBatch()?
+                .deliveryID,
+            batch.deliveryID
+        )
+        try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(
+            deliveryID: "stale-delivery"
+        )
+        XCTAssertNotNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+        try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(
+            deliveryID: batch.deliveryID
+        )
+        XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+    }
+
+    @BigSyncBackgroundActor
+    func testAdapterWithoutIdentityConsumerCommitsNoDeliveryDebt() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.activateAccountScope("no-consumer-account")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "no-consumer-container",
+            databaseScope: .private
+        )
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "no-consumer",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: .init(serializedData: Data("no-consumer".utf8)),
+            liveResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: record.recordType,
+                    recordID: record.recordID
+                ),
+                disposition: .applied
+            )],
+            deletionResults: []
+        ))
+
+        XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+    }
+
+    @BigSyncBackgroundActor
     private func makeRealmAdapterFixture(
         accountScopePropertyByClassName: [String: String] = [:],
-        priorityEntityTypeNames: [String] = []
+        priorityEntityTypeNames: [String] = [],
+        committedInboundIdentityDeliveryEnabled: Bool = false
     ) async throws -> (
         adapter: RealmSwiftAdapter,
         persistenceRealm: Realm,
@@ -13729,6 +13864,8 @@ final class BigSyncKitTests: XCTestCase {
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName,
             priorityEntityTypeNames: priorityEntityTypeNames,
+            committedInboundIdentityDeliveryEnabled:
+                committedInboundIdentityDeliveryEnabled,
             recordZoneID: CKRecordZone.ID(zoneName: "realm-adapter-zone", ownerName: CKCurrentUserDefaultName),
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false,
