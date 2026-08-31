@@ -79,4 +79,29 @@ extension RealmSwiftAdapter {
             return $0.recordName < $1.recordName
         }
     }
+
+#if DEBUG
+    /// Read-only E2E proof of tracking-Realm generations that have not yet
+    /// been acknowledged. It never clears or advances transport state.
+    @_spi(CloudKitE2E)
+    @BigSyncBackgroundActor
+    public func cloudKitE2EPendingTrackingGenerations(
+        recordNames: Set<String>
+    ) throws -> [String: String] {
+        guard !recordNames.isEmpty else { return [:] }
+        guard let realm = realmProvider?.persistenceRealm else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
+        realm.refresh()
+        var generations = [String: String]()
+        for recordName in recordNames {
+            guard let generation = realm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration else { continue }
+            generations[recordName] = generation
+        }
+        return generations
+    }
+#endif
 }

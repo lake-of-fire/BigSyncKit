@@ -3,7 +3,7 @@ import CloudKit
 import CoreFoundation
 import CryptoKit
 import Logging
-@testable import BigSyncKit
+@_spi(CloudKitE2E) @testable import BigSyncKit
 import RealmSwift
 import RealmSwiftGaps
 
@@ -48,6 +48,39 @@ private final class TerminalCallbackObservation: NSObject {
         sawCompletedDrain = !synchronizer.synchronizationDrainIsActive
         synchronizer.beginSynchronization()
     }
+}
+
+@BigSyncBackgroundActor
+private final class ProcessKillCompletionDelegate:
+    CloudKitSynchronizerDelegate {
+    private(set) var didSync = false
+    private(set) var didFail = false
+
+    func synchronizerWillFetchChanges(
+        _ synchronizer: CloudKitSynchronizer,
+        in recordZone: CKRecordZone.ID
+    ) {}
+
+    func synchronizerWillUploadChanges(
+        _ synchronizer: CloudKitSynchronizer,
+        to recordZone: CKRecordZone.ID
+    ) {}
+
+    func synchronizerDidSync(_ synchronizer: CloudKitSynchronizer) {
+        didSync = true
+    }
+
+    func synchronizerDidfailToSync(
+        _ synchronizer: CloudKitSynchronizer,
+        error: Error
+    ) {
+        didFail = true
+    }
+
+    func synchronizer(
+        _ synchronizer: CloudKitSynchronizer,
+        zoneIDWasDeleted zoneID: CKRecordZone.ID
+    ) {}
 }
 
 private struct FakeZoneChangePage {
@@ -11939,9 +11972,19 @@ final class BigSyncKitTests: XCTestCase {
             recordZoneID: zoneID
         )
         let events = SynchronizationBoundaryEventRecorder()
+        let completionDelegate = ProcessKillCompletionDelegate()
+        synchronizer.delegate = completionDelegate
+        synchronizer.domainPublicationScopeIdentifierProvider = {
+            "process-kill-test-scope"
+        }
         synchronizer.processKillCheckpointHandler = { checkpoint in
+            let didUpload = adapter.events.contains {
+                $0.hasPrefix("didUpload:")
+            }
+            let hasDurableEvidence = try synchronizer
+                .cloudKitE2EDurablePublicationEvidence() != nil
             await events.record(
-                "\(checkpoint.rawValue):fetches=\(database.databaseChangeFetchCount)"
+                "\(checkpoint.rawValue):fetches=\(database.databaseChangeFetchCount):didUpload=\(didUpload):evidence=\(hasDurableEvidence):completed=\(completionDelegate.didSync)"
             )
         }
         synchronizer.addModelAdapter(adapter)
@@ -11953,14 +11996,54 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(
             checkpointEvents,
             [
-                "localAcknowledgementBeforeTerminalPublication:fetches=1",
-                "terminalEvidenceBeforeCompletionDelivery:fetches=2",
+                "localAcknowledgementBeforeTerminalPublication:fetches=1:didUpload=true:evidence=false:completed=false",
+                "terminalEvidenceBeforeCompletionDelivery:fetches=2:didUpload=true:evidence=false:completed=false",
             ]
         )
         XCTAssertTrue(
             adapter.events.contains(where: { $0.hasPrefix("didUpload:") })
         )
         XCTAssertGreaterThanOrEqual(database.databaseChangeFetchCount, 2)
+        XCTAssertTrue(completionDelegate.didSync)
+        XCTAssertFalse(completionDelegate.didFail)
+    }
+
+    @BigSyncBackgroundActor
+    func testProcessKillCheckpointFailureCannotPublishSuccess() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(zoneName: "process-kill-failure")
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: [],
+            uploadedByEntity: [
+                "Bookmark": [
+                    makeRecord(type: "Bookmark", id: "one", zoneID: zoneID)
+                ]
+            ]
+        )
+        let synchronizer = makeSynchronizer(
+            database: database,
+            recordZoneID: zoneID
+        )
+        let completionDelegate = ProcessKillCompletionDelegate()
+        synchronizer.delegate = completionDelegate
+        synchronizer.processKillCheckpointHandler = { checkpoint in
+            if checkpoint == .localAcknowledgementBeforeTerminalPublication {
+                throw TestSynchronizationError.terminalForwardingFailed
+            }
+        }
+        synchronizer.addModelAdapter(adapter)
+
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("Expected checkpoint failure")
+        } catch TestSynchronizationError.terminalForwardingFailed {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertFalse(completionDelegate.didSync)
+        XCTAssertTrue(completionDelegate.didFail)
+        XCTAssertNil(try synchronizer.cloudKitE2EDurablePublicationEvidence())
     }
 #endif
 
@@ -13844,6 +13927,193 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNotNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
         try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(
             deliveryID: batch.deliveryID
+        )
+        XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundIdentityDeliveryAppendsPageChunksAndLastDispositionWins()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            committedInboundIdentityDeliveryEnabled: true
+        )
+        try await fixture.adapter.activateAccountScope("chunked-identity-account")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "chunked-identity-container",
+            databaseScope: .private
+        )
+        let changing = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "chunked-changing",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let retained = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "chunked-retained",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let firstCursor = RecordZoneChangeCursor(
+            serializedData: Data("chunked-first".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: firstCursor,
+            liveResults: [changing, retained].enumerated().map { ordinal, record in
+                .init(
+                    event: .init(
+                        ordinal: ordinal,
+                        entityType: record.recordType,
+                        recordID: record.recordID
+                    ),
+                    disposition: .unchanged
+                )
+            },
+            deletionResults: []
+        ))
+        let firstDeliveryID = try XCTUnwrap(
+            try fixture.adapter.pendingCommittedInboundIdentityBatch()?.deliveryID
+        )
+
+        let secondCursor = RecordZoneChangeCursor(
+            serializedData: Data("chunked-second".utf8)
+        )
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: firstCursor,
+            nextCursor: secondCursor,
+            liveResults: [],
+            deletionResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: changing.recordType,
+                    recordID: changing.recordID
+                ),
+                disposition: .alreadyDeleted
+            )]
+        ))
+
+        let delivery = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+        XCTAssertTrue(delivery.encodedIdentities.isEmpty)
+        XCTAssertEqual(delivery.encodedIdentityPageBatches.count, 2)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                [CommittedInboundIdentity].self,
+                from: delivery.encodedIdentityPageBatches[0]
+            ).count,
+            2
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                [CommittedInboundIdentity].self,
+                from: delivery.encodedIdentityPageBatches[1]
+            ).count,
+            1
+        )
+        XCTAssertNotEqual(delivery.deliveryID, firstDeliveryID)
+
+        try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(
+            deliveryID: firstDeliveryID
+        )
+        let batch = try XCTUnwrap(
+            try fixture.adapter.pendingCommittedInboundIdentityBatch()
+        )
+        XCTAssertEqual(Set(batch.identities), Set([
+            .init(
+                entityType: changing.recordType,
+                recordName: changing.recordID.recordName,
+                disposition: .delete
+            ),
+            .init(
+                entityType: retained.recordType,
+                recordName: retained.recordID.recordName,
+                disposition: .upsert
+            ),
+        ]))
+        try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(
+            deliveryID: batch.deliveryID
+        )
+        XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundIdentityDeliveryMergesLegacyAggregateBeforePageChunks()
+    async throws {
+        XCTAssertEqual(
+            RealmSwiftAdapter.defaultPersistenceConfiguration().schemaVersion,
+            20
+        )
+        let fixture = try await makeRealmAdapterFixture(
+            committedInboundIdentityDeliveryEnabled: true
+        )
+        try await fixture.adapter.activateAccountScope("legacy-identity-account")
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "legacy-identity-container",
+            databaseScope: .private
+        )
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "legacy-then-page",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let legacyIdentity = CommittedInboundIdentity(
+            entityType: record.recordType,
+            recordName: record.recordID.recordName,
+            disposition: .upsert
+        )
+        let legacyData = try JSONEncoder().encode([legacyIdentity])
+        try fixture.persistenceRealm.write {
+            let delivery = BigSyncPendingInboundIdentityDelivery()
+            delivery.deliveryID = "legacy-delivery"
+            delivery.encodedIdentities = legacyData
+            fixture.persistenceRealm.add(delivery)
+        }
+        let legacyBatch = try XCTUnwrap(
+            try fixture.adapter.pendingCommittedInboundIdentityBatch()
+        )
+        XCTAssertEqual(legacyBatch.identities, [legacyIdentity])
+
+        try await fixture.adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: .init(serializedData: Data("legacy-page".utf8)),
+            liveResults: [],
+            deletionResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: record.recordType,
+                    recordID: record.recordID
+                ),
+                disposition: .alreadyDeleted
+            )]
+        ))
+
+        let stored = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+        XCTAssertEqual(stored.encodedIdentities, legacyData)
+        XCTAssertEqual(stored.encodedIdentityPageBatches.count, 1)
+        XCTAssertNotEqual(stored.deliveryID, "legacy-delivery")
+        let mergedBatch = try XCTUnwrap(
+            try fixture.adapter.pendingCommittedInboundIdentityBatch()
+        )
+        XCTAssertEqual(
+            mergedBatch.identities,
+            [CommittedInboundIdentity(
+                entityType: record.recordType,
+                recordName: record.recordID.recordName,
+                disposition: .delete
+            )]
+        )
+        try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(
+            deliveryID: "legacy-delivery"
+        )
+        XCTAssertNotNil(
+            try fixture.adapter.pendingCommittedInboundIdentityBatch()
+        )
+        try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(
+            deliveryID: mergedBatch.deliveryID
         )
         XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
     }

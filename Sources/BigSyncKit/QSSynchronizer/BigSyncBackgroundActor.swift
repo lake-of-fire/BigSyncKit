@@ -544,6 +544,20 @@ public actor BigSyncBackgroundActor {
         -> BigSyncDurablePublicationEvidence? {
         try realmSynchronizer?.cloudKitE2EDurablePublicationEvidence()
     }
+
+    @_spi(CloudKitE2E)
+    @BigSyncBackgroundActor
+    public func cloudKitE2EPendingTrackingGenerations(
+        recordNames: Set<String>
+    ) throws -> [String: String] {
+        guard let adapter = realmSynchronizer?.modelAdapters.first
+                as? RealmSwiftAdapter else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
+        return try adapter.cloudKitE2EPendingTrackingGenerations(
+            recordNames: recordNames
+        )
+    }
 #endif
 
     /// Read-only inventory used by account-fenced model cutovers. The

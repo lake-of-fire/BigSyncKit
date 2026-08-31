@@ -779,7 +779,7 @@ public final class RealmSwiftAdapter:
 
     static public func defaultPersistenceConfiguration() -> Realm.Configuration {
         var configuration = Realm.Configuration()
-        configuration.schemaVersion = 19
+        configuration.schemaVersion = 20
         configuration.shouldCompactOnLaunch = { totalBytes, usedBytes in
             // totalBytes refers to the size of the file on disk in bytes (data + free space)
             // usedBytes refers to the number of bytes used by data in the file
@@ -7950,10 +7950,27 @@ public final class RealmSwiftAdapter:
                 ofType: BigSyncPendingInboundIdentityDelivery.self,
                 forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
               ), !delivery.deliveryID.isEmpty else { return nil }
-        let identities = try JSONDecoder().decode(
-            [CommittedInboundIdentity].self,
-            from: delivery.encodedIdentities
-        )
+        var latest = [String: CommittedInboundIdentity]()
+        func merge(_ encoded: Data) throws {
+            for identity in try JSONDecoder().decode(
+                [CommittedInboundIdentity].self,
+                from: encoded
+            ) {
+                latest[identity.entityType + "\0" + identity.recordName] =
+                    identity
+            }
+        }
+        // A migrated v19 aggregate is the oldest durable input. Later page
+        // batches overwrite it in committed cursor order.
+        if !delivery.encodedIdentities.isEmpty {
+            try merge(delivery.encodedIdentities)
+        }
+        for encodedPage in delivery.encodedIdentityPageBatches {
+            try merge(encodedPage)
+        }
+        let identities = latest.values.sorted {
+            ($0.entityType, $0.recordName) < ($1.entityType, $1.recordName)
+        }
         return CommittedInboundIdentityBatch(
             deliveryID: delivery.deliveryID,
             identities: identities
@@ -8269,26 +8286,9 @@ public final class RealmSwiftAdapter:
             ofType: BigSyncPendingInboundIdentityDelivery.self,
             forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
         ) ?? BigSyncPendingInboundIdentityDelivery()
-        let existing: [CommittedInboundIdentity]
-        if delivery.realm == nil || delivery.encodedIdentities.isEmpty {
-            existing = []
-        } else {
-            existing = try JSONDecoder().decode(
-                [CommittedInboundIdentity].self,
-                from: delivery.encodedIdentities
-            )
-        }
-        var latest = Dictionary(uniqueKeysWithValues: existing.map {
-            ($0.entityType + "\0" + $0.recordName, $0)
-        })
-        for identity in pageIdentities {
-            latest[identity.entityType + "\0" + identity.recordName] = identity
-        }
         delivery.deliveryID = UUID().uuidString
-        delivery.encodedIdentities = try JSONEncoder().encode(
-            latest.values.sorted {
-                ($0.entityType, $0.recordName) < ($1.entityType, $1.recordName)
-            }
+        delivery.encodedIdentityPageBatches.append(
+            try JSONEncoder().encode(pageIdentities)
         )
         realm.add(delivery, update: .modified)
     }

@@ -159,5 +159,11 @@ final class BigSyncPendingInboundIdentityDelivery: Object {
 
     @Persisted(primaryKey: true) var id = canonicalID
     @Persisted var deliveryID = ""
+    /// Compatibility payload written by persistence schemas through v19.
+    /// When present, it precedes every page batch below.
     @Persisted var encodedIdentities = Data()
+    /// Independently encoded committed pages, retained in cursor order. Page
+    /// commit appends only its own identities; terminal delivery performs the
+    /// one required last-disposition-wins consolidation.
+    @Persisted var encodedIdentityPageBatches = List<Data>()
 }
