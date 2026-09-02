@@ -1714,7 +1714,9 @@ public final class RealmSwiftAdapter:
                 await { @RealmBackgroundActor in
                     do {
                         guard let targetWriterRealm = realmProvider.targetWriterRealmPerSchemaName[schema.className] else { return }
-                        let writerTypedCount = targetWriterRealm.objects(objectClass).count
+                        let writerTypedCount: Int = targetWriterRealm
+                            .objects(objectClass)
+                            .count
                         if writerTypedCount == 0 {
                             try targetWriterRealm.write {
                                 let dummy = objectClass.init()
@@ -2402,7 +2404,9 @@ public final class RealmSwiftAdapter:
         ) -> (changes: [PendingObjectChange], latestExplicitlyModifiedAt: Date?) {
             var changes: [PendingObjectChange] = []
             var latestExplicitlyModifiedAt: Date?
-            var matchingObjects = targetReaderRealm.objects(objectClass)
+            var matchingObjects: Results<Object> = targetReaderRealm.objects(
+                objectClass
+            )
                 .filter(predicate)
             if let accountScopeProperty =
                     accountScopePropertyByClassName[schemaName] {
@@ -2830,7 +2834,9 @@ public final class RealmSwiftAdapter:
                     continue
                 }
 
-                var objects = targetReaderRealm.objects(objectClass)
+                var objects: Results<Object> = targetReaderRealm.objects(
+                    objectClass
+                )
                 if let eligibilityType = objectClass
                     as? CloudKitInitialSyncEligibilityModel.Type {
                     objects = objects.filter(
@@ -4828,7 +4834,7 @@ public final class RealmSwiftAdapter:
                         ?? objectType.sharedSchema()?.primaryKeyProperty?.name else {
                     continue
                 }
-                var objects = targetRealm.objects(objectType)
+                var objects: Results<Object> = targetRealm.objects(objectType)
                 if let accountScopeProperty =
                         accountScopePropertyByClassName[schema.className] {
                     objects = objects.filter(
@@ -5044,10 +5050,10 @@ public final class RealmSwiftAdapter:
                     continue
                 }
 
-                let provenance = persistenceRealm.object(
+                let provenance: RebuildProvenance? = persistenceRealm.object(
                     ofType: RebuildProvenance.self,
                     forPrimaryKey: candidate.identifier
-                ).flatMap { provenance in
+                ).flatMap { provenance -> RebuildProvenance? in
                     provenance.accountScopeIdentifier == accountScopeIdentifier
                         && provenance.epoch == epoch ? provenance : nil
                 }
