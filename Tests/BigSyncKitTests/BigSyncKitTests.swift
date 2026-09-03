@@ -1026,6 +1026,27 @@ private final class MutationJournalIdentitySequence: @unchecked Sendable {
     }
 }
 
+private final class MutableMutationJournalIdentity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedIdentity: BigSyncMutationJournalIdentity
+
+    init(_ identity: BigSyncMutationJournalIdentity) {
+        storedIdentity = identity
+    }
+
+    func load() -> BigSyncMutationJournalIdentity {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedIdentity
+    }
+
+    func store(_ identity: BigSyncMutationJournalIdentity) {
+        lock.lock()
+        storedIdentity = identity
+        lock.unlock()
+    }
+}
+
 final class BigSyncKitTests: XCTestCase {
 
     func testCloudKitBooleanCodecAcceptsOnlyBooleanOrIntegralZeroAndOne() {
@@ -3435,6 +3456,95 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertTrue(secondMutation.generation.hasPrefix(
             "installation:installation-b:binding:\(bindingB):"
         ))
+    }
+
+    @BigSyncBackgroundActor
+    func testCurrentJournalIdentityRequiresExactAutomaticMutationBindingsAndDoesNotRewriteOnRotation()
+    async throws {
+        let bindingA = String(repeating: "a", count: 64)
+        let bindingB = String(repeating: "b", count: 64)
+        let installation = "receipt-verification-installation"
+        let identityA = BigSyncMutationJournalIdentity(
+            installationIdentifier: installation,
+            replicaBindingGenerationIdentifier: bindingA
+        )
+        let identityB = BigSyncMutationJournalIdentity(
+            installationIdentifier: installation,
+            replicaBindingGenerationIdentifier: bindingB
+        )
+        let currentIdentity = MutableMutationJournalIdentity(identityA)
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier =
+            "receipt-journal-verification-\(UUID().uuidString)"
+        configuration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration],
+            mutationJournalIdentityProvider: { currentIdentity.load() }
+        )
+        let realm = try await Realm(
+            configuration: configuration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let first = BigSyncTrackedObject(
+            id: "receipt-verification-first",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        let second = BigSyncTrackedObject(
+            id: "receipt-verification-second",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+
+        var verifiedIdentity: BigSyncMutationJournalIdentity?
+        try realm.write {
+            realm.add([first, second])
+            first.refreshChangeMetadata(explicitlyModified: true)
+            second.refreshChangeMetadata(explicitlyModified: true)
+            verifiedIdentity = BigSyncMutationTracking.currentJournalIdentity(
+                verifyingPendingMutationsFor: [first, second],
+                in: realm
+            )
+        }
+        XCTAssertEqual(verifiedIdentity, identityA)
+        let rowsBeforeRotation = Dictionary(uniqueKeysWithValues:
+            realm.objects(BigSyncPendingMutation.self).map {
+                ($0.recordName, ($0.generation,
+                    $0.replicaBindingGenerationIdentifier))
+            }
+        )
+        XCTAssertEqual(rowsBeforeRotation.count, 2)
+        XCTAssertTrue(rowsBeforeRotation.values.allSatisfy {
+            $0.1 == bindingA
+        })
+
+        currentIdentity.store(identityB)
+        var rotatedVerification: BigSyncMutationJournalIdentity?
+        try realm.write {
+            rotatedVerification = BigSyncMutationTracking
+                .currentJournalIdentity(
+                    verifyingPendingMutationsFor: [first, second],
+                    in: realm
+                )
+        }
+        XCTAssertNil(rotatedVerification)
+        let rowsAfterRotation = Dictionary(uniqueKeysWithValues:
+            realm.objects(BigSyncPendingMutation.self).map {
+                ($0.recordName, ($0.generation,
+                    $0.replicaBindingGenerationIdentifier))
+            }
+        )
+        XCTAssertEqual(rowsAfterRotation.count, rowsBeforeRotation.count)
+        for (recordName, before) in rowsBeforeRotation {
+            let after = try XCTUnwrap(rowsAfterRotation[recordName])
+            XCTAssertEqual(after.0, before.0)
+            XCTAssertEqual(after.1, before.1)
+        }
     }
 
     @BigSyncBackgroundActor

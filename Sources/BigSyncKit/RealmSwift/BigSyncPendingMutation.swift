@@ -46,6 +46,20 @@ public final class BigSyncPendingMutation: Object {
         )
     }
 
+    static func wasCreatedInMutationJournalIdentity(
+        _ generation: String,
+        identity: BigSyncMutationJournalIdentity
+    ) -> Bool {
+        let installationPrefix = installationGenerationPrefix
+            + identity.installationIdentifier + ":"
+        guard generation.hasPrefix(installationPrefix) else { return false }
+        let suffix = generation.dropFirst(installationPrefix.count)
+        if let binding = identity.replicaBindingGenerationIdentifier {
+            return suffix.hasPrefix("binding:" + binding + ":")
+        }
+        return !suffix.hasPrefix("binding:")
+    }
+
     @Persisted(primaryKey: true) public var recordName = ""
     @Persisted(indexed: true) public var entityType = ""
     @Persisted public var objectIdentifier = ""
@@ -288,6 +302,17 @@ enum BigSyncMutationTrackingRegistry {
         }
     }
 
+    static func currentMutationJournalIdentity(
+        in realm: Realm
+    ) -> BigSyncMutationJournalIdentity? {
+        let provider = lock.withLock {
+            registrationsByRealm[
+                identity(for: realm.configuration)
+            ]?.mutationJournalIdentityProvider
+        }
+        return provider?()
+    }
+
     static func makeMutationGeneration(
         in realm: Realm
     ) -> (
@@ -490,5 +515,57 @@ public enum BigSyncMutationTracking {
             mutationJournalIdentityProvider:
                 mutationJournalIdentityProvider
         )
+    }
+
+    /// Returns the one live transport identity shared by the supplied
+    /// automatically journaled mutations, or `nil` when an account/binding
+    /// transition crossed the caller's Realm transaction.
+    ///
+    /// This is a verification boundary only. Application code continues to
+    /// create journal rows exclusively through `refreshChangeMetadata`.
+    public static func currentJournalIdentity<ObjectType: Object>(
+        verifyingPendingMutationsFor objects: [ObjectType],
+        in realm: Realm
+    ) -> BigSyncMutationJournalIdentity? {
+        precondition(realm.isInWriteTransaction)
+        guard let identity = BigSyncMutationTrackingRegistry
+            .currentMutationJournalIdentity(in: realm),
+              !identity.installationIdentifier.isEmpty,
+              identity.replicaBindingGenerationIdentifier?.isEmpty
+                != true else {
+            return nil
+        }
+        for object in objects {
+            guard let objectRealm = object.realm,
+                  !object.isInvalidated,
+                  BigSyncMutationTrackingRegistry.identity(
+                    for: objectRealm.configuration
+                  ) == BigSyncMutationTrackingRegistry.identity(
+                    for: realm.configuration
+                  ),
+                  let primaryKey = object.objectSchema.primaryKeyProperty?.name
+            else { return nil }
+            let entityType = object.objectSchema.className
+            let objectIdentifier = RealmSwiftAdapter
+                .getTargetObjectStringIdentifier(
+                    for: object,
+                    usingPrimaryKey: primaryKey
+                )
+            let recordName = entityType + "." + objectIdentifier
+            guard let mutation = realm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            ), mutation.entityType == entityType,
+               mutation.objectIdentifier == objectIdentifier,
+               mutation.replicaBindingGenerationIdentifier
+                == identity.replicaBindingGenerationIdentifier,
+               BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(
+                    mutation.generation,
+                    identity: identity
+               ) else {
+                return nil
+            }
+        }
+        return identity
     }
 }
