@@ -529,56 +529,55 @@ enum BackupDetection {
             sentinelURL: sentinelURL
         )
         let completedExists = fileManager.fileExists(atPath: completedURL.path)
-        let completed: ManualRestoreReceipt?
-        if completedExists {
-            guard let receipt = manualRestoreReceipt(at: completedURL),
-                  installationIdentifier(
-                    sentinelURL: sentinelURL,
-                    fileManager: fileManager
-                  ) == receipt.newInstallationIdentifier else {
-                throw Error.manualRestoreStateAmbiguous
-            }
-            completed = receipt
-        } else {
-            completed = nil
+        let completed = completedExists ? manualRestoreReceipt(at: completedURL) : nil
+        let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
+        let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil
+        guard (!completedExists || completed != nil),
+              (!intentExists || intent != nil),
+              (!eventExists || event != nil),
+              intent == nil || event == nil || intent == event,
+              let installation = installationIdentifier(
+                  sentinelURL: sentinelURL,
+                  fileManager: fileManager
+              ) else {
+            throw Error.manualRestoreStateAmbiguous
         }
 
-        // A matching completion receipt proves the replacement finished.
-        // Matching intent/event files are residue from cleanup interrupted by
-        // a crash; conflicting or unreadable residue remains ambiguous.
         if let completed,
            completed.transactionIdentifier == transactionIdentifier {
-            let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
-            let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil
-            if (intentExists && intent == nil)
-                || (eventExists && event == nil)
-                || intent.map({ $0 != completed }) == true
-                || event.map({ $0 != completed }) == true {
+            guard installation == completed.newInstallationIdentifier,
+                  intent.map({ $0 == completed }) ?? true,
+                  event.map({ $0 == completed }) ?? true else {
                 throw Error.manualRestoreStateAmbiguous
             }
             return .completed(completed)
         }
 
-        if !intentExists && !eventExists {
-            return .newTransaction
+        if let receipt = event ?? intent {
+            guard receipt.transactionIdentifier == transactionIdentifier else {
+                throw Error.manualRestoreTransactionMismatch
+            }
+            // A later restore may have rotated the sentinel before replacing
+            // the prior completion receipt. Its durable event proves that exact
+            // identity transition; the older receipt remains valid predecessor
+            // evidence rather than making the new transaction ambiguous.
+            guard completed.map({
+                $0.newInstallationIdentifier == receipt.oldInstallationIdentifier
+            }) ?? true,
+            installation == receipt.oldInstallationIdentifier
+                || (event != nil
+                    && installation == receipt.newInstallationIdentifier) else {
+                throw Error.manualRestoreStateAmbiguous
+            }
+            return event != nil ? .resumeEvent(receipt) : .resumeIntent(receipt)
         }
 
-        let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
-        let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil
-        if (intentExists && intent == nil)
-            || (eventExists && event == nil) {
+        guard completed.map({
+            installation == $0.newInstallationIdentifier
+        }) ?? true else {
             throw Error.manualRestoreStateAmbiguous
         }
-        if let intent, let event, intent != event {
-            throw Error.manualRestoreStateAmbiguous
-        }
-        guard let receipt = event ?? intent else {
-            throw Error.manualRestoreStateAmbiguous
-        }
-        guard receipt.transactionIdentifier == transactionIdentifier else {
-            throw Error.manualRestoreTransactionMismatch
-        }
-        return event != nil ? .resumeEvent(receipt) : .resumeIntent(receipt)
+        return .newTransaction
     }
 
     private static func prepareManualRestoreIntentLocked(

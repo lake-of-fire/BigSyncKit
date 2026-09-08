@@ -481,6 +481,62 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertEqual(replacementCount, 2)
     }
 
+    func testSecondRestoreResumesAfterSentinelRotationBeforeReceiptReplacement() throws {
+        let namespace = "second-restore-post-sentinel-crash"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(
+            store: store,
+            namespace: namespace,
+            sharedSentinelBaseURL: base
+        )
+        let first = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: UUID(),
+            sharedSentinelBaseURL: base
+        )
+        try BackupDetection.markRestoreResetCompleted(
+            namespace: namespace,
+            expectedEventIdentifier: first.restoreEventIdentifier.uuidString.lowercased(),
+            sharedSentinelBaseURL: base
+        )
+        let secondTransaction = UUID()
+        XCTAssertThrowsError(try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: secondTransaction,
+            sharedSentinelBaseURL: base,
+            sentinelPublisher: { sentinel, _ in
+                let intent = try XCTUnwrap(BackupDetection.manualRestoreIntentReceipt(
+                    namespace: namespace,
+                    sharedSentinelBaseURL: base
+                ))
+                // Model the durable prefix after publication of the new sentinel.
+                try Data(("BigSyncKit installation v1\n" + intent.newInstallationIdentifier + "\n").utf8)
+                    .write(to: sentinel)
+                let handle = try FileHandle(forWritingTo: sentinel)
+                try handle.synchronize()
+                try handle.close()
+                throw CocoaError(.fileWriteUnknown)
+            }
+        ))
+        guard case .resumeEvent(let pending) = try BackupDetection.manualRestorePreflight(
+            namespace: namespace,
+            transactionIdentifier: secondTransaction,
+            sharedSentinelBaseURL: base
+        ) else { return XCTFail("The newer durable event must own recovery") }
+        XCTAssertEqual(pending.oldInstallationIdentifier, first.newInstallationIdentifier)
+        let resumed = try BackupDetection.beginManualRestore(
+            namespace: namespace,
+            transactionIdentifier: secondTransaction,
+            sharedSentinelBaseURL: base
+        )
+        XCTAssertEqual(resumed, pending)
+        XCTAssertEqual(try BackupDetection.manualRestorePreflight(
+            namespace: namespace,
+            transactionIdentifier: secondTransaction,
+            sharedSentinelBaseURL: base
+        ), .completed(resumed))
+    }
+
     func testCompletedManualRestoreOutranksMatchingCleanupResidue() throws {
         let base = temporaryRoot()
         let identity = BigSyncClientIdentity(
