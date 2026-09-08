@@ -41,6 +41,10 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let suiteName: String?
     let recordZoneID: CKRecordZone.ID?
     let logger: Logging.Logger
+    let postImportProjectionReconciler:
+        (@Sendable @BigSyncBackgroundActor (
+            CommittedInboundIdentityBatch
+        ) async throws -> Void)?
     
     public init(
         synchronizerName: String,
@@ -50,6 +54,10 @@ public struct BigSyncBackgroundWorkerConfiguration {
         priorityObjectTypes: [RealmSwift.Object.Type] = [],
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
+        postImportProjectionReconciler:
+            (@Sendable @BigSyncBackgroundActor (
+                CommittedInboundIdentityBatch
+            ) async throws -> Void)? = nil,
         logger: Logging.Logger
     ) {
         mutationPolicy.install(configurations: configurations)
@@ -60,6 +68,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.priorityClassNames = priorityObjectTypes.map { $0.className() }
         self.suiteName = suiteName
         self.recordZoneID = recordZoneID
+        self.postImportProjectionReconciler = postImportProjectionReconciler
         self.logger = logger
     }
 
@@ -129,6 +138,7 @@ public actor BigSyncBackgroundActor {
             suiteName: configuration.suiteName,
             recordZoneID: configuration.recordZoneID,
             compatibilityVersion: Int(configuration.configurations.map { $0.schemaVersion } .reduce(0, +)),
+            postImportProjectionReconciler: configuration.postImportProjectionReconciler,
             logger: configuration.logger
         )
         

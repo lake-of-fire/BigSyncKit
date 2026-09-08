@@ -11,7 +11,29 @@ public final class BigSyncPendingMutation: Object {
     @Persisted(indexed: true) public var entityType = ""
     @Persisted public var objectIdentifier = ""
     @Persisted public var generation = ""
+    /// Retained while the hotfix Realm schema is bridged. A migrated row stays
+    /// bound to the replica that created it; upstream's current journal does
+    /// not reinterpret this historical value as authority for a later account.
+    @Persisted(indexed: true) public var accountScopeIdentifier: String?
+    @Persisted(indexed: true) public var replicaBindingGenerationIdentifier: String?
+    /// A historical row that was committed with a hotfix account or replica
+    /// binding. It remains durable evidence but is not eligible for the
+    /// account-agnostic adapter until a fenced recovery owner is available.
+    @Persisted(indexed: true) public var requiresReplicaBindingRecovery = false
     @Persisted public var changedAt = Date()
+
+    /// The accepted upstream transport is deliberately account-agnostic. A
+    /// row that carries any hotfix account or replica-binding attribution must
+    /// therefore remain recovery evidence until an owner can prove a complete
+    /// account/container/database binding for it. Do not rely only on the
+    /// persisted quarantine flag: a backup, interrupted migration, or older
+    /// writer can leave the attribution fields present while that flag has its
+    /// default value.
+    var isEligibleForAccountAgnosticTransport: Bool {
+        !requiresReplicaBindingRecovery
+            && accountScopeIdentifier == nil
+            && replicaBindingGenerationIdentifier == nil
+    }
 
     public convenience init(
         recordName: String,
@@ -26,6 +48,36 @@ public final class BigSyncPendingMutation: Object {
         self.objectIdentifier = objectIdentifier
         self.generation = generation
         self.changedAt = changedAt
+    }
+
+    /// Marks hotfix-bound outbox rows as evidence-only during the schema
+    /// bridge. The current adapter has no compatible account/binding recovery
+    /// owner, so forwarding one under a newly selected account would be data
+    /// corruption rather than recovery.
+    public static func quarantineLegacyReplicaBoundRows(
+        migration: Migration
+    ) {
+        migration.enumerateObjects(ofType: className()) { oldObject, newObject in
+            guard let oldObject, let newObject else { return }
+            let accountScopeIdentifier = oldObject.objectSchema.properties
+                .contains(where: { $0.name == "accountScopeIdentifier" })
+                ? oldObject["accountScopeIdentifier"] as? String
+                : nil
+            let replicaBindingGenerationIdentifier = oldObject.objectSchema.properties
+                .contains(where: { $0.name == "replicaBindingGenerationIdentifier" })
+                ? oldObject["replicaBindingGenerationIdentifier"] as? String
+                : nil
+            let hasReplicaAttribution = [
+                accountScopeIdentifier,
+                replicaBindingGenerationIdentifier,
+            ]
+                .compactMap({ $0 })
+                .contains(where: { !$0.isEmpty })
+            // Assign both outcomes. Schema 299 also repairs the short-lived
+            // schema-298 bridge whose inverted guard could mark ordinary
+            // account-agnostic rows while leaving attributed rows unmarked.
+            newObject["requiresReplicaBindingRecovery"] = hasReplicaAttribution
+        }
     }
 }
 

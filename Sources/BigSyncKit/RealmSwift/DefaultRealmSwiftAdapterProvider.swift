@@ -19,6 +19,10 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
     let priorityClassNames: [String]
     let appGroup: String?
     let logger: Logging.Logger
+    let postImportProjectionReconciler:
+        (@Sendable @BigSyncBackgroundActor (
+            CommittedInboundIdentityBatch
+        ) async throws -> Void)?
     public private(set) var adapter: RealmSwiftAdapter!
    
     public var beforeInitialSetup: (() -> Void)? {
@@ -34,6 +38,10 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         zoneID: CKRecordZone.ID,
         appGroup: String? = nil,
         persistenceNamespace: String? = nil,
+        postImportProjectionReconciler:
+            (@Sendable @BigSyncBackgroundActor (
+                CommittedInboundIdentityBatch
+            ) async throws -> Void)? = nil,
         logger: Logging.Logger
     ) {
         self.targetConfigurations = targetConfigurations
@@ -42,6 +50,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         self.zoneID = zoneID
         self.appGroup = appGroup
         self.logger = logger
+        self.postImportProjectionReconciler = postImportProjectionReconciler
         persistenceConfiguration = DefaultRealmSwiftAdapterProvider.createPersistenceConfiguration(
             suiteName: appGroup,
             zoneID: zoneID,
@@ -59,6 +68,7 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
         priorityClassNames = adapter.priorityEntityTypeNames
         appGroup = nil
         self.logger = logger
+        postImportProjectionReconciler = adapter.postImportProjectionReconciler
         super.init()
         self.adapter = adapter
     }
@@ -77,7 +87,8 @@ public class DefaultRealmSwiftAdapterProvider: NSObject, AdapterProvider {
             excludedClassNames: excludedClassNames,
             priorityEntityTypeNames: priorityClassNames,
             recordZoneID: zoneID,
-            logger: logger
+            logger: logger,
+            postImportProjectionReconciler: postImportProjectionReconciler
         )
     }
     

@@ -30,6 +30,10 @@ extension CloudKitSynchronizer {
         suiteName: String? = nil,
         recordZoneID: CKRecordZone.ID? = nil,
         compatibilityVersion: Int = 0,
+        postImportProjectionReconciler:
+            (@Sendable @BigSyncBackgroundActor (
+                CommittedInboundIdentityBatch
+            ) async throws -> Void)? = nil,
         logger: Logging.Logger
     ) -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
@@ -41,6 +45,7 @@ extension CloudKitSynchronizer {
             appGroup: suiteName,
             persistenceNamespace:
                 "\(containerName)|\(synchronizerName)|private",
+            postImportProjectionReconciler: postImportProjectionReconciler,
             logger: logger
         )
         let userDefaults = UserDefaults(suiteName: suiteName)!

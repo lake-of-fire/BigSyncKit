@@ -25,6 +25,37 @@ private enum TestSynchronizationError: Error {
     case deletedZoneResetFailed
     case restoredBackupResetFailed
     case importedPersistenceCacheFailed
+    case postImportProjectionFailed
+}
+
+private actor InboundIdentityProjectionProbe {
+    enum Action {
+        case succeed
+        case fail
+        case cancel
+    }
+
+    private var actions: [Action]
+    private var received = [CommittedInboundIdentityBatch]()
+
+    init(actions: [Action] = [.succeed]) {
+        self.actions = actions
+    }
+
+    func reconcile(_ batch: CommittedInboundIdentityBatch) throws {
+        received.append(batch)
+        let action = actions.isEmpty ? .succeed : actions.removeFirst()
+        switch action {
+        case .succeed:
+            return
+        case .fail:
+            throw TestSynchronizationError.postImportProjectionFailed
+        case .cancel:
+            throw CancellationError()
+        }
+    }
+
+    func batches() -> [CommittedInboundIdentityBatch] { received }
 }
 
 final class BigSyncDeadlineRaceTests: XCTestCase {
@@ -3808,7 +3839,9 @@ final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
     func testRedeliveryFinalizesPersistenceAfterTargetCommitInterruption() async throws {
-        let fixture = try await makeRealmAdapterFixture()
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { _ in }
+        )
         let object = BigSyncTrackedObject(
             id: "interrupted-finalization",
             createdAt: Date(),
@@ -3851,6 +3884,10 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: record.recordID.recordName
             )
         )
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
 
         // The committed inbound target write must retain its suppression
         // marker instead of being re-journaled as a local upload.
@@ -3873,6 +3910,23 @@ final class BigSyncKitTests: XCTestCase {
                 ofType: SyncedEntity.self,
                 forPrimaryKey: record.recordID.recordName
             )?.encodedRecord
+        )
+        let delivery = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                [CommittedInboundIdentity].self,
+                from: try XCTUnwrap(
+                    delivery.stagedEncodedIdentityPageBatches.first
+                )
+            ),
+            [.init(
+                entityType: BigSyncTrackedObject.className(),
+                recordName: record.recordID.recordName,
+                disposition: .upsert
+            )]
         )
     }
 
@@ -6321,6 +6375,227 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testJournalRetainsReplicaBoundCompatibilityRowsWithoutForwardingThem() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let recordName = "\(BigSyncTrackedObject.className()).historical"
+        let object = BigSyncTrackedObject(
+            id: "historical",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        let mutation = BigSyncPendingMutation(
+            recordName: recordName,
+            entityType: BigSyncTrackedObject.className(),
+            objectIdentifier: "historical"
+        )
+        mutation.accountScopeIdentifier = "hotfix-account"
+        mutation.replicaBindingGenerationIdentifier = "hotfix-binding"
+        // A copied or interrupted hotfix migration can retain attribution
+        // while the new quarantine flag still has its default value. Such a
+        // row must never be rebound to the current account-agnostic adapter.
+        mutation.requiresReplicaBindingRecovery = false
+
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            fixture.targetRealm.add(mutation)
+        }
+        let historicalGeneration = mutation.generation
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("current-process-edit")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+
+        XCTAssertNotEqual(mutation.generation, historicalGeneration)
+        XCTAssertEqual(mutation.accountScopeIdentifier, "hotfix-account")
+        XCTAssertEqual(
+            mutation.replicaBindingGenerationIdentifier,
+            "hotfix-binding"
+        )
+        XCTAssertFalse(mutation.isEligibleForAccountAgnosticTransport)
+
+        let forwarded = try await fixture.adapter
+            ._test_forwardPendingMutations(in: fixture.targetRealm)
+
+        XCTAssertEqual(forwarded, 0)
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertThrowsError(
+            try fixture.adapter.hasPendingChangesAtTerminalBoundary()
+        ) { error in
+            XCTAssertEqual(
+                error as? RealmSwiftAdapterError,
+                .replicaBindingRecoveryRequired(recordName: recordName)
+            )
+        }
+
+        let remoteRecord = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: object.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        remoteRecord["createdAt"] = Date() as CKRecordValue
+        remoteRecord["modifiedAt"] = Date() as CKRecordValue
+        remoteRecord["explicitlyModifiedAt"] = Date() as CKRecordValue
+        remoteRecord["isDeleted"] = false as CKRecordValue
+        remoteRecord["tags"] = ["wrong-replica"] as CKRecordValue
+
+        try await fixture.adapter.saveChanges(
+            in: [remoteRecord],
+            forceSave: true
+        )
+        try await fixture.adapter.deleteRecords(with: [remoteRecord.recordID])
+        await fixture.targetRealm.asyncRefresh()
+
+        XCTAssertEqual(Array(object.tags), ["current-process-edit"])
+        XCTAssertFalse(object.isDeleted)
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testCacheResetDoesNotRediscoverReplicaBoundDebtAsInitialUpload() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let recordName = "\(BigSyncTrackedObject.className()).reset-debt"
+        let object = BigSyncTrackedObject(
+            id: "reset-debt",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        let mutation = BigSyncPendingMutation(
+            recordName: recordName,
+            entityType: BigSyncTrackedObject.className(),
+            objectIdentifier: object.id
+        )
+        mutation.accountScopeIdentifier = "historical-account"
+        mutation.replicaBindingGenerationIdentifier = "historical-binding"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            fixture.targetRealm.add(mutation)
+        }
+
+        try await fixture.adapter.resetSyncCaches()
+
+        let persistenceRealm = try XCTUnwrap(
+            fixture.adapter.realmProvider?.persistenceRealm
+        )
+        XCTAssertNil(
+            persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertThrowsError(
+            try fixture.adapter.hasPendingChangesAtTerminalBoundary()
+        ) { error in
+            XCTAssertEqual(
+                error as? RealmSwiftAdapterError,
+                .replicaBindingRecoveryRequired(recordName: recordName)
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testVersionedRecoveryDoesNotRediscoverReplicaBoundDebt() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let recordName = "\(BigSyncTrackedObject.className()).recovery-debt"
+        let date = Date(timeIntervalSinceReferenceDate: 19_000)
+        let object = BigSyncTrackedObject(
+            id: "recovery-debt",
+            createdAt: date,
+            modifiedAt: date,
+            explicitlyModifiedAt: date
+        )
+        let eligibleSibling = BigSyncTrackedObject(
+            id: "recovery-eligible",
+            createdAt: date,
+            modifiedAt: date,
+            explicitlyModifiedAt: date
+        )
+        let mutation = BigSyncPendingMutation(
+            recordName: recordName,
+            entityType: BigSyncTrackedObject.className(),
+            objectIdentifier: object.id
+        )
+        mutation.accountScopeIdentifier = "historical-account"
+        mutation.replicaBindingGenerationIdentifier = "historical-binding"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            fixture.targetRealm.add(eligibleSibling)
+            fixture.targetRealm.add(mutation)
+        }
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(
+                SyncedEntity(
+                    entityType: BigSyncTrackedObject.className(),
+                    identifier: BigSyncTrackedObject.className()
+                        + ".existing-anchor",
+                    state: SyncedEntityState.synced.rawValue
+                ),
+                update: .modified
+            )
+            for recovery in fixture.persistenceRealm.objects(SyncedEntityType.self)
+            where recovery.entityType.hasPrefix(
+                "__BigSyncKitMutationJournalRecovery.v2."
+            ) {
+                recovery.recoveryVersion = 0
+            }
+        }
+
+        try await fixture.adapter._test_setup()
+
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNotNil(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )
+        )
+        XCTAssertNotNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: BigSyncTrackedObject.className()
+                    + ".recovery-eligible"
+            )
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(SyncedEntityType.self)
+                .first(where: {
+                    $0.entityType.hasPrefix(
+                        "__BigSyncKitMutationJournalRecovery.v2."
+                    )
+                })?.recoveryVersion,
+            2
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testVersionedRecoveryFindsPreJournalObjects() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let date = Date(timeIntervalSinceReferenceDate: 20_000)
@@ -6534,6 +6809,508 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCommittedInboundIdentitySurvivesAdapterRecreationAndRedelivery()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { _ in }
+        )
+        let record = makeInboundTrackedRecord(
+            id: "identity-crash-redelivery",
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+
+        let staged = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+        XCTAssertTrue(staged.deliveryID.isEmpty)
+        XCTAssertFalse(staged.stagedEncodedIdentityPageBatches.isEmpty)
+        XCTAssertNotNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: record.recordID.recordName
+        )?.encodedRecord)
+
+        let probe = InboundIdentityProjectionProbe()
+        let replacement = RealmSwiftAdapter(
+            persistenceRealmConfiguration: fixture.persistenceConfiguration,
+            targetRealmConfigurations: [fixture.targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: fixture.adapter.recordZoneID,
+            logger: Logger(label: "BigSyncKitTests"),
+            postImportProjectionReconciler: { batch in
+                try await probe.reconcile(batch)
+            },
+            startSetupTask: false
+        )
+        try await replacement._test_setup()
+        replacement._testTreatImportedRecordSystemFieldsAsCurrent = true
+
+        // This is the same-change-tag CloudKit retry after a crash before
+        // cursor publication. Force the production cached-change-tag branch:
+        // no target or system-field write reconstructs the identity here, so
+        // the durable stage from the original transaction is the only source.
+        try await replacement.saveChanges(in: [record], forceSave: false)
+        let replacementRealm = try XCTUnwrap(
+            replacement.realmProvider?.persistenceRealm
+        )
+        try await replacementRealm.asyncWrite {
+            try replacement.promoteStagedInboundIdentities(
+                in: replacementRealm
+            )
+        }
+        try await replacement.didFinishImport()
+
+        let deliveredBatches = await probe.batches()
+        let batch = try XCTUnwrap(deliveredBatches.last)
+        XCTAssertEqual(batch.identities, [.init(
+            entityType: BigSyncTrackedObject.className(),
+            recordName: record.recordID.recordName,
+            disposition: .upsert
+        )])
+        XCTAssertNil(replacementRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testAdapterWithoutProjectionConsumerDoesNotAccumulateIdentityDebt()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let record = makeInboundTrackedRecord(
+            id: "identity-no-consumer",
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.deleteRecords(with: [record.recordID])
+
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testProjectionDebtAppendsCommittedPagesBeforeSingleDeliveryReduction()
+    async throws {
+        let probe = InboundIdentityProjectionProbe()
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { batch in
+                try await probe.reconcile(batch)
+            }
+        )
+        let first = makeInboundTrackedRecord(
+            id: "identity-page-first",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let second = makeInboundTrackedRecord(
+            id: "identity-page-second",
+            zoneID: fixture.adapter.recordZoneID
+        )
+
+        try await fixture.adapter.saveChanges(in: [first], forceSave: true)
+        try await fixture.adapter.saveChanges(in: [second], forceSave: true)
+
+        let staged = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+        XCTAssertTrue(staged.stagedEncodedIdentities.isEmpty)
+        XCTAssertEqual(staged.stagedEncodedIdentityPageBatches.count, 2)
+
+        try await fixture.persistenceRealm.asyncWrite {
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        try await fixture.adapter.didFinishImport()
+
+        let deliveredIdentities = await probe.batches().last?.identities
+        XCTAssertEqual(
+            deliveredIdentities,
+            [
+                .init(
+                    entityType: BigSyncTrackedObject.className(),
+                    recordName: first.recordID.recordName,
+                    disposition: .upsert
+                ),
+                .init(
+                    entityType: BigSyncTrackedObject.className(),
+                    recordName: second.recordID.recordName,
+                    disposition: .upsert
+                ),
+            ].sorted { ($0.entityType, $0.recordName) < ($1.entityType, $1.recordName) }
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testProjectionDebtDecodesLegacyAggregateBeforeLaterPageChunks()
+    async throws {
+        let probe = InboundIdentityProjectionProbe()
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { batch in
+                try await probe.reconcile(batch)
+            }
+        )
+        let record = makeInboundTrackedRecord(
+            id: "identity-legacy-then-page",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let legacyIdentity = CommittedInboundIdentity(
+            entityType: BigSyncTrackedObject.className(),
+            recordName: record.recordID.recordName,
+            disposition: .upsert
+        )
+        try fixture.persistenceRealm.write {
+            let delivery = BigSyncPendingInboundIdentityDelivery()
+            delivery.stagedEncodedIdentities = try JSONEncoder().encode([
+                legacyIdentity
+            ])
+            fixture.persistenceRealm.add(delivery)
+        }
+
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.deleteRecords(with: [record.recordID])
+        try await fixture.persistenceRealm.asyncWrite {
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        try await fixture.adapter.didFinishImport()
+
+        let deliveredIdentities = await probe.batches().last?.identities
+        XCTAssertEqual(
+            deliveredIdentities,
+            [.init(
+                entityType: BigSyncTrackedObject.className(),
+                recordName: record.recordID.recordName,
+                disposition: .delete
+            )]
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testProjectionFailureAndCancellationRedeliverSameIdentityGeneration()
+    async throws {
+        let probe = InboundIdentityProjectionProbe(
+            actions: [.fail, .cancel, .succeed]
+        )
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { batch in
+                try await probe.reconcile(batch)
+            }
+        )
+        let record = makeInboundTrackedRecord(
+            id: "identity-callback-retry",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.persistenceRealm.asyncWrite {
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        let deliveryID = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )?.deliveryID)
+
+        do {
+            try await fixture.adapter.didFinishImport()
+            XCTFail("Expected projection failure")
+        } catch TestSynchronizationError.postImportProjectionFailed {}
+        XCTAssertEqual(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )?.deliveryID, deliveryID)
+
+        do {
+            try await fixture.adapter.didFinishImport()
+            XCTFail("Expected projection cancellation")
+        } catch is CancellationError {}
+        XCTAssertEqual(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )?.deliveryID, deliveryID)
+
+        try await fixture.adapter.didFinishImport()
+        let deliveredIDs = await probe.batches().map(\.deliveryID)
+        XCTAssertEqual(
+            deliveredIDs,
+            [deliveryID, deliveryID, deliveryID]
+        )
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testProjectionAcknowledgementPreservesIdentityStagedDuringSuspension()
+    async throws {
+        let entered = AsyncGate()
+        let release = AsyncGate()
+        let probe = InboundIdentityProjectionProbe()
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { batch in
+                try await probe.reconcile(batch)
+                await entered.open()
+                await release.wait()
+            }
+        )
+        let first = makeInboundTrackedRecord(
+            id: "identity-before-suspension",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.saveChanges(in: [first], forceSave: true)
+        try await fixture.persistenceRealm.asyncWrite {
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        let firstDeliveryID = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )?.deliveryID)
+
+        let finishing = Task { @BigSyncBackgroundActor in
+            try await fixture.adapter.didFinishImport()
+        }
+        await entered.wait()
+
+        let second = makeInboundTrackedRecord(
+            id: "identity-during-suspension",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let third = makeInboundTrackedRecord(
+            id: "identity-also-during-suspension",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.saveChanges(in: [second], forceSave: true)
+        try await fixture.adapter.saveChanges(in: [third], forceSave: true)
+        try await fixture.persistenceRealm.asyncWrite {
+            // Models the later page's token transaction while the first
+            // application callback is suspended on the same global actor.
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        let queuedDeliveryID = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )?.queuedDeliveryID)
+        XCTAssertFalse(queuedDeliveryID.isEmpty)
+        XCTAssertNotEqual(queuedDeliveryID, firstDeliveryID)
+        XCTAssertEqual(try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )).queuedEncodedIdentityPageBatches.count, 2)
+        await release.open()
+        try await finishing.value
+
+        let batches = await probe.batches()
+        XCTAssertEqual(batches.count, 2)
+        XCTAssertEqual(
+            batches.map(\.deliveryID),
+            [firstDeliveryID, queuedDeliveryID]
+        )
+        XCTAssertEqual(batches[1].identities, [
+            .init(
+                entityType: BigSyncTrackedObject.className(),
+                recordName: third.recordID.recordName,
+                disposition: .upsert
+            ),
+            .init(
+                entityType: BigSyncTrackedObject.className(),
+                recordName: second.recordID.recordName,
+                disposition: .upsert
+            ),
+        ].sorted { ($0.entityType, $0.recordName) < ($1.entityType, $1.recordName) })
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testTokenResetPreservesPendingInboundIdentityDelivery() async throws {
+        let probe = InboundIdentityProjectionProbe()
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { batch in
+                try await probe.reconcile(batch)
+            }
+        )
+        let record = makeInboundTrackedRecord(
+            id: "identity-token-reset",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.saveToken(nil)
+        XCTAssertFalse(try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )).stagedEncodedIdentityPageBatches.isEmpty)
+        try await fixture.persistenceRealm.asyncWrite {
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        let deliveryID = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )?.deliveryID)
+
+        try await fixture.adapter.saveToken(nil)
+
+        XCTAssertEqual(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        )?.deliveryID, deliveryID)
+        try await fixture.adapter.didFinishImport()
+        let deliveredIDs = await probe.batches().map(\.deliveryID)
+        XCTAssertEqual(deliveredIDs, [deliveryID])
+    }
+
+    @BigSyncBackgroundActor
+    func testRemoteDeletionStagesDurableDeleteIdentity() async throws {
+        let probe = InboundIdentityProjectionProbe()
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { batch in
+                try await probe.reconcile(batch)
+            }
+        )
+        let record = makeInboundTrackedRecord(
+            id: "identity-remote-delete",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.persistenceRealm.asyncWrite {
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        try await fixture.adapter.didFinishImport()
+
+        try await fixture.adapter.deleteRecords(with: [record.recordID])
+        let delivery = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                [CommittedInboundIdentity].self,
+                from: try XCTUnwrap(
+                    delivery.stagedEncodedIdentityPageBatches.first
+                )
+            ),
+            [.init(
+                entityType: BigSyncTrackedObject.className(),
+                recordName: record.recordID.recordName,
+                disposition: .delete
+            )]
+        )
+        try await fixture.persistenceRealm.asyncWrite {
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        try await fixture.adapter.didFinishImport()
+        let deliveredDelete = await probe.batches().last?.identities
+        XCTAssertEqual(deliveredDelete, [.init(
+            entityType: BigSyncTrackedObject.className(),
+            recordName: record.recordID.recordName,
+            disposition: .delete
+        )])
+    }
+
+    @BigSyncBackgroundActor
+    func testRemoteDeletionRedeliveryRepairsTargetPersistenceCrashWindow()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            postImportProjectionReconciler: { _ in }
+        )
+        let record = makeInboundTrackedRecord(
+            id: "identity-delete-crash-redelivery",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.persistenceRealm.asyncWrite {
+            try fixture.adapter.promoteStagedInboundIdentities(
+                in: fixture.persistenceRealm
+            )
+        }
+        try await fixture.adapter.didFinishImport()
+        fixture.adapter._testBeforeRemoteDeletionPersistenceWrite = {
+            throw CancellationError()
+        }
+
+        do {
+            try await fixture.adapter.deleteRecords(with: [record.recordID])
+            XCTFail("Expected interruption after the target deletion commit")
+        } catch is CancellationError {}
+        XCTAssertTrue(try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncTrackedObject.self,
+            forPrimaryKey: "identity-delete-crash-redelivery"
+        )).isDeleted)
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: BigSyncPendingInboundIdentityDelivery.self,
+            forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+        ))
+
+        let probe = InboundIdentityProjectionProbe()
+        let replacement = RealmSwiftAdapter(
+            persistenceRealmConfiguration: fixture.persistenceConfiguration,
+            targetRealmConfigurations: [fixture.targetConfiguration],
+            excludedClassNames: [],
+            recordZoneID: fixture.adapter.recordZoneID,
+            logger: Logger(label: "BigSyncKitTests"),
+            postImportProjectionReconciler: { batch in
+                try await probe.reconcile(batch)
+            },
+            startSetupTask: false
+        )
+        try await replacement._test_setup()
+        try await replacement.deleteRecords(with: [record.recordID])
+        let replacementRealm = try XCTUnwrap(
+            replacement.realmProvider?.persistenceRealm
+        )
+        try await replacementRealm.asyncWrite {
+            try replacement.promoteStagedInboundIdentities(
+                in: replacementRealm
+            )
+        }
+        try await replacement.didFinishImport()
+
+        let deliveredDelete = await probe.batches().last?.identities
+        XCTAssertEqual(deliveredDelete, [.init(
+            entityType: BigSyncTrackedObject.className(),
+            recordName: record.recordID.recordName,
+            disposition: .delete
+        )])
+    }
+
+    private func makeInboundTrackedRecord(
+        id: String,
+        zoneID: CKRecordZone.ID
+    ) -> CKRecord {
+        let record = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: id,
+            zoneID: zoneID
+        )
+        let timestamp = Date(timeIntervalSinceReferenceDate: 90_000)
+        record["createdAt"] = timestamp as CKRecordValue
+        record["modifiedAt"] = timestamp as CKRecordValue
+        record["explicitlyModifiedAt"] = timestamp as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record["tags"] = ["remote"] as CKRecordValue
+        return record
+    }
+
+    @BigSyncBackgroundActor
     private func makeSynchronizer(
         database: CloudKitDatabaseAdapter = FakeCloudKitDatabase(),
         keyValueStore: KeyValueStore = DictionaryKeyValueStore(),
@@ -6557,10 +7334,17 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    private func makeRealmAdapterFixture() async throws -> (
+    private func makeRealmAdapterFixture(
+        postImportProjectionReconciler:
+            (@Sendable @BigSyncBackgroundActor (
+                CommittedInboundIdentityBatch
+            ) async throws -> Void)? = nil
+    ) async throws -> (
         adapter: RealmSwiftAdapter,
         persistenceRealm: Realm,
-        targetRealm: Realm
+        targetRealm: Realm,
+        persistenceConfiguration: Realm.Configuration,
+        targetConfiguration: Realm.Configuration
     ) {
         let identifier = UUID().uuidString
         var persistenceConfiguration = RealmSwiftAdapter.defaultPersistenceConfiguration()
@@ -6581,6 +7365,8 @@ final class BigSyncKitTests: XCTestCase {
             excludedClassNames: [],
             recordZoneID: CKRecordZone.ID(zoneName: "realm-adapter-zone", ownerName: CKCurrentUserDefaultName),
             logger: Logger(label: "BigSyncKitTests"),
+            postImportProjectionReconciler:
+                postImportProjectionReconciler,
             startSetupTask: false
         )
         try await adapter.resetSyncCaches()
@@ -6594,6 +7380,12 @@ final class BigSyncKitTests: XCTestCase {
                 userInfo: [NSLocalizedDescriptionKey: "Adapter Realm provider was not initialized"]
             )
         }
-        return (adapter, persistenceRealm, targetRealm)
+        return (
+            adapter,
+            persistenceRealm,
+            targetRealm,
+            persistenceConfiguration,
+            targetConfiguration
+        )
     }
 }

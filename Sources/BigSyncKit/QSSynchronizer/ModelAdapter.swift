@@ -9,6 +9,37 @@ import Foundation
 import CloudKit
 import RealmSwift
 
+public struct CommittedInboundIdentity: Sendable, Equatable, Hashable, Codable {
+    public enum Disposition: String, Sendable, Equatable, Hashable, Codable {
+        case upsert
+        case delete
+    }
+
+    public let entityType: String
+    public let recordName: String
+    public let disposition: Disposition
+
+    public init(
+        entityType: String,
+        recordName: String,
+        disposition: Disposition
+    ) {
+        self.entityType = entityType
+        self.recordName = recordName
+        self.disposition = disposition
+    }
+}
+
+public struct CommittedInboundIdentityBatch: Sendable, Equatable {
+    public let deliveryID: String
+    public let identities: [CommittedInboundIdentity]
+
+    public init(deliveryID: String, identities: [CommittedInboundIdentity]) {
+        self.deliveryID = deliveryID
+        self.identities = identities
+    }
+}
+
 /// The merge policy to resolve change conflicts. Default value is `server`
 @objc public enum MergePolicy: Int, Sendable {
     /// Downloaded changes have preference.

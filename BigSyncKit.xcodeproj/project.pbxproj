@@ -21,6 +21,7 @@
 		3ED652F310A1670673BE2AC7 /* BigSyncPendingMutation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */; };
 		3F957FC859E4A7FB1000C0BF /* BackupDetectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1852992FB038D6864C46EF29 /* BackupDetectionTests.swift */; };
 		41B8E763FAD1533448520B02 /* PrimaryKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABEE9A26F724BE99A3697C23 /* PrimaryKey.swift */; };
+		50D4812DCE29CE281A5DDD3F /* BigSyncPendingInboundIdentityDelivery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E8485D66BE23EF85302E820 /* BigSyncPendingInboundIdentityDelivery.swift */; };
 		555740A729D68758CC69E42A /* SyncedEntityProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D7E1C6F12C321A94EABEF49 /* SyncedEntityProtocol.swift */; };
 		5A22CA086B25A59191E19AE2 /* BigSyncManualRebuildTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3018D323268107352430D467 /* BigSyncManualRebuildTests.swift */; };
 		5A6D8A0DC6ABB060CABE7AD7 /* CloudKitSynchronizer+Subscriptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */; };
@@ -170,6 +171,7 @@
 		5900E8EA44C1DBD7E8733C77 /* SyncedEntityState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncedEntityState.swift; sourceTree = "<group>"; };
 		6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudKitSynchronizer+Subscriptions.swift"; sourceTree = "<group>"; };
 		6D34F532F253611BC2AB181F /* FetchDatabaseChangesOperation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FetchDatabaseChangesOperation.swift; sourceTree = "<group>"; };
+		6E8485D66BE23EF85302E820 /* BigSyncPendingInboundIdentityDelivery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncPendingInboundIdentityDelivery.swift; sourceTree = "<group>"; };
 		73F4DCFDFCE608B084E2B80B /* PendingRelationship.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingRelationship.swift; sourceTree = "<group>"; };
 		7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncPendingMutation.swift; sourceTree = "<group>"; };
 		7E14FD1C796F678CE02FC194 /* RealModule.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = RealModule.framework; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -331,7 +333,6 @@
 				6B1DE5B32DFDD1E9C9BFFAB4 /* QSSynchronizer */,
 				DFB30316A0DAA344F0F89AA8 /* RealmSwift */,
 				50BAF26176B59251736A1535 /* Resources */,
-				C44AE0F0451502C1714F34EF /* Unused Archive */,
 				519B578D9E23C6ED68EE4C36 /* SyncedDevice.swift */,
 				404173218AABA19A4C08DC5C /* SyncStatusViewModel.swift */,
 			);
@@ -360,13 +361,6 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
-		C44AE0F0451502C1714F34EF /* Unused Archive */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = "Unused Archive";
-			sourceTree = "<group>";
-		};
 		D1A377E616FBAF91F9DA31FB /* InfoPlists */ = {
 			isa = PBXGroup;
 			children = (
@@ -380,6 +374,7 @@
 		DFB30316A0DAA344F0F89AA8 /* RealmSwift */ = {
 			isa = PBXGroup;
 			children = (
+				6E8485D66BE23EF85302E820 /* BigSyncPendingInboundIdentityDelivery.swift */,
 				7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */,
 				CD495927486A1B40B2B8DBA3 /* DefaultRealmSwiftAdapterProvider.swift */,
 				73F4DCFDFCE608B084E2B80B /* PendingRelationship.swift */,
@@ -560,6 +555,7 @@
 				41B8E763FAD1533448520B02 /* PrimaryKey.swift in Sources */,
 				0F94B5F5C1645FA2C7D6CB7E /* QSCoder.swift in Sources */,
 				316D9A9305E452F821839289 /* SyncedEntityState.swift in Sources */,
+				50D4812DCE29CE281A5DDD3F /* BigSyncPendingInboundIdentityDelivery.swift in Sources */,
 				3ED652F310A1670673BE2AC7 /* BigSyncPendingMutation.swift in Sources */,
 				D1076D33C1CCFA003ACD1332 /* DefaultRealmSwiftAdapterProvider.swift in Sources */,
 				02D03BE92F26412C61A3BB31 /* PendingRelationship.swift in Sources */,
