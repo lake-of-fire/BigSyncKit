@@ -739,7 +739,7 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     internal func restorePublicationEvidence(
         from synchronizer: CloudKitSynchronizer,
-        using handler: BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler
+        using handler: @escaping BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler
     ) async throws {
         try await restorePublicationEvidence(from: synchronizer, preparing: { handler })
     }
