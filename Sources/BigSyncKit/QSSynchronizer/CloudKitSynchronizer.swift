@@ -1911,8 +1911,12 @@ public class CloudKitSynchronizer: NSObject {
         try validatePostBarrierDrainPrincipal(completed)
     }
 
+    /// Synchronous ownership/persisted-binding check after a domain-owned
+    /// suspension. This does not query the account provider or require an empty
+    /// journal. Pair it with revalidatePostBarrierDrainPrincipal before the
+    /// suspension; neither method grants a new drain or publication capability.
     @BigSyncBackgroundActor
-    private func validatePostBarrierDrainPrincipal(
+    public func validatePostBarrierDrainPrincipal(
         _ completed: CompletedPostBarrierDrain
     ) throws {
         guard completed.issuerID == synchronizationReceiptIssuerID,

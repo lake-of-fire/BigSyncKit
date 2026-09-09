@@ -693,6 +693,17 @@ public actor BigSyncBackgroundActor {
         try Task.checkCancellation()
     }
 
+    /// Final synchronous ownership check after a domain's Realm read. The
+    /// currently installed worker must still own the original capability.
+    @BigSyncBackgroundActor
+    public func validatePostBarrierDrainPrincipal(
+        _ completed: CloudKitSynchronizer.CompletedPostBarrierDrain
+    ) throws {
+        try Task.checkCancellation()
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        try synchronizer.validatePostBarrierDrainPrincipal(completed)
+    }
+
     /// Returns at the deadline even when an underlying CloudKit await does not
     /// cooperate with Swift task cancellation. The losing request task is
     /// canceled and fenced; an already-running shared synchronization may still

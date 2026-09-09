@@ -524,6 +524,7 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         fixture.adapter.hasPendingTerminalChanges = true
         let writes = fixture.store.writes
         try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed)
+        try fixture.synchronizer.validatePostBarrierDrainPrincipal(completed)
         await assertRejected { try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed) }
         XCTAssertEqual(fixture.store.writes, writes)
         XCTAssertEqual(fixture.adapter.acknowledgements, 0)
@@ -562,6 +563,32 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         await assertRejected { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
         fixture.synchronizer.cancelSynchronization()
         await assertCancelled { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
+    }
+
+    @BigSyncBackgroundActor
+    func testPostBootstrapFinalOwnershipRejectsBindingChangeAfterAccountCheck() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(fixture.synchronizer)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
+        try await worker.revalidatePostBarrierDrainPrincipal(completed)
+        // Models a domain read yielding AFTER the actual-account revalidation.
+        try await fixture.replacePersistedBinding()
+        XCTAssertThrowsError(try worker.validatePostBarrierDrainPrincipal(completed))
+    }
+
+    @BigSyncBackgroundActor
+    func testPostBootstrapFinalOwnershipRejectsReplacementAfterAccountCheck() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let replacement = Fixture(useReplicaBinding: true)
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(fixture.synchronizer)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
+        try await worker.revalidatePostBarrierDrainPrincipal(completed)
+        await worker._test_installSynchronizer(replacement.synchronizer)
+        XCTAssertThrowsError(try worker.validatePostBarrierDrainPrincipal(completed))
     }
 
     @BigSyncBackgroundActor
