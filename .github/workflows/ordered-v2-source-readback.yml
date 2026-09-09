@@ -1,0 +1,36 @@
+name: Ordered-V2 BigSyncKit source readback
+on:
+  push:
+    branches: [codex/ordered-v2-source-readback-20260909]
+    paths: [.github/workflows/ordered-v2-source-readback.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    if: github.repository == 'lake-of-fire/BigSyncKit' && github.ref == 'refs/heads/codex/ordered-v2-source-readback-20260909'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: false
+      - shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/bigsync-readback
+          ref=a507394066bba82b4ccb7030daac35c95f5adcdd
+          git archive --format=tar "$ref" > /tmp/bigsync-readback/source.tar
+          git ls-tree -r -z "$ref" > /tmp/bigsync-readback/tree.z
+          git log -8 --format=fuller "$ref" > /tmp/bigsync-readback/ancestry.txt
+          printf 'repository=lake-of-fire/BigSyncKit\ncommit=%s\ntree=%s\n' "$ref" "$(git rev-parse "$ref^{tree}")" > /tmp/bigsync-readback/PROVENANCE.txt
+          cd /tmp/bigsync-readback
+          sha256sum source.tar tree.z ancestry.txt PROVENANCE.txt > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ordered-v2-bigsync-readback-a507394
+          path: /tmp/bigsync-readback/*
+          if-no-files-found: error
+          retention-days: 14
