@@ -578,7 +578,7 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
             prepared = true
             return { evidence in
                 XCTAssertTrue(prepared)
-                XCTAssertEqual(evidence?.domainPublicationScopeIdentifier, "restored-domain")
+                XCTAssertEqual(evidence?.domainScopeIdentifier, "restored-domain")
                 delivered = true
             }
         })
