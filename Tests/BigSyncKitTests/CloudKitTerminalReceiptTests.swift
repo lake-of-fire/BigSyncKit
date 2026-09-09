@@ -514,6 +514,274 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPostBootstrapPrincipalAllowsNewWorkButDoesNotRenewAggregateProof() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
+            using: receipt, authorizedBy: authorization)
+        // Bootstrap legitimately creates source journals. The principal is not
+        // an empty-journal capability and must not acknowledge those writes.
+        fixture.adapter.hasPendingTerminalChanges = true
+        let writes = fixture.store.writes
+        try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed)
+        await assertRejected { try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed) }
+        XCTAssertEqual(fixture.store.writes, writes)
+        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
+        XCTAssertTrue(fixture.adapter.hasPendingTerminalChanges)
+    }
+
+    @BigSyncBackgroundActor
+    func testPostBootstrapPrincipalRejectsBindingReplacementDuringAccountRead() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
+            using: receipt, authorizedBy: authorization)
+        await fixture.account.onNextRead { try await fixture.replacePersistedBinding() }
+        await assertRejected { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
+    }
+
+    @BigSyncBackgroundActor
+    func testPostBootstrapPrincipalRejectsWorkerReplacementDuringAccountRead() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let successor = Fixture(useReplicaBinding: true)
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(fixture.synchronizer)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
+        await fixture.account.onNextRead { await worker._test_installSynchronizer(successor.synchronizer) }
+        await assertCancelled { try await worker.revalidatePostBarrierDrainPrincipal(completed) }
+    }
+
+    @BigSyncBackgroundActor
+    func testPostBootstrapPrincipalRejectsNextRunAndCancellation() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
+            using: receipt, authorizedBy: authorization)
+        _ = try await fixture.drain()
+        await assertRejected { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
+        fixture.synchronizer.cancelSynchronization()
+        await assertCancelled { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
+    }
+
+    @BigSyncBackgroundActor
+    func testRestorationReservesConsumerBeforeAsynchronousLookup() async throws {
+        let first = Fixture(domainScopeIdentifier: "restored-domain", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(cold.synchronizer)
+        var prepared = false
+        var delivered = false
+        cold.adapter.namespaceHook = { XCTAssertTrue(prepared) }
+        try await worker.restorePublicationEvidence(from: cold.synchronizer, preparing: {
+            prepared = true
+            return { evidence in
+                XCTAssertTrue(prepared)
+                XCTAssertEqual(evidence?.domainPublicationScopeIdentifier, "restored-domain")
+                delivered = true
+            }
+        })
+        XCTAssertTrue(delivered)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledRestorationDoesNotReserveConsumer() async throws {
+        let fixture = Fixture()
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(fixture.synchronizer)
+        // Block entry independently of scheduling, then cancel before entering.
+        let entry = ReceiptPause()
+        let task = Task { @BigSyncBackgroundActor in
+            await entry.wait()
+            try await worker.restorePublicationEvidence(from: fixture.synchronizer, preparing: {
+                XCTFail("Cancelled entry must not invalidate the consumer")
+                return { _ in XCTFail("Cancelled entry must not deliver") }
+            })
+        }
+        task.cancel()
+        await entry.release()
+        await assertCancelled { try await task.value }
+    }
+
+    @BigSyncBackgroundActor
+    func testRestorationRevalidatesReentrantProviderBeforeLookup() async throws {
+        let fixture = Fixture()
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(fixture.synchronizer)
+        fixture.adapter.namespaceHook = { XCTFail("An obsolete preparation must not open adapters") }
+        await assertCancelled {
+            try await worker.restorePublicationEvidence(from: fixture.synchronizer, preparing: {
+                fixture.synchronizer.cancelSynchronization()
+                return { _ in XCTFail("An obsolete preparation must not deliver") }
+            })
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCorruptCursorReturningOldSaveCannotCompleteCoalescedSuccessor() async throws {
+        try await exerciseCursorFailureOwnership(expired: false, outcome: .returned)
+    }
+
+    @BigSyncBackgroundActor
+    func testCorruptCursorCancelledOldSaveCannotCompleteCoalescedSuccessor() async throws {
+        try await exerciseCursorFailureOwnership(expired: false, outcome: .cancelled)
+    }
+
+    @BigSyncBackgroundActor
+    func testCorruptCursorFailedOldSaveCannotCompleteCoalescedSuccessor() async throws {
+        try await exerciseCursorFailureOwnership(expired: false, outcome: .failed)
+    }
+
+    @BigSyncBackgroundActor
+    func testExpiredCursorReturningOldSaveCannotRetryCoalescedSuccessor() async throws {
+        try await exerciseCursorFailureOwnership(expired: true, outcome: .returned)
+    }
+
+    @BigSyncBackgroundActor
+    func testExpiredCursorCancelledOldSaveCannotCompleteCoalescedSuccessor() async throws {
+        try await exerciseCursorFailureOwnership(expired: true, outcome: .cancelled)
+    }
+
+    @BigSyncBackgroundActor
+    func testExpiredCursorFailedOldSaveCannotCompleteCoalescedSuccessor() async throws {
+        try await exerciseCursorFailureOwnership(expired: true, outcome: .failed)
+    }
+
+    @BigSyncBackgroundActor
+    func testOwnedCursorRecoveryReturnAndThrowAlwaysResolveOriginalDrain() async throws {
+        for expired in [false, true] {
+            for outcome: CursorSaveOutcome in [.returned, .cancelled, .failed] {
+                let fixture = Fixture(useReplicaBinding: true)
+                _ = try await fixture.drain()
+                var recoveryStarted = false
+                var cursorWrites = 0
+                fixture.synchronizer.domainPublicationScopeIdentifierProvider = {
+                    fixture.synchronizer.domainPublicationScopeIdentifierProvider = nil
+                    recoveryStarted = true
+                    if expired { throw CKError(.changeTokenExpired) }
+                    throw CloudKitChangeFeedError.corruptCursor
+                }
+                fixture.adapter.saveTokenHook = { token in
+                    guard recoveryStarted, token == nil else { return }
+                    fixture.adapter.saveTokenHook = nil
+                    cursorWrites += 1
+                    switch outcome {
+                    case .returned: return
+                    case .cancelled: throw CancellationError()
+                    case .failed: throw CursorTestError.persistence
+                    }
+                }
+                let watchdog = Task { @BigSyncBackgroundActor in
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    XCTFail("Owned recovery stranded its original caller")
+                    fixture.synchronizer.cancelSynchronization()
+                }
+                defer { watchdog.cancel(); fixture.synchronizer.cancelSynchronization() }
+                do {
+                    let result = try await fixture.synchronizer.synchronize()
+                    XCTAssertEqual(outcome, .returned)
+                    XCTAssertEqual(result.publicationState, .complete)
+                } catch {
+                    XCTAssertNotEqual(outcome, .returned)
+                    if expired { XCTAssertEqual((error as? CKError)?.code, .changeTokenExpired) }
+                    else { XCTAssertEqual(error as? CloudKitChangeFeedError, .corruptCursor) }
+                }
+                XCTAssertEqual(cursorWrites, 1)
+                XCTAssertEqual(fixture.synchronizer._testSynchronizationWaiterCount, 0)
+            }
+        }
+    }
+
+    private enum CursorSaveOutcome: Sendable, Equatable { case returned, cancelled, failed }
+    private enum CursorTestError: Error { case persistence, timeout }
+
+    @BigSyncBackgroundActor
+    private func exerciseCursorFailureOwnership(expired: Bool, outcome: CursorSaveOutcome) async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        _ = try await fixture.drain()
+        let oldSave = ReceiptPause()
+        let successorTransport = ReceiptPause()
+        var recoveryStarted = false
+        var oldSaveEntered = false
+        var successorEntered = false
+        var completions = 0
+        fixture.synchronizer.domainPublicationScopeIdentifierProvider = {
+            // Fail the real registered terminal callback exactly once.
+            recoveryStarted = true
+            fixture.synchronizer.domainPublicationScopeIdentifierProvider = nil
+            if expired { throw CKError(.changeTokenExpired) }
+            throw CloudKitChangeFeedError.corruptCursor
+        }
+        fixture.adapter.saveTokenHook = { token in
+            guard recoveryStarted, token == nil else { return }
+            fixture.adapter.saveTokenHook = nil
+            oldSaveEntered = true
+            await oldSave.wait()
+            switch outcome {
+            case .returned: return
+            case .cancelled: throw CancellationError()
+            case .failed: throw CursorTestError.persistence
+            }
+        }
+        let original = Task { @BigSyncBackgroundActor in try await fixture.synchronizer.synchronize() }
+        defer {
+            fixture.synchronizer.cancelSynchronization()
+            Task { await oldSave.release(); await successorTransport.release() }
+        }
+        try await waitFor { oldSaveEntered }
+        XCTAssertGreaterThan(fixture.synchronizer._testActiveRunCallbackCount, 0)
+        fixture.synchronizer.cancelSynchronization()
+        await assertCancelled { _ = try await original.value }
+        fixture.transport.databaseChangesHook = {
+            fixture.transport.databaseChangesHook = nil
+            successorEntered = true
+            await successorTransport.wait()
+        }
+        let first = Task { @BigSyncBackgroundActor in
+            let result = try await fixture.synchronizer.synchronize()
+            completions += 1
+            return result
+        }
+        let second = Task { @BigSyncBackgroundActor in
+            let result = try await fixture.synchronizer.synchronize()
+            completions += 1
+            return result
+        }
+        try await waitFor { fixture.synchronizer._testSynchronizationWaiterCount == 2 }
+        let successorID = fixture.synchronizer.synchronizationAttemptID
+        let successorTask = fixture.synchronizer.synchronizationTask
+        XCTAssertNotNil(successorTask)
+        await oldSave.release()
+        try await waitFor { successorEntered || completions > 0 }
+        XCTAssertTrue(successorEntered)
+        XCTAssertEqual(completions, 0)
+        XCTAssertEqual(fixture.synchronizer._testSynchronizationWaiterCount, 2)
+        XCTAssertEqual(fixture.synchronizer.synchronizationAttemptID, successorID)
+        XCTAssertEqual(fixture.synchronizer.synchronizationTask, successorTask)
+        XCTAssertFalse(fixture.synchronizer.cancelSync)
+        await successorTransport.release()
+        let firstResult = try await first.value
+        let secondResult = try await second.value
+        XCTAssertEqual(firstResult.publicationState, .complete)
+        XCTAssertEqual(secondResult.publicationState, .complete)
+        XCTAssertEqual(completions, 2)
+        XCTAssertEqual(fixture.synchronizer._testSynchronizationWaiterCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    private func waitFor(_ predicate: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !predicate() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Timed out waiting for a deterministic test boundary")
+                throw CursorTestError.timeout
+            }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
+
+    @BigSyncBackgroundActor
     private func assertCancelled(file: StaticString = #filePath, line: UInt = #line,
                                  _ operation: () async throws -> Void) async {
         do { try await operation(); XCTFail("Expected cancellation", file: file, line: line) }
@@ -682,7 +950,10 @@ private final class ReceiptTransport: NSObject, CloudKitDatabaseAdapter,
         savePolicy: CKModifyRecordsOperation.RecordSavePolicy, atomically: Bool) async throws -> CloudKitRecordMutationResults {
         operations += 1; return .init(saveResults: [:], deleteResults: [:])
     }
+    @BigSyncBackgroundActor var databaseChangesHook: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    @BigSyncBackgroundActor
     func databaseChanges(since: DatabaseChangeCursor?, resultsLimit: Int?) async throws -> CloudKitDatabaseChangePage {
+        try await databaseChangesHook?()
         operations += 1
         return .init(cursor: .init(serializedData: Data("db-boundary".utf8)),
             changedZoneIDs: [], deletions: [], moreComing: false)
@@ -733,7 +1004,9 @@ private final class ReceiptAdapter: NSObject, ModelAdapter, ChangeFeedResetMigra
     func didDelete(recordIDs: [CKRecord.ID], matchingGenerations: [String: String]) async throws { acknowledgements += 1 }
     func requeueMissingServerRecords(_ recordIDs: [CKRecord.ID], matchingPreparedGenerations: [String: String]) async throws { }
     var serverChangeToken: RecordZoneChangeCursor? { get async { nil } }
-    func saveToken(_ token: RecordZoneChangeCursor?) async throws { }
+    @BigSyncBackgroundActor var saveTokenHook: (@BigSyncBackgroundActor @Sendable (RecordZoneChangeCursor?) async throws -> Void)?
+    @BigSyncBackgroundActor
+    func saveToken(_ token: RecordZoneChangeCursor?) async throws { try await saveTokenHook?(token) }
     @BigSyncBackgroundActor
     func consumedServerBoundaryIdentifier(accountScopeIdentifier: String, replicaBindingGenerationIdentifier: String?,
         containerIdentifier: String, databaseScope: CKDatabase.Scope) throws -> String? { boundary }
@@ -763,4 +1036,21 @@ private final class ReceiptAdapter: NSObject, ModelAdapter, ChangeFeedResetMigra
     func unsetCancellation() async throws { }
     @BigSyncBackgroundActor
     func hasPendingChangesAtTerminalBoundary() throws -> Bool { hasPendingTerminalChanges }
+}
+
+/// Cancellation intentionally does not release this gate: the tests model a
+/// collaborator that returns late despite the original task being cancelled.
+private actor ReceiptPause {
+    private var released = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { continuations.append($0) }
+    }
+    func release() {
+        released = true
+        let pending = continuations
+        continuations.removeAll()
+        pending.forEach { $0.resume() }
+    }
 }

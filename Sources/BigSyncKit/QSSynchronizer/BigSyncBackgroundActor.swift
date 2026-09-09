@@ -60,6 +60,12 @@ public struct BigSyncBackgroundWorkerConfiguration {
         @BigSyncBackgroundActor @Sendable (
             BigSyncDurablePublicationEvidence?
         ) async throws -> Void
+    /// Synchronously reserves domain admission before evidence lookup can
+    /// suspend. The returned consumer must carry that admission to its first
+    /// mutation and reject obsolete delivery, including nil evidence. No new
+    /// durable state or live account lease is granted by this callback.
+    public typealias DurablePublicationEvidenceHandlerProvider =
+        @BigSyncBackgroundActor @Sendable () throws -> DurablePublicationEvidenceHandler
     public typealias AccountScopeInvalidationHandler =
         @BigSyncBackgroundActor @Sendable (
             BigSyncAccountScopeInvalidationReason
@@ -96,6 +102,8 @@ public struct BigSyncBackgroundWorkerConfiguration {
         DomainPublicationScopeIdentifierProvider?
     let durablePublicationEvidenceHandler:
         DurablePublicationEvidenceHandler?
+    let durablePublicationEvidenceHandlerProvider:
+        DurablePublicationEvidenceHandlerProvider?
     let accountScopeInvalidationHandler: AccountScopeInvalidationHandler?
     let initialReplicaBindingAdmissionHandler:
         InitialReplicaBindingAdmissionHandler?
@@ -132,6 +140,8 @@ public struct BigSyncBackgroundWorkerConfiguration {
         publicationConsumptionHandler: SynchronizationWillConsumeServerChangesHandler? = nil,
         durablePublicationEvidenceHandler:
             DurablePublicationEvidenceHandler? = nil,
+        durablePublicationEvidenceHandlerProvider:
+            DurablePublicationEvidenceHandlerProvider? = nil,
         synchronizationCompletionHandler: SynchronizationCompletionHandler? = nil,
         accountScopeInvalidationHandler: AccountScopeInvalidationHandler? = nil,
         initialReplicaBindingAdmissionHandler:
@@ -265,6 +275,8 @@ public struct BigSyncBackgroundWorkerConfiguration {
             domainPublicationScopeIdentifierProvider
         self.durablePublicationEvidenceHandler =
             durablePublicationEvidenceHandler
+        self.durablePublicationEvidenceHandlerProvider =
+            durablePublicationEvidenceHandlerProvider
         self.synchronizationCompletionHandler = synchronizationCompletionHandler
         self.accountScopeInvalidationHandler = accountScopeInvalidationHandler
         self.initialReplicaBindingAdmissionHandler =
@@ -441,14 +453,22 @@ public actor BigSyncBackgroundActor {
         cloudKitE2ELastRestoredPublicationEvidence = nil
 #endif
 
-        if let restorationHandler =
-            configuration.durablePublicationEvidenceHandler {
+        let restorationProvider: BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandlerProvider?
+        if let provider = configuration.durablePublicationEvidenceHandlerProvider {
+            restorationProvider = provider
+        } else if let handler = configuration.durablePublicationEvidenceHandler {
+            // Preserve the existing callback API for non-domain clients.
+            restorationProvider = { handler }
+        } else {
+            restorationProvider = nil
+        }
+        if let restorationProvider {
             publicationRestorationTask = Task(
                 priority: .utility
             ) { @BigSyncBackgroundActor in
                 do {
                     try await self.restorePublicationEvidence(
-                        from: synchronizer, using: restorationHandler
+                        from: synchronizer, preparing: restorationProvider
                     )
                 } catch {
                     configuration.logger.error(
@@ -660,6 +680,19 @@ public actor BigSyncBackgroundActor {
         try Task.checkCancellation()
     }
 
+    /// Identity-only post-bootstrap check. Unlike completed-drain validation,
+    /// this allows the new source journals; it cannot authorize a reservation,
+    /// head CAS, or terminal publication.
+    @BigSyncBackgroundActor
+    public func revalidatePostBarrierDrainPrincipal(
+        _ completed: CloudKitSynchronizer.CompletedPostBarrierDrain
+    ) async throws {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        try await synchronizer.revalidatePostBarrierDrainPrincipal(completed)
+        guard realmSynchronizer === synchronizer else { throw CancellationError() }
+        try Task.checkCancellation()
+    }
+
     /// Returns at the deadline even when an underlying CloudKit await does not
     /// cooperate with Swift task cancellation. The losing request task is
     /// canceled and fenced; an already-running shared synchronization may still
@@ -708,9 +741,24 @@ public actor BigSyncBackgroundActor {
         from synchronizer: CloudKitSynchronizer,
         using handler: BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler
     ) async throws {
+        try await restorePublicationEvidence(from: synchronizer, preparing: { handler })
+    }
+
+    @BigSyncBackgroundActor
+    internal func restorePublicationEvidence(
+        from synchronizer: CloudKitSynchronizer,
+        preparing provider: BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandlerProvider
+    ) async throws {
         let attemptID = synchronizer.synchronizationAttemptID
         try Task.checkCancellation()
         guard realmSynchronizer === synchronizer else { throw CancellationError() }
+        // No actor hop may separate owner validation and domain admission.
+        // The domain must not mint fresh authority when delivery eventually
+        // arrives on its own actor after a newer worker has completed.
+        let handler = try provider()
+        try Task.checkCancellation()
+        guard realmSynchronizer === synchronizer,
+              synchronizer.synchronizationAttemptID == attemptID else { throw CancellationError() }
         let evidence = try await synchronizer.restoredDurablePublicationEvidence()
         try Task.checkCancellation()
         guard realmSynchronizer === synchronizer,

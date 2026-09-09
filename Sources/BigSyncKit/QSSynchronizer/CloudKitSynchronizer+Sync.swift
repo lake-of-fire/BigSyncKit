@@ -504,7 +504,11 @@ extension CloudKitSynchronizer {
         }
         
         self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [cloudKitSynchronizerErrorKey: error])
+        // Observers and delegates may synchronously cancel A and admit B.
+        // Recheck before notifying or mutating anything on B's behalf.
+        guard synchronizationAttemptID == attemptID else { return }
         self.delegate?.synchronizerDidfailToSync(self, error: error)
+        guard synchronizationAttemptID == attemptID else { return }
         
         var shouldRetry = false
         var retryDelay: TimeInterval = 0
@@ -556,10 +560,13 @@ extension CloudKitSynchronizer {
                     do {
                         try self.resetDatabaseToken()
                         for adapter in modelAdapters {
+                            guard synchronizationAttemptID == attemptID else { return }
                             try await adapter.saveToken(nil)
+                            guard synchronizationAttemptID == attemptID else { return }
                         }
                         shouldRetry = true
                     } catch {
+                        guard synchronizationAttemptID == attemptID else { return }
                         logger.error("QSCloudKitSynchronizer >> Failed to clear expired adapter token: \(error)")
                     }
                 }
@@ -636,10 +643,13 @@ extension CloudKitSynchronizer {
                 do {
                     try resetDatabaseToken()
                     for adapter in modelAdapters {
+                        guard synchronizationAttemptID == attemptID else { return }
                         try await adapter.saveToken(nil)
+                        guard synchronizationAttemptID == attemptID else { return }
                     }
                     shouldRetry = true
                 } catch {
+                    guard synchronizationAttemptID == attemptID else { return }
                     logger.error(
                         "QSCloudKitSynchronizer >> Failed to clear corrupt adapter cursor: \(error)"
                     )
@@ -647,6 +657,9 @@ extension CloudKitSynchronizer {
             }
         }
 
+        // Cursor persistence can suspend after our entry ownership check.
+        // Never finalize or schedule work for a successor attempt.
+        guard synchronizationAttemptID == attemptID else { return }
         if error is CancellationError {
             logger.info("QSCloudKitSynchronizer >> Synchronization canceled, not retrying")
             shouldRetry = false

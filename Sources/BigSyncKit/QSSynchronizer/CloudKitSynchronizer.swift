@@ -1896,37 +1896,52 @@ public class CloudKitSynchronizer: NSObject {
         return completed
     }
 
-    /// Revalidates a completed post-barrier capability around an application
-    /// suspension. A failed recheck after Realm reservation prevents the head
-    /// CAS; the reservation remains for fenced recovery. Realm separately
-    /// compares the exact snapshot and journal identity inside its write.
+    /// Revalidates the original transport principal after the application has
+    /// consumed a completed aggregate drain by committing its bootstrap. New
+    /// source journals and a changed cursor are allowed here. This proves only
+    /// worker/run/account/binding continuity, NOT an empty journal or an approved
+    /// snapshot. Never use it to reserve, authorize a head CAS, or publish success;
+    /// those require the full completed drain or a new ordinary source receipt.
     @BigSyncBackgroundActor
-    public func revalidateCompletedPostBarrierDrain(
+    public func revalidatePostBarrierDrainPrincipal(
         _ completed: CompletedPostBarrierDrain
     ) async throws {
+        try validatePostBarrierDrainPrincipal(completed)
+        try await ensureCurrentAccount(completed.accountIdentifier)
+        try validatePostBarrierDrainPrincipal(completed)
+    }
+
+    @BigSyncBackgroundActor
+    private func validatePostBarrierDrainPrincipal(
+        _ completed: CompletedPostBarrierDrain
+    ) throws {
         guard completed.issuerID == synchronizationReceiptIssuerID,
               completedPostBarrierDrain == completed,
               activeReceiptAuthorizationID == completed.receiptAuthorizationID,
               let activeRunContext,
               activeRunContext.runID == completed.runID,
-              activeRunContext.accountScopeIdentifier
-                == completed.accountScopeIdentifier,
-              activeRunContext.replicaBindingGenerationIdentifier
-                == completed.replicaBindingGenerationIdentifier,
+              activeRunContext.accountScopeIdentifier == completed.accountScopeIdentifier,
+              activeRunContext.replicaBindingGenerationIdentifier == completed.replicaBindingGenerationIdentifier,
               !cancelSync else {
             throw CancellationError()
         }
         try checkRunContext(activeRunContext)
+    }
+
+    /// Revalidates a completed post-barrier capability around an application
+    /// suspension BEFORE consuming the aggregate snapshot. A failed recheck
+    /// after Realm reservation prevents the head CAS; the reservation remains
+    /// for fenced recovery. Realm also compares its exact snapshot and journal
+    /// identity inside the write. Do not reuse this precondition after bootstrap
+    /// has deliberately created source journals.
+    @BigSyncBackgroundActor
+    public func revalidateCompletedPostBarrierDrain(
+        _ completed: CompletedPostBarrierDrain
+    ) async throws {
+        try validatePostBarrierDrainPrincipal(completed)
         guard try !adaptersHavePendingChangesAtTerminalBoundary() else { throw CancellationError() }
         try await ensureCurrentAccount(completed.accountIdentifier)
-        guard completedPostBarrierDrain == completed,
-              activeReceiptAuthorizationID == completed.receiptAuthorizationID,
-              let currentRunContext = self.activeRunContext,
-              currentRunContext.runID == completed.runID,
-              !cancelSync else {
-            throw CancellationError()
-        }
-        try checkRunContext(currentRunContext)
+        try validatePostBarrierDrainPrincipal(completed)
         guard try !adaptersHavePendingChangesAtTerminalBoundary(),
               let adapter = modelAdapters.first,
               try adapter.consumedServerBoundaryIdentifier(
