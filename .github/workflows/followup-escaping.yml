@@ -1,0 +1,33 @@
+name: Correct restoration compatibility closure lifetime
+on:
+  push:
+    branches: [audit/followup-escaping-20260909]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach 051f05ba6280dd696fcb48001bef8fb9e16f2e19
+          test "$(git rev-parse HEAD^{tree})" = a6e030006d8025e39b7fa60a5e34baae158b3aa1
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift')
+          s=p.read_text()
+          old='using handler: BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler\n'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'using handler: @escaping BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler\n'))
+          PY
+          git add Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
+          git diff --cached --check
+          test "$(git write-tree)" = 8e32830e070f4b9514a679dfa614a94db9e5cfce
+          git -c user.name='OpenAI assistant' -c user.email='noreply@openai.com' commit -m 'Declare captured restoration compatibility handler escaping'
+          git push origin HEAD:refs/heads/codex/ordered-v2-followup-ownership-20260909
+          git rev-parse HEAD HEAD^{tree} HEAD^
