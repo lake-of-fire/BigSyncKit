@@ -1,0 +1,52 @@
+name: Publish reviewed worker request boundaries
+on:
+  push:
+    branches: [audit/more-boundaries-publish-20260909]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: transport
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 6dfefb4ad6a81bdce59d6bb979cf6537c418d536
+          path: source
+      - name: Verify exact patch and publish non-force source continuation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          import base64,zlib,pathlib,hashlib
+          b=zlib.decompress(base64.b64decode(pathlib.Path('transport/.audit/more-boundaries.patch.zlib.b64').read_bytes()))
+          assert hashlib.sha256(b).hexdigest()=='d20886109f9c6193d217d22b0b242b7dc6e59fc598cad586624465c3f8fa31b1'
+          pathlib.Path('source.patch').write_bytes(b)
+          PY
+          cd source
+          test "$(git rev-parse HEAD)" = 6dfefb4ad6a81bdce59d6bb979cf6537c418d536
+          test "$(git rev-parse HEAD^{tree})" = 4ddde22c327122e914617805343090fa62204f3c
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-followup-ownership-20260909 | cut -f1)" = 6dfefb4ad6a81bdce59d6bb979cf6537c418d536
+          git apply --check --index ../source.patch
+          git apply --index ../source.patch
+          git diff --cached --check
+          test "$(git write-tree)" = cfb5dde3736d5134094ead019255265ea74a1707
+          git config user.name 'OpenAI assistant'
+          git config user.email 'noreply@openai.com'
+          git commit -m 'Revoke cancelled worker requests and release terminal state before diagnostics'
+          git push origin HEAD:refs/heads/codex/ordered-v2-followup-ownership-20260909
+          git rev-parse HEAD HEAD^{tree} HEAD^ > "$RUNNER_TEMP/evidence/identity.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/evidence/source-manifest.txt"
+          cp ../source.patch "$RUNNER_TEMP/evidence/source.patch"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: more-boundaries-publication
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 14
