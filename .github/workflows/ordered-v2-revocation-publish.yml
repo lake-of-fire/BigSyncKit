@@ -1,0 +1,61 @@
+name: Ordered V2 verified revocation publication
+on:
+  push:
+    branches: [codex/ordered-v2-revocation-stage-20260909]
+    paths: [.github/workflows/ordered-v2-revocation-publish.yml]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 0b5cc31ea920ab51a0f29de2e7c1e720925aef9d
+          fetch-depth: 0
+      - name: Verify and publish source-only commit
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/revocation-evidence
+          test "$(git rev-parse HEAD^{tree})" = de448fc61045d80fee86988229610b8ed0a1e249
+          python3 - <<'PY'
+          import subprocess,re,base64,zlib,hashlib,pathlib
+          workflow=subprocess.check_output(['git','show','1a558305a7c49056987ace2442f55f9c41131f1e:.github/workflows/ordered-v2-revocation-stage.yml'],text=True)
+          encoded=re.search(r'^          PATCH_ZLIB_BASE64: (.+)$',workflow,re.M).group(1)
+          for wrong,right in [('M+tqUZ579','M+tqUZ79'),('ItWaAeou','ItWAeou')]:
+              assert encoded.count(wrong)==1
+              encoded=encoded.replace(wrong,right)
+          data=zlib.decompress(base64.b64decode(encoded,validate=True))
+          assert hashlib.sha256(data).hexdigest()=='3d694c054107dab91e45970b4b14880dc24d3af98cd2f711c7e061314c76b410'
+          pathlib.Path('/tmp/revocation-evidence/source.patch').write_bytes(data)
+          PY
+          git apply --check /tmp/revocation-evidence/source.patch
+          git apply --index /tmp/revocation-evidence/source.patch
+          git diff --cached --check
+          test "$(git write-tree)" = a101cb7eee47778101ec1ea793b469fa3708c9cb
+          git diff --cached --name-only > /tmp/revocation-evidence/changed-paths.txt
+          if command -v swiftc >/dev/null; then
+            swiftc --version > /tmp/revocation-evidence/swift-syntax.log
+            swiftc -frontend -parse -D DEBUG Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+TerminalReceipt.swift Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift >> /tmp/revocation-evidence/swift-syntax.log 2>&1
+            printf '\nLinux syntax parsing passed; no Apple SDK type-check or native test execution.\n' >> /tmp/revocation-evidence/swift-syntax.log
+          else
+            printf 'Swift frontend unavailable on runner; native tests not run.\n' > /tmp/revocation-evidence/swift-syntax.log
+          fi
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-revocation-boundaries-20260909 | cut -f1)" = 0b5cc31ea920ab51a0f29de2e7c1e720925aef9d
+          git config user.name 'Alex Ehlke'
+          git config user.email '71601+aehlke@users.noreply.github.com'
+          git commit -m 'Reject revoked publication evidence and replaced post-barrier workers' -m 'Revalidate domain receipt evidence and pending terminal work around suspension. Add eleven native behavioral cases; Apple runtime execution remains required. No activation, journal acknowledgement, reset, or release-ref change.'
+          git rev-parse HEAD > /tmp/revocation-evidence/head.txt
+          git rev-parse HEAD^{tree} > /tmp/revocation-evidence/tree.txt
+          git ls-tree -r HEAD > /tmp/revocation-evidence/source-tree.txt
+          git archive HEAD | gzip -n > /tmp/revocation-evidence/source.tar.gz
+          git push origin HEAD:refs/heads/codex/ordered-v2-revocation-boundaries-20260909
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-revocation-boundaries-20260909 | cut -f1)" = "$(git rev-parse HEAD)"
+          sha256sum /tmp/revocation-evidence/* > /tmp/revocation-evidence/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ordered-v2-revocation-evidence
+          path: /tmp/revocation-evidence
+          retention-days: 14
