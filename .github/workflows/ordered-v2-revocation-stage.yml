@@ -1,0 +1,58 @@
+name: Ordered V2 revocation source verification
+on:
+  push:
+    branches: [codex/ordered-v2-revocation-stage-20260909]
+    paths: [.github/workflows/ordered-v2-revocation-stage.yml]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 0b5cc31ea920ab51a0f29de2e7c1e720925aef9d
+          fetch-depth: 0
+      - name: Verify exact patch and publish source-only review branch
+        env:
+          PATCH_ZLIB_BASE64: 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
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/revocation-evidence
+          test "$(git rev-parse HEAD^{tree})" = de448fc61045d80fee86988229610b8ed0a1e249
+          python3 - <<'PY'
+          import os,base64,zlib,hashlib,pathlib
+          data=zlib.decompress(base64.b64decode(os.environ['PATCH_ZLIB_BASE64']))
+          assert hashlib.sha256(data).hexdigest()=='3d694c054107dab91e45970b4b14880dc24d3af98cd2f711c7e061314c76b410'
+          pathlib.Path('/tmp/revocation-evidence/source.patch').write_bytes(data)
+          PY
+          git apply --check /tmp/revocation-evidence/source.patch
+          git apply --index /tmp/revocation-evidence/source.patch
+          git diff --cached --check
+          test "$(git write-tree)" = a101cb7eee47778101ec1ea793b469fa3708c9cb
+          git diff --cached --name-only > /tmp/revocation-evidence/changed-paths.txt
+          if command -v swiftc >/dev/null; then
+            swiftc --version > /tmp/revocation-evidence/swift-syntax.log
+            swiftc -frontend -parse -D DEBUG Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+TerminalReceipt.swift Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift >> /tmp/revocation-evidence/swift-syntax.log 2>&1
+            printf '\nLinux syntax parsing passed; no Apple SDK type-check or native test execution.\n' >> /tmp/revocation-evidence/swift-syntax.log
+          else
+            printf 'Swift frontend unavailable on runner; native tests not run.\n' > /tmp/revocation-evidence/swift-syntax.log
+          fi
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-revocation-boundaries-20260909 | cut -f1)" = 0b5cc31ea920ab51a0f29de2e7c1e720925aef9d
+          git config user.name 'Alex Ehlke'
+          git config user.email '71601+aehlke@users.noreply.github.com'
+          git commit -m 'Reject revoked publication evidence and replaced post-barrier workers' -m 'Revalidate domain receipt evidence and pending terminal work around suspension. Add eleven native behavioral cases; Apple runtime execution remains required. No activation, journal acknowledgement, reset, or release-ref change.'
+          git rev-parse HEAD > /tmp/revocation-evidence/head.txt
+          git rev-parse HEAD^{tree} > /tmp/revocation-evidence/tree.txt
+          git ls-tree -r HEAD > /tmp/revocation-evidence/source-tree.txt
+          git archive HEAD | gzip -n > /tmp/revocation-evidence/source.tar.gz
+          git push origin HEAD:refs/heads/codex/ordered-v2-revocation-boundaries-20260909
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-revocation-boundaries-20260909 | cut -f1)" = "$(git rev-parse HEAD)"
+          sha256sum /tmp/revocation-evidence/* > /tmp/revocation-evidence/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ordered-v2-revocation-evidence
+          path: /tmp/revocation-evidence
+          retention-days: 14
