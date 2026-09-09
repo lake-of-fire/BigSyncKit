@@ -1,0 +1,27 @@
+name: Publish postcommit final ownership check
+on:
+  push:
+    branches: [audit/followup-final-ownership-20260909]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - shell: bash
+        run: |
+          set -euo pipefail
+          gzip -dc audit/final-ownership.patch.gz > "$RUNNER_TEMP/source.patch"
+          echo '9cd2cb342a2fb85d95fe52330b61421fabbd659c505937533d9bf372f8d782dd  '"$RUNNER_TEMP/source.patch" | sha256sum -c -
+          git checkout --detach 8064be39d74f25effcac864dbd5864111aad8e77
+          test "$(git rev-parse HEAD^{tree})" = 8e32830e070f4b9514a679dfa614a94db9e5cfce
+          git apply --index "$RUNNER_TEMP/source.patch"
+          git diff --cached --check
+          test "$(git write-tree)" = 4ddde22c327122e914617805343090fa62204f3c
+          git -c user.name='OpenAI assistant' -c user.email='noreply@openai.com' commit -m 'Fence original post-bootstrap principal after final domain suspension'
+          git push origin HEAD:refs/heads/codex/ordered-v2-followup-ownership-20260909
+          git rev-parse HEAD HEAD^{tree} HEAD^
