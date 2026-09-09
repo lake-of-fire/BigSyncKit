@@ -22,6 +22,18 @@ extension CloudKitSynchronizer {
             throw CancellationError()
         }
         try keyValueStore.bigSyncValidateDurability()
+        if let domainScope = receipt.domainPublicationScopeIdentifier {
+            // A live receipt is not sufficient after its durable publication
+            // evidence has been revoked or the change-feed namespace changed.
+            // Reuse the transport evidence check without restoring readiness,
+            // acknowledging work, or issuing a replacement receipt.
+            guard let context = activeRunContext,
+                  let evidence = try publicationEvidenceForUnconsumedFetch(context: context),
+                  evidence.runID == receipt.runID,
+                  evidence.domainScopeIdentifier == domainScope else {
+                throw CancellationError()
+            }
+        }
         try validateAccountScopeLease(lease)
         try validateTerminalReceiptIdentity(receipt)
     }

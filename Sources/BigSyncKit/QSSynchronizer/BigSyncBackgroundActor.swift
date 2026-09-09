@@ -638,13 +638,16 @@ public actor BigSyncBackgroundActor {
         using receipt: CloudKitSynchronizer.SynchronizationReceipt,
         authorizedBy authorization: CloudKitSynchronizer.PostBarrierDrainAuthorization
     ) async throws -> CloudKitSynchronizer.CompletedPostBarrierDrain {
-        guard let realmSynchronizer else {
+        guard let synchronizer = realmSynchronizer else {
             throw CancellationError()
         }
-        return try await realmSynchronizer.completedPostBarrierDrain(
+        let completed = try await synchronizer.completedPostBarrierDrain(
             using: receipt,
             authorizedBy: authorization
         )
+        guard realmSynchronizer === synchronizer else { throw CancellationError() }
+        try Task.checkCancellation()
+        return completed
     }
 
     /// Revalidates a completed capability after a domain CloudKit suspension.
@@ -652,12 +655,12 @@ public actor BigSyncBackgroundActor {
     public func revalidateCompletedPostBarrierDrain(
         _ completed: CloudKitSynchronizer.CompletedPostBarrierDrain
     ) async throws {
-        guard let realmSynchronizer else {
+        guard let synchronizer = realmSynchronizer else {
             throw CancellationError()
         }
-        try await realmSynchronizer.revalidateCompletedPostBarrierDrain(
-            completed
-        )
+        try await synchronizer.revalidateCompletedPostBarrierDrain(completed)
+        guard realmSynchronizer === synchronizer else { throw CancellationError() }
+        try Task.checkCancellation()
     }
 
     /// Returns at the deadline even when an underlying CloudKit await does not

@@ -1913,6 +1913,7 @@ public class CloudKitSynchronizer: NSObject {
             throw CancellationError()
         }
         try checkRunContext(activeRunContext)
+        guard try !adaptersHavePendingChangesAtTerminalBoundary() else { throw CancellationError() }
         try await ensureCurrentAccount(completed.accountIdentifier)
         guard completedPostBarrierDrain == completed,
               activeReceiptAuthorizationID == completed.receiptAuthorizationID,
@@ -1922,7 +1923,8 @@ public class CloudKitSynchronizer: NSObject {
             throw CancellationError()
         }
         try checkRunContext(currentRunContext)
-        guard let adapter = modelAdapters.first,
+        guard try !adaptersHavePendingChangesAtTerminalBoundary(),
+              let adapter = modelAdapters.first,
               try adapter.consumedServerBoundaryIdentifier(
                 accountScopeIdentifier: completed.accountScopeIdentifier,
                 replicaBindingGenerationIdentifier: completed.replicaBindingGenerationIdentifier,
