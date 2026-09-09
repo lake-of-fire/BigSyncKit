@@ -1,0 +1,46 @@
+name: Publish native terminal test import repair
+on:
+  push:
+    branches: [codex/terminal-control-flow-stage-20260909]
+    paths: [.github/workflows/terminal-native-import-fix.yml]
+permissions:
+  contents: write
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c81161cf92fa73632f90b75c79cf45027986400e
+          fetch-depth: 0
+      - name: Apply exact test-only import repair
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/native-import-fix
+          test "$(git rev-parse HEAD^{tree})" = 67f5e8b365a8f1f1591b282f2a587852b7c57a78
+          test "$(git hash-object Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift)" = 946c98b0947d3bb3c5ef27f4fef1048e60fb0f1d
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift')
+          s = p.read_text()
+          assert s.count('@testable import BigSyncKit') == 1
+          p.write_text(s.replace('@testable import BigSyncKit', '@_spi(CloudKitE2E) @testable import BigSyncKit'))
+          PY
+          git add Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          git diff --cached --check
+          test "$(git write-tree)" = f64f42757945c8338d4955418ae4fe539f0a4c8f
+          git diff --cached --binary --full-index > /tmp/native-import-fix/source.patch
+          git config user.name 'OpenAI assistant'
+          git config user.email 'noreply@openai.com'
+          git commit -m 'Import test-only CloudKitE2E SPI in terminal receipt suite' -m 'Native SwiftPM compilation reached the test target and diagnosed inaccessible checkpoint and evidence SPI. No production API visibility or behavior change.'
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-revocation-boundaries-20260909 | cut -f1)" = c81161cf92fa73632f90b75c79cf45027986400e
+          git push origin HEAD:refs/heads/codex/ordered-v2-revocation-boundaries-20260909
+          git rev-parse HEAD > /tmp/native-import-fix/head.txt
+          git rev-parse HEAD^{tree} > /tmp/native-import-fix/tree.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terminal-native-import-repair
+          path: /tmp/native-import-fix
+          retention-days: 14
