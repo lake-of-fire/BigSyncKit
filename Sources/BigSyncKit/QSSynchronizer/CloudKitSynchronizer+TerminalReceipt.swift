@@ -1,25 +1,16 @@
 import Foundation
 
 extension CloudKitSynchronizer {
-    /// Revalidates an ordinary completed drain without arming an aggregate
-    /// cutoff. Source publication after a committed cutover must use this
-    /// receipt, not request another aggregate snapshot/cutover capability.
-    ///
-    /// This is a read-only transport check. The application must separately
-    /// compare its current head and domain publication certificate. It grants
-    /// no authority to reset a zone, retire a reservation, or acknowledge work.
+    /// Checks the exact completed transport boundary without suspending. Use
+    /// after an application certificate read to close the final reentrancy gap.
+    /// This grants no authority to reset a zone, retire a reservation, or
+    /// acknowledge work. Domain/head certificates still need separate checks.
     @BigSyncBackgroundActor
-    public func revalidateTerminalReceipt(_ receipt: SynchronizationReceipt) async throws {
+    public func validateTerminalReceipt(_ receipt: SynchronizationReceipt) throws {
         try validateTerminalReceiptIdentity(receipt)
-        guard let context = activeRunContext,
-              let lease = try accountScopeLease(),
-              lease.accountScopeIdentifier == receipt.accountScopeIdentifier else {
-            throw CancellationError()
-        }
-        try await revalidateRunContext(context)
-        try validateAccountScopeLease(lease)
-        try validateTerminalReceiptIdentity(receipt)
-        guard modelAdapters.count == 1,
+        guard let lease = try accountScopeLease(),
+              lease.accountScopeIdentifier == receipt.accountScopeIdentifier,
+              modelAdapters.count == 1,
               let adapter = modelAdapters.first,
               try adapter.consumedServerBoundaryIdentifier(
                 accountScopeIdentifier: receipt.accountScopeIdentifier,
@@ -31,6 +22,21 @@ extension CloudKitSynchronizer {
             throw CancellationError()
         }
         try keyValueStore.bigSyncValidateDurability()
+        try validateAccountScopeLease(lease)
+        try validateTerminalReceiptIdentity(receipt)
+    }
+
+    /// Revalidates an ordinary completed drain, including the actual account
+    /// provider, without arming an aggregate cutoff. A newer run, binding,
+    /// account invalidation, or worker cannot adopt an older receipt.
+    @BigSyncBackgroundActor
+    public func revalidateTerminalReceipt(_ receipt: SynchronizationReceipt) async throws {
+        try validateTerminalReceipt(receipt)
+        guard let context = activeRunContext,
+              let lease = try accountScopeLease() else { throw CancellationError() }
+        try await revalidateRunContext(context)
+        try validateAccountScopeLease(lease)
+        try validateTerminalReceipt(receipt)
     }
 
     @BigSyncBackgroundActor
@@ -51,6 +57,14 @@ extension CloudKitSynchronizer {
 }
 
 extension BigSyncBackgroundActor {
+    @BigSyncBackgroundActor
+    public func validateTerminalReceipt(
+        _ receipt: CloudKitSynchronizer.SynchronizationReceipt
+    ) throws {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        try synchronizer.validateTerminalReceipt(receipt)
+    }
+
     /// A worker replacement during account validation cannot validate an old
     /// worker's receipt on behalf of its successor.
     @BigSyncBackgroundActor
