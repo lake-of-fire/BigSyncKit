@@ -796,6 +796,306 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         XCTAssertEqual(fixture.synchronizer._testSynchronizationWaiterCount, 0)
     }
 
+
+    // Worker requests have a cancellation lifetime separate from a transport
+    // run: ordinary concurrent callers coalesce, while explicit cancellation
+    // revokes callers still suspended before a run exists.
+    @BigSyncBackgroundActor
+    func testWorkerCancellationRevokesAvailablePreflightButAllowsFreshRequest() async throws {
+        try await assertCancelledPreflight(.available)
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerCancellationRevokesUndeterminedPreflightWithoutRetry() async throws {
+        try await assertCancelledPreflight(.unavailable(.couldNotDetermine))
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerCancellationRevokesFailedPreflightWithoutRetry() async throws {
+        try await assertCancelledPreflight(.failed)
+    }
+
+    @BigSyncBackgroundActor
+    private func assertCancelledPreflight(_ status: CloudKitAccountAvailability) async throws {
+        let fixture = Fixture()
+        let entered = ReceiptPause(), release = ReceiptPause()
+        let provider = ReceiptStatusProvider(first: status, entered: entered, release: release)
+        let worker = BigSyncBackgroundActor(accountAvailabilityGate:
+            CloudKitAccountAvailabilityGate(statusProvider: { _ in await provider.read() }))
+        await worker._test_installSynchronizer(fixture.synchronizer)
+        fixture.synchronizer.accountValidationRequired = true
+        fixture.synchronizer.cancelledDueToUnauthentication = true
+        let old = Task { @BigSyncBackgroundActor in await worker.synchronizeCloudKit() }
+        await entered.wait()
+        await worker.cancelSynchronization() // Deliberately do NOT cancel `old`.
+        let operations = fixture.transport.operations
+        let validation = fixture.synchronizer.accountValidationRequired
+        let unauthenticated = fixture.synchronizer.cancelledDueToUnauthentication
+        await release.release()
+        let result = await old.value
+        XCTAssertNil(result)
+        XCTAssertEqual(fixture.transport.operations, operations)
+        XCTAssertEqual(fixture.synchronizer.accountValidationRequired, validation)
+        XCTAssertEqual(fixture.synchronizer.cancelledDueToUnauthentication, unauthenticated)
+        let retry = await worker._test_hasScheduledAccountAvailabilityRetry
+        XCTAssertFalse(retry)
+        let fresh = await worker.synchronizeCloudKit()
+        XCTAssertEqual(fresh?.publicationState, .complete)
+        XCTAssertGreaterThan(fixture.transport.operations, operations)
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerCallerCancellationDoesNotMutateAvailablePreflightState() async throws {
+        let fixture = Fixture()
+        let entered = ReceiptPause(), release = ReceiptPause()
+        let provider = ReceiptStatusProvider(first: .available, entered: entered, release: release)
+        let worker = BigSyncBackgroundActor(accountAvailabilityGate:
+            CloudKitAccountAvailabilityGate(statusProvider: { _ in await provider.read() }))
+        await worker._test_installSynchronizer(fixture.synchronizer)
+        fixture.synchronizer.accountValidationRequired = true
+        fixture.synchronizer.cancelledDueToUnauthentication = true
+        let old = Task { @BigSyncBackgroundActor in await worker.synchronizeCloudKit() }
+        await entered.wait()
+        let retryRelease = ReceiptPause()
+        let retry = Task { await retryRelease.wait() }
+        await worker._test_installAccountAvailabilityRetryTask(retry)
+        old.cancel()
+        await release.release()
+        let result = await old.value
+        XCTAssertNil(result)
+        XCTAssertTrue(fixture.synchronizer.accountValidationRequired)
+        XCTAssertTrue(fixture.synchronizer.cancelledDueToUnauthentication)
+        XCTAssertEqual(fixture.transport.operations, 0)
+        let retained = await worker._test_accountAvailabilityRetryTask
+        XCTAssertEqual(retained, retry)
+        XCTAssertFalse(retry.isCancelled)
+        await retryRelease.release()
+        let fresh = await worker.synchronizeCloudKit()
+        XCTAssertEqual(fresh?.publicationState, .complete)
+    }
+
+    @BigSyncBackgroundActor
+    func testAlreadyCancelledWorkerEntryPreservesEligibleDelayedWork() async throws {
+        let fixture = Fixture()
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(fixture.synchronizer, performsAccountAvailabilityPreflight: false)
+        await worker._test_scheduleDormantInitialSynchronization()
+        let retryRelease = ReceiptPause(), entryRelease = ReceiptPause()
+        let retry = Task { await retryRelease.wait() }
+        await worker._test_installAccountAvailabilityRetryTask(retry)
+        let old = Task { @BigSyncBackgroundActor in
+            await entryRelease.wait()
+            return await worker.synchronizeCloudKit()
+        }
+        old.cancel()
+        await entryRelease.release()
+        let result = await old.value
+        let initial = await worker._test_hasScheduledInitialSynchronization
+        let retained = await worker._test_accountAvailabilityRetryTask
+        XCTAssertNil(result)
+        XCTAssertTrue(initial)
+        XCTAssertEqual(retained, retry)
+        XCTAssertFalse(retry.isCancelled)
+        XCTAssertEqual(fixture.transport.operations, 0)
+        await retryRelease.release()
+        await worker.cancelSynchronization()
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerCancellationRevokesRequestWaitingForRestoration() async throws {
+        let fixture = Fixture()
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(fixture.synchronizer, performsAccountAvailabilityPreflight: false)
+        let restorationRelease = ReceiptPause()
+        let restoration = Task { await restorationRelease.wait() }
+        await worker._test_installPublicationRestorationTask(restoration)
+        let old = Task { @BigSyncBackgroundActor in await worker.synchronizeCloudKit() }
+        try await waitFor { worker._test_activeSynchronizationRequestCount == 1 }
+        await worker.cancelSynchronization()
+        await restorationRelease.release()
+        let result = await old.value
+        XCTAssertNil(result)
+        XCTAssertEqual(fixture.transport.operations, 0)
+        let fresh = await worker.synchronizeCloudKit()
+        XCTAssertEqual(fresh?.publicationState, .complete)
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerReplacementCannotClearSuccessorAvailabilityRetry() async throws {
+        let fixture = Fixture(), successor = Fixture()
+        let entered = ReceiptPause(), release = ReceiptPause()
+        let provider = ReceiptStatusProvider(first: .available, entered: entered, release: release)
+        let worker = BigSyncBackgroundActor(accountAvailabilityGate:
+            CloudKitAccountAvailabilityGate(statusProvider: { _ in await provider.read() }))
+        var completions = 0
+        await worker._test_installSynchronizer(fixture.synchronizer,
+            synchronizationCompletionHandler: { _ in completions += 1 })
+        let old = Task { @BigSyncBackgroundActor in await worker.synchronizeCloudKit() }
+        await entered.wait()
+        let retryRelease = ReceiptPause()
+        let retry = Task { await retryRelease.wait() }
+        await worker._test_installSynchronizer(successor.synchronizer)
+        await worker._test_installAccountAvailabilityRetryTask(retry)
+        successor.synchronizer.accountValidationRequired = true
+        successor.synchronizer.cancelledDueToUnauthentication = true
+        await release.release()
+        let result = await old.value
+        let retained = await worker._test_accountAvailabilityRetryTask
+        XCTAssertNil(result)
+        XCTAssertEqual(retained, retry)
+        XCTAssertFalse(retry.isCancelled)
+        XCTAssertTrue(successor.synchronizer.accountValidationRequired)
+        XCTAssertTrue(successor.synchronizer.cancelledDueToUnauthentication)
+        XCTAssertEqual(fixture.transport.operations, 0)
+        XCTAssertEqual(completions, 0)
+        await retryRelease.release()
+        let fresh = await worker.synchronizeCloudKit()
+        XCTAssertEqual(fresh?.publicationState, .complete)
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerRejectsReturnAfterCallerCancellationInCompletionHandler() async throws {
+        try await assertObsoleteCompletion(.callerCancellation)
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerRejectsReturnAfterExplicitCancellationInCompletionHandler() async throws {
+        try await assertObsoleteCompletion(.workerCancellation)
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerRejectsReturnAfterReplacementInCompletionHandler() async throws {
+        try await assertObsoleteCompletion(.replacement)
+    }
+
+    private enum CompletionRevocation { case callerCancellation, workerCancellation, replacement }
+
+    @BigSyncBackgroundActor
+    private func assertObsoleteCompletion(_ revocation: CompletionRevocation) async throws {
+        let fixture = Fixture(), successor = Fixture()
+        let worker = BigSyncBackgroundActor()
+        let entered = ReceiptPause(), release = ReceiptPause()
+        var completions = 0
+        await worker._test_installSynchronizer(fixture.synchronizer,
+            performsAccountAvailabilityPreflight: false,
+            synchronizationCompletionHandler: { result in
+                XCTAssertEqual(result.publicationState, .complete)
+                XCTAssertNotNil(result.receipt)
+                completions += 1
+                await entered.release()
+                await release.wait()
+            })
+        let old = Task { @BigSyncBackgroundActor in await worker.synchronizeCloudKit() }
+        await entered.wait()
+        switch revocation {
+        case .callerCancellation: old.cancel()
+        case .workerCancellation: await worker.cancelSynchronization()
+        case .replacement:
+            await worker._test_installSynchronizer(successor.synchronizer,
+                performsAccountAvailabilityPreflight: false)
+        }
+        await release.release()
+        let result = await old.value
+        XCTAssertNil(result)
+        XCTAssertEqual(completions, 1)
+        let fresh = await worker.synchronizeCloudKit()
+        XCTAssertEqual(fresh?.publicationState, .complete)
+    }
+
+    @BigSyncBackgroundActor
+    func testConcurrentWorkerRequestsCoalesceWithoutRevokingEachOther() async throws {
+        try await assertCoalescedWorkerRequests(cancel: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testExplicitCancellationRevokesBothCoalescedWorkerRequests() async throws {
+        try await assertCoalescedWorkerRequests(cancel: true)
+    }
+
+    @BigSyncBackgroundActor
+    private func assertCoalescedWorkerRequests(cancel: Bool) async throws {
+        let fixture = Fixture()
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(fixture.synchronizer, performsAccountAvailabilityPreflight: false)
+        let entered = ReceiptPause(), release = ReceiptPause()
+        var starts = 0
+        fixture.transport.databaseChangesHook = {
+            starts += 1
+            if starts == 1 { await entered.release(); await release.wait() }
+        }
+        let a = Task { @BigSyncBackgroundActor in await worker.synchronizeCloudKit() }
+        await entered.wait()
+        let b = Task { @BigSyncBackgroundActor in await worker.synchronizeCloudKit() }
+        try await waitFor { fixture.synchronizer._testSynchronizationWaiterCount == 2 }
+        if cancel { await worker.cancelSynchronization() }
+        await release.release()
+        let ar = await a.value, br = await b.value
+        if cancel {
+            XCTAssertNil(ar); XCTAssertNil(br)
+            let fresh = await worker.synchronizeCloudKit()
+            XCTAssertEqual(fresh?.publicationState, .complete)
+        } else {
+            XCTAssertEqual(ar?.publicationState, .complete)
+            XCTAssertEqual(br?.publicationState, .complete)
+            XCTAssertEqual(ar?.receipt?.runID, br?.receipt?.runID)
+            XCTAssertEqual(starts, 1)
+        }
+        XCTAssertEqual(fixture.synchronizer._testSynchronizationWaiterCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalDiagnosticBeginStartsExactlyOneSuccessorRun() async throws {
+        try await assertSynchronousTerminalReentry(cancelFirst: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalDiagnosticCancelAndBeginPreservesSuccessorAndItsWaiters() async throws {
+        try await assertSynchronousTerminalReentry(cancelFirst: true)
+    }
+
+    @BigSyncBackgroundActor
+    private func assertSynchronousTerminalReentry(cancelFirst: Bool) async throws {
+        let observer = ReceiptProgressObserver(cancelFirst: cancelFirst)
+        let fixture = Fixture(progressHandler: { observer.record($0) })
+        observer.synchronizer = fixture.synchronizer
+        let successorEntered = ReceiptPause(), release = ReceiptPause()
+        var starts = 0
+        fixture.transport.databaseChangesHook = {
+            starts += 1
+            if starts == 2 { await successorEntered.release(); await release.wait() }
+        }
+        let first = try await fixture.synchronizer.synchronize()
+        await successorEntered.wait()
+        XCTAssertEqual(observer.terminalCount, 1)
+        XCTAssertNotEqual(fixture.synchronizer.synchronizationAttemptID, observer.firstAttempt)
+        XCTAssertTrue(fixture.synchronizer.syncing)
+        XCTAssertNotNil(fixture.synchronizer.synchronizationTask)
+        let b = Task { @BigSyncBackgroundActor in try await fixture.synchronizer.synchronize() }
+        let c = Task { @BigSyncBackgroundActor in try await fixture.synchronizer.synchronize() }
+        try await waitFor { fixture.synchronizer._testSynchronizationWaiterCount == 2 }
+        await release.release()
+        let br = try await b.value, cr = try await c.value
+        XCTAssertEqual(br.publicationState, .complete)
+        XCTAssertEqual(cr.receipt?.runID, br.receipt?.runID)
+        XCTAssertNotEqual(first.receipt?.runID, br.receipt?.runID)
+        XCTAssertEqual(starts, 2)
+        XCTAssertEqual(observer.terminalCount, 2)
+        XCTAssertFalse(fixture.synchronizer.syncing)
+        XCTAssertNil(fixture.synchronizer.synchronizationTask)
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalDiagnosticRecordsOneCompletedDrainAndKeepsKillCheckpoint() async throws {
+        var terminalCount = 0, checkpointCount = 0
+        let fixture = Fixture(progressHandler: { if $0 == "terminal-receipt" { terminalCount += 1 } })
+        fixture.synchronizer.processKillCheckpointHandler = { boundary in
+            if boundary == .terminalEvidenceBeforeCompletionDelivery { checkpointCount += 1 }
+        }
+        _ = try await fixture.drain()
+        XCTAssertEqual(terminalCount, 1)
+        XCTAssertEqual(checkpointCount, 1)
+    }
+
     @BigSyncBackgroundActor
     private func waitFor(_ predicate: () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
@@ -844,7 +1144,8 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
 
         init(domainScopeIdentifier: String? = nil, useReplicaBinding: Bool = false,
              store: ReceiptStore = ReceiptStore(), account: ReceiptAccount = ReceiptAccount(),
-             identifier: String = UUID().uuidString, zoneID: CKRecordZone.ID? = nil) {
+             identifier: String = UUID().uuidString, zoneID: CKRecordZone.ID? = nil,
+             progressHandler: CloudKitSynchronizer.ProgressHandler? = nil) {
             self.store = store; self.account = account; self.identifier = identifier
             self.useReplicaBinding = useReplicaBinding; self.domainScopeIdentifier = domainScopeIdentifier
             let zone = zoneID ?? CKRecordZone.ID(zoneName: "receipt-fixture-\(UUID().uuidString)",
@@ -854,7 +1155,7 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
                 containerIdentifier: "iCloud.receipt-fixture", database: transport,
                 recordZoneID: zone, keyValueStore: store,
                 accountIdentifierProvider: { try await account.read() },
-                accountStatusProvider: { .available }, changeFeed: transport,
+                accountStatusProvider: { .available }, progressHandler: progressHandler, changeFeed: transport,
                 subscriptionStore: transport, zoneStore: transport, recordStore: transport,
                 initialReplicaBindingAdmissionHandler: { _ in },
                 accountReplacementPolicy: useReplicaBinding ? .localDatasetRebootstrap : .serverReconciliation,
@@ -1079,5 +1380,42 @@ private actor ReceiptPause {
         let pending = continuations
         continuations.removeAll()
         pending.forEach { $0.resume() }
+    }
+}
+
+
+private actor ReceiptStatusProvider {
+    let first: CloudKitAccountAvailability
+    let entered: ReceiptPause
+    let release: ReceiptPause
+    private var firstRead = true
+    init(first: CloudKitAccountAvailability, entered: ReceiptPause, release: ReceiptPause) {
+        self.first = first; self.entered = entered; self.release = release
+    }
+    func read() async -> CloudKitAccountAvailability {
+        guard firstRead else { return .available }
+        firstRead = false
+        await entered.release()
+        await release.wait() // Intentionally ignores cooperative cancellation.
+        return first
+    }
+}
+
+@BigSyncBackgroundActor
+private final class ReceiptProgressObserver {
+    weak var synchronizer: CloudKitSynchronizer?
+    let cancelFirst: Bool
+    var terminalCount = 0
+    var firstAttempt: UUID?
+    init(cancelFirst: Bool) { self.cancelFirst = cancelFirst }
+    func record(_ milestone: String) {
+        guard milestone == "terminal-receipt", let synchronizer else { return }
+        terminalCount += 1
+        guard terminalCount == 1 else { return }
+        firstAttempt = synchronizer.synchronizationAttemptID
+        // Synchronous reentry is essential. Scheduling a Task would hide the
+        // old-run cleanup race by running only after the original tail returns.
+        if cancelFirst { synchronizer.cancelSynchronization() }
+        synchronizer.beginSynchronization()
     }
 }

@@ -364,6 +364,10 @@ public actor BigSyncBackgroundActor {
     private var accountAvailabilityRetryTask: Task<Void, Never>?
     @BigSyncBackgroundActor
     private var publicationRestorationTask: Task<Void, Never>?
+    /// Process-local revocation of already-entered lifecycle requests. This is
+    /// not a synchronization attempt, publication permit, or durable journal.
+    @BigSyncBackgroundActor
+    private var synchronizationRequestGeneration = UUID()
 #if DEBUG
     @BigSyncBackgroundActor
     private var cloudKitE2ELastRestoredPublicationEvidence:
@@ -617,6 +621,9 @@ public actor BigSyncBackgroundActor {
     @discardableResult
     public func synchronizeCloudKit()
         async -> CloudKitSynchronizer.SynchronizationResult? {
+        // A caller already cancelled before entry cannot revoke eligible
+        // delayed/retry work merely by invoking the public entry point.
+        guard !Task.isCancelled else { return nil }
         // An explicit request supersedes the delayed startup request. Leaving
         // both alive performs a second full drain ten seconds after every
         // configuration, or queues it behind a long initial reupload.
@@ -787,13 +794,21 @@ public actor BigSyncBackgroundActor {
     private func synchronizeCloudKit(
         expectedSynchronizer: CloudKitSynchronizer
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
-        guard realmSynchronizer === expectedSynchronizer else {
-            return nil
+        let requestGeneration = synchronizationRequestGeneration
+        @BigSyncBackgroundActor
+        func stillOwnsRequest() -> Bool {
+            !Task.isCancelled && realmSynchronizer === expectedSynchronizer
+                && synchronizationRequestGeneration == requestGeneration
         }
+        guard stillOwnsRequest() else { return nil }
+#if DEBUG
+        _test_activeSynchronizationRequestCount += 1
+        defer { _test_activeSynchronizationRequestCount -= 1 }
+#endif
         await publicationRestorationTask?.value
         // A stale waiter must not clear a successor worker's restoration task
         // or perform its account preflight after this suspension.
-        guard !Task.isCancelled, realmSynchronizer === expectedSynchronizer else { return nil }
+        guard stillOwnsRequest() else { return nil }
         publicationRestorationTask = nil
         let containerIdentifier = expectedSynchronizer.containerIdentifier
 
@@ -807,9 +822,13 @@ public actor BigSyncBackgroundActor {
         }
 
         if performsAccountAvailabilityPreflight {
-            switch await accountAvailabilityGate.availability(
+            let availability = await accountAvailabilityGate.availability(
                 for: containerIdentifier
-            ) {
+            )
+            // Never clear another invocation's retry or change validation
+            // flags using a status result obtained before cancellation/replacement.
+            guard stillOwnsRequest() else { return nil }
+            switch availability {
             case .available:
                 accountAvailabilityRetryTask?.cancel()
                 accountAvailabilityRetryTask = nil
@@ -847,15 +866,14 @@ public actor BigSyncBackgroundActor {
             expectedSynchronizer.accountValidationRequired = false
         }
 
-        guard !Task.isCancelled,
-              realmSynchronizer === expectedSynchronizer else { return nil }
+        guard stillOwnsRequest() else { return nil }
         do {
             let result = try await expectedSynchronizer.synchronize()
-            guard !Task.isCancelled,
-                  realmSynchronizer === expectedSynchronizer else {
-                return nil
-            }
+            guard stillOwnsRequest() else { return nil }
             await synchronizationCompletionHandler?(result)
+            // The consumer is an arbitrary async collaborator, not a commit
+            // barrier protecting this worker or the lifetime of this request.
+            guard stillOwnsRequest() else { return nil }
             return result
         } catch is CancellationError {
             return nil
@@ -881,7 +899,8 @@ public actor BigSyncBackgroundActor {
             } catch {
                 return
             }
-            guard realmSynchronizer === expectedSynchronizer else { return }
+            guard !Task.isCancelled,
+                  realmSynchronizer === expectedSynchronizer else { return }
             accountAvailabilityRetryTask = nil
             _ = await synchronizeCloudKit(
                 expectedSynchronizer: expectedSynchronizer
@@ -891,6 +910,9 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     public func cancelSynchronization() async {
+        // Revoke requests still in startup/status preflight as well as drains.
+        // A later explicit request captures the new generation and is allowed.
+        synchronizationRequestGeneration = UUID()
         initialSynchronizationTask?.cancel()
         initialSynchronizationTask = nil
         accountAvailabilityRetryTask?.cancel()
@@ -1015,6 +1037,9 @@ public actor BigSyncBackgroundActor {
 
 #if DEBUG
     @BigSyncBackgroundActor
+    private(set) var _test_activeSynchronizationRequestCount = 0
+
+    @BigSyncBackgroundActor
     var _test_hasScheduledInitialSynchronization: Bool {
         initialSynchronizationTask != nil
     }
@@ -1039,6 +1064,22 @@ public actor BigSyncBackgroundActor {
             performsAccountAvailabilityPreflight
         self.synchronizationCompletionHandler =
             synchronizationCompletionHandler
+    }
+
+    @BigSyncBackgroundActor
+    func _test_installPublicationRestorationTask(_ task: Task<Void, Never>) {
+        publicationRestorationTask = task
+    }
+
+    @BigSyncBackgroundActor
+    func _test_installAccountAvailabilityRetryTask(_ task: Task<Void, Never>) {
+        accountAvailabilityRetryTask?.cancel()
+        accountAvailabilityRetryTask = task
+    }
+
+    @BigSyncBackgroundActor
+    var _test_accountAvailabilityRetryTask: Task<Void, Never>? {
+        accountAvailabilityRetryTask
     }
 
     @BigSyncBackgroundActor

@@ -403,12 +403,14 @@ extension CloudKitSynchronizer {
             // future drain must be explicitly armed after its own barrier.
             self.postBarrierDrainAuthorization = nil
         }
-        reportProgress("terminal-receipt")
         finishSynchronizationDrain(with: .success(result))
         // See the blocked path above: close the logical drain before allowing
         // a new synchronization to become the owner of its task/state.
         syncing = false
         synchronizationTask = nil
+        // Observation runs only after the old drain releases its shared
+        // state. A synchronous diagnostic may cancel or start another run.
+        reportProgress("terminal-receipt")
         postNotification(.SynchronizerDidSynchronize)
         delegate?.synchronizerDidSync(self)
     }

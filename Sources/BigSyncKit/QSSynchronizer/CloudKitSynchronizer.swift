@@ -552,6 +552,9 @@ public class CloudKitSynchronizer: NSObject {
         -> CKAccountStatus
     /// Optional, actor-isolated lifecycle observation for diagnostics. Production
     /// callers receive a no-op unless they explicitly provide a handler.
+    /// `terminal-receipt` is a post-completion diagnostic, not a veto or
+    /// capability: the old drain has released its shared state before delivery.
+    /// Use the explicit DEBUG process-kill checkpoint for pre-delivery tests.
     public typealias ProgressHandler = @BigSyncBackgroundActor @Sendable (String) -> Void
     public typealias SynchronizationWillConsumeServerChangesHandler =
         @BigSyncBackgroundActor @Sendable (
