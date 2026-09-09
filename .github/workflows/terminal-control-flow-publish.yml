@@ -1,0 +1,55 @@
+name: Terminal control flow exact source publication
+on:
+  push:
+    branches: [codex/terminal-control-flow-stage-20260909]
+    paths: [.github/workflows/terminal-control-flow-publish.yml]
+permissions:
+  contents: write
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6907a0622671e69b507217420d21f1382bef43e2
+          fetch-depth: 0
+      - name: Exact source and ownership checks
+        env:
+          STAGE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/control-flow-evidence
+          test "$(git rev-parse HEAD^{tree})" = a101cb7eee47778101ec1ea793b469fa3708c9cb
+          git show "$STAGE_SHA:.review/terminal-control-flow.patch.gz.b64" > /tmp/transport.b64
+          python3 - <<'PY'
+          import base64,gzip,hashlib,pathlib
+          text=pathlib.Path('/tmp/transport.b64').read_text()
+          # Correct the single known transcription insertion in transport only.
+          text=text.replace('XsXRYUU88','XsXRYU88',1)
+          data=gzip.decompress(base64.b64decode(text))
+          assert len(data)==43240
+          assert hashlib.sha256(data).hexdigest()=='c7266222fd55fe981c1d3c9bcc236634ba6ba59d7eeaaefef611b3be1e794e39'
+          pathlib.Path('/tmp/control-flow-evidence/source.patch').write_bytes(data)
+          PY
+          git apply --index /tmp/control-flow-evidence/source.patch
+          git diff --cached --check
+          test "$(git write-tree)" = 67f5e8b365a8f1f1591b282f2a587852b7c57a78
+          git diff --cached --name-only > /tmp/control-flow-evidence/changed-paths.txt
+          while IFS= read -r path; do swiftc -frontend -parse "$path"; done < /tmp/control-flow-evidence/changed-paths.txt
+          swiftc --version > /tmp/control-flow-evidence/swift-version.txt
+          git config user.name 'OpenAI assistant'
+          git config user.email 'noreply@openai.com'
+          git commit -m 'Fence terminal issuance, cold-start restoration and owned cancellation' -m 'Revalidate after final suspensions, preserve legitimate unvalidated cold starts, and close only the owning cancelled drain. Adds 17 native behavior cases; syntax checked, native qualification pending.'
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-revocation-boundaries-20260909 | cut -f1)" = 6907a0622671e69b507217420d21f1382bef43e2
+          git push origin HEAD:refs/heads/codex/ordered-v2-revocation-boundaries-20260909
+          git rev-parse HEAD > /tmp/control-flow-evidence/head.txt
+          git rev-parse HEAD^{tree} > /tmp/control-flow-evidence/tree.txt
+          git archive HEAD | gzip -n > /tmp/control-flow-evidence/source.tar.gz
+          sha256sum /tmp/control-flow-evidence/* > /tmp/control-flow-evidence/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terminal-control-flow-source-evidence
+          path: /tmp/control-flow-evidence
+          retention-days: 14
