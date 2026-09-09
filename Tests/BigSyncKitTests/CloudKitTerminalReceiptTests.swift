@@ -1018,10 +1018,14 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         let worker = BigSyncBackgroundActor()
         await worker._test_installSynchronizer(fixture.synchronizer, performsAccountAvailabilityPreflight: false)
         let entered = ReceiptPause(), release = ReceiptPause()
-        var starts = 0
+        // One synchronization may perform several change-feed requests. Count
+        // distinct attempts, not requests, and pause only the first request.
+        var attempts = Set<UUID>()
         fixture.transport.databaseChangesHook = {
-            starts += 1
-            if starts == 1 { await entered.release(); await release.wait() }
+            if attempts.insert(fixture.synchronizer.synchronizationAttemptID).inserted {
+                await entered.release()
+                await release.wait()
+            }
         }
         let a = Task { @BigSyncBackgroundActor in await worker.synchronizeCloudKit() }
         await entered.wait()
@@ -1038,7 +1042,7 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
             XCTAssertEqual(ar?.publicationState, .complete)
             XCTAssertEqual(br?.publicationState, .complete)
             XCTAssertEqual(ar?.receipt?.runID, br?.receipt?.runID)
-            XCTAssertEqual(starts, 1)
+            XCTAssertEqual(attempts.count, 1)
         }
         XCTAssertEqual(fixture.synchronizer._testSynchronizationWaiterCount, 0)
     }
@@ -1059,12 +1063,17 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         let fixture = Fixture(progressHandler: { observer.record($0) })
         observer.synchronizer = fixture.synchronizer
         let successorEntered = ReceiptPause(), release = ReceiptPause()
-        var starts = 0
+        var attempts = Set<UUID>()
         fixture.transport.databaseChangesHook = {
-            starts += 1
-            if starts == 2 { await successorEntered.release(); await release.wait() }
+            let isNewAttempt = attempts.insert(fixture.synchronizer.synchronizationAttemptID).inserted
+            if isNewAttempt && attempts.count == 2 {
+                await successorEntered.release()
+                await release.wait()
+            }
         }
         let first = try await fixture.synchronizer.synchronize()
+        // A bounded wait makes a lost successor request fail rather than hang.
+        try await waitFor { attempts.count == 2 }
         await successorEntered.wait()
         XCTAssertEqual(observer.terminalCount, 1)
         XCTAssertNotEqual(fixture.synchronizer.synchronizationAttemptID, observer.firstAttempt)
@@ -1078,7 +1087,7 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         XCTAssertEqual(br.publicationState, .complete)
         XCTAssertEqual(cr.receipt?.runID, br.receipt?.runID)
         XCTAssertNotEqual(first.receipt?.runID, br.receipt?.runID)
-        XCTAssertEqual(starts, 2)
+        XCTAssertEqual(attempts.count, 2)
         XCTAssertEqual(observer.terminalCount, 2)
         XCTAssertFalse(fixture.synchronizer.syncing)
         XCTAssertNil(fixture.synchronizer.synchronizationTask)
