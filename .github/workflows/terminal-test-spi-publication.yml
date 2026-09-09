@@ -1,0 +1,51 @@
+name: Terminal test SPI source publication
+on:
+  push:
+    branches: [audit/terminal-test-spi-20260909]
+    paths: [.github/workflows/terminal-test-spi-publication.yml]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c81161cf92fa73632f90b75c79cf45027986400e
+          fetch-depth: 1
+      - shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          test "$(git rev-parse HEAD^{tree})" = 67f5e8b365a8f1f1591b282f2a587852b7c57a78
+          test "$(git rev-parse HEAD:Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift)" = 946c98b0947d3bb3c5ef27f4fef1048e60fb0f1d
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift')
+          old=p.read_bytes()
+          source=b'@testable import BigSyncKit\n'
+          replacement=b'@_spi(CloudKitE2E) @testable import BigSyncKit\n'
+          assert old.count(source)==1
+          new=old.replace(source,replacement,1)
+          assert new.replace(replacement,source,1)==old
+          p.write_bytes(new)
+          PY
+          git add Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          test "$(git diff --cached --name-only)" = Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          git diff --cached --check
+          git diff --cached --binary --full-index > "$RUNNER_TEMP/evidence/source.patch"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Import existing CloudKitE2E SPI in terminal receipt behavior tests'
+          git push origin HEAD:refs/heads/fix/terminal-test-spi-20260909
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/identity.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/evidence/tree.txt"
+          cp Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift "$RUNNER_TEMP/evidence/CloudKitTerminalReceiptTests.swift"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terminal-test-spi-publication
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
