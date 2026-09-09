@@ -9,11 +9,17 @@ import Foundation
 import CloudKit
 import RealmSwift
 
-/// The merge policy to resolve change conflicts. Default value is `server`
+/// Ordinary target-field conflict policy. The Realm adapter first applies
+/// model semantic dispositions and pending-local-generation fences. This
+/// setting does not authorize discarding newer pending work. Implementations
+/// choose their default; RealmSwiftAdapter defaults to `custom`.
 @objc public enum MergePolicy: Int, Sendable {
-    /// Downloaded changes have preference.
+    /// Downloaded changes have preference after admission and preservation.
     case server
-    /// Delegate can resolve changes manually.
+    /// A delegate may construct the merged value. Without a delegate, the
+    /// default compares record timestamps only when a target already exists.
+    /// Constructor defaults never defeat an admitted unseen record. Retransmitting
+    /// an unchanged local winner preserves its timestamps, not another user edit.
     case custom
 }
 
@@ -31,34 +37,18 @@ public protocol ModelAdapterDelegate: AnyObject {
 /// Optional hooks for the one-time change-feed tracking migration. The
 /// synchronizer owns account fencing and phase ordering; adapters own durable
 /// tracking/provenance storage.
-public enum ChangeFeedResetMode: String, Sendable {
-    /// The one bounded import of objects that predate BigSyncKit's durable
-    /// mutation journal. This is the only mode allowed to discover an
-    /// untracked, unjournaled target object as new upload work.
-    case initialImport
-    /// Reconcile a full server bootstrap conservatively. A previously
-    /// server-backed record that is now absent must not be resurrected.
-    case serverReconciliation
-    /// A device/app backup contains a historical snapshot of the local outbox.
-    /// Keep target Realm user objects, but do not replay copied mutation
-    /// generations or rediscover untracked objects as current local intent.
-    case backupRestore
-    /// CloudKit explicitly reset the account's encrypted data. The direct
-    /// database API documents that locally retained live data may be
-    /// re-uploaded, so rebuild durable upload generations without changing the
-    /// target objects themselves.
-    case encryptedDataReset
-    /// The authenticated account changed while the application retained one
-    /// admitted local dataset. Rebuild the destination replica from local
-    /// rows without copying an old CloudKit zone.
-    case localDatasetRebootstrap
-
-    var reuploadsRetainedLocalData: Bool {
-        self == .encryptedDataReset || self == .localDatasetRebootstrap
-    }
-}
 
 public protocol ChangeFeedResetMigrating: AnyObject {
+    /// Before server import, port only pending generations explicitly named by
+    /// the durable account handoff. At terminal, verify that none remain.
+    /// Target values and immutable per-object account scopes must not change.
+    func reconcileReplicaJournalHandoff(
+        _ handoff: BigSyncReplicaJournalHandoff,
+        accountScopeIdentifier: String,
+        epoch: Int,
+        verifyOnly: Bool
+    ) async throws
+
     /// Evidence captured before reset that this zone has previously held a
     /// valid server record.  It protects an established zone from accidental
     /// recreation after a deletion lifecycle event.
@@ -82,6 +72,16 @@ public protocol ChangeFeedResetMigrating: AnyObject {
 }
 
 public extension ChangeFeedResetMigrating {
+    func reconcileReplicaJournalHandoff(
+        _ handoff: BigSyncReplicaJournalHandoff,
+        accountScopeIdentifier: String,
+        epoch: Int,
+        verifyOnly: Bool
+    ) async throws {
+        // A legacy adapter cannot silently declare this recovery completed.
+        throw BigSyncReplicaJournalHandoffError.unsupportedAdapter
+    }
+
     func hasChangeFeedEstablishedServerEvidence() async throws -> Bool { false }
 
     func prepareChangeFeedReset(
@@ -303,6 +303,12 @@ public protocol ModelAdapter: AnyObject, Sendable {
     func semanticPublicationBlockers() async throws
         -> [CloudKitSynchronizer.DomainBlocker]
 
+    /// Conservative prediction before any target apply or quarantine. Domains
+    /// with atomic target invalidators may retain publication for irrelevant
+    /// models; unknown adapters keep the eager behavior for nonempty pages.
+    @BigSyncBackgroundActor
+    func mayAffectDomainPublication(records: [CKRecord], deletions: [CKRecord.ID]) -> Bool
+
     /// Binds adapter discovery, preparation, inbound validation, and
     /// acknowledgement to the CloudKit account already validated for this
     /// synchronization run. Implementations that do not own account-scoped
@@ -408,8 +414,10 @@ public protocol ModelAdapter: AnyObject, Sendable {
     /// Record zone ID managed by this adapter
     var recordZoneID: CKRecordZone.ID { get }
     
-    /// Latest record-zone cursor stored by this adapter, or `nil` if one does not exist.
-    var serverChangeToken: RecordZoneChangeCursor? { get async }
+    /// Latest stored record-zone checkpoint, or nil before first fetch/after explicit reset.
+    /// Unavailable storage and corrupt/ambiguous persisted checkpoints must throw,
+    /// not silently request a full fetch. Callers must use `try await`.
+    var serverChangeToken: RecordZoneChangeCursor? { get async throws }
     
     /// Save given token for future use by this adapter.
     /// - Parameter token: opaque record-zone history cursor.
@@ -445,7 +453,7 @@ public protocol ModelAdapter: AnyObject, Sendable {
     @BigSyncBackgroundActor
     func changeFeedEpoch() throws -> Int?
     
-    /// Merge policy in case of conflicts. Default is `server`.
+    /// Ordinary field merge policy; RealmSwiftAdapter defaults to `custom`.
     var mergePolicy: MergePolicy { get set }
     
     func cancelSynchronization()
@@ -475,7 +483,19 @@ public protocol ModelAdapter: AnyObject, Sendable {
 }
 
 public extension ModelAdapter {
+    @BigSyncBackgroundActor
+    func mayAffectDomainPublication(records: [CKRecord], deletions: [CKRecord.ID]) -> Bool {
+        !records.isEmpty || !deletions.isEmpty
+    }
+
     func commitInboundPage(_ page: InboundPageCommit) async throws {
+        try Task.checkCancellation()
+        guard !page.nextCursor.serializedData.isEmpty else {
+            throw CloudKitChangeFeedError.invalidPageCursor
+        }
+        if let previous = page.previousCursor, previous.serializedData.isEmpty {
+            throw CloudKitChangeFeedError.corruptCursor
+        }
         try await saveToken(page.nextCursor)
     }
 

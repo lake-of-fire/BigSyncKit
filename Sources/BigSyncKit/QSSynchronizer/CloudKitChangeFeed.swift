@@ -19,11 +19,13 @@ public protocol CloudKitChangeFeed: Sendable {
     ) async throws -> CloudKitRecordZoneChangePage
 }
 
-/// A persisted CloudKit cursor is opaque transport state. If its secure archive
-/// can no longer be decoded, the synchronizer must enter its fenced server-first
-/// rebuild instead of silently treating the cursor as a normal nil token.
+/// Stored history corruption requires fenced recovery. A malformed new page is
+/// a separate feed failure and does not justify resetting intact stored history.
 public enum CloudKitChangeFeedError: Error, Sendable, Equatable {
     case corruptCursor
+    /// A proposed next checkpoint is empty. The page cannot be committed,
+    /// but this does not mean a previously persisted checkpoint is corrupt.
+    case invalidPageCursor
 }
 
 /// Database and zone history tokens intentionally have distinct types. Their
@@ -33,24 +35,45 @@ public struct DatabaseChangeCursor: Sendable, Hashable {
     fileprivate let data: Data
     public init(serializedData: Data) { data = serializedData }
     public var serializedData: Data { data }
+
+    /// Only an absent stored value means first fetch. Nonempty bytes remain
+    /// opaque here; the default CloudKit transport validates their secure archive.
+    init?(persistedValue: Any?) throws {
+        guard let persistedValue else { return nil }
+        guard let data = persistedValue as? Data, !data.isEmpty else {
+            throw CloudKitChangeFeedError.corruptCursor
+        }
+        self.data = data
+    }
 }
 public struct RecordZoneChangeCursor: Sendable, Hashable {
     fileprivate let data: Data
     public init(serializedData: Data) { data = serializedData }
     public var serializedData: Data { data }
+
+    /// A legacy token row with nil data is an intentional cleared checkpoint.
+    /// More than one row is ambiguous even when the bytes happen to agree.
+    /// Inspect at most two rows; never choose a history by collection order.
+    init?<Values: Sequence>(persistedValues: Values) throws where Values.Element == Data? {
+        var iterator = persistedValues.makeIterator()
+        guard let value = iterator.next() else { return nil }
+        guard iterator.next() == nil else { throw CloudKitChangeFeedError.corruptCursor }
+        guard let value else { return nil }
+        guard !value.isEmpty else { throw CloudKitChangeFeedError.corruptCursor }
+        data = value
+    }
 }
 
-private func archive(_ token: CKServerChangeToken?) throws -> Data? {
-    guard let token else { return nil }
+private func archive(_ token: CKServerChangeToken) throws -> Data {
     return try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
 }
-private func unarchive(_ data: Data?) throws -> CKServerChangeToken? {
-    guard let data else { return nil }
+private func unarchive(_ data: Data) throws -> CKServerChangeToken {
+    guard !data.isEmpty else { throw CloudKitChangeFeedError.corruptCursor }
     // Scripted feeds deliberately use opaque cursor bytes. Only the default
     // CloudKit transport decodes CloudKit's secure token representation. A
-    // nonempty cursor which cannot be decoded must *not* become nil: doing so
-    // would turn corrupt progress into a normal full fetch, which cannot
-    // faithfully replay deletions that happened before the corrupt cursor.
+    // present cursor which cannot be decoded must *not* become nil. Absence
+    // means a first/full fetch; corruption requires the synchronizer's explicit
+    // recovery boundary before it can discard progress and rebuild tracking.
     let token: CKServerChangeToken?
     do {
         token = try NSKeyedUnarchiver.unarchivedObject(
@@ -66,12 +89,12 @@ private func unarchive(_ data: Data?) throws -> CKServerChangeToken? {
     return token
 }
 extension DatabaseChangeCursor {
-    init(token: CKServerChangeToken?) throws { self.data = try archive(token) ?? Data() }
-    func token() throws -> CKServerChangeToken? { try unarchive(data.isEmpty ? nil : data) }
+    init(token: CKServerChangeToken) throws { self.data = try archive(token) }
+    func token() throws -> CKServerChangeToken { try unarchive(data) }
 }
 extension RecordZoneChangeCursor {
-    init(token: CKServerChangeToken?) throws { self.data = try archive(token) ?? Data() }
-    func token() throws -> CKServerChangeToken? { try unarchive(data.isEmpty ? nil : data) }
+    init(token: CKServerChangeToken) throws { self.data = try archive(token) }
+    func token() throws -> CKServerChangeToken { try unarchive(data) }
 }
 
 public enum CloudKitZoneDeletionKind: String, Sendable, Equatable, Codable {

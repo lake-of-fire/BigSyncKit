@@ -58,120 +58,9 @@ internal func awaitCancellableCloudKitCallback<Value>(
     return value
 }
 
-/// Durable, account-scoped progress for the one-time transition to the
-/// page-oriented CloudKit change feed.  This deliberately lives beside the
-/// synchronizer's other local metadata rather than in a target Realm: a
-/// migration can be resumed after a process death before an adapter has opened
-/// its tracking Realm.
-private struct ChangeFeedMigrationState {
-    static let version = 3
-    // Epochs are durable adapter identities, not merely counters inside one KVS
-    // key. Reserve a disjoint range for each future migration version so a v2
-    // reset can never be mistaken for an already-completed v1 reset.
-    static let epochRangeSize = 1_000_000_000
-    static var initialEpoch: Int {
-        (version * epochRangeSize) + 1
-    }
-
-    enum Phase: String {
-        case requested
-        case prepared
-        case serverBootstrap
-        case reconciled
-        case finishing
-        case completed
-    }
-
-    let key: String
-    let accountScopeIdentifier: String
-    let zoneName: String
-    let zoneOwnerName: String
-    let epoch: Int
-    var mode: ChangeFeedResetMode
-    var phase: Phase
-    let backupRestoreEventIdentifier: String?
-
-    init(
-        key: String,
-        accountScopeIdentifier: String,
-        zoneID: CKRecordZone.ID,
-        epoch: Int,
-        mode: ChangeFeedResetMode,
-        phase: Phase,
-        backupRestoreEventIdentifier: String? = nil
-    ) {
-        self.key = key
-        self.accountScopeIdentifier = accountScopeIdentifier
-        zoneName = zoneID.zoneName
-        zoneOwnerName = zoneID.ownerName
-        self.epoch = epoch
-        self.mode = mode
-        self.phase = phase
-        self.backupRestoreEventIdentifier = backupRestoreEventIdentifier
-    }
-
-    init?(
-        key: String,
-        propertyList: [String: Any],
-        accountScopeIdentifier: String,
-        zoneID: CKRecordZone.ID
-    ) {
-        guard (propertyList["version"] as? NSNumber)?.intValue == Self.version,
-              propertyList["accountScopeIdentifier"] as? String
-                == accountScopeIdentifier,
-              propertyList["zoneName"] as? String == zoneID.zoneName,
-              propertyList["zoneOwnerName"] as? String == zoneID.ownerName,
-              let epoch = (propertyList["epoch"] as? NSNumber)?.intValue,
-              epoch >= Self.initialEpoch,
-              let rawMode = propertyList["mode"] as? String,
-              let mode = ChangeFeedResetMode(rawValue: rawMode),
-              let rawPhase = propertyList["phase"] as? String,
-              let phase = Phase(rawValue: rawPhase) else {
-            return nil
-        }
-        let backupRestoreEventIdentifier = propertyList[
-            "backupRestoreEventIdentifier"
-        ] as? String
-        guard mode != .backupRestore
-            || backupRestoreEventIdentifier.flatMap(UUID.init(uuidString:)) != nil else {
-            return nil
-        }
-        self.init(
-            key: key,
-            accountScopeIdentifier: accountScopeIdentifier,
-            zoneID: zoneID,
-            epoch: epoch,
-            mode: mode,
-            phase: phase,
-            backupRestoreEventIdentifier: backupRestoreEventIdentifier
-        )
-    }
-
-    var propertyList: [String: Any] {
-        var value: [String: Any] = [
-            "version": Self.version,
-            "accountScopeIdentifier": accountScopeIdentifier,
-            "zoneName": zoneName,
-            "zoneOwnerName": zoneOwnerName,
-            "epoch": epoch,
-            "mode": mode.rawValue,
-            "phase": phase.rawValue,
-        ]
-        if let backupRestoreEventIdentifier {
-            value["backupRestoreEventIdentifier"] =
-                backupRestoreEventIdentifier
-        }
-        return value
-    }
-}
-
-internal enum ChangeFeedMigrationPersistenceError: Error, Equatable {
-    case stateNotDurable
-}
-
-/// A production migration must never recreate a zone that CloudKit reports as
-/// deleted, purged, or reset.  The target Realm and durable journal remain
-/// intact so a future, explicitly supported recovery can classify the state.
+/// Ordinary deletion and purge fence an established zone. Only the explicit
+/// encrypted-data-reset recovery may recreate it and re-upload retained data;
+/// its durable recovery obligation must precede destructive metadata changes.
 public enum ChangeFeedMigrationError: LocalizedError {
     case establishedZoneUnavailable(
         CKRecordZone.ID,
@@ -672,6 +561,8 @@ public class CloudKitSynchronizer: NSObject {
         @BigSyncBackgroundActor @Sendable (
             PrepublicationBoundaryContext
         ) async throws -> [DomainBlocker]
+    public typealias PublicationFetchDeferralHandler =
+        @BigSyncBackgroundActor @Sendable (BigSyncDurablePublicationEvidence) async throws -> Bool
     public typealias DomainPublicationScopeIdentifierProvider =
         @BigSyncBackgroundActor @Sendable () async throws -> String?
 
@@ -698,6 +589,12 @@ public class CloudKitSynchronizer: NSObject {
             replicaBindingGenerationIdentifier =
                 context.replicaBindingGenerationIdentifier
             runID = context.runID
+        }
+
+        internal init(receipt: SynchronizationReceipt) {
+            accountScopeIdentifier = receipt.accountScopeIdentifier
+            replicaBindingGenerationIdentifier = receipt.replicaBindingGenerationIdentifier
+            runID = receipt.runID
         }
     }
 
@@ -731,15 +628,23 @@ public class CloudKitSynchronizer: NSObject {
         /// Latest record-zone cursor durably consumed by the terminal drain.
         /// It is distinct from any domain activation/floor boundary.
         public let consumedServerBoundaryIdentifier: String?
+        /// Exact domain scope used for this terminal candidate and its
+        /// durable evidence. Nil remains valid for a non-domain synchronizer.
+        public let domainPublicationScopeIdentifier: String?
         internal let accountIdentifier: String
         internal let issuerID: UUID
         internal let authorizationID: UUID
+        /// Present only for a drain explicitly armed while no synchronization
+        /// was in flight after an operator-established writer barrier.
+        internal let postBarrierDrainAuthorizationID: UUID?
 
         internal init(
             context: RunContext,
             issuerID: UUID,
             authorizationID: UUID,
-            consumedServerBoundaryIdentifier: String? = nil
+            consumedServerBoundaryIdentifier: String? = nil,
+            domainPublicationScopeIdentifier: String? = nil,
+            postBarrierDrainAuthorizationID: UUID? = nil
         ) {
             accountScopeIdentifier = context.accountScopeIdentifier
             replicaBindingGenerationIdentifier =
@@ -747,10 +652,43 @@ public class CloudKitSynchronizer: NSObject {
             runID = context.runID
             self.consumedServerBoundaryIdentifier =
                 consumedServerBoundaryIdentifier
+            self.domainPublicationScopeIdentifier = domainPublicationScopeIdentifier
             accountIdentifier = context.accountIdentifier
             self.issuerID = issuerID
             self.authorizationID = authorizationID
+            self.postBarrierDrainAuthorizationID =
+                postBarrierDrainAuthorizationID
         }
+    }
+
+    /// Opaque authorization established after an external writer/upload
+    /// barrier and before a new synchronization starts. It can authorize one
+    /// later terminal drain only; it is neither a server cursor nor a general
+    /// certificate.
+    public struct PostBarrierDrainAuthorization: Sendable, Equatable {
+        public let writerBarrierEvidenceID: String
+        internal let issuerID: UUID
+        internal let authorizationID: UUID
+        internal let accountScopeIdentifier: String
+        internal let replicaBindingGenerationIdentifier: String
+        internal let accountInvalidationGeneration: Int64
+    }
+
+    /// A successful, terminal receipt bound to a post-barrier authorization.
+    /// The capability is valid only until this synchronizer starts a newer run,
+    /// its account/binding changes, or its receipt authorization is replaced.
+    public struct CompletedPostBarrierDrain: Sendable, Equatable {
+        public let writerBarrierEvidenceID: String
+        public let accountScopeIdentifier: String
+        public let replicaBindingGenerationIdentifier: String?
+        public let runID: UUID
+        public let recordZoneName: String
+        public let consumedServerBoundaryIdentifier: String
+        public let snapshotScopeIdentifier: String
+        internal let accountIdentifier: String
+        internal let issuerID: UUID
+        internal let receiptAuthorizationID: UUID
+        internal let postBarrierDrainAuthorizationID: UUID
     }
 
     public struct SynchronizationResult: Sendable, Equatable {
@@ -762,19 +700,30 @@ public class CloudKitSynchronizer: NSObject {
         public let didImportChanges: Bool
         public let receipt: SynchronizationReceipt?
         public let publicationState: PublicationState
+        /// The attempted boundary exists even when semantic blockers prohibit
+        /// a success receipt. Domain callbacks must not apply a delayed block
+        /// to whichever unrelated run happens to be current on delivery.
+        public let boundary: SynchronizationBoundaryContext?
 
         public init(
             didImportChanges: Bool,
             receipt: SynchronizationReceipt? = nil,
-            publicationState: PublicationState = .complete
+            publicationState: PublicationState = .complete,
+            boundary: SynchronizationBoundaryContext? = nil
         ) {
             precondition(
                 publicationState == .complete || receipt == nil,
                 "A semantically blocked synchronization cannot publish a terminal receipt"
             )
             self.didImportChanges = didImportChanges
+            let receiptBoundary = receipt.map { SynchronizationBoundaryContext(receipt: $0) }
+            precondition(
+                boundary == nil || receiptBoundary == nil || boundary == receiptBoundary,
+                "A result and its receipt must name the same synchronization boundary"
+            )
             self.receipt = receipt
             self.publicationState = publicationState
+            self.boundary = receiptBoundary ?? boundary
         }
     }
 
@@ -860,6 +809,13 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationWillConsumeServerChangesHandler:
         SynchronizationWillConsumeServerChangesHandler?
     internal var domainPrepublicationHandler: DomainPrepublicationHandler?
+    /// One terminal snapshot capture for an explicitly armed cutover drain.
+    /// Ordinary source publication and aggregate publication keep their existing semantics.
+    internal var publicationFetchDeferralHandler: PublicationFetchDeferralHandler?
+    internal var publicationConsumptionHandler: SynchronizationWillConsumeServerChangesHandler?
+    internal var publicationConsumptionPending = false
+    internal var publicationFetchDeferralEligible = false
+    internal var postBarrierSnapshotIdentifierProvider: DomainPublicationScopeIdentifierProvider?
     internal var domainPublicationScopeIdentifierProvider:
         DomainPublicationScopeIdentifierProvider?
     private let backupDetectionBaseURL: URL?
@@ -1080,6 +1036,8 @@ public class CloudKitSynchronizer: NSObject {
     internal var activeRunContext: RunContext?
     internal var activeReceiptAuthorizationID: UUID?
     private var reservedReceiptAuthorizationID: UUID?
+    internal var postBarrierDrainAuthorization: PostBarrierDrainAuthorization?
+    internal var completedPostBarrierDrain: CompletedPostBarrierDrain?
     /// Non-nil only for the attempt currently performing the durable
     /// change-feed migration.  Adapter state remains the source of truth for
     /// per-zone provenance; this value merely fences the orchestration.
@@ -1548,37 +1506,42 @@ public class CloudKitSynchronizer: NSObject {
         }
 
         try await revalidateRunContext(context)
-        // Do not reset adapter tracking here. The durable migration activates
-        // provenance before clearing tracking, so a restored local object that
-        // has since been deleted remotely cannot be rediscovered as new work.
+        if let completed = try requireStoredChangeFeedMigrationState(for: context),
+           completed.phase == .completed,
+           completed.backupRestoreEventIdentifier == restoreEventIdentifier {
+            try completeRestoredBackupRecoveryIfNeeded(
+                expectedEventIdentifier: restoreEventIdentifier
+            )
+            return
+        }
+        try requestChangeFeedRecovery(
+            context: context,
+            mode: .backupRestore,
+            backupRestoreEventIdentifier: restoreEventIdentifier
+        )
+        guard let recovery = try requireStoredChangeFeedMigrationState(for: context),
+              recovery.phase != .completed,
+              recovery.backupRestoreEventIdentifier == restoreEventIdentifier,
+              recovery.mode == .backupRestore || recovery.mode == .encryptedDataReset else {
+            throw ChangeFeedMigrationPersistenceError.stateNotDurable
+        }
+        // The exact event and its recovery envelope are durable before clearing
+        // checkpoints. Adapter preparation owns copied-journal retirement.
         clearDeviceIdentifier()
         try resetDatabaseToken()
         resetActiveTokens()
         try clearAllStoredSubscriptionIDs()
         clearPersistedTransientRetryState()
         lastDatabaseChangesEmptyAt = nil
-        try requestChangeFeedRecovery(
-            context: context,
-            mode: .backupRestore,
-            backupRestoreEventIdentifier: restoreEventIdentifier
-        )
-        guard let recovery = storedChangeFeedMigrationState(for: context),
-              recovery.phase != .completed,
-              recovery.mode == .backupRestore else {
-            // The restore event remains on disk. Do not recreate upload state
-            // or acknowledge recovery unless its migration envelope can be
-            // read back from the client's durable store.
-            throw CocoaError(.fileWriteUnknown)
+        if recovery.mode == .backupRestore {
+            // A copied terminal marker is not fresh server evidence. A stronger
+            // encrypted reset observed by this restore, however, retains its
+            // fence until its journal-backed re-upload actually completes.
+            try clearConfiguredZoneTerminal(
+                recordZoneID,
+                accountScopeIdentifier: context.accountScopeIdentifier
+            )
         }
-        // The restore event and its migration envelope are now both durable.
-        // A terminal marker copied from the backup is sync metadata, not fresh
-        // server evidence, so it must not fence the reconciliation it requested.
-        // If the nil-token feed observes a current deletion, that event records
-        // a new terminal marker and aborts before migration completion.
-        try clearConfiguredZoneTerminal(
-            recordZoneID,
-            accountScopeIdentifier: context.accountScopeIdentifier
-        )
         try await revalidateRunContext(context)
     }
 
@@ -1619,10 +1582,10 @@ public class CloudKitSynchronizer: NSObject {
     ) throws {
         refreshBackupRestoreRequirement()
         guard backupRestoreDetected else { return }
-        guard let expectedEventIdentifier = expectedEventIdentifier
+        guard let expectedEventIdentifier = try expectedEventIdentifier
             ?? activeChangeFeedMigration?.backupRestoreEventIdentifier
             ?? activeRunContext.flatMap({ context in
-                storedChangeFeedMigrationState(for: context)?
+                try requireStoredChangeFeedMigrationState(for: context)?
                     .backupRestoreEventIdentifier
             }) else {
             throw CocoaError(.fileReadCorruptFile)
@@ -1665,8 +1628,15 @@ public class CloudKitSynchronizer: NSObject {
         let attemptID = UUID()
         synchronizationAttemptID = attemptID
         activeRunContext = nil
+        publicationConsumptionPending = false
+        publicationFetchDeferralEligible = false
         activeReceiptAuthorizationID = nil
         reservedReceiptAuthorizationID = nil
+        // A completed drain may never be replayed after another run begins.
+        // Keep an armed post-barrier authorization through a failed retry: the
+        // retry itself also begins after the barrier, but it cannot mint a
+        // capability until it reaches this terminal receipt path.
+        completedPostBarrierDrain = nil
 
         synchronizationTask?.cancel()
         // Synchronization is deferrable user-data work, but it must still make
@@ -1737,7 +1707,7 @@ public class CloudKitSynchronizer: NSObject {
                 let isRestoredBackupRecovery = backupRestoreDetected
                 if !isRestoredBackupRecovery,
                    let terminalState = configuredZoneTerminalState(recordZoneID),
-                   !hasPendingEncryptedDataResetRecovery(context: context) {
+                   try !hasPendingEncryptedDataResetRecovery(context: context) {
                     let terminalZoneID = CKRecordZone.ID(
                         zoneName: terminalState.zoneName,
                         ownerName: terminalState.ownerName
@@ -1783,15 +1753,33 @@ public class CloudKitSynchronizer: NSObject {
                     try checkRunContext(context)
                 }
                 reportProgress("adapters-ready")
-                // A new import attempt makes the previous terminal snapshot
-                // stale before its first page can become visible.
-                try clearDurablePublicationEvidence()
+                // Legacy integrations keep their eager invalidation contract.
+                if publicationFetchDeferralHandler == nil || publicationConsumptionHandler == nil {
+                    try clearDurablePublicationEvidence()
+                }
+                publicationConsumptionPending = publicationConsumptionHandler != nil
                 if let handler =
                     synchronizationWillConsumeServerChangesHandler {
                     try await handler(
                         SynchronizationBoundaryContext(context: context)
                     )
                     try await revalidateRunContext(context)
+                }
+                if publicationConsumptionHandler != nil {
+                    var canDefer = false
+                    if let handler = publicationFetchDeferralHandler,
+                       try requireStoredChangeFeedMigrationState(for: context)?.phase == .completed,
+                       let evidence = try publicationEvidenceForUnconsumedFetch(context: context) {
+                        var blockers = [DomainBlocker]()
+                        for adapter in modelAdapters {
+                            blockers.append(contentsOf: try await adapter.semanticPublicationBlockers())
+                            try await revalidateRunContext(context)
+                        }
+                        if blockers.isEmpty { canDefer = try await handler(evidence) }
+                        try await revalidateRunContext(context)
+                    }
+                    publicationFetchDeferralEligible = canDefer
+                    if !canDefer { try await beginPublicationConsumptionIfNeeded() }
                 }
                 try Task.checkCancellation()
                 await performSynchronization()
@@ -1800,6 +1788,21 @@ public class CloudKitSynchronizer: NSObject {
                 await failSynchronization(error: error)
             }
         }
+    }
+
+    /// Runs before relevant target pages, lifecycle loss, malformed results,
+    /// or semantic/non-network failure. Eligible irrelevant drains retain their
+    /// candidate, but only the terminal checks can mint a new receipt.
+    internal func beginPublicationConsumptionIfNeeded() async throws {
+        guard publicationConsumptionPending, let context = activeRunContext else { return }
+        try checkRunContext(context)
+        publicationConsumptionPending = false
+        publicationFetchDeferralEligible = false
+        if let handler = publicationConsumptionHandler {
+            try await handler(SynchronizationBoundaryContext(context: context))
+            try await revalidateRunContext(context)
+        }
+        try clearDurablePublicationEvidence()
     }
 
     /// Starts synchronization, coalesces with any in-flight request, and returns
@@ -1828,6 +1831,103 @@ public class CloudKitSynchronizer: NSObject {
                 self?.cancelSynchronizationRequest(requestID)
             }
         }
+    }
+
+    /// Arms the next successful terminal drain after an operator has
+    /// established writer/upload quiescence. It deliberately refuses an
+    /// already-running drain, so a receipt from work that began before the
+    /// barrier can never be relabelled as post-barrier evidence.
+    @BigSyncBackgroundActor
+    public func establishPostBarrierDrain(
+        writerBarrierEvidenceID: String
+    ) throws -> PostBarrierDrainAuthorization {
+        guard !writerBarrierEvidenceID.isEmpty,
+              writerBarrierEvidenceID.utf8.count <= 1_024,
+              !syncing,
+              !synchronizationDrainIsActive,
+              postBarrierSnapshotIdentifierProvider != nil,
+              completedPostBarrierDrain == nil,
+              postBarrierDrainAuthorization == nil else {
+            throw CancellationError()
+        }
+        guard let lease = try accountScopeLease(),
+              let binding = try BigSyncReplicaBindingStateStore.load(store: keyValueStore, key: replicaBindingStateKey),
+              binding.pendingPort == nil,
+              binding.activeAccountScopeIdentifier == lease.accountScopeIdentifier,
+              !binding.activeGenerationIdentifier.isEmpty else { throw CancellationError() }
+        let authorization = PostBarrierDrainAuthorization(
+            writerBarrierEvidenceID: writerBarrierEvidenceID,
+            issuerID: synchronizationReceiptIssuerID, authorizationID: UUID(),
+            accountScopeIdentifier: lease.accountScopeIdentifier,
+            replicaBindingGenerationIdentifier: binding.activeGenerationIdentifier,
+            accountInvalidationGeneration: lease.invalidationGeneration
+        )
+        postBarrierDrainAuthorization = authorization
+        return authorization
+    }
+
+    /// Materializes an opaque completed-drain capability from the exact
+    /// terminal receipt issued for an armed post-barrier run. This remains
+    /// valid after that run has released its waiters, but a newer run, account
+    /// replacement, binding replacement, cancellation, or receipt replacement
+    /// invalidates it before it can authorize a local reservation.
+    @BigSyncBackgroundActor
+    public func completedPostBarrierDrain(
+        using receipt: SynchronizationReceipt,
+        authorizedBy authorization: PostBarrierDrainAuthorization
+    ) async throws -> CompletedPostBarrierDrain {
+        guard receipt.issuerID == synchronizationReceiptIssuerID,
+              authorization.issuerID == synchronizationReceiptIssuerID,
+              receipt.postBarrierDrainAuthorizationID == authorization.authorizationID,
+              let completed = completedPostBarrierDrain,
+              completed.postBarrierDrainAuthorizationID == authorization.authorizationID,
+              completed.receiptAuthorizationID == receipt.authorizationID,
+              completed.runID == receipt.runID,
+              completed.accountScopeIdentifier == receipt.accountScopeIdentifier,
+              completed.replicaBindingGenerationIdentifier == receipt.replicaBindingGenerationIdentifier else {
+            throw CancellationError()
+        }
+        try await revalidateCompletedPostBarrierDrain(completed)
+        guard try !adaptersHavePendingChangesAtTerminalBoundary() else { throw CancellationError() }
+        return completed
+    }
+
+    /// Revalidates a completed post-barrier capability around an application
+    /// suspension. A failed recheck after Realm reservation prevents the head
+    /// CAS; the reservation remains for fenced recovery. Realm separately
+    /// compares the exact snapshot and journal identity inside its write.
+    @BigSyncBackgroundActor
+    public func revalidateCompletedPostBarrierDrain(
+        _ completed: CompletedPostBarrierDrain
+    ) async throws {
+        guard completed.issuerID == synchronizationReceiptIssuerID,
+              completedPostBarrierDrain == completed,
+              activeReceiptAuthorizationID == completed.receiptAuthorizationID,
+              let activeRunContext,
+              activeRunContext.runID == completed.runID,
+              activeRunContext.accountScopeIdentifier
+                == completed.accountScopeIdentifier,
+              activeRunContext.replicaBindingGenerationIdentifier
+                == completed.replicaBindingGenerationIdentifier,
+              !cancelSync else {
+            throw CancellationError()
+        }
+        try checkRunContext(activeRunContext)
+        try await ensureCurrentAccount(completed.accountIdentifier)
+        guard completedPostBarrierDrain == completed,
+              activeReceiptAuthorizationID == completed.receiptAuthorizationID,
+              let currentRunContext = self.activeRunContext,
+              currentRunContext.runID == completed.runID,
+              !cancelSync else {
+            throw CancellationError()
+        }
+        try checkRunContext(currentRunContext)
+        guard let adapter = modelAdapters.first,
+              try adapter.consumedServerBoundaryIdentifier(
+                accountScopeIdentifier: completed.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier: completed.replicaBindingGenerationIdentifier,
+                containerIdentifier: containerIdentifier, databaseScope: database.databaseScope
+              ) == completed.consumedServerBoundaryIdentifier else { throw CancellationError() }
     }
 
     private func cancelSynchronizationRequest(_ requestID: UUID) {
@@ -2112,6 +2212,12 @@ public class CloudKitSynchronizer: NSObject {
     internal func finishSynchronizationDrain(
         with result: Result<SynchronizationResult, Error>
     ) {
+        // Failed, cancelled, blocked, or scope-less terminal work must not
+        // leave an armed barrier authorization reusable. A later attempt needs
+        // a newly established barrier and a new full successful drain.
+        if completedPostBarrierDrain == nil {
+            postBarrierDrainAuthorization = nil
+        }
         synchronizationDrainIsActive = false
         synchronizationRequestedWhileRunning = false
         let waiters = synchronizationWaiters.values
@@ -2123,10 +2229,11 @@ public class CloudKitSynchronizer: NSObject {
 
     @BigSyncBackgroundActor
     private func validateSynchronizationAccount() async throws -> String {
-        let previousAccountIdentifier: String?
+        // Every replacement policy must distinguish absent account history
+        // from an unreadable or malformed stored marker before account I/O.
+        let previousAccountIdentifier = try durableAccountIdentifier()
         let preparedReplicaBinding: BigSyncReplicaBindingSnapshot?
         if accountReplacementPolicy.usesDatasetReplicaBinding {
-            previousAccountIdentifier = try durableAccountIdentifier()
             var binding = try prepareReplicaBindingState()
             // An existing installation can have an account marker but no
             // replica binding yet. Record that account as the dataset owner
@@ -2145,9 +2252,6 @@ public class CloudKitSynchronizer: NSObject {
             }
             preparedReplicaBinding = binding
         } else {
-            previousAccountIdentifier = keyValueStore.object(
-                forKey: cloudKitAccountIdentifierKey
-            ) as? String
             preparedReplicaBinding = nil
         }
         let validationAttemptID = synchronizationAttemptID
@@ -2238,6 +2342,17 @@ public class CloudKitSynchronizer: NSObject {
 
             if let pending = binding.pendingPort {
                 if currentScope == pending.sourceAccountScopeIdentifier {
+                    // Persist the exact retiring generation before cancelPort
+                    // erases it. Pending-row rebasing resumes from this envelope.
+                    try requestReplicaJournalHandoff(
+                        from: pending.bindingGenerationIdentifier,
+                        retiringAccountScopeIdentifier:
+                            pending.destinationAccountScopeIdentifier,
+                        to: binding.activeGenerationIdentifier,
+                        accountIdentifier: confirmedAccountIdentifier,
+                        accountScopeIdentifier: currentScope,
+                        validationAttemptID: validationAttemptID
+                    )
                     binding = try BigSyncReplicaBindingStateStore.cancelPort(
                         pending,
                         store: keyValueStore,
@@ -2246,6 +2361,15 @@ public class CloudKitSynchronizer: NSObject {
                     requiresLocalDatasetRebootstrap = true
                 } else if currentScope
                             == pending.destinationAccountScopeIdentifier {
+                    try requestReplicaJournalHandoff(
+                        from: binding.activeGenerationIdentifier,
+                        retiringAccountScopeIdentifier:
+                            pending.sourceAccountScopeIdentifier,
+                        to: pending.bindingGenerationIdentifier,
+                        accountIdentifier: confirmedAccountIdentifier,
+                        accountScopeIdentifier: currentScope,
+                        validationAttemptID: validationAttemptID
+                    )
                     try await admitReplicaBinding(
                         accountIdentifier: confirmedAccountIdentifier,
                         accountScopeIdentifier: currentScope,
@@ -2280,6 +2404,15 @@ public class CloudKitSynchronizer: NSObject {
                     store: keyValueStore,
                     key: replicaBindingStateKey
                 ) ?? binding
+                try requestReplicaJournalHandoff(
+                    from: binding.activeGenerationIdentifier,
+                    retiringAccountScopeIdentifier:
+                        pending.sourceAccountScopeIdentifier,
+                    to: pending.bindingGenerationIdentifier,
+                    accountIdentifier: confirmedAccountIdentifier,
+                    accountScopeIdentifier: currentScope,
+                    validationAttemptID: validationAttemptID
+                )
                 try await admitReplicaBinding(
                     accountIdentifier: confirmedAccountIdentifier,
                     accountScopeIdentifier: currentScope,
@@ -2360,10 +2493,7 @@ public class CloudKitSynchronizer: NSObject {
         // still sees the old account and idempotently requests the same reset;
         // it can never observe a new account paired with an old completed
         // migration and rediscover retained user data as fresh uploads.
-        try keyValueStore.bigSyncSetDurably(
-            value: confirmedAccountIdentifier,
-            forKey: cloudKitAccountIdentifierKey
-        )
+        try persistAccountIdentifier(confirmedAccountIdentifier)
         accountValidationRequired = false
         cancelSync = false
         cancelledDueToUnauthentication = false
@@ -2448,6 +2578,22 @@ public class CloudKitSynchronizer: NSObject {
         return value
     }
 
+    private func persistAccountIdentifier(_ identifier: String) throws {
+        guard !identifier.isEmpty else {
+            throw BigSyncCloudAccountPortError.corruptRequirement
+        }
+        // Routine validation of the same readable marker needs no durable
+        // rewrite. Re-read here rather than trusting the pre-await snapshot.
+        guard try durableAccountIdentifier() != identifier else { return }
+        try keyValueStore.bigSyncSetDurably(
+            value: identifier,
+            forKey: cloudKitAccountIdentifierKey
+        )
+        guard try durableAccountIdentifier() == identifier else {
+            throw DurableKeyValueStoreError.mutationNotDurable
+        }
+    }
+
     /// Returns the durable account-port gate, if one is active.
     @BigSyncBackgroundActor
     public func pendingCloudAccountPortRequirement() throws
@@ -2485,18 +2631,19 @@ public class CloudKitSynchronizer: NSObject {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
 
+        // Activation may commit before the durable store reports failure.
+        // Fence this worker before the first fallible publication, not only
+        // after success. Retry/reconstruction must reload the actual binding;
+        // an uncertain write must never resume the old configured worker.
+        accountValidationRequired = true
+        cancelSync = true
+        portActivationRequiresWorkerRestart = true
         _ = try BigSyncReplicaBindingStateStore.activatePort(
             expected,
             store: keyValueStore,
             key: replicaBindingStateKey
         )
-        try keyValueStore.bigSyncSetDurably(
-            value: confirmedAccountIdentifier,
-            forKey: cloudKitAccountIdentifierKey
-        )
-        accountValidationRequired = true
-        cancelSync = true
-        portActivationRequiresWorkerRestart = true
+        try persistAccountIdentifier(confirmedAccountIdentifier)
     }
 
     /// Stops an ordinary journal wakeup at the durable replica-binding gate.
@@ -2540,6 +2687,63 @@ public class CloudKitSynchronizer: NSObject {
                 "QSCloudKitSynchronizer >> Pending account-port state is unreadable: \(error)"
             )
             return true
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func requestReplicaJournalHandoff(
+        from retiringBinding: String,
+        retiringAccountScopeIdentifier: String,
+        to destinationBinding: String,
+        accountIdentifier: String,
+        accountScopeIdentifier: String,
+        validationAttemptID: UUID
+    ) throws {
+        guard let installation = BackupDetection.installationIdentifier(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: backupDetectionBaseURL
+        ) else { throw BigSyncReplicaBindingError.corrupt }
+        let context = RunContext(
+            attemptID: validationAttemptID,
+            runID: synchronizationRunID,
+            accountIdentifier: accountIdentifier,
+            accountScopeIdentifier: accountScopeIdentifier,
+            replicaBindingGenerationIdentifier: destinationBinding
+        )
+        var handoff = try BigSyncReplicaJournalHandoff(
+            installationIdentifier: installation,
+            retiringBindingGenerationIdentifiers: [retiringBinding],
+            destinationBindingGenerationIdentifier: destinationBinding
+        )
+        let retiringContext = RunContext(
+            attemptID: validationAttemptID,
+            runID: synchronizationRunID,
+            accountIdentifier: accountIdentifier,
+            accountScopeIdentifier: retiringAccountScopeIdentifier,
+            replicaBindingGenerationIdentifier: retiringBinding
+        )
+        if let previous = try requireStoredChangeFeedMigrationState(for: retiringContext),
+           previous.phase != .completed,
+           let inherited = previous.replicaJournalHandoff {
+            guard inherited.destinationBindingGenerationIdentifier == retiringBinding else {
+                throw BigSyncReplicaJournalHandoffError.unexpectedBinding
+            }
+            handoff = try handoff.retainingUnfinished(inherited)
+        }
+        try requestChangeFeedRecovery(
+            context: context,
+            mode: .localDatasetRebootstrap,
+            replicaJournalHandoff: handoff
+        )
+        guard let recorded = try requireStoredChangeFeedMigrationState(for: context),
+              recorded.phase != .completed,
+              let handoff = recorded.replicaJournalHandoff,
+              handoff.installationIdentifier == installation,
+              handoff.destinationBindingGenerationIdentifier == destinationBinding,
+              handoff.retiringBindingGenerationIdentifiers.contains(retiringBinding) else {
+            // Backup/encrypted reset may own a stronger recovery. Do not erase
+            // pending port identity unless this exact obligation was recorded.
+            throw BigSyncReplicaJournalHandoffError.invalidIdentity
         }
     }
 
@@ -2607,45 +2811,11 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
-    private struct PersistedAccountScopeLease {
-        let generation: Int64
-        let lease: BigSyncAccountScopeLease?
-    }
-
     private func readAccountScopeLeaseDurably() throws
-        -> PersistedAccountScopeLease {
-        guard let raw = try keyValueStore.bigSyncDurableObject(
-            forKey: accountScopeLeaseKey
-        ) else {
-            return PersistedAccountScopeLease(generation: 0, lease: nil)
-        }
-        guard let value = raw as? [String: Any],
-              (value["version"] as? NSNumber)?.intValue == 1,
-              let generationNumber = value["generation"] as? NSNumber,
-              generationNumber.int64Value >= 0,
-              let isValid = value["isValid"] as? Bool else {
-            throw BigSyncAccountScopeLeaseError.corrupt
-        }
-        let generation = generationNumber.int64Value
-        guard isValid else {
-            return PersistedAccountScopeLease(
-                generation: generation,
-                lease: nil
-            )
-        }
-        guard let accountScopeIdentifier =
-                value["accountScopeIdentifier"] as? String,
-              !accountScopeIdentifier.isEmpty,
-              let validatedAt = value["validatedAt"] as? Date else {
-            throw BigSyncAccountScopeLeaseError.corrupt
-        }
-        return PersistedAccountScopeLease(
-            generation: generation,
-            lease: BigSyncAccountScopeLease(
-                accountScopeIdentifier: accountScopeIdentifier,
-                invalidationGeneration: generation,
-                validatedAt: validatedAt
-            )
+        -> BigSyncAccountScopeLeaseState {
+        try BigSyncAccountScopeLeaseState.load(
+            store: keyValueStore,
+            key: accountScopeLeaseKey
         )
     }
 
@@ -2654,19 +2824,12 @@ public class CloudKitSynchronizer: NSObject {
         accountScopeIdentifier: String?,
         validatedAt: Date?
     ) throws {
-        var value: [String: Any] = [
-            "version": 1,
-            "generation": NSNumber(value: generation),
-            "isValid": accountScopeIdentifier != nil,
-        ]
-        if let accountScopeIdentifier, let validatedAt {
-            value["accountScopeIdentifier"] = accountScopeIdentifier
-            value["validatedAt"] = validatedAt
-        }
-        try keyValueStore.bigSyncSetDurably(
-            value: value,
-            forKey: accountScopeLeaseKey
+        let state = try BigSyncAccountScopeLeaseState(
+            generation: generation,
+            accountScopeIdentifier: accountScopeIdentifier,
+            validatedAt: validatedAt
         )
+        try state.persist(store: keyValueStore, key: accountScopeLeaseKey)
     }
 
     private func invalidateAccountScopeLeaseDurably() throws {
@@ -2830,53 +2993,42 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     @BigSyncBackgroundActor
-    private func storedChangeFeedMigrationState(
+    private func requireStoredChangeFeedMigrationState(
         for context: RunContext
-    ) -> ChangeFeedMigrationState? {
+    ) throws -> ChangeFeedMigrationState? {
         let key = changeFeedMigrationStateKey(for: context)
-        guard let propertyList = keyValueStore.object(forKey: key)
-            as? [String: Any] else { return nil }
-        return ChangeFeedMigrationState(
-            key: key,
-            propertyList: propertyList,
-            accountScopeIdentifier: context.accountScopeIdentifier,
-            zoneID: recordZoneID
-        )
+        guard let raw = try keyValueStore.bigSyncDurableObject(forKey: key) else {
+            return nil
+        }
+        guard let propertyList = raw as? [String: Any],
+              let state = ChangeFeedMigrationState(
+                key: key, propertyList: propertyList,
+                accountScopeIdentifier: context.accountScopeIdentifier,
+                zoneName: recordZoneID.zoneName,
+                zoneOwnerName: recordZoneID.ownerName
+              ) else {
+            // Decode the snapshot just read. Unknown/corrupt history is never
+            // permission to rediscover retained target rows as initial intent.
+            throw ChangeFeedMigrationPersistenceError.stateNotDurable
+        }
+        return state
     }
 
     @BigSyncBackgroundActor
     private func persistChangeFeedMigrationState(
         _ state: ChangeFeedMigrationState
     ) throws {
-        // One property-list mutation is the crash-consistency boundary. If it
-        // is not durable, the database cursor is still uncommitted and
-        // CloudKit replays the loss event. No partially updated mode/epoch/
-        // phase combination can be observed after relaunch.
-        let previousValue = keyValueStore.object(forKey: state.key)
-        keyValueStore.set(value: state.propertyList, forKey: state.key)
-        guard keyValueStore.synchronize?() == true,
-              let propertyList = keyValueStore.object(forKey: state.key)
-                as? [String: Any],
+        // The durable store owns atomic replacement and error propagation. A
+        // failed/uncertain write must not be followed by a best-effort write of
+        // an old envelope which could erase a newer recovery obligation.
+        try keyValueStore.bigSyncSetDurably(value: state.propertyList, forKey: state.key)
+        guard let raw = try keyValueStore.bigSyncDurableObject(forKey: state.key),
+              let fields = raw as? [String: Any],
               let persisted = ChangeFeedMigrationState(
-                key: state.key,
-                propertyList: propertyList,
+                key: state.key, propertyList: fields,
                 accountScopeIdentifier: state.accountScopeIdentifier,
-                zoneID: CKRecordZone.ID(
-                    zoneName: state.zoneName,
-                    ownerName: state.zoneOwnerName
-                )
-              ),
-              persisted.epoch == state.epoch,
-              persisted.mode == state.mode,
-              persisted.phase == state.phase,
-              persisted.backupRestoreEventIdentifier
-                == state.backupRestoreEventIdentifier else {
-            if let previousValue {
-                keyValueStore.set(value: previousValue, forKey: state.key)
-            } else {
-                keyValueStore.removeObject(forKey: state.key)
-            }
-            _ = keyValueStore.synchronize?()
+                zoneName: state.zoneName, zoneOwnerName: state.zoneOwnerName
+              ), persisted == state else {
             throw ChangeFeedMigrationPersistenceError.stateNotDurable
         }
     }
@@ -2884,8 +3036,8 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     internal func hasPendingEncryptedDataResetRecovery(
         context: RunContext
-    ) -> Bool {
-        guard let state = storedChangeFeedMigrationState(for: context) else {
+    ) throws -> Bool {
+        guard let state = try requireStoredChangeFeedMigrationState(for: context) else {
             return false
         }
         return state.phase != .completed && state.mode == .encryptedDataReset
@@ -2898,68 +3050,60 @@ public class CloudKitSynchronizer: NSObject {
     internal func requestChangeFeedRecovery(
         context: RunContext,
         mode: ChangeFeedResetMode = .serverReconciliation,
-        backupRestoreEventIdentifier: String? = nil
+        backupRestoreEventIdentifier: String? = nil,
+        replicaJournalHandoff: BigSyncReplicaJournalHandoff? = nil
     ) throws {
-        precondition(
-            mode == .backupRestore
-                ? backupRestoreEventIdentifier.flatMap(UUID.init(uuidString:)) != nil
-                : backupRestoreEventIdentifier == nil,
-            "Only backup-restore recovery carries a restore event identifier"
-        )
-        let stateKey = changeFeedMigrationStateKey(for: context)
-        let current = storedChangeFeedMigrationState(for: context)
-
-        // A migration already in progress owns valid provenance for this exact
-        // epoch. Restarting its nil-token bootstrap is idempotent; incrementing
-        // here would discard evidence captured before the interrupted fetch.
-        if let current, current.phase != .completed, current.mode == mode {
-            if mode != .backupRestore
-                || current.backupRestoreEventIdentifier
-                    == backupRestoreEventIdentifier {
-                return
-            }
-            // A fresh restore event supersedes an unfinished backup-recovery
-            // envelope copied from an older installation. Allocate a new
-            // epoch below so a copied envelope cannot consume the newer
-            // installation's restore event.
-        }
-
-        // A verified restore event describes the provenance of every migration
-        // envelope copied in that backup. Replace it with a fresh restore epoch.
-        // A subsequently observed encrypted-reset error can still supersede it.
-        if let current, current.phase != .completed,
-           mode == .backupRestore {
-            // Continue below and allocate a new epoch.
-        } else if let current, current.phase != .completed,
-                  current.mode == .backupRestore,
-                  mode != .encryptedDataReset {
-            return
-        }
-
-        // An encrypted-data reset supersedes a conservative server
-        // reconciliation already in flight. Its next epoch must rebuild all
-        // live local records rather than interpret the empty server as remote
-        // deletion. A conservative recovery never downgrades an encrypted
-        // reset already in progress.
-        if let current, current.phase != .completed,
-           current.mode == .encryptedDataReset,
-           mode != .backupRestore {
-            return
-        }
-
-        let previousEpoch = current?.epoch
-            ?? (ChangeFeedMigrationState.initialEpoch - 1)
-        let requested = ChangeFeedMigrationState(
-            key: stateKey,
+        let current = try requireStoredChangeFeedMigrationState(for: context)
+        let requested = try ChangeFeedMigrationState.requesting(
+            current: current,
+            key: changeFeedMigrationStateKey(for: context),
             accountScopeIdentifier: context.accountScopeIdentifier,
-            zoneID: recordZoneID,
-            epoch: max(previousEpoch + 1, ChangeFeedMigrationState.initialEpoch),
+            zoneName: recordZoneID.zoneName,
+            zoneOwnerName: recordZoneID.ownerName,
             mode: mode,
-            phase: .requested,
-            backupRestoreEventIdentifier: backupRestoreEventIdentifier
+            backupRestoreEventIdentifier: backupRestoreEventIdentifier,
+            replicaJournalHandoff: replicaJournalHandoff
         )
+        guard requested != current else { return }
         try persistChangeFeedMigrationState(requested)
         activeChangeFeedMigration = nil
+    }
+
+    /// Old recovery envelopes did not preserve retiring identities. Do not
+    /// infer them from arbitrary pending rows: a bound retained-data recovery
+    /// without history may proceed only when every portable row is already
+    /// owned by its destination. This also fences old interrupted migrations.
+    private func journalHandoffExpectation(
+        for migration: ChangeFeedMigrationState,
+        context: RunContext
+    ) throws -> BigSyncReplicaJournalHandoff? {
+        if let handoff = migration.replicaJournalHandoff { return handoff }
+        guard migration.mode.reuploadsRetainedLocalData,
+              let binding = context.replicaBindingGenerationIdentifier else { return nil }
+        guard let installation = BackupDetection.installationIdentifier(
+            namespace: durableStateNamespace,
+            sharedSentinelBaseURL: backupDetectionBaseURL
+        ) else { throw BigSyncReplicaBindingError.corrupt }
+        return try BigSyncReplicaJournalHandoff(
+            installationIdentifier: installation,
+            retiringBindingGenerationIdentifiers: [],
+            destinationBindingGenerationIdentifier: binding
+        )
+    }
+
+    /// Run identity alone does not identify a recovery operation. A stronger
+    /// recovery can be requested while an adapter or account check suspends,
+    /// without changing the run. Never overwrite that newer durable envelope
+    /// with an older phase or consume its restore event on return.
+    @BigSyncBackgroundActor
+    private func revalidateChangeFeedMigration(
+        _ expected: ChangeFeedMigrationState,
+        context: RunContext
+    ) async throws {
+        try await revalidateRunContext(context)
+        guard try requireStoredChangeFeedMigrationState(for: context) == expected else {
+            throw ChangeFeedMigrationPersistenceError.stateSuperseded
+        }
     }
 
     /// Starts (or resumes) the production migration before any normal token
@@ -2971,17 +3115,22 @@ public class CloudKitSynchronizer: NSObject {
     internal func beginChangeFeedMigrationIfNeeded(
         context: RunContext
     ) async throws {
-        guard let modelAdapter = modelAdapters.first,
-              let migratingAdapter = modelAdapter
-                as? any ChangeFeedResetMigrating else { return }
-
+        guard let modelAdapter = modelAdapters.first else { return }
         let stateKey = changeFeedMigrationStateKey(for: context)
-        var stored = storedChangeFeedMigrationState(for: context)
+        var stored = try requireStoredChangeFeedMigrationState(for: context)
+        guard let migratingAdapter = modelAdapter as? any ChangeFeedResetMigrating else {
+            if let stored, stored.phase != .completed,
+               stored.replicaJournalHandoff != nil {
+                throw BigSyncReplicaJournalHandoffError.unsupportedAdapter
+            }
+            return
+        }
         if stored == nil {
             let initial = ChangeFeedMigrationState(
                 key: stateKey,
                 accountScopeIdentifier: context.accountScopeIdentifier,
-                zoneID: modelAdapter.recordZoneID,
+                zoneName: modelAdapter.recordZoneID.zoneName,
+                zoneOwnerName: modelAdapter.recordZoneID.ownerName,
                 epoch: ChangeFeedMigrationState.initialEpoch,
                 mode: .initialImport,
                 phase: .requested
@@ -3005,8 +3154,17 @@ public class CloudKitSynchronizer: NSObject {
                     epoch: migration.epoch,
                     mode: migration.mode
                 )
-            try await revalidateRunContext(context)
+            try await revalidateChangeFeedMigration(migration, context: context)
             if completionIsDurable {
+                if let handoff = try journalHandoffExpectation(for: migration, context: context) {
+                    try await migratingAdapter.reconcileReplicaJournalHandoff(
+                        handoff,
+                        accountScopeIdentifier: migration.accountScopeIdentifier,
+                        epoch: migration.epoch,
+                        verifyOnly: true
+                    )
+                    try await revalidateChangeFeedMigration(migration, context: context)
+                }
                 if migration.mode == .encryptedDataReset {
                     try clearConfiguredZoneTerminal(
                         modelAdapter.recordZoneID,
@@ -3031,39 +3189,53 @@ public class CloudKitSynchronizer: NSObject {
         // A database cursor is not record-zone evidence. It may predate this
         // configured zone, so only the adapter's valid server record proof or
         // a previously persisted lifecycle marker may establish the zone.
-        if try await migratingAdapter.hasChangeFeedEstablishedServerEvidence() {
+        let hasServerEvidence = try await migratingAdapter.hasChangeFeedEstablishedServerEvidence()
+        try await revalidateChangeFeedMigration(migration, context: context)
+        if hasServerEvidence {
             try markConfiguredZoneEstablished(
                 modelAdapter.recordZoneID,
                 accountScopeIdentifier: context.accountScopeIdentifier
             )
         }
-        try await revalidateRunContext(context)
 
         try await migratingAdapter.prepareChangeFeedReset(
             accountScopeIdentifier: context.accountScopeIdentifier,
             epoch: migration.epoch,
             mode: migration.mode
         )
-        try await revalidateRunContext(context)
+        try await revalidateChangeFeedMigration(migration, context: context)
+        if let handoff = try journalHandoffExpectation(for: migration, context: context) {
+            guard context.replicaBindingGenerationIdentifier
+                    == handoff.destinationBindingGenerationIdentifier else {
+                throw BigSyncReplicaJournalHandoffError.unexpectedBinding
+            }
+            try await migratingAdapter.reconcileReplicaJournalHandoff(
+                handoff,
+                accountScopeIdentifier: migration.accountScopeIdentifier,
+                epoch: migration.epoch,
+                verifyOnly: false
+            )
+            try await revalidateChangeFeedMigration(migration, context: context)
+        }
         migration.phase = .prepared
-        activeChangeFeedMigration = migration
         try persistChangeFeedMigrationState(migration)
+        activeChangeFeedMigration = migration
         try await migratingAdapter.beginChangeFeedServerBootstrap(
             accountScopeIdentifier: context.accountScopeIdentifier,
             epoch: migration.epoch,
             mode: migration.mode
         )
-        try await revalidateRunContext(context)
+        try await revalidateChangeFeedMigration(migration, context: context)
 
         // A nil database and zone token is the explicit full-server bootstrap
         // contract. Do not reuse a token from the pre-change-feed transport.
         try resetDatabaseToken()
         resetActiveTokens()
         try await modelAdapter.saveToken(nil)
-        try await revalidateRunContext(context)
+        try await revalidateChangeFeedMigration(migration, context: context)
         migration.phase = .serverBootstrap
-        activeChangeFeedMigration = migration
         try persistChangeFeedMigrationState(migration)
+        activeChangeFeedMigration = migration
     }
 
     /// Runs exactly after the nil-token feed has consumed its pages and before
@@ -3077,15 +3249,16 @@ public class CloudKitSynchronizer: NSObject {
               migration.phase == .serverBootstrap else { return }
         guard let adapter = modelAdapters.first
             as? any ChangeFeedResetMigrating else { return }
+        try await revalidateChangeFeedMigration(migration, context: context)
         try await adapter.reconcileAfterChangeFeedServerBootstrap(
             accountScopeIdentifier: migration.accountScopeIdentifier,
             epoch: migration.epoch,
             mode: migration.mode
         )
-        try await revalidateRunContext(context)
+        try await revalidateChangeFeedMigration(migration, context: context)
         migration.phase = .reconciled
-        activeChangeFeedMigration = migration
         try persistChangeFeedMigrationState(migration)
+        activeChangeFeedMigration = migration
     }
 
     /// Called only at the normal terminal receipt, after the post-upload
@@ -3096,10 +3269,28 @@ public class CloudKitSynchronizer: NSObject {
         context: RunContext
     ) async throws {
         guard var migration = activeChangeFeedMigration,
-              migration.phase == .reconciled else { return }
+              migration.phase == .reconciled else {
+            if let stored = try requireStoredChangeFeedMigrationState(for: context),
+               stored.phase != .completed {
+                throw ChangeFeedMigrationPersistenceError.stateSuperseded
+            }
+            return
+        }
+        try await revalidateChangeFeedMigration(migration, context: context)
+        if let handoff = try journalHandoffExpectation(for: migration, context: context) {
+            guard let adapter = modelAdapters.first as? any ChangeFeedResetMigrating
+            else { throw BigSyncReplicaJournalHandoffError.unsupportedAdapter }
+            try await adapter.reconcileReplicaJournalHandoff(
+                handoff,
+                accountScopeIdentifier: migration.accountScopeIdentifier,
+                epoch: migration.epoch,
+                verifyOnly: true
+            )
+            try await revalidateChangeFeedMigration(migration, context: context)
+        }
         migration.phase = .finishing
-        activeChangeFeedMigration = migration
         try persistChangeFeedMigrationState(migration)
+        activeChangeFeedMigration = migration
         guard let modelAdapter = modelAdapters.first,
               let migratingAdapter = modelAdapter
                 as? any ChangeFeedResetMigrating else { return }
@@ -3108,7 +3299,7 @@ public class CloudKitSynchronizer: NSObject {
             epoch: migration.epoch,
             mode: migration.mode
         )
-        try await revalidateRunContext(context)
+        try await revalidateChangeFeedMigration(migration, context: context)
         if migration.mode == .encryptedDataReset {
             // Clear the terminal fence only after every adapter has completed
             // its journal-backed re-upload and the normal terminal drain has
@@ -3147,8 +3338,12 @@ public class CloudKitSynchronizer: NSObject {
         synchronizationAttemptID = UUID()
         cancelAttemptCallbacks(for: cancelledAttemptID)
         activeRunContext = nil
+        publicationConsumptionPending = false
+        publicationFetchDeferralEligible = false
         activeReceiptAuthorizationID = nil
         reservedReceiptAuthorizationID = nil
+        completedPostBarrierDrain = nil
+        postBarrierDrainAuthorization = nil
         changeRequestProcessor.reset()
         synchronizationTask?.cancel()
         synchronizationTask = nil

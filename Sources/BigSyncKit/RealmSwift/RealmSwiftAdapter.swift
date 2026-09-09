@@ -49,6 +49,7 @@ enum RealmSwiftAdapterError: Error, LocalizedError {
     case duplicateTrackedEntityType(entityType: String)
     case missingChangeMetadataConformance(entityType: String)
     case systemFieldEncodingFailed(recordName: String)
+    case invalidSystemFields(recordName: String)
     case accountScopeUnavailable(entityType: String)
     case accountScopeMismatch(
         entityType: String,
@@ -73,6 +74,8 @@ enum RealmSwiftAdapterError: Error, LocalizedError {
             return "Tracked Realm entity type \(entityType) must conform to ChangeMetadataRecordable."
         case let .systemFieldEncodingFailed(recordName):
             return "Could not durably encode CloudKit system fields for \(recordName)."
+        case let .invalidSystemFields(recordName):
+            return "CloudKit system fields are unreadable or belong to another record for \(recordName)."
         case let .accountScopeUnavailable(entityType):
             return "No validated CloudKit account scope is active for \(entityType)."
         case let .accountScopeMismatch(entityType, expected, actual):
@@ -121,6 +124,7 @@ enum RealmSwiftInboundPageCommitError: Error, Equatable {
 enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
     case batchBelongsToAnotherAdapter
     case recordWasNotPrepared
+    case recordOutsideAdapterZone
 
     var errorDescription: String? {
         switch self {
@@ -128,6 +132,8 @@ enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
             "The prepared batch belongs to another RealmSwiftAdapter."
         case .recordWasNotPrepared:
             "The acknowledgement contains a record that was not in the prepared batch."
+        case .recordOutsideAdapterZone:
+            "The mutation response belongs to another adapter zone."
         }
     }
 }
@@ -367,8 +373,6 @@ private struct RemoteRecordWriteCandidate {
     let expectedMutationGeneration: String?
     let expectedModifiedAt: Date?
     let expectedExplicitlyModifiedAt: Date?
-    let semanticReplacementDisposition:
-        BigSyncInboundSemanticReplacementDisposition
 }
 
 private func latestExplicitlyModifiedAt(in changes: [PendingObjectChange]) -> Date? {
@@ -415,30 +419,6 @@ private func usesStringEncodedIntegerTransport(
     }
     return modelType.bigSyncStringEncodedIntegerPropertyNames.contains(
         propertyName
-    )
-}
-
-private func objectIdentifier(
-    fromCloudKitRecordName recordName: String,
-    expectedEntityType: String
-) -> String? {
-    let prefix = expectedEntityType + "."
-    guard recordName.hasPrefix(prefix) else { return nil }
-    let separator = recordName.index(before: prefix.endIndex)
-    let identifierStart = recordName.index(after: separator)
-    guard identifierStart < recordName.endIndex else { return nil }
-    return String(recordName[identifierStart...])
-}
-
-private func objectIdentifier(
-    from reference: CKRecord.Reference,
-    expectedEntityType: String,
-    expectedZoneID: CKRecordZone.ID
-) -> String? {
-    guard reference.recordID.zoneID == expectedZoneID else { return nil }
-    return objectIdentifier(
-        fromCloudKitRecordName: reference.recordID.recordName,
-        expectedEntityType: expectedEntityType
     )
 }
 
@@ -1088,11 +1068,10 @@ public final class RealmSwiftAdapter:
         }
         guard activeAccountScopeIdentifier == accountScopeIdentifier,
               activeReplicaBindingGenerationIdentifier
-                == replicaBindingGenerationIdentifier,
-              let token = persistenceRealm.objects(ServerToken.self).first?
-                .token else {
+                == replicaBindingGenerationIdentifier else {
             return nil
         }
+        guard let token = try Self.storedZoneCursor(in: persistenceRealm) else { return nil }
         return CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
             containerIdentifier: containerIdentifier,
             databaseScope: databaseScope,
@@ -1269,7 +1248,7 @@ public final class RealmSwiftAdapter:
         }.joined()
         let deletionFeedLineage: String
         if record.recordChangeTag == nil {
-            deletionFeedLineage = inboundSemanticLiveFallbackLineage(
+            deletionFeedLineage = try inboundSemanticLiveFallbackLineage(
                 for: record,
                 evidenceDigestHex: digest
             )
@@ -1299,8 +1278,8 @@ public final class RealmSwiftAdapter:
         error: Error,
         semanticScopeIdentifier: String?,
         importRunIdentifier: String
-    ) -> BigSyncInboundSemanticQuarantine {
-        let digest = inboundSemanticFeedLineageDigest(
+    ) throws -> BigSyncInboundSemanticQuarantine {
+        let digest = try inboundSemanticFeedLineageDigest(
             domain: "BigSyncInboundDeletionEvidence.v2",
             recordID: recordID
         )
@@ -1322,8 +1301,8 @@ public final class RealmSwiftAdapter:
     private func inboundSemanticLiveFallbackLineage(
         for record: CKRecord,
         evidenceDigestHex: String
-    ) -> String {
-        inboundSemanticFeedLineageDigest(
+    ) throws -> String {
+        try inboundSemanticFeedLineageDigest(
             domain: "BigSyncInboundLiveFallbackLineage.v1",
             recordID: record.recordID,
             fieldsBeforeRecordIdentity: [record.recordType],
@@ -1337,9 +1316,11 @@ public final class RealmSwiftAdapter:
         recordID: CKRecord.ID,
         fieldsBeforeRecordIdentity: [String] = [],
         fieldsAfterRecordIdentity: [String] = []
-    ) -> String {
-        let previousCursor = realmProvider?.persistenceRealm?
-            .objects(ServerToken.self).first?.token
+    ) throws -> String {
+        guard let persistenceRealm = realmProvider?.persistenceRealm else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
+        let previousCursor = try Self.storedZoneCursor(in: persistenceRealm)
         var evidence = Data()
         func appendFramed(_ value: Data) {
             var length = UInt64(value.count).bigEndian
@@ -1831,6 +1812,31 @@ public final class RealmSwiftAdapter:
         }
     }
 
+    @BigSyncBackgroundActor
+    public func mayAffectDomainPublication(records: [CKRecord], deletions: [CKRecord.ID]) -> Bool {
+        func relevant(_ entity: String) -> Bool {
+            // Unknown types and malformed names are uncertainty, never evidence
+            // of an irrelevant page. Classification does not admit any record.
+            guard let model = modelTypes[entity] else { return true }
+            return model is BigSyncInboundTargetMutationObserving.Type
+        }
+        func entity(_ id: CKRecord.ID) -> String? {
+            let pieces = id.recordName.split(separator: ".", maxSplits: 1,
+                omittingEmptySubsequences: false)
+            guard pieces.count == 2, !pieces[0].isEmpty, !pieces[1].isEmpty else { return nil }
+            return String(pieces[0])
+        }
+        for record in records {
+            guard entity(record.recordID) == record.recordType else { return true }
+            if relevant(record.recordType) { return true }
+        }
+        for id in deletions {
+            guard let name = entity(id) else { return true }
+            if relevant(name) { return true }
+        }
+        return false
+    }
+
     private var ownedEntityTypeNames: Set<String> {
         Set(modelTypes.keys).subtracting(excludedClassNames)
     }
@@ -2149,30 +2155,25 @@ public final class RealmSwiftAdapter:
         in realm: Realm
     ) -> Bool {
         guard let objectType = modelTypes[mutation.entityType],
-              let primaryKey = objectType.primaryKey()
-                ?? objectType.sharedSchema()?.primaryKeyProperty?.name,
-              let primaryKeyProperty = objectType.sharedSchema()?.properties
-                .first(where: { $0.name == primaryKey }) else {
-            return false
+              let primaryKeyValue = getObjectIdentifier(
+                stringObjectId: mutation.objectIdentifier,
+                entityType: mutation.entityType
+              ) else { return false }
+        guard let target = realm.object(
+            ofType: objectType, forPrimaryKey: primaryKeyValue
+        ) else {
+            // A pending record survives a physical deletion. Treating this as
+            // an upsert drops deletion-only work during forwarding/rebootstrap.
+            return true
         }
-        let primaryKeyValue: Any
-        switch primaryKeyProperty.type {
-        case .string:
-            primaryKeyValue = mutation.objectIdentifier
-        case .int:
-            guard let value = Int64(mutation.objectIdentifier) else { return false }
-            primaryKeyValue = value
-        case .UUID:
-            guard let value = UUID(uuidString: mutation.objectIdentifier) else { return false }
-            primaryKeyValue = value
-        case .objectId:
-            guard let value = try? ObjectId(string: mutation.objectIdentifier) else { return false }
-            primaryKeyValue = value
-        default:
-            return false
-        }
-        return (realm.object(ofType: objectType, forPrimaryKey: primaryKeyValue)
-            as? SoftDeletable)?.isDeleted == true
+        return Self.requiresCloudKitDeletion(target)
+    }
+
+    /// Domain tombstones that carry ordered structural state stay live remote
+    /// values. Local UI deletion is separate from CloudKit record absence.
+    private static func requiresCloudKitDeletion(_ object: Object) -> Bool {
+        (object as? SoftDeletable)?.isDeleted == true
+            && (object as? BigSyncRetainsSyncedTombstone)?.retainsSyncedTombstone != true
     }
 
     /// Immediately updates.
@@ -2957,10 +2958,9 @@ public final class RealmSwiftAdapter:
     }
 
     func getObjectIdentifier(recordName: String, entityType: String) -> Any? {
-        let prefix = entityType + "."
-        guard recordName.hasPrefix(prefix) else { return nil }
-        let objectIdentifier = String(recordName.dropFirst(prefix.count))
-        guard !objectIdentifier.isEmpty else { return nil }
+        guard let objectIdentifier = BigSyncRecordIdentifier.objectIdentifier(
+            from: recordName, entityType: entityType
+        ) else { return nil }
         return getObjectIdentifier(
             stringObjectId: objectIdentifier,
             entityType: entityType
@@ -2975,16 +2975,47 @@ public final class RealmSwiftAdapter:
 
         switch keyType {
         case .int:
-            return Int(stringObjectId)
+            return BigSyncRecordIdentifier.canonicalValue(from: stringObjectId) {
+                Int($0)
+            }
         case .objectId:
-            return try? ObjectId(string: stringObjectId)
+            return BigSyncRecordIdentifier.canonicalValue(from: stringObjectId) {
+                try? ObjectId(string: $0)
+            }
         case .string:
             return stringObjectId
         case .UUID:
-            return UUID(uuidString: stringObjectId)
+            return BigSyncRecordIdentifier.canonicalValue(from: stringObjectId) {
+                UUID(uuidString: $0)
+            }
         default:
-            return stringObjectId
+            return nil
         }
+    }
+
+    private func objectIdentifier(
+        fromCloudKitRecordName recordName: String,
+        expectedEntityType: String
+    ) -> String? {
+        guard let identifier = BigSyncRecordIdentifier.objectIdentifier(
+            from: recordName, entityType: expectedEntityType
+        ), getObjectIdentifier(stringObjectId: identifier,
+                               entityType: expectedEntityType) != nil else {
+            return nil
+        }
+        return identifier
+    }
+
+    private func objectIdentifier(
+        from reference: CKRecord.Reference,
+        expectedEntityType: String,
+        expectedZoneID: CKRecordZone.ID
+    ) -> String? {
+        guard reference.recordID.zoneID == expectedZoneID else { return nil }
+        return objectIdentifier(
+            fromCloudKitRecordName: reference.recordID.recordName,
+            expectedEntityType: expectedEntityType
+        )
     }
 
     @BigSyncBackgroundActor
@@ -3382,8 +3413,17 @@ public final class RealmSwiftAdapter:
         to object: Object,
         syncedEntityID: String,
         syncedEntityState: SyncedEntityState,
-        entityType: String
+        entityType: String,
+        isNewObject: Bool,
+        preferIncomingRecord: Bool = false,
+        publicationInvalidations: inout BigSyncInboundPublicationInvalidations
     ) throws -> [PendingRelationshipRequest] {
+        // A custom delegate may mutate the object even when declining generic
+        // application. Invalidate before that call, in this same target write.
+        // This deliberately does not claim exact semantic-delta accounting.
+        guard let realm = object.realm else { throw RealmSwiftAdapterError.setupUnavailable }
+        try publicationInvalidations.record(type(of: object), in: realm,
+            existingObject: object, incomingRecord: record, allowTargeting: delegate == nil && !isNewObject)
         let objectProperties = object.objectSchema.properties
         var pendingRelationships = [PendingRelationshipRequest]()
 
@@ -3415,11 +3455,15 @@ public final class RealmSwiftAdapter:
                     pendingRelationships: &pendingRelationships
                 )
             }
+            // A restored preimage is recovery evidence until actual admitted
+            // server fields have been consumed in this same target transaction.
+            try (object as? BigSyncRestoredObjectRecovering)?.admitAfterServerEvidence()
         }
 
-        if mergePolicy == .server
+        if preferIncomingRecord || mergePolicy == .server
             || syncedEntityState == .deletedRemotely
             || syncedEntityState == .recreatingRemotely {
+            // An explicit domain winner bypasses ordinary timestamp ordering.
             // A live record delivered after a remote deletion is a recreation
             // in CloudKit change-feed order. The prior tombstone is not a
             // competing local edit, so it must not win timestamp conflict
@@ -3427,7 +3471,10 @@ public final class RealmSwiftAdapter:
             try applyChanges()
         } else if mergePolicy == .custom {
             let acceptRemoteChange: Bool
-            if let delegate {
+            // Retain the same delegate for both selection and journaling. A
+            // delegate may construct a new value; default selection never does.
+            let mergeDelegate = delegate
+            if let delegate = mergeDelegate {
                 var recordChanges = [String: Any]()
                 for property in objectProperties
                     where !skippedKeys.contains(property.name) {
@@ -3465,18 +3512,13 @@ public final class RealmSwiftAdapter:
                         record["explicitlyModifiedAt"] as? Date
                         ?? .distantPast
                     let localExplicitlyModifiedAt = object["explicitlyModifiedAt"] as? Date ?? .distantPast
-                    let result: Bool
-                    if remoteExplicitlyModifiedAt > localExplicitlyModifiedAt {
-                        result = true
-                    } else if remoteExplicitlyModifiedAt == localExplicitlyModifiedAt {
-                        let remoteModifiedAt =
-                            record["modifiedAt"] as? Date
-                            ?? .distantPast
-                        let localModifiedAt = object["modifiedAt"] as? Date ?? .distantPast
-                        result = remoteModifiedAt >= localModifiedAt
-                    } else {
-                        result = false
-                    }
+                    let result = BigSyncRecordConflictPolicy.acceptsRemote(
+                        remoteExplicitlyModifiedAt: remoteExplicitlyModifiedAt,
+                        remoteModifiedAt: record["modifiedAt"] as? Date,
+                        localExplicitlyModifiedAt: localExplicitlyModifiedAt,
+                        localModifiedAt: object["modifiedAt"] as? Date,
+                        localObjectExists: !isNewObject
+                    )
                     try Task.checkCancellation()
                     logger.info("QSCloudKitSynchronizer >> Conflict resolution: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\(localExplicitlyModifiedAt), remote explicitly modified=\(remoteExplicitlyModifiedAt) => accepted remote: \(result)")
                     //#if DEBUG
@@ -3499,13 +3541,12 @@ public final class RealmSwiftAdapter:
                 if let remoteExplicitlyModifiedAt = record["explicitlyModifiedAt"] as? Date, let localExplicitlyModifiedAt = (object as? ChangeMetadataRecordable)?.explicitlyModifiedAt, remoteExplicitlyModifiedAt < localExplicitlyModifiedAt {
                     logger.info("QSCloudKitSynchronizer >> Rejecting remote changes with lower explicitlyModifiedAt: \(object.objectSchema.className) \(object.primaryKeyValue ?? "") – local explicitly modified=\((object as? ChangeMetadataRecordable)?.explicitlyModifiedAt), remote explicitly modified=\(record["explicitlyModifiedAt"] as? Date), syncedEntityState=\(syncedEntityState.rawValue)")
                 }
-                // Choosing the local object is an authoritative conflict
-                // decision. Persist that decision through the same target-
-                // Realm journal boundary as an ordinary user edit so a later
-                // upload cannot be lost after process death. This path is
-                // reached only when the selection snapshot had no pending
-                // mutation; journaled local values are fenced before entering
-                // `applyChanges`.
+                // Keep the selected value durably uploadable. Default conflict
+                // selection changes no business fields, so retransmission must
+                // not make an older user edit beat a genuinely later edit.
+                // A custom delegate can mutate while declining generic apply;
+                // retain its existing new-value timestamp contract. Pending
+                // local generations remain fenced before this method.
                 guard let changeMetadata = object as? ChangeMetadataRecordable
                 else {
                     throw RealmSwiftAdapterError
@@ -3513,10 +3554,11 @@ public final class RealmSwiftAdapter:
                             entityType: entityType
                         )
                 }
-                changeMetadata.refreshChangeMetadata(
-                    explicitlyModified: true,
-                    at: Date()
-                )
+                if mergeDelegate == nil {
+                    try changeMetadata.journalCurrentValuePreservingChangeMetadata(at: Date())
+                } else {
+                    try changeMetadata.refreshChangeMetadataRequiringJournal(at: Date())
+                }
             }
         }
         return pendingRelationships
@@ -4399,6 +4441,8 @@ public final class RealmSwiftAdapter:
                         forKey: group.key.relationshipName
                     )
                 }
+                try (originObjectClass as? BigSyncInboundTargetMutationObserving.Type)?
+                    .invalidatePublicationForInboundTargetWrite(in: targetRealm)
             }
 
             if case .unsupportedCollectionBridge = applicationOutcome {
@@ -4433,7 +4477,19 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     func save(record: CKRecord, for syncedEntity: SyncedEntity) throws {
+        guard systemFieldIdentityMatches(record, entity: syncedEntity) else {
+            throw RealmSwiftAdapterError.invalidSystemFields(
+                recordName: syncedEntity.identifier
+            )
+        }
         try syncedEntity.encodedRecord = encodedRecord(record, onlySystemFields: true)
+    }
+
+    @BigSyncBackgroundActor
+    private func systemFieldIdentityMatches(_ record: CKRecord, entity: SyncedEntity) -> Bool {
+        record.recordType == entity.entityType
+            && record.recordID.zoneID == zoneID
+            && record.recordID.recordName.utf8.elementsEqual(entity.identifier.utf8)
     }
 
     @BigSyncBackgroundActor
@@ -4466,8 +4522,13 @@ public final class RealmSwiftAdapter:
               let unarchiver = try? NSKeyedUnarchiver(forReadingWith: decompressed) else {
             return nil
         }
+        unarchiver.decodingFailurePolicy = .setErrorAndReturn
         let record = CKRecord(coder: unarchiver)
         unarchiver.finishDecoding()
+        guard unarchiver.error == nil, let record,
+              systemFieldIdentityMatches(record, entity: syncedEntity) else {
+            return nil
+        }
         return record
     }
 
@@ -4600,6 +4661,10 @@ public final class RealmSwiftAdapter:
             // truth or resurrect a remotely deleted record. Target objects are
             // deliberately retained and become uploadable again only after a
             // genuine post-restore user mutation creates a fresh generation.
+            try await retainRestoredObjectsForRecovery(
+                namespace: namespace,
+                cancellationGeneration: expectedCancellationGeneration
+            )
             try await retireRestoredMutationJournal(
                 namespace: namespace,
                 cancellationGeneration: expectedCancellationGeneration
@@ -4612,11 +4677,230 @@ public final class RealmSwiftAdapter:
         try await resetSyncCaches(requiredTransport: namespace)
     }
 
+    /// Runs before nil-token import, not after server-membership filtering.
+    /// It visits the outbox, so acknowledged values keep normal merge policy
+    /// and deletion-only rows are not lost in a live-object enumeration.
+    @BigSyncBackgroundActor
+    public func reconcileReplicaJournalHandoff(
+        _ handoff: BigSyncReplicaJournalHandoff,
+        accountScopeIdentifier: String,
+        epoch: Int,
+        verifyOnly: Bool
+    ) async throws {
+        guard activeAccountScopeIdentifier == accountScopeIdentifier,
+              activeReplicaBindingGenerationIdentifier
+                == handoff.destinationBindingGenerationIdentifier,
+              !cancelSync,
+              !activeContainerIdentifier.isEmpty else {
+            throw CancellationError()
+        }
+        let namespace = InboundPageNamespace(
+            accountScopeIdentifier: accountScopeIdentifier,
+            containerIdentifier: activeContainerIdentifier,
+            databaseScopeRawValue: activeDatabaseScopeRawValue,
+            zoneOwnerName: recordZoneID.ownerName,
+            zoneName: recordZoneID.zoneName,
+            replicaActivationIdentifier:
+                handoff.destinationBindingGenerationIdentifier,
+            changeFeedEpoch: epoch
+        )
+        let expectedCancellationGeneration = cancellationGeneration
+        let persistenceRealm = try await Realm(
+            configuration: persistenceRealmConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        try requireCurrentTransport(
+            namespace,
+            cancellationGeneration: expectedCancellationGeneration
+        )
+        guard let state = persistenceRealm.object(
+            ofType: RebuildProvenanceState.self,
+            forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+        ), state.accountScopeIdentifier == accountScopeIdentifier,
+           state.epoch == epoch,
+           (changeFeedResetMode(for: state) == .localDatasetRebootstrap
+                || changeFeedResetMode(for: state) == .encryptedDataReset),
+           verifyOnly || state.isActive else {
+            throw BigSyncReplicaJournalHandoffError.invalidIdentity
+        }
+        let destinationIdentity = BigSyncMutationJournalIdentity(
+            installationIdentifier: handoff.installationIdentifier,
+            replicaBindingGenerationIdentifier:
+                handoff.destinationBindingGenerationIdentifier
+        )
+        var opened = Set<String>()
+        for configuration in targetRealmConfigurations {
+            let realmIdentity = BigSyncMutationTrackingRegistry.identity(
+                for: configuration
+            )
+            guard opened.insert(realmIdentity).inserted else { continue }
+            let targetRealm = try await Realm(
+                configuration: configuration,
+                actor: BigSyncBackgroundActor.shared
+            )
+            try requireCurrentTransport(
+                namespace,
+                cancellationGeneration: expectedCancellationGeneration
+            )
+            guard targetRealm.schema.objectSchema.contains(where: {
+                $0.className == BigSyncPendingMutation.className()
+            }) else { throw BigSyncMutationJournalError.missingJournalSchema }
+            let changedAt = Date()
+            // Even verification takes the writer: the check and an admitted
+            // local mutation are serialized, not sampled across await points.
+            try await targetRealm.asyncWrite {
+                try requireCurrentTransport(
+                    namespace,
+                    cancellationGeneration: expectedCancellationGeneration
+                )
+                guard try BigSyncMutationTracking.requireCurrentJournalIdentity(
+                    in: targetRealm
+                ) == destinationIdentity else {
+                    throw BigSyncMutationJournalError.identityChanged
+                }
+                for mutation in targetRealm.objects(BigSyncPendingMutation.self)
+                    .sorted(byKeyPath: "recordName") {
+                    let entityType = mutation.entityType
+                    guard !excludedClassNames.contains(entityType) else { continue }
+                    let scopeProperty = accountScopePropertyByClassName[entityType]
+                    if scopeProperty != nil,
+                       mutation.accountScopeIdentifier != accountScopeIdentifier {
+                        // Account-scoped facts are not portable. Their journal
+                        // remains owned by its original account unchanged.
+                        continue
+                    }
+                    guard targetRealm.schema.objectSchema.contains(where: {
+                        $0.className == entityType
+                    }), !mutation.objectIdentifier.isEmpty,
+                       let objectType = realmObjectClass(name: entityType),
+                       let objectID = getObjectIdentifier(
+                        stringObjectId: mutation.objectIdentifier,
+                        entityType: entityType
+                       ), mutation.recordName == entityType + "." + mutation.objectIdentifier,
+                       scopeProperty != nil || mutation.accountScopeIdentifier == nil else {
+                        throw BigSyncReplicaJournalHandoffError.invalidRecord(
+                            mutation.recordName
+                        )
+                    }
+                    if let property = scopeProperty,
+                       let object = targetRealm.object(
+                        ofType: objectType, forPrimaryKey: objectID
+                       ), object[property] as? String != mutation.accountScopeIdentifier {
+                        throw BigSyncReplicaJournalHandoffError.invalidRecord(
+                            mutation.recordName
+                        )
+                    }
+                    let action = try handoff.action(
+                        for: mutation.replicaBindingGenerationIdentifier,
+                        verifyOnly: verifyOnly
+                    )
+                    let recordedIdentity = BigSyncMutationJournalIdentity(
+                        installationIdentifier: handoff.installationIdentifier,
+                        replicaBindingGenerationIdentifier:
+                            mutation.replicaBindingGenerationIdentifier
+                    )
+                    guard BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(
+                        mutation.generation, identity: recordedIdentity
+                    ) else {
+                        // A restored installation's outbox cannot be adopted
+                        // by an account port. Backup recovery owns that case.
+                        throw BigSyncReplicaJournalHandoffError.invalidRecord(
+                            mutation.recordName
+                        )
+                    }
+                    guard action == .rebindRetiring else { continue }
+                    let context = BigSyncMutationTrackingRegistry.mutationContext(
+                        className: entityType, in: targetRealm
+                    )
+                    guard context.trackingStatus == .tracked else {
+                        throw BigSyncMutationJournalError.unregisteredModel(entityType)
+                    }
+                    let fresh = try BigSyncMutationTrackingRegistry.makeMutationGeneration(
+                        context: context,
+                        expectedIdentity: destinationIdentity
+                    )
+                    mutation.generation = fresh.generation
+                    mutation.replicaBindingGenerationIdentifier =
+                        fresh.replicaBindingGenerationIdentifier
+                    mutation.changedAt = changedAt
+                }
+                guard try BigSyncMutationTracking.requireCurrentJournalIdentity(
+                    in: targetRealm
+                ) == destinationIdentity else {
+                    throw BigSyncMutationJournalError.identityChanged
+                }
+                try requireCurrentTransport(
+                    namespace,
+                    cancellationGeneration: expectedCancellationGeneration
+                )
+            }
+        }
+    }
+
+    /// Retained source bytes must lose admission before the old outbox is
+    /// retired. A crash can replay this idempotent phase; it cannot expose a
+    /// copied source as current or make it eligible for later account reseed.
+    @BigSyncBackgroundActor
+    private func retainRestoredObjectsForRecovery(
+        namespace: InboundPageNamespace,
+        cancellationGeneration expectedCancellationGeneration: UInt64
+    ) async throws {
+        var opened = Set<String>()
+        for configuration in targetRealmConfigurations {
+            let identity = BigSyncMutationTrackingRegistry.identity(for: configuration)
+            guard opened.insert(identity).inserted else { continue }
+            let targetRealm = try await Realm(
+                configuration: configuration, actor: BigSyncBackgroundActor.shared
+            )
+            try requireCurrentTransport(namespace,
+                cancellationGeneration: expectedCancellationGeneration)
+            let recoveringTypes = targetRealm.schema.objectSchema.compactMap { schema -> Object.Type? in
+                guard !excludedClassNames.contains(schema.className),
+                      let type = realmObjectClass(name: schema.className),
+                      type is BigSyncRestoredObjectRecovering.Type else { return nil }
+                return type
+            }
+            guard !recoveringTypes.isEmpty else { continue }
+            try await targetRealm.asyncWrite {
+                try requireCurrentTransport(namespace,
+                    cancellationGeneration: expectedCancellationGeneration)
+                for type in recoveringTypes {
+                    var objects = targetRealm.objects(type)
+                    if let property = accountScopePropertyByClassName[type.className()] {
+                        objects = objects.filter(NSPredicate(format: "%K == %@", property,
+                            namespace.accountScopeIdentifier))
+                    }
+                    for object in objects {
+                        try Task.checkCancellation()
+                        // A fresh post-restore command is current intent. The
+                        // ordinary source writer's installation check prevents
+                        // that command from continuing the copied owner's home.
+                        if let primaryKey = object.objectSchema.primaryKeyProperty?.name {
+                            let objectID = Self.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey)
+                            if let mutation = targetRealm.object(ofType: BigSyncPendingMutation.self,
+                                forPrimaryKey: type.className() + "." + objectID),
+                               try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+                                mutation, realm: targetRealm,
+                                expectedBindingGenerationIdentifier: activeReplicaBindingGenerationIdentifier) {
+                                continue
+                            }
+                        }
+                        try (object as? BigSyncRestoredObjectRecovering)?.retainForRestoreRecovery()
+                    }
+                }
+                try requireCurrentTransport(namespace,
+                    cancellationGeneration: expectedCancellationGeneration)
+            }
+        }
+    }
+
     @BigSyncBackgroundActor
     private func retireRestoredMutationJournal(
         namespace: InboundPageNamespace,
         cancellationGeneration expectedCancellationGeneration: UInt64
     ) async throws {
+        try requireCurrentTransport(namespace, cancellationGeneration: expectedCancellationGeneration)
+        let recoveryBinding = activeReplicaBindingGenerationIdentifier
         var openedRealmIdentities = Set<String>()
         for configuration in targetRealmConfigurations {
             try requireCurrentTransport(
@@ -4637,13 +4921,15 @@ public final class RealmSwiftAdapter:
                 namespace,
                 cancellationGeneration: expectedCancellationGeneration
             )
-            let restoredMutations = targetRealm.objects(
+            let restoredMutations = try targetRealm.objects(
                 BigSyncPendingMutation.self
             ).compactMap { mutation -> (recordName: String, generation: String)? in
-                guard !BigSyncMutationTrackingRegistry
+                try Task.checkCancellation()
+                guard try !BigSyncMutationTrackingRegistry
                     .mutationWasCreatedInCurrentTransportIdentity(
                         mutation,
-                        realm: targetRealm
+                        realm: targetRealm,
+                        expectedBindingGenerationIdentifier: recoveryBinding
                     ) else {
                     return nil
                 }
@@ -4656,14 +4942,16 @@ public final class RealmSwiftAdapter:
                     cancellationGeneration: expectedCancellationGeneration
                 )
                 for restoredMutation in restoredMutations {
+                    try Task.checkCancellation()
                     guard let liveMutation = targetRealm.object(
                         ofType: BigSyncPendingMutation.self,
                         forPrimaryKey: restoredMutation.recordName
                     ), liveMutation.generation == restoredMutation.generation,
-                       !BigSyncMutationTrackingRegistry
+                       try !BigSyncMutationTrackingRegistry
                         .mutationWasCreatedInCurrentTransportIdentity(
                             liveMutation,
-                            realm: targetRealm
+                            realm: targetRealm,
+                            expectedBindingGenerationIdentifier: recoveryBinding
                         ) else {
                         continue
                     }
@@ -4750,6 +5038,7 @@ public final class RealmSwiftAdapter:
               !activeContainerIdentifier.isEmpty else {
             throw CancellationError()
         }
+        let recoveryBinding = activeReplicaBindingGenerationIdentifier
         let expectedCancellationGeneration = cancellationGeneration
         let namespace = InboundPageNamespace(
             accountScopeIdentifier: accountScopeIdentifier,
@@ -4849,6 +5138,10 @@ public final class RealmSwiftAdapter:
                     objects = objects.filter(eligibilityType.initialCloudKitSyncEligibilityPredicate)
                 }
                 for object in objects {
+                    // Recovery-only copied bytes are neither current local
+                    // intent nor destination data, even after account change.
+                    if (object as? BigSyncRestoredObjectRecovering)?
+                        .isAwaitingRecoveryEvidence == true { continue }
                     let objectIdentifier = Self
                         .getTargetObjectStringIdentifier(
                             for: object,
@@ -4861,7 +5154,7 @@ public final class RealmSwiftAdapter:
                         accountScopeIdentifier:
                             accountScopePropertyByClassName[schema.className]
                                 .flatMap { object[$0] as? String },
-                        isDeleted: (object as? SoftDeletable)?.isDeleted == true
+                        isDeleted: Self.requiresCloudKitDeletion(object)
                     ))
                 }
             }
@@ -4906,10 +5199,12 @@ public final class RealmSwiftAdapter:
                         ), let liveObject = targetRealm.object(
                             ofType: objectType,
                             forPrimaryKey: objectIdentifier
-                        ), ((liveObject as? SoftDeletable)?.isDeleted == true)
+                        ), Self.requiresCloudKitDeletion(liveObject)
                             == candidate.isDeleted else {
                             continue
                         }
+                        guard (liveObject as? BigSyncRestoredObjectRecovering)?
+                            .isAwaitingRecoveryEvidence != true else { continue }
                         let existingMutation = targetRealm.object(
                             ofType: BigSyncPendingMutation.self,
                             forPrimaryKey: candidate.identifier
@@ -4921,28 +5216,39 @@ public final class RealmSwiftAdapter:
                             // revival while this write waited owns its new
                             // generation and must remain pending.
                             if let existingMutation,
-                               !BigSyncMutationTrackingRegistry
+                               try !BigSyncMutationTrackingRegistry
                                 .mutationWasCreatedInCurrentTransportIdentity(
                                     existingMutation,
-                                    realm: targetRealm
+                                    realm: targetRealm,
+                                    expectedBindingGenerationIdentifier: recoveryBinding
                                 ) {
                                 targetRealm.delete(existingMutation)
                             }
                             continue
                         }
                         if let existingMutation {
-                            guard !BigSyncMutationTrackingRegistry
+                            guard try !BigSyncMutationTrackingRegistry
                                 .mutationWasCreatedInCurrentTransportIdentity(
                                     existingMutation,
-                                    realm: targetRealm
+                                    realm: targetRealm,
+                                    expectedBindingGenerationIdentifier: recoveryBinding
                                 ) else {
                                 continue
                             }
                             targetRealm.delete(existingMutation)
                         }
-                        let mutationGeneration =
-                            BigSyncMutationTrackingRegistry
-                                .makeMutationGeneration(in: targetRealm)
+                        let mutationContext = BigSyncMutationTrackingRegistry
+                            .mutationContext(className: candidate.entityType, in: targetRealm)
+                        guard mutationContext.trackingStatus == .tracked else {
+                            throw BigSyncMutationJournalError.unregisteredModel(candidate.entityType)
+                        }
+                        // Recovery is fallible work. Provider loss must roll back
+                        // replacement of the old journal, not terminate the process.
+                        let mutationGeneration = try BigSyncMutationTrackingRegistry
+                            .makeMutationGenerationRequiringIdentity(context: mutationContext)
+                        guard mutationGeneration.replicaBindingGenerationIdentifier == recoveryBinding else {
+                            throw BigSyncMutationJournalError.identityChanged
+                        }
                         targetRealm.add(BigSyncPendingMutation(
                             recordName: candidate.identifier,
                             entityType: candidate.entityType,
@@ -5006,7 +5312,7 @@ public final class RealmSwiftAdapter:
                 ), let liveObject = targetRealm.object(
                     ofType: objectType,
                     forPrimaryKey: objectIdentifier
-                ), ((liveObject as? SoftDeletable)?.isDeleted == true)
+                ), Self.requiresCloudKitDeletion(liveObject)
                     == candidate.isDeleted else {
                     continue
                 }
@@ -5353,22 +5659,23 @@ public final class RealmSwiftAdapter:
         } else {
             results = allResults.where { $0.state == state.rawValue }
         }
-        // Capture only primary keys before materializing any records. The
-        // missing-target path in recordToUpload can mark a tracking row as
-        // deleted; iterating a live Results while that write occurs can leave
-        // Realm's fast enumerator pointing at invalidated storage.
-        let candidateIdentifiers = results.map(\.identifier)
+        // A short-lived frozen query keeps iteration stable if serialization
+        // changes a live tracking row. Resolve only visited rows in the current
+        // Realm; do not copy the entire backlog for every limited upload batch.
+        let candidates = results.freeze()
         var resultArray = [PreparedRecordUpload]()
         var includedEntityIDs = Set<String>()
 
         func appendUploadRecords(
+            from selectedCandidates: Results<SyncedEntity>,
             matching include: (String) -> Bool
         ) throws {
-            for identifier in candidateIdentifiers {
+            for snapshot in selectedCandidates {
+                if resultArray.count >= limit { return }
+                try Task.checkCancellation()
+                guard !cancelSync else { throw CancellationError() }
+                let identifier = snapshot.identifier
                 guard include(identifier) else { continue }
-                if resultArray.count >= limit {
-                    return
-                }
                 guard let candidate = persistenceRealm.object(
                     ofType: SyncedEntity.self,
                     forPrimaryKey: identifier
@@ -5434,15 +5741,17 @@ public final class RealmSwiftAdapter:
 #if DEBUG
         // Ensure dummy records are uploaded first.
         if dummyRecordIdentifiers.isEmpty {
-            try appendUploadRecords { _ in true }
+            try appendUploadRecords(from: candidates) { _ in true }
         } else {
-            try appendUploadRecords { dummyRecordIdentifiers.contains($0) }
+            try appendUploadRecords(from: candidates.filter(
+                "identifier IN %@", Array(dummyRecordIdentifiers)
+            )) { _ in true }
             if resultArray.count < limit {
-                try appendUploadRecords { !dummyRecordIdentifiers.contains($0) }
+                try appendUploadRecords(from: candidates) { !dummyRecordIdentifiers.contains($0) }
             }
         }
 #else
-        try appendUploadRecords { _ in true }
+        try appendUploadRecords(from: candidates) { _ in true }
 #endif
 
         return resultArray
@@ -5456,16 +5765,27 @@ public final class RealmSwiftAdapter:
         includeAllProperties: Bool = false
     ) throws -> CKRecord? {
         try Self.validateCloudKitRecordName(syncedEntity.identifier)
-        let record = if let targetZoneID {
-            CKRecord(
+        let record: CKRecord
+        if let targetZoneID {
+            record = CKRecord(
                 recordType: syncedEntity.entityType,
                 recordID: CKRecord.ID(
                     recordName: syncedEntity.identifier,
                     zoneID: targetZoneID
                 )
             )
+        } else if syncedEntity.encodedRecord != nil {
+            // A present invalid archive is uncertainty, not evidence that this
+            // is a new record. Do not silently discard a tag or send this
+            // object's values under another record's cached identity.
+            guard let cached = getRecord(for: syncedEntity) else {
+                throw RealmSwiftAdapterError.invalidSystemFields(
+                    recordName: syncedEntity.identifier
+                )
+            }
+            record = cached
         } else {
-            getRecord(for: syncedEntity) ?? CKRecord(
+            record = CKRecord(
                 recordType: syncedEntity.entityType,
                 recordID: CKRecord.ID(
                     recordName: syncedEntity.identifier,
@@ -5483,10 +5803,13 @@ public final class RealmSwiftAdapter:
                 entityType: syncedEntity.entityType
             )
         }
-        let object = realmProvider?.targetReaderRealmPerSchemaName[objectClass.className()]?.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
+        guard let realmProvider,
+              let targetRealm = realmProvider.targetReaderRealmPerSchemaName[objectClass.className()],
+              let persistenceRealm = realmProvider.persistenceRealm else {
+            throw RealmSwiftAdapterError.setupUnavailable
+        }
+        let object = targetRealm.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
         let entityState = syncedEntity.state
-
-        guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
         guard let object else {
             // Object does not exist, but tracking syncedEntity thinks it does.
             // We mark it as deleted so the iCloud record will get deleted too
@@ -5505,6 +5828,9 @@ public final class RealmSwiftAdapter:
             object,
             entityType: syncedEntity.entityType
         ) else { return nil }
+        if let validator = object as? BigSyncOutboundSemanticObjectValidating {
+            try validator.validateOutboundSemanticObject(in: targetRealm)
+        }
 
         let skippedKeys: Set<String>
         if let skippable = object as? SyncSkippablePropertiesModel {
@@ -5873,6 +6199,15 @@ public final class RealmSwiftAdapter:
         }
 #endif
 
+        if let admittingType = objectClass as?
+            BigSyncRealmSemanticRecordAdmitting.Type {
+            guard let targetRealm = object.realm else {
+                throw BigSyncSemanticAdmissionUnavailable(
+                    entityType: objectClass.className()
+                )
+            }
+            try admittingType.validateSemanticAdmission(of: record, in: targetRealm)
+        }
         //        debugPrint("# TO UPLOAD:", record.debugDescription)
         return record
     }
@@ -5890,12 +6225,13 @@ public final class RealmSwiftAdapter:
             .where { $0.state == SyncedEntityState.deletedRemotely.rawValue }
             .compactMap { entity -> RemoteDeletionSnapshot? in
                 guard !self.excludedClassNames.contains(entity.entityType) else { return nil }
-                let prefix = entity.entityType + "."
-                guard entity.identifier.hasPrefix(prefix) else { return nil }
+                guard let objectIdentifier = BigSyncRecordIdentifier.objectIdentifier(
+                    from: entity.identifier, entityType: entity.entityType
+                ) else { return nil }
                 return RemoteDeletionSnapshot(
                     recordName: entity.identifier,
                     entityType: entity.entityType,
-                    objectIdentifier: String(entity.identifier.dropFirst(prefix.count))
+                    objectIdentifier: objectIdentifier
                 )
             }
 
@@ -5916,6 +6252,7 @@ public final class RealmSwiftAdapter:
             try await _testBeforeCleanupTargetWrite?()
 #endif
             try await targetRealm.asyncWrite {
+                var publicationInvalidations = BigSyncInboundPublicationInvalidations()
                 for deletion in deletions {
                     try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
@@ -5952,10 +6289,17 @@ public final class RealmSwiftAdapter:
                        !softDeletable.isDeleted {
                         continue
                     }
+                    if let retained = object as? BigSyncRetainsSyncedTombstone,
+                       retained.retainsSyncedTombstone {
+                        committedRecordNames.insert(deletion.recordName)
+                        continue
+                    }
                     if let syncable = object as? any SyncableBase,
                        syncable.needsSyncToAppServer {
                         continue
                     }
+                    try publicationInvalidations.record(objectClass, in: targetRealm,
+                        existingObject: object, allowTargeting: true)
                     targetRealm.delete(object)
                     committedRecordNames.insert(deletion.recordName)
                 }
@@ -5993,10 +6337,51 @@ public final class RealmSwiftAdapter:
 
     // MARK: - QSModelAdapter
 
+    /// Staging/tracking outcomes are keyed by name. Reject a foreign zone or
+    /// ambiguous input batch before any target group, quarantine, or system
+    /// fields can commit. Page-commit validation is too late for this boundary.
+    @BigSyncBackgroundActor
+    private func validateInboundRecordIDs(_ recordIDs: some Sequence<CKRecord.ID>) throws {
+        try Task.checkCancellation()
+        guard !cancelSync else { throw CancellationError() }
+        var names = Set<String>()
+        for recordID in recordIDs {
+            guard recordID.zoneID == zoneID else {
+                throw RealmSwiftInboundPageCommitError.eventOutsideAdapterZone(
+                    recordName: recordID.recordName
+                )
+            }
+            guard names.insert(recordID.recordName).inserted else {
+                throw RealmSwiftInboundPageCommitError.duplicateInboundEvent(
+                    recordName: recordID.recordName
+                )
+            }
+        }
+    }
+
+    /// Keep the actual consumption record stable across the actor hop. The
+    /// model may snapshot bounded assets but cannot retarget transport proof.
+    @BigSyncBackgroundActor
+    private func validatedInboundRecord(
+        _ record: CKRecord,
+        using validator: BigSyncInboundSemanticRecordValidating.Type
+    ) throws -> CKRecord {
+        let validated = try validator.validatedInboundRecord(record)
+        guard validated.recordID == record.recordID,
+              validated.recordType == record.recordType,
+              validated.recordChangeTag == record.recordChangeTag else {
+            throw RealmSwiftAdapterError.malformedRecordIdentifier(
+                recordName: record.recordID.recordName, entityType: record.recordType
+            )
+        }
+        return validated
+    }
+
     @BigSyncBackgroundActor
     public func validateAuthoritativeOwnUploadRecords(
         _ records: [CKRecord]
     ) async throws -> [InboundLiveResult] {
+        try validateInboundRecordIDs(records.lazy.map(\.recordID))
         try await ensureSetup()
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else {
@@ -6023,7 +6408,8 @@ public final class RealmSwiftAdapter:
                 await targetReaderRealm.asyncRefresh()
             }
 
-            for record in chunk {
+            for receivedRecord in chunk {
+                var record = receivedRecord
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 guard !excludedClassNames.contains(record.recordType) else {
@@ -6044,8 +6430,14 @@ public final class RealmSwiftAdapter:
                     BigSyncInboundSemanticRecordValidating.Type
                 let replacementValidatingType = objectClass as?
                     BigSyncInboundSemanticReplacementValidating.Type
+                let targetValidatingType = objectClass as?
+                    BigSyncInboundSemanticTargetValidating.Type
+                let admittingType = objectClass as?
+                    BigSyncRealmSemanticRecordAdmitting.Type
                 guard recordValidatingType != nil
-                        || replacementValidatingType != nil else {
+                        || replacementValidatingType != nil
+                        || targetValidatingType != nil
+                        || admittingType != nil else {
                     dispositionsByRecordName[record.recordID.recordName] =
                         .ignoredExplicitAuthority
                     continue
@@ -6054,9 +6446,25 @@ public final class RealmSwiftAdapter:
                     .inboundSemanticQuarantineScopeIdentifier(record)
 
                 do {
-                    try recordValidatingType?
-                        .validateInboundSemanticRecord(record)
-                    if let replacementValidatingType {
+                    if let admittingType {
+                        guard let targetRealm = realmProvider
+                            .targetReaderRealmPerSchemaName[record.recordType] else {
+                            throw BigSyncSemanticAdmissionUnavailable(
+                                entityType: record.recordType
+                            )
+                        }
+                        try admittingType.validateSemanticAdmission(
+                            of: record, in: targetRealm
+                        )
+                    }
+                    if let recordValidatingType {
+                        record = try validatedInboundRecord(record, using: recordValidatingType)
+                    }
+                    if replacementValidatingType != nil || targetValidatingType != nil {
+                        guard let targetRealm = realmProvider
+                            .targetReaderRealmPerSchemaName[record.recordType] else {
+                            throw BigSyncSemanticAdmissionUnavailable(entityType: record.recordType)
+                        }
                         guard let objectIdentifier = getObjectIdentifier(
                             recordName: record.recordID.recordName,
                             entityType: record.recordType
@@ -6067,21 +6475,20 @@ public final class RealmSwiftAdapter:
                                     entityType: record.recordType
                                 )
                         }
-                        let existingObject = realmProvider
-                            .targetReaderRealmPerSchemaName[record.recordType]?
-                            .object(
-                                ofType: objectClass,
-                                forPrimaryKey: objectIdentifier
-                            )
-                        _ = try replacementValidatingType
-                            .inboundSemanticReplacementDisposition(
-                                record,
-                                existingObject: existingObject
-                            )
+                        let existingObject = targetRealm.object(
+                            ofType: objectClass, forPrimaryKey: objectIdentifier)
+                        if let targetValidatingType {
+                            _ = try targetValidatingType.inboundSemanticTargetDisposition(
+                                record, existingObject: existingObject, in: targetRealm)
+                        } else if let replacementValidatingType {
+                            _ = try replacementValidatingType.inboundSemanticReplacementDisposition(
+                                record, existingObject: existingObject)
+                        }
                     }
                     dispositionsByRecordName[record.recordID.recordName] =
                         .validatedAuthoritativeOwnUpload
                 } catch {
+                    try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
                     let quarantine = try inboundSemanticQuarantine(
                         for: record,
                         error: error,
@@ -6124,6 +6531,7 @@ public final class RealmSwiftAdapter:
         in records: [CKRecord],
         forceSave: Bool
     ) async throws -> [InboundLiveResult] {
+        try validateInboundRecordIDs(records.lazy.map(\.recordID))
         guard let realmProvider = realmProvider else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
@@ -6139,9 +6547,7 @@ public final class RealmSwiftAdapter:
             entityType: String,
             expectedMutationGeneration: String?,
             expectedModifiedAt: Date?,
-            expectedExplicitlyModifiedAt: Date?,
-            semanticReplacementDisposition:
-                BigSyncInboundSemanticReplacementDisposition
+            expectedExplicitlyModifiedAt: Date?
         )] = []
         var syncedEntitiesToCreate = [String: SyncedEntity]()
         var semanticQuarantines = [BigSyncInboundSemanticQuarantine]()
@@ -6165,7 +6571,8 @@ public final class RealmSwiftAdapter:
                 await targetReaderRealm.asyncRefresh()
             }
             var remoteRecreationClaims = Set<String>()
-            for record in chunk {
+            for receivedRecord in chunk {
+                var record = receivedRecord
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
                 // Exclusions define ownership in both directions. Records for
@@ -6188,13 +6595,30 @@ public final class RealmSwiftAdapter:
                 let semanticScopeIdentifier = (objectClass as?
                     BigSyncInboundSemanticRecordValidating.Type)?
                     .inboundSemanticQuarantineScopeIdentifier(record)
-                if let validatingType = objectClass as?
-                    BigSyncInboundSemanticRecordValidating.Type {
+                if objectClass is BigSyncInboundSemanticRecordValidating.Type
+                    || objectClass is BigSyncRealmSemanticRecordAdmitting.Type {
                     do {
-                        try validatingType.validateInboundSemanticRecord(
-                            record
-                        )
+                        // Dataset admission precedes protocol-specific decoding.
+                        // An unavailable local authority is not a quarantine
+                        // verdict on bytes the current protocol cannot interpret.
+                        if let admittingType = objectClass as?
+                            BigSyncRealmSemanticRecordAdmitting.Type {
+                            guard let targetRealm = realmProvider
+                                .targetReaderRealmPerSchemaName[record.recordType] else {
+                                throw BigSyncSemanticAdmissionUnavailable(
+                                    entityType: record.recordType
+                                )
+                            }
+                            try admittingType.validateSemanticAdmission(
+                                of: record, in: targetRealm
+                            )
+                        }
+                        if let validatingType = objectClass as?
+                            BigSyncInboundSemanticRecordValidating.Type {
+                            record = try validatedInboundRecord(record, using: validatingType)
+                        }
                     } catch {
+                        try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
                         let quarantine = try inboundSemanticQuarantine(
                             for: record,
                             error: error,
@@ -6278,44 +6702,6 @@ public final class RealmSwiftAdapter:
                             ofType: objectClass,
                             forPrimaryKey: objectIdentifier
                         )
-                        let semanticReplacementDisposition:
-                            BigSyncInboundSemanticReplacementDisposition
-                        if let replacementValidatingType = objectClass as?
-                            BigSyncInboundSemanticReplacementValidating.Type {
-                            do {
-                                semanticReplacementDisposition =
-                                    try replacementValidatingType
-                                    .inboundSemanticReplacementDisposition(
-                                        record,
-                                        existingObject: existingObject
-                                    )
-                            } catch {
-                                let quarantine = try inboundSemanticQuarantine(
-                                    for: record,
-                                    error: error,
-                                    semanticScopeIdentifier:
-                                        semanticScopeIdentifier,
-                                    importRunIdentifier:
-                                        importRunIdentifier
-                                )
-                                semanticQuarantines.append(quarantine)
-                                dispositionsByRecordName[
-                                    record.recordID.recordName
-                                ] = .quarantined(
-                                    lineageID: quarantine.lineageID
-                                )
-                                syncedEntitiesToCreate[
-                                    record.recordID.recordName
-                                ] = nil
-                                logger.error(
-                                    "QSCloudKitSynchronizer >> Quarantined immutable collision for \(record.recordType) record \(record.recordID.recordName): \(String(describing: error))"
-                                )
-                                continue
-                            }
-                        } else {
-                            semanticReplacementDisposition =
-                                .applyIncomingRecord
-                        }
                         let expectedModifiedAt =
                             (existingObject as? ChangeMetadataRecordable)?
                                 .modifiedAt
@@ -6331,8 +6717,7 @@ public final class RealmSwiftAdapter:
                             syncedEntity.entityType,
                             expectedMutationGeneration,
                             expectedModifiedAt,
-                            expectedExplicitlyModifiedAt,
-                            semanticReplacementDisposition
+                            expectedExplicitlyModifiedAt
                         )
                         guard !cancelSync else { throw CancellationError() }
                         try Task.checkCancellation()
@@ -6358,11 +6743,6 @@ public final class RealmSwiftAdapter:
                                 ] = .preservedPendingLocal(
                                     generation: generation
                                 )
-                            } else if semanticReplacementDisposition
-                                        == .preserveExistingObject {
-                                dispositionsByRecordName[
-                                    record.recordID.recordName
-                                ] = .preservedImmutable
                             } else {
                                 dispositionsByRecordName[
                                     record.recordID.recordName
@@ -6444,9 +6824,7 @@ public final class RealmSwiftAdapter:
                         entityType: $0.entityType,
                         expectedMutationGeneration: $0.expectedMutationGeneration,
                         expectedModifiedAt: $0.expectedModifiedAt,
-                        expectedExplicitlyModifiedAt: $0.expectedExplicitlyModifiedAt,
-                        semanticReplacementDisposition:
-                            $0.semanticReplacementDisposition
+                        expectedExplicitlyModifiedAt: $0.expectedExplicitlyModifiedAt
                     )
                 }
                 do {
@@ -6459,15 +6837,18 @@ public final class RealmSwiftAdapter:
                                 relationships: [PendingRelationshipRequest],
                                 appliedRecordNames: Set<String>,
                                 preservedDispositionsByRecordName:
-                                    [String: InboundLiveDisposition]
+                                    [String: InboundLiveDisposition],
+                                replacementFailures: [String: any Error]
                             ) in
                             var relationshipRequests =
                                 [PendingRelationshipRequest]()
                             var appliedRecordNames = Set<String>()
                             var preservedDispositionsByRecordName =
                                 [String: InboundLiveDisposition]()
+                            var replacementFailures = [String: any Error]()
+                            try Task.checkCancellation()
                             guard realmProvider.targetWriterRealms != nil else {
-                                return ([], [], [:])
+                                throw RealmSwiftAdapterError.setupUnavailable
                             }
                             var candidatesByRealm = [
                                 String: (
@@ -6484,7 +6865,9 @@ public final class RealmSwiftAdapter:
                                 guard let targetWriterRealm = realmProvider
                                     .targetWriterRealmPerSchemaName[
                                         candidate.objectType.className()
-                                    ] else { continue }
+                                    ] else {
+                                    throw RealmSwiftAdapterError.setupUnavailable
+                                }
                                 let schemaName = candidate.objectType.className()
                                 let realmIdentity: String
                                 if let cachedIdentity = realmIdentityBySchemaName[
@@ -6519,7 +6902,8 @@ public final class RealmSwiftAdapter:
                                 try Task.checkCancellation()
 
                                 try await targetWriterRealm.asyncWrite { [weak self] in
-                                    guard let self else { return }
+                                    guard let self else { throw RealmSwiftAdapterError.setupUnavailable }
+                                    var publicationInvalidations = BigSyncInboundPublicationInvalidations()
                                     for candidate in group.candidates {
                                         try Task.checkCancellation()
 
@@ -6544,11 +6928,56 @@ public final class RealmSwiftAdapter:
                                         let currentExplicitlyModifiedAt =
                                             (object as? ChangeMetadataRecordable)?
                                                 .explicitlyModifiedAt
-                                        guard currentMutationGeneration
-                                                == candidate.expectedMutationGeneration,
-                                              currentModifiedAt == candidate.expectedModifiedAt,
-                                              currentExplicitlyModifiedAt
-                                                == candidate.expectedExplicitlyModifiedAt else {
+                                        // Intrinsic record validation runs before selection.
+                                        // Replacement validation belongs to this transaction:
+                                        // equal timestamps/journal IDs do not prove that the
+                                        // immutable fields match an earlier reader snapshot.
+                                        let replacementDisposition:
+                                            BigSyncInboundSemanticReplacementDisposition
+                                        do {
+                                            if let admittingType = candidate.objectType as?
+                                                BigSyncRealmSemanticRecordAdmitting.Type {
+                                                try admittingType.validateSemanticAdmission(
+                                                    of: candidate.record, in: targetWriterRealm
+                                                )
+                                            }
+                                            if let validator = candidate.objectType as?
+                                                BigSyncInboundSemanticTargetValidating.Type {
+                                                replacementDisposition = try validator
+                                                    .inboundSemanticTargetDisposition(
+                                                        candidate.record, existingObject: object,
+                                                        in: targetWriterRealm
+                                                    )
+                                            } else if let validator = candidate.objectType as?
+                                                BigSyncInboundSemanticReplacementValidating.Type {
+                                                replacementDisposition = try validator
+                                                    .inboundSemanticReplacementDisposition(
+                                                        candidate.record,
+                                                        existingObject: object
+                                                    )
+                                            } else {
+                                                replacementDisposition = .applyIncomingRecord
+                                            }
+                                        } catch {
+                                            try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
+                                            // No target fields have changed for this record.
+                                            // Its quarantine is persisted with the chunk's
+                                            // tracking outcomes on the tracking Realm actor.
+                                            replacementFailures[candidate.syncedEntityID] = error
+                                            continue
+                                        }
+                                        let selectionStillMatches = currentMutationGeneration
+                                            == candidate.expectedMutationGeneration
+                                            && currentModifiedAt == candidate.expectedModifiedAt
+                                            && currentExplicitlyModifiedAt == candidate.expectedExplicitlyModifiedAt
+                                        // Ordinary records retain their newer-local selection
+                                        // fence. An explicit domain winner was just proved
+                                        // against the current target, so its decision must
+                                        // not disappear because a pending generation was
+                                        // replaced or acknowledged while selection suspended.
+                                        if !selectionStillMatches,
+                                           replacementDisposition != .preferIncomingRecord,
+                                           replacementDisposition != .preferExistingObject {
                                             if let currentMutationGeneration {
                                                 preservedDispositionsByRecordName[
                                                     candidate.syncedEntityID
@@ -6562,7 +6991,8 @@ public final class RealmSwiftAdapter:
                                             )
                                             continue
                                         }
-                                        if currentMutationGeneration != nil {
+                                        if currentMutationGeneration != nil,
+                                           replacementDisposition != .preferIncomingRecord {
                                             // The durable local journal is the
                                             // authority for user intent. Keep
                                             // the target values untouched while
@@ -6577,9 +7007,7 @@ public final class RealmSwiftAdapter:
                                             )
                                             continue
                                         }
-                                        if candidate
-                                            .semanticReplacementDisposition
-                                            == .preserveExistingObject {
+                                        if replacementDisposition == .preserveExistingObject {
                                             // Immutable semantic records may
                                             // accept newer CloudKit system
                                             // fields without allowing audit or
@@ -6593,9 +7021,47 @@ public final class RealmSwiftAdapter:
                                             )
                                             continue
                                         }
+                                        if replacementDisposition == .preferExistingObject {
+                                            guard let changeMetadata = object as? ChangeMetadataRecordable else {
+                                                throw RealmSwiftAdapterError.missingChangeMetadataConformance(
+                                                    entityType: candidate.entityType
+                                                )
+                                            }
+                                            // The server has an older semantic value, not
+                                            // merely different audit metadata. Keep the
+                                            // selected target uploadable without a second
+                                            // journal or a domain-owned journal mutation.
+                                            try changeMetadata
+                                                .journalCurrentValuePreservingChangeMetadata(at: Date())
+                                            appliedRecordNames.insert(candidate.syncedEntityID)
+                                            continue
+                                        }
+                                        // A changed CloudKit tag still needs the later tracking
+                                        // write, but matching target values must not cross a new
+                                        // domain publication boundary. Recheck inside this write,
+                                        // after admission, pending-generation and winner checks.
+                                        // Delegates, relationships, recreation and restore admission
+                                        // may have additional effects for matching received fields.
+                                        if let object, self.delegate == nil,
+                                           replacementDisposition == .applyIncomingRecord,
+                                           candidate.syncedEntityState != .deletedRemotely,
+                                           candidate.syncedEntityState != .recreatingRemotely,
+                                           !object.objectSchema.properties.contains(where: {
+                                               $0.type == .object || $0.type == .linkingObjects
+                                           }),
+                                           (object as? BigSyncRestoredObjectRecovering)?
+                                            .isAwaitingRecoveryEvidence != true,
+                                           !self.hasChanges(record: candidate.record, object: object) {
+                                            preservedDispositionsByRecordName[candidate.syncedEntityID] = .unchanged
+                                            continue
+                                        }
                                         try Task.checkCancellation()
 
-                                        if object == nil {
+                                        // Capture existence at the actual target write,
+                                        // after admission/pending preservation. Constructor
+                                        // defaults are not a competing local record version.
+                                        let isNewObject = object == nil
+                                        if isNewObject {
                                             object = candidate.objectType.init()
                                             try Task.checkCancellation()
 
@@ -6619,9 +7085,26 @@ public final class RealmSwiftAdapter:
                                                     to: object,
                                                     syncedEntityID: candidate.syncedEntityID,
                                                     syncedEntityState: candidate.syncedEntityState,
-                                                    entityType: candidate.entityType
+                                                    entityType: candidate.entityType,
+                                                    isNewObject: isNewObject,
+                                                    preferIncomingRecord:
+                                                        replacementDisposition == .preferIncomingRecord,
+                                                    publicationInvalidations: &publicationInvalidations
                                                 )
                                             )
+                                            if currentMutationGeneration != nil {
+                                                guard let changeMetadata = object as? ChangeMetadataRecordable else {
+                                                    throw RealmSwiftAdapterError.missingChangeMetadataConformance(
+                                                        entityType: candidate.entityType
+                                                    )
+                                                }
+                                                // Only a model-selected incoming winner
+                                                // reaches here with pending local work.
+                                                // Replace its generation atomically with
+                                                // the new value; old in-flight acks lose.
+                                                try changeMetadata
+                                                .journalCurrentValuePreservingChangeMetadata(at: Date())
+                                            }
                                             appliedRecordNames.insert(
                                                 candidate.syncedEntityID
                                             )
@@ -6632,11 +7115,31 @@ public final class RealmSwiftAdapter:
                             return (
                                 relationshipRequests,
                                 appliedRecordNames,
-                                preservedDispositionsByRecordName
+                                preservedDispositionsByRecordName,
+                                replacementFailures
                             )
                     }()
                     let relationshipRequests = importResult.relationships
                     let appliedRecordNames = importResult.appliedRecordNames
+                    var targetQuarantines = [BigSyncInboundSemanticQuarantine]()
+                    for item in chunk {
+                        guard let error = importResult.replacementFailures[
+                            item.syncedEntityID
+                        ] else { continue }
+                        let scope = (item.objectClass as?
+                            BigSyncInboundSemanticRecordValidating.Type)?
+                            .inboundSemanticQuarantineScopeIdentifier(item.record)
+                        let quarantine = try inboundSemanticQuarantine(
+                            for: item.record,
+                            error: error,
+                            semanticScopeIdentifier: scope,
+                            importRunIdentifier: importRunIdentifier
+                        )
+                        targetQuarantines.append(quarantine)
+                        dispositionsByRecordName[item.syncedEntityID] =
+                            .quarantined(lineageID: quarantine.lineageID)
+                        syncedEntitiesToCreate[item.syncedEntityID] = nil
+                    }
                     for (recordName, disposition) in importResult
                         .preservedDispositionsByRecordName {
                         dispositionsByRecordName[recordName] = disposition
@@ -6660,7 +7163,10 @@ public final class RealmSwiftAdapter:
                         syncedEntitiesToCreate[$0.syncedEntityID]
                     }
                     try await persistenceRealm.asyncWrite { [weak self] in
-                        guard let self else { return }
+                        guard let self else { throw RealmSwiftAdapterError.setupUnavailable }
+                        for quarantine in targetQuarantines {
+                            persistenceRealm.add(quarantine, update: .modified)
+                        }
                         for entity in newEntitiesForChunk {
                             // A journal forwarder can create or update this
                             // record after selection but before this write.
@@ -6677,6 +7183,9 @@ public final class RealmSwiftAdapter:
                         for item in chunk {
                             try Task.checkCancellation()
                             guard !cancelSync else { throw CancellationError() }
+                            guard importResult.replacementFailures[
+                                item.syncedEntityID
+                            ] == nil else { continue }
                             let syncedEntity: SyncedEntity
                             if let existing = persistenceRealm.object(
                                 ofType: SyncedEntity.self,
@@ -6824,6 +7333,7 @@ public final class RealmSwiftAdapter:
     public func deleteRecords(
         with recordIDs: [CKRecord.ID]
     ) async throws -> [InboundDeletionResult] {
+        try validateInboundRecordIDs(recordIDs)
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
@@ -6873,10 +7383,9 @@ public final class RealmSwiftAdapter:
                 objectIdentifier: recordID.recordName,
                 realm: persistenceRealm
             )
-            let parsedEntityType = recordID.recordName
-                .split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-                .first
-                .map(String.init)
+            let parsedEntityType = BigSyncRecordIdentifier.entityType(
+                from: recordID.recordName
+            )
             guard let entityType = syncedEntity?.entityType
                     ?? parsedEntityType else {
                 throw RealmSwiftAdapterError.malformedRecordIdentifier(
@@ -6895,18 +7404,9 @@ public final class RealmSwiftAdapter:
                     entityType
                 )
             }
-            let prefix = entityType + "."
-            guard recordID.recordName.hasPrefix(prefix) else {
-                throw RealmSwiftAdapterError.malformedRecordIdentifier(
-                    recordName: recordID.recordName,
-                    entityType: entityType
-                )
-            }
-            let objectIdentifier = String(
-                recordID.recordName.dropFirst(prefix.count)
-            )
-            guard !objectIdentifier.isEmpty,
-                  let primaryKey = getObjectIdentifier(
+            guard let objectIdentifier = BigSyncRecordIdentifier.objectIdentifier(
+                from: recordID.recordName, entityType: entityType
+            ), let primaryKey = getObjectIdentifier(
                     stringObjectId: objectIdentifier,
                     entityType: entityType
                   ) else {
@@ -6954,7 +7454,8 @@ public final class RealmSwiftAdapter:
                         existingObject: localObject
                     )
                 } catch {
-                    let quarantine = inboundSemanticDeletionQuarantine(
+                    try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
+                    let quarantine = try inboundSemanticDeletionQuarantine(
                         for: recordID,
                         entityType: entityType,
                         error: error,
@@ -7018,12 +7519,13 @@ public final class RealmSwiftAdapter:
             try Task.checkCancellation()
             guard let objectClass = realmObjectClass(name: entityType),
                   let targetRealm = realmProvider.targetReaderRealmPerSchemaName[entityType] else {
-                continue
+                throw RealmSwiftAdapterError.setupUnavailable
             }
 #if DEBUG
             try await _testBeforeRemoteDeletionTargetWrite?()
 #endif
             try await targetRealm.asyncWrite {
+                var publicationInvalidations = BigSyncInboundPublicationInvalidations()
                 for deletion in entityDeletions {
                     try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
@@ -7056,13 +7558,58 @@ public final class RealmSwiftAdapter:
                                 entityType: entityType
                             )
                     }
-                    if let object = targetRealm.object(
+                    let object = targetRealm.object(
                         ofType: objectClass,
                         forPrimaryKey: objectIdentifier
-                    ) {
-                        if let object = object as? SoftDeletable {
-                            object.isDeleted = true
+                    )
+                    // Write entry refreshes Realm. Neither the account field nor
+                    // a domain's deletion authority may be reused from selection.
+                    if accountScopePropertyByClassName[entityType] != nil {
+                        guard activeAccountScopeIdentifier != nil else {
+                            throw RealmSwiftAdapterError.accountScopeUnavailable(
+                                entityType: entityType
+                            )
                         }
+                        if let object, !objectIsEligibleForActiveAccount(
+                            object, entityType: entityType
+                        ) {
+                            dispositionsByRecordName[deletion.recordName] =
+                                .ignoredExplicitAuthority
+                            continue
+                        }
+                    }
+                    if let validator = objectClass as?
+                        BigSyncInboundSemanticDeletionValidating.Type {
+                        let recordID = CKRecord.ID(
+                            recordName: deletion.recordName, zoneID: recordZoneID
+                        )
+                        do {
+                            try validator.validateInboundSemanticDeletion(
+                                recordID, existingObject: object
+                            )
+                        } catch {
+                            try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
+                            let scope = validator
+                                .inboundSemanticDeletionQuarantineScopeIdentifier(
+                                    recordID, existingObject: object
+                                )
+                            let quarantine = try inboundSemanticDeletionQuarantine(
+                                for: recordID,
+                                entityType: entityType,
+                                error: error,
+                                semanticScopeIdentifier: scope,
+                                importRunIdentifier: importRunIdentifier
+                            )
+                            semanticQuarantines.append(quarantine)
+                            dispositionsByRecordName[deletion.recordName] =
+                                .quarantined(lineageID: quarantine.lineageID)
+                            continue
+                        }
+                    }
+                    if let object = object as? SoftDeletable, !object.isDeleted {
+                        object.isDeleted = true
+                        try publicationInvalidations.record(objectClass, in: targetRealm,
+                            existingObject: object as? Object, allowTargeting: true)
                     }
                     committedRemoteDeletions.append(deletion)
                     dispositionsByRecordName[deletion.recordName] =
@@ -7278,6 +7825,15 @@ public final class RealmSwiftAdapter:
         return recordsArray
     }
 
+    @BigSyncBackgroundActor
+    private func requireMutationResponseZone(_ recordIDs: some Sequence<CKRecord.ID>) throws {
+        try Task.checkCancellation()
+        guard !cancelSync else { throw CancellationError() }
+        guard recordIDs.allSatisfy({ $0.zoneID == zoneID }) else {
+            throw RealmSwiftAdapterAcknowledgementError.recordOutsideAdapterZone
+        }
+    }
+
     /// Prepares upload records together with an opaque snapshot of their local
     /// mutation generations. Pass this batch back when acknowledging successes.
     @BigSyncBackgroundActor
@@ -7320,6 +7876,8 @@ public final class RealmSwiftAdapter:
         savedRecords: [CKRecord],
         matchingGenerations: [String: String]
     ) async throws {
+        try requireMutationResponseZone(savedRecords.lazy.map(\.recordID))
+
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else { return }
         var acknowledgedGenerations = [String: String]()
@@ -7511,6 +8069,8 @@ public final class RealmSwiftAdapter:
         recordIDs deletedRecordIDs: [CKRecord.ID],
         matchingGenerations: [String: String]
     ) async throws {
+        try requireMutationResponseZone(deletedRecordIDs)
+
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else { return }
         var acknowledgedGenerations = [String: String]()
@@ -7659,6 +8219,8 @@ public final class RealmSwiftAdapter:
         _ recordIDs: [CKRecord.ID],
         matchingPreparedGenerations: [String: String]
     ) async throws {
+        try requireMutationResponseZone(recordIDs)
+
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
 
         for chunk in recordIDs.chunks(ofCount: 1000) {
@@ -7701,6 +8263,8 @@ public final class RealmSwiftAdapter:
         using serverRecords: [CKRecord],
         matchingPreparedGenerations: [String: String]
     ) async throws {
+        try requireMutationResponseZone(serverRecords.lazy.map(\.recordID))
+
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm,
               !serverRecords.isEmpty else { return }
@@ -7763,19 +8327,33 @@ public final class RealmSwiftAdapter:
         return zoneID
     }
 
+    /// Read the one checkpoint from the querying tracking snapshot. This helper
+    /// is also used by page CAS, terminal evidence, and quarantine lineage.
+    private static func storedZoneCursor(in realm: Realm) throws -> Data? {
+        try RecordZoneChangeCursor(
+            persistedValues: realm.objects(ServerToken.self).lazy.map(\.token)
+        )?.serializedData
+    }
+
     public var serverChangeToken: RecordZoneChangeCursor? {
-        get async {
-            return await { @BigSyncBackgroundActor in
-                guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
-                let serverToken = persistenceRealm.objects(ServerToken.self).first
-                return serverToken?.token.map(RecordZoneChangeCursor.init(serializedData:))
+        get async throws {
+            return try await { @BigSyncBackgroundActor in
+                try Task.checkCancellation()
+                guard let persistenceRealm = realmProvider?.persistenceRealm else {
+                    throw RealmSwiftAdapterError.setupUnavailable
+                }
+                let data = try Self.storedZoneCursor(in: persistenceRealm)
+                return data.map(RecordZoneChangeCursor.init(serializedData:))
             }()
         }
     }
 
     @BigSyncBackgroundActor
     public func saveToken(_ token: RecordZoneChangeCursor?) async throws {
-        //        debugPrint("# saveToken", token, recordZoneID)
+        try Task.checkCancellation()
+        if let token, token.serializedData.isEmpty {
+            throw CloudKitChangeFeedError.invalidPageCursor
+        }
         // Token migration and zone-token publication require the same completed
         // readiness boundary as imports and uploads. Returning while setup is
         // incomplete would let callers discard their only durable token copy.
@@ -7832,18 +8410,18 @@ public final class RealmSwiftAdapter:
                   )?.epoch ?? 0) == expectedChangeFeedEpoch else {
                 throw CancellationError()
             }
-            // Resolve the managed token at the transaction boundary rather than
-            // carrying a Realm object across the async-write suspension.
-            let serverToken: ServerToken
-            if let existingToken = persistenceRealm.objects(ServerToken.self).first {
-                serverToken = existingToken
+            // Only an explicit reset may discard corrupt/ambiguous checkpoints.
+            // A non-nil save cannot silently select and overwrite the first row.
+            if let token {
+                _ = try Self.storedZoneCursor(in: persistenceRealm)
+                let serverToken = persistenceRealm.objects(ServerToken.self).first ?? ServerToken()
+                if serverToken.realm == nil { persistenceRealm.add(serverToken) }
+                serverToken.token = token.serializedData
             } else {
-                serverToken = ServerToken()
-                persistenceRealm.add(serverToken)
-            }
-
-            serverToken.token = token?.serializedData
-            if token == nil {
+                persistenceRealm.delete(persistenceRealm.objects(ServerToken.self))
+                // Preserve the existing explicit-reset representation, but
+                // collapse any ambiguous old rows inside this same write.
+                persistenceRealm.add(ServerToken())
                 var candidateReceiptIDs = Set<String>()
                 if let resetNamespace {
                     for quarantine in persistenceRealm.objects(
@@ -7878,6 +8456,13 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     public func commitInboundPage(_ page: InboundPageCommit) async throws {
+        try Task.checkCancellation()
+        guard !page.nextCursor.serializedData.isEmpty else {
+            throw CloudKitChangeFeedError.invalidPageCursor
+        }
+        if let previous = page.previousCursor, previous.serializedData.isEmpty {
+            throw CloudKitChangeFeedError.corruptCursor
+        }
         try await ensureSetup()
         guard let persistenceRealm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
@@ -8148,7 +8733,7 @@ public final class RealmSwiftAdapter:
         collectsCommittedInboundIdentities: Bool,
         in realm: Realm
     ) throws {
-        let liveCurrentCursor = realm.objects(ServerToken.self).first?.token
+        let liveCurrentCursor = try storedZoneCursor(in: realm)
         guard liveCurrentCursor == expectedPreviousCursor else {
             throw RealmSwiftInboundPageCommitError.previousCursorMismatch
         }

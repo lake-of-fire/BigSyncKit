@@ -4,7 +4,10 @@ import CloudKit
 ///
 /// BigSync consumes every item result independently so a successful record is
 /// acknowledged only for the journal generation that produced it, while a
-/// conflict, missing item, or transient failure remains explicit.
+/// conflict, missing item, or transient failure remains explicit. Each save
+/// value and server-conflict record must identify the requested item, including
+/// its zone; save values also retain its record type. A result dictionary key
+/// alone is not authority to acknowledge a differently identified value.
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
 public struct CloudKitRecordMutationResults {
     public let saveResults: [CKRecord.ID: Result<CKRecord, Error>]

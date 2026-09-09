@@ -53,11 +53,16 @@ public final class BigSyncPendingMutation: Object {
         let installationPrefix = installationGenerationPrefix
             + identity.installationIdentifier + ":"
         guard generation.hasPrefix(installationPrefix) else { return false }
-        let suffix = generation.dropFirst(installationPrefix.count)
+        var suffix = generation.dropFirst(installationPrefix.count)
         if let binding = identity.replicaBindingGenerationIdentifier {
-            return suffix.hasPrefix("binding:" + binding + ":")
+            let bindingPrefix = "binding:" + binding + ":"
+            guard suffix.hasPrefix(bindingPrefix) else { return false }
+            suffix = suffix.dropFirst(bindingPrefix.count)
         }
-        return !suffix.hasPrefix("binding:")
+        // Every installation-owned generation is minted with a UUID nonce.
+        // A matching authority prefix alone is not a well-formed mutation;
+        // do not adopt a truncated/corrupt journal during exact handoff.
+        return UUID(uuidString: String(suffix)) != nil
     }
 
     @Persisted(primaryKey: true) public var recordName = ""
@@ -175,6 +180,32 @@ struct BigSyncPendingMutationSnapshot: Sendable {
     let generation: String
     let changedAt: Date
     let isDeletion: Bool
+}
+
+/// Transaction-local proof of a fresh metadata refresh. Only BigSyncKit can
+/// construct witnesses; they are never persisted as a second outbox.
+public struct BigSyncMutationJournalWitness: Sendable, Equatable {
+    public let recordName: String
+    public let entityType: String
+    public let objectIdentifier: String
+    public let accountScopeIdentifier: String?
+    public let generation: String
+    public let identity: BigSyncMutationJournalIdentity
+}
+
+public enum BigSyncMutationJournalError: Error, Sendable, Equatable {
+    case authoritativeMutationRequired
+    case objectUnavailable
+    case writeTransactionRequired
+    case unregisteredModel(String)
+    case excludedModel(String)
+    case missingJournalSchema
+    case unsupportedPrimaryKey(String)
+    case identityUnavailable
+    case identityChanged
+    case invalidAccountScope(String)
+    case accountScopeChanged(String)
+    case witnessMismatch(String)
 }
 
 enum BigSyncMutationTrackingRegistry {
@@ -314,32 +345,24 @@ enum BigSyncMutationTrackingRegistry {
     }
 
     static func makeMutationGeneration(
-        in realm: Realm
+        context: MutationContext
     ) -> (
         generation: String,
         replicaBindingGenerationIdentifier: String?
     ) {
-        let context = lock.withLock {
-            let registration = registrationsByRealm[
-                identity(for: realm.configuration)
-            ]
-            return MutationContext(
-                trackingStatus: registration == nil
-                    ? .unregistered
-                    : .tracked,
-                accountScopePropertyName: nil,
-                installationIdentifierProvider:
-                    registration?.installationIdentifierProvider,
-                mutationJournalIdentityProvider:
-                    registration?.mutationJournalIdentityProvider
-            )
+        do {
+            return try makeMutationGenerationRequiringIdentity(context: context)
+        } catch {
+            fatalError("BigSync mutation identity is unavailable for a registered target Realm")
         }
-        return makeMutationGeneration(context: context)
     }
 
-    static func makeMutationGeneration(
+    /// Throwing transport path. A registered provider returning nil is not
+    /// permission to commit an unjournaled conflict winner. Unbound test and
+    /// legacy configurations with no identity provider retain process IDs.
+    static func makeMutationGenerationRequiringIdentity(
         context: MutationContext
-    ) -> (
+    ) throws -> (
         generation: String,
         replicaBindingGenerationIdentifier: String?
     ) {
@@ -348,37 +371,17 @@ enum BigSyncMutationTrackingRegistry {
                   !identity.installationIdentifier.isEmpty,
                   identity.replicaBindingGenerationIdentifier?.isEmpty
                     != true else {
-                fatalError(
-                    "BigSync mutation identity is unavailable for a registered target Realm"
-                )
+                throw BigSyncMutationJournalError.identityUnavailable
             }
-            if let binding =
-                identity.replicaBindingGenerationIdentifier {
-                return (
-                    BigSyncPendingMutation.makeGeneration(
-                        installationIdentifier:
-                            identity.installationIdentifier,
-                        replicaBindingGenerationIdentifier: binding
-                    ),
-                    binding
-                )
-            }
-            return (
-                BigSyncPendingMutation.makeGeneration(
-                    installationIdentifier:
-                        identity.installationIdentifier
-                ),
-                nil
-            )
+            return makeMutationGeneration(identity: identity)
         }
         guard let installationProvider =
                 context.installationIdentifierProvider else {
             return (BigSyncPendingMutation.makeGeneration(), nil)
         }
-        guard let installationIdentifier = installationProvider() else {
-            fatalError(
-                "BigSync installation identity is unavailable for a registered target Realm"
-            )
+        guard let installationIdentifier = installationProvider(),
+              !installationIdentifier.isEmpty else {
+            throw BigSyncMutationJournalError.identityUnavailable
         }
         return (
             BigSyncPendingMutation.makeGeneration(
@@ -388,83 +391,100 @@ enum BigSyncMutationTrackingRegistry {
         )
     }
 
-    static func accountScopeIdentifier(
-        for object: Object,
-        entityType: String,
-        propertyName: String?
-    ) -> String? {
-        guard let propertyName else { return nil }
-        guard object.objectSchema.properties.contains(where: {
-            $0.name == propertyName && $0.type == .string
-        }) else {
-            preconditionFailure(
-                "BigSync account-scope property \(entityType).\(propertyName) is missing or not a String"
-            )
+    static func makeMutationGeneration(
+        context: MutationContext,
+        expectedIdentity: BigSyncMutationJournalIdentity
+    ) throws -> (
+        generation: String,
+        replicaBindingGenerationIdentifier: String?
+    ) {
+        guard let identity = context.mutationJournalIdentityProvider?(),
+              !identity.installationIdentifier.isEmpty,
+              identity.replicaBindingGenerationIdentifier?.isEmpty != true else {
+            throw BigSyncMutationJournalError.identityUnavailable
         }
-        guard let value = object[propertyName] as? String,
-              !value.isEmpty else {
-            preconditionFailure(
-                "BigSync account-scoped mutation for \(entityType) has no immutable account scope"
-            )
+        guard identity == expectedIdentity else {
+            throw BigSyncMutationJournalError.identityChanged
         }
-        return value
+        return makeMutationGeneration(identity: identity)
     }
 
-    static func generationWasCreatedInCurrentInstallation(
-        _ generation: String,
-        realm: Realm
-    ) -> Bool {
-        let provider = lock.withLock {
-            let registration = registrationsByRealm[
-                identity(for: realm.configuration)
-            ]
+    private static func makeMutationGeneration(
+        identity: BigSyncMutationJournalIdentity
+    ) -> (
+        generation: String,
+        replicaBindingGenerationIdentifier: String?
+    ) {
+        if let binding = identity.replicaBindingGenerationIdentifier {
             return (
-                registration?.mutationJournalIdentityProvider,
-                registration?.installationIdentifierProvider
+                BigSyncPendingMutation.makeGeneration(
+                    installationIdentifier: identity.installationIdentifier,
+                    replicaBindingGenerationIdentifier: binding
+                ),
+                binding
             )
         }
-        if let combinedProvider = provider.0 {
-            guard let identity = combinedProvider() else { return false }
-            return BigSyncPendingMutation.wasCreatedInInstallation(
-                generation,
+        return (
+            BigSyncPendingMutation.makeGeneration(
                 installationIdentifier: identity.installationIdentifier
-            )
-        }
-        guard let installationProvider = provider.1 else {
-            return BigSyncPendingMutation.wasCreatedInCurrentProcess(generation)
-        }
-        guard let installationIdentifier = installationProvider() else {
-            return false
-        }
-        return BigSyncPendingMutation.wasCreatedInInstallation(
-            generation,
-            installationIdentifier: installationIdentifier
+            ),
+            nil
         )
     }
 
+    /// Recovery may discard historical outbox entries only after resolving the
+    /// current identity. Provider unavailability is uncertainty, not evidence
+    /// that a pending mutation came from a backup. Sample the registration once;
+    /// never fall back to process identity when an installed provider returns nil.
+    /// A successor provider binding is not this recovery run's authority to
+    /// retire preceding work: the existing handoff/retry must reconcile it.
     static func mutationWasCreatedInCurrentTransportIdentity(
         _ mutation: BigSyncPendingMutation,
-        realm: Realm
-    ) -> Bool {
-        guard let mutationBinding =
-                mutation.replicaBindingGenerationIdentifier else {
-            return generationWasCreatedInCurrentInstallation(
-                mutation.generation,
-                realm: realm
+        realm: Realm,
+        expectedBindingGenerationIdentifier: String?
+    ) throws -> Bool {
+        let registration = lock.withLock {
+            registrationsByRealm[identity(for: realm.configuration)]
+        }
+        guard let registration else {
+            throw BigSyncMutationJournalError.unregisteredModel(mutation.entityType)
+        }
+        if let provider = registration.mutationJournalIdentityProvider {
+            guard let current = provider(), !current.installationIdentifier.isEmpty,
+                  current.replicaBindingGenerationIdentifier?.isEmpty != true else {
+                throw BigSyncMutationJournalError.identityUnavailable
+            }
+            guard current.replicaBindingGenerationIdentifier
+                    == expectedBindingGenerationIdentifier else {
+                throw BigSyncMutationJournalError.identityChanged
+            }
+            guard mutation.replicaBindingGenerationIdentifier
+                    == current.replicaBindingGenerationIdentifier else { return false }
+            return BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(
+                mutation.generation, identity: current
             )
         }
-        let provider = lock.withLock {
-            registrationsByRealm[
-                identity(for: realm.configuration)
-            ]?.mutationJournalIdentityProvider
+        if let provider = registration.installationIdentifierProvider {
+            guard let installation = provider(), !installation.isEmpty else {
+                throw BigSyncMutationJournalError.identityUnavailable
+            }
+            guard expectedBindingGenerationIdentifier == nil else {
+                throw BigSyncMutationJournalError.identityChanged
+            }
+            guard mutation.replicaBindingGenerationIdentifier == nil else { return false }
+            return BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(
+                mutation.generation,
+                identity: .init(installationIdentifier: installation,
+                                replicaBindingGenerationIdentifier: nil)
+            )
         }
-        guard let identity = provider?(),
-              identity.replicaBindingGenerationIdentifier
-                == mutationBinding else { return false }
-        return BigSyncPendingMutation.wasCreatedInInstallation(
-            mutation.generation,
-            installationIdentifier: identity.installationIdentifier
-        )
+        // Explicitly unbound configurations use the process prefix. This is
+        // not a fallback for an unavailable installation/binding provider.
+        guard expectedBindingGenerationIdentifier == nil else {
+            throw BigSyncMutationJournalError.identityChanged
+        }
+        return mutation.replicaBindingGenerationIdentifier == nil
+            && BigSyncPendingMutation.wasCreatedInCurrentProcess(mutation.generation)
     }
 
 }
@@ -515,6 +535,62 @@ public enum BigSyncMutationTracking {
             mutationJournalIdentityProvider:
                 mutationJournalIdentityProvider
         )
+    }
+
+    /// Captures installation and binding together from the provider registered
+    /// for this exact Realm. Missing identity is retryable, not a process trap.
+    public static func requireCurrentJournalIdentity(
+        in realm: Realm
+    ) throws -> BigSyncMutationJournalIdentity {
+        guard let identity = BigSyncMutationTrackingRegistry
+            .currentMutationJournalIdentity(in: realm),
+              !identity.installationIdentifier.isEmpty,
+              identity.replicaBindingGenerationIdentifier?.isEmpty != true else {
+            throw BigSyncMutationJournalError.identityUnavailable
+        }
+        return identity
+    }
+
+    /// Checks exact command authority even for a no-op, then requires each
+    /// final pending row to retain the fresh generation returned by its write.
+    /// A second refresh of the same record must supply its final witness only.
+    public static func verifyJournalWitnesses(
+        _ witnesses: [BigSyncMutationJournalWitness],
+        expectedIdentity: BigSyncMutationJournalIdentity,
+        in realm: Realm
+    ) throws {
+        guard realm.isInWriteTransaction else {
+            throw BigSyncMutationJournalError.writeTransactionRequired
+        }
+        guard try requireCurrentJournalIdentity(in: realm) == expectedIdentity else {
+            throw BigSyncMutationJournalError.identityChanged
+        }
+        guard realm.schema.objectSchema.contains(where: {
+            $0.className == BigSyncPendingMutation.className()
+        }) else {
+            throw BigSyncMutationJournalError.missingJournalSchema
+        }
+        var verifiedNames = Set<String>()
+        for witness in witnesses {
+            guard witness.identity == expectedIdentity,
+                  verifiedNames.insert(witness.recordName).inserted,
+                  let mutation = realm.object(
+                    ofType: BigSyncPendingMutation.self,
+                    forPrimaryKey: witness.recordName
+                  ),
+                  mutation.entityType == witness.entityType,
+                  mutation.objectIdentifier == witness.objectIdentifier,
+                  mutation.accountScopeIdentifier == witness.accountScopeIdentifier,
+                  mutation.replicaBindingGenerationIdentifier
+                    == expectedIdentity.replicaBindingGenerationIdentifier,
+                  mutation.generation == witness.generation,
+                  BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(
+                    mutation.generation,
+                    identity: expectedIdentity
+                  ) else {
+                throw BigSyncMutationJournalError.witnessMismatch(witness.recordName)
+            }
+        }
     }
 
     /// Returns the one live transport identity shared by the supplied

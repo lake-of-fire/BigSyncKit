@@ -43,8 +43,8 @@ extension CloudKitSynchronizer {
     
 #if DEBUG
     /// Fixture-only nonthrowing token seam. Production commits every cursor
-    /// through `persistDatabaseToken(_:)` so a disk failure cannot be reported
-    /// as a completed CloudKit page.
+    /// through `persistDatabaseToken(_:)` and loads through the throwing loader
+    /// below. Tests may deliberately inject invalid bytes through this seam.
     @BigSyncBackgroundActor
     var storedDatabaseToken: DatabaseChangeCursor? {
         get {
@@ -62,20 +62,26 @@ extension CloudKitSynchronizer {
             }
         }
     }
-#else
-    @BigSyncBackgroundActor
-    var storedDatabaseToken: DatabaseChangeCursor? {
-        guard let encodedToken = keyValueStore.object(
-            forKey: userDefaultsKey(for: databaseServerChangeTokenKey)
-        ) as? Data else { return nil }
-        return DatabaseChangeCursor(serializedData: encodedToken)
-    }
 #endif
+
+    /// Missing storage is the first-fetch state. A present value of the wrong
+    /// type, or an empty archive, must enter fenced change-feed recovery rather
+    /// than silently erasing the consumed database boundary.
+    @BigSyncBackgroundActor
+    func loadStoredDatabaseToken() throws -> DatabaseChangeCursor? {
+        let key = userDefaultsKey(for: databaseServerChangeTokenKey)
+        return try DatabaseChangeCursor(
+            persistedValue: keyValueStore.bigSyncDurableObject(forKey: key)
+        )
+    }
 
     @BigSyncBackgroundActor
     func persistDatabaseToken(_ token: DatabaseChangeCursor?) throws {
         let key = userDefaultsKey(for: databaseServerChangeTokenKey)
         if let token {
+            guard !token.serializedData.isEmpty else {
+                throw CloudKitChangeFeedError.invalidPageCursor
+            }
             try keyValueStore.bigSyncSetDurably(
                 value: token.serializedData,
                 forKey: key

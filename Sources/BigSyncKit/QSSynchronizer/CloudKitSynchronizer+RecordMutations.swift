@@ -1,6 +1,13 @@
 import CloudKit
 import Foundation
 
+/// A malformed transport result must not acknowledge or import another record.
+/// These are operation-boundary errors, not semantic quarantine decisions.
+enum BigSyncRecordMutationIdentityError: Error, Equatable, Sendable {
+    case invalidPreparedBatch
+    case responseIdentityMismatch
+}
+
 struct PreparedMutationRetryKey: Hashable, Sendable {
     let recordID: CKRecord.ID
     let generation: String?
@@ -67,6 +74,18 @@ extension CloudKitSynchronizer {
     /// retry allowance.
     private static let maximumHandledRetriesPerDrain = 1_000
 
+    /// The generation map is keyed by record name. Require one unambiguous
+    /// name in this adapter's zone before either networking or acknowledgement.
+    private func validatePreparedMutationIDs(
+        _ recordIDs: [CKRecord.ID],
+        for adapter: ModelAdapter
+    ) throws {
+        guard recordIDs.allSatisfy({ $0.zoneID == adapter.recordZoneID }),
+              Set(recordIDs.map(\.recordName)).count == recordIDs.count else {
+            throw BigSyncRecordMutationIdentityError.invalidPreparedBatch
+        }
+    }
+
     private func partialMutationError(
         _ failures: [CKRecord.ID: NSError]
     ) -> CKError {
@@ -113,6 +132,7 @@ extension CloudKitSynchronizer {
             guard !prepared.isEmpty else { return }
 
             let records = prepared.map(\.record)
+            try validatePreparedMutationIDs(records.map(\.recordID), for: adapter)
             let generations = prepared.reduce(into: [String: String]()) {
                 guard let generation = $1.generation else { return }
                 $0[$1.record.recordID.recordName] = generation
@@ -157,6 +177,12 @@ extension CloudKitSynchronizer {
                 }
                 switch result {
                 case .success(let savedRecord):
+                    guard savedRecord.recordID == record.recordID,
+                          savedRecord.recordType == record.recordType else {
+                        unresolvedFailures[record.recordID] =
+                            BigSyncRecordMutationIdentityError.responseIdentityMismatch as NSError
+                        continue
+                    }
                     retryBudget.retire(retryKey)
                     savedRecords.append(savedRecord)
                 case .failure(let error):
@@ -191,6 +217,12 @@ extension CloudKitSynchronizer {
                     } else if let serverRecord = nsError.userInfo[
                         CKRecordChangedErrorServerRecordKey
                     ] as? CKRecord {
+                        guard serverRecord.recordID == record.recordID,
+                              serverRecord.recordType == record.recordType else {
+                            unresolvedFailures[record.recordID] =
+                                BigSyncRecordMutationIdentityError.responseIdentityMismatch as NSError
+                            continue
+                        }
                         conflictedRecordsByID[record.recordID] = serverRecord
                     } else {
                         unresolvedFailures[record.recordID] = nsError
@@ -289,6 +321,7 @@ extension CloudKitSynchronizer {
             guard !prepared.isEmpty else { return }
 
             let recordIDs = prepared.map(\.recordID)
+            try validatePreparedMutationIDs(recordIDs, for: adapter)
             let generations = prepared.reduce(into: [String: String]()) {
                 guard let generation = $1.generation else { return }
                 $0[$1.recordID.recordName] = generation
@@ -332,6 +365,11 @@ extension CloudKitSynchronizer {
                               let serverRecord = nsError.userInfo[
                                   CKRecordChangedErrorServerRecordKey
                               ] as? CKRecord {
+                        guard serverRecord.recordID == recordID else {
+                            unresolvedFailures[recordID] =
+                                BigSyncRecordMutationIdentityError.responseIdentityMismatch as NSError
+                            continue
+                        }
                         do {
                             try retryBudget.register(
                                 retryKey,

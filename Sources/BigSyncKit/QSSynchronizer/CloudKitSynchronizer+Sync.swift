@@ -38,7 +38,12 @@ extension CloudKitSynchronizer {
     func performSynchronization() async {
         logger.info("QSCloudKitSynchronizer >> Perform synchronization...")
         self.postNotification(.SynchronizerWillSynchronize)
-        self.serverChangeToken = self.storedDatabaseToken
+        do {
+            self.serverChangeToken = try loadStoredDatabaseToken()
+        } catch {
+            await failSynchronization(error: error)
+            return
+        }
         self.uploadRetries = 0
         self.didNotifyUpload = Set<CKRecordZone.ID>()
         await fetchChanges()
@@ -103,6 +108,24 @@ extension CloudKitSynchronizer {
             restartSynchronizationForTerminalWork()
             return
         }
+
+#if DEBUG
+        do {
+            // The upload callback runs before the confirmation fetch and its
+            // adapter cleanup.  At that point the durable journal can still
+            // contain every uploaded generation.  This checkpoint belongs
+            // after that confirmation tail has proven zero pending work, but
+            // before any terminal publication evidence or completion delivery.
+            try await processKillCheckpointHandler?(
+                .localAcknowledgementBeforeTerminalPublication
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            await failSynchronization(error: error)
+            return
+        }
+#endif
         // The migration may finish only after final import forwarding and the
         // terminal pending-state check have proven this drain quiescent.
         do {
@@ -132,6 +155,7 @@ extension CloudKitSynchronizer {
         }
         var publicationBlockers = [DomainBlocker]()
         var domainPublicationScopeIdentifier: String?
+        var postBarrierSnapshotIdentifier: String?
         var inboundIdentityDeliveries = [
             (adapter: ModelAdapter, batch: CommittedInboundIdentityBatch)
         ]()
@@ -184,6 +208,21 @@ extension CloudKitSynchronizer {
                 )
             }
             try await revalidateRunContext(terminalContext)
+            if publicationBlockers.isEmpty, let barrier = postBarrierDrainAuthorization {
+                guard barrier.accountScopeIdentifier == terminalContext.accountScopeIdentifier,
+                      barrier.replicaBindingGenerationIdentifier == terminalContext.replicaBindingGenerationIdentifier,
+                      let lease = try accountScopeLease(),
+                      lease.accountScopeIdentifier == barrier.accountScopeIdentifier,
+                      lease.invalidationGeneration == barrier.accountInvalidationGeneration else {
+                    throw DurableKeyValueStoreError.mutationNotDurable
+                }
+                guard let provider = postBarrierSnapshotIdentifierProvider,
+                      let snapshot = try await provider(), !snapshot.isEmpty else {
+                    throw DurableKeyValueStoreError.mutationNotDurable
+                }
+                postBarrierSnapshotIdentifier = snapshot
+                try await revalidateRunContext(terminalContext)
+            }
             if publicationBlockers.isEmpty,
                let provider = domainPublicationScopeIdentifierProvider {
                 let scope = try await provider()
@@ -232,6 +271,11 @@ extension CloudKitSynchronizer {
         // one.
         if !publicationBlockers.isEmpty {
             do {
+                // A deferred candidate cannot retain prior publication once
+                // terminal semantic validation reports uncertainty/invalidity.
+                try await beginPublicationConsumptionIfNeeded()
+                try await revalidateRunContext(terminalContext)
+                try clearDurablePublicationEvidence()
                 try recordSyncHealth(
                     .semanticBlocked,
                     context: terminalContext
@@ -248,7 +292,8 @@ extension CloudKitSynchronizer {
                 with: .success(SynchronizationResult(
                     didImportChanges:
                         synchronizationDrainDidImportChanges,
-                    publicationState: .blocked(publicationBlockers)
+                    publicationState: .blocked(publicationBlockers),
+                    boundary: .init(context: terminalContext)
                 ))
             )
             // Keep the terminal run owner until the drain waiters have been
@@ -270,7 +315,10 @@ extension CloudKitSynchronizer {
             issuerID: synchronizationReceiptIssuerID,
             authorizationID: authorizationID,
             consumedServerBoundaryIdentifier:
-                consumedServerBoundaryIdentifier
+                consumedServerBoundaryIdentifier,
+            domainPublicationScopeIdentifier: domainPublicationScopeIdentifier,
+            postBarrierDrainAuthorizationID:
+                postBarrierDrainAuthorization?.authorizationID
         )
         let result = SynchronizationResult(
             didImportChanges: synchronizationDrainDidImportChanges,
@@ -278,12 +326,11 @@ extension CloudKitSynchronizer {
         )
         consecutiveTransientCloudKitFailures = 0
         clearPersistedTransientRetryState()
-        if let domainPublicationScopeIdentifier,
-           let consumedServerBoundaryIdentifier,
-           let adapter = modelAdapters.first {
+        if let domainPublicationScopeIdentifier {
             do {
-                guard let changeFeedEpoch = try adapter.changeFeedEpoch()
-                else {
+                guard let consumedServerBoundaryIdentifier,
+                      let adapter = modelAdapters.first,
+                      let changeFeedEpoch = try adapter.changeFeedEpoch() else {
                     throw DurableKeyValueStoreError.mutationNotDurable
                 }
                 try persistDurablePublicationEvidence(
@@ -333,6 +380,32 @@ extension CloudKitSynchronizer {
             return
         }
 #endif
+        if let postBarrierDrainAuthorization,
+           let consumedServerBoundaryIdentifier,
+           let postBarrierSnapshotIdentifier,
+           let recordZoneName = modelAdapters.first?.recordZoneID.zoneName {
+            completedPostBarrierDrain = CompletedPostBarrierDrain(
+                writerBarrierEvidenceID:
+                    postBarrierDrainAuthorization.writerBarrierEvidenceID,
+                accountScopeIdentifier: terminalContext.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier:
+                    terminalContext.replicaBindingGenerationIdentifier,
+                runID: terminalContext.runID,
+                recordZoneName: recordZoneName,
+                consumedServerBoundaryIdentifier:
+                    consumedServerBoundaryIdentifier,
+                snapshotScopeIdentifier:
+                    postBarrierSnapshotIdentifier,
+                accountIdentifier: terminalContext.accountIdentifier,
+                issuerID: synchronizationReceiptIssuerID,
+                receiptAuthorizationID: authorizationID,
+                postBarrierDrainAuthorizationID:
+                    postBarrierDrainAuthorization.authorizationID
+            )
+            // The completed capability retains the exact authorization. A
+            // future drain must be explicitly armed after its own barrier.
+            self.postBarrierDrainAuthorization = nil
+        }
         reportProgress("terminal-receipt")
         finishSynchronizationDrain(with: .success(result))
         // See the blocked path above: close the logical drain before allowing
@@ -390,6 +463,11 @@ extension CloudKitSynchronizer {
         let attemptID = synchronizationAttemptID
         logger.info("QSCloudKitSynchronizer >> Failing or backing off synchronization...")
         
+        if publicationConsumptionPending && !(publicationFetchDeferralEligible && Self.isUnconsumedFetchNetworkFailure(error)) {
+            do { try await beginPublicationConsumptionIfNeeded() }
+            catch { logger.error("Could not fence failed publication: \(error)") }
+            guard synchronizationAttemptID == attemptID else { return }
+        }
         resetActiveTokens()
         
         uploadRetries = 0
@@ -678,8 +756,13 @@ extension CloudKitSynchronizer {
     ) -> Error? {
         switch disposition {
         case .encryptedDataReset:
-            let recoveryWasActive = isEncryptedDataResetRecoveryActive
-                || hasPendingEncryptedDataResetRecovery(context: context)
+            let recoveryWasActive: Bool
+            do {
+                recoveryWasActive = try isEncryptedDataResetRecoveryActive
+                    || hasPendingEncryptedDataResetRecovery(context: context)
+            } catch {
+                return error
+            }
             if !recoveryWasActive {
                 do {
                     try requestChangeFeedRecovery(
@@ -806,7 +889,7 @@ extension CloudKitSynchronizer {
             // dynamically constructing an incompletely configured adapter.
             guard let adapter = modelAdapterDictionary[zoneID] else { continue }
             filteredZoneIDs.append(zoneID)
-            activeZoneTokens[zoneID] = await adapter.serverChangeToken
+            activeZoneTokens[zoneID] = try await loadZoneToken(for: adapter)
         }
         
         return filteredZoneIDs
@@ -896,16 +979,43 @@ extension CloudKitSynchronizer {
         }
     }
     
+    /// The adapter may use its own opaque feed representation, but a present
+    /// empty checkpoint is never the same as an absent checkpoint.
+    @BigSyncBackgroundActor
+    private func loadZoneToken(for adapter: ModelAdapter) async throws -> RecordZoneChangeCursor? {
+        let token = try await adapter.serverChangeToken
+        try Task.checkCancellation()
+        if let token, token.serializedData.isEmpty {
+            throw CloudKitChangeFeedError.corruptCursor
+        }
+        return token
+    }
+
     @BigSyncBackgroundActor
     func needsZoneSetup(adapter: ModelAdapter) async throws -> Bool {
-        //        debugPrint("# needsZoneSetup?", adapter.recordZoneID, adapter.serverChangeToken)
-        return await adapter.serverChangeToken == nil
+        try await loadZoneToken(for: adapter) == nil
     }
 }
 
 //MARK: - Fetch changes
 
 extension CloudKitSynchronizer {
+    /// Only a top-level transport failure before relevant consumption is eligible.
+    /// Partial failures, token expiry, permissions and lifecycle errors fence.
+    nonisolated static func isUnconsumedFetchNetworkFailure(_ error: Error) -> Bool {
+        guard let error = error as? CKError,
+              error.userInfo[CKPartialErrorsByItemIDKey] == nil else { return false }
+        return error.code == .networkFailure || error.code == .networkUnavailable
+    }
+
+    nonisolated static func databasePageRequiresPublicationConsumption(
+        _ page: CloudKitDatabaseChangePage,
+        zoneID: CKRecordZone.ID
+    ) -> Bool {
+        page.cursor.serializedData.isEmpty
+            || page.deletions.contains(where: { $0.zoneID == zoneID })
+    }
+
     @BigSyncBackgroundActor
     func fetchChanges(afterUpload: Bool = false) async {
         let attemptID = synchronizationAttemptID
@@ -921,6 +1031,9 @@ extension CloudKitSynchronizer {
 
             let token = try await fetchDatabaseChanges()
             try await revalidateActiveRunContext(for: attemptID)
+            // Eligible domains keep prior publication through an unchanged
+            // drain. Relevant target writes revoke their same-Realm certificate;
+            // terminal preparation may retain only an exactly matching scope.
 
             // The first migration pass starts with nil database and zone
             // cursors. Reconcile only after every configured zone page has
@@ -975,6 +1088,12 @@ extension CloudKitSynchronizer {
                     resultsLimit: 200
                 )
             } catch {
+                // A delayed result from an obsolete fetch must not fence or
+                // classify lifecycle loss under the successor run's context.
+                try await revalidateActiveRunContext(for: attemptID)
+                if !(publicationFetchDeferralEligible && Self.isUnconsumedFetchNetworkFailure(error)) {
+                    try await beginPublicationConsumptionIfNeeded()
+                }
                 if let context = activeRunContext,
                    let lifecycleError = applyCloudKitLoss(
                     error: error,
@@ -988,6 +1107,16 @@ extension CloudKitSynchronizer {
                 throw error
             }
             try await revalidateActiveRunContext(for: attemptID)
+            // A zone announcement alone contains no target state. Retain the
+            // candidate until its record page is classified; lifecycle deletion
+            // and malformed cursors revoke it immediately.
+            if Self.databasePageRequiresPublicationConsumption(page, zoneID: recordZoneID) {
+                try await beginPublicationConsumptionIfNeeded()
+                try await revalidateActiveRunContext(for: attemptID)
+            }
+            guard !page.cursor.serializedData.isEmpty else {
+                throw CloudKitChangeFeedError.invalidPageCursor
+            }
             changedZoneIDs.formUnion(page.changedZoneIDs)
             deletedZoneIDs.formUnion(page.deletions.map(\.zoneID))
             pageDeletions.append(contentsOf: page.deletions)
@@ -1051,6 +1180,12 @@ extension CloudKitSynchronizer {
             return pageCursor
         }
 
+        // Migration/recovery is never deferral-eligible. Ordinary zone pages
+        // are classified below before they can apply or quarantine any record.
+        if isChangeFeedMigrationActive {
+            try await beginPublicationConsumptionIfNeeded()
+            try await revalidateActiveRunContext(for: attemptID)
+        }
         lastDatabaseChangesEmptyAt = nil
         try checkSynchronizationAttempt(attemptID)
         zoneIDsToFetch.forEach {
@@ -1124,11 +1259,21 @@ extension CloudKitSynchronizer {
                     continue
                 }
                 try await revalidateActiveRunContext(for: attemptID)
+                // A page needs a usable checkpoint before any of its records can
+                // be applied or quarantined, including authoritative own echoes.
+                guard !page.cursor.serializedData.isEmpty else {
+                    throw CloudKitChangeFeedError.invalidPageCursor
+                }
                 try ChangeRequestProcessor.validateInboundPageIdentities(
                     records: page.records,
                     deletedRecordIDs: page.deletedRecordIDs,
                     expectedZoneID: zoneID
                 )
+                if adapter.mayAffectDomainPublication(records: page.records,
+                    deletions: page.deletedRecordIDs) {
+                    try await beginPublicationConsumptionIfNeeded()
+                    try await revalidateActiveRunContext(for: attemptID)
+                }
                 pageIndex += 1
                 // A stable, machine-readable progress checkpoint lets the
                 // disposable E2E client prove it consumed every page through
@@ -1370,11 +1515,6 @@ extension CloudKitSynchronizer {
                 try await revalidateActiveRunContext(for: attemptID)
                 try persistDatabaseToken(serverChangeToken)
                 reportProgress("upload-completed")
-#if DEBUG
-                try await processKillCheckpointHandler?(
-                    .localAcknowledgementBeforeTerminalPublication
-                )
-#endif
                 // Always re-fetch after upload. The next fetch either imports
                 // concurrent server changes or reaches the terminal receipt.
                 await fetchChanges(afterUpload: true)

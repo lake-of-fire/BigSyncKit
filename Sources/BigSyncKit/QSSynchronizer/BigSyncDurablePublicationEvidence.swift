@@ -85,6 +85,26 @@ extension CloudKitSynchronizer {
         )
     }
 
+    /// Exact prior transport evidence, without changing namespace or target state.
+    /// Domain code must independently compare the current Realm scope and gate.
+    func publicationEvidenceForUnconsumedFetch(context: RunContext) throws -> BigSyncDurablePublicationEvidence? {
+        try checkRunContext(context)
+        guard let evidence = try persistedDurablePublicationEvidence(),
+              evidence.accountScopeIdentifier == context.accountScopeIdentifier,
+              evidence.replicaBindingGenerationIdentifier == context.replicaBindingGenerationIdentifier,
+              evidence.zoneName == recordZoneID.zoneName,
+              evidence.zoneOwnerName == recordZoneID.ownerName,
+              try !adaptersHavePendingChangesAtTerminalBoundary(),
+              let adapter = modelAdapters.first,
+              try adapter.changeFeedEpoch() == evidence.changeFeedEpoch,
+              try adapter.consumedServerBoundaryIdentifier(
+                accountScopeIdentifier: context.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier: context.replicaBindingGenerationIdentifier,
+                containerIdentifier: containerIdentifier, databaseScope: database.databaseScope
+              ) == evidence.consumedServerBoundaryIdentifier else { return nil }
+        return evidence
+    }
+
     private func persistedDurablePublicationEvidence() throws
         -> BigSyncDurablePublicationEvidence? {
         guard let raw = try keyValueStore.bigSyncDurableObject(
@@ -171,6 +191,12 @@ extension CloudKitSynchronizer {
                 replicaBindingGenerationIdentifier:
                     replicaBindingGenerationIdentifier
             )
+        }
+        // Configuration starts Realm setup asynchronously. Restoration must
+        // join that existing task before inspecting journals and the cursor;
+        // otherwise a cold launch can discard valid evidence as unavailable.
+        for case let adapter as RealmSwiftAdapter in modelAdapters {
+            try await adapter.ensureSetup()
         }
         guard try !adaptersHavePendingChangesAtTerminalBoundary() else {
             return nil

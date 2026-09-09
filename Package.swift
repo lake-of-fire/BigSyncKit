@@ -3,6 +3,23 @@
 
 import PackageDescription
 
+#if TUIST
+import Foundation
+import ProjectDescription
+
+// The ordered-v2 capacity lane is opt-in. Keep the package's test target and
+// all third-party macro/support targets at their normal Debug settings.
+let orderedPerformanceSettings: Settings =
+    (ProcessInfo.processInfo.environment["MANABI_ORDERED_PERFORMANCE_BUILD"] == "1"
+        || ProcessInfo.processInfo.environment["TUIST_MANABI_ORDERED_PERFORMANCE_BUILD"] == "1")
+    ? .settings(debug: ["SWIFT_OPTIMIZATION_LEVEL": "-O"])
+    : .settings()
+
+let packageSettings = PackageSettings(
+    targetSettings: ["BigSyncKit": orderedPerformanceSettings]
+)
+#endif
+
 let package = Package(
     name: "BigSyncKit",
     // BigSyncKit's supported clients are iOS and macOS. The Realm-backed

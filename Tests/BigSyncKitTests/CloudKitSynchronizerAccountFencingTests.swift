@@ -45,6 +45,50 @@ private final class AccountFencingStore:
     }
 }
 
+/// Faults only the durable recovery-envelope boundary. Other client metadata
+/// uses the existing in-memory store. This is not filesystem durability evidence.
+private final class RecoveryEnvelopeStore: NSObject, DurableKeyValueStore, @unchecked Sendable {
+    enum Fault: Error, Equatable { case read, beforeWrite, afterWrite }
+    let backing = AccountFencingStore()
+    var fault: Fault?
+    var staleLegacyEnvelope: Any?
+    private(set) var legacyEnvelopeReads = 0
+    private(set) var legacyEnvelopeWrites = 0
+    private(set) var durableEnvelopeWrites = 0
+
+    private func isEnvelope(_ key: String) -> Bool { key.contains("ChangeFeedMigration.v3") }
+    func object(forKey key: String) -> Any? {
+        if isEnvelope(key) {
+            legacyEnvelopeReads += 1
+            if let staleLegacyEnvelope { return staleLegacyEnvelope }
+        }
+        return backing.object(forKey: key)
+    }
+    func bool(forKey key: String) -> Bool { backing.bool(forKey: key) }
+    func set(value: Any?, forKey key: String) {
+        if isEnvelope(key) { legacyEnvelopeWrites += 1 }
+        backing.set(value: value, forKey: key)
+    }
+    func set(boolValue: Bool, forKey key: String) { set(value: boolValue, forKey: key) }
+    func removeObject(forKey key: String) { set(value: nil, forKey: key) }
+    func synchronize() -> Bool { true }
+    func prepareForUse() throws {}
+    func validateDurability() throws {}
+    func durableObject(forKey key: String) throws -> Any? {
+        if isEnvelope(key), fault == .read { throw Fault.read }
+        return backing.object(forKey: key)
+    }
+    func setDurably(value: Any?, forKey key: String) throws {
+        if isEnvelope(key) {
+            durableEnvelopeWrites += 1
+            if fault == .beforeWrite { throw Fault.beforeWrite }
+        }
+        backing.set(value: value, forKey: key)
+        if isEnvelope(key), fault == .afterWrite { throw Fault.afterWrite }
+    }
+    func removeDurably(forKey key: String) throws { try setDurably(value: nil, forKey: key) }
+}
+
 private final class AccountFencingTransport:
     NSObject,
     CloudKitDatabaseAdapter,
@@ -149,6 +193,24 @@ private final class AccountFencingModelAdapter:
     var mergePolicy: MergePolicy = .server
     private(set) var resetSyncCachesCount = 0
     private(set) var preparedResetModes = [ChangeFeedResetMode]()
+    private(set) var journalHandoffs = [(BigSyncReplicaJournalHandoff, Bool)]()
+    var rejectJournalHandoff = false
+    var afterResetPreparation: (@Sendable () async throws -> Void)?
+    var afterResetReconciliation: (@Sendable () async throws -> Void)?
+    var afterResetFinish: (@Sendable () async throws -> Void)?
+
+    func reconcileReplicaJournalHandoff(
+        _ handoff: BigSyncReplicaJournalHandoff,
+        accountScopeIdentifier: String,
+        epoch: Int,
+        verifyOnly: Bool
+    ) async throws {
+        if rejectJournalHandoff {
+            throw BigSyncReplicaJournalHandoffError.unexpectedBinding
+        }
+        journalHandoffs.append((handoff, verifyOnly))
+    }
+
     var requestsOneUploadWakeupOnFinish = false
     var hasPendingTerminalChanges = false
     private var rebuildIsActive = false
@@ -172,6 +234,7 @@ private final class AccountFencingModelAdapter:
         preparedResetModes.append(mode)
         rebuildIsActive = true
         try await resetSyncCaches()
+        try await afterResetPreparation?()
     }
     func beginChangeFeedServerBootstrap(
         accountScopeIdentifier: String,
@@ -203,6 +266,7 @@ private final class AccountFencingModelAdapter:
         _ = accountScopeIdentifier
         _ = epoch
         _ = mode
+        try await afterResetReconciliation?()
     }
     func finishChangeFeedReset(
         accountScopeIdentifier: String,
@@ -213,6 +277,7 @@ private final class AccountFencingModelAdapter:
         _ = epoch
         _ = mode
         rebuildIsActive = false
+        try await afterResetFinish?()
     }
     func hasChanges(record: CKRecord, object: RealmSwift.Object) -> Bool { false }
     func saveChanges(
@@ -1510,6 +1575,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
 
         let firstResult = try await first.synchronize()
         XCTAssertNotNil(firstResult.receipt)
+        XCTAssertEqual(firstResult.receipt?.domainPublicationScopeIdentifier, "dataset-a")
 
         func reopened(
             accountIdentifierProvider:
@@ -1577,6 +1643,27 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testDomainReceiptRequiresPersistableServerBoundary() async throws {
+        let store = AccountFencingStore()
+        let zone = makeZoneID()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(), store: store, recordZoneID: zone
+        )
+        let adapter = AccountFencingModelAdapter(zoneID: zone)
+        adapter.feedEpoch = 7
+        adapter.consumedBoundaryIdentifier = nil
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.domainPublicationScopeIdentifierProvider = { "domain-scope" }
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("A domain receipt requires the transport boundary needed by its evidence")
+        } catch {
+            XCTAssertEqual(error as? DurableKeyValueStoreError, .mutationNotDurable)
+        }
+        XCTAssertNil(store.value(forKey: synchronizer.durableStateKey("TerminalPublication.v1")))
+    }
+
+    @BigSyncBackgroundActor
     func testNewDrainClearsPriorPublicationEvidenceBeforeInboundWork()
     async throws {
         let store = AccountFencingStore()
@@ -1612,6 +1699,89 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         XCTAssertNotNil(secondResult.receipt)
         XCTAssertTrue(store.bool(forKey: observedKey))
         XCTAssertNotNil(store.value(forKey: evidenceKey))
+    }
+
+    @BigSyncBackgroundActor
+    func testUnconsumedNetworkFailureAndEmptyPageKeepEvidenceUntilMaintenance() async throws {
+        let store = AccountFencingStore()
+        let transport = AccountFencingTransport()
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(transport: transport, store: store,
+            recordZoneID: zoneID, accountReplacementPolicy: .localDatasetRebootstrap,
+            initialReplicaBindingAdmissionHandler: { _ in })
+        let adapter = AccountFencingModelAdapter(zoneID: zoneID)
+        adapter.consumedBoundaryIdentifier = "boundary-a"
+        adapter.feedEpoch = 3
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.domainPublicationScopeIdentifierProvider = { "dataset-a" }
+        _ = try await synchronizer.synchronize()
+        let key = synchronizer.durableStateKey("TerminalPublication.v1")
+        XCTAssertNotNil(store.value(forKey: key))
+        synchronizer.publicationConsumptionHandler = { _ in store.set(boolValue: true, forKey: "consumed") }
+        synchronizer.publicationConsumptionPending = true
+        synchronizer.publicationFetchDeferralEligible = true
+        transport.nextDatabaseChangesError = CKError(.networkFailure)
+        do {
+            _ = try await synchronizer.fetchDatabaseChanges()
+            XCTFail("Expected the first fetch to fail")
+        } catch { XCTAssertEqual((error as? CKError)?.code, .networkFailure) }
+        XCTAssertFalse(store.bool(forKey: "consumed"))
+        XCTAssertNotNil(store.value(forKey: key))
+        _ = try await synchronizer.fetchDatabaseChanges()
+        XCTAssertFalse(store.bool(forKey: "consumed"))
+        XCTAssertNotNil(store.value(forKey: key))
+        try await synchronizer.beginPublicationConsumptionIfNeeded()
+        XCTAssertTrue(store.bool(forKey: "consumed"))
+        XCTAssertNil(store.value(forKey: key))
+    }
+
+    @BigSyncBackgroundActor
+    func testDatabasePublicationBoundaryIgnoresOnlyValidUnrelatedPages() {
+        let zone = makeZoneID()
+        let unrelated = CKRecordZone.ID(zoneName: "unrelated", ownerName: CKCurrentUserDefaultName)
+        func requiresConsumption(
+            changes: [CKRecordZone.ID] = [],
+            deletions: [CloudKitZoneDeletion] = [],
+            cursor: Data = Data("valid-cursor".utf8)
+        ) -> Bool {
+            CloudKitSynchronizer.databasePageRequiresPublicationConsumption(
+                .init(cursor: .init(serializedData: cursor),
+                      changedZoneIDs: changes, deletions: deletions, moreComing: true),
+                zoneID: zone)
+        }
+        XCTAssertFalse(requiresConsumption())
+        XCTAssertFalse(requiresConsumption(changes: [unrelated]))
+        XCTAssertFalse(requiresConsumption(deletions: [.init(zoneID: unrelated, kind: .purged)]))
+        // Announcements contain no target bytes; the zone page decides.
+        XCTAssertFalse(requiresConsumption(changes: [zone]))
+        for kind in [CloudKitZoneDeletionKind.deleted, .purged, .encryptedDataReset, .unknown] {
+            XCTAssertTrue(requiresConsumption(deletions: [.init(zoneID: zone, kind: kind)]))
+        }
+        XCTAssertTrue(requiresConsumption(cursor: Data()))
+    }
+
+    @BigSyncBackgroundActor
+    func testUnconsumedPermissionFailureRevokesPublicationBeforeRecovery() async throws {
+        let store = AccountFencingStore()
+        let transport = AccountFencingTransport()
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(transport: transport, store: store,
+            recordZoneID: zoneID, accountReplacementPolicy: .localDatasetRebootstrap,
+            initialReplicaBindingAdmissionHandler: { _ in })
+        let adapter = AccountFencingModelAdapter(zoneID: zoneID)
+        adapter.consumedBoundaryIdentifier = "boundary-a"
+        adapter.feedEpoch = 3
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.domainPublicationScopeIdentifierProvider = { "dataset-a" }
+        _ = try await synchronizer.synchronize()
+        synchronizer.publicationConsumptionHandler = { _ in store.set(boolValue: true, forKey: "consumed") }
+        synchronizer.publicationConsumptionPending = true
+        synchronizer.publicationFetchDeferralEligible = true
+        transport.nextDatabaseChangesError = CKError(.permissionFailure)
+        do { _ = try await synchronizer.fetchDatabaseChanges(); XCTFail("Expected permission failure") }
+        catch { XCTAssertEqual((error as? CKError)?.code, .permissionFailure) }
+        XCTAssertTrue(store.bool(forKey: "consumed"))
+        XCTAssertNil(store.value(forKey: synchronizer.durableStateKey("TerminalPublication.v1")))
     }
 
     @BigSyncBackgroundActor
@@ -1659,6 +1829,12 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         let synchronizationResult = try await synchronizer.synchronize()
         XCTAssertNotNil(synchronizationResult.receipt)
         XCTAssertEqual(adapter.preparedResetModes, [.localDatasetRebootstrap])
+        XCTAssertEqual(adapter.journalHandoffs.map { $0.1 }, [false, true])
+        let handoff = try XCTUnwrap(adapter.journalHandoffs.first?.0)
+        XCTAssertEqual(handoff.destinationBindingGenerationIdentifier,
+                       binding.activeGenerationIdentifier)
+        XCTAssertEqual(handoff.retiringBindingGenerationIdentifiers.count, 1)
+
         let envelope = try XCTUnwrap(store.valuesWithPrefix(
             synchronizer.durableStateKey("ChangeFeedMigration.v3")
         ).values.first as? [String: Any])
@@ -1812,7 +1988,102 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         XCTAssertNil(try synchronizer.pendingCloudAccountPortRequirement())
         let envelope = try XCTUnwrap(store.valuesWithPrefix(
             synchronizer.durableStateKey("ChangeFeedMigration.v3")
-        ).values.first as? [String: Any])
+        ).values.compactMap { $0 as? [String: Any] }.first {
+            $0["accountScopeIdentifier"] as? String
+                == CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        })
+        XCTAssertEqual(envelope["mode"] as? String, "localDatasetRebootstrap")
+        XCTAssertEqual(envelope["phase"] as? String, "requested")
+    }
+
+    @BigSyncBackgroundActor
+    func testReverseHandoffPersistenceFailureDoesNotClearPendingPort()
+    async throws {
+        let store = AccountFencingStore()
+        let identity = AccountFencingAccountIdentity("account-a")
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(), store: store,
+            identifier: "reverse-write-ahead-\(UUID().uuidString)",
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .localDatasetRebootstrap,
+            initialReplicaBindingAdmissionHandler: { context in
+                if context.accountScopeIdentifier == CloudKitSynchronizer.accountScopeIdentifier(for: "account-b") {
+                    throw InitialBindingAdmissionTestError.rejected
+                }
+            }
+        )
+        try await synchronizer._test_validateSynchronizationAccount()
+        await identity.replace(with: "account-b")
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected destination admission rejection")
+        } catch InitialBindingAdmissionTestError.rejected {}
+        let pending = try XCTUnwrap(try synchronizer.pendingCloudAccountPortRequirement())
+
+        await identity.replace(with: "account-a")
+        store.undurableKeySubstring = "ChangeFeedMigration.v3"
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected recovery write-ahead persistence to fail")
+        } catch {
+            guard case .unavailable? = error as? DurableKeyValueStoreError else {
+                return XCTFail("Expected the original durable-store failure, got \(error)")
+            }
+        }
+        store.undurableKeySubstring = nil
+        XCTAssertEqual(try synchronizer.pendingCloudAccountPortRequirement(), pending)
+
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertNil(try synchronizer.pendingCloudAccountPortRequirement())
+        let envelope = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.compactMap { $0 as? [String: Any] }.first {
+            $0["accountScopeIdentifier"] as? String
+                == CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        })
+        XCTAssertEqual(envelope["mode"] as? String, "localDatasetRebootstrap")
+    }
+
+    @BigSyncBackgroundActor
+    func testReverseHandoffIntentSurvivesFailingAccountInvalidation()
+    async throws {
+        let store = AccountFencingStore()
+        let identity = AccountFencingAccountIdentity("account-a")
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(), store: store,
+            identifier: "reverse-invalidation-\(UUID().uuidString)",
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .localDatasetRebootstrap,
+            initialReplicaBindingAdmissionHandler: { context in
+                if context.accountScopeIdentifier == CloudKitSynchronizer.accountScopeIdentifier(for: "account-b") {
+                    throw InitialBindingAdmissionTestError.rejected
+                }
+            }
+        )
+        try await synchronizer._test_validateSynchronizationAccount()
+        await identity.replace(with: "account-b")
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected destination admission rejection")
+        } catch InitialBindingAdmissionTestError.rejected {}
+        XCTAssertNotNil(try synchronizer.pendingCloudAccountPortRequirement())
+        synchronizer.accountScopeInvalidationHandler = { _ in
+            throw InitialBindingAdmissionTestError.rejected
+        }
+        await identity.replace(with: "account-a")
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected invalidation to interrupt the return to A")
+        } catch InitialBindingAdmissionTestError.rejected {}
+
+        // Cancellation may already have committed, but the recovery obligation
+        // must not depend on returning successfully from the asynchronous hook.
+        let envelope = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.compactMap { $0 as? [String: Any] }.first {
+            $0["accountScopeIdentifier"] as? String
+                == CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        })
         XCTAssertEqual(envelope["mode"] as? String, "localDatasetRebootstrap")
         XCTAssertEqual(envelope["phase"] as? String, "requested")
     }
@@ -2006,8 +2277,10 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         do {
             try await synchronizer._test_validateSynchronizationAccount()
             XCTFail("Expected the migration durability fence to fail")
-        } catch let error as ChangeFeedMigrationPersistenceError {
-            XCTAssertEqual(error, .stateNotDurable)
+        } catch {
+            guard case .unavailable? = error as? DurableKeyValueStoreError else {
+                return XCTFail("Expected the original durable-store failure, got \(error)")
+            }
         }
 
         XCTAssertEqual(
@@ -2016,9 +2289,13 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             )) as? String,
             "account-a"
         )
-        XCTAssertTrue(store.valuesWithPrefix(
+        // The non-durable store may retain an uncertain proposed envelope.
+        // Do not compensate by overwriting it with an older state. The account
+        // and usable checkpoint must remain unpublished/unchanged on failure.
+        let proposal = try XCTUnwrap(store.valuesWithPrefix(
             synchronizer.durableStateKey("ChangeFeedMigration.v3")
-        ).isEmpty)
+        ).values.first as? [String: Any])
+        XCTAssertEqual(proposal["phase"] as? String, "requested")
         XCTAssertEqual(
             synchronizer.storedDatabaseToken?.serializedData,
             Data("old-account-cursor".utf8)
@@ -2277,6 +2554,549 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             viewModel.cloudKitSyncHealthText,
             "Your iCloud account changed; Manabi data must be moved before sync can resume"
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testNewRecoveryRequestSurvivesOldPreparationCallback() async throws {
+        try await verifyRecoverySupersession(stage: 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testNewRecoveryRequestSurvivesOldReconciliationCallback() async throws {
+        try await verifyRecoverySupersession(stage: 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testNewRecoveryRequestSurvivesOldFinishingCallback() async throws {
+        try await verifyRecoverySupersession(stage: 2)
+    }
+
+    @BigSyncBackgroundActor
+    private func verifyRecoverySupersession(stage: Int) async throws {
+        let store = AccountFencingStore()
+        let transport = AccountFencingTransport()
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(transport: transport, store: store, recordZoneID: zoneID)
+        let adapter = AccountFencingModelAdapter(zoneID: zoneID)
+        synchronizer.addModelAdapter(adapter)
+        let supersede: @Sendable () async throws -> Void = { @BigSyncBackgroundActor in
+            adapter.afterResetPreparation = nil
+            adapter.afterResetReconciliation = nil
+            adapter.afterResetFinish = nil
+            let context = try XCTUnwrap(synchronizer.activeRunContext)
+            try synchronizer.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset)
+        }
+        switch stage {
+        case 0: adapter.afterResetPreparation = supersede
+        case 1: adapter.afterResetReconciliation = supersede
+        default: adapter.afterResetFinish = supersede
+        }
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("Old phase work must not complete a superseding recovery")
+        } catch {
+            XCTAssertEqual(error as? ChangeFeedMigrationPersistenceError, .stateSuperseded)
+        }
+        let values = store.valuesWithPrefix(synchronizer.durableStateKey("ChangeFeedMigration.v3"))
+        let envelope = try XCTUnwrap(values.values.first as? [String: Any])
+        XCTAssertEqual(envelope["mode"] as? String, "encryptedDataReset")
+        XCTAssertEqual(envelope["phase"] as? String, "requested")
+        // The durable new operation remains usable after rejecting the old run.
+        let result = try await synchronizer.synchronize()
+        XCTAssertNotNil(result.receipt)
+        let completed = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.first as? [String: Any])
+        XCTAssertEqual(completed["mode"] as? String, "encryptedDataReset")
+        XCTAssertEqual(completed["phase"] as? String, "completed")
+    }
+
+    @BigSyncBackgroundActor
+    func testHandoffSurvivesTokenRecoveryAndEncryptedReset() throws {
+        let store = AccountFencingStore()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(), store: store
+        )
+        let context = CloudKitSynchronizer.RunContext(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "account-a"),
+            replicaBindingGenerationIdentifier: "binding-b"
+        )
+        let handoff = try BigSyncReplicaJournalHandoff(
+            installationIdentifier: "installation",
+            retiringBindingGenerationIdentifiers: ["binding-a"],
+            destinationBindingGenerationIdentifier: "binding-b"
+        )
+        try synchronizer.requestChangeFeedRecovery(
+            context: context, mode: .localDatasetRebootstrap,
+            replicaJournalHandoff: handoff
+        )
+        try synchronizer.requestChangeFeedRecovery(
+            context: context, mode: .serverReconciliation
+        )
+        var envelope = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.first as? [String: Any])
+        XCTAssertEqual(envelope["mode"] as? String, "localDatasetRebootstrap")
+        XCTAssertEqual(try BigSyncReplicaJournalHandoff(propertyList:
+            XCTUnwrap(envelope["replicaJournalHandoff"] as? [String: Any])
+        ), handoff)
+        try synchronizer.requestChangeFeedRecovery(
+            context: context, mode: .encryptedDataReset
+        )
+        envelope = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.first as? [String: Any])
+        XCTAssertEqual(envelope["mode"] as? String, "encryptedDataReset")
+        XCTAssertEqual(try BigSyncReplicaJournalHandoff(propertyList:
+            XCTUnwrap(envelope["replicaJournalHandoff"] as? [String: Any])
+        ), handoff)
+        // A repeated handoff request must preserve the stronger reset, while
+        // still retaining the exact journal obligation.
+        try synchronizer.requestChangeFeedRecovery(
+            context: context, mode: .localDatasetRebootstrap,
+            replicaJournalHandoff: handoff
+        )
+        envelope = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.first as? [String: Any])
+        XCTAssertEqual(envelope["mode"] as? String, "encryptedDataReset")
+        XCTAssertEqual(try BigSyncReplicaJournalHandoff(propertyList:
+            XCTUnwrap(envelope["replicaJournalHandoff"] as? [String: Any])
+        ), handoff)
+    }
+
+    @BigSyncBackgroundActor
+    func testCorruptRecoveryEnvelopeCannotBeOverwrittenAsAbsent() throws {
+        let store = AccountFencingStore()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(), store: store
+        )
+        let context = CloudKitSynchronizer.RunContext(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        try synchronizer.requestChangeFeedRecovery(context: context)
+        let key = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).keys.first)
+        store.set(value: "corrupt-but-present", forKey: key)
+        XCTAssertThrowsError(try synchronizer.requestChangeFeedRecovery(context: context)) {
+            XCTAssertEqual($0 as? ChangeFeedMigrationPersistenceError, .stateNotDurable)
+        }
+        XCTAssertEqual(store.value(forKey: key) as? String, "corrupt-but-present")
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryEpochOverflowFailsWithoutReplacingEnvelope() throws {
+        let store = AccountFencingStore()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(), store: store
+        )
+        let context = CloudKitSynchronizer.RunContext(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        try synchronizer.requestChangeFeedRecovery(context: context)
+        let key = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).keys.first)
+        var envelope = try XCTUnwrap(store.value(forKey: key) as? [String: Any])
+        envelope["epoch"] = Int.max
+        store.set(value: envelope, forKey: key)
+        XCTAssertThrowsError(try synchronizer.requestChangeFeedRecovery(
+            context: context, mode: .encryptedDataReset
+        )) {
+            XCTAssertEqual($0 as? ChangeFeedMigrationPersistenceError, .stateNotDurable)
+        }
+        XCTAssertEqual((store.value(forKey: key) as? [String: Any])?["epoch"] as? Int, Int.max)
+    }
+
+    @BigSyncBackgroundActor
+    func testInterruptedMultiAccountHandoffCarriesEarlierGenerations() async throws {
+        let store = AccountFencingStore()
+        let identity = AccountFencingAccountIdentity("account-a")
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(), store: store,
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .localDatasetRebootstrap,
+            initialReplicaBindingAdmissionHandler: { _ in }
+        )
+        try await synchronizer._test_validateSynchronizationAccount()
+        let bindingA = try XCTUnwrap(BigSyncReplicaBindingStateStore.load(
+            store: store, key: synchronizer.durableStateKey("ReplicaBinding.v1")
+        )).activeGenerationIdentifier
+        await identity.replace(with: "account-b")
+        try await synchronizer._test_validateSynchronizationAccount()
+        let bindingB = try XCTUnwrap(BigSyncReplicaBindingStateStore.load(
+            store: store, key: synchronizer.durableStateKey("ReplicaBinding.v1")
+        )).activeGenerationIdentifier
+        // No drain of B takes place before switching again.
+        await identity.replace(with: "account-c")
+        try await synchronizer._test_validateSynchronizationAccount()
+        let bindingC = try XCTUnwrap(BigSyncReplicaBindingStateStore.load(
+            store: store, key: synchronizer.durableStateKey("ReplicaBinding.v1")
+        )).activeGenerationIdentifier
+        let scopeC = CloudKitSynchronizer.accountScopeIdentifier(for: "account-c")
+        let envelope = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.compactMap { $0 as? [String: Any] }.first {
+            $0["accountScopeIdentifier"] as? String == scopeC
+        })
+        let handoff = try BigSyncReplicaJournalHandoff(propertyList:
+            XCTUnwrap(envelope["replicaJournalHandoff"] as? [String: Any])
+        )
+        XCTAssertEqual(handoff.destinationBindingGenerationIdentifier, bindingC)
+        XCTAssertEqual(Set(handoff.retiringBindingGenerationIdentifiers), [bindingA, bindingB])
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryUsesOneThrowingSnapshotRatherThanLegacyReread() throws {
+        let store = RecoveryEnvelopeStore()
+        let synchronizer = makeSynchronizer(transport: AccountFencingTransport(), store: store)
+        let context = recoveryContext(synchronizer)
+        try synchronizer.requestChangeFeedRecovery(context: context)
+        store.staleLegacyEnvelope = "a different unchecked snapshot"
+        try synchronizer.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset)
+        let envelope = try XCTUnwrap(store.backing.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.first as? [String: Any])
+        XCTAssertEqual(envelope["mode"] as? String, "encryptedDataReset")
+        XCTAssertEqual(store.legacyEnvelopeReads, 0)
+        XCTAssertEqual(store.legacyEnvelopeWrites, 0)
+        XCTAssertEqual(store.durableEnvelopeWrites, 2)
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryReadFailurePreservesEnvelopeAndUsableCheckpoint() throws {
+        let store = RecoveryEnvelopeStore()
+        let synchronizer = makeSynchronizer(transport: AccountFencingTransport(), store: store)
+        let context = recoveryContext(synchronizer)
+        try synchronizer.requestChangeFeedRecovery(context: context)
+        synchronizer.storedDatabaseToken = .init(serializedData: Data("usable-checkpoint".utf8))
+        let prefix = synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        let original = try XCTUnwrap(store.backing.valuesWithPrefix(prefix).values.first as? [String: Any])
+        let writes = store.durableEnvelopeWrites
+        store.fault = .read
+        XCTAssertThrowsError(try synchronizer.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset)) {
+            XCTAssertEqual($0 as? RecoveryEnvelopeStore.Fault, .read)
+        }
+        XCTAssertThrowsError(try synchronizer.hasPendingEncryptedDataResetRecovery(context: context)) {
+            XCTAssertEqual($0 as? RecoveryEnvelopeStore.Fault, .read)
+        }
+        XCTAssertEqual(store.durableEnvelopeWrites, writes)
+        let retained = try XCTUnwrap(store.backing.valuesWithPrefix(prefix).values.first as? [String: Any])
+        XCTAssertEqual(retained as NSDictionary, original as NSDictionary)
+        XCTAssertEqual(synchronizer.storedDatabaseToken?.serializedData, Data("usable-checkpoint".utf8))
+        store.fault = nil
+        try synchronizer.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset)
+        XCTAssertTrue(try synchronizer.hasPendingEncryptedDataResetRecovery(context: context))
+    }
+
+    @BigSyncBackgroundActor
+    func testUncertainRecoveryWriteIsNotCompensatedWithAnOlderEnvelope() throws {
+        for fault in [RecoveryEnvelopeStore.Fault.beforeWrite, .afterWrite] {
+            let store = RecoveryEnvelopeStore()
+            let synchronizer = makeSynchronizer(transport: AccountFencingTransport(), store: store)
+            let context = recoveryContext(synchronizer)
+            try synchronizer.requestChangeFeedRecovery(context: context)
+            let prefix = synchronizer.durableStateKey("ChangeFeedMigration.v3")
+            let original = try XCTUnwrap(store.backing.valuesWithPrefix(prefix).values.first as? [String: Any])
+            let oldEpoch = try XCTUnwrap(original["epoch"] as? Int)
+            store.fault = fault
+            XCTAssertThrowsError(try synchronizer.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset)) {
+                XCTAssertEqual($0 as? RecoveryEnvelopeStore.Fault, fault)
+            }
+            let retained = try XCTUnwrap(store.backing.valuesWithPrefix(prefix).values.first as? [String: Any])
+            XCTAssertEqual(retained["mode"] as? String,
+                           fault == .afterWrite ? "encryptedDataReset" : "serverReconciliation")
+            XCTAssertEqual(store.legacyEnvelopeWrites, 0)
+            store.fault = nil
+            let writesBeforeRetry = store.durableEnvelopeWrites
+            try synchronizer.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset)
+            let retried = try XCTUnwrap(store.backing.valuesWithPrefix(prefix).values.first as? [String: Any])
+            XCTAssertEqual(retried["epoch"] as? Int, oldEpoch + 1)
+            XCTAssertEqual(store.durableEnvelopeWrites, writesBeforeRetry + (fault == .afterWrite ? 0 : 1))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUncertainSupersedingRecoveryCannotReconcileOrFinishOldAdapterEpoch() async throws {
+        for finishing in [false, true] {
+            let store = RecoveryEnvelopeStore()
+            let zone = makeZoneID()
+            let synchronizer = makeSynchronizer(transport: AccountFencingTransport(), store: store, recordZoneID: zone)
+            let adapter = AccountFencingModelAdapter(zoneID: zone)
+            synchronizer.addModelAdapter(adapter)
+            let context = recoveryContext(synchronizer)
+            synchronizer.activeRunContext = context
+            try await synchronizer.beginChangeFeedMigrationIfNeeded(context: context)
+            if finishing { try await synchronizer.reconcileChangeFeedMigrationIfNeeded(context: context) }
+            let calledKey = "test.obsolete-adapter-called"
+            let callback: @Sendable () async throws -> Void = { @BigSyncBackgroundActor in
+                store.backing.set(boolValue: true, forKey: calledKey)
+            }
+            if finishing { adapter.afterResetFinish = callback }
+            else { adapter.afterResetReconciliation = callback }
+            // The durable store accepted the successor before reporting failure.
+            // The synchronizer's in-memory phase therefore still names the old epoch.
+            store.fault = .afterWrite
+            XCTAssertThrowsError(try synchronizer.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset)) {
+                XCTAssertEqual($0 as? RecoveryEnvelopeStore.Fault, .afterWrite)
+            }
+            store.fault = nil
+            do {
+                if finishing { try await synchronizer.finishChangeFeedMigrationIfNeeded(context: context) }
+                else { try await synchronizer.reconcileChangeFeedMigrationIfNeeded(context: context) }
+                XCTFail("Expected the old adapter operation to be rejected before it runs")
+            } catch {
+                XCTAssertEqual(error as? ChangeFeedMigrationPersistenceError, .stateSuperseded)
+            }
+            XCTAssertFalse(store.backing.bool(forKey: calledKey))
+            let saved = try XCTUnwrap(store.backing.valuesWithPrefix(
+                synchronizer.durableStateKey("ChangeFeedMigration.v3")
+            ).values.first as? [String: Any])
+            XCTAssertEqual(saved["mode"] as? String, "encryptedDataReset")
+            XCTAssertEqual(saved["phase"] as? String, "requested")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func recoveryContext(_ synchronizer: CloudKitSynchronizer) -> CloudKitSynchronizer.RunContext {
+        .init(attemptID: synchronizer.synchronizationAttemptID,
+              runID: synchronizer.synchronizationRunID,
+              accountIdentifier: "account-a",
+              accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "account-a"))
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedOrUnreadableAccountMarkerStopsEveryPolicyBeforeAccountLookup() async throws {
+        for policy in [BigSyncCloudAccountReplacementPolicy.serverReconciliation,
+                       .localDatasetRebootstrap, .requireExplicitDatasetPort] {
+            for bad in [NSNull(), "", 7, Data(), ["account": "old"]] as [Any] {
+                let store = AccountAuthorityTestStore()
+                let transport = AccountFencingTransport()
+                let identity = AccountFencingAccountIdentity("account-a")
+                let synchronizer = makeSynchronizer(
+                    transport: transport, store: store,
+                    accountIdentifierProvider: { await identity.current() },
+                    accountReplacementPolicy: policy,
+                    initialReplicaBindingAdmissionHandler: { _ in })
+                let key = synchronizer.durableStateKey("CloudKitAccountIdentifier")
+                try synchronizer.persistDatabaseToken(DatabaseChangeCursor(serializedData: Data([1, 2, 3])))
+                store.values[key] = bad
+                let writes = store.writes
+                do {
+                    try await synchronizer._test_validateSynchronizationAccount()
+                    XCTFail("Malformed existing account history must not become initial adoption")
+                } catch let error as BigSyncCloudAccountPortError {
+                    XCTAssertEqual(error, .corruptRequirement)
+                }
+                let requests = await identity.requests()
+                XCTAssertEqual(requests, 0)
+                XCTAssertEqual(transport.operationCount, 0)
+                XCTAssertEqual(store.writes, writes)
+                XCTAssertEqual(try synchronizer.loadStoredDatabaseToken()?.serializedData, Data([1, 2, 3]))
+                XCTAssertNil(try synchronizer.accountScopeLease())
+            }
+            let store = AccountAuthorityTestStore()
+            let identity = AccountFencingAccountIdentity("account-a")
+            let transport = AccountFencingTransport()
+            let synchronizer = makeSynchronizer(
+                transport: transport, store: store,
+                accountIdentifierProvider: { await identity.current() },
+                accountReplacementPolicy: policy,
+                initialReplicaBindingAdmissionHandler: { _ in })
+            let key = synchronizer.durableStateKey("CloudKitAccountIdentifier")
+            store.arm(.read, forKey: key)
+            do {
+                try await synchronizer._test_validateSynchronizationAccount()
+                XCTFail("An I/O failure must not become a missing account marker")
+            } catch let error as AccountAuthorityTestStore.Fault {
+                XCTAssertEqual(error, .read)
+            }
+            let requests = await identity.requests()
+            XCTAssertEqual(requests, 0)
+            XCTAssertEqual(transport.operationCount, 0)
+            store.arm(nil, forKey: key)
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTAssertEqual(store.values[key] as? String, "account-a")
+            XCTAssertNotNil(try synchronizer.accountScopeLease())
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUnverifiedLeaseWriteCannotPublishAccountAndRetryReusesAcceptedLease() async throws {
+        for fault in [AccountAuthorityTestStore.Fault.discardWrite, .afterWrite, .readAfterWrite] {
+            let store = AccountAuthorityTestStore()
+            let synchronizer = makeSynchronizer(transport: AccountFencingTransport(), store: store)
+            let leaseKey = synchronizer.durableStateKey("AccountScopeLease.v1")
+            let markerKey = synchronizer.durableStateKey("CloudKitAccountIdentifier")
+            store.arm(fault, forKey: leaseKey)
+            do {
+                try await synchronizer._test_validateSynchronizationAccount()
+                XCTFail("A lease proposal must be verified before publishing validated account state")
+            } catch {
+                XCTAssertTrue(error is AccountAuthorityTestStore.Fault || error is DurableKeyValueStoreError)
+            }
+            XCTAssertTrue(synchronizer.accountValidationRequired)
+            XCTAssertNil(try synchronizer.accountScopeLease())
+            XCTAssertNil(store.values[markerKey])
+            store.arm(nil, forKey: leaseKey)
+            let accepted = try BigSyncAccountScopeLeaseState.load(store: store, key: leaseKey)
+            try await synchronizer._test_validateSynchronizationAccount()
+            let lease = try XCTUnwrap(synchronizer.accountScopeLease())
+            XCTAssertEqual(lease.invalidationGeneration, 0)
+            if fault != .discardWrite { XCTAssertEqual(lease, accepted.lease) }
+            XCTAssertEqual(store.values[markerKey] as? String, "account-a")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDroppedAccountMarkerWriteDoesNotPublishAccountAndCorrectedRetryCompletes() async throws {
+        let store = AccountAuthorityTestStore()
+        let synchronizer = makeSynchronizer(transport: AccountFencingTransport(), store: store)
+        let markerKey = synchronizer.durableStateKey("CloudKitAccountIdentifier")
+        store.arm(.discardWrite, forKey: markerKey)
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("A successful store return is not a matching account readback")
+        } catch let error as DurableKeyValueStoreError {
+            if case .mutationNotDurable = error {} else { XCTFail("Unexpected \(error)") }
+        }
+        XCTAssertTrue(synchronizer.accountValidationRequired)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertNil(store.values[markerKey])
+        let leaseKey = synchronizer.durableStateKey("AccountScopeLease.v1")
+        let accepted = try BigSyncAccountScopeLeaseState.load(store: store, key: leaseKey)
+        store.arm(nil, forKey: markerKey)
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertEqual(try synchronizer.accountScopeLease(), accepted.lease)
+        XCTAssertEqual(store.values[markerKey] as? String, "account-a")
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountInvalidationMustReadBackBeforeDomainHandlerRuns() async throws {
+        let store = AccountAuthorityTestStore()
+        let identity = AccountFencingAccountIdentity("account-a")
+        let recorder = AccountScopeInvalidationRecorder()
+        let transport = AccountFencingTransport()
+        let synchronizer = makeSynchronizer(transport: transport, store: store,
+            accountIdentifierProvider: { await identity.current() })
+        synchronizer.accountScopeInvalidationHandler = { await recorder.record($0) }
+        try await synchronizer._test_validateSynchronizationAccount()
+        let previous = try XCTUnwrap(synchronizer.accountScopeLease())
+        let leaseKey = synchronizer.durableStateKey("AccountScopeLease.v1")
+        await identity.replace(with: "account-b")
+        store.arm(.discardWrite, forKey: leaseKey)
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("A discarded invalidation must stop before the domain callback")
+        } catch let error as DurableKeyValueStoreError {
+            if case .mutationNotDurable = error {} else { XCTFail("Unexpected \(error)") }
+        }
+        let beforeRetry = await recorder.reasons
+        XCTAssertTrue(beforeRetry.isEmpty)
+        XCTAssertEqual(transport.operationCount, 0)
+        XCTAssertEqual(try BigSyncAccountScopeLeaseState.load(store: store, key: leaseKey).lease, previous)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        store.arm(nil, forKey: leaseKey)
+        try await synchronizer._test_validateSynchronizationAccount()
+        let reasons = await recorder.reasons
+        XCTAssertEqual(reasons, [.accountReplaced])
+        let current = try XCTUnwrap(synchronizer.accountScopeLease())
+        XCTAssertEqual(current.invalidationGeneration, previous.invalidationGeneration + 1)
+        XCTAssertEqual(current.accountScopeIdentifier, CloudKitSynchronizer.accountScopeIdentifier(for: "account-b"))
+        XCTAssertThrowsError(try synchronizer.validateAccountScopeLease(previous))
+    }
+
+    @BigSyncBackgroundActor
+    func testExplicitPortUncertainPublicationCannotResumeOldWorker() async throws {
+        for suffix in ["ReplicaBinding.v1", "CloudKitAccountIdentifier"] {
+            for fault in [AccountAuthorityTestStore.Fault.beforeWrite, .afterWrite, .discardWrite] {
+                let store = AccountAuthorityTestStore()
+                let identity = AccountFencingAccountIdentity("account-a")
+                let transport = AccountFencingTransport()
+                let identifier = "uncertain-explicit-port-\(UUID().uuidString)"
+                let zone = makeZoneID()
+                let synchronizer = makeSynchronizer(
+                    transport: transport, store: store, identifier: identifier,
+                    recordZoneID: zone,
+                    accountIdentifierProvider: { await identity.current() },
+                    accountReplacementPolicy: .requireExplicitDatasetPort,
+                    initialReplicaBindingAdmissionHandler: { _ in })
+                synchronizer.addModelAdapter(AccountFencingModelAdapter(zoneID: zone))
+                try await synchronizer._test_validateSynchronizationAccount()
+                await identity.replace(with: "account-b")
+                do {
+                    try await synchronizer._test_validateSynchronizationAccount()
+                    XCTFail("Expected an explicit port requirement")
+                } catch let error as BigSyncCloudAccountPortError {
+                    if case .required = error {} else { XCTFail("Unexpected \(error)") }
+                }
+                let requirement = try XCTUnwrap(synchronizer.pendingCloudAccountPortRequirement())
+                let faultKey = synchronizer.durableStateKey(suffix)
+                store.arm(fault, forKey: faultKey)
+                do {
+                    try await synchronizer.activateCloudAccountPort(requirement)
+                    XCTFail("Expected uncertain activation publication")
+                } catch {
+                    XCTAssertTrue(error is AccountAuthorityTestStore.Fault || error is DurableKeyValueStoreError)
+                }
+                do {
+                    _ = try await synchronizer.synchronize()
+                    XCTFail("The old worker must stay fenced even when activation reports failure")
+                } catch let error as BigSyncCloudAccountPortError {
+                    XCTAssertEqual(error, .workerRestartRequired)
+                }
+                XCTAssertEqual(transport.operationCount, 0)
+                store.arm(nil, forKey: faultKey)
+                let current = try XCTUnwrap(BigSyncReplicaBindingStateStore.load(
+                    store: store, key: synchronizer.durableStateKey("ReplicaBinding.v1")))
+                if current.pendingPort != nil {
+                    // The failed write did not activate. The exact pending
+                    // operation may still finish, but this worker stays fenced.
+                    try await synchronizer.activateCloudAccountPort(requirement)
+                } else {
+                    XCTAssertEqual(current.activeGenerationIdentifier, requirement.bindingGenerationIdentifier)
+                    XCTAssertEqual(current.activeAccountScopeIdentifier, requirement.destinationAccountScopeIdentifier)
+                }
+                let reopened = makeSynchronizer(
+                    transport: AccountFencingTransport(), store: store, identifier: identifier,
+                    recordZoneID: zone, accountIdentifierProvider: { await identity.current() },
+                    accountReplacementPolicy: .requireExplicitDatasetPort,
+                    initialReplicaBindingAdmissionHandler: { _ in })
+                try await reopened._test_validateSynchronizationAccount()
+                XCTAssertNil(try reopened.pendingCloudAccountPortRequirement())
+                XCTAssertEqual(try reopened.accountScopeLease()?.accountScopeIdentifier,
+                               requirement.destinationAccountScopeIdentifier)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRoutineAccountValidationDoesNotRewriteVerifiedAuthority() async throws {
+        for policy in [BigSyncCloudAccountReplacementPolicy.serverReconciliation,
+                       .localDatasetRebootstrap, .requireExplicitDatasetPort] {
+            let store = AccountAuthorityTestStore()
+            let synchronizer = makeSynchronizer(
+                transport: AccountFencingTransport(), store: store,
+                accountReplacementPolicy: policy,
+                initialReplicaBindingAdmissionHandler: { _ in })
+            try await synchronizer._test_validateSynchronizationAccount()
+            let lease = try XCTUnwrap(synchronizer.accountScopeLease())
+            let writes = store.writes
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTAssertEqual(store.writes, writes)
+            XCTAssertEqual(try synchronizer.accountScopeLease(), lease)
+            XCTAssertEqual(store.values[synchronizer.durableStateKey("CloudKitAccountIdentifier")] as? String, "account-a")
+        }
     }
 
     @BigSyncBackgroundActor

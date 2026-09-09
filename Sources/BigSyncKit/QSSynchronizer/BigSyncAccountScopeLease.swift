@@ -1,3 +1,4 @@
+import CoreFoundation
 import CryptoKit
 import Foundation
 
@@ -230,7 +231,7 @@ enum BigSyncReplicaBindingStateStore {
             return nil
         }
         guard let value = raw as? [String: Any],
-              (value["version"] as? NSNumber)?.intValue == version,
+              exactAuthorityInteger(value["version"]) == Int64(version),
               let installationIdentityDigest = validDigest(
                 value["installationIdentityDigest"]
               ),
@@ -240,12 +241,14 @@ enum BigSyncReplicaBindingStateStore {
         }
         let activeAccountScopeIdentifier =
             value["activeAccountScopeIdentifier"] as? String
-        if activeAccountScopeIdentifier?.isEmpty == true {
+        if value["activeAccountScopeIdentifier"] != nil,
+           activeAccountScopeIdentifier?.isEmpty != false {
             throw BigSyncReplicaBindingError.corrupt
         }
         let restoredDatasetOwnerAccountScopeIdentifier =
             value["restoredDatasetOwnerAccountScopeIdentifier"] as? String
-        if restoredDatasetOwnerAccountScopeIdentifier?.isEmpty == true
+        if (value["restoredDatasetOwnerAccountScopeIdentifier"] != nil
+                && restoredDatasetOwnerAccountScopeIdentifier?.isEmpty != false)
             || (
                 activeAccountScopeIdentifier != nil
                     && restoredDatasetOwnerAccountScopeIdentifier != nil
@@ -279,7 +282,9 @@ enum BigSyncReplicaBindingStateStore {
                     "pendingDestinationAccountScopeIdentifier"
                   ] as? String,
                   !destinationAccountScopeIdentifier.isEmpty,
-                  let detectedAt = value["pendingDetectedAt"] as? Date else {
+                  sourceAccountScopeIdentifier != destinationAccountScopeIdentifier,
+                  let detectedAt = value["pendingDetectedAt"] as? Date,
+                  detectedAt.timeIntervalSinceReferenceDate.isFinite else {
                 throw BigSyncReplicaBindingError.corrupt
             }
             pendingPort = BigSyncCloudAccountPortRequirement(
@@ -512,6 +517,12 @@ enum BigSyncReplicaBindingStateStore {
             value["pendingDetectedAt"] = pendingPort.detectedAt
         }
         try store.bigSyncSetDurably(value: value, forKey: key)
+        // Report durable publication only after exact readback. The live identity
+        // provider may already observe an accepted write even if this call
+        // fails: never compensate with the old binding. Reload before retry.
+        guard try load(store: store, key: key) == snapshot else {
+            throw DurableKeyValueStoreError.mutationNotDurable
+        }
     }
 
     private static func validDigest(_ value: Any?) -> String? {
@@ -614,4 +625,106 @@ public enum BigSyncAccountScopeLeaseError: Error, LocalizedError, Equatable {
             return "The durable CloudKit account-scope lease is malformed."
         }
     }
+}
+
+/// The existing lease envelope, not another authority or persisted model.
+/// Missing storage is the initial state; malformed present storage is not.
+struct BigSyncAccountScopeLeaseState: Equatable {
+    let generation: Int64
+    let lease: BigSyncAccountScopeLease?
+
+    init(
+        generation: Int64,
+        accountScopeIdentifier: String?,
+        validatedAt: Date?
+    ) throws {
+        guard generation >= 0 else {
+            throw BigSyncAccountScopeLeaseError.corrupt
+        }
+        self.generation = generation
+        switch (accountScopeIdentifier, validatedAt) {
+        case (nil, nil):
+            lease = nil
+        case let (account?, date?) where !account.isEmpty
+                && date.timeIntervalSinceReferenceDate.isFinite:
+            lease = BigSyncAccountScopeLease(
+                accountScopeIdentifier: account,
+                invalidationGeneration: generation,
+                validatedAt: date
+            )
+        default:
+            throw BigSyncAccountScopeLeaseError.corrupt
+        }
+    }
+
+    init(propertyList raw: Any) throws {
+        guard let value = raw as? [String: Any],
+              exactAuthorityInteger(value["version"]) == 1,
+              let generation = exactAuthorityInteger(value["generation"]),
+              let validity = value["isValid"] as? NSNumber,
+              CFGetTypeID(validity) == CFBooleanGetTypeID() else {
+            throw BigSyncAccountScopeLeaseError.corrupt
+        }
+        if validity.boolValue {
+            guard let account = value["accountScopeIdentifier"] as? String,
+                  let date = value["validatedAt"] as? Date else {
+                throw BigSyncAccountScopeLeaseError.corrupt
+            }
+            try self.init(
+                generation: generation,
+                accountScopeIdentifier: account,
+                validatedAt: date
+            )
+        } else {
+            // Invalidation has one writer-produced shape. Stale lease fields
+            // must not be silently discarded while selecting a generation.
+            guard value["accountScopeIdentifier"] == nil,
+                  value["validatedAt"] == nil else {
+                throw BigSyncAccountScopeLeaseError.corrupt
+            }
+            try self.init(
+                generation: generation,
+                accountScopeIdentifier: nil,
+                validatedAt: nil
+            )
+        }
+    }
+
+    var propertyList: [String: Any] {
+        var value: [String: Any] = [
+            "version": 1,
+            "generation": NSNumber(value: generation),
+            "isValid": lease != nil,
+        ]
+        if let lease {
+            value["accountScopeIdentifier"] = lease.accountScopeIdentifier
+            value["validatedAt"] = lease.validatedAt
+        }
+        return value
+    }
+
+    static func load(store: any KeyValueStore, key: String) throws -> Self {
+        guard let raw = try store.bigSyncDurableObject(forKey: key) else {
+            return try Self(generation: 0, accountScopeIdentifier: nil, validatedAt: nil)
+        }
+        return try Self(propertyList: raw)
+    }
+
+    func persist(store: any KeyValueStore, key: String) throws {
+        try store.bigSyncSetDurably(value: propertyList, forKey: key)
+        // A store can accept the successor before reporting an error. Do not
+        // write the preimage back on failure or accept a different readback.
+        guard let raw = try store.bigSyncDurableObject(forKey: key),
+              try Self(propertyList: raw) == self else {
+            throw DurableKeyValueStoreError.mutationNotDurable
+        }
+    }
+}
+
+/// Property-list identity numbers are exact integers, not conversions of
+/// fractional values or Boolean tags. Integral numeric encodings stay legal.
+private func exactAuthorityInteger(_ value: Any?) -> Int64? {
+    guard let number = value as? NSNumber,
+          CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+    return Int64(exactly: number)
 }

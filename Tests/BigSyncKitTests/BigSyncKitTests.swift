@@ -88,12 +88,14 @@ private struct FakeZoneChangePage {
     let records: [CKRecord]
     let deletedRecordIDs: [CKRecord.ID]
     let moreComing: Bool
+    var cursorOverride: Data? = nil
 }
 
 private struct FakeDatabaseChangePage {
     let changedZoneIDs: [CKRecordZone.ID]
     let deletions: [CloudKitZoneDeletion]
     let moreComing: Bool
+    var cursorOverride: Data? = nil
 }
 
 private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @unchecked Sendable {
@@ -115,6 +117,8 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var accountIdentifierAfterNextSubscriptionSave: String?
     var accountIdentifierAfterNextSubscriptionDelete: String?
     var reportsDeletedRecordsAsUnknownItems = false
+    /// Inject malformed result values without pretending they came from CloudKit.
+    var successfulSaveRecordOverrides = [CKRecord.ID: CKRecord]()
     var partialSaveErrorsByRecordID = [CKRecord.ID: NSError]()
     var partialSaveErrorsOnceByRecordID = [CKRecord.ID: NSError]()
     var partialDeleteErrorsByRecordID = [CKRecord.ID: NSError]()
@@ -153,6 +157,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private(set) var recordZoneFetchCount = 0
     private(set) var databaseChangeFetchCount = 0
     private(set) var recordZoneChangeFetchCount = 0
+    private(set) var zoneCursorInputs = [RecordZoneChangeCursor?]()
     private(set) var savedZoneCount = 0
     private(set) var modifyRecordsAtomicValues = [Bool]()
     private(set) var modifyRecordsSavePolicies = [CKModifyRecordsOperation.RecordSavePolicy]()
@@ -330,6 +335,10 @@ extension FakeCloudKitDatabase: CloudKitRecordStore {
 
         var saveResults = [CKRecord.ID: Result<CKRecord, Error>]()
         for record in recordsToSave {
+            if let override = successfulSaveRecordOverrides[record.recordID] {
+                saveResults[record.recordID] = .success(override)
+                continue
+            }
             if let error = partialSaveErrorsOnceByRecordID.removeValue(
                 forKey: record.recordID
             ) ?? partialSaveErrorsByRecordID[record.recordID] {
@@ -406,7 +415,7 @@ extension FakeCloudKitDatabase: CloudKitChangeFeed {
             : databaseChangePages.removeFirst()
         return CloudKitDatabaseChangePage(
             cursor: DatabaseChangeCursor(
-                serializedData: Data("database-\(databaseChangeFetchCount)".utf8)
+                serializedData: page.cursorOverride ?? Data("database-\(databaseChangeFetchCount)".utf8)
             ),
             changedZoneIDs: page.changedZoneIDs,
             deletions: page.deletions,
@@ -428,11 +437,12 @@ extension FakeCloudKitDatabase: CloudKitChangeFeed {
             }
         }
         recordZoneChangeFetchCount += 1
+        zoneCursorInputs.append(cursor)
         let page = zoneChangePages.isEmpty
             ? FakeZoneChangePage(zoneID: zoneID, records: [], deletedRecordIDs: [], moreComing: false)
             : zoneChangePages.removeFirst()
         return CloudKitRecordZoneChangePage(
-            cursor: RecordZoneChangeCursor(serializedData: Data("zone-\(recordZoneChangeFetchCount)".utf8)),
+            cursor: RecordZoneChangeCursor(serializedData: page.cursorOverride ?? Data("zone-\(recordZoneChangeFetchCount)".utf8)),
             records: page.records,
             deletedRecordIDs: page.deletedRecordIDs,
             moreComing: page.moreComing
@@ -555,6 +565,10 @@ private final class FakeModelAdapter:
     var domainHookInvocationCount = 0
     var repeatsPreparedUploads = false
     var repeatsPreparedDeletions = false
+    var durableEvidenceFeedEpoch: Int?
+
+    @BigSyncBackgroundActor
+    func changeFeedEpoch() throws -> Int? { durableEvidenceFeedEpoch }
 
     var hasChanges: Bool {
         uploadedByEntity.values.contains(where: { !$0.isEmpty }) ||
@@ -731,6 +745,7 @@ private final class FakeModelAdapter:
             replicaBindingGenerationIdentifier:
                 replicaBindingGenerationIdentifier,
             recordZoneID: recordZoneID,
+            changeFeedEpoch: durableEvidenceFeedEpoch ?? 0,
             cursorData: token
         )
     }
@@ -764,6 +779,17 @@ private final class FakeModelAdapter:
     private func nextEntityTypeWithPendingDeletions() -> String? {
         priorityEntityTypeNames.first(where: { !(deletedByEntity[$0] ?? []).isEmpty }) ??
         deletedByEntity.keys.sorted().first(where: { !(deletedByEntity[$0] ?? []).isEmpty })
+    }
+}
+
+/// A custom delegate may construct a new value while declining generic apply.
+/// Its existing timestamp contract must not be confused with default selection.
+private final class AuthoringConflictDelegate: RealmSwiftAdapterDelegate {
+    func realmSwiftAdapter(_ adapter: RealmSwiftAdapter, gotChanges changes: [String: Any], object: Object) -> Bool {
+        guard let tracked = object as? BigSyncTrackedObject else { return false }
+        tracked.tags.removeAll()
+        tracked.tags.append("delegate-authored")
+        return false
     }
 }
 
@@ -814,6 +840,36 @@ private final class BigSyncIntegerKeyedObject: Object,
     @Persisted var isDeleted = false
 }
 
+@objc(BigSyncUUIDKeyedObject)
+private final class BigSyncUUIDKeyedObject: Object, ChangeMetadataRecordable {
+    @Persisted(primaryKey: true) var id = UUID()
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+}
+
+@objc(BigSyncObjectIdKeyedObject)
+private final class BigSyncObjectIdKeyedObject: Object, ChangeMetadataRecordable {
+    @Persisted(primaryKey: true) var id = ObjectId.generate()
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+}
+
+@objc(BigSyncIntegerRelationshipParent)
+private final class BigSyncIntegerRelationshipParent: Object, ChangeMetadataRecordable {
+    @Persisted(primaryKey: true) var id = ""
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+    @Persisted var children: List<BigSyncIntegerKeyedObject>
+    @Persisted var relatedChildren: MutableSet<BigSyncIntegerKeyedObject>
+    @Persisted var favoriteChild: BigSyncIntegerKeyedObject?
+}
+
 private enum TestInboundSemanticFailure: Error,
     BigSyncInboundSemanticValidationFailure {
     case rejected
@@ -835,6 +891,10 @@ private final class BigSyncSemanticallyValidatedObject: Object,
     @Persisted var isDeleted = false
 
     static func validateInboundSemanticRecord(_ record: CKRecord) throws {
+        try rejectUnavailableTestPrerequisite(record["semanticValue"] as? String)
+        if record["semanticValue"] as? String == "cancel-record" {
+            throw CancellationError()
+        }
         guard record["semanticValue"] as? String == "valid" else {
             throw TestInboundSemanticFailure.rejected
         }
@@ -854,6 +914,9 @@ private final class BigSyncSemanticallyValidatedObject: Object,
     ) throws {
         guard let existing = existingObject as?
                 BigSyncSemanticallyValidatedObject else { return }
+        if existing.immutableNonce == "cancel-replacement" {
+            throw CancellationError()
+        }
         guard record["immutableNonce"] as? String
                 == existing.immutableNonce else {
             throw TestInboundSemanticFailure.rejected
@@ -877,7 +940,23 @@ private final class BigSyncSemanticallyValidatedObject: Object,
         _ recordID: CKRecord.ID,
         existingObject: Object?
     ) throws {
+        if let existing = existingObject as? Self {
+            try rejectUnavailableTestPrerequisite(existing.immutableNonce)
+            if existing.immutableNonce == "cancel-deletion" {
+                throw CancellationError()
+            }
+            if existing.immutableNonce == "deletion-permitted" { return }
+        }
         throw TestInboundSemanticFailure.rejected
+    }
+
+    private static func rejectUnavailableTestPrerequisite(_ marker: String?) throws {
+        if marker == "admission-unavailable" {
+            throw BigSyncSemanticAdmissionUnavailable(entityType: className())
+        }
+        if marker == "resource-unavailable" {
+            throw BigSyncInboundResourceUnavailable(entityType: className(), fieldName: "local-proof")
+        }
     }
 
     static func inboundSemanticDeletionQuarantineScopeIdentifier(
@@ -925,6 +1004,73 @@ SoftDeletable {
     @Persisted var children: List<BigSyncRelationshipChild>
     @Persisted var relatedChildren: MutableSet<BigSyncRelationshipChild>
     @Persisted var favoriteChild: BigSyncRelationshipChild?
+}
+
+// Native-only fixtures for target-write publication invalidation. The counter
+// is local-only and is never a source of synchronization work.
+@objc(BigSyncTestPublicationFence)
+private final class BigSyncTestPublicationFence: Object {
+    @Persisted(primaryKey: true) var id = "fence"
+    @Persisted var count = 0
+    @Persisted var rejectsWrite = false
+    @Persisted var targetIdentities = List<String>()
+
+    enum Failure: Error { case rejected }
+
+    static func record(in realm: Realm) throws {
+        let state = try XCTUnwrap(realm.object(ofType: BigSyncTestPublicationFence.self, forPrimaryKey: "fence"))
+        state.count += 1
+        if state.rejectsWrite { throw Failure.rejected }
+    }
+}
+
+@objc(BigSyncObservedTarget)
+private final class BigSyncObservedTarget: Object, ChangeMetadataRecordable,
+    BigSyncInboundTargetMutationObserving {
+    @Persisted(primaryKey: true) var id = ""
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+    @Persisted var children: List<BigSyncRelationshipChild>
+
+    static func invalidatePublicationForInboundTargetWrite(in realm: Realm) throws {
+        try BigSyncTestPublicationFence.record(in: realm)
+    }
+}
+
+@objc(BigSyncObservedTargetPeer)
+private final class BigSyncObservedTargetPeer: Object,
+    BigSyncInboundTargetMutationObserving {
+    @Persisted(primaryKey: true) var id = ""
+
+    static func invalidatePublicationForInboundTargetWrite(in realm: Realm) throws {
+        try BigSyncTestPublicationFence.record(in: realm)
+    }
+}
+
+@objc(BigSyncIdentityObservedTarget)
+private final class BigSyncIdentityObservedTarget: Object, ChangeMetadataRecordable,
+    BigSyncInboundTargetIdentityObserving {
+    @Persisted(primaryKey: true) var id = ""
+    @Persisted var articleProgressID = ""
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+
+    static func invalidatePublicationForInboundTargetWrite(in realm: Realm) throws {
+        try BigSyncTestPublicationFence.record(in: realm)
+    }
+
+    static func invalidatePublicationForInboundTargetWrite(
+        in realm: Realm, existingObject: Object?, incomingRecord: CKRecord?
+    ) throws {
+        let fence = try XCTUnwrap(realm.object(ofType: BigSyncTestPublicationFence.self, forPrimaryKey: "fence"))
+        fence.targetIdentities.append((existingObject as? BigSyncIdentityObservedTarget)?.articleProgressID ?? "missing")
+        fence.targetIdentities.append(incomingRecord?["articleProgressID"] as? String ?? "deletion")
+        if fence.rejectsWrite { throw BigSyncTestPublicationFence.Failure.rejected }
+    }
 }
 
 private actor SynchronizationResultRecorder {
@@ -1044,6 +1190,29 @@ private final class MutableMutationJournalIdentity: @unchecked Sendable {
         lock.lock()
         storedIdentity = identity
         lock.unlock()
+    }
+}
+
+private final class OptionalMutationJournalIdentitySequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let identities: [BigSyncMutationJournalIdentity?]
+    private var offset = 0
+
+    init(_ identities: [BigSyncMutationJournalIdentity?]) {
+        precondition(!identities.isEmpty)
+        self.identities = identities
+    }
+
+    func next() -> BigSyncMutationJournalIdentity? {
+        lock.lock()
+        defer { offset += 1; lock.unlock() }
+        return identities[min(offset, identities.count - 1)]
+    }
+
+    var invocationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return offset
     }
 }
 
@@ -1316,22 +1485,29 @@ final class BigSyncKitTests: XCTestCase {
             databaseScope: .private,
             zoneID: baseZone
         )
-        try await importMalformed(
-            account: "account-a",
-            container: "container-a",
-            databaseScope: .private,
-            zoneID: CKRecordZone.ID(
-                zoneName: "other-zone",
-                ownerName: CKCurrentUserDefaultName
+        // Foreign-zone records must be rejected before quarantine; a target
+        // adapter cannot manufacture lineage for a zone it does not own.
+        do {
+            try await importMalformed(
+                account: "account-a",
+                container: "container-a",
+                databaseScope: .private,
+                zoneID: CKRecordZone.ID(
+                    zoneName: "other-zone",
+                    ownerName: CKCurrentUserDefaultName
+                )
             )
-        )
+            XCTFail("Expected the adapter zone fence")
+        } catch RealmSwiftInboundPageCommitError.eventOutsideAdapterZone(let rejectedName) {
+            XCTAssertEqual(rejectedName, recordName)
+        }
         fixture.persistenceRealm.refresh()
 
         let quarantines = fixture.persistenceRealm.objects(
             BigSyncInboundSemanticQuarantine.self
         ).where { $0.recordName == recordName }
-        XCTAssertEqual(quarantines.count, 5)
-        XCTAssertEqual(Set(quarantines.map(\.lineageID)).count, 5)
+        XCTAssertEqual(quarantines.count, 4)
+        XCTAssertEqual(Set(quarantines.map(\.lineageID)).count, 4)
     }
 
     @BigSyncBackgroundActor
@@ -1654,7 +1830,7 @@ final class BigSyncKitTests: XCTestCase {
             pageReceipt.outcomeDigestHex
         )
 
-        let receivedZoneCursor = await fixture.adapter.serverChangeToken
+        let receivedZoneCursor = try await fixture.adapter.serverChangeToken
         let zoneCursor = try XCTUnwrap(receivedZoneCursor)
         XCTAssertFalse(zoneCursor.serializedData.isEmpty)
         XCTAssertNotNil(synchronizer.storedDatabaseToken)
@@ -1667,7 +1843,7 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertTrue(fixture.persistenceRealm.objects(
             BigSyncInboundPageReceipt.self
         ).isEmpty)
-        let resetCursor = await fixture.adapter.serverChangeToken
+        let resetCursor = try await fixture.adapter.serverChangeToken
         XCTAssertNil(resetCursor)
     }
 
@@ -2199,7 +2375,7 @@ final class BigSyncKitTests: XCTestCase {
         }
 
         fixture.persistenceRealm.refresh()
-        let committedCursor = await fixture.adapter.serverChangeToken
+        let committedCursor = try await fixture.adapter.serverChangeToken
         XCTAssertNil(committedCursor)
         XCTAssertEqual(
             fixture.persistenceRealm.object(
@@ -2277,7 +2453,7 @@ final class BigSyncKitTests: XCTestCase {
             )
         }
 
-        let committedCursor = await fixture.adapter.serverChangeToken
+        let committedCursor = try await fixture.adapter.serverChangeToken
         XCTAssertNil(committedCursor)
     }
 
@@ -2324,7 +2500,7 @@ final class BigSyncKitTests: XCTestCase {
             )
         }
 
-        let committedCursor = await fixture.adapter.serverChangeToken
+        let committedCursor = try await fixture.adapter.serverChangeToken
         XCTAssertNil(committedCursor)
     }
 
@@ -2375,7 +2551,7 @@ final class BigSyncKitTests: XCTestCase {
         ))
 
         fixture.persistenceRealm.refresh()
-        let committedCursor = await fixture.adapter.serverChangeToken
+        let committedCursor = try await fixture.adapter.serverChangeToken
         XCTAssertEqual(committedCursor, cursor)
         XCTAssertEqual(
             fixture.persistenceRealm.object(
@@ -2449,7 +2625,7 @@ final class BigSyncKitTests: XCTestCase {
             liveResults: results,
             deletionResults: []
         ))
-        let committedCursor = await fixture.adapter.serverChangeToken
+        let committedCursor = try await fixture.adapter.serverChangeToken
         XCTAssertNotNil(committedCursor)
     }
 
@@ -2676,6 +2852,602 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNotNil(fixture.persistenceRealm.objects(
             BigSyncInboundSemanticQuarantine.self
         ).where { $0.recordName == recordName }.first)
+    }
+
+    @BigSyncBackgroundActor
+    func testReplacementIsValidatedInsideTargetWriteOnNormalImport() async throws {
+        try await assertReplacementIsValidatedInsideTargetWrite(forceSave: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testReplacementIsValidatedInsideTargetWriteOnForceSave() async throws {
+        try await assertReplacementIsValidatedInsideTargetWrite(forceSave: true)
+    }
+
+    @BigSyncBackgroundActor
+    private func assertReplacementIsValidatedInsideTargetWrite(forceSave: Bool) async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter.mergePolicy = .server
+        let date = Date(timeIntervalSinceReferenceDate: 100)
+        let local = BigSyncSemanticallyValidatedObject()
+        local.id = "replacement-race"
+        local.semanticValue = "valid"
+        local.immutableNonce = "before-selection"
+        local.createdAt = date
+        local.modifiedAt = date
+        local.explicitlyModifiedAt = date
+        try await fixture.targetRealm.asyncWrite { fixture.targetRealm.add(local) }
+
+        let incoming = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(),
+            id: local.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        incoming["semanticValue"] = "valid" as CKRecordValue
+        incoming["immutableNonce"] = "before-selection" as CKRecordValue
+        incoming["semanticScope"] = "scope-race" as CKRecordValue
+        incoming["createdAt"] = date as CKRecordValue
+        incoming["modifiedAt"] = date.addingTimeInterval(1) as CKRecordValue
+        incoming["explicitlyModifiedAt"] = date.addingTimeInterval(1) as CKRecordValue
+        incoming["isDeleted"] = false as CKRecordValue
+
+        let neighbor = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "replacement-neighbor",
+            zoneID: fixture.adapter.recordZoneID
+        )
+        neighbor["createdAt"] = date as CKRecordValue
+        neighbor["modifiedAt"] = date as CKRecordValue
+        neighbor["explicitlyModifiedAt"] = date as CKRecordValue
+        neighbor["isDeleted"] = false as CKRecordValue
+        neighbor["tags"] = ["accepted"] as CKRecordValue
+
+        fixture.adapter._testBeforeImportedRecordTargetWrite = {
+            // Models imported on another path can have equal conflict clocks.
+            // Exercise a changed semantic preimage without inventing a local
+            // pending generation that would cause selection to skip the record.
+            try await fixture.targetRealm.asyncWrite {
+                local.immutableNonce = "after-selection"
+            }
+        }
+        defer { fixture.adapter._testBeforeImportedRecordTargetWrite = nil }
+        let results = try await fixture.adapter.saveChanges(
+            in: [incoming, neighbor], forceSave: forceSave
+        )
+        await fixture.targetRealm.asyncRefresh()
+        fixture.persistenceRealm.refresh()
+        XCTAssertEqual(local.immutableNonce, "after-selection")
+        XCTAssertEqual(local.modifiedAt, date)
+        let quarantine = try XCTUnwrap(fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where { $0.recordName == incoming.recordID.recordName }.first)
+        XCTAssertEqual(quarantine.validationCode, "test-semantic-rejection")
+        XCTAssertEqual(quarantine.semanticScopeIdentifier, "scope-race")
+        XCTAssertEqual(results.first?.disposition, .quarantined(lineageID: quarantine.lineageID))
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: incoming.recordID.recordName
+        ))
+        XCTAssertNil(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: incoming.recordID.recordName
+        ))
+        XCTAssertEqual(Array(try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncTrackedObject.self, forPrimaryKey: "replacement-neighbor"
+        )).tags), ["accepted"])
+    }
+
+    @BigSyncBackgroundActor
+    func testCancellationDuringReplacementRollsBackWithoutQuarantine() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let local = BigSyncSemanticallyValidatedObject()
+        local.id = "cancel-replacement"
+        local.semanticValue = "valid"
+        local.immutableNonce = "cancel-replacement"
+        try await fixture.targetRealm.asyncWrite { fixture.targetRealm.add(local) }
+        let incoming = makeRecord(
+            type: BigSyncSemanticallyValidatedObject.className(), id: local.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        incoming["semanticValue"] = "valid" as CKRecordValue
+        incoming["immutableNonce"] = "cancel-replacement" as CKRecordValue
+        incoming["createdAt"] = local.createdAt as CKRecordValue
+        incoming["modifiedAt"] = Date() as CKRecordValue
+        incoming["isDeleted"] = false as CKRecordValue
+        do {
+            _ = try await fixture.adapter.saveChanges(in: [incoming], forceSave: true)
+            XCTFail("Cancellation is not a successful quarantined import")
+        } catch is CancellationError {
+            // Expected: page processing must retry; cancellation is not corruption.
+        }
+        fixture.persistenceRealm.refresh()
+        XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: incoming.recordID.recordName
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testNumericNameAliasesCannotBypassCanonicalPendingImportWork() async throws {
+        for forceSave in [false, true] {
+            for alias in ["01", "+1", "0001"] {
+                let f = try await makeRealmAdapterFixture()
+                let local = BigSyncIntegerKeyedObject()
+                local.id = 1
+                let date = Date(timeIntervalSince1970: 100)
+                try await f.targetRealm.asyncWrite {
+                    f.targetRealm.add(local)
+                    local.refreshChangeMetadata(explicitlyModified: true, at: date)
+                }
+                let canonicalName = BigSyncIntegerKeyedObject.className() + ".1"
+                let generation = try XCTUnwrap(f.targetRealm.object(
+                    ofType: BigSyncPendingMutation.self, forPrimaryKey: canonicalName)?.generation)
+                let incoming = makeRecord(type: BigSyncIntegerKeyedObject.className(), id: alias,
+                                          zoneID: f.adapter.recordZoneID)
+                incoming["createdAt"] = date as CKRecordValue
+                incoming["modifiedAt"] = date.addingTimeInterval(200) as CKRecordValue
+                incoming["explicitlyModifiedAt"] = date.addingTimeInterval(200) as CKRecordValue
+                incoming["isDeleted"] = true as CKRecordValue
+                do {
+                    _ = try await f.adapter.saveChanges(in: [incoming], forceSave: forceSave)
+                    XCTFail("An alias must not address the canonical target with a different journal key")
+                } catch RealmSwiftAdapterError.malformedRecordIdentifier(let name, let type) {
+                    XCTAssertEqual(name, incoming.recordID.recordName)
+                    XCTAssertEqual(type, BigSyncIntegerKeyedObject.className())
+                }
+                await f.targetRealm.asyncRefresh()
+                XCTAssertFalse(local.isDeleted)
+                XCTAssertEqual(local.modifiedAt, date)
+                XCTAssertEqual(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                    forPrimaryKey: canonicalName)?.generation, generation)
+                XCTAssertNil(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                    forPrimaryKey: incoming.recordID.recordName))
+                XCTAssertNil(f.persistenceRealm.object(ofType: SyncedEntity.self,
+                    forPrimaryKey: incoming.recordID.recordName))
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testNumericNameAliasesCannotTombstoneAnObjectWithCanonicalPendingWork() async throws {
+        for (value, alias) in [(1, "01"), (1, "+1"), (0, "-0"), (-17, "-017")] {
+            let f = try await makeRealmAdapterFixture()
+            let local = BigSyncIntegerKeyedObject()
+            local.id = value
+            try await f.targetRealm.asyncWrite {
+                f.targetRealm.add(local)
+                local.refreshChangeMetadata(explicitlyModified: true)
+            }
+            let canonicalName = BigSyncIntegerKeyedObject.className() + "." + String(value)
+            let generation = try XCTUnwrap(f.targetRealm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: canonicalName)?.generation)
+            let recordID = CKRecord.ID(recordName: BigSyncIntegerKeyedObject.className() + "." + alias,
+                                       zoneID: f.adapter.recordZoneID)
+            do {
+                _ = try await f.adapter.deleteRecords(with: [recordID])
+                XCTFail("Alias deletion must not bypass the canonical journal")
+            } catch RealmSwiftAdapterError.malformedRecordIdentifier(let name, _) {
+                XCTAssertEqual(name, recordID.recordName)
+            }
+            await f.targetRealm.asyncRefresh()
+            XCTAssertFalse(local.isDeleted)
+            XCTAssertEqual(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: canonicalName)?.generation, generation)
+            XCTAssertNil(f.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName))
+            // The legitimate same-key delete still respects outstanding intent.
+            let result = try await f.adapter.deleteRecords(with: [CKRecord.ID(
+                recordName: canonicalName, zoneID: f.adapter.recordZoneID)])
+            XCTAssertEqual(result.first?.disposition, .preservedNewerLive(generation: generation))
+            XCTAssertFalse(local.isDeleted)
+            // Old malformed tracking must not give cleanup a second route to
+            // delete the canonical target while its genuine tombstone is pending.
+            try await f.targetRealm.asyncWrite {
+                local.isDeleted = true
+                local.refreshChangeMetadata(explicitlyModified: true)
+            }
+            let deletionGeneration = try XCTUnwrap(f.targetRealm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: canonicalName)?.generation)
+            try await f.persistenceRealm.asyncWrite {
+                f.persistenceRealm.add(SyncedEntity(entityType: BigSyncIntegerKeyedObject.className(),
+                    identifier: recordID.recordName, state: SyncedEntityState.deletedRemotely.rawValue))
+            }
+            try await f.adapter.cleanUp()
+            await f.targetRealm.asyncRefresh()
+            XCTAssertTrue(try XCTUnwrap(f.targetRealm.object(ofType: BigSyncIntegerKeyedObject.self, forPrimaryKey: value)).isDeleted)
+            XCTAssertEqual(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: canonicalName)?.generation, deletionGeneration)
+            XCTAssertNotNil(f.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCanonicalTypedKeyImportsAndDeletesRemainSupported() async throws {
+        let f = try await makeRealmAdapterFixture(additionalObjectTypes: [
+            BigSyncUUIDKeyedObject.self, BigSyncObjectIdKeyedObject.self
+        ])
+        let cases: [(Object.Type, String)] = [
+            (BigSyncIntegerKeyedObject.self, "-17"),
+            (BigSyncUUIDKeyedObject.self, "ABCDEF01-2345-6789-ABCD-EF0123456789"),
+            (BigSyncObjectIdKeyedObject.self, "abcdef0123456789abcdef01")
+        ]
+        let date = Date(timeIntervalSince1970: 100)
+        for (type, key) in cases {
+            let record = makeRecord(type: type.className(), id: key, zoneID: f.adapter.recordZoneID)
+            record["createdAt"] = date as CKRecordValue
+            record["modifiedAt"] = date as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            _ = try await f.adapter.saveChanges(in: [record], forceSave: false)
+            await f.targetRealm.asyncRefresh()
+            let identifier = try XCTUnwrap(f.adapter.getObjectIdentifier(stringObjectId: key, entityType: type.className()))
+            let object = try XCTUnwrap(f.targetRealm.object(ofType: type, forPrimaryKey: identifier))
+            let metadata = try XCTUnwrap(object as? ChangeMetadataRecordable)
+            XCTAssertEqual(metadata.modifiedAt, date)
+            XCTAssertFalse(metadata.isDeleted)
+            let primaryKey = try XCTUnwrap(object.objectSchema.primaryKeyProperty?.name)
+            XCTAssertEqual(RealmSwiftAdapter.getTargetObjectStringIdentifier(for: object, usingPrimaryKey: primaryKey), key)
+            XCTAssertNil(f.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: record.recordID.recordName))
+            let result = try await f.adapter.deleteRecords(with: [record.recordID])
+            await f.targetRealm.asyncRefresh()
+            XCTAssertEqual(result.first?.disposition, .appliedTombstone)
+            XCTAssertTrue(metadata.isDeleted)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUUIDAndObjectIdCaseAliasesAreRejectedRatherThanRekeyed() async throws {
+        for forceSave in [false, true] {
+            let f = try await makeRealmAdapterFixture(additionalObjectTypes: [
+                BigSyncUUIDKeyedObject.self, BigSyncObjectIdKeyedObject.self
+            ])
+            for (type, alias) in [
+                (BigSyncUUIDKeyedObject.self as Object.Type, "abcdef01-2345-6789-abcd-ef0123456789"),
+                (BigSyncObjectIdKeyedObject.self as Object.Type, "ABCDEF0123456789ABCDEF01")
+            ] {
+                let record = makeRecord(type: type.className(), id: alias, zoneID: f.adapter.recordZoneID)
+                do {
+                    _ = try await f.adapter.saveChanges(in: [record], forceSave: forceSave)
+                    XCTFail("Typed aliases must not create an alternate tracking identity")
+                } catch RealmSwiftAdapterError.malformedRecordIdentifier(let name, _) {
+                    XCTAssertEqual(name, record.recordID.recordName)
+                }
+                do {
+                    _ = try await f.adapter.deleteRecords(with: [record.recordID])
+                    XCTFail("Typed aliases must not become an alternate deletion identity")
+                } catch RealmSwiftAdapterError.malformedRecordIdentifier(let name, _) {
+                    XCTAssertEqual(name, record.recordID.recordName)
+                }
+                XCTAssertTrue(f.targetRealm.objects(type).isEmpty)
+                XCTAssertNil(f.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName))
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testOpaqueStringKeysRemainDistinctThroughImportDeletionAndCleanup() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let ids = ["1", "01", "+1", "a.b", "\u{0301}leading", "é", "e\u{0301}"]
+        // Check exact bytes without relying on Swift's canonical String equality.
+        for id in ids {
+            let parsed = try XCTUnwrap(f.adapter.getObjectIdentifier(
+                recordName: BigSyncTrackedObject.className() + "." + id,
+                entityType: BigSyncTrackedObject.className()) as? String)
+            XCTAssertEqual(Array(parsed.utf8), Array(id.utf8))
+        }
+        let date = Date(timeIntervalSince1970: 100)
+        let importedIDs = ["1", "01", "+1", "a.b", "\u{0301}leading", "leading"]
+        for id in importedIDs {
+            let record = makeRecord(type: BigSyncTrackedObject.className(), id: id, zoneID: f.adapter.recordZoneID)
+            record["createdAt"] = date as CKRecordValue
+            record["modifiedAt"] = date as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            _ = try await f.adapter.saveChanges(in: [record], forceSave: false)
+        }
+        await f.targetRealm.asyncRefresh()
+        XCTAssertEqual(Set(f.targetRealm.objects(BigSyncTrackedObject.self).map(\.id)), Set(importedIDs))
+        let trackedID = CKRecord.ID(recordName: BigSyncTrackedObject.className() + ".\u{0301}leading", zoneID: f.adapter.recordZoneID)
+        _ = try await f.adapter.deleteRecords(with: [trackedID])
+        try await f.adapter.cleanUp()
+        await f.targetRealm.asyncRefresh()
+        XCTAssertNil(f.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "\u{0301}leading"))
+        XCTAssertFalse(try XCTUnwrap(f.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "leading")).isDeleted)
+
+        // Without a tracking row the deletion must infer the same type from the
+        // ASCII separator, not mistake its combining-mark grapheme for no separator.
+        try await f.targetRealm.asyncWrite {
+            for suffix in ["\u{0301}untracked", "untracked"] {
+                let object = BigSyncTrackedObject(); object.id = suffix
+                f.targetRealm.add(object)
+            }
+        }
+        let untrackedID = CKRecord.ID(recordName: BigSyncTrackedObject.className() + ".\u{0301}untracked", zoneID: f.adapter.recordZoneID)
+        XCTAssertNil(f.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: untrackedID.recordName))
+        _ = try await f.adapter.deleteRecords(with: [untrackedID])
+        try await f.adapter.cleanUp()
+        await f.targetRealm.asyncRefresh()
+        XCTAssertNil(f.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "\u{0301}untracked"))
+        XCTAssertFalse(try XCTUnwrap(f.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "untracked")).isDeleted)
+    }
+
+    @BigSyncBackgroundActor
+    func testRelationshipAliasesFailBeforePersistingDeferredWorkAndCanRetryCanonically() async throws {
+        for field in ["children", "relatedChildren", "favoriteChild"] {
+            for asReference in [false, true] {
+                let f = try await makeRealmAdapterFixture(additionalObjectTypes: [BigSyncIntegerRelationshipParent.self])
+                f.adapter.mergePolicy = .server
+                let first = BigSyncIntegerKeyedObject(); first.id = 1
+                let second = BigSyncIntegerKeyedObject(); second.id = 2
+                let parent = BigSyncIntegerRelationshipParent(); parent.id = "parent"
+                parent.children.append(second); parent.relatedChildren.insert(second); parent.favoriteChild = second
+                let originalDate = parent.modifiedAt
+                try await f.targetRealm.asyncWrite { f.targetRealm.add([first, second, parent]) }
+                let record = makeRecord(type: BigSyncIntegerRelationshipParent.className(), id: parent.id,
+                                        zoneID: f.adapter.recordZoneID)
+                record["modifiedAt"] = originalDate.addingTimeInterval(60) as CKRecordValue
+                func value(for suffix: String) -> CKRecordValue {
+                    let name = BigSyncIntegerKeyedObject.className() + "." + suffix
+                    if asReference {
+                        let reference = CKRecord.Reference(recordID: CKRecord.ID(recordName: name, zoneID: f.adapter.recordZoneID), action: .none)
+                        if field == "favoriteChild" { return reference as CKRecordValue }
+                        return [reference] as CKRecordValue
+                    }
+                    return field == "favoriteChild" ? name as CKRecordValue : [name] as CKRecordValue
+                }
+                record[field] = value(for: "01")
+                do {
+                    _ = try await f.adapter.saveChanges(in: [record], forceSave: true)
+                    XCTFail("A typed relationship alias must not wait forever as missing-target work")
+                } catch is RealmSwiftRemoteRecordDecodingError {}
+                await f.targetRealm.asyncRefresh()
+                XCTAssertEqual(parent.modifiedAt, originalDate)
+                XCTAssertEqual(parent.children.map(\.id), [2])
+                XCTAssertEqual(Set(parent.relatedChildren.map(\.id)), Set([2]))
+                XCTAssertEqual(parent.favoriteChild?.id, 2)
+                XCTAssertTrue(f.persistenceRealm.objects(PendingRelationship.self).isEmpty)
+                record[field] = value(for: "1")
+                _ = try await f.adapter.saveChanges(in: [record], forceSave: true)
+                try await f.adapter.persistImportedChanges()
+                await f.targetRealm.asyncRefresh()
+                if field == "children" { XCTAssertEqual(parent.children.map(\.id), [1]) }
+                if field == "relatedChildren" { XCTAssertEqual(Set(parent.relatedChildren.map(\.id)), Set([1])) }
+                if field == "favoriteChild" { XCTAssertEqual(parent.favoriteChild?.id, 1) }
+                XCTAssertTrue(f.persistenceRealm.objects(PendingRelationship.self).isEmpty)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUnavailableDeletionAdmissionAbortsWithoutQuarantineAndRetainsPendingWork() async throws {
+        for marker in ["admission-unavailable", "resource-unavailable"] {
+            let f = try await makeRealmAdapterFixture()
+            let local = BigSyncSemanticallyValidatedObject()
+            local.id = "pending-delete"; local.semanticValue = "valid"; local.immutableNonce = marker
+            try await f.targetRealm.asyncWrite {
+                f.targetRealm.add(local)
+                local.refreshChangeMetadata(explicitlyModified: true)
+            }
+            let name = BigSyncSemanticallyValidatedObject.className() + "." + local.id
+            let generation = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation)
+            let id = CKRecord.ID(recordName: name, zoneID: f.adapter.recordZoneID)
+            do {
+                _ = try await f.adapter.deleteRecords(with: [id])
+                XCTFail("Unavailable local evidence is not a deletion-quarantine verdict")
+            } catch {
+                if marker == "admission-unavailable" { XCTAssertTrue(error is BigSyncSemanticAdmissionUnavailable) }
+                else { XCTAssertTrue(error is BigSyncInboundResourceUnavailable) }
+            }
+            await f.targetRealm.asyncRefresh()
+            XCTAssertFalse(local.isDeleted)
+            XCTAssertEqual(f.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+            XCTAssertTrue(f.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            try await f.targetRealm.asyncWrite { local.immutableNonce = "deletion-permitted" }
+            let retried = try await f.adapter.deleteRecords(with: [id])
+            XCTAssertEqual(retried.first?.disposition, .preservedNewerLive(generation: generation))
+            XCTAssertFalse(local.isDeleted)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUnavailableFinalDeletionEvidenceRollsBackEarlierTargetAndRetries() async throws {
+        for marker in ["admission-unavailable", "resource-unavailable"] {
+            let f = try await makeRealmAdapterFixture()
+            let ids = ["first", "later"].map { suffix -> CKRecord.ID in
+                CKRecord.ID(recordName: BigSyncSemanticallyValidatedObject.className() + "." + suffix,
+                            zoneID: f.adapter.recordZoneID)
+            }
+            try await f.targetRealm.asyncWrite {
+                for suffix in ["first", "later"] {
+                    let object = BigSyncSemanticallyValidatedObject()
+                    object.id = suffix; object.semanticValue = "valid"; object.immutableNonce = "deletion-permitted"
+                    f.targetRealm.add(object)
+                }
+            }
+            f.adapter._testBeforeRemoteDeletionTargetWrite = {
+                try await f.targetRealm.asyncWrite {
+                    let later = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncSemanticallyValidatedObject.self, forPrimaryKey: "later"))
+                    later.immutableNonce = marker
+                }
+            }
+            do {
+                _ = try await f.adapter.deleteRecords(with: ids)
+                XCTFail("Missing final authority/resource must roll back this physical target group")
+            } catch {
+                if marker == "admission-unavailable" { XCTAssertTrue(error is BigSyncSemanticAdmissionUnavailable) }
+                else { XCTAssertTrue(error is BigSyncInboundResourceUnavailable) }
+            }
+            f.adapter._testBeforeRemoteDeletionTargetWrite = nil
+            await f.targetRealm.asyncRefresh()
+            for suffix in ["first", "later"] {
+                XCTAssertFalse(try XCTUnwrap(f.targetRealm.object(ofType: BigSyncSemanticallyValidatedObject.self, forPrimaryKey: suffix)).isDeleted)
+            }
+            XCTAssertTrue(f.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            for id in ids { XCTAssertNil(f.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: id.recordName)) }
+            try await f.targetRealm.asyncWrite {
+                let later = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncSemanticallyValidatedObject.self, forPrimaryKey: "later"))
+                later.immutableNonce = "deletion-permitted"
+            }
+            let retried = try await f.adapter.deleteRecords(with: ids)
+            XCTAssertEqual(retried.map(\.disposition), [.appliedTombstone, .appliedTombstone])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testSharedValidationErrorBoundaryKeepsSaveAndOwnEchoOperationalFailuresRetryable() async throws {
+        for marker in ["admission-unavailable", "resource-unavailable"] {
+            for mode in 0..<3 {
+                let f = try await makeRealmAdapterFixture()
+                let record = makeRecord(type: BigSyncSemanticallyValidatedObject.className(), id: "retryable-input", zoneID: f.adapter.recordZoneID)
+                record["semanticValue"] = marker as CKRecordValue
+                record["immutableNonce"] = "same" as CKRecordValue
+                do {
+                    if mode == 2 { _ = try await f.adapter.validateAuthoritativeOwnUploadRecords([record]) }
+                    else { _ = try await f.adapter.saveChanges(in: [record], forceSave: mode == 1) }
+                    XCTFail("Unavailable local evidence must not become semantic quarantine")
+                } catch {
+                    if marker == "admission-unavailable" { XCTAssertTrue(error is BigSyncSemanticAdmissionUnavailable) }
+                    else { XCTAssertTrue(error is BigSyncInboundResourceUnavailable) }
+                }
+                XCTAssertTrue(f.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+                XCTAssertNil(f.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: record.recordID.recordName))
+                record["semanticValue"] = "valid" as CKRecordValue
+                if mode == 2 { _ = try await f.adapter.validateAuthoritativeOwnUploadRecords([record]) }
+                else { _ = try await f.adapter.saveChanges(in: [record], forceSave: mode == 1) }
+                XCTAssertTrue(f.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionRevalidatesCurrentSemanticAuthorityInsideWrite() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let date = Date(timeIntervalSinceReferenceDate: 100)
+        let local = BigSyncSemanticallyValidatedObject()
+        local.id = "deletion-authority-race"
+        local.semanticValue = "valid"
+        local.immutableNonce = "deletion-permitted"
+        local.modifiedAt = date
+        local.explicitlyModifiedAt = date
+        let neighbor = BigSyncSemanticallyValidatedObject()
+        neighbor.id = "deletion-permitted-neighbor"
+        neighbor.semanticValue = "valid"
+        neighbor.immutableNonce = "deletion-permitted"
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add([local, neighbor])
+        }
+        let recordID = CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className() + "." + local.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        let neighborID = CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className() + "." + neighbor.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        fixture.adapter._testBeforeRemoteDeletionTargetWrite = {
+            try await fixture.targetRealm.asyncWrite {
+                local.immutableNonce = "protected-after-selection"
+            }
+        }
+        defer { fixture.adapter._testBeforeRemoteDeletionTargetWrite = nil }
+        let results = try await fixture.adapter.deleteRecords(with: [recordID, neighborID])
+        await fixture.targetRealm.asyncRefresh()
+        fixture.persistenceRealm.refresh()
+        XCTAssertFalse(local.isDeleted)
+        XCTAssertEqual(local.immutableNonce, "protected-after-selection")
+        XCTAssertEqual(local.modifiedAt, date)
+        XCTAssertTrue(neighbor.isDeleted)
+        let quarantine = try XCTUnwrap(fixture.persistenceRealm.objects(
+            BigSyncInboundSemanticQuarantine.self
+        ).where { $0.recordName == recordID.recordName }.first)
+        XCTAssertEqual(quarantine.semanticScopeIdentifier, "protected-after-selection")
+        XCTAssertEqual(results.first?.disposition, .quarantined(lineageID: quarantine.lineageID))
+        XCTAssertEqual(results.last?.disposition, .appliedTombstone)
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName
+        ))
+        XCTAssertNil(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testCancellationInFinalDeletionCheckRollsBackTheTargetGroup() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let objects = ["neighbor", "cancel-late"].map { id in
+            let object = BigSyncSemanticallyValidatedObject()
+            object.id = id
+            object.semanticValue = "valid"
+            object.immutableNonce = "deletion-permitted"
+            return object
+        }
+        try await fixture.targetRealm.asyncWrite { fixture.targetRealm.add(objects) }
+        let ids = objects.map { CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className() + "." + $0.id,
+            zoneID: fixture.adapter.recordZoneID
+        ) }
+        fixture.adapter._testBeforeRemoteDeletionTargetWrite = {
+            try await fixture.targetRealm.asyncWrite {
+                objects[1].immutableNonce = "cancel-deletion"
+            }
+        }
+        defer { fixture.adapter._testBeforeRemoteDeletionTargetWrite = nil }
+        do {
+            _ = try await fixture.adapter.deleteRecords(with: ids)
+            XCTFail("Cancellation must abort the target group, not quarantine it")
+        } catch is CancellationError {
+            // Requery after rollback rather than using rolled-back live references.
+        }
+        await fixture.targetRealm.asyncRefresh()
+        fixture.persistenceRealm.refresh()
+        for id in ["neighbor", "cancel-late"] {
+            XCTAssertFalse(try XCTUnwrap(fixture.targetRealm.object(
+                ofType: BigSyncSemanticallyValidatedObject.self, forPrimaryKey: id
+            )).isDeleted)
+        }
+        XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        for id in ids {
+            XCTAssertNil(fixture.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: id.recordName))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledIntrinsicAdmissionIsNotQuarantined() async throws {
+        for ownEcho in [false, true] {
+            let fixture = try await makeRealmAdapterFixture()
+            let incoming = makeRecord(
+                type: BigSyncSemanticallyValidatedObject.className(), id: "cancel-intrinsic",
+                zoneID: fixture.adapter.recordZoneID
+            )
+            incoming["semanticValue"] = "cancel-record" as CKRecordValue
+            do {
+                if ownEcho {
+                    _ = try await fixture.adapter.validateAuthoritativeOwnUploadRecords([incoming])
+                } else {
+                    _ = try await fixture.adapter.saveChanges(in: [incoming], forceSave: false)
+                }
+                XCTFail("Cancellation must escape intrinsic admission, ownEcho=\(ownEcho)")
+            } catch is CancellationError {}
+            fixture.persistenceRealm.refresh()
+            XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            XCTAssertNil(fixture.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: incoming.recordID.recordName))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledDeletionAdmissionIsNotQuarantined() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let local = BigSyncSemanticallyValidatedObject()
+        local.id = "cancel-deletion"
+        local.semanticValue = "valid"
+        local.immutableNonce = "cancel-deletion"
+        try await fixture.targetRealm.asyncWrite { fixture.targetRealm.add(local) }
+        let id = CKRecord.ID(
+            recordName: BigSyncSemanticallyValidatedObject.className() + "." + local.id,
+            zoneID: fixture.adapter.recordZoneID
+        )
+        do {
+            _ = try await fixture.adapter.deleteRecords(with: [id])
+            XCTFail("Cancellation is not a durable deletion rejection")
+        } catch is CancellationError {}
+        fixture.persistenceRealm.refresh()
+        XCTAssertFalse(local.isDeleted)
+        XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
     }
 
     @BigSyncBackgroundActor
@@ -3385,6 +4157,342 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testLegacyAndStrictRefreshShareTheSameRecordJournal() async throws {
+        let identity = BigSyncMutationJournalIdentity(
+            installationIdentifier: "shared-journal",
+            replicaBindingGenerationIdentifier: String(repeating: "a", count: 64)
+        )
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = UUID().uuidString
+        configuration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy(
+            excludedClassNames: [],
+            accountScopePropertyByClassName: [
+                BigSyncTrackedObject.className(): "cloudKitAccountScopeIdentifier"
+            ]
+        ).install(configurations: [configuration], mutationJournalIdentityProvider: { identity })
+        let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+        let timestamp = Date(timeIntervalSince1970: 1_000)
+        let object = BigSyncTrackedObject(
+            id: "shared", createdAt: timestamp, modifiedAt: timestamp,
+            explicitlyModifiedAt: nil
+        )
+        object.cloudKitAccountScopeIdentifier = "account-a"
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true, at: timestamp)
+        }
+        let recordName = BigSyncTrackedObject.className() + ".shared"
+        let firstGeneration = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation)
+        let strictWitness = try realm.write {
+            object.isDeleted = true
+            return try object.refreshChangeMetadata(
+                explicitlyModified: true, at: timestamp.addingTimeInterval(1),
+                expectedJournalIdentity: identity
+            )
+        }
+        XCTAssertEqual(strictWitness.recordName, recordName)
+        XCTAssertEqual(strictWitness.accountScopeIdentifier, "account-a")
+        XCTAssertNotEqual(firstGeneration, strictWitness.generation)
+        try realm.write {
+            object.isDeleted = false
+            object.refreshChangeMetadata(explicitlyModified: true, at: timestamp.addingTimeInterval(2))
+        }
+        let journal = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+        XCTAssertNotEqual(journal.generation, strictWitness.generation)
+        XCTAssertEqual(journal.accountScopeIdentifier, "account-a")
+        XCTAssertEqual(journal.replicaBindingGenerationIdentifier, identity.replicaBindingGenerationIdentifier)
+        XCTAssertEqual(journal.changedAt, timestamp.addingTimeInterval(2))
+        XCTAssertEqual(object.explicitlyModifiedAt, timestamp.addingTimeInterval(2))
+
+        let finalGeneration = journal.generation
+        XCTAssertThrowsError(try realm.write {
+            object.cloudKitAccountScopeIdentifier = "account-b"
+            try object.refreshChangeMetadata(
+                explicitlyModified: true, at: timestamp.addingTimeInterval(3),
+                expectedJournalIdentity: identity
+            )
+        }) { error in
+            XCTAssertEqual(error as? BigSyncMutationJournalError, .accountScopeChanged(recordName))
+        }
+        XCTAssertEqual(object.cloudKitAccountScopeIdentifier, "account-a")
+        XCTAssertEqual(journal.generation, finalGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testSharedJournalPreservesLegacyUnmanagedExcludedAndNonAuthoritativeRefresh() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_000)
+        let object = BigSyncTrackedObject(
+            id: "local-only", createdAt: timestamp, modifiedAt: timestamp,
+            explicitlyModifiedAt: nil
+        )
+        object.refreshChangeMetadata(explicitlyModified: true, at: timestamp)
+        XCTAssertEqual(object.explicitlyModifiedAt, timestamp)
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = UUID().uuidString
+        configuration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy(excludedClassNames: [BigSyncTrackedObject.className()])
+            .install(configurations: [configuration])
+        let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true, at: timestamp.addingTimeInterval(1))
+            object.refreshChangeMetadata(explicitlyModified: false, at: timestamp.addingTimeInterval(2))
+        }
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+        XCTAssertEqual(object.modifiedAt, timestamp.addingTimeInterval(2))
+        XCTAssertEqual(object.explicitlyModifiedAt, timestamp.addingTimeInterval(1))
+    }
+
+    @BigSyncBackgroundActor
+    func testSharedJournalKeepsIntegerRecordIdentityAcrossOverloads() async throws {
+        let identity = BigSyncMutationJournalIdentity(
+            installationIdentifier: "integer-shared",
+            replicaBindingGenerationIdentifier: String(repeating: "a", count: 64)
+        )
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = UUID().uuidString
+        configuration.objectTypes = [BigSyncIntegerKeyedObject.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration], mutationJournalIdentityProvider: { identity }
+        )
+        let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+        let object = BigSyncIntegerKeyedObject()
+        object.id = -17
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+            let witness = try object.refreshChangeMetadata(
+                explicitlyModified: true, at: Date(), expectedJournalIdentity: identity
+            )
+            XCTAssertEqual(witness.objectIdentifier, "-17")
+            XCTAssertEqual(witness.recordName, BigSyncIntegerKeyedObject.className() + ".-17")
+            try BigSyncMutationTracking.verifyJournalWitnesses(
+                [witness], expectedIdentity: identity, in: realm
+            )
+        }
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testStrictJournalRefreshSamplesOnceAndRejectsAdmissionRotation()
+    async throws {
+        let identityA = BigSyncMutationJournalIdentity(
+            installationIdentifier: "strict-journal-installation",
+            replicaBindingGenerationIdentifier: String(repeating: "a", count: 64)
+        )
+        let identityB = BigSyncMutationJournalIdentity(
+            installationIdentifier: identityA.installationIdentifier,
+            replicaBindingGenerationIdentifier: String(repeating: "b", count: 64)
+        )
+        let identities = MutationJournalIdentitySequence([identityA, identityB])
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "strict-journal-\(UUID().uuidString)"
+        configuration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration],
+            mutationJournalIdentityProvider: { identities.next() }
+        )
+        let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+        let originalDate = Date(timeIntervalSince1970: 1_000)
+        let object = BigSyncTrackedObject(
+            id: "strict-journal", createdAt: originalDate,
+            modifiedAt: originalDate, explicitlyModifiedAt: nil
+        )
+        let first = try realm.write {
+            realm.add(object)
+            return try object.refreshChangeMetadata(
+                explicitlyModified: true, at: originalDate,
+                expectedJournalIdentity: identityA
+            )
+        }
+        XCTAssertEqual(identities.invocationCount, 1)
+        XCTAssertEqual(first.identity, identityA)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+                                    forPrimaryKey: first.recordName)?.generation, first.generation)
+
+        XCTAssertThrowsError(try realm.write {
+            object.tags.append("must-roll-back")
+            try object.refreshChangeMetadata(
+                explicitlyModified: true, at: originalDate.addingTimeInterval(1),
+                expectedJournalIdentity: identityA
+            )
+        }) { error in
+            XCTAssertEqual(error as? BigSyncMutationJournalError, .identityChanged)
+        }
+        XCTAssertEqual(identities.invocationCount, 2)
+        XCTAssertTrue(object.tags.isEmpty)
+        XCTAssertEqual(object.modifiedAt, originalDate)
+        XCTAssertEqual(object.explicitlyModifiedAt, originalDate)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+                                    forPrimaryKey: first.recordName)?.generation, first.generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testStrictJournalWitnessRejectsSupersededAndDuplicateGenerations()
+    async throws {
+        let identity = BigSyncMutationJournalIdentity(
+            installationIdentifier: "strict-witness-installation",
+            replicaBindingGenerationIdentifier: String(repeating: "a", count: 64)
+        )
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "strict-witness-\(UUID().uuidString)"
+        configuration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration], mutationJournalIdentityProvider: { identity }
+        )
+        let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+        let timestamp = Date(timeIntervalSince1970: 2_000)
+        let object = BigSyncTrackedObject(
+            id: "strict-witness", createdAt: timestamp,
+            modifiedAt: timestamp, explicitlyModifiedAt: nil
+        )
+        try realm.write {
+            realm.add(object)
+            let first = try object.refreshChangeMetadata(
+                explicitlyModified: true, at: timestamp,
+                expectedJournalIdentity: identity
+            )
+            object.tags.append("second-value")
+            let second = try object.refreshChangeMetadata(
+                explicitlyModified: true, at: timestamp,
+                expectedJournalIdentity: identity
+            )
+            XCTAssertNotEqual(first.generation, second.generation)
+            XCTAssertThrowsError(try BigSyncMutationTracking.verifyJournalWitnesses(
+                [first], expectedIdentity: identity, in: realm
+            ))
+            XCTAssertThrowsError(try BigSyncMutationTracking.verifyJournalWitnesses(
+                [second, second], expectedIdentity: identity, in: realm
+            ))
+            try BigSyncMutationTracking.verifyJournalWitnesses(
+                [second], expectedIdentity: identity, in: realm
+            )
+        }
+        XCTAssertEqual(Array(object.tags), ["second-value"])
+    }
+
+    @BigSyncBackgroundActor
+    func testStrictJournalUnavailableIdentityRollsBackWithoutTerminating()
+    async throws {
+        let identity = BigSyncMutationJournalIdentity(
+            installationIdentifier: "unavailable-installation",
+            replicaBindingGenerationIdentifier: String(repeating: "a", count: 64)
+        )
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "strict-unavailable-\(UUID().uuidString)"
+        configuration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration], mutationJournalIdentityProvider: { nil }
+        )
+        let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+        let timestamp = Date(timeIntervalSince1970: 3_000)
+        XCTAssertThrowsError(try realm.write {
+            let object = BigSyncTrackedObject(
+                id: "unavailable", createdAt: timestamp,
+                modifiedAt: timestamp, explicitlyModifiedAt: nil
+            )
+            realm.add(object)
+            try object.refreshChangeMetadata(
+                explicitlyModified: true, at: timestamp,
+                expectedJournalIdentity: identity
+            )
+        }) { error in
+            XCTAssertEqual(error as? BigSyncMutationJournalError, .identityUnavailable)
+        }
+        XCTAssertTrue(realm.objects(BigSyncTrackedObject.self).isEmpty)
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testStrictJournalMixedIdentityTransactionRollsBackEveryTarget()
+    async throws {
+        let identityA = BigSyncMutationJournalIdentity(
+            installationIdentifier: "mixed-installation",
+            replicaBindingGenerationIdentifier: String(repeating: "a", count: 64)
+        )
+        let identityB = BigSyncMutationJournalIdentity(
+            installationIdentifier: identityA.installationIdentifier,
+            replicaBindingGenerationIdentifier: String(repeating: "b", count: 64)
+        )
+        let identities = MutationJournalIdentitySequence([identityA, identityB])
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "strict-mixed-\(UUID().uuidString)"
+        configuration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration], mutationJournalIdentityProvider: { identities.next() }
+        )
+        let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+        let timestamp = Date(timeIntervalSince1970: 4_000)
+        XCTAssertThrowsError(try realm.write {
+            for id in ["first", "second"] {
+                let object = BigSyncTrackedObject(
+                    id: id, createdAt: timestamp,
+                    modifiedAt: timestamp, explicitlyModifiedAt: nil
+                )
+                realm.add(object)
+                try object.refreshChangeMetadata(
+                    explicitlyModified: true, at: timestamp,
+                    expectedJournalIdentity: identityA
+                )
+            }
+        }) { error in
+            XCTAssertEqual(error as? BigSyncMutationJournalError, .identityChanged)
+        }
+        XCTAssertEqual(identities.invocationCount, 2)
+        XCTAssertTrue(realm.objects(BigSyncTrackedObject.self).isEmpty)
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testStrictJournalRejectsExcludedOrMissingJournalSchemaWithoutCommitting()
+    async throws {
+        let identity = BigSyncMutationJournalIdentity(
+            installationIdentifier: "strict-policy-installation",
+            replicaBindingGenerationIdentifier: String(repeating: "a", count: 64)
+        )
+        for excludesModel in [false, true] {
+            var configuration = Realm.Configuration()
+            configuration.inMemoryIdentifier = "strict-policy-\(UUID().uuidString)"
+            configuration.objectTypes = excludesModel
+                ? [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+                : [BigSyncTrackedObject.self]
+            // Deliberately bypass BigSyncMutationPolicy.install's schema
+            // precondition to reach the runtime missing-journal error below.
+            BigSyncMutationTracking.install(
+                configurations: [configuration],
+                excludedClassNames: excludesModel
+                    ? [BigSyncTrackedObject.className()] : [],
+                mutationJournalIdentityProvider: { identity }
+            )
+            let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+            let timestamp = Date(timeIntervalSince1970: 5_000)
+            XCTAssertThrowsError(try realm.write {
+                let object = BigSyncTrackedObject(
+                    id: "strict-policy", createdAt: timestamp,
+                    modifiedAt: timestamp, explicitlyModifiedAt: nil
+                )
+                realm.add(object)
+                try object.refreshChangeMetadata(
+                    explicitlyModified: true, at: timestamp,
+                    expectedJournalIdentity: identity
+                )
+            }) { error in
+                let expected: BigSyncMutationJournalError = excludesModel
+                    ? .excludedModel(BigSyncTrackedObject.className())
+                    : .missingJournalSchema
+                XCTAssertEqual(error as? BigSyncMutationJournalError, expected)
+            }
+            XCTAssertTrue(realm.objects(BigSyncTrackedObject.self).isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testCombinedMutationJournalIdentityIsSampledOncePerMutation()
     async throws {
         let bindingA = String(repeating: "a", count: 64)
@@ -3545,6 +4653,95 @@ final class BigSyncKitTests: XCTestCase {
             XCTAssertEqual(after.0, before.0)
             XCTAssertEqual(after.1, before.1)
         }
+    }
+
+    @BigSyncBackgroundActor
+    func testStrictJournalUploadAcknowledgesOnlyItsPreparedGeneration()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let binding = String(repeating: "f", count: 64)
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: "same-binding-installation",
+                    replicaBindingGenerationIdentifier: binding
+                )
+            }
+        )
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: "transport-account",
+            replicaBindingGenerationIdentifier: binding
+        )
+        let object = BigSyncTrackedObject(
+            id: "strict-bound-newer-edit",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            try object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(),
+                expectedJournalIdentity: BigSyncMutationJournalIdentity(
+                    installationIdentifier: "same-binding-installation",
+                    replicaBindingGenerationIdentifier: binding
+                )
+            )
+        }
+        let recordName = BigSyncTrackedObject.className()
+            + ".strict-bound-newer-edit"
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        let firstBatch = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 1,
+            restrictedToEntityType: nil
+        )
+        let first = try XCTUnwrap(firstBatch.first)
+        let firstGeneration = try XCTUnwrap(first.generation)
+
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("newer-edit")
+            try object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(),
+                expectedJournalIdentity: BigSyncMutationJournalIdentity(
+                    installationIdentifier: "same-binding-installation",
+                    replicaBindingGenerationIdentifier: binding
+                )
+            )
+        }
+        let secondGeneration = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.generation)
+        XCTAssertNotEqual(secondGeneration, firstGeneration)
+
+        try await fixture.adapter.didUpload(
+            savedRecords: [first.record],
+            matchingGenerations: [recordName: firstGeneration]
+        )
+
+        XCTAssertEqual(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.generation, secondGeneration)
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(tracking.pendingGeneration, secondGeneration)
+        XCTAssertEqual(
+            tracking.pendingReplicaBindingGenerationIdentifier,
+            binding
+        )
+        let secondBatch = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 1,
+            restrictedToEntityType: nil
+        )
+        XCTAssertEqual(secondBatch.map(\.generation), [secondGeneration])
     }
 
     @BigSyncBackgroundActor
@@ -3841,6 +5038,71 @@ final class BigSyncKitTests: XCTestCase {
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: recordName
         ))
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedBindingOwnerMakesStrictJournalUnavailableWithoutLosingExistingIntent() async throws {
+        let store = AccountAuthorityTestStore()
+        let key = "strict-journal-binding"
+        let installation = "strict-journal-installation"
+        _ = try BigSyncReplicaBindingStateStore.prepare(store: store, key: key,
+                                                        installationIdentifier: installation)
+        _ = try BigSyncReplicaBindingStateStore.bindInitialAccount("account-a", store: store, key: key)
+        let valid = try XCTUnwrap(store.values[key] as? [String: Any])
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "authority-store-journal-\(UUID().uuidString)"
+        configuration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration],
+            mutationJournalIdentityProvider: {
+                guard let binding = try? BigSyncReplicaBindingStateStore.load(store: store, key: key),
+                      binding.installationIdentityDigest == BigSyncReplicaBindingStateStore
+                        .installationIdentityDigest(for: installation) else { return nil }
+                return BigSyncMutationJournalIdentity(installationIdentifier: installation,
+                    replicaBindingGenerationIdentifier: binding.mutationGenerationIdentifier)
+            })
+        let realm = try await Realm(configuration: configuration, actor: BigSyncBackgroundActor.shared)
+        let originalTime = Date(timeIntervalSince1970: 1_700_000_000)
+        let object = BigSyncTrackedObject(id: "retained-intent", createdAt: originalTime,
+                                         modifiedAt: originalTime, explicitlyModifiedAt: nil)
+        try await realm.asyncWrite {
+            realm.add(object)
+            object.tags.append("retained")
+            try object.refreshChangeMetadataRequiringJournal(at: originalTime)
+        }
+        let recordName = BigSyncTrackedObject.className() + ".retained-intent"
+        let generation = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self,
+                                                    forPrimaryKey: recordName)?.generation)
+        for (field, bad) in [("activeAccountScopeIdentifier", Data()) as (String, Any),
+                             ("restoredDatasetOwnerAccountScopeIdentifier", NSNull()),
+                             ("version", 1.5)] {
+            var damaged = valid
+            damaged[field] = bad
+            store.values[key] = damaged
+            do {
+                try await realm.asyncWrite {
+                    let target = try XCTUnwrap(realm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "retained-intent"))
+                    target.tags.append("must-roll-back")
+                    try target.refreshChangeMetadataRequiringJournal(at: originalTime.addingTimeInterval(1))
+                }
+                XCTFail("Corrupt binding cannot supply the identity for a new journal generation")
+            } catch let error as BigSyncMutationJournalError {
+                XCTAssertEqual(error, .identityUnavailable)
+            }
+            let retained = try XCTUnwrap(realm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "retained-intent"))
+            XCTAssertEqual(Array(retained.tags), ["retained"])
+            XCTAssertEqual(retained.modifiedAt, originalTime)
+            XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName)?.generation, generation)
+        }
+        store.values[key] = valid
+        try await realm.asyncWrite {
+            let target = try XCTUnwrap(realm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "retained-intent"))
+            target.tags.append("retry")
+            try target.refreshChangeMetadataRequiringJournal(at: originalTime.addingTimeInterval(2))
+        }
+        XCTAssertEqual(Array(try XCTUnwrap(realm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "retained-intent")).tags), ["retained", "retry"])
+        let updated = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName)?.generation)
+        XCTAssertNotEqual(updated, generation)
     }
 
     @BigSyncBackgroundActor
@@ -5451,8 +6713,12 @@ final class BigSyncKitTests: XCTestCase {
         for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
             try await Task.sleep(nanoseconds: 1_000_000)
         }
+        let expectedBoundary = CloudKitSynchronizer.SynchronizationBoundaryContext(
+            context: try XCTUnwrap(synchronizer.activeRunContext)
+        )
         await synchronizer.changesFinishedSynchronizing()
         let result = try await synchronization.value
+        XCTAssertEqual(result.boundary, expectedBoundary)
 
         XCTAssertNil(result.receipt)
         XCTAssertEqual(
@@ -7478,18 +8744,56 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     func testCorruptDatabaseAndZoneCursorsDoNotDowngradeToNil() {
-        let corruptData = Data("not-a-keyed-archive".utf8)
+        for corruptData in [Data(), Data("not-a-keyed-archive".utf8)] {
+            XCTAssertThrowsError(
+                try DatabaseChangeCursor(serializedData: corruptData).token()
+            ) { error in
+                XCTAssertEqual(error as? CloudKitChangeFeedError, .corruptCursor)
+            }
+            XCTAssertThrowsError(
+                try RecordZoneChangeCursor(serializedData: corruptData).token()
+            ) { error in
+                XCTAssertEqual(error as? CloudKitChangeFeedError, .corruptCursor)
+            }
+        }
+    }
 
-        XCTAssertThrowsError(
-            try DatabaseChangeCursor(serializedData: corruptData).token()
-        ) { error in
-            XCTAssertEqual(error as? CloudKitChangeFeedError, .corruptCursor)
+    @BigSyncBackgroundActor
+    func testStoredDatabaseCursorLoaderPreservesAbsenceAndRejectsCorruption() throws {
+        let store = DictionaryKeyValueStore()
+        let synchronizer = makeSynchronizer(keyValueStore: store)
+        let key = synchronizer.durableStateKey("QSDatabaseServerChangeTokenKey")
+        XCTAssertNil(try synchronizer.loadStoredDatabaseToken())
+        for malformed in [Data() as Any, "not-data", NSNumber(value: 1)] {
+            store.set(value: malformed, forKey: key)
+            XCTAssertThrowsError(try synchronizer.loadStoredDatabaseToken()) { error in
+                XCTAssertEqual(error as? CloudKitChangeFeedError, .corruptCursor)
+            }
+            XCTAssertNotNil(store.object(forKey: key), "The loader must not erase unreadable evidence")
         }
-        XCTAssertThrowsError(
-            try RecordZoneChangeCursor(serializedData: corruptData).token()
-        ) { error in
-            XCTAssertEqual(error as? CloudKitChangeFeedError, .corruptCursor)
+        let bytes = Data("opaque-scripted-cursor".utf8)
+        store.set(value: bytes, forKey: key)
+        XCTAssertEqual(try synchronizer.loadStoredDatabaseToken()?.serializedData, bytes)
+        store.removeObject(forKey: key)
+        XCTAssertNil(try synchronizer.loadStoredDatabaseToken())
+    }
+
+    @BigSyncBackgroundActor
+    func testStoredDatabaseCursorReadFailureIsNotFirstFetchOrCorruption() throws {
+        let store = DictionaryKeyValueStore()
+        let synchronizer = makeSynchronizer(keyValueStore: store)
+        let key = synchronizer.durableStateKey("QSDatabaseServerChangeTokenKey")
+        let bytes = Data("retained-cursor".utf8)
+        store.set(value: bytes, forKey: key)
+        store.synchronizesDurably = false
+        XCTAssertThrowsError(try synchronizer.loadStoredDatabaseToken()) { error in
+            guard case DurableKeyValueStoreError.unavailable = error else {
+                return XCTFail("Expected storage failure, got \(error)")
+            }
         }
+        XCTAssertEqual(store.object(forKey: key) as? Data, bytes)
+        store.synchronizesDurably = true
+        XCTAssertEqual(try synchronizer.loadStoredDatabaseToken()?.serializedData, bytes)
     }
 
     @BigSyncBackgroundActor
@@ -11566,7 +12870,7 @@ final class BigSyncKitTests: XCTestCase {
 
         try await fixture.adapter.saveToken(cursor)
 
-        let persistedCursor = await fixture.adapter.serverChangeToken
+        let persistedCursor = try await fixture.adapter.serverChangeToken
         XCTAssertEqual(persistedCursor, cursor)
         XCTAssertEqual(
             fixture.persistenceRealm.objects(ServerToken.self).first?.token,
@@ -12077,6 +13381,11 @@ final class BigSyncKitTests: XCTestCase {
                 "Bookmark": [makeRecord(type: "Bookmark", id: "one", zoneID: zoneID)]
             ]
         )
+        // Durable publication requires an actually consumed zone cursor.
+        // The fake's default database feed reports no changed zones.
+        try await adapter.saveToken(RecordZoneChangeCursor(
+            serializedData: Data("process-kill-existing-zone-cursor".utf8)
+        ))
         let synchronizer = makeSynchronizer(
             database: database,
             recordZoneID: zoneID
@@ -12084,6 +13393,7 @@ final class BigSyncKitTests: XCTestCase {
         let events = SynchronizationBoundaryEventRecorder()
         let completionDelegate = ProcessKillCompletionDelegate()
         synchronizer.delegate = completionDelegate
+        adapter.durableEvidenceFeedEpoch = 7
         synchronizer.domainPublicationScopeIdentifierProvider = {
             "process-kill-test-scope"
         }
@@ -12106,8 +13416,8 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(
             checkpointEvents,
             [
-                "localAcknowledgementBeforeTerminalPublication:fetches=1:didUpload=true:evidence=false:completed=false",
-                "terminalEvidenceBeforeCompletionDelivery:fetches=2:didUpload=true:evidence=false:completed=false",
+                "localAcknowledgementBeforeTerminalPublication:fetches=2:didUpload=true:evidence=false:completed=false",
+                "terminalEvidenceBeforeCompletionDelivery:fetches=2:didUpload=true:evidence=true:completed=false",
             ]
         )
         XCTAssertTrue(
@@ -12492,6 +13802,381 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testUnavailableZoneCheckpointStorageThrowsWithoutInventingFirstFetch() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let cursor = RecordZoneChangeCursor(serializedData: Data("retained-zone".utf8))
+        try await fixture.adapter.saveToken(cursor)
+        let provider = try XCTUnwrap(fixture.adapter.realmProvider)
+        fixture.adapter.realmProvider = nil
+        defer { fixture.adapter.realmProvider = provider }
+        do {
+            _ = try await fixture.adapter.serverChangeToken
+            XCTFail("Unavailable tracking storage is not first fetch")
+        } catch RealmSwiftAdapterError.setupUnavailable {}
+        let synchronizer = makeSynchronizer()
+        do {
+            _ = try await synchronizer.needsZoneSetup(adapter: fixture.adapter)
+            XCTFail("Unavailable tracking storage must not authorize zone creation")
+        } catch RealmSwiftAdapterError.setupUnavailable {}
+        XCTAssertEqual(fixture.persistenceRealm.objects(ServerToken.self).first?.token, cursor.serializedData)
+    }
+
+    @BigSyncBackgroundActor
+    func testAmbiguousZoneCheckpointCannotAdvanceReceiptsOrPublicationAndResetPreservesWork() async throws {
+        let a = Data("zone-a".utf8), b = Data("zone-b".utf8)
+        let invalidRows: [[Data?]] = [[Data()], [nil, a], [a, nil], [a, a], [a, b], [b, a]]
+        for values in invalidRows {
+            let fixture = try await makeRealmAdapterFixture(committedInboundIdentityDeliveryEnabled: true)
+            try await activateChangeFeedNamespace(fixture.adapter, account: "checkpoint-account")
+            let object = BigSyncTrackedObject(id: "checkpoint-local", createdAt: Date(),
+                                              modifiedAt: Date(), explicitlyModifiedAt: nil)
+            let name = BigSyncTrackedObject.className() + "." + object.id
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add(object)
+                try object.refreshChangeMetadataRequiringJournal()
+            }
+            let generation = try XCTUnwrap(fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: name
+            )?.generation)
+            let record = makeRecord(type: BigSyncTrackedObject.className(), id: "checkpoint-event",
+                                    zoneID: fixture.adapter.recordZoneID)
+            let first = RecordZoneChangeCursor(serializedData: a)
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: nil, nextCursor: first,
+                liveResults: [.init(event: .init(ordinal: 0, entityType: record.recordType,
+                                                recordID: record.recordID), disposition: .unchanged)],
+                deletionResults: []
+            ))
+            let receipt = try XCTUnwrap(fixture.persistenceRealm.object(
+                ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: BigSyncInboundPageReceipt.canonicalID
+            ))
+            let sequence = receipt.pageSequence
+            let outcome = receipt.outcomeDigestHex
+            let delivery = try XCTUnwrap(try fixture.adapter.pendingCommittedInboundIdentityBatch()).deliveryID
+            try await fixture.persistenceRealm.asyncWrite {
+                fixture.persistenceRealm.delete(fixture.persistenceRealm.objects(ServerToken.self))
+                for value in values {
+                    let row = ServerToken()
+                    row.token = value
+                    fixture.persistenceRealm.add(row)
+                }
+            }
+            do {
+                _ = try await fixture.adapter.serverChangeToken
+                XCTFail("Must not select the first of ambiguous checkpoint rows")
+            } catch CloudKitChangeFeedError.corruptCursor {}
+            XCTAssertThrowsError(try fixture.adapter.currentServerBoundaryIdentifier(
+                containerIdentifier: "iCloud.test", databaseScope: .private
+            )) { error in
+                XCTAssertEqual(error as? CloudKitChangeFeedError, .corruptCursor)
+            }
+            do {
+                try await fixture.adapter.saveToken(RecordZoneChangeCursor(serializedData: b))
+                XCTFail("Ordinary save must not silently repair checkpoint ambiguity")
+            } catch CloudKitChangeFeedError.corruptCursor {}
+            do {
+                try await fixture.adapter.commitInboundPage(.init(
+                    previousCursor: first, nextCursor: .init(serializedData: b),
+                    liveResults: [], deletionResults: []
+                ))
+                XCTFail("A cursor CAS must reject ambiguous current storage")
+            } catch CloudKitChangeFeedError.corruptCursor {}
+            XCTAssertEqual(Array(fixture.persistenceRealm.objects(ServerToken.self).map(\.token)), values)
+            XCTAssertEqual(receipt.pageSequence, sequence)
+            XCTAssertEqual(receipt.outcomeDigestHex, outcome)
+            XCTAssertEqual(try fixture.adapter.pendingCommittedInboundIdentityBatch()?.deliveryID, delivery)
+            XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                                                     forPrimaryKey: name)?.generation, generation)
+
+            // Explicit recovery may clear ambiguity and the head, but not local
+            // upload work or the already durable inbound-identity obligation.
+            try await fixture.adapter.saveToken(nil)
+            let reset = try await fixture.adapter.serverChangeToken
+            XCTAssertNil(reset)
+            XCTAssertEqual(fixture.persistenceRealm.objects(ServerToken.self).count, 1)
+            XCTAssertNil(fixture.persistenceRealm.object(ofType: BigSyncInboundPageReceipt.self,
+                                                         forPrimaryKey: BigSyncInboundPageReceipt.canonicalID))
+            XCTAssertEqual(try fixture.adapter.pendingCommittedInboundIdentityBatch()?.deliveryID, delivery)
+            XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                                                     forPrimaryKey: name)?.generation, generation)
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: nil, nextCursor: .init(serializedData: b),
+                liveResults: [], deletionResults: []
+            ))
+            let retried = try await fixture.adapter.serverChangeToken
+            XCTAssertEqual(retried?.serializedData, b)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testEmptyPageCheckpointCannotReplaceStoredCursorOrReceipt() async throws {
+        let store = DictionaryKeyValueStore()
+        let synchronizer = makeSynchronizer(keyValueStore: store)
+        let prior = DatabaseChangeCursor(serializedData: Data("prior-db".utf8))
+        try synchronizer.persistDatabaseToken(prior)
+        XCTAssertThrowsError(try synchronizer.persistDatabaseToken(.init(serializedData: Data()))) { error in
+            XCTAssertEqual(error as? CloudKitChangeFeedError, .invalidPageCursor)
+        }
+        XCTAssertEqual(try synchronizer.loadStoredDatabaseToken(), prior)
+
+        let fixture = try await makeRealmAdapterFixture()
+        try await activateChangeFeedNamespace(fixture.adapter, account: "invalid-page-account")
+        let zonePrior = RecordZoneChangeCursor(serializedData: Data("prior-zone".utf8))
+        try await fixture.adapter.commitInboundPage(.init(previousCursor: nil, nextCursor: zonePrior,
+                                                        liveResults: [], deletionResults: []))
+        let before = try XCTUnwrap(fixture.persistenceRealm.objects(BigSyncInboundPageReceipt.self).first)
+            .outcomeDigestHex
+        do {
+            try await fixture.adapter.commitInboundPage(.init(
+                previousCursor: zonePrior, nextCursor: .init(serializedData: Data()),
+                liveResults: [], deletionResults: []
+            ))
+            XCTFail("An unusable page checkpoint cannot advance the receipt")
+        } catch CloudKitChangeFeedError.invalidPageCursor {}
+        do {
+            try await fixture.adapter.saveToken(.init(serializedData: Data()))
+            XCTFail("An unusable checkpoint cannot overwrite tracking")
+        } catch CloudKitChangeFeedError.invalidPageCursor {}
+        let after = try await fixture.adapter.serverChangeToken
+        XCTAssertEqual(after, zonePrior)
+        XCTAssertEqual(fixture.persistenceRealm.objects(BigSyncInboundPageReceipt.self).first?.outcomeDigestHex, before)
+
+        // The non-Realm default page adapter must enforce this contract too.
+        let fake = FakeModelAdapter(zoneID: fixture.adapter.recordZoneID, priorities: [])
+        let generic: any ModelAdapter = fake
+        do {
+            try await generic.commitInboundPage(.init(previousCursor: nil,
+                nextCursor: .init(serializedData: Data()), liveResults: [], deletionResults: []))
+            XCTFail("The default adapter must not save an empty page checkpoint")
+        } catch CloudKitChangeFeedError.invalidPageCursor {}
+        do {
+            try await generic.commitInboundPage(.init(previousCursor: .init(serializedData: Data()),
+                nextCursor: zonePrior, liveResults: [], deletionResults: []))
+            XCTFail("A present empty predecessor is not a first-fetch checkpoint")
+        } catch CloudKitChangeFeedError.corruptCursor {}
+        XCTAssertFalse(fake.events.contains("saveToken"))
+    }
+
+    @BigSyncBackgroundActor
+    func testInvalidFeedCheckpointRejectsThePageBeforeTargetOrZoneEffects() async throws {
+        for databasePageIsInvalid in [true, false] {
+            let fixture = try await makeRealmAdapterFixture()
+            let database = FakeCloudKitDatabase()
+            database.completesEmptyZoneChangeOperation = true
+            let synchronizer = makeSynchronizer(database: database, recordZoneID: fixture.adapter.recordZoneID)
+            synchronizer.addModelAdapter(fixture.adapter)
+            _ = try await synchronizer.synchronize()
+            let priorDatabaseCursor = try XCTUnwrap(try synchronizer.loadStoredDatabaseToken())
+            let priorZoneCursor = try await fixture.adapter.serverChangeToken
+            let priorEpoch = try fixture.adapter.changeFeedEpoch()
+            let beforeZoneFetches = database.recordZoneChangeFetchCount
+            let record = makeRecord(type: BigSyncTrackedObject.className(), id: "must-not-import",
+                                    zoneID: fixture.adapter.recordZoneID)
+            record["createdAt"] = Date(timeIntervalSince1970: 10) as CKRecordValue
+            record["modifiedAt"] = Date(timeIntervalSince1970: 10) as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            database.databaseChangePages = [FakeDatabaseChangePage(
+                changedZoneIDs: [fixture.adapter.recordZoneID],
+                deletions: databasePageIsInvalid ? [.init(zoneID: fixture.adapter.recordZoneID, kind: .deleted)] : [],
+                moreComing: false, cursorOverride: databasePageIsInvalid ? Data() : nil
+            )]
+            database.zoneChangePages = [FakeZoneChangePage(zoneID: fixture.adapter.recordZoneID,
+                records: [record], deletedRecordIDs: [], moreComing: false, cursorOverride: Data())]
+            do {
+                _ = try await synchronizer.synchronize()
+                XCTFail("A faulty feed result must fail, not reset previously valid history")
+            } catch CloudKitChangeFeedError.invalidPageCursor {}
+            XCTAssertEqual(try synchronizer.loadStoredDatabaseToken(), priorDatabaseCursor)
+            let afterZoneCursor = try await fixture.adapter.serverChangeToken
+            XCTAssertEqual(afterZoneCursor, priorZoneCursor)
+            XCTAssertEqual(try fixture.adapter.changeFeedEpoch(), priorEpoch)
+            XCTAssertFalse(synchronizer.configuredZoneIsTerminal(fixture.adapter.recordZoneID))
+            XCTAssertNil(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "must-not-import"))
+            XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            XCTAssertEqual(database.recordZoneChangeFetchCount - beforeZoneFetches,
+                           databasePageIsInvalid ? 0 : 1)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testGoodPageSurvivesInvalidContinuationAndRetryResumesItsCheckpoint() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let synchronizer = makeSynchronizer(database: database, recordZoneID: fixture.adapter.recordZoneID)
+        synchronizer.addModelAdapter(fixture.adapter)
+        _ = try await synchronizer.synchronize()
+        let priorDatabase = try synchronizer.loadStoredDatabaseToken()
+        let priorEpoch = try fixture.adapter.changeFeedEpoch()
+        let zone = fixture.adapter.recordZoneID
+        let records = ["accepted-first-page", "rejected-second-page"].map { id in
+            let record = makeRecord(type: BigSyncTrackedObject.className(), id: id, zoneID: zone)
+            record["createdAt"] = Date(timeIntervalSince1970: 10) as CKRecordValue
+            record["modifiedAt"] = Date(timeIntervalSince1970: 10) as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            return record
+        }
+        let firstCursor = Data("valid-first-page".utf8)
+        database.databaseChangePages = [.init(changedZoneIDs: [zone], deletions: [], moreComing: false)]
+        database.zoneChangePages = [
+            .init(zoneID: zone, records: [records[0]], deletedRecordIDs: [], moreComing: true,
+                  cursorOverride: firstCursor),
+            .init(zoneID: zone, records: [records[1]], deletedRecordIDs: [], moreComing: false,
+                  cursorOverride: Data())
+        ]
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("The malformed second page must not advance either checkpoint")
+        } catch CloudKitChangeFeedError.invalidPageCursor {}
+        XCTAssertEqual(try synchronizer.loadStoredDatabaseToken(), priorDatabase)
+        let afterFailure = try await fixture.adapter.serverChangeToken
+        XCTAssertEqual(afterFailure?.serializedData, firstCursor)
+        XCTAssertEqual(try fixture.adapter.changeFeedEpoch(), priorEpoch)
+        XCTAssertNotNil(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "accepted-first-page"))
+        XCTAssertNil(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "rejected-second-page"))
+
+        let inputOffset = database.zoneCursorInputs.count
+        database.databaseChangePages = [.init(changedZoneIDs: [zone], deletions: [], moreComing: false)]
+        database.zoneChangePages = [.init(zoneID: zone, records: [records[1]], deletedRecordIDs: [],
+            moreComing: false, cursorOverride: Data("valid-second-page".utf8))]
+        let result = try await synchronizer.synchronize()
+        XCTAssertNotNil(result.receipt)
+        XCTAssertGreaterThan(database.zoneCursorInputs.count, inputOffset)
+        if database.zoneCursorInputs.count > inputOffset {
+            XCTAssertEqual(database.zoneCursorInputs[inputOffset]?.serializedData, firstCursor)
+        }
+        XCTAssertNotNil(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "rejected-second-page"))
+        XCTAssertEqual(try fixture.adapter.changeFeedEpoch(), priorEpoch)
+    }
+
+    @BigSyncBackgroundActor
+    func testCorruptZoneCheckpointRecoveryRetainsAndDrainsJournaledIntent() async throws {
+        let opaque = Data("ambiguous-zone".utf8)
+        for (index, rows) in [[Data()] as [Data?], [opaque, opaque], [nil, opaque]].enumerated() {
+            let fixture = try await makeRealmAdapterFixture()
+            let database = FakeCloudKitDatabase()
+            database.completesEmptyZoneChangeOperation = true
+            let synchronizer = makeSynchronizer(database: database, recordZoneID: fixture.adapter.recordZoneID)
+            synchronizer.addModelAdapter(fixture.adapter)
+            _ = try await synchronizer.synchronize()
+            let beforeEpoch = try XCTUnwrap(fixture.adapter.changeFeedEpoch())
+            let object = BigSyncTrackedObject(id: "zone-recovery-\(index)", createdAt: Date(),
+                                              modifiedAt: Date(), explicitlyModifiedAt: nil)
+            object.tags.append("retained-local")
+            let name = BigSyncTrackedObject.className() + "." + object.id
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add(object)
+                try object.refreshChangeMetadataRequiringJournal()
+            }
+            XCTAssertNotNil(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+            try await fixture.persistenceRealm.asyncWrite {
+                fixture.persistenceRealm.delete(fixture.persistenceRealm.objects(ServerToken.self))
+                for bytes in rows {
+                    let row = ServerToken()
+                    row.token = bytes
+                    fixture.persistenceRealm.add(row)
+                }
+            }
+            database.databaseChangePages = [.init(changedZoneIDs: [fixture.adapter.recordZoneID],
+                                                  deletions: [], moreComing: false)]
+            let result = try await synchronizer.synchronize()
+            XCTAssertNotNil(result.receipt)
+            XCTAssertGreaterThan(try XCTUnwrap(fixture.adapter.changeFeedEpoch()), beforeEpoch)
+            XCTAssertEqual(fixture.persistenceRealm.objects(ServerToken.self).count, 1)
+            let recovered = try await fixture.adapter.serverChangeToken
+            XCTAssertNotNil(recovered)
+            XCTAssertNil(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+            XCTAssertEqual(database.record(for: .init(recordName: name, zoneID: fixture.adapter.recordZoneID))?["tags"] as? [String],
+                           ["retained-local"])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testQuarantineLineageDoesNotSelectAnAmbiguousCheckpoint() async throws {
+        for deletion in [false, true] {
+            let fixture = try await makeRealmAdapterFixture()
+            try await activateChangeFeedNamespace(fixture.adapter, account: "lineage-checkpoint-account")
+            try await fixture.persistenceRealm.asyncWrite {
+                for bytes in [Data("first-history".utf8), Data("second-history".utf8)] {
+                    let row = ServerToken()
+                    row.token = bytes
+                    fixture.persistenceRealm.add(row)
+                }
+            }
+            let record = makeRecord(type: BigSyncSemanticallyValidatedObject.className(),
+                                    id: "invalid-domain-value", zoneID: fixture.adapter.recordZoneID)
+            record["semanticValue"] = "invalid" as CKRecordValue
+            do {
+                if deletion {
+                    _ = try await fixture.adapter.deleteRecords(with: [record.recordID])
+                } else {
+                    _ = try await fixture.adapter.saveChanges(in: [record], forceSave: false)
+                }
+                XCTFail("Domain rejection cannot produce page lineage from ambiguous local history")
+            } catch CloudKitChangeFeedError.corruptCursor {}
+            XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            XCTAssertEqual(fixture.persistenceRealm.objects(ServerToken.self).count, 2)
+            XCTAssertTrue(fixture.targetRealm.objects(BigSyncSemanticallyValidatedObject.self).isEmpty)
+
+            try await fixture.adapter.saveToken(nil)
+            if deletion {
+                let results = try await fixture.adapter.deleteRecords(with: [record.recordID])
+                if case .quarantined = try XCTUnwrap(results.first).disposition {} else {
+                    XCTFail("After explicit recovery, normal domain rejection still applies")
+                }
+            } else {
+                let results = try await fixture.adapter.saveChanges(in: [record], forceSave: false)
+                if case .quarantined = try XCTUnwrap(results.first).disposition {} else {
+                    XCTFail("After explicit recovery, normal domain rejection still applies")
+                }
+            }
+            XCTAssertEqual(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).count, 1)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedStoredCursorEntersRecoveryBeforeNormalFetching() async throws {
+        for (index, malformed) in [Data() as Any, "wrong-storage-type"].enumerated() {
+            let fixture = try await makeRealmAdapterFixture()
+            let database = FakeCloudKitDatabase()
+            database.completesEmptyZoneChangeOperation = true
+            let store = DictionaryKeyValueStore()
+            let synchronizer = makeSynchronizer(database: database, keyValueStore: store)
+            synchronizer.addModelAdapter(fixture.adapter)
+            _ = try await synchronizer.synchronize()
+            let oldEpoch = try XCTUnwrap(fixture.adapter.changeFeedEpoch())
+
+            let object = BigSyncTrackedObject(
+                id: "stored-cursor-recovery-\(index)", createdAt: Date(), modifiedAt: Date(),
+                explicitlyModifiedAt: nil
+            )
+            object.tags.append("durable-local")
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add(object)
+                try object.refreshChangeMetadataRequiringJournal()
+            }
+            let recordName = BigSyncTrackedObject.className() + "." + object.id
+            let generation = try XCTUnwrap(fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+            )?.generation)
+            let key = synchronizer.durableStateKey("QSDatabaseServerChangeTokenKey")
+            store.set(value: malformed, forKey: key)
+
+            let result = try await synchronizer.synchronize()
+
+            XCTAssertNotNil(result.receipt)
+            XCTAssertGreaterThan(try XCTUnwrap(fixture.adapter.changeFeedEpoch()), oldEpoch,
+                                 "A malformed stored cursor must request a new recovery epoch")
+            XCTAssertFalse(generation.isEmpty)
+            XCTAssertNil(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName))
+            XCTAssertEqual(database.record(for: CKRecord.ID(
+                recordName: recordName, zoneID: fixture.adapter.recordZoneID
+            ))?["tags"] as? [String], ["durable-local"])
+            XCTAssertNotNil(try synchronizer.loadStoredDatabaseToken())
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testExpiredOrCorruptCursorRebuildsTrackingWithoutLosingJournal()
     async throws {
         let recoveryErrors: [Error] = [
@@ -12846,6 +14531,80 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testBackupRestoreEncryptedResetRetainsItsEventThroughRetryAndCompletion() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let store = DictionaryKeyValueStore()
+        let database = FakeCloudKitDatabase()
+        database.zoneExists = false
+        database.completesEmptyZoneChangeOperation = true
+        database.databaseChangePages = [.init(
+            changedZoneIDs: [],
+            deletions: [.init(zoneID: fixture.adapter.recordZoneID, kind: .encryptedDataReset)],
+            moreComing: false)]
+        let identifier = "restore-encrypted-\(UUID().uuidString)"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(identifier, isDirectory: true)
+        let installedBase = directory.appendingPathComponent("installed", isDirectory: true)
+        let restoredBase = directory.appendingPathComponent("restored", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let installed = makeSynchronizer(database: database, keyValueStore: store, identifier: identifier,
+                                         recordZoneID: fixture.adapter.recordZoneID, backupDetectionBaseURL: installedBase)
+        let installedSentinel = BackupDetection.defaultSentinelURL(namespace: installed.durableStateNamespace,
+                                                                    sharedBaseURL: installedBase)
+        let restoredSentinel = BackupDetection.defaultSentinelURL(namespace: installed.durableStateNamespace,
+                                                                   sharedBaseURL: restoredBase)
+        let copiedMarker = BackupDetection.markerURL(sentinelURL: restoredSentinel)
+        try FileManager.default.createDirectory(at: restoredBase, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: BackupDetection.markerURL(sentinelURL: installedSentinel), to: copiedMarker)
+        let restored = makeSynchronizer(database: database, keyValueStore: store, identifier: identifier,
+                                        recordZoneID: fixture.adapter.recordZoneID, backupDetectionBaseURL: restoredBase)
+        let event = try XCTUnwrap(BackupDetection.restoreResetEventIdentifier(
+            namespace: restored.durableStateNamespace, sharedSentinelBaseURL: restoredBase))
+        let eventURL = BackupDetection.restoreEventURL(sentinelURL: restoredSentinel)
+        let eventBytes = try Data(contentsOf: eventURL)
+        let objectID = "retained-across-restore-reset"
+        let recordName = BigSyncTrackedObject.className() + "." + objectID
+        let originalDate = Date(timeIntervalSince1970: 1_000)
+        try await fixture.targetRealm.asyncWrite {
+            let object = BigSyncTrackedObject(id: objectID, createdAt: originalDate,
+                                              modifiedAt: originalDate, explicitlyModifiedAt: nil)
+            object.tags.append("retained-user-data")
+            fixture.targetRealm.add(object)
+        }
+        restored.addModelAdapter(fixture.adapter)
+        let result = try await restored.synchronize()
+        XCTAssertNotNil(result.receipt)
+        let envelope = try XCTUnwrap(store.propertyListEntries.first(where: {
+            $0.key.contains("ChangeFeedMigration.v3")
+        })?.value)
+        XCTAssertEqual(envelope["mode"] as? String, "encryptedDataReset")
+        XCTAssertEqual(envelope["phase"] as? String, "completed")
+        XCTAssertEqual(envelope["backupRestoreEventIdentifier"] as? String, event)
+        let completedEpoch = try XCTUnwrap(envelope["epoch"] as? Int)
+        XCTAssertFalse(BackupDetection.restoreResetIsRequired(namespace: restored.durableStateNamespace,
+                                                             sharedSentinelBaseURL: restoredBase))
+        XCTAssertFalse(restored.configuredZoneIsTerminal(fixture.adapter.recordZoneID))
+        await fixture.targetRealm.asyncRefresh()
+        let retained = try XCTUnwrap(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: objectID))
+        XCTAssertEqual(Array(retained.tags), ["retained-user-data"])
+        XCTAssertEqual(retained.modifiedAt, originalDate)
+        XCTAssertNil(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName))
+        XCTAssertEqual(database.record(for: .init(recordName: recordName, zoneID: fixture.adapter.recordZoneID))?["tags"] as? [String],
+                       ["retained-user-data"])
+        // Model process death after durable migration completion but before the
+        // filesystem acknowledgement of this same event became durable. This
+        // is not a second restore: the sentinel and event identity are unchanged.
+        try eventBytes.write(to: eventURL, options: .atomic)
+        let retry = try await restored.synchronize()
+        XCTAssertNotNil(retry.receipt)
+        let afterRetry = try XCTUnwrap(store.propertyListEntries.first(where: {
+            $0.key.contains("ChangeFeedMigration.v3")
+        })?.value)
+        XCTAssertEqual(afterRetry["epoch"] as? Int, completedEpoch)
+        XCTAssertFalse(BackupDetection.restoreResetIsRequired(namespace: restored.durableStateNamespace,
+                                                             sharedSentinelBaseURL: restoredBase))
+    }
+
+    @BigSyncBackgroundActor
     func testEncryptedDataResetRebuildsJournalAndPreservesTargetRealm()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
@@ -13005,6 +14764,519 @@ final class BigSyncKitTests: XCTestCase {
             prepared.first?.record["tags"] as? [String],
             ["local"]
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testUnseenDefaultImportDoesNotCompeteWithConstructorDates() async throws {
+        for forceSave in [false, true] {
+            let f = try await makeRealmAdapterFixture()
+            f.adapter.mergePolicy = .custom
+            let old = Date(timeIntervalSince1970: 100)
+            let record = makeRecord(type: BigSyncIntegerKeyedObject.className(), id: "41",
+                                    zoneID: f.adapter.recordZoneID)
+            record["createdAt"] = old as CKRecordValue
+            record["modifiedAt"] = old as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            // This model defaults modifiedAt to Date(). No explicit user clock
+            // exists remotely, so its constructor used to win and be uploaded.
+            XCTAssertNil(record["explicitlyModifiedAt"])
+            XCTAssertNil(f.targetRealm.object(ofType: BigSyncIntegerKeyedObject.self, forPrimaryKey: 41))
+            _ = try await f.adapter.saveChanges(in: [record], forceSave: forceSave)
+            try await f.adapter.persistImportedChanges()
+            await f.targetRealm.asyncRefresh()
+            let value = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncIntegerKeyedObject.self, forPrimaryKey: 41))
+            XCTAssertEqual(value.createdAt, old)
+            XCTAssertEqual(value.modifiedAt, old)
+            XCTAssertNil(value.explicitlyModifiedAt)
+            XCTAssertNil(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                                              forPrimaryKey: record.recordID.recordName))
+            try await f.adapter.didFinishImport()
+            let uploads = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+            XCTAssertTrue(uploads.isEmpty, "A downloaded new object is not a new local edit")
+            XCTAssertNotNil(f.persistenceRealm.object(ofType: SyncedEntity.self,
+                                                      forPrimaryKey: record.recordID.recordName)?.encodedRecord)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testExistingDefaultClockStillCompetesWithoutAnExplicitClock() async throws {
+        let f = try await makeRealmAdapterFixture()
+        f.adapter.mergePolicy = .custom
+        let localDate = Date(timeIntervalSince1970: 200)
+        try await f.targetRealm.asyncWrite {
+            let object = BigSyncIntegerKeyedObject()
+            object.id = 42
+            object.createdAt = localDate
+            object.modifiedAt = localDate
+            f.targetRealm.add(object)
+        }
+        let remote = makeRecord(type: BigSyncIntegerKeyedObject.className(), id: "42", zoneID: f.adapter.recordZoneID)
+        remote["createdAt"] = Date(timeIntervalSince1970: 100) as CKRecordValue
+        remote["modifiedAt"] = Date(timeIntervalSince1970: 100) as CKRecordValue
+        remote["isDeleted"] = false as CKRecordValue
+        _ = try await f.adapter.saveChanges(in: [remote], forceSave: true)
+        await f.targetRealm.asyncRefresh()
+        let value = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncIntegerKeyedObject.self, forPrimaryKey: 42))
+        XCTAssertEqual(value.modifiedAt, localDate)
+        XCTAssertNil(value.explicitlyModifiedAt)
+        XCTAssertNotNil(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                                             forPrimaryKey: remote.recordID.recordName))
+    }
+
+    @BigSyncBackgroundActor
+    func testUnseenSelectionCannotBypassALateLocalCreation() async throws {
+        for forceSave in [false, true] {
+            let f = try await makeRealmAdapterFixture()
+            f.adapter.mergePolicy = .custom
+            let remote = makeRecord(type: BigSyncIntegerKeyedObject.className(), id: "43", zoneID: f.adapter.recordZoneID)
+            remote["createdAt"] = Date(timeIntervalSince1970: 100) as CKRecordValue
+            remote["modifiedAt"] = Date(timeIntervalSince1970: 100) as CKRecordValue
+            remote["isDeleted"] = false as CKRecordValue
+            let localDate = Date(timeIntervalSince1970: 50)
+            f.adapter._testBeforeImportedRecordTargetWrite = {
+                try await f.targetRealm.asyncWrite {
+                    let object = BigSyncIntegerKeyedObject()
+                    object.id = 43
+                    object.createdAt = localDate
+                    f.targetRealm.add(object)
+                    object.refreshChangeMetadata(explicitlyModified: true, at: localDate)
+                }
+            }
+            let results = try await f.adapter.saveChanges(in: [remote], forceSave: forceSave)
+            await f.targetRealm.asyncRefresh()
+            let value = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncIntegerKeyedObject.self, forPrimaryKey: 43))
+            let pending = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                                                           forPrimaryKey: remote.recordID.recordName))
+            XCTAssertEqual(value.modifiedAt, localDate)
+            XCTAssertEqual(value.explicitlyModifiedAt, localDate)
+            XCTAssertEqual(results.map(\.disposition), [.preservedPendingLocal(generation: pending.generation)])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testNewObjectStillUsesTheExplicitAuthoringDelegate() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let delegate = AuthoringConflictDelegate()
+        f.adapter.mergePolicy = .custom
+        f.adapter.delegate = delegate
+        let remote = makeRecord(type: BigSyncTrackedObject.className(), id: "delegate-new", zoneID: f.adapter.recordZoneID)
+        remote["createdAt"] = Date(timeIntervalSince1970: 100) as CKRecordValue
+        remote["modifiedAt"] = Date(timeIntervalSince1970: 100) as CKRecordValue
+        remote["isDeleted"] = false as CKRecordValue
+        remote["tags"] = ["server"] as CKRecordValue
+        _ = try await f.adapter.saveChanges(in: [remote], forceSave: true)
+        await f.targetRealm.asyncRefresh()
+        let value = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "delegate-new"))
+        XCTAssertEqual(Array(value.tags), ["delegate-authored"])
+        XCTAssertNotNil(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                                             forPrimaryKey: remote.recordID.recordName))
+        withExtendedLifetime(delegate) {}
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedUnseenDefaultImportRollsBackTheConstructedObject() async throws {
+        let f = try await makeRealmAdapterFixture()
+        f.adapter.mergePolicy = .custom
+        let remote = makeRecord(type: BigSyncIntegerKeyedObject.className(), id: "44", zoneID: f.adapter.recordZoneID)
+        remote["createdAt"] = Date(timeIntervalSince1970: 100) as CKRecordValue
+        remote["modifiedAt"] = "not-a-date" as CKRecordValue
+        remote["isDeleted"] = false as CKRecordValue
+        do {
+            _ = try await f.adapter.saveChanges(in: [remote], forceSave: true)
+            XCTFail("A new record still requires valid target-field decoding")
+        } catch {
+            XCTAssertTrue(error is RealmSwiftRemoteRecordDecodingError)
+        }
+        await f.targetRealm.asyncRefresh()
+        XCTAssertNil(f.targetRealm.object(ofType: BigSyncIntegerKeyedObject.self, forPrimaryKey: 44))
+        XCTAssertTrue(f.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
+        XCTAssertNil(f.persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: remote.recordID.recordName))
+    }
+
+    func testTrackedFixtureOwnsItsIntendedObjectiveCRecordName() {
+        XCTAssertEqual(BigSyncTrackedObject.className(), "BigSyncTrackedObject")
+    }
+
+    @BigSyncBackgroundActor
+    func testBackupRecoveryProviderLossPreservesOutboxAndCanRetry() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let current = BigSyncMutationJournalIdentity(installationIdentifier: "recovery-current",
+                                                     replicaBindingGenerationIdentifier: "recovery-binding")
+        let old = BigSyncMutationJournalIdentity(installationIdentifier: "copied-installation",
+                                                 replicaBindingGenerationIdentifier: "copied-binding")
+        var expected = [String: String]()
+        try await f.targetRealm.asyncWrite {
+            for (id, identity) in [("current", current), ("copied", old)] {
+                let date = Date(timeIntervalSince1970: 100)
+                let object = BigSyncTrackedObject(id: id, createdAt: date, modifiedAt: date, explicitlyModifiedAt: date)
+                object.tags.append(id)
+                f.targetRealm.add(object)
+                let name = BigSyncTrackedObject.className() + "." + id
+                let generation = BigSyncPendingMutation.makeGeneration(installationIdentifier: identity.installationIdentifier,
+                    replicaBindingGenerationIdentifier: try XCTUnwrap(identity.replicaBindingGenerationIdentifier))
+                expected[name] = generation
+                f.targetRealm.add(BigSyncPendingMutation(recordName: name, entityType: BigSyncTrackedObject.className(),
+                    objectIdentifier: id, replicaBindingGenerationIdentifier: identity.replicaBindingGenerationIdentifier,
+                    generation: generation))
+            }
+        }
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                             mutationJournalIdentityProvider: { nil })
+        try await activateChangeFeedNamespace(f.adapter, account: "recovery-account",
+                                             replicaBindingGenerationIdentifier: current.replicaBindingGenerationIdentifier)
+        do {
+            try await f.adapter.prepareChangeFeedReset(accountScopeIdentifier: "recovery-account", epoch: 601, mode: .backupRestore)
+            XCTFail("Unavailable identity cannot classify current work as copied")
+        } catch {
+            XCTAssertEqual(error as? BigSyncMutationJournalError, .identityUnavailable)
+        }
+        await f.targetRealm.asyncRefresh()
+        for (name, generation) in expected {
+            XCTAssertEqual(f.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+        }
+        XCTAssertEqual(f.targetRealm.objects(BigSyncTrackedObject.self).count, 2)
+        XCTAssertEqual(f.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).count, 0)
+        XCTAssertEqual(f.persistenceRealm.object(ofType: RebuildProvenanceState.self,
+                                                 forPrimaryKey: RebuildProvenanceState.primaryKeyValue)?.phase, "requested")
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                             mutationJournalIdentityProvider: { current })
+        try await f.adapter.prepareChangeFeedReset(accountScopeIdentifier: "recovery-account", epoch: 601, mode: .backupRestore)
+        await f.targetRealm.asyncRefresh()
+        XCTAssertEqual(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: BigSyncTrackedObject.className() + ".current")?.generation,
+            expected[BigSyncTrackedObject.className() + ".current"])
+        XCTAssertNil(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                                          forPrimaryKey: BigSyncTrackedObject.className() + ".copied"))
+        XCTAssertEqual(f.targetRealm.objects(BigSyncTrackedObject.self).count, 2, "Recovery retires historical work, not user data")
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryRejectsUnavailableInstallationProviderInsteadOfProcessFallback() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let mutation = BigSyncPendingMutation(recordName: "record", entityType: BigSyncTrackedObject.className(),
+                                               objectIdentifier: "record", generation: BigSyncPendingMutation.makeGeneration())
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                             installationIdentifierProvider: { nil })
+        XCTAssertThrowsError(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(mutation, realm: f.targetRealm,
+                expectedBindingGenerationIdentifier: nil)) {
+            XCTAssertEqual($0 as? BigSyncMutationJournalError, .identityUnavailable)
+        }
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                             installationIdentifierProvider: { "" })
+        XCTAssertThrowsError(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(mutation, realm: f.targetRealm,
+                expectedBindingGenerationIdentifier: nil))
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryRetainsExplicitlyUnboundIdentityModes() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let processMutation = BigSyncPendingMutation(
+            recordName: "process", entityType: BigSyncTrackedObject.className(),
+            objectIdentifier: "process", generation: BigSyncPendingMutation.makeGeneration()
+        )
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration])
+        XCTAssertTrue(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+            processMutation, realm: f.targetRealm, expectedBindingGenerationIdentifier: nil
+        ))
+        XCTAssertThrowsError(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+            processMutation, realm: f.targetRealm, expectedBindingGenerationIdentifier: "bound-run"
+        )) {
+            XCTAssertEqual($0 as? BigSyncMutationJournalError, .identityChanged)
+        }
+
+        let installation = "explicitly-unbound-installation"
+        let owned = BigSyncPendingMutation(
+            recordName: "owned", entityType: BigSyncTrackedObject.className(),
+            objectIdentifier: "owned", generation: BigSyncPendingMutation.makeGeneration(installationIdentifier: installation)
+        )
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [f.targetRealm.configuration], installationIdentifier: installation
+        )
+        XCTAssertTrue(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+            owned, realm: f.targetRealm, expectedBindingGenerationIdentifier: nil
+        ))
+        XCTAssertFalse(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+            processMutation, realm: f.targetRealm, expectedBindingGenerationIdentifier: nil
+        ))
+        let unbound = BigSyncMutationJournalIdentity(installationIdentifier: installation,
+                                                    replicaBindingGenerationIdentifier: nil)
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [f.targetRealm.configuration], mutationJournalIdentityProvider: { unbound }
+        )
+        XCTAssertTrue(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+            owned, realm: f.targetRealm, expectedBindingGenerationIdentifier: nil
+        ))
+        for invalid in [BigSyncMutationJournalIdentity(installationIdentifier: "", replicaBindingGenerationIdentifier: nil),
+                        BigSyncMutationJournalIdentity(installationIdentifier: installation, replicaBindingGenerationIdentifier: "")] {
+            BigSyncMutationPolicy(excludedClassNames: []).install(
+                configurations: [f.targetRealm.configuration], mutationJournalIdentityProvider: { invalid }
+            )
+            XCTAssertThrowsError(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+                owned, realm: f.targetRealm, expectedBindingGenerationIdentifier: nil
+            )) {
+                XCTAssertEqual($0 as? BigSyncMutationJournalError, .identityUnavailable)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryRequiresExactEmbeddedBindingAndGenerationNonce() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let current = BigSyncMutationJournalIdentity(installationIdentifier: "current-owner",
+                                                     replicaBindingGenerationIdentifier: "current-binding")
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                             mutationJournalIdentityProvider: { current })
+        let good = BigSyncPendingMutation.makeGeneration(installationIdentifier: current.installationIdentifier,
+                                                         replicaBindingGenerationIdentifier: "current-binding")
+        let stale = BigSyncPendingMutation.makeGeneration(installationIdentifier: current.installationIdentifier,
+                                                          replicaBindingGenerationIdentifier: "other-binding")
+        let unbound = BigSyncPendingMutation.makeGeneration(installationIdentifier: current.installationIdentifier)
+        for (generation, binding, admitted) in [(good, "current-binding", true), (stale, "current-binding", false),
+                                               (good, "other-binding", false), (unbound, "current-binding", false),
+                                               ("installation:current-owner:binding:current-binding:bad", "current-binding", false)] {
+            let mutation = BigSyncPendingMutation(recordName: "record", entityType: BigSyncTrackedObject.className(),
+                objectIdentifier: "record", replicaBindingGenerationIdentifier: binding, generation: generation)
+            XCTAssertEqual(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(mutation, realm: f.targetRealm,
+                expectedBindingGenerationIdentifier: current.replicaBindingGenerationIdentifier), admitted)
+        }
+        let mutation = BigSyncPendingMutation(recordName: "record", entityType: BigSyncTrackedObject.className(),
+                                               objectIdentifier: "record", generation: unbound)
+        XCTAssertFalse(try BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(mutation, realm: f.targetRealm,
+                expectedBindingGenerationIdentifier: current.replicaBindingGenerationIdentifier))
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryIdentityFailureInsideWriteRollsBackEarlierRetirement() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let current = BigSyncMutationJournalIdentity(installationIdentifier: "current", replicaBindingGenerationIdentifier: "binding")
+        let copied = BigSyncPendingMutation.makeGeneration(installationIdentifier: "copied", replicaBindingGenerationIdentifier: "old")
+        try await f.targetRealm.asyncWrite {
+            for id in ["a", "b"] {
+                f.targetRealm.add(BigSyncPendingMutation(recordName: BigSyncTrackedObject.className() + "." + id,
+                    entityType: BigSyncTrackedObject.className(), objectIdentifier: id,
+                    replicaBindingGenerationIdentifier: "old", generation: copied))
+            }
+        }
+        // Two selection reads, one successful deletion recheck, then provider
+        // loss during the second deletion. The first deletion must roll back.
+        let sequence = OptionalMutationJournalIdentitySequence([current, current, current, nil])
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                             mutationJournalIdentityProvider: { sequence.next() })
+        try await activateChangeFeedNamespace(f.adapter, account: "rollback-account", replicaBindingGenerationIdentifier: "binding")
+        do {
+            try await f.adapter.prepareChangeFeedReset(accountScopeIdentifier: "rollback-account", epoch: 602, mode: .backupRestore)
+            XCTFail("Identity loss must abort the target transaction")
+        } catch {
+            XCTAssertEqual(error as? BigSyncMutationJournalError, .identityUnavailable)
+        }
+        await f.targetRealm.asyncRefresh()
+        XCTAssertEqual(f.targetRealm.objects(BigSyncPendingMutation.self).count, 2)
+        for row in f.targetRealm.objects(BigSyncPendingMutation.self) { XCTAssertEqual(row.generation, copied) }
+        XCTAssertEqual(sequence.invocationCount, 4)
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryCannotRetireWorkUsingASuccessorProviderBinding() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let original = BigSyncMutationJournalIdentity(installationIdentifier: "same-owner",
+                                                       replicaBindingGenerationIdentifier: "binding-a")
+        let successor = BigSyncMutationJournalIdentity(installationIdentifier: "same-owner",
+                                                        replicaBindingGenerationIdentifier: "binding-b")
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                             mutationJournalIdentityProvider: { original })
+        let date = Date(timeIntervalSince1970: 100)
+        let object = BigSyncTrackedObject(id: "live-a-intent", createdAt: date, modifiedAt: date, explicitlyModifiedAt: date)
+        try await f.targetRealm.asyncWrite {
+            f.targetRealm.add(object)
+            try object.refreshChangeMetadata(explicitlyModified: true, at: date, expectedJournalIdentity: original)
+        }
+        let name = BigSyncTrackedObject.className() + "." + object.id
+        let generation = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation)
+        try await activateChangeFeedNamespace(f.adapter, account: "account-a", replicaBindingGenerationIdentifier: "binding-a")
+        // A pending port can expose B before the adapter's A run is replaced.
+        // That does not grant A recovery permission to discard A's live work.
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                             mutationJournalIdentityProvider: { successor })
+        do {
+            try await f.adapter.prepareChangeFeedReset(accountScopeIdentifier: "account-a", epoch: 603, mode: .backupRestore)
+            XCTFail("Recovery must retry rather than misclassify preceding work")
+        } catch {
+            XCTAssertEqual(error as? BigSyncMutationJournalError, .identityChanged)
+        }
+        await f.targetRealm.asyncRefresh()
+        XCTAssertEqual(f.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+        XCTAssertEqual(object.modifiedAt, date)
+    }
+
+    @BigSyncBackgroundActor
+    func testRebootstrapLateIdentityFailureRollsBackJournalReplacementAndRetries() async throws {
+        let destination = BigSyncMutationJournalIdentity(installationIdentifier: "retained-owner",
+                                                         replicaBindingGenerationIdentifier: "destination")
+        let unrelated = BigSyncMutationJournalIdentity(installationIdentifier: "retained-owner",
+                                                       replicaBindingGenerationIdentifier: "next-destination")
+        let failures: [(BigSyncMutationJournalIdentity?, BigSyncMutationJournalError)] = [
+            (nil, .identityUnavailable), (unrelated, .identityChanged)
+        ]
+        for (laterIdentity, expectedError) in failures {
+            let f = try await makeRealmAdapterFixture()
+            BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                                 mutationJournalIdentityProvider: { destination })
+            let date = Date(timeIntervalSince1970: 100)
+            let object = BigSyncTrackedObject(id: "rebootstrap-retained", createdAt: date, modifiedAt: date, explicitlyModifiedAt: date)
+            let name = BigSyncTrackedObject.className() + "." + object.id
+            let generation = BigSyncPendingMutation.makeGeneration(installationIdentifier: "retained-owner",
+                                                                    replicaBindingGenerationIdentifier: "source")
+            try await f.targetRealm.asyncWrite {
+                object.tags.append("retained-local")
+                f.targetRealm.add(object)
+                f.targetRealm.add(BigSyncPendingMutation(recordName: name, entityType: BigSyncTrackedObject.className(),
+                    objectIdentifier: object.id, replicaBindingGenerationIdentifier: "source", generation: generation))
+            }
+            try await activateChangeFeedNamespace(f.adapter, account: "destination-account", replicaBindingGenerationIdentifier: "destination")
+            try await f.adapter.prepareChangeFeedReset(accountScopeIdentifier: "destination-account", epoch: 604, mode: .localDatasetRebootstrap)
+            try await f.adapter.beginChangeFeedServerBootstrap(accountScopeIdentifier: "destination-account", epoch: 604, mode: .localDatasetRebootstrap)
+            // Classification succeeds, but generating replacement work loses
+            // its authority. The already-deleted old journal must be restored.
+            let sequence = OptionalMutationJournalIdentitySequence([destination, laterIdentity])
+            BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                                 mutationJournalIdentityProvider: { sequence.next() })
+            do {
+                try await f.adapter.reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: "destination-account", epoch: 604, mode: .localDatasetRebootstrap)
+                XCTFail("Provider loss/change must not commit partial replacement")
+            } catch {
+                XCTAssertEqual(error as? BigSyncMutationJournalError, expectedError)
+            }
+            await f.targetRealm.asyncRefresh()
+            let retained = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+            XCTAssertEqual(retained.generation, generation)
+            XCTAssertEqual(retained.replicaBindingGenerationIdentifier, "source")
+            XCTAssertEqual(Array(object.tags), ["retained-local"])
+            XCTAssertEqual(object.modifiedAt, date)
+            XCTAssertEqual(sequence.invocationCount, 2)
+            BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.targetRealm.configuration],
+                                                                 mutationJournalIdentityProvider: { destination })
+            try await f.adapter.reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: "destination-account", epoch: 604, mode: .localDatasetRebootstrap)
+            await f.targetRealm.asyncRefresh()
+            let fresh = try XCTUnwrap(f.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+            XCTAssertEqual(fresh.replicaBindingGenerationIdentifier, "destination")
+            XCTAssertNotEqual(fresh.generation, generation)
+            XCTAssertEqual(object.modifiedAt, date)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDefaultConflictRetransmissionDoesNotAuthorANewerEdit() async throws {
+        for forceSave in [false, true] {
+            let f = try await makeRealmAdapterFixture()
+            let date = Date(timeIntervalSince1970: 1_700_000_200)
+            let object = BigSyncTrackedObject(id: "clock-preserving-winner",
+                createdAt: date, modifiedAt: date, explicitlyModifiedAt: date)
+            object.tags.append("local-200")
+            try await f.targetRealm.asyncWrite { f.targetRealm.add(object) }
+            let record = makeRecord(type: BigSyncTrackedObject.className(), id: object.id,
+                zoneID: f.adapter.recordZoneID)
+            record["createdAt"] = date as CKRecordValue
+            record["modifiedAt"] = date.addingTimeInterval(-50) as CKRecordValue
+            record["explicitlyModifiedAt"] = date.addingTimeInterval(-50) as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            record["tags"] = ["remote-150"] as CKRecordValue
+            f.adapter.mergePolicy = .custom
+            _ = try await f.adapter.saveChanges(in: [record], forceSave: forceSave)
+            await f.targetRealm.asyncRefresh()
+            XCTAssertEqual(object.modifiedAt, date)
+            XCTAssertEqual(object.explicitlyModifiedAt, date)
+            XCTAssertEqual(Array(object.tags), ["local-200"])
+            let firstGeneration = try XCTUnwrap(f.targetRealm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: record.recordID.recordName
+            )?.generation)
+            // Re-delivery must not mint another generation for the same
+            // already-pending winner or change its semantic timestamps.
+            _ = try await f.adapter.saveChanges(in: [record], forceSave: true)
+            await f.targetRealm.asyncRefresh()
+            XCTAssertEqual(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: record.recordID.recordName)?.generation, firstGeneration)
+            XCTAssertEqual(object.modifiedAt, date)
+            try await f.adapter.didFinishImport()
+            let uploads = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+            let sent = try XCTUnwrap(uploads.first { $0.record.recordID == record.recordID })
+            XCTAssertEqual(sent.record["explicitlyModifiedAt"] as? Date, date)
+            try await f.adapter.didUpload(savedRecords: [sent.record],
+                matchingGenerations: [record.recordID.recordName: try XCTUnwrap(sent.generation)])
+            // A real later edit must now beat the original 200, not a
+            // retransmission clock which was silently advanced to "now".
+            record["modifiedAt"] = date.addingTimeInterval(50) as CKRecordValue
+            record["explicitlyModifiedAt"] = date.addingTimeInterval(50) as CKRecordValue
+            record["tags"] = ["remote-250"] as CKRecordValue
+            _ = try await f.adapter.saveChanges(in: [record], forceSave: forceSave)
+            await f.targetRealm.asyncRefresh()
+            XCTAssertEqual(Array(object.tags), ["remote-250"])
+            XCTAssertEqual(object.explicitlyModifiedAt, date.addingTimeInterval(50))
+            XCTAssertNil(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: record.recordID.recordName))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCustomDelegateAuthoredValueKeepsNewEditTimestampContract() async throws {
+        let f = try await makeRealmAdapterFixture()
+        let oldDate = Date(timeIntervalSince1970: 1_700_000_200)
+        let object = BigSyncTrackedObject(id: "delegate-authored-winner",
+            createdAt: oldDate, modifiedAt: oldDate, explicitlyModifiedAt: oldDate)
+        object.tags.append("initial")
+        try await f.targetRealm.asyncWrite { f.targetRealm.add(object) }
+        let delegate = AuthoringConflictDelegate()
+        f.adapter.delegate = delegate
+        f.adapter.mergePolicy = .custom
+        let record = makeRecord(type: BigSyncTrackedObject.className(), id: object.id,
+            zoneID: f.adapter.recordZoneID)
+        record["createdAt"] = oldDate as CKRecordValue
+        record["modifiedAt"] = oldDate as CKRecordValue
+        record["explicitlyModifiedAt"] = oldDate as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record["tags"] = ["incoming"] as CKRecordValue
+        let before = Date()
+        _ = try await f.adapter.saveChanges(in: [record], forceSave: true)
+        await f.targetRealm.asyncRefresh()
+        XCTAssertEqual(Array(object.tags), ["delegate-authored"])
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(object.explicitlyModifiedAt), before)
+        XCTAssertEqual(object.modifiedAt, object.explicitlyModifiedAt)
+        XCTAssertNotNil(f.targetRealm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: record.recordID.recordName))
+        withExtendedLifetime(delegate) {}
+    }
+
+    @BigSyncBackgroundActor
+    func testConflictWinnerCannotCommitWhenItsJournalIdentityIsUnavailable() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: { nil }
+        )
+        let localDate = Date()
+        let remoteDate = localDate.addingTimeInterval(-60)
+        let object = BigSyncTrackedObject(id: "unavailable-conflict-journal",
+            createdAt: localDate, modifiedAt: localDate, explicitlyModifiedAt: localDate)
+        object.tags.append("local")
+        try await fixture.targetRealm.asyncWrite { fixture.targetRealm.add(object) }
+        let record = makeRecord(type: BigSyncTrackedObject.className(),
+            id: object.id, zoneID: fixture.adapter.recordZoneID)
+        record["createdAt"] = remoteDate as CKRecordValue
+        record["modifiedAt"] = remoteDate as CKRecordValue
+        record["explicitlyModifiedAt"] = remoteDate as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record["tags"] = ["remote"] as CKRecordValue
+        fixture.adapter.mergePolicy = .custom
+        do {
+            _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTFail("A local winner must not be reported as applied without its journal")
+        } catch {
+            XCTAssertEqual(error as? BigSyncMutationJournalError, .identityUnavailable)
+        }
+        fixture.targetRealm.refresh()
+        XCTAssertEqual(Array(object.tags), ["local"])
+        XCTAssertEqual(object.modifiedAt, localDate)
+        XCTAssertEqual(object.explicitlyModifiedAt, localDate)
+        XCTAssertTrue(fixture.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
     }
 
     @BigSyncBackgroundActor
@@ -13980,7 +16252,7 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Expected stale cursor rejection")
         } catch RealmSwiftInboundPageCommitError.previousCursorMismatch {}
         XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
-        let rejectedToken = await fixture.adapter.serverChangeToken
+        let rejectedToken = try await fixture.adapter.serverChangeToken
         XCTAssertNil(rejectedToken)
 
         let committedCursor = RecordZoneChangeCursor(
@@ -14022,7 +16294,7 @@ final class BigSyncKitTests: XCTestCase {
                 disposition: .delete
             ),
         ]))
-        let storedToken = await fixture.adapter.serverChangeToken
+        let storedToken = try await fixture.adapter.serverChangeToken
         XCTAssertEqual(storedToken, committedCursor)
 
         try await fixture.adapter.saveToken(nil)
@@ -14259,10 +16531,238 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testIdentityInvalidationUsesEveryPreimageAndRollsBackWithImport() async throws {
+        let fixture = try await makeObservedTargetFixture()
+        let realm = fixture.targetRealm
+        try await realm.asyncWrite {
+            for id in ["one", "two"] {
+                let object = BigSyncIdentityObservedTarget()
+                object.id = id
+                object.articleProgressID = "old-" + id
+                realm.add(object)
+            }
+            realm.object(ofType: BigSyncTestPublicationFence.self, forPrimaryKey: "fence")!.rejectsWrite = true
+        }
+        let importedAt = Date().addingTimeInterval(60)
+        let records = ["one", "two"].map { id in
+            let record = makeRecord(type: BigSyncIdentityObservedTarget.className(), id: id, zoneID: fixture.adapter.recordZoneID)
+            record["articleProgressID"] = ("new-" + id) as CKRecordValue
+            record["modifiedAt"] = importedAt as CKRecordValue
+            record["explicitlyModifiedAt"] = importedAt as CKRecordValue
+            return record
+        }
+        do {
+            _ = try await fixture.adapter.saveChanges(in: records, forceSave: true)
+            XCTFail("Expected rollback")
+        } catch BigSyncTestPublicationFence.Failure.rejected { }
+        await realm.asyncRefresh()
+        XCTAssertTrue(realm.object(ofType: BigSyncTestPublicationFence.self, forPrimaryKey: "fence")!.targetIdentities.isEmpty)
+        XCTAssertEqual(realm.object(ofType: BigSyncIdentityObservedTarget.self, forPrimaryKey: "one")?.articleProgressID, "old-one")
+        try await realm.asyncWrite {
+            realm.object(ofType: BigSyncTestPublicationFence.self, forPrimaryKey: "fence")!.rejectsWrite = false
+        }
+        _ = try await fixture.adapter.saveChanges(in: records, forceSave: true)
+        await realm.asyncRefresh()
+        let fence = try XCTUnwrap(realm.object(ofType: BigSyncTestPublicationFence.self, forPrimaryKey: "fence"))
+        XCTAssertEqual(Set(fence.targetIdentities), ["old-one", "new-one", "old-two", "new-two"])
+        XCTAssertEqual(fence.targetIdentities.count, 4)
+        XCTAssertEqual(fence.count, 0)
+        try await realm.asyncWrite { fence.targetIdentities.removeAll() }
+        _ = try await fixture.adapter.deleteRecords(with: [records[0].recordID])
+        await realm.asyncRefresh()
+        XCTAssertEqual(Array(fence.targetIdentities.prefix(2)), ["new-one", "deletion"])
+        XCTAssertTrue(realm.object(ofType: BigSyncIdentityObservedTarget.self, forPrimaryKey: "one")?.isDeleted == true)
+    }
+
+    @BigSyncBackgroundActor
+    func testIdentityInvalidationFallsBackForCustomDelegate() async throws {
+        let fixture = try await makeObservedTargetFixture()
+        let delegate = AuthoringConflictDelegate()
+        fixture.adapter.delegate = delegate
+        fixture.adapter.mergePolicy = .custom
+        let record = makeRecord(type: BigSyncIdentityObservedTarget.className(), id: "custom", zoneID: fixture.adapter.recordZoneID)
+        record["articleProgressID"] = "article" as CKRecordValue
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        await fixture.targetRealm.asyncRefresh()
+        let fence = try XCTUnwrap(fixture.targetRealm.object(ofType: BigSyncTestPublicationFence.self, forPrimaryKey: "fence"))
+        XCTAssertEqual(fence.count, 1)
+        XCTAssertTrue(fence.targetIdentities.isEmpty)
+        withExtendedLifetime(delegate) {}
+    }
+
+    @BigSyncBackgroundActor
+    func testTargetInvalidationCoalescesPerModelWithinOneTransaction() async throws {
+        let fixture = try await makeObservedTargetFixture()
+        let realm = fixture.targetRealm
+        var outsideWrite = BigSyncInboundPublicationInvalidations()
+        XCTAssertThrowsError(try outsideWrite.record(BigSyncObservedTarget.self, in: realm))
+        try await realm.asyncWrite {
+            var invalidations = BigSyncInboundPublicationInvalidations()
+            for _ in 0..<8 {
+                try invalidations.record(BigSyncObservedTarget.self, in: realm)
+                try invalidations.record(BigSyncObservedTargetPeer.self, in: realm)
+                try invalidations.record(BigSyncTrackedObject.self, in: realm)
+            }
+        }
+        XCTAssertEqual(realm.object(ofType: BigSyncTestPublicationFence.self,
+                                    forPrimaryKey: "fence")?.count, 2)
+        try await realm.asyncWrite {
+            var nextTransaction = BigSyncInboundPublicationInvalidations()
+            try nextTransaction.record(BigSyncObservedTarget.self, in: realm)
+        }
+        XCTAssertEqual(realm.object(ofType: BigSyncTestPublicationFence.self,
+                                    forPrimaryKey: "fence")?.count, 3)
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testTargetInvalidatorFailureRollsBackImportWithoutQuarantine() async throws {
+        for forceSave in [false, true] {
+            let fixture = try await makeObservedTargetFixture()
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.object(ofType: BigSyncTestPublicationFence.self,
+                                           forPrimaryKey: "fence")!.rejectsWrite = true
+            }
+            let records = ["one", "two", "three"].map {
+                makeRecord(type: BigSyncObservedTarget.className(), id: $0,
+                           zoneID: fixture.adapter.recordZoneID)
+            }
+            do {
+                _ = try await fixture.adapter.saveChanges(in: records, forceSave: forceSave)
+                XCTFail("A local invalidation failure must abort target import")
+            } catch BigSyncTestPublicationFence.Failure.rejected { }
+            await fixture.targetRealm.asyncRefresh()
+            XCTAssertTrue(fixture.targetRealm.objects(BigSyncObservedTarget.self).isEmpty)
+            XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncTestPublicationFence.self,
+                                                     forPrimaryKey: "fence")?.count, 0)
+            XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.object(ofType: BigSyncTestPublicationFence.self,
+                                           forPrimaryKey: "fence")!.rejectsWrite = false
+            }
+            _ = try await fixture.adapter.saveChanges(in: records, forceSave: forceSave)
+            await fixture.targetRealm.asyncRefresh()
+            XCTAssertEqual(fixture.targetRealm.objects(BigSyncObservedTarget.self).count, 3)
+            XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncTestPublicationFence.self,
+                                                     forPrimaryKey: "fence")?.count, 1)
+            XCTAssertTrue(fixture.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipInvalidatesOnlyOnCommittedApplication() async throws {
+        let fixture = try await makeObservedTargetFixture()
+        let realm = fixture.targetRealm
+        let stale = BigSyncRelationshipChild()
+        stale.id = "stale"
+        let parent = BigSyncObservedTarget()
+        parent.id = "parent"
+        parent.children.append(stale)
+        try await realm.asyncWrite { realm.add([stale, parent]) }
+        let record = makeRecord(type: BigSyncObservedTarget.className(), id: "parent",
+                                zoneID: fixture.adapter.recordZoneID)
+        record["children"] = ["\(BigSyncRelationshipChild.className()).late"] as CKRecordValue
+        record["modifiedAt"] = Date().addingTimeInterval(60) as CKRecordValue
+        record["explicitlyModifiedAt"] = Date().addingTimeInterval(60) as CKRecordValue
+        _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+        try await fixture.adapter.persistImportedChanges()
+        await realm.asyncRefresh()
+        let initialCount = try XCTUnwrap(realm.object(ofType: BigSyncTestPublicationFence.self,
+                                                     forPrimaryKey: "fence")?.count)
+        XCTAssertEqual(parent.children.map(\.id), ["stale"])
+        XCTAssertEqual(fixture.persistenceRealm.objects(PendingRelationship.self).count, 1)
+        try await fixture.adapter.persistImportedChanges()
+        await realm.asyncRefresh()
+        XCTAssertEqual(realm.object(ofType: BigSyncTestPublicationFence.self,
+                                    forPrimaryKey: "fence")?.count, initialCount)
+
+        let late = BigSyncRelationshipChild()
+        late.id = "late"
+        try await realm.asyncWrite {
+            realm.add(late)
+            realm.object(ofType: BigSyncTestPublicationFence.self,
+                         forPrimaryKey: "fence")!.rejectsWrite = true
+        }
+        do {
+            try await fixture.adapter.persistImportedChanges()
+            XCTFail("The relationship and local invalidation must roll back together")
+        } catch BigSyncTestPublicationFence.Failure.rejected { }
+        await realm.asyncRefresh()
+        // Requery after rollback: Realm does not revive invalidated object instances.
+        XCTAssertEqual(realm.object(ofType: BigSyncObservedTarget.self,
+                                    forPrimaryKey: "parent")?.children.map(\.id), ["stale"])
+        XCTAssertEqual(realm.object(ofType: BigSyncTestPublicationFence.self,
+                                    forPrimaryKey: "fence")?.count, initialCount)
+        XCTAssertEqual(fixture.persistenceRealm.objects(PendingRelationship.self).count, 1)
+        try await realm.asyncWrite {
+            realm.object(ofType: BigSyncTestPublicationFence.self,
+                         forPrimaryKey: "fence")!.rejectsWrite = false
+        }
+        try await fixture.adapter.persistImportedChanges()
+        await realm.asyncRefresh()
+        XCTAssertEqual(realm.object(ofType: BigSyncObservedTarget.self,
+                                    forPrimaryKey: "parent")?.children.map(\.id), ["late"])
+        XCTAssertEqual(realm.object(ofType: BigSyncTestPublicationFence.self,
+                                    forPrimaryKey: "fence")?.count, initialCount + 1)
+        XCTAssertTrue(fixture.persistenceRealm.objects(PendingRelationship.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testPublicationPageClassifierRetainsOnlyKnownIrrelevantRecords() async throws {
+        let fixture = try await makeObservedTargetFixture()
+        let adapter = fixture.adapter
+        let zone = adapter.recordZoneID
+        func record(_ type: String, named name: String? = nil) -> CKRecord {
+            CKRecord(recordType: type, recordID: .init(recordName: name ?? type + ".one", zoneID: zone))
+        }
+        XCTAssertFalse(adapter.mayAffectDomainPublication(records: [], deletions: []))
+        XCTAssertFalse(adapter.mayAffectDomainPublication(
+            records: [record(BigSyncTrackedObject.className())], deletions: []))
+        XCTAssertTrue(adapter.mayAffectDomainPublication(
+            records: [record(BigSyncObservedTarget.className())], deletions: []))
+        XCTAssertTrue(adapter.mayAffectDomainPublication(
+            records: [record("UnknownFutureModel")], deletions: []))
+        XCTAssertTrue(adapter.mayAffectDomainPublication(
+            records: [record(BigSyncTrackedObject.className(), named: "OtherType.one")], deletions: []))
+    }
+
+    @BigSyncBackgroundActor
+    func testPublicationPageClassifierFencesRelevantAndMalformedDeletions() async throws {
+        let fixture = try await makeObservedTargetFixture()
+        let adapter = fixture.adapter
+        for name in ["missing-separator", ".empty-type", "EmptyIdentifier.",
+                     "UnknownFutureModel.one", BigSyncObservedTarget.className() + ".one"] {
+            XCTAssertTrue(adapter.mayAffectDomainPublication(records: [],
+                deletions: [.init(recordName: name, zoneID: adapter.recordZoneID)]), name)
+        }
+        XCTAssertFalse(adapter.mayAffectDomainPublication(records: [],
+            deletions: [.init(recordName: BigSyncTrackedObject.className() + ".one",
+                             zoneID: adapter.recordZoneID)]))
+    }
+
+    @BigSyncBackgroundActor
+    private func makeObservedTargetFixture() async throws -> (
+        adapter: RealmSwiftAdapter, persistenceRealm: Realm, targetRealm: Realm
+    ) {
+        let fixture = try await makeRealmAdapterFixture(
+            additionalObjectTypes: [BigSyncTestPublicationFence.self, BigSyncIdentityObservedTarget.self, BigSyncObservedTarget.self,
+                                    BigSyncObservedTargetPeer.self],
+            additionalExcludedClassNames: [BigSyncTestPublicationFence.className(),
+                                           BigSyncObservedTargetPeer.className()]
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(BigSyncTestPublicationFence())
+        }
+        return fixture
+    }
+
+    @BigSyncBackgroundActor
     private func makeRealmAdapterFixture(
         accountScopePropertyByClassName: [String: String] = [:],
         priorityEntityTypeNames: [String] = [],
-        committedInboundIdentityDeliveryEnabled: Bool = false
+        committedInboundIdentityDeliveryEnabled: Bool = false,
+        additionalObjectTypes: [Object.Type] = [],
+        additionalExcludedClassNames: [String] = []
     ) async throws -> (
         adapter: RealmSwiftAdapter,
         persistenceRealm: Realm,
@@ -14282,12 +16782,12 @@ final class BigSyncKitTests: XCTestCase {
             BigSyncRelationshipChild.self,
             BigSyncRelationshipParent.self,
             BigSyncPendingMutation.self,
-        ]
+        ] + additionalObjectTypes
 
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistenceConfiguration,
             targetRealmConfigurations: [targetConfiguration],
-            excludedClassNames: [],
+            excludedClassNames: additionalExcludedClassNames,
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName,
             priorityEntityTypeNames: priorityEntityTypeNames,
@@ -14424,6 +16924,249 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    @BigSyncBackgroundActor
+    private func makeReplicaHandoffFixture() async throws -> (
+        adapter: RealmSwiftAdapter, target: Realm, persistence: Realm,
+        handoff: BigSyncReplicaJournalHandoff, object: BigSyncTrackedObject,
+        recordName: String, retiredGeneration: String
+    ) {
+        let fixture = try await makeRealmAdapterFixture()
+        let handoff = try BigSyncReplicaJournalHandoff(
+            installationIdentifier: "handoff-installation",
+            retiringBindingGenerationIdentifiers: ["retiring-binding"],
+            destinationBindingGenerationIdentifier: "destination-binding"
+        )
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [fixture.targetRealm.configuration],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: handoff.installationIdentifier,
+                    replicaBindingGenerationIdentifier:
+                        handoff.destinationBindingGenerationIdentifier
+                )
+            }
+        )
+        let object = BigSyncTrackedObject(
+            id: "handoff-target", createdAt: Date(), modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        object.tags.append("preserved-local-value")
+        // A genuine later journal must bypass initial-upload eligibility.
+        object.initialCloudKitSyncEligible = false
+        let name = BigSyncTrackedObject.className() + "." + object.id
+        let generation = BigSyncPendingMutation.makeGeneration(
+            installationIdentifier: handoff.installationIdentifier,
+            replicaBindingGenerationIdentifier: "retiring-binding"
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            fixture.targetRealm.add(BigSyncPendingMutation(
+                recordName: name, entityType: BigSyncTrackedObject.className(),
+                objectIdentifier: object.id,
+                replicaBindingGenerationIdentifier: "retiring-binding",
+                generation: generation
+            ))
+        }
+        try await fixture.adapter.activateTransportNamespace(
+            containerIdentifier: "iCloud.test", databaseScope: .private
+        )
+        try await fixture.adapter.activateReplicaBinding(
+            accountScopeIdentifier: "handoff-account",
+            replicaBindingGenerationIdentifier: "destination-binding"
+        )
+        try await fixture.adapter.prepareChangeFeedReset(
+            accountScopeIdentifier: "handoff-account", epoch: 4_000_000_001,
+            mode: .localDatasetRebootstrap
+        )
+        return (fixture.adapter, fixture.targetRealm, fixture.persistenceRealm,
+                handoff, object, name, generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testExactHandoffRebindsServerBackedJournalBeforeImport() async throws {
+        let f = try await makeReplicaHandoffFixture()
+        // Server membership must not suppress a retiring local mutation.
+        try await f.persistence.asyncWrite {
+            f.persistence.add(SyncedEntity(
+                entityType: BigSyncTrackedObject.className(),
+                identifier: f.recordName, state: SyncedEntityState.synced.rawValue
+            ), update: .modified)
+        }
+        try await f.adapter.reconcileReplicaJournalHandoff(
+            f.handoff, accountScopeIdentifier: "handoff-account",
+            epoch: 4_000_000_001, verifyOnly: false
+        )
+        f.target.refresh()
+        let pending = try XCTUnwrap(f.target.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: f.recordName
+        ))
+        let fresh = pending.generation
+        XCTAssertNotEqual(fresh, f.retiredGeneration)
+        XCTAssertEqual(pending.replicaBindingGenerationIdentifier, "destination-binding")
+        try await f.adapter.beginChangeFeedServerBootstrap(
+            accountScopeIdentifier: "handoff-account", epoch: 4_000_000_001,
+            mode: .localDatasetRebootstrap
+        )
+        let incoming = CKRecord(recordType: BigSyncTrackedObject.className(),
+            recordID: CKRecord.ID(recordName: f.recordName, zoneID: f.adapter.recordZoneID))
+        incoming["tags"] = ["older-server-value"] as CKRecordValue
+        incoming["modifiedAt"] = Date(timeIntervalSince1970: 1) as CKRecordValue
+        _ = try await f.adapter.saveChanges(in: [incoming], forceSave: true)
+        f.target.refresh()
+        XCTAssertEqual(Array(f.object.tags), ["preserved-local-value"])
+        XCTAssertEqual(pending.generation, fresh)
+        _ = try await f.adapter._test_forwardPendingMutations(in: f.target)
+        let tracking = try XCTUnwrap(f.persistence.object(
+            ofType: SyncedEntity.self, forPrimaryKey: f.recordName
+        ))
+        XCTAssertEqual(tracking.pendingGeneration, fresh)
+        XCTAssertEqual(tracking.pendingReplicaBindingGenerationIdentifier, "destination-binding")
+    }
+
+    @BigSyncBackgroundActor
+    func testExactHandoffPreservesNewerDestinationAndIsIdempotent() async throws {
+        let f = try await makeReplicaHandoffFixture()
+        try await f.adapter.reconcileReplicaJournalHandoff(
+            f.handoff, accountScopeIdentifier: "handoff-account",
+            epoch: 4_000_000_001, verifyOnly: false
+        )
+        f.target.refresh()
+        try await f.target.asyncWrite {
+            f.object.tags.append("new-destination-edit")
+            try f.object.refreshChangeMetadata(
+                explicitlyModified: true, at: Date(),
+                expectedJournalIdentity: BigSyncMutationJournalIdentity(
+                    installationIdentifier: f.handoff.installationIdentifier,
+                    replicaBindingGenerationIdentifier: "destination-binding"
+                )
+            )
+        }
+        let current = try XCTUnwrap(f.target.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: f.recordName
+        )?.generation)
+        for verifyOnly in [false, true, false] {
+            try await f.adapter.reconcileReplicaJournalHandoff(
+                f.handoff, accountScopeIdentifier: "handoff-account",
+                epoch: 4_000_000_001, verifyOnly: verifyOnly
+            )
+            f.target.refresh()
+            XCTAssertEqual(f.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: f.recordName)?.generation, current)
+        }
+        XCTAssertEqual(Array(f.object.tags), ["preserved-local-value", "new-destination-edit"])
+    }
+
+    @BigSyncBackgroundActor
+    func testExactHandoffRejectsUnrelatedGenerationWithoutPartialCommit() async throws {
+        let f = try await makeReplicaHandoffFixture()
+        try await f.target.asyncWrite {
+            f.target.add(BigSyncPendingMutation(
+                recordName: BigSyncTrackedObject.className() + ".unrelated",
+                entityType: BigSyncTrackedObject.className(), objectIdentifier: "unrelated",
+                replicaBindingGenerationIdentifier: "unrelated-binding",
+                generation: BigSyncPendingMutation.makeGeneration(
+                    installationIdentifier: f.handoff.installationIdentifier,
+                    replicaBindingGenerationIdentifier: "unrelated-binding"
+                )
+            ))
+        }
+        do {
+            try await f.adapter.reconcileReplicaJournalHandoff(
+                f.handoff, accountScopeIdentifier: "handoff-account",
+                epoch: 4_000_000_001, verifyOnly: false
+            )
+            XCTFail("An account handoff must not adopt unrelated pending work")
+        } catch {
+            XCTAssertEqual(error as? BigSyncReplicaJournalHandoffError, .unexpectedBinding)
+        }
+        f.target.refresh()
+        XCTAssertEqual(f.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: f.recordName)?.generation, f.retiredGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testExactHandoffKeepsDeletionOnlyPendingWork() async throws {
+        let f = try await makeReplicaHandoffFixture()
+        try await f.target.asyncWrite { f.target.delete(f.object) }
+        try await f.adapter.reconcileReplicaJournalHandoff(
+            f.handoff, accountScopeIdentifier: "handoff-account",
+            epoch: 4_000_000_001, verifyOnly: false
+        )
+        f.target.refresh()
+        let pending = try XCTUnwrap(f.target.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: f.recordName
+        ))
+        XCTAssertTrue(f.adapter.pendingMutationTargetsDeletedObject(pending, in: f.target))
+        _ = try await f.adapter._test_forwardPendingMutations(in: f.target)
+        let tracked = try XCTUnwrap(f.persistence.object(
+            ofType: SyncedEntity.self, forPrimaryKey: f.recordName
+        ))
+        XCTAssertEqual(tracked.entityState, .deletedLocally)
+        XCTAssertEqual(tracked.pendingGeneration, pending.generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testLegacyHandoffWithoutRecordedHistoryCannotAdoptOldJournals() async throws {
+        let f = try await makeReplicaHandoffFixture()
+        let verification = try BigSyncReplicaJournalHandoff(
+            installationIdentifier: f.handoff.installationIdentifier,
+            retiringBindingGenerationIdentifiers: [],
+            destinationBindingGenerationIdentifier: "destination-binding"
+        )
+        do {
+            try await f.adapter.reconcileReplicaJournalHandoff(
+                verification, accountScopeIdentifier: "handoff-account",
+                epoch: 4_000_000_001, verifyOnly: false
+            )
+            XCTFail("Missing handoff history is not permission to adopt every old binding")
+        } catch {
+            XCTAssertEqual(error as? BigSyncReplicaJournalHandoffError, .unexpectedBinding)
+        }
+        f.target.refresh()
+        XCTAssertEqual(f.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: f.recordName)?.generation, f.retiredGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testExactHandoffTerminalCheckRejectsRemainingRetiringMutation() async throws {
+        let f = try await makeReplicaHandoffFixture()
+        do {
+            try await f.adapter.reconcileReplicaJournalHandoff(
+                f.handoff, accountScopeIdentifier: "handoff-account",
+                epoch: 4_000_000_001, verifyOnly: true
+            )
+            XCTFail("Terminal verification must not repair or accept undrained work")
+        } catch {
+            XCTAssertEqual(error as? BigSyncReplicaJournalHandoffError, .retiringMutationRemaining)
+        }
+        f.target.refresh()
+        XCTAssertEqual(f.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: f.recordName)?.generation, f.retiredGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testExactHandoffRejectsCopiedInstallationJournal() async throws {
+        let f = try await makeReplicaHandoffFixture()
+        try await f.target.asyncWrite {
+            let pending = try XCTUnwrap(f.target.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: f.recordName
+            ))
+            pending.generation = BigSyncPendingMutation.makeGeneration(
+                installationIdentifier: "copied-installation",
+                replicaBindingGenerationIdentifier: "retiring-binding"
+            )
+        }
+        do {
+            try await f.adapter.reconcileReplicaJournalHandoff(
+                f.handoff, accountScopeIdentifier: "handoff-account",
+                epoch: 4_000_000_001, verifyOnly: false
+            )
+            XCTFail("Restore provenance must not be replaced by account-port provenance")
+        } catch {
+            XCTAssertEqual(error as? BigSyncReplicaJournalHandoffError, .invalidRecord(f.recordName))
+        }
+    }
+
     func testCloudKitLossClassifierRecognizesTopLevelEncryptedDataReset() {
         let zoneID = CKRecordZone.ID(zoneName: "encrypted-reset", ownerName: CKCurrentUserDefaultName)
         let error = CKError(
@@ -14527,10 +17270,9 @@ final class BigSyncKitTests: XCTestCase {
             context: context
         )
 
-        XCTAssertEqual(
-            error as? ChangeFeedMigrationPersistenceError,
-            .stateNotDurable
-        )
+        guard case .unavailable? = error as? DurableKeyValueStoreError else {
+            return XCTFail("Expected the original durable-store failure, got \(String(describing: error))")
+        }
         XCTAssertFalse(synchronizer.configuredZoneIsTerminal(zoneID))
         XCTAssertTrue(store.propertyListEntries.keys.allSatisfy {
             !$0.contains("ChangeFeedMigration.v3")
@@ -15191,4 +17933,659 @@ final class BigSyncKitTests: XCTestCase {
             ofType: BigSyncPendingMutation.self, forPrimaryKey: unresolvedName
         ))
     }
+
+    func testJournalIdentityRequiresACompleteMutationNonce() {
+        let bound = BigSyncMutationJournalIdentity(
+            installationIdentifier: "installation", replicaBindingGenerationIdentifier: "binding"
+        )
+        let unbound = BigSyncMutationJournalIdentity(
+            installationIdentifier: "installation", replicaBindingGenerationIdentifier: nil
+        )
+        let nonce = UUID().uuidString
+        for identity in [bound, unbound] {
+            let prefix = "installation:installation:" + (identity.replicaBindingGenerationIdentifier.map { "binding:\($0):" } ?? "")
+            XCTAssertTrue(BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(prefix + nonce, identity: identity))
+            for badSuffix in ["", "truncated", nonce + ":tail", String(nonce.dropLast())] {
+                XCTAssertFalse(BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(prefix + badSuffix, identity: identity))
+            }
+        }
+        XCTAssertFalse(BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(
+            "installation:installation:binding:binding:" + nonce, identity: unbound
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    func testAcknowledgedNewerRetainedValueIsRejournaledAfterAccountBootstrap() async throws {
+        try await verifyAcknowledgedRetainedValue(
+            localExplicit: 200, localModified: 200,
+            remoteExplicit: 100, remoteModified: 300, expectsLocal: true
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testAcknowledgedRetainedValueDoesNotOverrideNewerDestinationValue() async throws {
+        try await verifyAcknowledgedRetainedValue(
+            localExplicit: 200, localModified: 400,
+            remoteExplicit: 300, remoteModified: 300, expectsLocal: false
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testAcknowledgedRetainedValueKeepsExistingServerTieBreak() async throws {
+        try await verifyAcknowledgedRetainedValue(
+            localExplicit: 200, localModified: 400,
+            remoteExplicit: 200, remoteModified: 400, expectsLocal: false
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testAcknowledgedRetainedValueUsesSecondaryModificationTime() async throws {
+        try await verifyAcknowledgedRetainedValue(
+            localExplicit: 200, localModified: 400,
+            remoteExplicit: 200, remoteModified: 300, expectsLocal: true
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func verifyAcknowledgedRetainedValue(
+        localExplicit: TimeInterval, localModified: TimeInterval,
+        remoteExplicit: TimeInterval, remoteModified: TimeInterval,
+        expectsLocal: Bool
+    ) async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let adapter = fixture.adapter
+        let target = fixture.targetRealm
+        let source = BigSyncMutationJournalIdentity(
+            installationIdentifier: "retained-installation",
+            replicaBindingGenerationIdentifier: "temporary-binding"
+        )
+        let destination = BigSyncMutationJournalIdentity(
+            installationIdentifier: "retained-installation",
+            replicaBindingGenerationIdentifier: "returned-binding"
+        )
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [target.configuration], mutationJournalIdentityProvider: { source }
+        )
+        try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.test", databaseScope: .private)
+        try await adapter.activateReplicaBinding(
+            accountScopeIdentifier: "temporary-account", replicaBindingGenerationIdentifier: "temporary-binding"
+        )
+        let object = BigSyncTrackedObject(
+            id: "acknowledged-retained", createdAt: Date(timeIntervalSince1970: 1),
+            modifiedAt: Date(timeIntervalSince1970: localModified), explicitlyModifiedAt: nil
+        )
+        object.tags.append("retained-value")
+        try await target.asyncWrite {
+            target.add(object)
+            try object.refreshChangeMetadata(
+                explicitlyModified: true, at: Date(timeIntervalSince1970: localExplicit),
+                expectedJournalIdentity: source
+            )
+            object.modifiedAt = Date(timeIntervalSince1970: localModified)
+        }
+        _ = try await adapter._test_forwardPendingMutations(in: target)
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        XCTAssertEqual(prepared.count, 1)
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let generation = try XCTUnwrap(prepared.first?.generation)
+        try await adapter.didUpload(savedRecords: prepared.map(\.record), matchingGenerations: [recordName: generation])
+        target.refresh()
+        XCTAssertNil(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName))
+
+        // Unlike a pending handoff, this real acknowledgement leaves no old
+        // journal. Reset tracking, then use the normal server-first apply path.
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [target.configuration], mutationJournalIdentityProvider: { destination }
+        )
+        let account = "returned-account"
+        let epoch = 4_000_000_001
+        try await adapter.activateReplicaBinding(
+            accountScopeIdentifier: account, replicaBindingGenerationIdentifier: "returned-binding"
+        )
+        try await adapter.prepareChangeFeedReset(accountScopeIdentifier: account, epoch: epoch, mode: .localDatasetRebootstrap)
+        try await adapter.beginChangeFeedServerBootstrap(accountScopeIdentifier: account, epoch: epoch, mode: .localDatasetRebootstrap)
+        let incoming = CKRecord(recordType: BigSyncTrackedObject.className(),
+            recordID: CKRecord.ID(recordName: recordName, zoneID: adapter.recordZoneID))
+        incoming["createdAt"] = Date(timeIntervalSince1970: 1) as CKRecordValue
+        incoming["explicitlyModifiedAt"] = Date(timeIntervalSince1970: remoteExplicit) as CKRecordValue
+        incoming["modifiedAt"] = Date(timeIntervalSince1970: remoteModified) as CKRecordValue
+        incoming["isDeleted"] = false as CKRecordValue
+        incoming["tags"] = ["destination-value"] as CKRecordValue
+        _ = try await adapter.saveChanges(in: [incoming], forceSave: false)
+        try await adapter.reconcileAfterChangeFeedServerBootstrap(
+            accountScopeIdentifier: account, epoch: epoch, mode: .localDatasetRebootstrap
+        )
+        target.refresh()
+        XCTAssertEqual(Array(object.tags), expectsLocal ? ["retained-value"] : ["destination-value"])
+        let pending = target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName)
+        if expectsLocal {
+            let pending = try XCTUnwrap(pending)
+            XCTAssertNotEqual(pending.generation, generation)
+            XCTAssertEqual(pending.replicaBindingGenerationIdentifier, "returned-binding")
+            XCTAssertTrue(BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(pending.generation, identity: destination))
+            _ = try await adapter._test_forwardPendingMutations(in: target)
+            let upload = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+            let retained = try XCTUnwrap(upload.first { $0.record.recordID.recordName == recordName })
+            XCTAssertEqual(retained.record["tags"] as? [String], ["retained-value"])
+            XCTAssertEqual(retained.generation, pending.generation)
+        } else {
+            XCTAssertNil(pending, "A retained-value repair must not convert a newer server winner into local intent")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCrossRecordSaveResultCannotRetireAnotherPendingGeneration() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let ids = ["misdirected-response-a", "misdirected-response-b", "valid-neighbor"]
+        for id in ids {
+            let value = BigSyncTrackedObject(id: id, createdAt: Date(), modifiedAt: Date(),
+                                            explicitlyModifiedAt: nil)
+            value.tags.append(id)
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add(value)
+                value.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        let prepared = try await fixture.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let byName = Dictionary(uniqueKeysWithValues: prepared.map { ($0.record.recordID.recordName, $0) })
+        let names = ids.map { BigSyncTrackedObject.className() + "." + $0 }
+        let first = try XCTUnwrap(byName[names[0]])
+        let second = try XCTUnwrap(byName[names[1]])
+        let generations = try Dictionary(uniqueKeysWithValues: names.map { name in
+            (name, try XCTUnwrap(byName[name]?.generation))
+        })
+        let database = FakeCloudKitDatabase()
+        database.successfulSaveRecordOverrides[first.record.recordID] = second.record
+        database.partialSaveErrorsByRecordID[second.record.recordID] = CKError(.networkFailure) as NSError
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(fixture.adapter)
+        do {
+            try await synchronizer.synchronizeAdapter(fixture.adapter)
+            XCTFail("A success value for B under A's result key must not acknowledge B")
+        } catch let error as CKError {
+            XCTAssertEqual(error.code, .partialFailure)
+            let failures = try XCTUnwrap((error as NSError).userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError])
+            XCTAssertNotNil(failures[first.record.recordID])
+            XCTAssertNotNil(failures[second.record.recordID])
+        }
+        fixture.targetRealm.refresh()
+        fixture.persistenceRealm.refresh()
+        for name in names.prefix(2) {
+            XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, generations[name])
+            XCTAssertEqual(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+                forPrimaryKey: name)?.pendingGeneration, generations[name])
+        }
+        XCTAssertNil(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: names[2]), "An independent valid success must still be acknowledged")
+        XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadSuccessRequiresTheRequestedZoneOwnerZoneNameAndType() async throws {
+        for variant in 0..<3 {
+            let zone = CKRecordZone.ID(zoneName: "reply-zone", ownerName: CKCurrentUserDefaultName)
+            let expected = makeRecord(type: "Bookmark", id: "request", zoneID: zone)
+            let neighbor = makeRecord(type: "Bookmark", id: "neighbor", zoneID: zone)
+            let wrongZone = CKRecordZone.ID(zoneName: variant == 0 ? "other-zone" : zone.zoneName,
+                ownerName: variant == 1 ? "other-owner" : zone.ownerName)
+            let wrong = CKRecord(recordType: variant == 2 ? "OtherType" : expected.recordType,
+                recordID: CKRecord.ID(recordName: expected.recordID.recordName, zoneID: wrongZone))
+            let database = FakeCloudKitDatabase()
+            database.successfulSaveRecordOverrides[expected.recordID] = wrong
+            let adapter = FakeModelAdapter(zoneID: zone, priorities: [],
+                uploadedByEntity: ["Bookmark": [expected, neighbor]])
+            let synchronizer = makeSynchronizer(database: database)
+            synchronizer.addModelAdapter(adapter)
+            do {
+                try await synchronizer.synchronizeAdapter(adapter)
+                XCTFail("Mismatched successful result must fail its own item")
+            } catch let error as CKError { XCTAssertEqual(error.code, .partialFailure) }
+            XCTAssertEqual(adapter.events.filter { $0.hasPrefix("didUpload:") },
+                           ["didUpload:Bookmark.neighbor"])
+            XCTAssertFalse(adapter.events.contains("save:OtherType"))
+            XCTAssertEqual(database.modifyRecordsOperationCount, 1)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadConflictCannotImportADifferentRecordOrType() async throws {
+        for variant in 0..<3 {
+            let zone = CKRecordZone.ID(zoneName: "conflict-identity-zone")
+            let requested = makeRecord(type: "Bookmark", id: "request", zoneID: zone)
+            let neighbor = makeRecord(type: "Bookmark", id: "neighbor", zoneID: zone)
+            let wrongID = CKRecord.ID(recordName: variant == 0 ? "Bookmark.other" : requested.recordID.recordName,
+                zoneID: variant == 1 ? CKRecordZone.ID(zoneName: "another-zone") : zone)
+            let wrong = CKRecord(recordType: variant == 2 ? "OtherType" : "Bookmark", recordID: wrongID)
+            let database = FakeCloudKitDatabase()
+            database.partialSaveErrorsByRecordID[requested.recordID] = CKError(.serverRecordChanged,
+                userInfo: [CKRecordChangedErrorServerRecordKey: wrong]) as NSError
+            let adapter = FakeModelAdapter(zoneID: zone, priorities: [],
+                uploadedByEntity: ["Bookmark": [requested, neighbor]])
+            let synchronizer = makeSynchronizer(database: database)
+            synchronizer.addModelAdapter(adapter)
+            do {
+                try await synchronizer.synchronizeAdapter(adapter)
+                XCTFail("A conflict record must identify the item that failed")
+            } catch let error as CKError { XCTAssertEqual(error.code, .partialFailure) }
+            XCTAssertFalse(adapter.events.contains { $0.hasPrefix("save:") })
+            XCTAssertEqual(adapter.events.filter { $0.hasPrefix("didUpload:") },
+                           ["didUpload:Bookmark.neighbor"])
+            XCTAssertEqual(database.modifyRecordsOperationCount, 1)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionConflictCannotRebaseADifferentRecord() async throws {
+        for outsideZone in [false, true] {
+            let zone = CKRecordZone.ID(zoneName: "deletion-identity-zone")
+            let requested = CKRecord.ID(recordName: "Bookmark.request", zoneID: zone)
+            let neighbor = CKRecord.ID(recordName: "Bookmark.neighbor", zoneID: zone)
+            let wrong = CKRecord(recordType: "Bookmark", recordID: CKRecord.ID(
+                recordName: outsideZone ? requested.recordName : "Bookmark.other",
+                zoneID: outsideZone ? CKRecordZone.ID(zoneName: "other-zone") : zone))
+            let database = FakeCloudKitDatabase()
+            database.partialDeleteErrorsByRecordID[requested] = CKError(.serverRecordChanged,
+                userInfo: [CKRecordChangedErrorServerRecordKey: wrong]) as NSError
+            let adapter = FakeModelAdapter(zoneID: zone, priorities: [],
+                deletedByEntity: ["Bookmark": [requested, neighbor]])
+            let synchronizer = makeSynchronizer(database: database)
+            synchronizer.addModelAdapter(adapter)
+            do {
+                try await synchronizer.synchronizeAdapter(adapter)
+                XCTFail("An unrelated conflict must not enter deletion metadata rebase")
+            } catch let error as CKError { XCTAssertEqual(error.code, .partialFailure) }
+            XCTAssertFalse(adapter.events.contains { $0.hasPrefix("save:") })
+            XCTAssertEqual(adapter.events.filter { $0.hasPrefix("didDelete:") },
+                           ["didDelete:Bookmark.neighbor"])
+            XCTAssertEqual(database.modifyRecordsOperationCount, 1)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPreparedMutationBatchRejectsDuplicateNamesAndForeignZonesBeforeSending() async throws {
+        for deletion in [false, true] {
+            for duplicate in [false, true] {
+                let zone = CKRecordZone.ID(zoneName: "prepared-identity-zone")
+                let first = makeRecord(type: "Bookmark", id: "same", zoneID: zone)
+                let second = makeRecord(type: "Bookmark", id: "same",
+                    zoneID: duplicate ? zone : CKRecordZone.ID(zoneName: "foreign-zone"))
+                let database = FakeCloudKitDatabase()
+                let adapter = FakeModelAdapter(zoneID: zone, priorities: [],
+                    uploadedByEntity: deletion ? [:] : ["Bookmark": [first, second]],
+                    deletedByEntity: deletion ? ["Bookmark": [first.recordID, second.recordID]] : [:])
+                let synchronizer = makeSynchronizer(database: database)
+                synchronizer.addModelAdapter(adapter)
+                do {
+                    try await synchronizer.synchronizeAdapter(adapter)
+                    XCTFail("A name-keyed generation map cannot represent this batch")
+                } catch {
+                    XCTAssertEqual(error as? BigSyncRecordMutationIdentityError, .invalidPreparedBatch)
+                }
+                XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+                XCTAssertFalse(adapter.events.contains { $0.hasPrefix("didUpload:") || $0.hasPrefix("didDelete:") })
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRawMutationCallbacksRejectForeignZoneBeforeAnyAcknowledgement() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(id: "callback-zone", createdAt: Date(),
+                                         modifiedAt: Date(), explicitlyModifiedAt: nil)
+        object.tags.append("local-value")
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        let correct = try XCTUnwrap(batch.records.first)
+        let name = correct.recordID.recordName
+        let generation = try XCTUnwrap(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation)
+        let wrong = CKRecord(recordType: correct.recordType, recordID: CKRecord.ID(recordName: name,
+            zoneID: CKRecordZone.ID(zoneName: "foreign-callback-zone")))
+        for operation in 0..<4 {
+            do {
+                switch operation {
+                case 0:
+                    try await fixture.adapter.didUpload(savedRecords: [correct, wrong],
+                        matchingGenerations: [name: generation])
+                case 1:
+                    try await fixture.adapter.didDelete(recordIDs: [correct.recordID, wrong.recordID],
+                        matchingGenerations: [name: generation])
+                case 2:
+                    try await fixture.adapter.requeueMissingServerRecords([correct.recordID, wrong.recordID],
+                        matchingPreparedGenerations: [name: generation])
+                default:
+                    try await fixture.adapter.rebasePendingDeletionMetadata(using: [correct, wrong],
+                        matchingPreparedGenerations: [name: generation])
+                }
+                XCTFail("Wrong-zone response must not consume the earlier valid item")
+            } catch RealmSwiftAdapterAcknowledgementError.recordOutsideAdapterZone {} catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+            fixture.persistenceRealm.refresh()
+            fixture.targetRealm.refresh()
+            XCTAssertEqual(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+                forPrimaryKey: name)?.pendingGeneration, generation)
+            XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, generation)
+            XCTAssertEqual(Array(object.tags), ["local-value"])
+        }
+        try await fixture.adapter.acknowledgeUploadedRecords([correct], from: batch)
+        fixture.targetRealm.refresh()
+        XCTAssertNil(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+    }
+
+    @BigSyncBackgroundActor
+    func testWrongTypeAcknowledgementRollsBackEarlierTrackingAcknowledgements() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        for id in ["ack-a", "ack-b"] {
+            let object = BigSyncTrackedObject(id: id, createdAt: Date(), modifiedAt: Date(),
+                                             explicitlyModifiedAt: nil)
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        let ordered = batch.records.sorted { $0.recordID.recordName < $1.recordID.recordName }
+        XCTAssertEqual(ordered.count, 2)
+        let first = try XCTUnwrap(ordered.first)
+        let second = try XCTUnwrap(ordered.dropFirst().first)
+        let wrong = CKRecord(recordType: "DifferentType", recordID: second.recordID)
+        let generations = try Dictionary(uniqueKeysWithValues: ordered.map { record in
+            (record.recordID.recordName, try XCTUnwrap(fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: record.recordID.recordName)?.generation))
+        })
+        do {
+            try await fixture.adapter.acknowledgeUploadedRecords([first, wrong], from: batch)
+            XCTFail("A returned type cannot replace the tracking row's type")
+        } catch RealmSwiftAdapterError.invalidSystemFields(let name) {
+            XCTAssertEqual(name, wrong.recordID.recordName)
+        }
+        fixture.persistenceRealm.refresh()
+        fixture.targetRealm.refresh()
+        for (name, generation) in generations {
+            XCTAssertEqual(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+                forPrimaryKey: name)?.pendingGeneration, generation)
+            XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, generation)
+        }
+        try await fixture.adapter.acknowledgeUploadedRecords(ordered, from: batch)
+        fixture.targetRealm.refresh()
+        XCTAssertTrue(fixture.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testCachedSystemFieldsCannotRetargetAnUploadAndCanBeRepairedByRedelivery() async throws {
+        for variant in 0..<4 {
+            let fixture = try await makeRealmAdapterFixture()
+            let object = BigSyncTrackedObject(id: "cached-identity", createdAt: Date(),
+                                             modifiedAt: Date(), explicitlyModifiedAt: nil)
+            object.tags.append("local-value")
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+            _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+            let batch = try await fixture.adapter.prepareUploadBatch(limit: 10)
+            let correct = try XCTUnwrap(batch.records.first)
+            let tracking = try XCTUnwrap(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+                forPrimaryKey: correct.recordID.recordName))
+            let generation = try XCTUnwrap(tracking.pendingGeneration)
+            let wrong = CKRecord(recordType: variant == 2 ? "DifferentType" : correct.recordType,
+                recordID: CKRecord.ID(recordName: variant == 0 ? "BigSyncTrackedObject.other" : tracking.identifier,
+                    zoneID: variant == 1 ? CKRecordZone.ID(zoneName: "other-zone") : fixture.adapter.recordZoneID))
+            let corruptArchive = variant == 3 ? Data([1, 2, 3])
+                : try fixture.adapter.encodedRecord(wrong, onlySystemFields: true)
+            try await fixture.persistenceRealm.asyncWrite { tracking.encodedRecord = corruptArchive }
+            XCTAssertNil(fixture.adapter.getRecord(for: tracking))
+            do {
+                _ = try await fixture.adapter.prepareUploadBatch(limit: 10)
+                XCTFail("An invalid present archive cannot become a new record or another key")
+            } catch RealmSwiftAdapterError.invalidSystemFields(let name) {
+                XCTAssertEqual(name, correct.recordID.recordName)
+            }
+            XCTAssertEqual(tracking.pendingGeneration, generation)
+            XCTAssertEqual(tracking.encodedRecord, corruptArchive)
+            // A valid incoming representation supplies its own system fields.
+            // Pending-local selection retains the authoritative local value.
+            _ = try await fixture.adapter.saveChanges(in: [correct], forceSave: true)
+            fixture.targetRealm.refresh()
+            fixture.persistenceRealm.refresh()
+            let repaired = try await fixture.adapter.prepareUploadBatch(limit: 10)
+            let upload = try XCTUnwrap(repaired.records.first)
+            XCTAssertEqual(upload.recordID, correct.recordID)
+            XCTAssertEqual(upload.recordType, correct.recordType)
+            XCTAssertEqual(upload["tags"] as? [String], ["local-value"])
+            XCTAssertEqual(tracking.pendingGeneration, generation)
+            XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: correct.recordID.recordName)?.generation, generation)
+            XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testSystemFieldPersistenceRejectsTransplantedIdentityWithoutChangingArchive() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let type = BigSyncTrackedObject.className()
+        let correct = makeRecord(type: type, id: "archive", zoneID: fixture.adapter.recordZoneID)
+        let tracking = SyncedEntity(entityType: type, identifier: correct.recordID.recordName,
+                                    state: SyncedEntityState.synced.rawValue)
+        try await fixture.persistenceRealm.asyncWrite {
+            fixture.persistenceRealm.add(tracking)
+            try fixture.adapter.save(record: correct, for: tracking)
+        }
+        let saved = tracking.encodedRecord
+        for wrong in [
+            makeRecord(type: type, id: "another", zoneID: fixture.adapter.recordZoneID),
+            CKRecord(recordType: "DifferentType", recordID: correct.recordID),
+            CKRecord(recordType: type, recordID: CKRecord.ID(recordName: correct.recordID.recordName,
+                zoneID: CKRecordZone.ID(zoneName: "another-zone")))
+        ] {
+            do {
+                try await fixture.persistenceRealm.asyncWrite {
+                    try fixture.adapter.save(record: wrong, for: tracking)
+                }
+                XCTFail("Do not persist another record's system fields")
+            } catch RealmSwiftAdapterError.invalidSystemFields {}
+            XCTAssertEqual(tracking.encodedRecord, saved)
+            XCTAssertEqual(fixture.adapter.getRecord(for: tracking)?.recordID, correct.recordID)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadEnumerationSurvivesMissingTargetChangingTrackingState() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let identifiers = ["missing-target-first", "survivor-one", "survivor-two"]
+        try await fixture.targetRealm.asyncWrite {
+            for identifier in identifiers {
+                let object = BigSyncTrackedObject(id: identifier, createdAt: Date(),
+                    modifiedAt: Date(), explicitlyModifiedAt: nil)
+                fixture.targetRealm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        // Deliberately corrupt the fixture to exercise materialization's
+        // missing-target repair, not a supported application deletion path.
+        let missing = try XCTUnwrap(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self,
+            forPrimaryKey: identifiers[0]))
+        try await fixture.targetRealm.asyncWrite { fixture.targetRealm.delete(missing) }
+        let batch = try await fixture.adapter.preparedRecordsToUpload(limit: 3, restrictedToEntityType: nil)
+        XCTAssertEqual(Set(batch.map { $0.record.recordID.recordName }),
+            Set(identifiers.dropFirst().map { BigSyncTrackedObject.className() + "." + $0 }))
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+            forPrimaryKey: BigSyncTrackedObject.className() + "." + identifiers[0]))
+        XCTAssertEqual(tracking.entityState, .deletedLocally)
+        XCTAssertNotNil(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: tracking.identifier))
+    }
+
+    @BigSyncBackgroundActor
+    func testLimitedUploadBatchesDrainEveryEligibleRecordExactlyOnce() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let identifiers = (0..<5).map { "limited-upload-\($0)" }
+        try await fixture.targetRealm.asyncWrite {
+            for identifier in identifiers {
+                let object = BigSyncTrackedObject(id: identifier, createdAt: Date(),
+                    modifiedAt: Date(), explicitlyModifiedAt: nil)
+                fixture.targetRealm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        var uploaded = Set<String>()
+        for expectedCount in [2, 2, 1, 0] {
+            let batch = try await fixture.adapter.preparedRecordsToUpload(limit: 2, restrictedToEntityType: nil)
+            XCTAssertEqual(batch.count, expectedCount)
+            for prepared in batch {
+                XCTAssertTrue(uploaded.insert(prepared.record.recordID.recordName).inserted)
+            }
+            if !batch.isEmpty {
+                let generations = try Dictionary(uniqueKeysWithValues: batch.map {
+                    ($0.record.recordID.recordName, try XCTUnwrap($0.generation))
+                })
+                try await fixture.adapter.didUpload(savedRecords: batch.map(\.record),
+                    matchingGenerations: generations)
+            }
+        }
+        XCTAssertEqual(uploaded, Set(identifiers.map { BigSyncTrackedObject.className() + "." + $0 }))
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingTargetStorageIsNotASuccessfulEmptyUpload() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(id: "missing-provider", createdAt: Date(),
+                                         modifiedAt: Date(), explicitlyModifiedAt: nil)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        let name = BigSyncTrackedObject.className() + "." + object.id
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+            forPrimaryKey: name))
+        let state = tracking.entityState
+        let generation = tracking.pendingGeneration
+        let provider = fixture.adapter.realmProvider
+        fixture.adapter.realmProvider = nil
+        defer { fixture.adapter.realmProvider = provider }
+        do {
+            _ = try fixture.adapter.recordToUpload(syncedEntity: tracking, isDummyRecord: false)
+            XCTFail("Missing configured storage must not be interpreted as a missing target")
+        } catch RealmSwiftAdapterError.setupUnavailable {}
+        XCTAssertEqual(tracking.entityState, state)
+        XCTAssertEqual(tracking.pendingGeneration, generation)
+        XCTAssertNotNil(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: object.id))
+    }
+
+    @BigSyncBackgroundActor
+    func testForeignZoneInputsFailBeforeTargetAndTrackingWrites() async throws {
+        for operation in 0..<3 {
+            let fixture = try await makeRealmAdapterFixture()
+            fixture.adapter.mergePolicy = .server
+            let correct = makeRecord(type: BigSyncTrackedObject.className(), id: "zone-first",
+                                     zoneID: fixture.adapter.recordZoneID)
+            correct["createdAt"] = Date() as CKRecordValue
+            correct["modifiedAt"] = Date() as CKRecordValue
+            correct["isDeleted"] = false as CKRecordValue
+            correct["tags"] = ["incoming"] as CKRecordValue
+            let wrong = makeRecord(type: BigSyncTrackedObject.className(), id: "zone-second",
+                                   zoneID: CKRecordZone.ID(zoneName: "other-zone"))
+            for key in correct.allKeys() { wrong[key] = correct[key] }
+            do {
+                if operation == 2 {
+                    _ = try await fixture.adapter.validateAuthoritativeOwnUploadRecords([correct, wrong])
+                } else {
+                    _ = try await fixture.adapter.saveChanges(in: [correct, wrong], forceSave: operation == 1)
+                }
+                XCTFail("A later foreign-zone item must be rejected before the earlier target can commit")
+            } catch {
+                XCTAssertEqual(error as? RealmSwiftInboundPageCommitError,
+                    .eventOutsideAdapterZone(recordName: wrong.recordID.recordName))
+            }
+            fixture.targetRealm.refresh()
+            fixture.persistenceRealm.refresh()
+            XCTAssertTrue(fixture.targetRealm.objects(BigSyncTrackedObject.self).isEmpty)
+            XCTAssertTrue(fixture.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
+            XCTAssertTrue(fixture.persistenceRealm.objects(SyncedEntity.self).isEmpty)
+            XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            _ = try await fixture.adapter.saveChanges(in: [correct], forceSave: false)
+            fixture.targetRealm.refresh()
+            let imported = try XCTUnwrap(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self,
+                forPrimaryKey: "zone-first"))
+            XCTAssertEqual(Array(imported.tags), ["incoming"])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testForeignZoneDeletionDoesNotTombstoneSameNamedLocalObjects() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        for id in ["zone-first", "zone-second"] {
+            let object = BigSyncTrackedObject(id: id, createdAt: Date(), modifiedAt: Date(),
+                                             explicitlyModifiedAt: nil)
+            try await fixture.targetRealm.asyncWrite { fixture.targetRealm.add(object) }
+        }
+        let correct = CKRecord.ID(recordName: BigSyncTrackedObject.className() + ".zone-first",
+                                  zoneID: fixture.adapter.recordZoneID)
+        let wrong = CKRecord.ID(recordName: BigSyncTrackedObject.className() + ".zone-second",
+                                zoneID: CKRecordZone.ID(zoneName: "other-zone"))
+        do {
+            _ = try await fixture.adapter.deleteRecords(with: [correct, wrong])
+            XCTFail("A foreign-zone deletion cannot address the same local primary key")
+        } catch {
+            XCTAssertEqual(error as? RealmSwiftInboundPageCommitError,
+                .eventOutsideAdapterZone(recordName: wrong.recordName))
+        }
+        fixture.targetRealm.refresh()
+        fixture.persistenceRealm.refresh()
+        XCTAssertEqual(fixture.targetRealm.objects(BigSyncTrackedObject.self).filter("isDeleted == true").count, 0)
+        XCTAssertTrue(fixture.persistenceRealm.objects(SyncedEntity.self).isEmpty)
+        XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        _ = try await fixture.adapter.deleteRecords(with: [correct])
+        fixture.targetRealm.refresh()
+        XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self,
+            forPrimaryKey: "zone-first")?.isDeleted, true)
+        XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self,
+            forPrimaryKey: "zone-second")?.isDeleted, false)
+    }
+
+    @BigSyncBackgroundActor
+    func testDuplicateInboundNamesFailBeforeAnyPartialApplication() async throws {
+        for operation in 0..<4 {
+            let fixture = try await makeRealmAdapterFixture()
+            fixture.adapter.mergePolicy = .server
+            let record = makeRecord(type: BigSyncTrackedObject.className(), id: "duplicate",
+                                    zoneID: fixture.adapter.recordZoneID)
+            record["createdAt"] = Date() as CKRecordValue
+            record["modifiedAt"] = Date() as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            do {
+                switch operation {
+                case 0, 1:
+                    _ = try await fixture.adapter.saveChanges(in: [record, record], forceSave: operation == 1)
+                case 2:
+                    _ = try await fixture.adapter.validateAuthoritativeOwnUploadRecords([record, record])
+                default:
+                    _ = try await fixture.adapter.deleteRecords(with: [record.recordID, record.recordID])
+                }
+                XCTFail("Name-keyed outcomes cannot describe two events for the same name")
+            } catch {
+                XCTAssertEqual(error as? RealmSwiftInboundPageCommitError,
+                    .duplicateInboundEvent(recordName: record.recordID.recordName))
+            }
+            fixture.targetRealm.refresh()
+            fixture.persistenceRealm.refresh()
+            XCTAssertTrue(fixture.targetRealm.objects(BigSyncTrackedObject.self).isEmpty)
+            XCTAssertTrue(fixture.persistenceRealm.objects(SyncedEntity.self).isEmpty)
+            XCTAssertTrue(fixture.persistenceRealm.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        }
+    }
+
 }

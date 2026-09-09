@@ -89,6 +89,9 @@ public struct BigSyncBackgroundWorkerConfiguration {
     let synchronizationWillConsumeServerChangesHandler:
         SynchronizationWillConsumeServerChangesHandler?
     let domainPrepublicationHandler: DomainPrepublicationHandler?
+    let publicationFetchDeferralHandler: CloudKitSynchronizer.PublicationFetchDeferralHandler?
+    let publicationConsumptionHandler: SynchronizationWillConsumeServerChangesHandler?
+    let postBarrierSnapshotIdentifierProvider: DomainPublicationScopeIdentifierProvider?
     let domainPublicationScopeIdentifierProvider:
         DomainPublicationScopeIdentifierProvider?
     let durablePublicationEvidenceHandler:
@@ -124,6 +127,9 @@ public struct BigSyncBackgroundWorkerConfiguration {
         domainPrepublicationHandler: DomainPrepublicationHandler? = nil,
         domainPublicationScopeIdentifierProvider:
             DomainPublicationScopeIdentifierProvider? = nil,
+        postBarrierSnapshotIdentifierProvider: DomainPublicationScopeIdentifierProvider? = nil,
+        publicationFetchDeferralHandler: CloudKitSynchronizer.PublicationFetchDeferralHandler? = nil,
+        publicationConsumptionHandler: SynchronizationWillConsumeServerChangesHandler? = nil,
         durablePublicationEvidenceHandler:
             DurablePublicationEvidenceHandler? = nil,
         synchronizationCompletionHandler: SynchronizationCompletionHandler? = nil,
@@ -252,6 +258,9 @@ public struct BigSyncBackgroundWorkerConfiguration {
         self.synchronizationWillConsumeServerChangesHandler =
             synchronizationWillConsumeServerChangesHandler
         self.domainPrepublicationHandler = domainPrepublicationHandler
+        self.publicationFetchDeferralHandler = publicationFetchDeferralHandler
+        self.publicationConsumptionHandler = publicationConsumptionHandler
+        self.postBarrierSnapshotIdentifierProvider = postBarrierSnapshotIdentifierProvider
         self.domainPublicationScopeIdentifierProvider =
             domainPublicationScopeIdentifierProvider
         self.durablePublicationEvidenceHandler =
@@ -413,6 +422,9 @@ public actor BigSyncBackgroundActor {
             configuration.synchronizationWillConsumeServerChangesHandler
         synchronizer.domainPrepublicationHandler =
             configuration.domainPrepublicationHandler
+        synchronizer.publicationFetchDeferralHandler = configuration.publicationFetchDeferralHandler
+        synchronizer.publicationConsumptionHandler = configuration.publicationConsumptionHandler
+        synchronizer.postBarrierSnapshotIdentifierProvider = configuration.postBarrierSnapshotIdentifierProvider
         synchronizer.domainPublicationScopeIdentifierProvider =
             configuration.domainPublicationScopeIdentifierProvider
         synchronizer.accountScopeInvalidationHandler =
@@ -468,6 +480,15 @@ public actor BigSyncBackgroundActor {
     }
 
 #if DEBUG
+    /// Lets the isolated coordinator own the first drain without cancelling
+    /// adapter setup or the independent durable-publication restoration task.
+    @_spi(CloudKitE2E)
+    @BigSyncBackgroundActor
+    public func cancelCloudKitE2EDelayedSynchronization() {
+        initialSynchronizationTask?.cancel()
+        initialSynchronizationTask = nil
+    }
+
     /// Waits only for configuration's pre-sync restoration task. It does not
     /// begin or request a synchronization drain.
     @_spi(CloudKitE2E)
@@ -593,6 +614,50 @@ public actor BigSyncBackgroundActor {
         }
 
         return await synchronizeCloudKit(expectedSynchronizer: realmSynchronizer)
+    }
+
+    /// Arms the next full drain after an externally reviewed writer barrier.
+    /// The caller must then request synchronization and present that run's
+    /// terminal receipt to `completedPostBarrierDrain`.
+    @BigSyncBackgroundActor
+    public func establishPostBarrierDrain(
+        writerBarrierEvidenceID: String
+    ) throws -> CloudKitSynchronizer.PostBarrierDrainAuthorization {
+        guard let realmSynchronizer else {
+            throw CancellationError()
+        }
+        return try realmSynchronizer.establishPostBarrierDrain(
+            writerBarrierEvidenceID: writerBarrierEvidenceID
+        )
+    }
+
+    /// Validates a terminal receipt after its run finished and exposes only the
+    /// exact completed post-barrier drain capability needed by domain cutovers.
+    @BigSyncBackgroundActor
+    public func completedPostBarrierDrain(
+        using receipt: CloudKitSynchronizer.SynchronizationReceipt,
+        authorizedBy authorization: CloudKitSynchronizer.PostBarrierDrainAuthorization
+    ) async throws -> CloudKitSynchronizer.CompletedPostBarrierDrain {
+        guard let realmSynchronizer else {
+            throw CancellationError()
+        }
+        return try await realmSynchronizer.completedPostBarrierDrain(
+            using: receipt,
+            authorizedBy: authorization
+        )
+    }
+
+    /// Revalidates a completed capability after a domain CloudKit suspension.
+    @BigSyncBackgroundActor
+    public func revalidateCompletedPostBarrierDrain(
+        _ completed: CloudKitSynchronizer.CompletedPostBarrierDrain
+    ) async throws {
+        guard let realmSynchronizer else {
+            throw CancellationError()
+        }
+        try await realmSynchronizer.revalidateCompletedPostBarrierDrain(
+            completed
+        )
     }
 
     /// Returns at the deadline even when an underlying CloudKit await does not
