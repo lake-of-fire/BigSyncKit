@@ -1,0 +1,40 @@
+name: Publish verified followup ownership source
+on:
+  push:
+    branches: [audit/followup-ownership-publish-20260909]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply exact patch on normal source history
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          gzip -dc audit/followup-ownership.patch.gz > "$RUNNER_TEMP/evidence/source.patch"
+          echo '9b142ce43e52a0c2ff2aea069c6bc6c97bfbb00f0b1280ee9300372e252fce84  '"$RUNNER_TEMP/evidence/source.patch" | sha256sum -c -
+          git checkout --detach 5574785f473a7d22536cc651918fa0ac7883bf4d
+          test "$(git rev-parse HEAD^{tree})" = f64f42757945c8338d4955418ae4fe539f0a4c8f
+          git apply --index "$RUNNER_TEMP/evidence/source.patch"
+          git diff --cached --check
+          test "$(git write-tree)" = 8dcd7c6159d5d5de6739237585d7de71ae6e7251
+          git -c user.name='OpenAI assistant' -c user.email='noreply@openai.com' commit -m 'Fence cursor failure ownership and separate cutover and restoration witnesses'
+          test "$(git rev-parse HEAD^)" = 5574785f473a7d22536cc651918fa0ac7883bf4d
+          git push origin HEAD:refs/heads/codex/ordered-v2-followup-ownership-20260909
+          git rev-parse HEAD HEAD^{tree} HEAD^ > "$RUNNER_TEMP/evidence/identity.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/evidence/source-manifest.txt"
+          git status --porcelain > "$RUNNER_TEMP/evidence/status.txt"
+          cat "$RUNNER_TEMP/evidence/identity.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: followup-ownership-publication
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
