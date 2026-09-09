@@ -1,0 +1,39 @@
+name: Publish exact attempt-aware regression fixtures
+on:
+  push:
+    branches: [audit/fixture-correction-publish-20260909]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: transport
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 69b5e4ea1d37b64a3b3bc1a1c04fd0b7ab962cd8
+          path: source
+      - shell: bash
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          test "$(sha256sum transport/.audit/fixture-correction.patch | cut -d' ' -f1)" = 0a434efa4394a47d21c8e992ea99d90023c16b650867b312e496b89b776d218f
+          cd source
+          test "$(git rev-parse HEAD^{tree})" = cfb5dde3736d5134094ead019255265ea74a1707
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-followup-ownership-20260909 | cut -f1)" = 69b5e4ea1d37b64a3b3bc1a1c04fd0b7ab962cd8
+          git apply --index ../transport/.audit/fixture-correction.patch
+          git diff --cached --check
+          test "$(git write-tree)" = ea74bcdc2512e89c13d72d19ed0a11a10ba0b592
+          git -c user.name='OpenAI assistant' -c user.email='noreply@openai.com' commit -m 'Count distinct synchronization attempts in coalescing and diagnostic fixtures'
+          git push origin HEAD:refs/heads/codex/ordered-v2-followup-ownership-20260909
+          git rev-parse HEAD HEAD^{tree} > ../evidence/source-identity.txt
+          git diff HEAD^ HEAD --binary --full-index > ../evidence/source.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: attempt-aware-fixture-publication
+          path: evidence
+          retention-days: 14
+          if-no-files-found: error
