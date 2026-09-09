@@ -447,12 +447,9 @@ public actor BigSyncBackgroundActor {
                 priority: .utility
             ) { @BigSyncBackgroundActor in
                 do {
-                    let evidence = try await synchronizer
-                        .restoredDurablePublicationEvidence()
-#if DEBUG
-                    self.cloudKitE2ELastRestoredPublicationEvidence = evidence
-#endif
-                    try await restorationHandler(evidence)
+                    try await self.restorePublicationEvidence(
+                        from: synchronizer, using: restorationHandler
+                    )
                 } catch {
                     configuration.logger.error(
                         "QSCloudKitSynchronizer >> Could not restore terminal publication evidence: \(error)"
@@ -707,6 +704,27 @@ public actor BigSyncBackgroundActor {
     }
 
     @BigSyncBackgroundActor
+    internal func restorePublicationEvidence(
+        from synchronizer: CloudKitSynchronizer,
+        using handler: BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler
+    ) async throws {
+        let attemptID = synchronizer.synchronizationAttemptID
+        try Task.checkCancellation()
+        guard realmSynchronizer === synchronizer else { throw CancellationError() }
+        let evidence = try await synchronizer.restoredDurablePublicationEvidence()
+        try Task.checkCancellation()
+        guard realmSynchronizer === synchronizer,
+              synchronizer.synchronizationAttemptID == attemptID,
+              !synchronizer.accountScopeAuthorityFence.requiresGenerationRotation else { throw CancellationError() }
+#if DEBUG
+        cloudKitE2ELastRestoredPublicationEvidence = evidence
+#endif
+        // The domain callback retains its own final Realm/account admission.
+        // Never deliver old restoration (including nil) to a replacement worker.
+        try await handler(evidence)
+    }
+
+    @BigSyncBackgroundActor
     private func synchronizeCloudKit(
         expectedSynchronizer: CloudKitSynchronizer
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
@@ -714,6 +732,9 @@ public actor BigSyncBackgroundActor {
             return nil
         }
         await publicationRestorationTask?.value
+        // A stale waiter must not clear a successor worker's restoration task
+        // or perform its account preflight after this suspension.
+        guard !Task.isCancelled, realmSynchronizer === expectedSynchronizer else { return nil }
         publicationRestorationTask = nil
         let containerIdentifier = expectedSynchronizer.containerIdentifier
 

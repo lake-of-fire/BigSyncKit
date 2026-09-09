@@ -57,10 +57,8 @@ extension CloudKitSynchronizer {
         do {
             reportProgress("terminal-tail-start")
             try await revalidateActiveRunContext(for: attemptID)
-        } catch is CancellationError {
-            return
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
 //        logger.info("QSCloudKitSynchronizer >> Finishing synchronization batch...")
@@ -80,10 +78,8 @@ extension CloudKitSynchronizer {
                 // drain before a terminal receipt is issued.
                 try await adapter.didFinishImport()
                 try await revalidateActiveRunContext(for: attemptID)
-            } catch is CancellationError {
-                return
             } catch {
-                await failSynchronization(error: error)
+                await failTerminalSynchronization(error: error, for: attemptID)
                 return
             }
         }
@@ -96,10 +92,8 @@ extension CloudKitSynchronizer {
             if try adaptersHavePendingChangesAtTerminalBoundary() {
                 synchronizationRequestedWhileRunning = true
             }
-        } catch is CancellationError {
-            return
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
         
@@ -119,10 +113,8 @@ extension CloudKitSynchronizer {
             try await processKillCheckpointHandler?(
                 .localAcknowledgementBeforeTerminalPublication
             )
-        } catch is CancellationError {
-            return
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
 #endif
@@ -133,24 +125,20 @@ extension CloudKitSynchronizer {
                 try await finishChangeFeedMigrationIfNeeded(context: context)
                 try await revalidateRunContext(context)
             }
-        } catch is CancellationError {
-            return
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
         let consumedServerBoundaryIdentifier: String?
         do {
             consumedServerBoundaryIdentifier = try
                 currentConsumedServerBoundaryIdentifier(for: activeRunContext)
-        } catch is CancellationError {
-            return
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
         guard let terminalContext = activeRunContext else {
-            await failSynchronization(error: CancellationError())
+            await failTerminalSynchronization(error: CancellationError(), for: attemptID)
             return
         }
         var publicationBlockers = [DomainBlocker]()
@@ -193,10 +181,8 @@ extension CloudKitSynchronizer {
                         )
                     try await revalidateRunContext(terminalContext)
                 }
-            } catch is CancellationError {
-                return
             } catch {
-                await failSynchronization(error: error)
+                await failTerminalSynchronization(error: error, for: attemptID)
                 return
             }
         }
@@ -232,30 +218,23 @@ extension CloudKitSynchronizer {
                 domainPublicationScopeIdentifier = scope
                 try await revalidateRunContext(terminalContext)
             }
-        } catch is CancellationError {
-            return
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
 
         do {
-            // Application reconciliation is allowed to create upload work.
-            // Repeat the exact terminal journal predicate after it returns;
-            // any new generation is drained before a receipt can exist.
-            if try adaptersHavePendingChangesAtTerminalBoundary() {
-                synchronizationRequestedWhileRunning = true
-            }
+            // Account lookup is the last suspension before the terminal cut.
+            // An ordinary journal writer need not have delivered its debounced
+            // observer yet, so refresh the journal AFTER account lookup too.
             try await revalidateRunContext(terminalContext)
-            if try currentConsumedServerBoundaryIdentifier(
-                for: terminalContext
-            ) != consumedServerBoundaryIdentifier {
+            if try terminalBoundaryNeedsAnotherDrain(
+                context: terminalContext, consumedBoundary: consumedServerBoundaryIdentifier
+            ) {
                 synchronizationRequestedWhileRunning = true
             }
-        } catch is CancellationError {
-            return
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
         if synchronizationRequestedWhileRunning {
@@ -275,16 +254,22 @@ extension CloudKitSynchronizer {
                 // terminal semantic validation reports uncertainty/invalidity.
                 try await beginPublicationConsumptionIfNeeded()
                 try await revalidateRunContext(terminalContext)
+                // The blocked branch has its own awaits. A blocker does not
+                // permit completion at an unconsumed journal/cursor boundary.
+                if try terminalBoundaryNeedsAnotherDrain(
+                    context: terminalContext, consumedBoundary: consumedServerBoundaryIdentifier
+                ) {
+                    restartSynchronizationForTerminalWork()
+                    return
+                }
                 try clearDurablePublicationEvidence()
                 try recordSyncHealth(
                     .semanticBlocked,
                     context: terminalContext
                 )
                 try keyValueStore.bigSyncValidateDurability()
-            } catch is CancellationError {
-                return
             } catch {
-                await failSynchronization(error: error)
+                await failTerminalSynchronization(error: error, for: attemptID)
                 return
             }
             activeReceiptAuthorizationID = nil
@@ -341,20 +326,16 @@ extension CloudKitSynchronizer {
                         consumedServerBoundaryIdentifier,
                     changeFeedEpoch: changeFeedEpoch
                 )
-            } catch is CancellationError {
-                return
             } catch {
-                await failSynchronization(error: error)
+                await failTerminalSynchronization(error: error, for: attemptID)
                 return
             }
         }
         if let context = activeRunContext {
             do {
                 try recordSyncHealth(.succeeded, context: context)
-            } catch is CancellationError {
-                return
             } catch {
-                await failSynchronization(error: error)
+                await failTerminalSynchronization(error: error, for: attemptID)
                 return
             }
         }
@@ -365,7 +346,7 @@ extension CloudKitSynchronizer {
             // local-state commit failed.
             try keyValueStore.bigSyncValidateDurability()
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
 #if DEBUG
@@ -373,10 +354,26 @@ extension CloudKitSynchronizer {
             try await processKillCheckpointHandler?(
                 .terminalEvidenceBeforeCompletionDelivery
             )
-        } catch is CancellationError {
-            return
+            // A diagnostic checkpoint may return, not kill the process. It is
+            // then a real suspension and cannot bypass terminal admission.
+            try await revalidateRunContext(terminalContext)
+            if try terminalBoundaryNeedsAnotherDrain(
+                context: terminalContext, consumedBoundary: consumedServerBoundaryIdentifier
+            ) {
+                try clearDurablePublicationEvidence()
+                restartSynchronizationForTerminalWork()
+                return
+            }
+            if let domainPublicationScopeIdentifier {
+                guard let evidence = try publicationEvidenceForUnconsumedFetch(context: terminalContext),
+                      evidence.runID == terminalContext.runID,
+                      evidence.domainScopeIdentifier == domainPublicationScopeIdentifier else {
+                    throw DurableKeyValueStoreError.mutationNotDurable
+                }
+            }
+            try keyValueStore.bigSyncValidateDurability()
         } catch {
-            await failSynchronization(error: error)
+            await failTerminalSynchronization(error: error, for: attemptID)
             return
         }
 #endif
@@ -414,6 +411,31 @@ extension CloudKitSynchronizer {
         synchronizationTask = nil
         postNotification(.SynchronizerDidSynchronize)
         delegate?.synchronizerDidSync(self)
+    }
+
+    /// Do not await the cancellation barrier from a registered callback: it
+    /// waits for this callback's own defer. A collaborator's CancellationError
+    /// is not proof that another path has already closed our drain.
+    @BigSyncBackgroundActor
+    private func failTerminalSynchronization(error: Error, for attemptID: UUID) async {
+        guard synchronizationAttemptID == attemptID else { return }
+        if error is CancellationError {
+            cancelSynchronization()
+        } else {
+            await failSynchronization(error: error)
+        }
+    }
+
+    /// Point-in-time transport cut. Call only after the last account await;
+    /// any additional await requires another check before terminal delivery.
+    @BigSyncBackgroundActor
+    private func terminalBoundaryNeedsAnotherDrain(
+        context: RunContext, consumedBoundary: String?
+    ) throws -> Bool {
+        try checkRunContext(context)
+        let pending = try adaptersHavePendingChangesAtTerminalBoundary()
+        let currentBoundary = try currentConsumedServerBoundaryIdentifier(for: context)
+        return pending || currentBoundary != consumedBoundary || synchronizationRequestedWhileRunning
     }
 
     @BigSyncBackgroundActor

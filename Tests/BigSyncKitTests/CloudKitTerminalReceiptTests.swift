@@ -279,6 +279,248 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         XCTAssertEqual(fixture.adapter.acknowledgements, 0)
     }
 
+
+    @BigSyncBackgroundActor
+    func testLatePendingEditDuringFinalAccountReadRestartsBeforeReceipt() async throws {
+        let fixture = Fixture(domainScopeIdentifier: "domain-a")
+        fixture.armFinalAccountInjection { fixture.introducePendingEdit() }
+        fixture.adapter.finishImportHook = {
+            if fixture.adapter.hasPendingTerminalChanges {
+                fixture.sawPrematureEvidence = try fixture.synchronizer.cloudKitE2EDurablePublicationEvidence() != nil
+                fixture.forwardedLateWork = true
+                fixture.adapter.hasPendingTerminalChanges = false
+            }
+        }
+        let receipt = try await fixture.drain()
+        XCTAssertTrue(fixture.injected)
+        XCTAssertTrue(fixture.forwardedLateWork)
+        XCTAssertFalse(fixture.sawPrematureEvidence)
+        XCTAssertNotEqual(receipt.runID, fixture.injectedRunID)
+        XCTAssertFalse(fixture.adapter.hasPendingTerminalChanges)
+    }
+
+    @BigSyncBackgroundActor
+    func testChangedCursorDuringFinalAccountReadRestartsBeforeReceipt() async throws {
+        let fixture = Fixture(domainScopeIdentifier: "domain-a")
+        fixture.armFinalAccountInjection { fixture.adapter.boundary = "changed-boundary" }
+        let receipt = try await fixture.drain()
+        XCTAssertTrue(fixture.injected)
+        XCTAssertNotEqual(receipt.runID, fixture.injectedRunID)
+        XCTAssertEqual(receipt.consumedServerBoundaryIdentifier, "changed-boundary")
+    }
+
+    @BigSyncBackgroundActor
+    func testBlockedBranchRechecksLatePendingEditAfterItsOwnAccountAwait() async throws {
+        let fixture = Fixture()
+        fixture.synchronizer.domainPrepublicationHandler = { _ in
+            fixture.synchronizer.publicationConsumptionPending = true
+            return [.init(code: "test-blocker")]
+        }
+        fixture.synchronizer.publicationConsumptionHandler = { _ in
+            guard !fixture.injected else { return }
+            // Consumption itself revalidates once; the blocked branch then
+            // performs the account await whose return must refresh journals.
+            await fixture.account.onNextRead {
+                await fixture.account.onNextRead { await fixture.injectPendingAtCurrentRun() }
+            }
+        }
+        fixture.adapter.finishImportHook = {
+            if fixture.adapter.hasPendingTerminalChanges {
+                fixture.forwardedLateWork = true
+                fixture.adapter.hasPendingTerminalChanges = false
+            }
+        }
+        let result = try await fixture.synchronizer.synchronize()
+        XCTAssertTrue(fixture.injected)
+        XCTAssertTrue(fixture.forwardedLateWork)
+        XCTAssertNil(result.receipt)
+        XCTAssertEqual(result.publicationState, .blocked([.init(code: "test-blocker")]))
+        XCTAssertFalse(fixture.synchronizer.synchronizationDrainIsActive)
+    }
+
+    @BigSyncBackgroundActor
+    func testReturningEvidenceCheckpointRechecksPendingJournalAndRevokesEvidence() async throws {
+        let fixture = Fixture(domainScopeIdentifier: "domain-a")
+        fixture.synchronizer.processKillCheckpointHandler = { point in
+            guard point == .terminalEvidenceBeforeCompletionDelivery, !fixture.injected else { return }
+            XCTAssertNotNil(try fixture.synchronizer.cloudKitE2EDurablePublicationEvidence())
+            fixture.injectPendingAtCurrentRun()
+        }
+        fixture.adapter.finishImportHook = {
+            if fixture.adapter.hasPendingTerminalChanges {
+                fixture.sawPrematureEvidence = try fixture.synchronizer.cloudKitE2EDurablePublicationEvidence() != nil
+                fixture.forwardedLateWork = true
+                fixture.adapter.hasPendingTerminalChanges = false
+            }
+        }
+        let receipt = try await fixture.drain()
+        XCTAssertTrue(fixture.forwardedLateWork)
+        XCTAssertFalse(fixture.sawPrematureEvidence)
+        XCTAssertNotEqual(receipt.runID, fixture.injectedRunID)
+    }
+
+    @BigSyncBackgroundActor
+    func testScopeCollaboratorCancellationClosesOwnedDrainAndAllowsRetry() async throws {
+        let fixture = Fixture()
+        fixture.synchronizer.domainPublicationScopeIdentifierProvider = { throw CancellationError() }
+        await assertCancelled { _ = try await fixture.synchronizer.synchronize() }
+        XCTAssertFalse(fixture.synchronizer.syncing)
+        XCTAssertFalse(fixture.synchronizer.synchronizationDrainIsActive)
+        XCTAssertEqual(fixture.synchronizer._testActiveRunCallbackCount, 0)
+        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
+        fixture.synchronizer.domainPublicationScopeIdentifierProvider = { "recovered-domain" }
+        _ = try await fixture.drain()
+    }
+
+    @BigSyncBackgroundActor
+    func testAdapterCollaboratorCancellationClosesOwnedDrain() async throws {
+        let fixture = Fixture()
+        fixture.adapter.semanticHook = { throw CancellationError() }
+        await assertCancelled { _ = try await fixture.synchronizer.synchronize() }
+        XCTAssertFalse(fixture.synchronizer.syncing)
+        XCTAssertFalse(fixture.synchronizer.synchronizationDrainIsActive)
+        XCTAssertEqual(fixture.synchronizer._testActiveRunCallbackCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testLateAccountCollaboratorCancellationClosesOwnedDrain() async throws {
+        let fixture = Fixture(domainScopeIdentifier: "domain-a")
+        fixture.armFinalAccountInjection { throw CancellationError() }
+        await assertCancelled { _ = try await fixture.synchronizer.synchronize() }
+        XCTAssertTrue(fixture.injected)
+        XCTAssertFalse(fixture.synchronizer.synchronizationDrainIsActive)
+        XCTAssertNil(fixture.synchronizer.activeReceiptAuthorizationID)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledCheckpointDoesNotStrandOwnedDrain() async throws {
+        for point in [BigSyncBackgroundWorkerConfiguration.ProcessKillCheckpoint.localAcknowledgementBeforeTerminalPublication,
+                      .terminalEvidenceBeforeCompletionDelivery] {
+            let fixture = Fixture(domainScopeIdentifier: "domain-a")
+            fixture.synchronizer.processKillCheckpointHandler = { checkpoint in
+                if checkpoint == point { throw CancellationError() }
+            }
+            await assertCancelled { _ = try await fixture.synchronizer.synchronize() }
+            XCTAssertFalse(fixture.synchronizer.syncing)
+            XCTAssertFalse(fixture.synchronizer.synchronizationDrainIsActive)
+            XCTAssertNil(fixture.synchronizer.activeReceiptAuthorizationID)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testColdStartRestoresWithoutGrantingLiveAccountLease() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        let receipt = try await first.drain()
+        let cold = first.reopened()
+        XCTAssertTrue(cold.synchronizer.accountValidationRequired)
+        XCTAssertNil(try cold.synchronizer.accountScopeLease())
+        let writes = cold.store.writes
+        let evidence = try await cold.synchronizer.restoredDurablePublicationEvidence()
+        XCTAssertEqual(evidence?.runID, receipt.runID)
+        XCTAssertEqual(cold.store.writes, writes)
+        XCTAssertTrue(cold.synchronizer.accountValidationRequired)
+        XCTAssertNil(try cold.synchronizer.accountScopeLease())
+        XCTAssertNil(cold.synchronizer.activeRunContext)
+    }
+
+    @BigSyncBackgroundActor
+    func testColdStartAccountSwitchDuringNamespaceActivationRejectsEvidence() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        cold.adapter.namespaceHook = { await cold.account.replace("account-b") }
+        let evidence = try await cold.synchronizer.restoredDurablePublicationEvidence()
+        XCTAssertNil(evidence)
+        XCTAssertEqual(cold.adapter.bindingActivations, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testColdStartAccountSwitchDuringBindingActivationRejectsEvidence() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        cold.adapter.bindingHook = { await cold.account.replace("account-b") }
+        let evidence = try await cold.synchronizer.restoredDurablePublicationEvidence()
+        XCTAssertNil(evidence)
+    }
+
+    @BigSyncBackgroundActor
+    func testColdStartSameAccountBindingReplacementRejectsOriginalEvidence() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        cold.adapter.namespaceHook = { try cold.replacePersistedBinding() }
+        await assertCancelled { _ = try await cold.synchronizer.restoredDurablePublicationEvidence() }
+        XCTAssertNil(cold.synchronizer.activeReceiptAuthorizationID)
+    }
+
+    @BigSyncBackgroundActor
+    func testColdStartAccountReturnWithNewGenerationRejectsOriginalEvidence() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        cold.adapter.namespaceHook = {
+            await cold.account.replace("account-b")
+            try cold.advancePersistedLeaseGeneration()
+            await cold.account.replace("original-account")
+        }
+        await assertCancelled { _ = try await cold.synchronizer.restoredDurablePublicationEvidence() }
+    }
+
+    @BigSyncBackgroundActor
+    func testColdStartEvidenceReplacementDuringActivationDoesNotBorrowAdmission() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        cold.adapter.namespaceHook = { try cold.synchronizer.clearDurablePublicationEvidence() }
+        await assertCancelled { _ = try await cold.synchronizer.restoredDurablePublicationEvidence() }
+    }
+
+    @BigSyncBackgroundActor
+    func testColdStartPoisonBeforeNotificationActorRunsRejectsEvidence() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        cold.adapter.namespaceHook = { cold.synchronizer.accountScopeAuthorityFence.poison() }
+        await assertCancelled { _ = try await cold.synchronizer.restoredDurablePublicationEvidence() }
+    }
+
+    @BigSyncBackgroundActor
+    func testColdStartSupersededByNewRunCannotReturnOldEvidence() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        cold.adapter.namespaceHook = { _ = try await cold.drain() }
+        await assertCancelled { _ = try await cold.synchronizer.restoredDurablePublicationEvidence() }
+        XCTAssertNotNil(cold.synchronizer.activeRunContext)
+        XCTAssertFalse(cold.synchronizer.synchronizationDrainIsActive)
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerReplacementDuringColdStartNeverReceivesOldCallback() async throws {
+        let first = Fixture(domainScopeIdentifier: "domain-a", useReplicaBinding: true)
+        _ = try await first.drain()
+        let cold = first.reopened()
+        let successor = Fixture()
+        let worker = BigSyncBackgroundActor()
+        await worker._test_installSynchronizer(cold.synchronizer)
+        cold.adapter.namespaceHook = { await worker._test_installSynchronizer(successor.synchronizer) }
+        await assertCancelled {
+            try await worker.restorePublicationEvidence(from: cold.synchronizer) { _ in
+                XCTFail("Old restoration must not be handed to replacement worker")
+            }
+        }
+        XCTAssertFalse(successor.synchronizer.cancelSync)
+    }
+
+    @BigSyncBackgroundActor
+    private func assertCancelled(file: StaticString = #filePath, line: UInt = #line,
+                                 _ operation: () async throws -> Void) async {
+        do { try await operation(); XCTFail("Expected cancellation", file: file, line: line) }
+        catch is CancellationError { }
+        catch { XCTFail("Unexpected error: \(error)", file: file, line: line) }
+    }
+
     @BigSyncBackgroundActor
     private func assertRejected(
         file: StaticString = #filePath, line: UInt = #line,
@@ -292,18 +534,28 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
 
     @BigSyncBackgroundActor
     private final class Fixture {
-        let store = ReceiptStore()
+        let store: ReceiptStore
         let transport = ReceiptTransport()
-        let account = ReceiptAccount()
+        let account: ReceiptAccount
+        let identifier: String
+        let useReplicaBinding: Bool
+        let domainScopeIdentifier: String?
+        var injected = false
+        var injectedRunID: UUID?
+        var forwardedLateWork = false
+        var sawPrematureEvidence = false
         let adapter: ReceiptAdapter
         let synchronizer: CloudKitSynchronizer
 
-        init(domainScopeIdentifier: String? = nil, useReplicaBinding: Bool = false) {
-            let zone = CKRecordZone.ID(zoneName: "receipt-fixture-\(UUID().uuidString)",
+        init(domainScopeIdentifier: String? = nil, useReplicaBinding: Bool = false,
+             store: ReceiptStore = ReceiptStore(), account: ReceiptAccount = ReceiptAccount(),
+             identifier: String = UUID().uuidString, zoneID: CKRecordZone.ID? = nil) {
+            self.store = store; self.account = account; self.identifier = identifier
+            self.useReplicaBinding = useReplicaBinding; self.domainScopeIdentifier = domainScopeIdentifier
+            let zone = zoneID ?? CKRecordZone.ID(zoneName: "receipt-fixture-\(UUID().uuidString)",
                 ownerName: CKCurrentUserDefaultName)
             adapter = ReceiptAdapter(zoneID: zone)
-            let account = account
-            synchronizer = CloudKitSynchronizer(identifier: UUID().uuidString,
+            synchronizer = CloudKitSynchronizer(identifier: identifier,
                 containerIdentifier: "iCloud.receipt-fixture", database: transport,
                 recordZoneID: zone, keyValueStore: store,
                 accountIdentifierProvider: { try await account.read() },
@@ -320,6 +572,49 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         }
 
         func introducePendingEdit() { adapter.hasPendingTerminalChanges = true }
+        func reopened() -> Fixture {
+            Fixture(domainScopeIdentifier: domainScopeIdentifier, useReplicaBinding: useReplicaBinding,
+                    store: store, account: account, identifier: identifier, zoneID: adapter.recordZoneID)
+        }
+
+        func injectPendingAtCurrentRun() {
+            injected = true; injectedRunID = synchronizer.activeRunContext?.runID
+            introducePendingEdit()
+        }
+
+        func armFinalAccountInjection(_ operation: @escaping @BigSyncBackgroundActor @Sendable () throws -> Void) {
+            synchronizer.domainPublicationScopeIdentifierProvider = { [self] in
+                guard !injected else { return domainScopeIdentifier }
+                await account.onNextRead {
+                    await self.account.onNextRead {
+                        try await self.runInjection(operation)
+                    }
+                }
+                return domainScopeIdentifier
+            }
+        }
+
+        func runInjection(_ operation: @BigSyncBackgroundActor @Sendable () throws -> Void) throws {
+            injected = true; injectedRunID = synchronizer.activeRunContext?.runID
+            try operation()
+        }
+
+        func replacePersistedBinding() throws {
+            let key = synchronizer.durableStateKey("ReplicaBinding.v1")
+            var value = try XCTUnwrap(store.object(forKey: key) as? [String: Any])
+            value["activeGenerationIdentifier"] = String(repeating: "e", count: 64)
+            try store.bigSyncSetDurably(value: value, forKey: key)
+        }
+
+        func advancePersistedLeaseGeneration() throws {
+            let key = synchronizer.durableStateKey("AccountScopeLease.v1")
+            let old = try BigSyncAccountScopeLeaseState.load(store: store, key: key)
+            let lease = try XCTUnwrap(old.lease)
+            let next = try BigSyncAccountScopeLeaseState(generation: old.generation + 1,
+                accountScopeIdentifier: lease.accountScopeIdentifier, validatedAt: lease.validatedAt)
+            try next.persist(store: store, key: key)
+        }
+
 
         func postBarrierDrain() async throws -> (
             CloudKitSynchronizer.SynchronizationReceipt,
@@ -444,7 +739,26 @@ private final class ReceiptAdapter: NSObject, ModelAdapter, ChangeFeedResetMigra
         containerIdentifier: String, databaseScope: CKDatabase.Scope) throws -> String? { boundary }
     @BigSyncBackgroundActor
     func changeFeedEpoch() throws -> Int? { epoch }
-    func didFinishImport() async throws { }
+    @BigSyncBackgroundActor var finishImportHook: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    @BigSyncBackgroundActor var namespaceHook: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    @BigSyncBackgroundActor var bindingHook: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    @BigSyncBackgroundActor var semanticHook: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    @BigSyncBackgroundActor var bindingActivations = 0
+    @BigSyncBackgroundActor
+    func didFinishImport() async throws { try await finishImportHook?() }
+    @BigSyncBackgroundActor
+    func activateTransportNamespace(containerIdentifier: String, databaseScope: CKDatabase.Scope) async throws {
+        let hook = namespaceHook; namespaceHook = nil; try await hook?()
+    }
+    @BigSyncBackgroundActor
+    func activateReplicaBinding(accountScopeIdentifier: String, replicaBindingGenerationIdentifier: String?) async throws {
+        bindingActivations += 1
+        let hook = bindingHook; bindingHook = nil; try await hook?()
+    }
+    @BigSyncBackgroundActor
+    func semanticPublicationBlockers() async throws -> [CloudKitSynchronizer.DomainBlocker] {
+        try await semanticHook?(); return []
+    }
     func cancelSynchronization() { }
     func unsetCancellation() async throws { }
     @BigSyncBackgroundActor

@@ -1020,6 +1020,10 @@ public class CloudKitSynchronizer: NSObject {
     internal var _testActiveRunCallbackCount: Int {
         activeRunCallbackCount
     }
+
+    internal var _testSynchronizationWaiterCount: Int {
+        synchronizationWaiters.count
+    }
 #endif
     private var runCallbackWaiters = [CheckedContinuation<Void, Never>]()
     private var attemptCallbackContinuations = [
@@ -2811,6 +2815,42 @@ public class CloudKitSynchronizer: NSObject {
                 == expected.invalidationGeneration else {
             throw BigSyncAccountScopeLeaseError.stale
         }
+    }
+
+    /// Read-only startup ownership. This is NOT a live account lease or writer
+    /// permission: a fresh synchronizer deliberately still requires validation.
+    internal struct PublicationRestorationAuthority: Equatable {
+        let attemptID: UUID
+        let installationIdentifier: String
+        let accountState: BigSyncAccountScopeLeaseState
+        let binding: BigSyncReplicaBindingSnapshot?
+    }
+
+    internal func publicationRestorationAuthority() throws -> PublicationRestorationAuthority {
+        try Task.checkCancellation()
+        guard !syncing, !synchronizationDrainIsActive, activeRunContext == nil,
+              !cancelSync, !accountScopeAuthorityFence.requiresGenerationRotation,
+              pendingAccountScopeInvalidation == nil,
+              backupDetectionError == nil, !backupRestoreDetected else {
+            throw CancellationError()
+        }
+        try keyValueStore.bigSyncValidateDurability()
+        guard let installation = BackupDetection.installationIdentifier(
+            namespace: durableStateNamespace, sharedSentinelBaseURL: backupDetectionBaseURL
+        ) else { throw BigSyncReplicaBindingError.corrupt }
+        let binding = accountReplacementPolicy.usesDatasetReplicaBinding
+            ? try BigSyncReplicaBindingStateStore.load(store: keyValueStore, key: replicaBindingStateKey)
+            : nil
+        if accountReplacementPolicy.usesDatasetReplicaBinding {
+            guard let binding, binding.pendingPort == nil,
+                  binding.installationIdentityDigest == BigSyncReplicaBindingStateStore.installationIdentityDigest(for: installation) else {
+                throw CancellationError()
+            }
+        }
+        return PublicationRestorationAuthority(
+            attemptID: synchronizationAttemptID, installationIdentifier: installation,
+            accountState: try readAccountScopeLeaseDurably(), binding: binding
+        )
     }
 
     private func readAccountScopeLeaseDurably() throws

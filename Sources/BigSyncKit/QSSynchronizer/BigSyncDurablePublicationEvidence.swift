@@ -157,61 +157,79 @@ extension CloudKitSynchronizer {
         )
     }
 
-    /// Restores terminal evidence only when the current CloudKit account,
-    /// replica binding, local cursor, and feed epoch still match it exactly.
+    private struct PublicationRestorationSnapshot {
+        let authority: PublicationRestorationAuthority
+        let evidence: BigSyncDurablePublicationEvidence
+        let adapters: [ObjectIdentifier]
+    }
+
+    private func validatePublicationRestoration(_ snapshot: PublicationRestorationSnapshot) throws {
+        // Includes cancellation, synchronous account-notification poison, the
+        // persisted invalidation generation, full binding/installation and run
+        // ownership. The initial unvalidated fence is not an invalidation event.
+        guard try publicationRestorationAuthority() == snapshot.authority,
+              modelAdapters.map({ ObjectIdentifier($0) }) == snapshot.adapters,
+              try persistedDurablePublicationEvidence() == snapshot.evidence else {
+            throw CancellationError()
+        }
+    }
+
+    private func revalidatePublicationRestoration(_ snapshot: PublicationRestorationSnapshot) async throws -> Bool {
+        try validatePublicationRestoration(snapshot)
+        let account = try await accountIdentifierProvider()
+        try validatePublicationRestoration(snapshot)
+        return Self.accountScopeIdentifier(for: account) == snapshot.evidence.accountScopeIdentifier
+    }
+
+    /// Read-only cold-start inspection, never a newly issued receipt or lease.
+    /// Restored evidence can be handed to the domain only while the same startup
+    /// attempt, saved evidence, account generation and installation still own it.
     func restoredDurablePublicationEvidence() async throws
         -> BigSyncDurablePublicationEvidence? {
+        try Task.checkCancellation()
         guard let evidence = try persistedDurablePublicationEvidence(),
               evidence.zoneOwnerName == recordZoneID.ownerName,
-              evidence.zoneName == recordZoneID.zoneName else {
+              evidence.zoneName == recordZoneID.zoneName else { return nil }
+        let authority = try publicationRestorationAuthority()
+        guard authority.accountState.lease?.accountScopeIdentifier == evidence.accountScopeIdentifier,
+              authority.binding?.activeGenerationIdentifier == evidence.replicaBindingGenerationIdentifier,
+              authority.binding == nil || authority.binding?.activeAccountScopeIdentifier == evidence.accountScopeIdentifier else {
             return nil
         }
-        let accountIdentifier = try await accountIdentifierProvider()
-        let accountScopeIdentifier = Self.accountScopeIdentifier(
-            for: accountIdentifier
+        let snapshot = PublicationRestorationSnapshot(
+            authority: authority, evidence: evidence,
+            adapters: modelAdapters.map { ObjectIdentifier($0) }
         )
-        guard evidence.accountScopeIdentifier == accountScopeIdentifier else {
-            return nil
-        }
-        let replicaBindingGenerationIdentifier = try
-            activeReplicaBindingGenerationIdentifierForRun(
-            accountScopeIdentifier: accountScopeIdentifier
-        )
-        guard evidence.replicaBindingGenerationIdentifier
-                == replicaBindingGenerationIdentifier else {
-            return nil
-        }
+        guard try await revalidatePublicationRestoration(snapshot) else { return nil }
         for adapter in modelAdapters {
             try await adapter.activateTransportNamespace(
-                containerIdentifier: containerIdentifier,
-                databaseScope: database.databaseScope
+                containerIdentifier: containerIdentifier, databaseScope: database.databaseScope
             )
+            guard try await revalidatePublicationRestoration(snapshot) else { return nil }
             try await adapter.activateReplicaBinding(
-                accountScopeIdentifier: accountScopeIdentifier,
-                replicaBindingGenerationIdentifier:
-                    replicaBindingGenerationIdentifier
+                accountScopeIdentifier: evidence.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier: evidence.replicaBindingGenerationIdentifier
             )
+            guard try await revalidatePublicationRestoration(snapshot) else { return nil }
         }
-        // Configuration starts Realm setup asynchronously. Restoration must
-        // join that existing task before inspecting journals and the cursor;
-        // otherwise a cold launch can discard valid evidence as unavailable.
+        // Join the existing Realm setup task, retaining the original startup
+        // ownership across readiness. Do not prepare a new binding or namespace.
         for case let adapter as RealmSwiftAdapter in modelAdapters {
             try await adapter.ensureSetup()
+            try validatePublicationRestoration(snapshot)
         }
-        guard try !adaptersHavePendingChangesAtTerminalBoundary() else {
-            return nil
-        }
-        guard let adapter = modelAdapters.first,
+        // LAST actual-account await. The journal/cursor/feed/evidence checks
+        // below must remain a non-suspending tail, even on a cold launch.
+        guard try await revalidatePublicationRestoration(snapshot) else { return nil }
+        guard try !adaptersHavePendingChangesAtTerminalBoundary(),
+              let adapter = modelAdapters.first,
               try adapter.consumedServerBoundaryIdentifier(
-                accountScopeIdentifier: accountScopeIdentifier,
-                replicaBindingGenerationIdentifier:
-                    replicaBindingGenerationIdentifier,
-                containerIdentifier: containerIdentifier,
-                databaseScope: database.databaseScope
+                accountScopeIdentifier: evidence.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier: evidence.replicaBindingGenerationIdentifier,
+                containerIdentifier: containerIdentifier, databaseScope: database.databaseScope
               ) == evidence.consumedServerBoundaryIdentifier,
-              try adapter.changeFeedEpoch() == evidence.changeFeedEpoch else {
-            return nil
-        }
+              try adapter.changeFeedEpoch() == evidence.changeFeedEpoch else { return nil }
+        try validatePublicationRestoration(snapshot)
         return evidence
     }
 
