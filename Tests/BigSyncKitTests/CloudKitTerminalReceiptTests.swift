@@ -3,7 +3,7 @@ import Foundation
 import Logging
 import RealmSwift
 import XCTest
-@testable import BigSyncKit
+@_spi(CloudKitE2E) @testable import BigSyncKit
 
 /// Real synchronizer drains with injected transport/account providers. These
 /// tests do not access a CloudKit account, manufacture journals, or arm a cutoff.
