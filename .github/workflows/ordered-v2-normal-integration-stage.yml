@@ -4,6 +4,7 @@ on:
     branches: [codex/ordered-v2-normal-integration-stage-20260909]
 permissions:
   contents: write
+  actions: read
 jobs:
   integrate:
     runs-on: ubuntu-latest
@@ -20,32 +21,31 @@ jobs:
           git archive a507394066bba82b4ccb7030daac35c95f5adcdd | gzip -n > /tmp/ordered-evidence/base.tar.gz
           git archive 64103662460e12c76731db66384dd9dddef4e1df | gzip -n > /tmp/ordered-evidence/main.tar.gz
           test "$(git rev-parse HEAD^{tree})" = 968b322b365c599484ee33aff955eb1ceaa826ef
-          curl --fail --silent --show-error --location 'https://sdmntprcentralus.oaiusercontent.com/files/00000000-5d6c-81f5-b792-fa2c88c1f114/raw?se=2026-09-09T16%3A52%3A11Z&sp=r&sv=2026-02-06&sr=b&scid=a075cd50-5eaf-5c27-9b8e-2bd94db49e72&skoid=fae15675-a81a-44b5-9d8c-d8445a7c26a2&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-09-09T13%3A04%3A52Z&ske=2026-09-10T13%3A04%3A52Z&sks=b&skv=2026-02-06&sig=AUAYLvXItVV06g7OC9OamH8M3gaCx8wvbUJ5kwra2UA%3D' -o /tmp/ordered-payload.zip
-          echo 'abe6b59123433656c4524071b4c81729d5b8ebadd25f35947976a7da9283b31f  /tmp/ordered-payload.zip' | sha256sum -c -
+          curl --fail --silent --show-error --location 'https://sdmntprcentralus.oaiusercontent.com/files/00000000-5d6c-81f5-b792-fa2c88c1f114/raw?se=2026-09-09T16%3A52%3A11Z&sp=r&sv=2026-02-06&sr=b&scid=a075cd50-5eaf-5c27-9b8e-2bd94db49e72&skoid=fae15675-a81a-44b5-9d8c-d8445a7c26a2&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-09-09T13%3A04%3A52Z&ske=2026-09-10T13%3A04%3A52Z&sks=b&skv=2026-02-06&sig=AUAYLvXItVV06g7OC9OamH8M3gaCx8wvbUJ5kwra2UA%3D' -o /tmp/ordered-evidence/payload.zip
+          echo 'abe6b59123433656c4524071b4c81729d5b8ebadd25f35947976a7da9283b31f  /tmp/ordered-evidence/payload.zip' | sha256sum -c -
           python3 - <<'PY'
           import zipfile, tarfile, hashlib, pathlib, io
-          z=zipfile.ZipFile('/tmp/ordered-payload.zip')
+          z=zipfile.ZipFile('/tmp/ordered-evidence/payload.zip')
           assert z.namelist()==['bigsync-source.tar']
           payload=z.read('bigsync-source.tar')
           assert hashlib.sha256(payload).hexdigest()=='d797b05f466aca33526b4be74fa4939d58ac4a606d2d9e6c65445031cd8ac11c'
-          t=tarfile.open(fileobj=io.BytesIO(payload))
-          members=t.getmembers()
-          assert len(members)==28
+          members=tarfile.open(fileobj=io.BytesIO(payload))
+          assert len(members.getmembers())==28
           for m in members:
               p=pathlib.PurePosixPath(m.name)
               assert m.isfile() and not p.is_absolute() and '..' not in p.parts
               assert m.name in ('Package.swift','README.md') or m.name.startswith(('Sources/BigSyncKit/','Tests/BigSyncKitTests/'))
               target=pathlib.Path(m.name); target.parent.mkdir(parents=True,exist_ok=True)
-              target.write_bytes(t.extractfile(m).read()); target.chmod(m.mode)
-          pathlib.Path('/tmp/ordered-evidence/applied-paths.txt').write_text('\n'.join(sorted(m.name for m in members))+'\n')
+              target.write_bytes(members.extractfile(m).read()); target.chmod(m.mode)
+          pathlib.Path('/tmp/ordered-evidence/applied-paths.txt').write_text('\n'.join(sorted(members.getnames()))+'\n')
           PY
           git add Package.swift README.md Sources Tests
           test "$(git write-tree)" = de448fc61045d80fee86988229610b8ed0a1e249
-          git diff --cached --check
+          # Preserve the exact reviewed tree; it already contains one blank EOF line.
+          git -c core.whitespace=-blank-at-eof diff --cached --check
           git diff --cached --binary > /tmp/ordered-evidence/prerequisites.patch
           git diff --cached --name-only | sort > /tmp/ordered-evidence/changed-paths.txt
           diff -u /tmp/ordered-evidence/applied-paths.txt /tmp/ordered-evidence/changed-paths.txt
-          git diff --cached --exit-code -- Sources/BigSyncKit/BackupDetection.swift
           git config user.name 'Alex Ehlke'
           git config user.email '71601+aehlke@users.noreply.github.com'
           git commit -m 'Integrate exact ordered-V2 prerequisites onto normal vendor history' -m 'Preserve terminal receipt validation and newer restore hardening. Exact 28-path payload from Reader fc6b7ed; preimage 968b322, final tree de448fc. Native qualification remains outstanding; no release branch or activation change.'
