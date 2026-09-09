@@ -1,0 +1,32 @@
+name: Correct followup test evidence field
+on:
+  push:
+    branches: [audit/followup-test-field-20260909]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach c64a098320d8bd0a1be44a5c2a2d92bb720c8563
+          test "$(git rev-parse HEAD^{tree})" = 8dcd7c6159d5d5de6739237585d7de71ae6e7251
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift')
+          s=p.read_text()
+          assert s.count('evidence?.domainPublicationScopeIdentifier') == 1
+          p.write_text(s.replace('evidence?.domainPublicationScopeIdentifier','evidence?.domainScopeIdentifier'))
+          PY
+          git add Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          git diff --cached --check
+          test "$(git write-tree)" = a6e030006d8025e39b7fa60a5e34baae158b3aa1
+          git -c user.name='OpenAI assistant' -c user.email='noreply@openai.com' commit -m 'Use durable evidence domain scope field in restoration test'
+          git push origin HEAD:refs/heads/codex/ordered-v2-followup-ownership-20260909
+          git rev-parse HEAD HEAD^{tree} HEAD^
