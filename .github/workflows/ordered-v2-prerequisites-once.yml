@@ -1,0 +1,94 @@
+name: Integrate verified ordered-V2 prerequisites
+on:
+  push:
+    branches: [codex/ordered-v2-prerequisites-stage-20260909]
+    paths: [.github/workflows/ordered-v2-prerequisites-once.yml]
+permissions:
+  contents: write
+concurrency:
+  group: ordered-v2-prerequisites-stage-20260909
+  cancel-in-progress: false
+jobs:
+  integrate:
+    if: github.repository == 'lake-of-fire/BigSyncKit' && github.ref == 'refs/heads/codex/ordered-v2-prerequisites-stage-20260909'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          submodules: false
+      - name: Import only the verified vendor source inventory
+        shell: bash
+        env:
+          SOURCE_URL: 'https://sdmntprnorthcentralus.oaiusercontent.com/files/00000000-a8b4-822f-927b-5469eef22d11/raw?se=2026-09-09T12%3A48%3A13Z&sp=r&sv=2026-02-06&sr=b&scid=e70d0bbd-0db3-59d6-9941-7bb19a7e5f6c&skoid=fae15675-a81a-44b5-9d8c-d8445a7c26a2&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-09-09T01%3A16%3A16Z&ske=2026-09-10T01%3A16%3A16Z&sks=b&skv=2026-02-06&sig=amFP7fbN6Tcp4lKnNCjq1sEv8idrVI3BzaoDi%2BTxnQs%3D'
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 - <<'PY'
+          import hashlib, io, os, pathlib, subprocess, tarfile, urllib.request, zipfile
+          base = 'a507394066bba82b4ccb7030daac35c95f5adcdd'
+          expected_tree = 'de448fc61045d80fee86988229610b8ed0a1e249'
+          allowed = set('''Package.swift
+          README.md
+          Sources/BigSyncKit/QSSynchronizer/BigSyncAccountScopeLease.swift
+          Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
+          Sources/BigSyncKit/QSSynchronizer/BigSyncChangeFeedRecoveryState.swift
+          Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift
+          Sources/BigSyncKit/QSSynchronizer/BigSyncReplicaJournalHandoff.swift
+          Sources/BigSyncKit/QSSynchronizer/CloudKitChangeFeed.swift
+          Sources/BigSyncKit/QSSynchronizer/CloudKitRecordStore.swift
+          Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Private.swift
+          Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift
+          Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift
+          Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          Sources/BigSyncKit/QSSynchronizer/ModelAdapter.swift
+          Sources/BigSyncKit/RealmSwift/BigSyncInboundSemanticValidation.swift
+          Sources/BigSyncKit/RealmSwift/BigSyncPendingMutation.swift
+          Sources/BigSyncKit/RealmSwift/BigSyncRecordConflictPolicy.swift
+          Sources/BigSyncKit/RealmSwift/BigSyncRecordIdentifier.swift
+          Sources/BigSyncKit/RealmSwift/BigSyncRestoredObjectRecovering.swift
+          Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+          Sources/BigSyncKit/RealmSwift/SyncedEntityProtocol.swift
+          Tests/BigSyncKitTests/AccountAuthorityPersistenceTests.swift
+          Tests/BigSyncKitTests/BigSyncKitTests.swift
+          Tests/BigSyncKitTests/BigSyncRecordConflictPolicyTests.swift
+          Tests/BigSyncKitTests/BigSyncRecordIdentityBoundaryTests.swift
+          Tests/BigSyncKitTests/ChangeFeedRecoveryStateTests.swift
+          Tests/BigSyncKitTests/CloudKitCursorPersistenceTests.swift
+          Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift'''.split())
+          assert len(allowed) == 28
+          with urllib.request.urlopen(os.environ['SOURCE_URL'], timeout=60) as response:
+              payload = response.read(300001)
+          assert len(payload) == 285700
+          assert hashlib.sha256(payload).hexdigest() == 'abe6b59123433656c4524071b4c81729d5b8ebadd25f35947976a7da9283b31f'
+          with zipfile.ZipFile(io.BytesIO(payload)) as outer:
+              assert outer.namelist() == ['bigsync-source.tar']
+              assert outer.getinfo('bigsync-source.tar').file_size == 1904640
+              data = outer.read('bigsync-source.tar')
+          assert hashlib.sha256(data).hexdigest() == 'd797b05f466aca33526b4be74fa4939d58ac4a606d2d9e6c65445031cd8ac11c'
+          subprocess.run(['git','merge-base','--is-ancestor',base,'HEAD'],check=True)
+          assert subprocess.check_output(['git','rev-parse',base+'^{tree}']).decode().strip() == '968b322b365c599484ee33aff955eb1ceaa826ef'
+          env = dict(os.environ,GIT_INDEX_FILE=os.path.join(os.environ['RUNNER_TEMP'],'verified-vendor.index'))
+          subprocess.run(['git','read-tree',base],env=env,check=True)
+          with tarfile.open(fileobj=io.BytesIO(data),mode='r:') as archive:
+              members = archive.getmembers()
+              assert len(members) == 28 and {m.name for m in members} == allowed
+              assert all(m.isfile() and m.mode == 0o644 and m.size <= 600000 for m in members)
+              for member in members:
+                  content = archive.extractfile(member).read()
+                  blob = subprocess.check_output(['git','hash-object','-w','--stdin'],input=content).decode().strip()
+                  subprocess.run(['git','update-index','--add','--cacheinfo',f'100644,{blob},{member.name}'],env=env,check=True)
+                  print(hashlib.sha256(content).hexdigest(),member.name)
+          actual = subprocess.check_output(['git','write-tree'],env=env).decode().strip()
+          assert actual == expected_tree,(actual,expected_tree)
+          changed = set(subprocess.check_output(['git','diff','--name-only',base,actual]).decode().splitlines())
+          assert changed == allowed
+          subprocess.run(['git','diff','--check',base,actual],check=True)
+          message = 'Integrate ordered-V2 journal and publication prerequisites from verified source\n\nSource authority is the supplied ZIP plus reviewed increments. Preserve the existing terminal receipt API/tests and the newer normal-history backup sentinel-rotation fix/test. Exclude generated Xcode/user project changes. Native qualification remains pending; no production activation.\n'
+          commit = subprocess.check_output(['git','commit-tree',actual,'-p',base],input=message.encode()).decode().strip()
+          print('VERIFIED_TREE',actual)
+          print('SOURCE_COMMIT',commit)
+          subprocess.run(['git','push','origin',commit+':refs/heads/codex/ordered-v2-snapshot-prerequisites-20260909'],check=True)
+          PY
