@@ -483,7 +483,7 @@ extension CloudKitSynchronizer {
         try outboundQuiescenceCoordinator.validateDrained(owner, principal: currentOutboundPrincipal())
     }
 
-    private func matchingOutboundOwner(_ token: PostBarrierOutboundQuiescence) -> BigSyncOutboundQuiescenceLease? {
+    internal func matchingOutboundOwner(_ token: PostBarrierOutboundQuiescence) -> BigSyncOutboundQuiescenceLease? {
         guard token.issuerID == synchronizationReceiptIssuerID,
               postBarrierOutboundTicket == token, let owner = postBarrierOutboundLease,
               owner.barrier.identifier == token.identifier else { return nil }

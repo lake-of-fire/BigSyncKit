@@ -232,7 +232,10 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
     ) throws -> BigSyncOutboundQuiescenceSnapshot {
         try owner.withLock {
             guard validEvidence(evidenceID) else { throw BigSyncOutboundQuiescenceError.invalidState }
-            try validateOwner(owner, principal: owner.barrier.principal)
+            // A cancelled preparing/recovery owner cannot advance to a new
+            // admitting phase using its old token. Physical settlement, exact
+            // abort and explicit recovery retain their separate contracts.
+            try owner.validateAcquisition(principal: owner.barrier.principal)
             guard owner.barrier.phase == .recoveryRequired else {
                 throw BigSyncOutboundQuiescenceError.recoveryRequired
             }
@@ -494,6 +497,9 @@ internal final class BigSyncOutboundQuiescenceLease: @unchecked Sendable {
     fileprivate var closed = false
     fileprivate var allowsFinalDrain = false
     fileprivate var allowsSourcePublication = false
+    // Cancellation is a one-way revocation of this live acquisition, not only
+    // its current phase. Only explicit recovery may create a new acquisition.
+    private var admissionRevoked = false
     private var hasArmedFinalDrain = false
 
     fileprivate init(coordinator: BigSyncOutboundQuiescenceCoordinator, ownerLease: BigSyncFileLease,
@@ -509,6 +515,15 @@ internal final class BigSyncOutboundQuiescenceLease: @unchecked Sendable {
         try withLock { try coordinator.validateOwner(self, principal: principal) }
     }
 
+    /// Logical acquisition authority is separate from physical lease validity:
+    /// already-submitted batches must still be able to settle after revocation.
+    func validateAcquisition(principal: BigSyncOutboundPrincipal, requiresDrained: Bool = true) throws {
+        try withLock {
+            guard !admissionRevoked else { throw BigSyncOutboundQuiescenceError.staleAuthority }
+            try coordinator.validateOwner(self, principal: principal, requiresDrained: requiresDrained)
+        }
+    }
+
     func validateOutboundAdmission(principal: BigSyncOutboundPrincipal) throws {
         try withLock {
             try coordinator.validateOwner(self, principal: principal)
@@ -521,7 +536,7 @@ internal final class BigSyncOutboundQuiescenceLease: @unchecked Sendable {
 
     func armFinalDrain() throws {
         try withLock {
-            guard !closed, !hasArmedFinalDrain, barrier.phase == .preparing else {
+            guard !closed, !admissionRevoked, !hasArmedFinalDrain, barrier.phase == .preparing else {
                 throw BigSyncOutboundQuiescenceError.staleAuthority
             }
             try coordinator.validateDrained(self, principal: barrier.principal)
@@ -534,6 +549,7 @@ internal final class BigSyncOutboundQuiescenceLease: @unchecked Sendable {
 
     func sealOutboundAdmission() {
         withLock {
+            admissionRevoked = true
             allowsFinalDrain = false
             allowsSourcePublication = false
         }
@@ -541,6 +557,7 @@ internal final class BigSyncOutboundQuiescenceLease: @unchecked Sendable {
 
     fileprivate func close() {
         closed = true
+        admissionRevoked = true
         allowsFinalDrain = false
         allowsSourcePublication = false
         batchLease = nil
