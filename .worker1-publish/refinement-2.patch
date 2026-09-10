@@ -1,0 +1,63 @@
+diff --git a/Documentation/OutboundQuiescence.md b/Documentation/OutboundQuiescence.md
+index 6170c5a..b5b8ff8 100644
+--- a/Documentation/OutboundQuiescence.md
++++ b/Documentation/OutboundQuiescence.md
+@@ -31,7 +31,7 @@ The following APIs are available on **both** `CloudKitSynchronizer` and `BigSync
+ 4. **Run normal synchronization:** the owning next full drain may fetch/import and upload through the existing pipeline while peers remain fenced. Obtain its terminal receipt, then `await completedPostBarrierDrain(using:authorizedBy:)`. Require `completed.outboundQuiescenceIdentifier == token.identifier`. The completed receipt also retains its existing exact run, account, binding, cursor, snapshot and journal checks. The completed drain seals further owner batches; it cannot be rearmed.
+ 5. **Before any reservation/CAS-capable domain write:** call `await requirePostBarrierDrainRecoveryBeforeReservation(completed)`. It revalidates the completed drain and synchronously writes the transport phase `recoveryRequired`. Only **after success** may the domain persist its reservation. A crash or uncertain write between these two stores leaves a stricter fence, not reopened uploads. Continue to use the existing completed-drain checks before reservation/head-CAS, and validate the domain's exact journal/snapshot inside its transaction.
+ 6. **After bootstrap:** use the existing `revalidatePostBarrierDrainPrincipal` / `validatePostBarrierDrainPrincipal` for continuity only; new source journals intentionally invalidate the pre-bootstrap empty-journal witness. These methods do not authorize reservation or publication.
+-7. **Explicit transition/recovery:** once the domain durably commits a decision that makes transport reopening safe, take an exact `outboundQuiescenceSnapshot()` and call `resolvePostBarrierOutboundQuiescence(token, expected: snapshot, recoveryEvidenceID:)`. For an activated transition, all current-release writers **and outbound preparation** must now select only the new authority; legacy aggregate work must be retired or fenced before reopening. The library does not infer this from a string or flip a feature flag. It records the supplied durable evidence identifier and clears only the exact expected gate state. Alternatively leave the gate closed until recovery completes.
++7. **Explicit transition/recovery:** after step 5 has durably sealed transport as `recoveryRequired` and the domain durably commits a decision that makes transport reopening safe, take an exact `outboundQuiescenceSnapshot()` and call `resolvePostBarrierOutboundQuiescence(token, expected: snapshot, recoveryEvidenceID:)`. A live owner still in `preparing` cannot use resolution as a shortcut around the reservation/recovery seal; use exact pre-reservation abort when rolling back instead. For an activated transition, all current-release writers **and outbound preparation** must now select only the new authority; legacy aggregate work must be retired or fenced before reopening. The library does not infer this from a string or flip a feature flag. It records the supplied durable evidence identifier and clears only the exact expected gate state. Alternatively leave the gate closed until recovery completes.
+ 
+ **Production activation stays disabled.** Workers 2/3 own the business-state proof and invocation; Worker 4 owns subsequent vendor integration. This repository contains no Reader/Common/Core changes.
+ 
+diff --git a/Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift b/Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift
+index 4be7600..627b973 100644
+--- a/Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift
++++ b/Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift
+@@ -245,6 +245,9 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
+         try owner.withLock {
+             guard validEvidence(evidenceID) else { throw BigSyncOutboundQuiescenceError.invalidState }
+             try validateOwner(owner, principal: owner.barrier.principal)
++            guard owner.barrier.phase == .recoveryRequired else {
++                throw BigSyncOutboundQuiescenceError.recoveryRequired
++            }
+             guard owner.activeBatches == 0 else { throw BigSyncOutboundQuiescenceError.busy }
+             try withState { state in
+                 guard state == expected else { throw BigSyncOutboundQuiescenceError.staleAuthority }
+diff --git a/Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift b/Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift
+index 7e76b78..3aae645 100644
+--- a/Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift
++++ b/Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift
+@@ -82,6 +82,13 @@ final class BigSyncOutboundQuiescenceTests: XCTestCase {
+         try await candidate.waitUntilDrained(owner)
+         try owner.armFinalDrain()
+         owner.sealFinalDrain()
++        let preparing = try candidate.snapshot()
++        XCTAssertThrowsError(try candidate.resolveOwned(
++            owner, expected: preparing, evidenceID: "premature-transition"
++        )) {
++            XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .recoveryRequired)
++        }
++        XCTAssertEqual(try candidate.snapshot(), preparing)
+         try candidate.requireRecovery(owner)
+         XCTAssertEqual(try candidate.snapshot().barrier?.phase, .recoveryRequired)
+         XCTAssertThrowsError(try candidate.abort(owner))
+diff --git a/Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift b/Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+index 08d1218..7b00332 100644
+--- a/Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
++++ b/Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+@@ -1823,6 +1823,13 @@ extension CloudKitTerminalReceiptTests {
+         XCTAssertEqual(authorization.outboundQuiescenceIdentifier, token.identifier)
+         XCTAssertEqual(completed.outboundQuiescenceIdentifier, token.identifier)
+         XCTAssertTrue(try gate.snapshot().outstandingSubmissions.isEmpty)
++        let preparingCheckpoint = try fixture.synchronizer.outboundQuiescenceSnapshot()
++        XCTAssertThrowsError(try fixture.synchronizer.resolvePostBarrierOutboundQuiescence(
++            token, expected: preparingCheckpoint, recoveryEvidenceID: "premature-transition"
++        )) {
++            XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .recoveryRequired)
++        }
++        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot(), preparingCheckpoint)
+         let checkpoint = try await fixture.synchronizer.requirePostBarrierDrainRecoveryBeforeReservation(completed)
+         XCTAssertEqual(checkpoint.barrier?.phase, .recoveryRequired)
+         XCTAssertThrowsError(try fixture.synchronizer.abortPostBarrierOutboundQuiescence(token)) {
