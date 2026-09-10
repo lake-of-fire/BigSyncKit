@@ -1873,6 +1873,28 @@ public class CloudKitSynchronizer: NSObject {
         return authorization
     }
 
+    /// Revokes only the exact post-barrier authorization supplied by its holder.
+    /// An in-flight synchronization may continue as an ordinary drain, but it
+    /// can no longer mint a completed cutover capability. A matching completed
+    /// capability is invalidated too; ordinary receipts remain untouched.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func revokePostBarrierDrainAuthorization(
+        _ authorization: PostBarrierDrainAuthorization
+    ) -> Bool {
+        guard authorization.issuerID == synchronizationReceiptIssuerID else { return false }
+        var revoked = false
+        if postBarrierDrainAuthorization == authorization {
+            postBarrierDrainAuthorization = nil
+            revoked = true
+        }
+        if completedPostBarrierDrain?.postBarrierDrainAuthorizationID == authorization.authorizationID {
+            completedPostBarrierDrain = nil
+            revoked = true
+        }
+        return revoked
+    }
+
     /// Materializes an opaque completed-drain capability from the exact
     /// terminal receipt issued for an armed post-barrier run. This remains
     /// valid after that run has released its waiters, but a newer run, account

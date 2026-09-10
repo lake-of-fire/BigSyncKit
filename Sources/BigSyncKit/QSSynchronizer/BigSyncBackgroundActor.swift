@@ -657,6 +657,17 @@ public actor BigSyncBackgroundActor {
 
     /// Validates a terminal receipt after its run finished and exposes only the
     /// exact completed post-barrier drain capability needed by domain cutovers.
+    /// Revokes only a capability issued by the currently installed worker.
+    /// This does not cancel or await an ordinary synchronization run.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func revokePostBarrierDrainAuthorization(
+        _ authorization: CloudKitSynchronizer.PostBarrierDrainAuthorization
+    ) -> Bool {
+        guard let synchronizer = realmSynchronizer else { return false }
+        return synchronizer.revokePostBarrierDrainAuthorization(authorization)
+    }
+
     @BigSyncBackgroundActor
     public func completedPostBarrierDrain(
         using receipt: CloudKitSynchronizer.SynchronizationReceipt,
