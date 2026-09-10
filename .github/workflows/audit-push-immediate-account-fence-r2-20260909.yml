@@ -1,0 +1,39 @@
+name: Audit push immediate account fence r2
+on:
+  push:
+    branches:
+      - audit/push-immediate-account-fence-r2-20260909
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/ordered-v2-followup-ownership-20260909
+          fetch-depth: 0
+      - name: Verify and apply exact fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=4489cbe29964f23e1b0f026b725bf48534b13091
+          test "$(git rev-parse HEAD)" = "$expected"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
+          s = p.read_text()
+          old = '''        guard activeRunContext == context,\n              synchronizationAttemptID == context.attemptID,\n              synchronizationRunID == context.runID,\n              !cancelSync else {\n'''
+          new = '''        guard activeRunContext == context,\n              synchronizationAttemptID == context.attemptID,\n              synchronizationRunID == context.runID,\n              !accountScopeAuthorityFence.requiresGenerationRotation,\n              !cancelSync else {\n'''
+          if s.count(old) != 1:
+              raise SystemExit('expected checkRunContext preimage not found exactly once')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git diff --check
+          swiftc -frontend -parse Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          test "$(git hash-object Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift)" = 94313beac53f3d6c09667b15af24c212e247981f
+          git config user.name 'Alex Ehlke'
+          git config user.email '71601+aehlke@users.noreply.github.com'
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          git commit -m 'Reject immediately revoked account authority at run boundaries'
+          git push origin HEAD:codex/ordered-v2-followup-ownership-20260909
