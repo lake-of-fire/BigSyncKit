@@ -1,4 +1,4 @@
-name: Worker 1 recovery-seal hardening publish
+name: Worker 1 acknowledgement-lifetime refinement publish
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: worker1-recovery-seal-publish-pr8
+  group: worker1-ack-lifetime-pr8
   cancel-in-progress: false
 
 jobs:
@@ -20,50 +20,42 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Verify hardening, test, and fast-forward PR 8
+      - name: Verify acknowledgement lifetime, test, and fast-forward PR 8
         shell: bash
         env:
-          BASE: 8a87f0b6d812ce6a21aeb9ce04afeb4546dd5203
-          BASE_TREE: 966a76cf373ed9ebb671584eeaf027549cbef9ad
-          EXPECTED_TREE: 69fdb89966778f3d691e4dc573b7ab30deb452c3
+          BASE: 98d75c4e478c8de626c30f08fb820b01e74e2bbb
+          BASE_TREE: 69fdb89966778f3d691e4dc573b7ab30deb452c3
           TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
-          PATCH_SHA256: e1eac673e418e59b0ab0e1476f1bb6c8ef8651252dec0efcbebafe4abaa7ce91
+          GZIP_SHA256: f7d1fce8559d10b4eb65b8d324ed712b9d01734d9f9dd4ce7416d26a7854bb98
+          PATCH_SHA256: a9a1010634b0f2ef5c38706e135789b1e942f03af87067a5605bdf7c299dd201
         run: |
           set -euo pipefail
           test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
-          printf '%s  %s\n' "$PATCH_SHA256" .worker1-publish/refinement-2.patch | sha256sum -c -
-          cp .worker1-publish/refinement-2.patch /tmp/refinement-2.patch
-          printf '%s  %s\n' "$PATCH_SHA256" /tmp/refinement-2.patch | sha256sum -c -
-
+          printf '%s  %s\n' "$GZIP_SHA256" .worker1-publish/ack-lifetime.patch.gz | sha256sum -c -
+          gzip -dc .worker1-publish/ack-lifetime.patch.gz > /tmp/refinement.patch
+          printf '%s  %s\n' "$PATCH_SHA256" /tmp/refinement.patch | sha256sum -c -
           current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
           test "$current" = "$BASE"
-
           git checkout --detach "$BASE"
-          git apply --check /tmp/refinement-2.patch
-          git apply /tmp/refinement-2.patch
+          git apply --check /tmp/refinement.patch
+          git apply /tmp/refinement.patch
           git diff --check
-          git add -A
-          tree="$(git write-tree)"
-          test "$tree" = "$EXPECTED_TREE"
-
           while IFS= read -r file; do
-            if [[ -f "$file" ]]; then swiftc -frontend -parse "$file"; fi
-          done < <(git diff --cached --name-only -- '*.swift')
+            if [[ -f "$file" && "$file" == *.swift ]]; then swiftc -frontend -parse "$file"; fi
+          done < <(git diff --name-only)
           Tools/run-outbound-quiescence-portable-tests.sh
           Tools/run-outbound-quiescence-process-tests.sh
-
-          export GIT_AUTHOR_NAME=Codex
-          export GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
-          export GIT_COMMITTER_NAME=Codex
-          export GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
+          git add -A
+          tree="$(git write-tree)"
+          export GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
+          export GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
           commit="$(printf '%s\n\n%s\n' \
-            'Require recovery seal before live cutoff resolution' \
-            'Prevent a drained live owner from using resolution as a shortcut around the durable recoveryRequired phase. Pre-reservation rollback remains the exact abort path; committed transitions must first seal recovery before reservation.' \
+            'Retain outbound uncertainty through local acknowledgement' \
+            'Do not clear a definitive CloudKit submission marker until generation-matched local response processing completes. Cancellation or authority replacement between server return and acknowledgement now remains fail-closed for explicit recovery.' \
             | git commit-tree "$tree" -p "$BASE")"
           test "$(git rev-parse "$commit^")" = "$BASE"
-          test "$(git rev-parse "$commit^{tree}")" = "$EXPECTED_TREE"
-
           current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
           test "$current" = "$BASE"
           git push origin "$commit:refs/heads/$TARGET_BRANCH"
           echo "PUBLISHED_COMMIT=$commit"
+          echo "PUBLISHED_TREE=$tree"
