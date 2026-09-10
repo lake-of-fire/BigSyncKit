@@ -1293,6 +1293,40 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
     }
 }
 
+
+extension CloudKitTerminalReceiptTests {
+    @BigSyncBackgroundActor
+    func testRevokingArmedPostBarrierAuthorizationDowngradesDrainAndAllowsRearm() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        _ = try await fixture.drain()
+        fixture.synchronizer.postBarrierSnapshotIdentifierProvider = { "snapshot-scope" }
+        let authorization = try fixture.synchronizer.establishPostBarrierDrain(
+            writerBarrierEvidenceID: "test-barrier")
+        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))
+        let receipt = try await fixture.drain()
+        XCTAssertNil(receipt.postBarrierDrainAuthorizationID)
+        await assertRejected {
+            _ = try await fixture.synchronizer.completedPostBarrierDrain(
+                using: receipt, authorizedBy: authorization)
+        }
+        let next = try fixture.synchronizer.establishPostBarrierDrain(
+            writerBarrierEvidenceID: "test-barrier-2")
+        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(next))
+    }
+
+    @BigSyncBackgroundActor
+    func testRevokingCompletedPostBarrierAuthorizationInvalidatesOnlyCutoverCapability() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
+            using: receipt, authorizedBy: authorization)
+        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))
+        XCTAssertThrowsError(try fixture.synchronizer.validatePostBarrierDrainPrincipal(completed))
+        try await fixture.synchronizer.revalidateTerminalReceipt(receipt)
+        XCTAssertFalse(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))
+    }
+}
+
 private actor ReceiptAccount {
     private var identifier = "original-account"
     private var nextRead: (@Sendable () async throws -> Void)?
