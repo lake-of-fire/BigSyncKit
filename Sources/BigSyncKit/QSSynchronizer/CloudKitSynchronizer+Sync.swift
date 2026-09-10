@@ -411,7 +411,12 @@ extension CloudKitSynchronizer {
         // Observation runs only after the old drain releases its shared
         // state. A synchronous diagnostic may cancel or start another run.
         reportProgress("terminal-receipt")
+        // Diagnostics and notifications are synchronous, reentrant observers.
+        // Once one replaces or fences this run, do not tell the next observer
+        // that the successor (which shares this synchronizer object) succeeded.
+        do { try checkRunContext(terminalContext) } catch { return }
         postNotification(.SynchronizerDidSynchronize)
+        do { try checkRunContext(terminalContext) } catch { return }
         delegate?.synchronizerDidSync(self)
     }
 
