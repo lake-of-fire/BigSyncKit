@@ -1,0 +1,80 @@
+name: Failure health native review
+on:
+  push:
+    branches: [audit/terminal-review-20260910-b]
+    paths: [.github/workflows/failure-health-review.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: review
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: fb349ff7ea17bff5ff793640fd04ce647b919f34
+          path: source/BigSyncKit
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 3c0ccf00d734cae997bd34654a4f2efd01397531
+          path: source/RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: source/SwiftUtilities
+          persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3'
+      - name: Native regression and source publication
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          EVIDENCE="$PWD/evidence"
+          python3 review/audit/health-review.py source/BigSyncKit tests
+          cd source/BigSyncKit
+          swift --version > "$EVIDENCE/swift.txt"
+          git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/before.txt"
+          set +e
+          swift test -j 4 --filter 'CloudKitTerminalReceiptTests.test(FailureFenceAtNotification|RetryableFailureFenceAtNotification|FailureHealthNotification|RetryableFailureHealthNotification)' > "$EVIDENCE/baseline.log" 2>&1
+          baseline=$?
+          set -e
+          echo "$baseline" > "$EVIDENCE/baseline-exit.txt"
+          test "$baseline" -ne 0
+          python3 - "$EVIDENCE/baseline.log" <<'PY'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text()
+          failed = re.findall(r"Test Case .*test(?:FailureFenceAtNotification|RetryableFailureFenceAtNotification|FailureHealthNotification|RetryableFailureHealthNotification).* failed \(", log)
+          assert len(failed) == 4, (len(failed), log[-12000:])
+          PY
+          python3 ../../review/audit/health-review.py . runtime
+          swift test -j 4 --filter CloudKitTerminalReceiptTests > "$EVIDENCE/terminal.log" 2>&1
+          swift test -j 4 --filter 'CloudKitCursorPersistenceTests|CloudKitSynchronizerAccountFencingTests|AccountAuthorityPersistenceTests|ChangeFeedRecoveryStateTests|CloudKitAccountAvailabilityGateTests|BigSyncRecordIdentityBoundaryTests' > "$EVIDENCE/adjacent.log" 2>&1
+          git diff --check
+          git diff --binary > "$EVIDENCE/fix.patch"
+          cp Package.resolved "$EVIDENCE/Package.resolved"
+          git config user.name 'Codex'
+          git config user.email 'codex@users.noreply.github.com'
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSyncHealth.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          git commit -m 'Close fenced failure drains and preserve health-observer successors'
+          git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/after.txt"
+          git ls-tree -r HEAD > "$EVIDENCE/source-manifest.txt"
+          git archive --format=tar.gz HEAD > "$EVIDENCE/source.tar.gz"
+          branch=codex/ordered-v2-followup-ownership-20260909
+          current=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+          test "$current" = fb349ff7ea17bff5ff793640fd04ce647b919f34
+          git push origin "HEAD:refs/heads/$branch"
+          git ls-remote origin "refs/heads/$branch" > "$EVIDENCE/published.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: failure-health-review-evidence
+          path: evidence
+          retention-days: 30
