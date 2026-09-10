@@ -1014,7 +1014,10 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
 
     @BigSyncBackgroundActor
     private func assertCoalescedWorkerRequests(cancel: Bool) async throws {
-        let fixture = Fixture()
+        var terminalCount = 0
+        let fixture = Fixture(progressHandler: {
+            if $0 == "terminal-receipt" { terminalCount += 1 }
+        })
         let worker = BigSyncBackgroundActor()
         await worker._test_installSynchronizer(fixture.synchronizer, performsAccountAvailabilityPreflight: false)
         let entered = ReceiptPause(), release = ReceiptPause()
@@ -1042,13 +1045,17 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
             XCTAssertEqual(ar?.publicationState, .complete)
             XCTAssertEqual(br?.publicationState, .complete)
             XCTAssertEqual(ar?.receipt?.runID, br?.receipt?.runID)
-            XCTAssertEqual(attempts.count, 1)
+            // synchronize() requests fresh work as well as registering a
+            // waiter. Its second caller deliberately coalesces one refresh
+            // attempt into the SAME drain, not a second completion.
+            XCTAssertEqual(attempts.count, 2)
+            XCTAssertEqual(terminalCount, 1)
         }
         XCTAssertEqual(fixture.synchronizer._testSynchronizationWaiterCount, 0)
     }
 
     @BigSyncBackgroundActor
-    func testTerminalDiagnosticBeginStartsExactlyOneSuccessorRun() async throws {
+    func testTerminalDiagnosticBeginStartsOneSuccessorDrain() async throws {
         try await assertSynchronousTerminalReentry(cancelFirst: false)
     }
 
@@ -1087,7 +1094,10 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         XCTAssertEqual(br.publicationState, .complete)
         XCTAssertEqual(cr.receipt?.runID, br.receipt?.runID)
         XCTAssertNotEqual(first.receipt?.runID, br.receipt?.runID)
-        XCTAssertEqual(attempts.count, 2)
+        // The two ordinary synchronize() calls below B's first fetch request
+        // one coalesced refresh inside B. A and B still complete exactly once
+        // each; the diagnostic itself creates only one successor drain.
+        XCTAssertEqual(attempts.count, 3)
         XCTAssertEqual(observer.terminalCount, 2)
         XCTAssertFalse(fixture.synchronizer.syncing)
         XCTAssertNil(fixture.synchronizer.synchronizationTask)
