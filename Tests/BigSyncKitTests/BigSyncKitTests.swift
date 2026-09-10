@@ -18649,8 +18649,11 @@ extension BigSyncKitTests {
             ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation)
         XCTAssertNotEqual(olderGeneration, newerGeneration)
         try batch?.willSubmit()
-        try batch?.didSettle()
+        try batch?.noteDefinitiveTransportOutcome()
+        XCTAssertEqual(try gate.snapshot().outstandingSubmissions.count, 1)
         try await fixture.adapter.didUpload(savedRecords: [first.record], matchingGenerations: [name: olderGeneration])
+        try await batch?.completeLocalResponseProcessingCooperatively()
+        XCTAssertTrue(try gate.snapshot().outstandingSubmissions.isEmpty)
         XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, newerGeneration)
         XCTAssertThrowsError(try gate.validateDrained(owner, principal: principal))
         batch = nil
@@ -18658,5 +18661,43 @@ extension BigSyncKitTests {
         // Physical transport quiescence is not an empty-journal certificate.
         XCTAssertTrue(try fixture.adapter.hasPendingChangesAtTerminalBoundary())
         try gate.abort(owner)
+    }
+}
+
+
+extension BigSyncKitTests {
+    @BigSyncBackgroundActor
+    func testDeepRealmAccountSwitchAfterServerReturnPreservesGenerationAndMarker() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(id: "server-return-account-fence", createdAt: Date(),
+            modifiedAt: Date(), explicitlyModifiedAt: nil)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        let name = BigSyncTrackedObject.className() + "." + object.id
+        let generation = try XCTUnwrap(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation)
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(database: database, recordZoneID: fixture.adapter.recordZoneID,
+            accountIdentifierProvider: { database.accountIdentifier })
+        synchronizer.addModelAdapter(fixture.adapter)
+        try await prepareDirectOutboundAuthority(synchronizer)
+        database.accountIdentifierAfterNextModifyRecords = "replacement-account"
+        do {
+            try await synchronizer.synchronizeAdapter(fixture.adapter)
+            XCTFail("Account replacement must prevent the returned save from acknowledging local work")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged { }
+        fixture.targetRealm.refresh()
+        fixture.persistenceRealm.refresh()
+        XCTAssertEqual(database.modifyRecordsOperationCount, 1)
+        XCTAssertNotNil(database.record(for: .init(recordName: name, zoneID: fixture.adapter.recordZoneID)))
+        XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation, generation)
+        XCTAssertEqual(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+            forPrimaryKey: name)?.pendingGeneration, generation)
+        XCTAssertEqual(try synchronizer.outboundQuiescenceSnapshot().outstandingSubmissions.count, 1)
+        XCTAssertTrue(try fixture.adapter.hasPendingChangesAtTerminalBoundary())
     }
 }

@@ -610,6 +610,9 @@ public class CloudKitSynchronizer: NSObject {
         /// Captured before the run's first suspension after account validation.
         /// Nil is reserved for non-upload recovery contexts/older test fixtures.
         let accountInvalidationGeneration: Int64?
+        /// Exact live source-publication owner captured at run admission, before
+        /// any suspension. Nil for ordinary and aggregate-cutoff runs.
+        let sourcePublicationOwnershipID: UUID?
 
         init(
             attemptID: UUID,
@@ -617,8 +620,10 @@ public class CloudKitSynchronizer: NSObject {
             accountIdentifier: String,
             accountScopeIdentifier: String,
             replicaBindingGenerationIdentifier: String? = nil,
-            accountInvalidationGeneration: Int64? = nil
+            accountInvalidationGeneration: Int64? = nil,
+            sourcePublicationOwnershipID: UUID? = nil
         ) {
+            self.sourcePublicationOwnershipID = sourcePublicationOwnershipID
             self.accountInvalidationGeneration = accountInvalidationGeneration
             self.attemptID = attemptID
             self.runID = runID
@@ -1646,6 +1651,9 @@ public class CloudKitSynchronizer: NSObject {
         syncing = true
         retrySleepUntil = nil
         let attemptID = UUID()
+        let sourcePublicationOwnershipID =
+            postBarrierOutboundLease?.barrier.phase == .sourcePublication
+                ? postBarrierOutboundTicket?.ownershipID : nil
         synchronizationAttemptID = attemptID
         activeRunContext = nil
         publicationConsumptionPending = false
@@ -1706,9 +1714,11 @@ public class CloudKitSynchronizer: NSObject {
                     ),
                     replicaBindingGenerationIdentifier:
                         replicaBindingGenerationIdentifier,
-                    accountInvalidationGeneration: validatedLease.invalidationGeneration
+                    accountInvalidationGeneration: validatedLease.invalidationGeneration,
+                    sourcePublicationOwnershipID: sourcePublicationOwnershipID
                 )
                 activeRunContext = context
+                try validateSourcePublicationRun(context)
                 for adapter in modelAdapters {
                     try await adapter.activateTransportNamespace(
                         containerIdentifier: containerIdentifier,
@@ -3488,7 +3498,7 @@ public class CloudKitSynchronizer: NSObject {
         completedPostBarrierDrain = nil
         postBarrierDrainAuthorization = nil
         postBarrierOutboundEstablishmentID = nil
-        postBarrierOutboundLease?.sealFinalDrain()
+        postBarrierOutboundLease?.sealOutboundAdmission()
         // Cancellation drops receipt authority, never the durable cutoff.
         // Actual batch scopes retain OS ownership until they really unwind.
         changeRequestProcessor.reset()

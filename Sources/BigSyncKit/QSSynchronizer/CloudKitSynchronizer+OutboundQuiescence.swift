@@ -7,6 +7,9 @@ extension CloudKitSynchronizer {
     public struct PostBarrierOutboundQuiescence: Equatable, Sendable {
         public let identifier: UUID
         public let writerBarrierEvidenceID: String
+        // Never recycle a live capability when the same synchronizer reacquires
+        // the same durable barrier. Old callbacks must not own the resumed gate.
+        internal let ownershipID = UUID()
         internal let issuerID: UUID
         internal let principal: BigSyncOutboundPrincipal
     }
@@ -216,10 +219,11 @@ extension CloudKitSynchronizer {
         retireOutboundCapabilities(token)
     }
 
-    /// Resume a previously committed source-publication phase after process or
-    /// worker loss. The host proof must reconcile the exact checkpoint and every
-    /// outstanding source submission; unlike generic recovery this retains the
-    /// peer fence and returns a new process-local owner token.
+    /// Resume a committed domain handoff after process or worker loss. A
+    /// recoveryRequired checkpoint may be promoted only after the host proves
+    /// the domain commit won the crash race. An existing sourcePublication
+    /// checkpoint also requires proof covering every outstanding submission.
+    /// Neither path opens peers or re-arms an aggregate cutoff.
     public func resumePostBarrierSourcePublication(
         expected: BigSyncOutboundQuiescenceSnapshot,
         authorizingResume: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
@@ -250,7 +254,8 @@ extension CloudKitSynchronizer {
         }
         let principal = try currentOutboundPrincipal()
         guard let persistedBarrier = expected.barrier,
-              persistedBarrier.phase == .sourcePublication,
+              (persistedBarrier.phase == .recoveryRequired
+                || persistedBarrier.phase == .sourcePublication),
               persistedBarrier.principal == principal else {
             throw BigSyncOutboundQuiescenceError.staleAuthority
         }
@@ -378,14 +383,9 @@ extension CloudKitSynchronizer {
                     throw BigSyncOutboundQuiescenceError.staleAuthority
                 }
                 owner = postBarrierOutboundLease
-            } else if let ticket = postBarrierOutboundTicket,
-                      let sourceOwner = postBarrierOutboundLease,
-                      sourceOwner.barrier.identifier == ticket.identifier,
-                      sourceOwner.barrier.phase == .sourcePublication {
-                // Post-bootstrap source publication uses the ordinary sync and
-                // terminal receipt pipeline, but only this durable barrier owner
-                // may enter outbound preparation while peers remain blocked.
-                owner = sourceOwner
+            } else if context.sourcePublicationOwnershipID != nil {
+                try validateSourcePublicationRun(context)
+                owner = postBarrierOutboundLease
             } else {
                 owner = nil
             }
@@ -399,8 +399,10 @@ extension CloudKitSynchronizer {
         saving records: [CKRecord], deleting recordIDs: [CKRecord.ID]
     ) async throws -> CloudKitRecordMutationResults {
         try await outbound.willSubmitCooperatively()
-        do { try validateOutboundBatch(outbound, for: attemptID) }
-        catch {
+        do {
+            try validateOutboundBatch(outbound, for: attemptID)
+            try outbound.validateSubmissionAdmission()
+        } catch {
             // No request has entered transport. Cancellation/epoch replacement
             // here cannot manufacture an unknown server outcome.
             try await outbound.didSettleCooperatively()
@@ -438,6 +440,28 @@ extension CloudKitSynchronizer {
             throw BigSyncOutboundQuiescenceError.staleAuthority
         }
         try checkRunContext(context)
+        try validateSourcePublicationRun(context)
+    }
+
+    /// Source receipt issuance is still ordinary publication, but must not
+    /// forget the held cutoff or unresolved requests from earlier source runs.
+    /// Do not apply this after explicit durable completion/release: an already
+    /// issued ordinary receipt retains its existing revalidation contract.
+    internal func validateSourcePublicationRun(
+        _ context: RunContext, requiresDrained: Bool = false
+    ) throws {
+        guard let ownershipID = context.sourcePublicationOwnershipID else { return }
+        guard let token = postBarrierOutboundTicket,
+              token.ownershipID == ownershipID,
+              let owner = matchingOutboundOwner(token),
+              owner.barrier.phase == .sourcePublication,
+              try currentOutboundPrincipal(for: context) == token.principal else {
+            throw BigSyncOutboundQuiescenceError.staleAuthority
+        }
+        try owner.validateOutboundAdmission(principal: token.principal)
+        if requiresDrained {
+            try outboundQuiescenceCoordinator.validateDrained(owner, principal: token.principal)
+        }
     }
 
     internal func revalidateOutboundBatch(_ batch: BigSyncOutboundBatchLease, for attemptID: UUID) async throws {

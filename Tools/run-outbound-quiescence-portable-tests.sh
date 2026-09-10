@@ -14,7 +14,9 @@ cp "$root/Tests/BigSyncKitTests/BigSyncOutboundStateBoundsTests.swift" "$work/Te
 cat > "$work/Package.swift" <<'PACKAGE'
 // swift-tools-version: 5.9
 import PackageDescription
-let package = Package(name: "BigSyncOutboundQuiescencePortable", targets: [
+// Match the production package minimum instead of SwiftPM's legacy macOS default.
+let package = Package(name: "BigSyncOutboundQuiescencePortable",
+    platforms: [.macOS("15.0")], targets: [
     .target(name: "BigSyncKit"),
     .testTarget(name: "BigSyncKitTests", dependencies: ["BigSyncKit"])
 ])
