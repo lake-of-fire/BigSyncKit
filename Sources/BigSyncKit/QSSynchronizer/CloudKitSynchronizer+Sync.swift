@@ -694,6 +694,11 @@ extension CloudKitSynchronizer {
                     )
                 }
             } catch is CancellationError {
+                // A notification can revoke authority without rotating this
+                // attempt yet. Close its waiters rather than stranding them.
+                // A replacement attempt owns its own drain and must survive.
+                guard synchronizationAttemptID == attemptID else { return }
+                cancelSynchronization()
                 return
             } catch {
                 logger.error("QSCloudKitSynchronizer >> Failed to persist sync health: \(error)")

@@ -153,6 +153,9 @@ extension CloudKitSynchronizer {
             .SynchronizerSyncHealthDidChange,
             userInfo: [cloudKitSynchronizerSyncHealthSnapshotKey: snapshot]
         )
+        // NotificationCenter delivery is synchronous and may cancel, fence,
+        // or replace the run. Never let the caller finish a successor's drain.
+        try checkRunContext(context)
     }
 
     internal func syncHealthCategory(for error: Error) -> CloudKitSyncHealthSnapshot.Category {
