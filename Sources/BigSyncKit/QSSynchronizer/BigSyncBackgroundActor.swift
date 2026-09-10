@@ -640,7 +640,9 @@ public actor BigSyncBackgroundActor {
         return await synchronizeCloudKit(expectedSynchronizer: realmSynchronizer)
     }
 
-    /// Arms the next full drain after an externally reviewed writer barrier.
+    /// Legacy external writer/upload-barrier entry point. Production cutoff
+    /// consumers must use beginPostBarrierOutboundQuiescence and the token
+    /// overload instead; this method does not certify cross-process quiescence.
     /// The caller must then request synchronization and present that run's
     /// terminal receipt to `completedPostBarrierDrain`.
     @BigSyncBackgroundActor
@@ -653,6 +655,100 @@ public actor BigSyncBackgroundActor {
         return try realmSynchronizer.establishPostBarrierDrain(
             writerBarrierEvidenceID: writerBarrierEvidenceID
         )
+    }
+
+    /// Publish the cross-process outbound fence after the domain's durable
+    /// writer barrier. Keep the returned token for exact abort/recovery.
+    @BigSyncBackgroundActor
+    public func beginPostBarrierOutboundQuiescence(
+        writerBarrierEvidenceID: String
+    ) throws -> CloudKitSynchronizer.PostBarrierOutboundQuiescence {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        return try synchronizer.beginPostBarrierOutboundQuiescence(
+            writerBarrierEvidenceID: writerBarrierEvidenceID)
+    }
+
+    @BigSyncBackgroundActor
+    public func establishPostBarrierDrain(
+        quiescence token: CloudKitSynchronizer.PostBarrierOutboundQuiescence
+    ) async throws -> CloudKitSynchronizer.PostBarrierDrainAuthorization {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        let authorization = try await synchronizer.establishPostBarrierDrain(quiescence: token)
+        guard realmSynchronizer === synchronizer else {
+            synchronizer.revokePostBarrierDrainAuthorization(authorization)
+            synchronizer.abandonPostBarrierOutboundQuiescence(token)
+            throw CancellationError()
+        }
+        try Task.checkCancellation()
+        return authorization
+    }
+
+    /// This durable transport seal MUST precede the domain's reservation write.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func requirePostBarrierDrainRecoveryBeforeReservation(
+        _ completed: CloudKitSynchronizer.CompletedPostBarrierDrain
+    ) async throws -> BigSyncOutboundQuiescenceSnapshot {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        let checkpoint = try await synchronizer.requirePostBarrierDrainRecoveryBeforeReservation(completed)
+        guard realmSynchronizer === synchronizer else { throw CancellationError() }
+        try Task.checkCancellation()
+        return checkpoint
+    }
+
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func abortPostBarrierOutboundQuiescence(
+        _ token: CloudKitSynchronizer.PostBarrierOutboundQuiescence
+    ) throws -> Bool {
+        guard let synchronizer = realmSynchronizer else { return false }
+        return try synchronizer.abortPostBarrierOutboundQuiescence(token)
+    }
+
+    /// Abandonment drops live authority but leaves the durable fence closed.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func abandonPostBarrierOutboundQuiescence(
+        _ token: CloudKitSynchronizer.PostBarrierOutboundQuiescence
+    ) -> Bool {
+        guard let synchronizer = realmSynchronizer else { return false }
+        return synchronizer.abandonPostBarrierOutboundQuiescence(token)
+    }
+
+    @BigSyncBackgroundActor
+    public func outboundQuiescenceSnapshot() throws -> BigSyncOutboundQuiescenceSnapshot {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        return try synchronizer.outboundQuiescenceSnapshot()
+    }
+
+    @BigSyncBackgroundActor
+    public func resolvePostBarrierOutboundQuiescence(
+        _ token: CloudKitSynchronizer.PostBarrierOutboundQuiescence,
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        recoveryEvidenceID: String
+    ) throws {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        try synchronizer.resolvePostBarrierOutboundQuiescence(
+            token, expected: expected, recoveryEvidenceID: recoveryEvidenceID)
+    }
+
+    @BigSyncBackgroundActor
+    public func recoverOutboundQuiescence(
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        authorizingRecovery: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
+    ) async throws {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        try await synchronizer.recoverOutboundQuiescence(expected: expected) { @BigSyncBackgroundActor checkpoint in
+            guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
+            let evidence = try await authorizingRecovery(checkpoint)
+            // Unlike a post-return check, this prevents the displaced worker
+            // from durably reopening transport after a delayed domain proof.
+            guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
+            try Task.checkCancellation()
+            return evidence
+        }
+        guard realmSynchronizer === synchronizer else { throw CancellationError() }
+        try Task.checkCancellation()
     }
 
     /// Validates a terminal receipt after its run finished and exposes only the

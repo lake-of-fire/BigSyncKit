@@ -195,6 +195,7 @@ extension CloudKitSynchronizer {
             }
             try await revalidateRunContext(terminalContext)
             if publicationBlockers.isEmpty, let barrier = postBarrierDrainAuthorization {
+                try validatePostBarrierOutboundDrain(barrier)
                 guard barrier.accountScopeIdentifier == terminalContext.accountScopeIdentifier,
                       barrier.replicaBindingGenerationIdentifier == terminalContext.replicaBindingGenerationIdentifier,
                       let lease = try accountScopeLease(),
@@ -290,6 +291,15 @@ extension CloudKitSynchronizer {
             return
         }
 
+        do {
+            if let barrier = postBarrierDrainAuthorization {
+                try validatePostBarrierOutboundDrain(barrier)
+            }
+        } catch {
+            await failTerminalSynchronization(error: error, for: attemptID)
+            return
+        }
+
         // Only now authorize and publish the receipt. A notification observer
         // may request a fresh synchronization, so snapshot the result before
         // releasing run ownership.
@@ -377,6 +387,15 @@ extension CloudKitSynchronizer {
             return
         }
 #endif
+        do {
+            // Recheck after every terminal collaborator/checkpoint suspension.
+            if let barrier = postBarrierDrainAuthorization {
+                try validatePostBarrierOutboundDrain(barrier)
+            }
+        } catch {
+            await failTerminalSynchronization(error: error, for: attemptID)
+            return
+        }
         if let postBarrierDrainAuthorization,
            let consumedServerBoundaryIdentifier,
            let postBarrierSnapshotIdentifier,
@@ -397,8 +416,13 @@ extension CloudKitSynchronizer {
                 issuerID: synchronizationReceiptIssuerID,
                 receiptAuthorizationID: authorizationID,
                 postBarrierDrainAuthorizationID:
-                    postBarrierDrainAuthorization.authorizationID
+                    postBarrierDrainAuthorization.authorizationID,
+                outboundQuiescenceIdentifier:
+                    postBarrierDrainAuthorization.outboundQuiescenceIdentifier
             )
+            if postBarrierDrainAuthorization.outboundQuiescenceIdentifier != nil {
+                postBarrierOutboundLease?.sealFinalDrain()
+            }
             // The completed capability retains the exact authorization. A
             // future drain must be explicitly armed after its own barrier.
             self.postBarrierDrainAuthorization = nil

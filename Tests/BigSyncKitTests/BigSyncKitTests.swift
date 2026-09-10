@@ -9080,6 +9080,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.addModelAdapter(adapter)
 
         let oldUpload = Task { @BigSyncBackgroundActor in
+            try await prepareDirectOutboundAuthority(synchronizer)
             try await synchronizer.uploadRecordsIfNeeded(
                 adapter: adapter,
                 restrictedToEntityType: nil
@@ -9340,7 +9341,7 @@ final class BigSyncKitTests: XCTestCase {
         let synchronizer = makeSynchronizer(database: database)
         synchronizer.addModelAdapter(adapter)
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         XCTAssertTrue(adapter.events.contains("didDelete:Bookmark.missing"))
     }
@@ -9365,7 +9366,7 @@ final class BigSyncKitTests: XCTestCase {
         let synchronizer = makeSynchronizer(database: database)
         synchronizer.addModelAdapter(adapter)
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         XCTAssertTrue(adapter.events.contains("save:Bookmark"))
         XCTAssertTrue(adapter.events.contains("persist"))
@@ -9399,7 +9400,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.addModelAdapter(adapter)
 
         do {
-            try await synchronizer.synchronizeAdapter(adapter)
+            try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
             XCTFail("Expected the repeated deletion conflict retry ceiling")
         } catch let error as CKError {
             XCTAssertEqual(error.code, .partialFailure)
@@ -9440,7 +9441,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.addModelAdapter(adapter)
 
         do {
-            try await synchronizer.synchronizeAdapter(adapter)
+            try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
             XCTFail("Expected the unresolved per-record failure to propagate")
         } catch {
             XCTAssertTrue(
@@ -9485,7 +9486,7 @@ final class BigSyncKitTests: XCTestCase {
         let synchronizer = makeSynchronizer(database: database)
         synchronizer.addModelAdapter(adapter)
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         XCTAssertTrue(adapter.events.contains("save:Bookmark"))
         XCTAssertTrue(adapter.events.contains("persist"))
@@ -9528,7 +9529,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.addModelAdapter(adapter)
 
         do {
-            try await synchronizer.synchronizeAdapter(adapter)
+            try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
             XCTFail("Expected the repeated conflict retry ceiling")
         } catch let error as CKError {
             XCTAssertEqual(error.code, .partialFailure)
@@ -9806,7 +9807,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.batchSize = 1
         synchronizer.addModelAdapter(adapter)
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         XCTAssertEqual(synchronizer.batchSize, 2)
         XCTAssertEqual(database.modifyRecordsOperationCount, 1)
@@ -9945,7 +9946,7 @@ final class BigSyncKitTests: XCTestCase {
         processor.addFetchedChangeRequest(ChangeRequest(downloadedRecord: nil, deletedRecordID: CKRecord.ID(recordName: "HistoryRecord.2", zoneID: zoneID), adapter: adapter))
         processor.addFetchedChangeRequest(ChangeRequest(downloadedRecord: makeRecord(type: "Bookmark", id: "3", zoneID: zoneID), deletedRecordID: nil, adapter: adapter))
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         XCTAssertEqual(
             adapter.events.filter { $0.hasPrefix("save:") || $0.hasPrefix("deleteRemote:") },
@@ -9971,7 +9972,7 @@ final class BigSyncKitTests: XCTestCase {
         processor.clearErrors()
         processor.addFetchedChangeRequest(ChangeRequest(downloadedRecord: nil, deletedRecordID: CKRecord.ID(recordName: "Bookmark.1", zoneID: zoneID), adapter: adapter))
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         let deleteIndex = try XCTUnwrap(adapter.events.firstIndex(of: "deleteRemote:Bookmark.1"))
         let lowerPriorityUploadIndex = try XCTUnwrap(adapter.events.firstIndex(of: "recordsToUpload:HistoryRecord"))
@@ -10001,7 +10002,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.batchSize = 1
         synchronizer.addModelAdapter(adapter)
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         let uploads = adapter.events.filter { $0.hasPrefix("didUpload:") }
         XCTAssertEqual(uploads, [
@@ -10032,7 +10033,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.batchSize = 1
         synchronizer.addModelAdapter(adapter)
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         let deletions = adapter.events.filter { $0.hasPrefix("didDelete:") }
         XCTAssertEqual(deletions, [
@@ -10056,7 +10057,7 @@ final class BigSyncKitTests: XCTestCase {
         processor.clearErrors()
         processor.addFetchedChangeRequest(ChangeRequest(downloadedRecord: makeRecord(type: "HistoryRecord", id: "1", zoneID: zoneID), deletedRecordID: nil, adapter: adapter))
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         XCTAssertFalse(adapter.events.contains("save:Bookmark"))
         XCTAssertTrue(adapter.events.contains("save:HistoryRecord"))
@@ -10118,7 +10119,7 @@ final class BigSyncKitTests: XCTestCase {
             )
         }
 
-        try await synchronizer.synchronizeAdapter(adapter)
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
 
         XCTAssertEqual(adapter.savedBatchSizes, [250])
         XCTAssertEqual(adapter.events.filter { $0 == "persist" }.count, 1)
@@ -16112,6 +16113,33 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    /// Lower-level adapter tests bypass the full drain. Establish its real
+    /// account lease plus a test run identity before entering the now-fenced
+    /// outbound phase; never bypass the production gate or forge a receipt.
+    @BigSyncBackgroundActor
+    private func prepareDirectOutboundAuthority(_ synchronizer: CloudKitSynchronizer) async throws {
+        guard synchronizer.activeRunContext == nil else { return }
+        try await synchronizer._test_validateSynchronizationAccount()
+        let account = try XCTUnwrap(synchronizer.keyValueStore.object(
+            forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier")) as? String)
+        let lease = try XCTUnwrap(synchronizer.accountScopeLease())
+        synchronizer.activeRunContext = .init(
+            attemptID: synchronizer.synchronizationAttemptID,
+            runID: synchronizer.synchronizationRunID,
+            accountIdentifier: account, accountScopeIdentifier: lease.accountScopeIdentifier,
+            replicaBindingGenerationIdentifier: try synchronizer.activeReplicaBindingGenerationIdentifierForRun(
+                accountScopeIdentifier: lease.accountScopeIdentifier),
+            accountInvalidationGeneration: lease.invalidationGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    private func synchronizeAdapterWithOutboundAuthority(
+        _ synchronizer: CloudKitSynchronizer, _ adapter: ModelAdapter
+    ) async throws {
+        try await prepareDirectOutboundAuthority(synchronizer)
+        try await synchronizer.synchronizeAdapter(adapter)
+    }
+
     @BigSyncBackgroundActor
     private func makeSynchronizer(
         database: CloudKitDatabaseAdapter = FakeCloudKitDatabase(),
@@ -17910,7 +17938,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.addModelAdapter(fixture.adapter)
 
         do {
-            try await synchronizer.synchronizeAdapter(fixture.adapter)
+            try await synchronizeAdapterWithOutboundAuthority(synchronizer, fixture.adapter)
             XCTFail("Expected unresolved per-record delete failure")
         } catch let error as CKError {
             XCTAssertEqual(error.code, .partialFailure)
@@ -18101,7 +18129,7 @@ final class BigSyncKitTests: XCTestCase {
         let synchronizer = makeSynchronizer(database: database)
         synchronizer.addModelAdapter(fixture.adapter)
         do {
-            try await synchronizer.synchronizeAdapter(fixture.adapter)
+            try await synchronizeAdapterWithOutboundAuthority(synchronizer, fixture.adapter)
             XCTFail("A success value for B under A's result key must not acknowledge B")
         } catch let error as CKError {
             XCTAssertEqual(error.code, .partialFailure)
@@ -18139,7 +18167,7 @@ final class BigSyncKitTests: XCTestCase {
             let synchronizer = makeSynchronizer(database: database)
             synchronizer.addModelAdapter(adapter)
             do {
-                try await synchronizer.synchronizeAdapter(adapter)
+                try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
                 XCTFail("Mismatched successful result must fail its own item")
             } catch let error as CKError { XCTAssertEqual(error.code, .partialFailure) }
             XCTAssertEqual(adapter.events.filter { $0.hasPrefix("didUpload:") },
@@ -18166,7 +18194,7 @@ final class BigSyncKitTests: XCTestCase {
             let synchronizer = makeSynchronizer(database: database)
             synchronizer.addModelAdapter(adapter)
             do {
-                try await synchronizer.synchronizeAdapter(adapter)
+                try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
                 XCTFail("A conflict record must identify the item that failed")
             } catch let error as CKError { XCTAssertEqual(error.code, .partialFailure) }
             XCTAssertFalse(adapter.events.contains { $0.hasPrefix("save:") })
@@ -18193,7 +18221,7 @@ final class BigSyncKitTests: XCTestCase {
             let synchronizer = makeSynchronizer(database: database)
             synchronizer.addModelAdapter(adapter)
             do {
-                try await synchronizer.synchronizeAdapter(adapter)
+                try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
                 XCTFail("An unrelated conflict must not enter deletion metadata rebase")
             } catch let error as CKError { XCTAssertEqual(error.code, .partialFailure) }
             XCTAssertFalse(adapter.events.contains { $0.hasPrefix("save:") })
@@ -18218,7 +18246,7 @@ final class BigSyncKitTests: XCTestCase {
                 let synchronizer = makeSynchronizer(database: database)
                 synchronizer.addModelAdapter(adapter)
                 do {
-                    try await synchronizer.synchronizeAdapter(adapter)
+                    try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
                     XCTFail("A name-keyed generation map cannot represent this batch")
                 } catch {
                     XCTAssertEqual(error as? BigSyncRecordMutationIdentityError, .invalidPreparedBatch)
@@ -18588,4 +18616,47 @@ final class BigSyncKitTests: XCTestCase {
         }
     }
 
+}
+
+extension BigSyncKitTests {
+    @BigSyncBackgroundActor
+    func testOutboundLeaseDoesNotAcknowledgeANewerRealmJournalGeneration() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gate = BigSyncOutboundQuiescenceCoordinator(sharedStateBaseURL: directory, durableStateNamespace: "generation-test")
+        let principal = BigSyncOutboundPrincipal(durableStateNamespace: "generation-test", installationIdentifier: "installation",
+            accountScopeIdentifier: "account", replicaBindingGenerationIdentifier: "binding", accountInvalidationGeneration: 1)
+        let object = BigSyncTrackedObject(id: "leased-generation", createdAt: Date(), modifiedAt: Date(), explicitlyModifiedAt: nil)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        var batch: BigSyncOutboundBatchLease? = try gate.admit(principal: principal)
+        let prepared = try await fixture.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let first = try XCTUnwrap(prepared.first)
+        let name = first.record.recordID.recordName
+        let olderGeneration = try XCTUnwrap(first.generation)
+        let owner = try gate.begin(principal: principal, writerBarrierEvidenceID: "test-barrier")
+        // Deliberately violate domain writer quiescence to verify transport
+        // acknowledgement never clears a newer generation even in that case.
+        try await fixture.targetRealm.asyncWrite {
+            object.tags.append("newer-edit")
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let newerGeneration = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation)
+        XCTAssertNotEqual(olderGeneration, newerGeneration)
+        try batch?.willSubmit()
+        try batch?.didSettle()
+        try await fixture.adapter.didUpload(savedRecords: [first.record], matchingGenerations: [name: olderGeneration])
+        XCTAssertEqual(fixture.targetRealm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, newerGeneration)
+        XCTAssertThrowsError(try gate.validateDrained(owner, principal: principal))
+        batch = nil
+        try await gate.waitUntilDrained(owner)
+        // Physical transport quiescence is not an empty-journal certificate.
+        XCTAssertTrue(try fixture.adapter.hasPendingChangesAtTerminalBoundary())
+        try gate.abort(owner)
+    }
 }

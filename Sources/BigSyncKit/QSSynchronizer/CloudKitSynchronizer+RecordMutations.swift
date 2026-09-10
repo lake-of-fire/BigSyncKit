@@ -123,6 +123,10 @@ extension CloudKitSynchronizer {
         var retryBudget = HandledMutationRetryBudget()
         while true {
             try checkSynchronizationAttempt(attemptID)
+            let outbound = try await admitOutboundBatch(for: attemptID)
+            // Cancellation of an orchestration waiter must not drop the lease
+            // before this actual transport/callback scope has unwound.
+            defer { withExtendedLifetime(outbound) {} }
             let requestedBatchSize = batchSize
             let prepared = try await adapter.preparedRecordsToUpload(
                 limit: requestedBatchSize,
@@ -149,15 +153,11 @@ extension CloudKitSynchronizer {
             }
 
             addMetadata(to: records)
-            try await revalidateActiveRunContext(for: attemptID)
-            let mutationResults = try await recordStore.modifyRecords(
-                saving: records,
-                deleting: [],
-                savePolicy: .ifServerRecordUnchanged,
-                atomically: false
-            )
+            try await revalidateOutboundBatch(outbound, for: attemptID)
+            let mutationResults = try await modifyRecordsHoldingOutboundLease(
+                outbound, attemptID: attemptID, saving: records, deleting: [])
             try Task.checkCancellation()
-            try await revalidateActiveRunContext(for: attemptID)
+            try await revalidateOutboundBatch(outbound, for: attemptID)
 
             var savedRecords = [CKRecord]()
             var missingRecordIDs = Set<CKRecord.ID>()
@@ -235,14 +235,14 @@ extension CloudKitSynchronizer {
                     savedRecords: savedRecords,
                     matchingGenerations: generations
                 )
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateOutboundBatch(outbound, for: attemptID)
             }
             if !missingRecordIDs.isEmpty {
                 try await adapter.requeueMissingServerRecords(
                     Array(missingRecordIDs),
                     matchingPreparedGenerations: generations
                 )
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateOutboundBatch(outbound, for: attemptID)
             }
             if !conflictedRecordsByID.isEmpty {
                 let conflictedRecords = Array(conflictedRecordsByID.values)
@@ -257,9 +257,9 @@ extension CloudKitSynchronizer {
                     results,
                     records: conflictedRecords
                 )
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateOutboundBatch(outbound, for: attemptID)
                 try await adapter.persistImportedChanges()
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateOutboundBatch(outbound, for: attemptID)
             }
 
             guard unresolvedFailures.isEmpty else {
@@ -312,6 +312,10 @@ extension CloudKitSynchronizer {
         var retryBudget = HandledMutationRetryBudget()
         while true {
             try checkSynchronizationAttempt(attemptID)
+            let outbound = try await admitOutboundBatch(for: attemptID)
+            // Cancellation of an orchestration waiter must not drop the lease
+            // before this actual transport/callback scope has unwound.
+            defer { withExtendedLifetime(outbound) {} }
             let requestedBatchSize = batchSize
             let prepared = try await adapter.preparedRecordDeletions(
                 limit: requestedBatchSize,
@@ -326,15 +330,11 @@ extension CloudKitSynchronizer {
                 guard let generation = $1.generation else { return }
                 $0[$1.recordID.recordName] = generation
             }
-            try await revalidateActiveRunContext(for: attemptID)
-            let mutationResults = try await recordStore.modifyRecords(
-                saving: [],
-                deleting: recordIDs,
-                savePolicy: .ifServerRecordUnchanged,
-                atomically: false
-            )
+            try await revalidateOutboundBatch(outbound, for: attemptID)
+            let mutationResults = try await modifyRecordsHoldingOutboundLease(
+                outbound, attemptID: attemptID, saving: [], deleting: recordIDs)
             try Task.checkCancellation()
-            try await revalidateActiveRunContext(for: attemptID)
+            try await revalidateOutboundBatch(outbound, for: attemptID)
 
             var acknowledged = [CKRecord.ID]()
             var conflictedRecordsByID = [CKRecord.ID: CKRecord]()
@@ -397,7 +397,7 @@ extension CloudKitSynchronizer {
                     recordIDs: acknowledged,
                     matchingGenerations: generations
                 )
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateOutboundBatch(outbound, for: attemptID)
             }
             if !conflictedRecordsByID.isEmpty {
                 // Rebase only server system fields before retrying the local
@@ -408,7 +408,7 @@ extension CloudKitSynchronizer {
                     using: Array(conflictedRecordsByID.values),
                     matchingPreparedGenerations: generations
                 )
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateOutboundBatch(outbound, for: attemptID)
             }
             guard unresolvedFailures.isEmpty else {
                 if unresolvedFailures.values.contains(where: {

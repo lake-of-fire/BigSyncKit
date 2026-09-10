@@ -607,14 +607,19 @@ public class CloudKitSynchronizer: NSObject {
         let accountIdentifier: String
         let accountScopeIdentifier: String
         let replicaBindingGenerationIdentifier: String?
+        /// Captured before the run's first suspension after account validation.
+        /// Nil is reserved for non-upload recovery contexts/older test fixtures.
+        let accountInvalidationGeneration: Int64?
 
         init(
             attemptID: UUID,
             runID: UUID,
             accountIdentifier: String,
             accountScopeIdentifier: String,
-            replicaBindingGenerationIdentifier: String? = nil
+            replicaBindingGenerationIdentifier: String? = nil,
+            accountInvalidationGeneration: Int64? = nil
         ) {
+            self.accountInvalidationGeneration = accountInvalidationGeneration
             self.attemptID = attemptID
             self.runID = runID
             self.accountIdentifier = accountIdentifier
@@ -675,6 +680,9 @@ public class CloudKitSynchronizer: NSObject {
         internal let accountScopeIdentifier: String
         internal let replicaBindingGenerationIdentifier: String
         internal let accountInvalidationGeneration: Int64
+        /// Nil means the legacy, externally-established upload-barrier API.
+        /// Production cutoff consumers must require a non-nil identifier.
+        public internal(set) var outboundQuiescenceIdentifier: UUID? = nil
     }
 
     /// A successful, terminal receipt bound to a post-barrier authorization.
@@ -692,6 +700,7 @@ public class CloudKitSynchronizer: NSObject {
         internal let issuerID: UUID
         internal let receiptAuthorizationID: UUID
         internal let postBarrierDrainAuthorizationID: UUID
+        public internal(set) var outboundQuiescenceIdentifier: UUID? = nil
     }
 
     public struct SynchronizationResult: Sendable, Equatable {
@@ -821,7 +830,7 @@ public class CloudKitSynchronizer: NSObject {
     internal var postBarrierSnapshotIdentifierProvider: DomainPublicationScopeIdentifierProvider?
     internal var domainPublicationScopeIdentifierProvider:
         DomainPublicationScopeIdentifierProvider?
-    private let backupDetectionBaseURL: URL?
+    internal let backupDetectionBaseURL: URL?
     private var allowsDisposableZoneDeletion: Bool
     /// Page-oriented history transport. A non-default database adapter must
     /// inject this explicitly; callback fetch operations are intentionally not
@@ -939,7 +948,7 @@ public class CloudKitSynchronizer: NSObject {
         durableStateKey("AccountScopeLease.v1")
     }
 
-    private var replicaBindingStateKey: String {
+    internal var replicaBindingStateKey: String {
         durableStateKey("ReplicaBinding.v1")
     }
 
@@ -1045,6 +1054,10 @@ public class CloudKitSynchronizer: NSObject {
     private var reservedReceiptAuthorizationID: UUID?
     internal var postBarrierDrainAuthorization: PostBarrierDrainAuthorization?
     internal var completedPostBarrierDrain: CompletedPostBarrierDrain?
+    internal var postBarrierOutboundLease: BigSyncOutboundQuiescenceLease?
+    internal var postBarrierOutboundTicket: PostBarrierOutboundQuiescence?
+    internal var postBarrierOutboundEstablishmentID: UUID?
+    internal var outboundRecoveryID: UUID?
     /// Non-nil only for the attempt currently performing the durable
     /// change-feed migration.  Adapter state remains the source of truth for
     /// per-zone provenance; this value merely fences the orchestration.
@@ -1678,6 +1691,10 @@ public class CloudKitSynchronizer: NSObject {
                         for: accountIdentifier
                     )
                 )
+                guard let validatedLease = try readAccountScopeLeaseDurably().lease,
+                      validatedLease.accountScopeIdentifier == Self.accountScopeIdentifier(for: accountIdentifier) else {
+                    throw BigSyncAccountScopeLeaseError.unavailable
+                }
                 let runID = await changeRequestProcessor.beginRun()
                 synchronizationRunID = runID
                 let context = RunContext(
@@ -1688,7 +1705,8 @@ public class CloudKitSynchronizer: NSObject {
                         for: accountIdentifier
                     ),
                     replicaBindingGenerationIdentifier:
-                        replicaBindingGenerationIdentifier
+                        replicaBindingGenerationIdentifier,
+                    accountInvalidationGeneration: validatedLease.invalidationGeneration
                 )
                 activeRunContext = context
                 for adapter in modelAdapters {
@@ -1841,7 +1859,10 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     /// Arms the next successful terminal drain after an operator has
-    /// established writer/upload quiescence. It deliberately refuses an
+    /// established writer/upload quiescence outside BigSyncKit. This legacy
+    /// API does NOT prove cross-process quiescence; production cutoff callers
+    /// must use beginPostBarrierOutboundQuiescence followed by
+    /// establishPostBarrierDrain(quiescence:). It deliberately refuses an
     /// already-running drain, so a receipt from work that began before the
     /// barrier can never be relabelled as post-barrier evidence.
     @BigSyncBackgroundActor
@@ -1862,6 +1883,11 @@ public class CloudKitSynchronizer: NSObject {
               binding.pendingPort == nil,
               binding.activeAccountScopeIdentifier == lease.accountScopeIdentifier,
               !binding.activeGenerationIdentifier.isEmpty else { throw CancellationError() }
+        // The legacy API cannot borrow another request's in-progress fence.
+        // Use establishPostBarrierDrain(quiescence:) for library-owned cutoff.
+        guard postBarrierOutboundLease == nil else {
+            throw BigSyncOutboundQuiescenceError.blocked
+        }
         let authorization = PostBarrierDrainAuthorization(
             writerBarrierEvidenceID: writerBarrierEvidenceID,
             issuerID: synchronizationReceiptIssuerID, authorizationID: UUID(),
@@ -1884,6 +1910,11 @@ public class CloudKitSynchronizer: NSObject {
     ) -> Bool {
         guard authorization.issuerID == synchronizationReceiptIssuerID else { return false }
         var revoked = false
+        if let identifier = authorization.outboundQuiescenceIdentifier,
+           postBarrierOutboundTicket?.identifier == identifier {
+            // Revocation must not reopen peers or release an in-flight batch.
+            postBarrierOutboundLease?.sealFinalDrain()
+        }
         if postBarrierDrainAuthorization == authorization {
             postBarrierDrainAuthorization = nil
             revoked = true
@@ -1955,6 +1986,9 @@ public class CloudKitSynchronizer: NSObject {
             throw CancellationError()
         }
         try checkRunContext(activeRunContext)
+        if let quiescenceID = completed.outboundQuiescenceIdentifier {
+            try validatePostBarrierOutboundPrincipal(identifier: quiescenceID)
+        }
     }
 
     /// Revalidates a completed post-barrier capability around an application
@@ -2005,6 +2039,13 @@ public class CloudKitSynchronizer: NSObject {
               !accountScopeAuthorityFence.requiresGenerationRotation,
               !cancelSync else {
             throw CancellationError()
+        }
+        if let expectedGeneration = context.accountInvalidationGeneration {
+            guard let lease = try readAccountScopeLeaseDurably().lease,
+                  lease.accountScopeIdentifier == context.accountScopeIdentifier,
+                  lease.invalidationGeneration == expectedGeneration else {
+                throw CancellationError()
+            }
         }
         if let expectedBinding =
             context.replicaBindingGenerationIdentifier {
@@ -2844,6 +2885,21 @@ public class CloudKitSynchronizer: NSObject {
         return try readAccountScopeLeaseDurably().lease
     }
 
+    /// A normal, validated transport run may finish server-first restore
+    /// reconciliation while the public domain-writer lease is still withheld.
+    /// This never grants a cutoff/writer capability and does not bypass account,
+    /// installation, binding, invalidation-epoch or durable-state validation.
+    internal func outboundAccountScopeLease(for context: RunContext) throws -> BigSyncAccountScopeLease {
+        try checkRunContext(context)
+        guard !accountScopeAuthorityFence.rejectsAuthority, !accountValidationRequired,
+              backupDetectionError == nil,
+              let lease = try readAccountScopeLeaseDurably().lease,
+              lease.accountScopeIdentifier == context.accountScopeIdentifier else {
+            throw BigSyncAccountScopeLeaseError.unavailable
+        }
+        return lease
+    }
+
     /// Revalidates a captured lease after suspension. Domain writers should
     /// also mirror this epoch into their local Realm and compare it inside the
     /// final non-suspending write transaction.
@@ -3431,6 +3487,10 @@ public class CloudKitSynchronizer: NSObject {
         reservedReceiptAuthorizationID = nil
         completedPostBarrierDrain = nil
         postBarrierDrainAuthorization = nil
+        postBarrierOutboundEstablishmentID = nil
+        postBarrierOutboundLease?.sealFinalDrain()
+        // Cancellation drops receipt authority, never the durable cutoff.
+        // Actual batch scopes retain OS ownership until they really unwind.
         changeRequestProcessor.reset()
         synchronizationTask?.cancel()
         synchronizationTask = nil
