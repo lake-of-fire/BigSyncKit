@@ -1,0 +1,31 @@
+name: Retarget long-lived publication
+
+on:
+  push:
+    branches:
+      - codex/bigsync-recovery-descriptor-20260910
+    paths:
+      - .github/workflows/bump-long-lived-target.yml
+
+permissions:
+  contents: write
+
+jobs:
+  retarget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bigsync-recovery-descriptor-20260910
+      - name: Retarget only if prior guarded source is an ancestor
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=.github/workflows/codex-publish-recovery-descriptor.yml
+          grep -q 'EXPECTED_HEAD: c22ab31ee74b72eebaac56b655d5bfe2509b091b' "$target"
+          sed -i 's/EXPECTED_HEAD: c22ab31ee74b72eebaac56b655d5bfe2509b091b/EXPECTED_HEAD: a9a466a349ad1eda6ae1fc3027b4002dae042810/' "$target"
+          git config user.name 'Alex Ehlke'
+          git config user.email 'alex.ehlke@gmail.com'
+          git add "$target"
+          git commit -m 'Retarget guarded long-lived transport publication'
+          git push origin HEAD:codex/bigsync-recovery-descriptor-20260910
