@@ -1,0 +1,56 @@
+name: Publish rebased long-lived outbound recovery
+
+on:
+  push:
+    branches:
+      - codex/bigsync-long-lived-publish2-20260910
+    paths:
+      - .github/workflows/codex-publish-long-lived-outbound-recovery.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
+      EXPECTED_HEAD: 6bff3c144c1d24958d6ba446d4ea27c9ca9180de
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+      - name: Guard and load staged transform
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)" = "$EXPECTED_HEAD"
+          git fetch origin codex/bigsync-long-lived-publish-20260910
+          git show FETCH_HEAD:Tools/apply-long-lived-outbound-recovery.py > /tmp/apply.py
+      - name: Apply and inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/apply.py
+          git grep -n 'configuration.isLongLived = longLived' -- Sources/BigSyncKit/QSSynchronizer/CloudKitRecordStore.swift
+          git grep -n 'transportIdentity: preparedTransport?.transportIdentity' -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift
+          git grep -n 'container: container' -- Sources/BigSyncKit/RealmSwift/QSCloudKitSynchronizer+RealmSwift.swift
+          git diff --check
+          git diff --stat
+      - name: Commit guarded fast-forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)" = "$EXPECTED_HEAD"
+          git config user.name 'Alex Ehlke'
+          git config user.email 'alex.ehlke@gmail.com'
+          git add Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitRecordStore.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitDatabase.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift \
+                  Sources/BigSyncKit/RealmSwift/QSCloudKitSynchronizer+RealmSwift.swift
+          git commit -m 'Bind uncertainty to long-lived CloudKit operations [skip ci]'
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
