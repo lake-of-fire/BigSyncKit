@@ -1,0 +1,76 @@
+name: Deep transport review
+on:
+  push:
+    branches: [audit/transport-deep-review-20260910]
+    paths: [.github/workflows/transport-deep-review.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export exact source for review
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          git branch review-source e73a7adc759ee25992dd8ed43129eabf2127b478
+          git bundle create evidence/source.bundle review-source
+          git archive --format=tar.gz review-source > evidence/source.tar.gz
+          git show origin/codex/worker1-transport-publish-20260910:.worker1-publish/apply-source-publication-restart-gap.py > evidence/staged-restart.py
+          git rev-parse review-source review-source^{tree} > evidence/source.txt
+          sha256sum evidence/* > evidence/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deep-transport-source
+          path: evidence
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e73a7adc759ee25992dd8ed43129eabf2127b478
+          path: source/BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 3c0ccf00d734cae997bd34654a4f2efd01397531
+          path: source/RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: source/SwiftUtilities
+          persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3'
+      - name: Execute native package coverage with injected transports
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          EVIDENCE="$PWD/evidence"
+          cd source/BigSyncKit
+          git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/source.txt"
+          swift --version > "$EVIDENCE/swift.txt"
+          set +e
+          swift test -j 4 --filter 'CloudKitTerminalReceiptTests|BigSyncOutboundQuiescenceTests|CloudKitOutboundSettlementTests|CloudKitCursorPersistenceTests|CloudKitSynchronizerAccountFencingTests|AccountAuthorityPersistenceTests|ChangeFeedRecoveryStateTests|CloudKitAccountAvailabilityGateTests|BigSyncRecordIdentityBoundaryTests' > "$EVIDENCE/native.log" 2>&1
+          result=$?
+          set -e
+          cp Package.resolved "$EVIDENCE/Package.resolved"
+          echo "$result" > "$EVIDENCE/exit.txt"
+          tail -80 "$EVIDENCE/native.log"
+          exit "$result"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deep-transport-native-baseline
+          path: evidence
+          retention-days: 30
