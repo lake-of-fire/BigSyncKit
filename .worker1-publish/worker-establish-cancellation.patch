@@ -1,0 +1,19 @@
+diff --git a/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift b/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
+--- a/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
++++ b/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
+@@ -681,7 +681,12 @@ public actor BigSyncBackgroundActor {
+             synchronizer.abandonPostBarrierOutboundQuiescence(token)
+             throw CancellationError()
+         }
+-        try Task.checkCancellation()
++        do {
++            try Task.checkCancellation()
++        } catch {
++            // The caller did not receive this capability. Do not leave the
++            // owner-only final drain armed merely because cancellation landed
++            // after the synchronizer finished establishment.
++            synchronizer.revokePostBarrierDrainAuthorization(authorization)
++            throw error
++        }
+         return authorization
+     }
