@@ -52,26 +52,46 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
+      # BigSync's Package.swift intentionally uses sibling local packages.
+      # Recreate that source layout rather than editing the package for CI.
       - uses: actions/checkout@v4
-        with: { persist-credentials: false }
+        with:
+          persist-credentials: false
+          path: BigSyncKit
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          path: SwiftUtilities
+          persist-credentials: false
       - name: Select Xcode and capture identity
+        working-directory: BigSyncKit
         run: |
           if [ -d /Applications/Xcode_26.3.app ]; then sudo xcode-select -s /Applications/Xcode_26.3.app; fi
           mkdir -p "$RUNNER_TEMP/native-review"
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/native-review/identity.txt"
+          git -C ../RealmSwiftGaps rev-parse HEAD > "$RUNNER_TEMP/native-review/realm-swift-gaps.txt"
+          git -C ../SwiftUtilities rev-parse HEAD > "$RUNNER_TEMP/native-review/swift-utilities.txt"
           swift --version > "$RUNNER_TEMP/native-review/toolchain.txt"
           xcodebuild -version >> "$RUNNER_TEMP/native-review/toolchain.txt"
       - name: Native outbound gate suite
+        working-directory: BigSyncKit
         shell: bash
         run: |
           set -o pipefail
           swift test --filter BigSyncOutboundQuiescenceTests 2>&1 | tee "$RUNNER_TEMP/native-review/quiescence.log"
       - name: Native terminal receipt suite
+        working-directory: BigSyncKit
         shell: bash
         run: |
           set -o pipefail
           swift test --filter CloudKitTerminalReceiptTests 2>&1 | tee "$RUNNER_TEMP/native-review/receipts.log"
       - name: Native settlement and account fencing suites
+        working-directory: BigSyncKit
         shell: bash
         run: |
           set -o pipefail
