@@ -1,62 +1,13 @@
-name: Worker 1 worker recovery ownership publish
+name: Worker 1 staging (dormant)
 
 on:
-  push:
-    branches:
-      - codex/worker1-transport-publish-20260910
+  workflow_dispatch:
 
 permissions:
-  contents: write
-
-concurrency:
-  group: worker1-recovery-ownership-pr8
-  cancel-in-progress: true
+  contents: read
 
 jobs:
-  publish:
-    if: github.repository == 'lake-of-fire/BigSyncKit'
+  dormant:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Verify worker recovery ownership and fast-forward PR 8
-        shell: bash
-        env:
-          BASE: 4d33bce325e68b5e2c3b61317e3a42dee61064a9
-          BASE_TREE: 7508f0ff846c4011dbfc7b5d3a6fab74d713b383
-          TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
-          SCRIPT_BLOB: 26ef306e8eac6d994647062777b9a5341b7791f0
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
-          test "$(git hash-object .worker1-publish/apply-worker-recovery-fixes.py)" = "$SCRIPT_BLOB"
-          cp .worker1-publish/apply-worker-recovery-fixes.py /tmp/apply.py
-          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
-          test "$current" = "$BASE"
-          git checkout --detach "$BASE"
-          python3 /tmp/apply.py
-          git diff --check
-          changed="$(git diff --name-only | sort)"
-          expected="$(printf '%s\n%s' \
-            'Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift' \
-            'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift' | sort)"
-          test "$changed" = "$expected"
-          swiftc -frontend -parse Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
-          swiftc -frontend -parse Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift
-          Tools/run-outbound-quiescence-portable-tests.sh
-          Tools/run-outbound-quiescence-process-tests.sh
-          git add -A
-          tree="$(git write-tree)"
-          export GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
-          export GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
-          commit="$(printf '%s\n\n%s\n' \
-            'Fence worker ownership through final recovery suspension' \
-            'Revoke a post-barrier authorization if caller cancellation lands after establishment but before delivery, and carry the background-worker ownership check through every recovery suspension so a displaced synchronizer cannot reopen the durable outbound gate after the final account lookup.' \
-            | git commit-tree "$tree" -p "$BASE")"
-          test "$(git rev-parse "$commit^")" = "$BASE"
-          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
-          test "$current" = "$BASE"
-          git push origin "$commit:refs/heads/$TARGET_BRANCH"
-          echo "PUBLISHED_COMMIT=$commit"
-          echo "PUBLISHED_TREE=$tree"
+      - run: echo "Staging branch is dormant between guarded publications."
