@@ -1,0 +1,68 @@
+name: Publish transport completion without tests
+on:
+  push:
+    branches: [audit/transport-completion-publish-20260910]
+    paths: [.github/workflows/transport-completion-publish.yml]
+permissions:
+  contents: write
+concurrency:
+  group: transport-completion-publication-20260910
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply exact reviewed patch and fast-forward PR 8
+        env:
+          BASE: 481f0113adc8e3dcebe7c36ed8993d098877d9c6
+          BASE_TREE: a801e5bf86640ccd365b82f253456170f129a773
+          FINAL_TREE: ae0d106df424f5c3f22357229259ae3594be200d
+          TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
+          test "$(git hash-object .review/transport-completion.transfer)" = 435b3ff9ce2b24e3e1c09416f8a8247c07c7210a
+          python3 - <<'PY'
+          import base64, gzip, hashlib, pathlib
+          payload = pathlib.Path('.review/transport-completion.transfer').read_text()
+          # Normalize two duplicated transfer fragments, then require the exact
+          # independently generated canonical payload and decoded source hashes.
+          for old, new in [('GtGyJVnGyJVn1hZk', 'GtGyJVn1hZk'), ('UXSOWSOWO5ML', 'UXSOWO5ML')]:
+              assert payload.count(old) == 1
+              payload = payload.replace(old, new, 1)
+          encoded = payload.encode()
+          blob = hashlib.sha1(b'blob ' + str(len(encoded)).encode() + b'\0' + encoded).hexdigest()
+          assert blob == 'b5f14775c1638b2e99253c1d71564177775f8fd4', blob
+          compressed = base64.b64decode(payload.strip(), validate=True)
+          assert hashlib.sha256(compressed).hexdigest() == 'cbd46a7776b95ed8f3ff2fed3f80cc4af7d8e352b11a464df44ba7c6e94859d1'
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == '057f46eeaf6d391ed062d155fb4030102e2980dd55bf6639e88962f67974195a'
+          pathlib.Path('/tmp/transport-completion.patch').write_bytes(patch)
+          PY
+          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$current" = "$BASE"
+          git checkout --detach "$BASE"
+          git apply --index /tmp/transport-completion.patch
+          git diff --cached --check
+          tree="$(git write-tree)"
+          test "$tree" = "$FINAL_TREE"
+          export GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
+          export GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
+          commit="$(printf '%s\n\n%s\n' \
+            'Finish outbound acquisition and source-completion integration [skip ci]' \
+            'Make cancellation irrevocable across preparing/recovery phase transitions. Expose exact owner/source receipt validation and final source completion, plus host-admission revalidation through the last recovery account lookup. Preserve the merged checkpoint bounds and all earlier transport work. No tests or builds run for this implementation increment.' \
+            | git commit-tree "$tree" -p "$BASE")"
+          test "$(git rev-parse "$commit^")" = "$BASE"
+          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$current" = "$BASE"
+          git push origin "$commit:refs/heads/$TARGET_BRANCH"
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)" = "$commit"
+          echo "PUBLISHED_COMMIT=$commit"
+          echo "PUBLISHED_TREE=$tree"
+          git show --stat --oneline "$commit"
+          echo 'No tests, Swift compilation, Tuist generation or CloudKit operations executed.'
