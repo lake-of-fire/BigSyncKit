@@ -17,7 +17,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected=69b5e4ea1d37b64a3b3bc1a1c04fd0b7ab962cd8
+          expected=4489cbe29964f23e1b0f026b725bf48534b13091
           test "$(git rev-parse HEAD)" = "$expected"
           python3 - <<'PY'
           from pathlib import Path
