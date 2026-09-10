@@ -33,53 +33,51 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '26.3'
-      - name: Reproduce regressions and qualify exact refinement
+      - name: Qualify exact source and fast-forward PR 8
         env:
           BASE: e73a7adc759ee25992dd8ed43129eabf2127b478
           BASE_TREE: 3c7ae540e566e116ba195a881700126a2f785e28
-          FINAL_TREE: 5631cb2be3569a5f70108e8576d643b7f213c133
+          FINAL_TREE: 04f01caed422e53e033c2bea21355be40d287774
           TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
         run: |
           set -euo pipefail
           mkdir evidence
           EVIDENCE="$PWD/evidence"
-          cat review/.review/deep-patch.1 review/.review/deep-patch.2 > "$EVIDENCE/fix.patch.gz"
-          test "$(shasum -a 256 "$EVIDENCE/fix.patch.gz" | cut -d' ' -f1)" = 5c89aa554bb61e1206a00092f884943aae0b26c964a0f415784c92b982e7521c
-          gzip -dc "$EVIDENCE/fix.patch.gz" > "$EVIDENCE/fix.patch"
-          test "$(shasum -a 256 "$EVIDENCE/fix.patch" | cut -d' ' -f1)" = 1b61dec1eeeabe2b0ae8433ab65605d118f3bc51d7223f26a8a790ac71c0e554
+          cat review/.review/deep-patch.1 review/.review/deep-patch.2 > "$EVIDENCE/refinement.patch.gz"
+          test "$(shasum -a 256 "$EVIDENCE/refinement.patch.gz" | cut -d' ' -f1)" = 5c89aa554bb61e1206a00092f884943aae0b26c964a0f415784c92b982e7521c
+          gzip -dc "$EVIDENCE/refinement.patch.gz" > "$EVIDENCE/refinement.patch"
+          test "$(shasum -a 256 "$EVIDENCE/refinement.patch" | cut -d' ' -f1)" = 1b61dec1eeeabe2b0ae8433ab65605d118f3bc51d7223f26a8a790ac71c0e554
+          test "$(git -C review hash-object .review/harness.patch)" = ad1c59df6ba1f48a0d8dfc1c403663319ec7beb7
+          cp review/.review/harness.patch "$EVIDENCE/harness.patch"
+          echo 'Before/after native regression evidence: run 34483778746, artifact 10154970718. Nine cases failed on original runtime; all 228 selected native tests passed with runtime patch before the standalone macOS harness deployment-target error stopped publication.' > "$EVIDENCE/prior-regression-evidence.txt"
           cd source/BigSyncKit
           test "$(git rev-parse HEAD)" = "$BASE"
           test "$(git rev-parse HEAD^{tree})" = "$BASE_TREE"
           git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/before.txt"
           swift --version > "$EVIDENCE/swift.txt"
-          git apply --check "$EVIDENCE/fix.patch"
-          git apply --include='Tests/*' "$EVIDENCE/fix.patch"
-          set +e
-          swift test -j 4 --filter 'CloudKitTerminalReceiptTests.testDeep|BigSyncOutboundQuiescenceTests.test(Restart|Sealed|DefinitiveOutcomeLost)|BigSyncKitTests.testDeepRealm' > "$EVIDENCE/baseline-new-regressions.log" 2>&1
-          baseline=$?
-          set -e
-          echo "$baseline" > "$EVIDENCE/baseline-exit.txt"
-          test "$baseline" -ne 0
-          python3 - "$EVIDENCE/baseline-new-regressions.log" <<'PY'
-          import pathlib, re, sys
-          log = pathlib.Path(sys.argv[1]).read_text()
-          failed = re.findall(r"Test Case .*test(?:Deep|Restart|Sealed).* failed \(", log)
-          assert len(failed) >= 6, (len(failed), log[-16000:])
-          print('BASELINE_FAILED_CASES', len(failed))
-          PY
-          git apply --exclude='Tests/*' "$EVIDENCE/fix.patch"
+          git apply --check "$EVIDENCE/refinement.patch"
+          git apply "$EVIDENCE/refinement.patch"
+          git apply --check "$EVIDENCE/harness.patch"
+          git apply "$EVIDENCE/harness.patch"
           git diff --check
           while IFS= read -r file; do
             if [[ "$file" == *.swift ]]; then swiftc -frontend -parse "$file"; fi
           done < <(git diff --name-only)
-          swift test -j 4 --filter 'CloudKitTerminalReceiptTests|BigSyncOutboundQuiescenceTests|CloudKitOutboundSettlementTests|CloudKitCursorPersistenceTests|CloudKitSynchronizerAccountFencingTests|AccountAuthorityPersistenceTests|ChangeFeedRecoveryStateTests|CloudKitAccountAvailabilityGateTests|BigSyncRecordIdentityBoundaryTests|BigSyncKitTests.testDeepRealm|BigSyncKitTests.testOutboundLeaseDoesNotAcknowledgeANewerRealmJournalGeneration' > "$EVIDENCE/native-fixed.log" 2>&1
           Tools/run-outbound-quiescence-portable-tests.sh > "$EVIDENCE/portable.log" 2>&1
           Tools/run-outbound-quiescence-process-tests.sh > "$EVIDENCE/process.log" 2>&1
+          set +e
+          swift test -j 4 --filter 'CloudKitTerminalReceiptTests|BigSyncOutboundQuiescenceTests|CloudKitOutboundSettlementTests|CloudKitCursorPersistenceTests|CloudKitSynchronizerAccountFencingTests|AccountAuthorityPersistenceTests|ChangeFeedRecoveryStateTests|CloudKitAccountAvailabilityGateTests|BigSyncRecordIdentityBoundaryTests|BigSyncKitTests.testDeepRealm|BigSyncKitTests.testOutboundLeaseDoesNotAcknowledgeANewerRealmJournalGeneration' > "$EVIDENCE/native-fixed.log" 2>&1
+          result=$?
+          set -e
           cp Package.resolved "$EVIDENCE/Package.resolved"
+          echo "$result" > "$EVIDENCE/native-exit.txt"
+          test "$result" -eq 0
+          grep -q 'Executed 228 tests, with 0 failures' "$EVIDENCE/native-fixed.log"
           git restore Package.resolved
-          git add Documentation Sources Tests
+          git add Documentation Sources Tests Tools
           test "$(git write-tree)" = "$FINAL_TREE"
           git diff --cached --check
+          git diff --cached --binary > "$EVIDENCE/fix.patch"
           git config user.name Codex
           git config user.email codex@users.noreply.github.com
           git commit -m 'Fence resumed source ownership, restart promotion and terminal settlement'
@@ -97,6 +95,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: deep-transport-refinement-evidence
+          name: deep-transport-refinement-final-evidence
           path: evidence
           retention-days: 30
