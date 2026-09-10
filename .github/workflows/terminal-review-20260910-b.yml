@@ -1,0 +1,23 @@
+name: Terminal review source
+on:
+  push:
+    branches: [audit/terminal-review-20260910-b]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 1ff11190ce4dc21833a1d930000e75fad16e2229
+          persist-credentials: false
+      - run: |
+          mkdir evidence
+          git archive --format=tar.gz HEAD > evidence/bigsync.tar.gz
+          git rev-parse HEAD HEAD^{tree} > evidence/identity.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-review-source
+          path: evidence
+          retention-days: 14
