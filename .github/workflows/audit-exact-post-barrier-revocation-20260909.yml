@@ -23,67 +23,14 @@ jobs:
           from pathlib import Path
           p=Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
           s=p.read_text()
-          anchor='''        postBarrierDrainAuthorization = authorization
-        return authorization
-    }
-
-    /// Materializes an opaque completed-drain capability from the exact
-'''
-          insert='''        postBarrierDrainAuthorization = authorization
-        return authorization
-    }
-
-    /// Revokes only the exact post-barrier authorization supplied by its
-    /// holder. An in-flight synchronization may continue as an ordinary drain,
-    /// but it can no longer mint a completed cutover capability. If that exact
-    /// drain already completed before the caller observed failure, invalidate
-    /// the unconsumed completed capability as well. Ordinary receipts and
-    /// publication evidence remain untouched.
-    @BigSyncBackgroundActor
-    @discardableResult
-    public func revokePostBarrierDrainAuthorization(
-        _ authorization: PostBarrierDrainAuthorization
-    ) -> Bool {
-        guard authorization.issuerID == synchronizationReceiptIssuerID else {
-            return false
-        }
-        var revoked = false
-        if postBarrierDrainAuthorization == authorization {
-            postBarrierDrainAuthorization = nil
-            revoked = true
-        }
-        if completedPostBarrierDrain?.postBarrierDrainAuthorizationID
-            == authorization.authorizationID {
-            completedPostBarrierDrain = nil
-            revoked = true
-        }
-        return revoked
-    }
-
-    /// Materializes an opaque completed-drain capability from the exact
-'''
+          anchor="        postBarrierDrainAuthorization = authorization\n        return authorization\n    }\n\n    /// Materializes an opaque completed-drain capability from the exact\n"
+          insert="        postBarrierDrainAuthorization = authorization\n        return authorization\n    }\n\n    /// Revokes only the exact post-barrier authorization supplied by its holder.\n    /// An in-flight synchronization may continue as an ordinary drain, but it\n    /// can no longer mint a completed cutover capability. A matching completed\n    /// capability is invalidated too; ordinary receipts remain untouched.\n    @BigSyncBackgroundActor\n    @discardableResult\n    public func revokePostBarrierDrainAuthorization(\n        _ authorization: PostBarrierDrainAuthorization\n    ) -> Bool {\n        guard authorization.issuerID == synchronizationReceiptIssuerID else { return false }\n        var revoked = false\n        if postBarrierDrainAuthorization == authorization {\n            postBarrierDrainAuthorization = nil\n            revoked = true\n        }\n        if completedPostBarrierDrain?.postBarrierDrainAuthorizationID == authorization.authorizationID {\n            completedPostBarrierDrain = nil\n            revoked = true\n        }\n        return revoked\n    }\n\n    /// Materializes an opaque completed-drain capability from the exact\n"
           if s.count(anchor)!=1: raise SystemExit('authorization anchor mismatch')
           p.write_text(s.replace(anchor,insert,1))
-
           p=Path('Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift')
           s=p.read_text()
-          anchor='''    @BigSyncBackgroundActor
-    public func completedPostBarrierDrain(
-'''
-          insert='''    /// Revokes only a capability issued by the currently installed worker.
-    /// This does not cancel or await an ordinary synchronization run.
-    @BigSyncBackgroundActor
-    @discardableResult
-    public func revokePostBarrierDrainAuthorization(
-        _ authorization: CloudKitSynchronizer.PostBarrierDrainAuthorization
-    ) -> Bool {
-        guard let synchronizer = realmSynchronizer else { return false }
-        return synchronizer.revokePostBarrierDrainAuthorization(authorization)
-    }
-
-    @BigSyncBackgroundActor
-    public func completedPostBarrierDrain(
-'''
+          anchor="    @BigSyncBackgroundActor\n    public func completedPostBarrierDrain(\n"
+          insert="    /// Revokes only a capability issued by the currently installed worker.\n    /// This does not cancel or await an ordinary synchronization run.\n    @BigSyncBackgroundActor\n    @discardableResult\n    public func revokePostBarrierDrainAuthorization(\n        _ authorization: CloudKitSynchronizer.PostBarrierDrainAuthorization\n    ) -> Bool {\n        guard let synchronizer = realmSynchronizer else { return false }\n        return synchronizer.revokePostBarrierDrainAuthorization(authorization)\n    }\n\n    @BigSyncBackgroundActor\n    public func completedPostBarrierDrain(\n"
           if s.count(anchor)!=1: raise SystemExit('worker anchor mismatch')
           p.write_text(s.replace(anchor,insert,1))
           PY
