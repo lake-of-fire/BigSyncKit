@@ -82,6 +82,13 @@ final class BigSyncOutboundQuiescenceTests: XCTestCase {
         try await candidate.waitUntilDrained(owner)
         try owner.armFinalDrain()
         owner.sealFinalDrain()
+        let preparing = try candidate.snapshot()
+        XCTAssertThrowsError(try candidate.resolveOwned(
+            owner, expected: preparing, evidenceID: "premature-transition"
+        )) {
+            XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .recoveryRequired)
+        }
+        XCTAssertEqual(try candidate.snapshot(), preparing)
         try candidate.requireRecovery(owner)
         XCTAssertEqual(try candidate.snapshot().barrier?.phase, .recoveryRequired)
         XCTAssertThrowsError(try candidate.abort(owner))

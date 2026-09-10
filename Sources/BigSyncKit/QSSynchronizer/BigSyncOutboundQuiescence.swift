@@ -245,6 +245,9 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         try owner.withLock {
             guard validEvidence(evidenceID) else { throw BigSyncOutboundQuiescenceError.invalidState }
             try validateOwner(owner, principal: owner.barrier.principal)
+            guard owner.barrier.phase == .recoveryRequired else {
+                throw BigSyncOutboundQuiescenceError.recoveryRequired
+            }
             guard owner.activeBatches == 0 else { throw BigSyncOutboundQuiescenceError.busy }
             try withState { state in
                 guard state == expected else { throw BigSyncOutboundQuiescenceError.staleAuthority }

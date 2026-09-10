@@ -1823,6 +1823,13 @@ extension CloudKitTerminalReceiptTests {
         XCTAssertEqual(authorization.outboundQuiescenceIdentifier, token.identifier)
         XCTAssertEqual(completed.outboundQuiescenceIdentifier, token.identifier)
         XCTAssertTrue(try gate.snapshot().outstandingSubmissions.isEmpty)
+        let preparingCheckpoint = try fixture.synchronizer.outboundQuiescenceSnapshot()
+        XCTAssertThrowsError(try fixture.synchronizer.resolvePostBarrierOutboundQuiescence(
+            token, expected: preparingCheckpoint, recoveryEvidenceID: "premature-transition"
+        )) {
+            XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .recoveryRequired)
+        }
+        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot(), preparingCheckpoint)
         let checkpoint = try await fixture.synchronizer.requirePostBarrierDrainRecoveryBeforeReservation(completed)
         XCTAssertEqual(checkpoint.barrier?.phase, .recoveryRequired)
         XCTAssertThrowsError(try fixture.synchronizer.abortPostBarrierOutboundQuiescence(token)) {
