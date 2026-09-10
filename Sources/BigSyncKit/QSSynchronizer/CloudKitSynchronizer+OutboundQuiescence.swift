@@ -394,11 +394,51 @@ extension CloudKitSynchronizer {
         }
     }
 
+    private func outboundRecoveryDescriptor(
+        saving records: [CKRecord],
+        deleting recordIDs: [CKRecord.ID],
+        preparedGenerations: [String: String]
+    ) -> BigSyncOutboundSubmissionRecoveryDescriptor {
+        let saves = records.map { record in
+            BigSyncOutboundSubmissionItem(
+                mutation: .save,
+                recordName: record.recordID.recordName,
+                zoneName: record.recordID.zoneID.zoneName,
+                zoneOwnerName: record.recordID.zoneID.ownerName,
+                recordType: record.recordType,
+                preparedGeneration: preparedGenerations[record.recordID.recordName],
+                priorRecordChangeTag: record.recordChangeTag
+            )
+        }
+        let deletes = recordIDs.map { recordID in
+            BigSyncOutboundSubmissionItem(
+                mutation: .delete,
+                recordName: recordID.recordName,
+                zoneName: recordID.zoneID.zoneName,
+                zoneOwnerName: recordID.zoneID.ownerName,
+                recordType: nil,
+                preparedGeneration: preparedGenerations[recordID.recordName],
+                priorRecordChangeTag: nil
+            )
+        }
+        return BigSyncOutboundSubmissionRecoveryDescriptor(items: saves + deletes)
+    }
+
     internal func modifyRecordsHoldingOutboundLease(
-        _ outbound: BigSyncOutboundBatchLease, attemptID: UUID,
-        saving records: [CKRecord], deleting recordIDs: [CKRecord.ID]
+        _ outbound: BigSyncOutboundBatchLease,
+        attemptID: UUID,
+        saving records: [CKRecord],
+        deleting recordIDs: [CKRecord.ID],
+        preparedGenerations: [String: String]
     ) async throws -> CloudKitRecordMutationResults {
-        try await outbound.willSubmitCooperatively()
+        let recoveryDescriptor = outboundRecoveryDescriptor(
+            saving: records,
+            deleting: recordIDs,
+            preparedGenerations: preparedGenerations
+        )
+        try await outbound.willSubmitCooperatively(
+            recoveryDescriptor: recoveryDescriptor
+        )
         do {
             try validateOutboundBatch(outbound, for: attemptID)
             try outbound.validateSubmissionAdmission()
@@ -410,8 +450,12 @@ extension CloudKitSynchronizer {
         }
         let results: CloudKitRecordMutationResults
         do {
-            results = try await recordStore.modifyRecords(saving: records, deleting: recordIDs,
-                savePolicy: .ifServerRecordUnchanged, atomically: false)
+            results = try await recordStore.modifyRecords(
+                saving: records,
+                deleting: recordIDs,
+                savePolicy: .ifServerRecordUnchanged,
+                atomically: false
+            )
         } catch {
             // An operation-wide definitive rejection (for example the batch
             // limit) did not commit either and requires no per-item local ack.
@@ -427,7 +471,10 @@ extension CloudKitSynchronizer {
         // marker only after generation-matched local response processing. If
         // cancellation or an authority fence wins in that window, process death
         // loses this in-memory note but deliberately leaves the durable marker.
-        if results.provesDefinitiveSettlement(saving: records, deleting: recordIDs) {
+        if results.provesDefinitiveSettlement(
+            saving: records,
+            deleting: recordIDs
+        ) {
             try outbound.noteDefinitiveTransportOutcome()
         }
         return results

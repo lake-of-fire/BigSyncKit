@@ -13,6 +13,54 @@ final class BigSyncOutboundQuiescenceTests: XCTestCase {
                 BigSyncOutboundQuiescenceCoordinator(sharedStateBaseURL: directory, durableStateNamespace: "client"), principal)
     }
 
+    func testSubmissionPersistsExactRecoveryIdentity() throws {
+        let (_, peer, _, principal) = fixture()
+        let batch = try peer.admit(principal: principal)
+        let descriptor = BigSyncOutboundSubmissionRecoveryDescriptor(items: [
+            BigSyncOutboundSubmissionItem(
+                mutation: .save,
+                recordName: "record-1",
+                zoneName: "zone",
+                zoneOwnerName: "owner",
+                recordType: "Article",
+                preparedGeneration: "generation-1",
+                priorRecordChangeTag: "change-tag-1"
+            )
+        ])
+        try batch.willSubmit(recoveryDescriptor: descriptor)
+        let submission = try XCTUnwrap(
+            peer.snapshot().outstandingSubmissions.first
+        )
+        XCTAssertEqual(submission.recoveryDescriptor, descriptor)
+        try batch.didSettle()
+    }
+
+    func testSubmissionRejectsDuplicateRecoveryRecordIdentity() throws {
+        let (_, peer, _, principal) = fixture()
+        let batch = try peer.admit(principal: principal)
+        let item = BigSyncOutboundSubmissionItem(
+            mutation: .save,
+            recordName: "record-1",
+            zoneName: "zone",
+            zoneOwnerName: "owner",
+            recordType: "Article",
+            preparedGeneration: "generation-1",
+            priorRecordChangeTag: nil
+        )
+        let duplicate = BigSyncOutboundSubmissionRecoveryDescriptor(
+            items: [item, item]
+        )
+        XCTAssertThrowsError(
+            try batch.willSubmit(recoveryDescriptor: duplicate)
+        ) {
+            XCTAssertEqual(
+                $0 as? BigSyncOutboundQuiescenceError,
+                .invalidState
+            )
+        }
+        XCTAssertTrue(try peer.snapshot().outstandingSubmissions.isEmpty)
+    }
+
     func testPeerScopeMustFinishBeforeExclusiveQuiescence() async throws {
         let (_, peer, candidate, principal) = fixture()
         var batch: BigSyncOutboundBatchLease? = try peer.admit(principal: principal)

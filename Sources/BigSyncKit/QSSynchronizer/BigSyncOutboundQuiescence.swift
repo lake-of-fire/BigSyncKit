@@ -39,15 +39,98 @@ public struct BigSyncOutboundBarrier: Codable, Equatable, Sendable {
     public internal(set) var sourcePublicationEvidenceID: String? = nil
 }
 
+public struct BigSyncOutboundSubmissionItem: Codable, Equatable, Sendable {
+    public enum Mutation: String, Codable, Sendable {
+        case save
+        case delete
+    }
+
+    public let mutation: Mutation
+    public let recordName: String
+    public let zoneName: String
+    public let zoneOwnerName: String
+    /// Present for saves; omitted for deletions. This is identity only,
+    /// never a persisted retry payload.
+    public let recordType: String?
+    /// Exact durable journal generation that prepared this item when the
+    /// adapter exposes one. A nil generation remains explicitly unsupported
+    /// for automatic journal reconciliation after an indeterminate crash.
+    public let preparedGeneration: String?
+    /// Change-tag witness carried by the prepared save, if one existed.
+    /// The record body itself remains exclusively in the Realm journal.
+    public let priorRecordChangeTag: String?
+
+    public init(
+        mutation: Mutation,
+        recordName: String,
+        zoneName: String,
+        zoneOwnerName: String,
+        recordType: String?,
+        preparedGeneration: String?,
+        priorRecordChangeTag: String?
+    ) {
+        self.mutation = mutation
+        self.recordName = recordName
+        self.zoneName = zoneName
+        self.zoneOwnerName = zoneOwnerName
+        self.recordType = recordType
+        self.preparedGeneration = preparedGeneration
+        self.priorRecordChangeTag = priorRecordChangeTag
+    }
+}
+
+/// Bounded recovery identity for one actual CloudKit mutation request.
+/// It deliberately contains no field values, assets, retry payloads or
+/// acknowledgement authority; the Realm journal remains authoritative.
+public struct BigSyncOutboundSubmissionRecoveryDescriptor: Codable, Equatable, Sendable {
+    public let version: Int
+    public let items: [BigSyncOutboundSubmissionItem]
+
+    public init(items: [BigSyncOutboundSubmissionItem]) {
+        version = 1
+        self.items = items.sorted(by: Self.canonicalOrder)
+    }
+
+    fileprivate static func canonicalOrder(
+        _ lhs: BigSyncOutboundSubmissionItem,
+        _ rhs: BigSyncOutboundSubmissionItem
+    ) -> Bool {
+        if lhs.zoneOwnerName != rhs.zoneOwnerName {
+            return lhs.zoneOwnerName < rhs.zoneOwnerName
+        }
+        if lhs.zoneName != rhs.zoneName {
+            return lhs.zoneName < rhs.zoneName
+        }
+        if lhs.recordName != rhs.recordName {
+            return lhs.recordName < rhs.recordName
+        }
+        return lhs.mutation.rawValue < rhs.mutation.rawValue
+    }
+}
+
 public struct BigSyncOutboundSubmission: Codable, Equatable, Sendable {
     public let identifier: UUID
     public let principal: BigSyncOutboundPrincipal
+    /// Nil is accepted only for checkpoints written by older builds (and
+    /// low-level debug tests). New production requests persist this before
+    /// transport so a crash does not leave an opaque immortal UUID.
+    public let recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor?
+
+    public init(
+        identifier: UUID,
+        principal: BigSyncOutboundPrincipal,
+        recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor? = nil
+    ) {
+        self.identifier = identifier
+        self.principal = principal
+        self.recoveryDescriptor = recoveryDescriptor
+    }
 }
 
-/// An exact durable recovery checkpoint. Outstanding submission IDs are only
-/// transport uncertainty markers: they contain no mutations, record values,
-/// record-mutation generations, retry payloads or merge clocks. The existing Realm journal is
-/// still the sole mutation authority.
+/// An exact durable recovery checkpoint. Outstanding submissions carry
+/// bounded record/journal identity but never record values, assets, retry
+/// payloads or merge clocks. The existing Realm journal remains the sole
+/// mutation and acknowledgement authority.
 public struct BigSyncOutboundQuiescenceSnapshot: Codable, Equatable, Sendable {
     internal let version: Int
     public let revisionIdentifier: UUID
@@ -73,6 +156,15 @@ public struct BigSyncOutboundQuiescenceSnapshot: Codable, Equatable, Sendable {
 /// mutex is held across an await or while waiting for existing batches.
 internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
     static let maximumStateBytes = 8 * 1_024 * 1_024
+    /// CloudKitSynchronizer itself never prepares more than 400 records
+    /// in one request. Keep recovery identity bounded to the same limit.
+    static let maximumRecoveryItemsPerSubmission = 400
+
+    private struct RecoveryRecordKey: Hashable {
+        let recordName: String
+        let zoneName: String
+        let zoneOwnerName: String
+    }
 
     let directory: URL
     private var stateURL: URL { directory.appendingPathComponent("state.json") }
@@ -428,18 +520,34 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         }
     }
 
-    fileprivate func willSubmit(_ batch: BigSyncOutboundBatchLease) throws -> UUID {
+    fileprivate func willSubmit(
+        _ batch: BigSyncOutboundBatchLease,
+        recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor?
+    ) throws -> UUID {
         try batch.validateSubmissionAdmission()
+        if let recoveryDescriptor,
+           !validRecoveryDescriptor(recoveryDescriptor) {
+            throw BigSyncOutboundQuiescenceError.invalidState
+        }
         let id = UUID()
         try withState { state in
             // Already-admitted peers may finish even after a cutoff was
             // published. Their shared batch leases still prevent exclusive
             // acquisition; rejecting them here is unnecessary and loses work.
             var submissions = state.outstandingSubmissions
-            guard submissions.count < 4_096 else { throw BigSyncOutboundQuiescenceError.recoveryRequired }
-            submissions.append(BigSyncOutboundSubmission(identifier: id, principal: batch.principal))
-            try write(BigSyncOutboundQuiescenceSnapshot(barrier: state.barrier, submissions: submissions,
-                recoveryEvidenceID: state.lastRecoveryEvidenceID))
+            guard submissions.count < 4_096 else {
+                throw BigSyncOutboundQuiescenceError.recoveryRequired
+            }
+            submissions.append(BigSyncOutboundSubmission(
+                identifier: id,
+                principal: batch.principal,
+                recoveryDescriptor: recoveryDescriptor
+            ))
+            try write(BigSyncOutboundQuiescenceSnapshot(
+                barrier: state.barrier,
+                submissions: submissions,
+                recoveryEvidenceID: state.lastRecoveryEvidenceID
+            ))
         }
         return id
     }
@@ -472,7 +580,7 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
             state = try JSONDecoder().decode(BigSyncOutboundQuiescenceSnapshot.self, from: data)
             guard state.version == 1,
                   state.outstandingSubmissions.count <= 4_096,
-                  state.outstandingSubmissions.allSatisfy({ validPrincipal($0.principal) }),
+                  state.outstandingSubmissions.allSatisfy(validSubmission),
                   state.barrier.map(validBarrier) ?? true,
                   Set(state.outstandingSubmissions.map(\.identifier)).count == state.outstandingSubmissions.count else {
                 throw BigSyncOutboundQuiescenceError.invalidState
@@ -503,6 +611,64 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
             throw BigSyncOutboundQuiescenceError.recoveryRequired
         }
         try bigSyncWriteDataDurably(data, to: stateURL)
+    }
+
+    private func validSubmission(_ submission: BigSyncOutboundSubmission) -> Bool {
+        validPrincipal(submission.principal)
+            && submission.recoveryDescriptor.map(validRecoveryDescriptor) != false
+    }
+
+    private func validRecoveryDescriptor(
+        _ descriptor: BigSyncOutboundSubmissionRecoveryDescriptor
+    ) -> Bool {
+        guard descriptor.version == 1,
+              !descriptor.items.isEmpty,
+              descriptor.items.count <= Self.maximumRecoveryItemsPerSubmission,
+              descriptor.items == descriptor.items.sorted(
+                  by: BigSyncOutboundSubmissionRecoveryDescriptor.canonicalOrder
+              ) else {
+            return false
+        }
+        let keys = descriptor.items.map {
+            RecoveryRecordKey(
+                recordName: $0.recordName,
+                zoneName: $0.zoneName,
+                zoneOwnerName: $0.zoneOwnerName
+            )
+        }
+        guard Set(keys).count == keys.count else { return false }
+        return descriptor.items.allSatisfy { item in
+            guard validRecoveryComponent(item.recordName),
+                  validRecoveryComponent(item.zoneName),
+                  validRecoveryComponent(item.zoneOwnerName) else {
+                return false
+            }
+            if let generation = item.preparedGeneration,
+               !validRecoveryComponent(generation) {
+                return false
+            }
+            if let changeTag = item.priorRecordChangeTag,
+               !validRecoveryComponent(changeTag) {
+                return false
+            }
+            switch item.mutation {
+            case .save:
+                guard let recordType = item.recordType,
+                      validRecoveryComponent(recordType) else {
+                    return false
+                }
+            case .delete:
+                guard item.recordType == nil,
+                      item.priorRecordChangeTag == nil else {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    private func validRecoveryComponent(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 4_096
     }
 
     private func validBarrier(_ barrier: BigSyncOutboundBarrier) -> Bool {
@@ -627,10 +793,29 @@ internal final class BigSyncOutboundBatchLease {
 
     deinit { owner?.withLock { owner?.activeBatches -= 1 } }
 
-    func willSubmit() throws {
-        guard submissionID == nil else { throw BigSyncOutboundQuiescenceError.invalidState }
+    func willSubmit(
+        recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor
+    ) throws {
+        guard submissionID == nil else {
+            throw BigSyncOutboundQuiescenceError.invalidState
+        }
         transportOutcomeIsDefinitive = false
-        submissionID = try coordinator.willSubmit(self)
+        submissionID = try coordinator.willSubmit(
+            self,
+            recoveryDescriptor: recoveryDescriptor
+        )
+    }
+
+    /// Compatibility for low-level debug tests that exercise only lock and
+    /// marker lifetime. Release transport must always provide real recovery
+    /// identity before entering CloudKit.
+    @available(*, deprecated, message: "Production submissions must provide a recovery descriptor")
+    func willSubmit() throws {
+        guard _isDebugAssertConfiguration(), submissionID == nil else {
+            throw BigSyncOutboundQuiescenceError.invalidState
+        }
+        transportOutcomeIsDefinitive = false
+        submissionID = try coordinator.willSubmit(self, recoveryDescriptor: nil)
     }
 
     /// Remember a definitive server outcome without yet clearing durable
@@ -664,7 +849,25 @@ internal final class BigSyncOutboundBatchLease {
     /// A short metadata-lock collision must not manufacture an unresolved
     /// server operation. Preparation honours task cancellation; settlement is
     /// physical bookkeeping and may complete after its run has been cancelled.
+    func willSubmitCooperatively(
+        recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor
+    ) async throws {
+        while true {
+            try Task.checkCancellation()
+            do {
+                try willSubmit(recoveryDescriptor: recoveryDescriptor)
+                return
+            } catch BigSyncOutboundQuiescenceError.busy {
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+    }
+
+    @available(*, deprecated, message: "Production submissions must provide a recovery descriptor")
     func willSubmitCooperatively() async throws {
+        guard _isDebugAssertConfiguration() else {
+            throw BigSyncOutboundQuiescenceError.invalidState
+        }
         while true {
             try Task.checkCancellation()
             do { try willSubmit(); return }
