@@ -1,13 +1,57 @@
-name: Worker 1 transport publication audit
+name: Worker 1 worker-establishment cancellation publish
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - codex/worker1-transport-publish-20260910
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: worker1-establish-cancellation-pr8
+  cancel-in-progress: false
 
 jobs:
-  audit:
+  publish:
+    if: github.repository == 'lake-of-fire/BigSyncKit'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Publication complete; this staging branch is retained only as audit evidence."
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify worker cancellation cleanup and fast-forward PR 8
+        shell: bash
+        env:
+          BASE: 4d33bce325e68b5e2c3b61317e3a42dee61064a9
+          BASE_TREE: 7508f0ff846c4011dbfc7b5d3a6fab74d713b383
+          TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
+          PATCH_SHA256: 3f24c6688301baba6a68305bf0ee3cb7c6969a9b33f705f5aeead8afd467ea7a
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
+          printf '%s  %s\n' "$PATCH_SHA256" .worker1-publish/worker-establish-cancellation.patch | sha256sum -c -
+          cp .worker1-publish/worker-establish-cancellation.patch /tmp/refinement.patch
+          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$current" = "$BASE"
+          git checkout --detach "$BASE"
+          git apply --check /tmp/refinement.patch
+          git apply /tmp/refinement.patch
+          git diff --check
+          swiftc -frontend -parse Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
+          Tools/run-outbound-quiescence-portable-tests.sh
+          Tools/run-outbound-quiescence-process-tests.sh
+          git add -A
+          tree="$(git write-tree)"
+          export GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
+          export GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
+          commit="$(printf '%s\n\n%s\n' \
+            'Revoke lost final-drain authorization on worker cancellation' \
+            'If cancellation lands after post-barrier establishment succeeds but before the worker returns the authorization, revoke that exact authorization so a capability the caller never received cannot remain armed. Keep the durable cutoff/token for explicit abort or recovery.' \
+            | git commit-tree "$tree" -p "$BASE")"
+          test "$(git rev-parse "$commit^")" = "$BASE"
+          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$current" = "$BASE"
+          git push origin "$commit:refs/heads/$TARGET_BRANCH"
+          echo "PUBLISHED_COMMIT=$commit"
+          echo "PUBLISHED_TREE=$tree"
