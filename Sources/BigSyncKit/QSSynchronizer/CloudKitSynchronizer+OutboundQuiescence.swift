@@ -202,6 +202,22 @@ extension CloudKitSynchronizer {
         expected: BigSyncOutboundQuiescenceSnapshot,
         authorizingRecovery: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
     ) async throws {
+        try await recoverOutboundQuiescence(
+            expected: expected,
+            revalidatingExternalOwner: { @BigSyncBackgroundActor in },
+            authorizingRecovery: authorizingRecovery
+        )
+    }
+
+    /// Internal host wrapper used when another lifecycle owner (for example the
+    /// shared background worker) must remain current across every suspension.
+    /// The external owner is rechecked after the final account lookup and
+    /// immediately before the durable gate can be reopened.
+    internal func recoverOutboundQuiescence(
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        revalidatingExternalOwner: @Sendable @BigSyncBackgroundActor () throws -> Void,
+        authorizingRecovery: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
+    ) async throws {
         guard !syncing, !synchronizationDrainIsActive,
               postBarrierOutboundLease == nil, outboundRecoveryID == nil else {
             throw BigSyncOutboundQuiescenceError.busy
@@ -213,12 +229,14 @@ extension CloudKitSynchronizer {
         outboundRecoveryID = requestID
         defer { if outboundRecoveryID == requestID { outboundRecoveryID = nil } }
         func validateOwnership() throws {
+            try revalidatingExternalOwner()
             guard outboundRecoveryID == requestID, synchronizationAttemptID == attemptID,
                   !syncing, !synchronizationDrainIsActive,
                   try currentOutboundRecoveryPrincipal() == principal else {
                 throw BigSyncOutboundQuiescenceError.staleAuthority
             }
         }
+        try validateOwnership()
         let account = try await accountIdentifierProvider()
         try validateOwnership()
         guard Self.accountScopeIdentifier(for: account) == principal.accountScopeIdentifier else {

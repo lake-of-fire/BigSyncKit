@@ -679,7 +679,15 @@ public actor BigSyncBackgroundActor {
             synchronizer.abandonPostBarrierOutboundQuiescence(token)
             throw CancellationError()
         }
-        try Task.checkCancellation()
+        do {
+            try Task.checkCancellation()
+        } catch {
+            // The caller did not receive this capability. Do not leave the
+            // owner-only final drain armed merely because cancellation landed
+            // after the synchronizer finished establishment.
+            synchronizer.revokePostBarrierDrainAuthorization(authorization)
+            throw error
+        }
         return authorization
     }
 
@@ -738,15 +746,21 @@ public actor BigSyncBackgroundActor {
         authorizingRecovery: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
     ) async throws {
         guard let synchronizer = realmSynchronizer else { throw CancellationError() }
-        try await synchronizer.recoverOutboundQuiescence(expected: expected) { @BigSyncBackgroundActor checkpoint in
-            guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
-            let evidence = try await authorizingRecovery(checkpoint)
-            // Unlike a post-return check, this prevents the displaced worker
-            // from durably reopening transport after a delayed domain proof.
-            guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
-            try Task.checkCancellation()
-            return evidence
-        }
+        try await synchronizer.recoverOutboundQuiescence(
+            expected: expected,
+            revalidatingExternalOwner: { @BigSyncBackgroundActor in
+                guard self.realmSynchronizer === synchronizer else {
+                    throw CancellationError()
+                }
+            },
+            authorizingRecovery: { @BigSyncBackgroundActor checkpoint in
+                guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
+                let evidence = try await authorizingRecovery(checkpoint)
+                guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
+                try Task.checkCancellation()
+                return evidence
+            }
+        )
         guard realmSynchronizer === synchronizer else { throw CancellationError() }
         try Task.checkCancellation()
     }
