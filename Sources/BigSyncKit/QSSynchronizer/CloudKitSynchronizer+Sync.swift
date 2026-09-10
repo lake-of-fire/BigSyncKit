@@ -389,6 +389,7 @@ extension CloudKitSynchronizer {
 #endif
         do {
             // Recheck after every terminal collaborator/checkpoint suspension.
+            try validateSourcePublicationRun(terminalContext, requiresDrained: true)
             if let barrier = postBarrierDrainAuthorization {
                 try validatePostBarrierOutboundDrain(barrier)
             }
@@ -464,6 +465,7 @@ extension CloudKitSynchronizer {
         context: RunContext, consumedBoundary: String?
     ) throws -> Bool {
         try checkRunContext(context)
+        try validateSourcePublicationRun(context, requiresDrained: true)
         let pending = try adaptersHavePendingChangesAtTerminalBoundary()
         let currentBoundary = try currentConsumedServerBoundaryIdentifier(for: context)
         return pending || currentBoundary != consumedBoundary || synchronizationRequestedWhileRunning

@@ -1334,6 +1334,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             transport: transport,
             store: store,
             identifier: identifier,
+            recordZoneID: zoneID,
             accountIdentifierProvider: { "account-b" },
             accountStatusProvider: { await statuses.next() }
         )
@@ -1369,8 +1370,11 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     async throws {
         let transport = AccountFencingTransport()
         transport.nextDatabaseChangesError = CKError(.accountTemporarilyUnavailable)
-        let synchronizer = makeSynchronizer(transport: transport)
-        let adapter = AccountFencingModelAdapter(zoneID: makeZoneID())
+        // Installation and outbound admission must use the constructor's real
+        // zone; debug rebinding would leave the new namespace uninitialized.
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(transport: transport, recordZoneID: zoneID)
+        let adapter = AccountFencingModelAdapter(zoneID: zoneID)
         synchronizer.addModelAdapter(adapter)
         adapter.requestsOneUploadWakeupOnFinish = true
         try await synchronizer._test_validateSynchronizationAccount()

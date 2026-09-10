@@ -267,6 +267,8 @@ extension CloudKitSynchronizer {
             // completed. Cancellation before here deliberately retains the
             // durable uncertainty marker for explicit recovery.
             try await outbound.completeLocalResponseProcessingCooperatively()
+            // Settlement may suspend, but obsolete runs must not tune a successor's batch size.
+            try validateOutboundBatch(outbound, for: attemptID)
 
             guard unresolvedFailures.isEmpty else {
                 if unresolvedFailures.values.contains(where: {
@@ -421,6 +423,8 @@ extension CloudKitSynchronizer {
             // delete/rebase callbacks. A cancellation in that interval must not
             // let a cutoff mistake server response for completed local handling.
             try await outbound.completeLocalResponseProcessingCooperatively()
+            // Settlement may suspend, but obsolete runs must not tune a successor's batch size.
+            try validateOutboundBatch(outbound, for: attemptID)
             guard unresolvedFailures.isEmpty else {
                 if unresolvedFailures.values.contains(where: {
                     $0.domain == CKErrorDomain

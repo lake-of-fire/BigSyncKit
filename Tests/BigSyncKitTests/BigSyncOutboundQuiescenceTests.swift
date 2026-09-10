@@ -387,3 +387,114 @@ extension BigSyncOutboundQuiescenceTests {
         try peer.resolveRecovery(recovery, evidenceID: "correct-namespace")
     }
 }
+
+
+extension BigSyncOutboundQuiescenceTests {
+    func testRestartPromotesCommittedRecoveryCheckpointWithoutOpeningPeers() async throws {
+        let (_, peer, gate, principal) = fixture()
+        var owner: BigSyncOutboundQuiescenceLease? = try gate.begin(
+            principal: principal, writerBarrierEvidenceID: "committed-domain")
+        try await gate.waitUntilDrained(XCTUnwrap(owner))
+        try gate.requireRecovery(XCTUnwrap(owner))
+        let checkpoint = try gate.snapshot()
+        owner = nil // Domain commit won; the transport phase write did not run.
+        let recovery = try peer.takeRecoveryOwnership(expected: checkpoint)
+        let resumed = try peer.resumeSourcePublication(recovery, principal: principal,
+            recoveryEvidenceID: "exact-committed-domain-proof")
+        XCTAssertEqual(try peer.snapshot().barrier?.phase, .sourcePublication)
+        XCTAssertEqual(try peer.snapshot().barrier?.identifier, checkpoint.barrier?.identifier)
+        XCTAssertThrowsError(try gate.admit(principal: principal))
+        XCTAssertThrowsError(try resumed.armFinalDrain())
+        var batch: BigSyncOutboundBatchLease? = try peer.admit(principal: principal, owner: resumed)
+        try batch?.willSubmit()
+        try batch?.noteDefinitiveTransportOutcome()
+        try await batch?.completeLocalResponseProcessingCooperatively()
+        batch = nil
+        try peer.resolveOwned(resumed, expected: peer.snapshot(), evidenceID: "durable-completion")
+        _ = try gate.admit(principal: principal)
+    }
+
+    func testRestartCannotPromotePreparingOrBorrowChangedPrincipal() async throws {
+        let (_, peer, gate, principal) = fixture()
+        var owner: BigSyncOutboundQuiescenceLease? = try gate.begin(
+            principal: principal, writerBarrierEvidenceID: "not-reserved")
+        XCTAssertNotNil(owner)
+        owner = nil
+        let checkpoint = try gate.snapshot()
+        let recovery = try peer.takeRecoveryOwnership(expected: checkpoint)
+        XCTAssertThrowsError(try peer.resumeSourcePublication(recovery, principal: principal,
+            recoveryEvidenceID: "not-proof-of-a-reservation"))
+        XCTAssertEqual(try peer.snapshot(), checkpoint)
+        try peer.resolveRecovery(recovery, evidenceID: "exact-preparing-abort")
+
+        owner = try gate.begin(principal: principal, writerBarrierEvidenceID: "committed")
+        try await gate.waitUntilDrained(XCTUnwrap(owner))
+        try gate.requireRecovery(XCTUnwrap(owner))
+        let committed = try gate.snapshot()
+        owner = nil
+        let held = try peer.takeRecoveryOwnership(expected: committed)
+        let changed = BigSyncOutboundPrincipal(durableStateNamespace: "client",
+            installationIdentifier: "installation", accountScopeIdentifier: "account",
+            replicaBindingGenerationIdentifier: "binding", accountInvalidationGeneration: 2)
+        XCTAssertThrowsError(try peer.resumeSourcePublication(held, principal: changed,
+            recoveryEvidenceID: "stale-account-proof"))
+        XCTAssertEqual(try peer.snapshot(), committed)
+        XCTAssertThrowsError(try gate.admit(principal: principal))
+    }
+
+    func testSealedOwnerCannotSubmitPreviouslyPreparedBatch() async throws {
+        for sourcePublication in [false, true] {
+            let (_, _, gate, principal) = fixture()
+            let owner = try gate.begin(principal: principal, writerBarrierEvidenceID: "barrier")
+            try await gate.waitUntilDrained(owner)
+            if sourcePublication {
+                try gate.requireRecovery(owner)
+                _ = try gate.authorizeSourcePublication(owner, expected: gate.snapshot(), evidenceID: "committed")
+            } else {
+                try owner.armFinalDrain()
+            }
+            let batch = try gate.admit(principal: principal, owner: owner)
+            owner.sealOutboundAdmission() // Revoked while adapter preparation was suspended.
+            XCTAssertThrowsError(try batch.willSubmit())
+            XCTAssertTrue(try gate.snapshot().outstandingSubmissions.isEmpty)
+            XCTAssertThrowsError(try gate.admit(principal: principal, owner: owner))
+        }
+    }
+
+    func testSealedSubmittedOwnerCanFinishPhysicalBookkeepingButCannotResubmit() async throws {
+        let (_, peer, gate, principal) = fixture()
+        let owner = try gate.begin(principal: principal, writerBarrierEvidenceID: "barrier")
+        try await gate.waitUntilDrained(owner)
+        try gate.requireRecovery(owner)
+        _ = try gate.authorizeSourcePublication(owner, expected: gate.snapshot(), evidenceID: "committed")
+        var batch: BigSyncOutboundBatchLease? = try gate.admit(principal: principal, owner: owner)
+        try batch?.willSubmit()
+        owner.sealOutboundAdmission()
+        try batch?.noteDefinitiveTransportOutcome()
+        try await batch?.completeLocalResponseProcessingCooperatively()
+        XCTAssertTrue(try gate.snapshot().outstandingSubmissions.isEmpty)
+        XCTAssertThrowsError(try batch?.willSubmit())
+        XCTAssertThrowsError(try peer.takeRecoveryOwnership(expected: peer.snapshot()))
+        batch = nil
+        XCTAssertThrowsError(try gate.admit(principal: principal, owner: owner))
+        try gate.resolveOwned(owner, expected: gate.snapshot(), evidenceID: "durable-completion")
+    }
+
+    func testDefinitiveOutcomeLostBeforeLocalHandlingRetainsDurableMarker() async throws {
+        let (_, peer, gate, principal) = fixture()
+        var batch: BigSyncOutboundBatchLease? = try peer.admit(principal: principal)
+        try batch?.willSubmit()
+        try batch?.noteDefinitiveTransportOutcome()
+        let checkpoint = try peer.snapshot()
+        batch = nil // Cancelled callback/process dies before generation-matched ack.
+        let owner = try gate.begin(principal: principal, writerBarrierEvidenceID: "cutoff")
+        do {
+            try await gate.waitUntilDrained(owner)
+            XCTFail("Definitive server return cannot stand in for durable local handling")
+        } catch let error as BigSyncOutboundQuiescenceError {
+            XCTAssertEqual(error, .unresolvedSubmissions(checkpoint.outstandingSubmissions.map(\.identifier)))
+        }
+        XCTAssertEqual(try gate.snapshot().outstandingSubmissions, checkpoint.outstandingSubmissions)
+        try gate.abort(owner)
+    }
+}

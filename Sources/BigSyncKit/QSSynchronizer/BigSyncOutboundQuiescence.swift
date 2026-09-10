@@ -93,11 +93,7 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         guard validPrincipal(principal) else { throw BigSyncOutboundQuiescenceError.invalidState }
         if let owner {
             return try owner.withLock {
-                try validateOwner(owner, principal: principal, requiresDrained: true)
-                let mayUpload =
-                    (owner.allowsFinalDrain && owner.barrier.phase == .preparing)
-                    || (owner.allowsSourcePublication && owner.barrier.phase == .sourcePublication)
-                guard mayUpload else { throw BigSyncOutboundQuiescenceError.blocked }
+                try owner.validateOutboundAdmission(principal: principal)
                 owner.activeBatches += 1
                 return BigSyncOutboundBatchLease(coordinator: self, principal: principal,
                                                  batchLease: nil, owner: owner)
@@ -320,11 +316,22 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         try recovery.batches?.validateIdentity()
         let barrier = try withState { state -> BigSyncOutboundBarrier in
             guard state == recovery.snapshot,
-                  let barrier = state.barrier,
-                  barrier.phase == .sourcePublication,
-                  barrier.principal == principal,
-                  barrier.sourcePublicationEvidenceID.map(validEvidence) == true else {
+                  var barrier = state.barrier,
+                  barrier.principal == principal else {
                 throw BigSyncOutboundQuiescenceError.staleAuthority
+            }
+            switch barrier.phase {
+            case .recoveryRequired:
+                // The host must prove that the domain commit preceded the crash;
+                // the persisted transport phase alone is not that proof.
+                barrier.phase = .sourcePublication
+                barrier.sourcePublicationEvidenceID = recoveryEvidenceID
+            case .sourcePublication:
+                guard barrier.sourcePublicationEvidenceID.map(validEvidence) == true else {
+                    throw BigSyncOutboundQuiescenceError.staleAuthority
+                }
+            case .preparing:
+                throw BigSyncOutboundQuiescenceError.recoveryRequired
             }
             // The host proof covers the exact checkpoint, including every
             // indeterminate source request. Clear only those exact markers while
@@ -375,7 +382,7 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
     }
 
     fileprivate func willSubmit(_ batch: BigSyncOutboundBatchLease) throws -> UUID {
-        try batch.validateLease()
+        try batch.validateSubmissionAdmission()
         let id = UUID()
         try withState { state in
             // Already-admitted peers may finish even after a cutoff was
@@ -493,6 +500,16 @@ internal final class BigSyncOutboundQuiescenceLease: @unchecked Sendable {
         try withLock { try coordinator.validateOwner(self, principal: principal) }
     }
 
+    func validateOutboundAdmission(principal: BigSyncOutboundPrincipal) throws {
+        try withLock {
+            try coordinator.validateOwner(self, principal: principal)
+            guard (allowsFinalDrain && barrier.phase == .preparing)
+                    || (allowsSourcePublication && barrier.phase == .sourcePublication) else {
+                throw BigSyncOutboundQuiescenceError.blocked
+            }
+        }
+    }
+
     func armFinalDrain() throws {
         try withLock {
             guard !closed, !hasArmedFinalDrain, barrier.phase == .preparing else {
@@ -601,6 +618,14 @@ internal final class BigSyncOutboundBatchLease {
         // Preserve the uncertainty marker rather than ignoring persistence
         // failure or waiting forever on a peer suspended inside admission.
         throw BigSyncOutboundQuiescenceError.busy
+    }
+
+    /// Recheck at submission, not only at preparation. Revocation may occur
+    /// while the owning batch is suspended in adapter preparation or metadata
+    /// contention. Already-admitted ordinary peers still finish across a fence.
+    func validateSubmissionAdmission() throws {
+        if let owner { try owner.validateOutboundAdmission(principal: principal) }
+        else { try validateLease() }
     }
 
     fileprivate func validateLease() throws {
