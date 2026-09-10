@@ -1,7 +1,7 @@
 diff --git a/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift b/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
 --- a/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
 +++ b/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
-@@ -681,7 +681,12 @@ public actor BigSyncBackgroundActor {
+@@ -679,7 +679,15 @@
              synchronizer.abandonPostBarrierOutboundQuiescence(token)
              throw CancellationError()
          }
@@ -17,3 +17,4 @@ diff --git a/Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift b/So
 +        }
          return authorization
      }
+ 
