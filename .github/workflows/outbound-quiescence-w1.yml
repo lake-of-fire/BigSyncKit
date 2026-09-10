@@ -50,10 +50,12 @@ jobs:
           subprocess.run(['git', 'apply', '--check', str(path)], cwd='source/BigSyncKit', check=True)
           subprocess.run(['git', 'apply', str(path)], cwd='source/BigSyncKit', check=True)
           PY
+          python3 review/audit/quiescence-refine.py source/BigSyncKit
           cd source/BigSyncKit
           git diff --check
           git add Documentation/OutboundQuiescence.md Sources/BigSyncKit/QSSynchronizer/BigSyncClientIdentity.swift Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
-          test "$(git write-tree)" = 2899fd19c11bafaf1bd55a5305ddc07f06fe2626
+          test "$(git write-tree)" = e2fe9e9e9e81166711dd0fc56d18cece39cf3751
+          git diff --cached --binary > ../../evidence/fix.patch
           git rev-parse HEAD > ../../evidence/before.txt
           git write-tree > ../../evidence/candidate-tree.txt
           swift --version > ../../evidence/swift.txt
@@ -69,21 +71,23 @@ jobs:
           let package = Package(name: "BigSyncKit", platforms: [.macOS("15.0")], targets: [.target(name: "BigSyncKit"), .testTarget(name: "BigSyncKitTests", dependencies: ["BigSyncKit"])])
           SWIFT
           cd primitive
-          swift test -j 4 > ../evidence/primitive.log 2>&1
+          swift test -j 4 > ../evidence/primitive.log 2>&1 || { tail -150 ../evidence/primitive.log; exit 1; }
           tail -12 ../evidence/primitive.log
       - name: Native terminal and adjacent regression suites
         run: |
           set -euo pipefail
           cd source/BigSyncKit
-          swift test -j 4 --filter 'CloudKitTerminalReceiptTests|BigSyncOutboundQuiescenceTests' > ../../evidence/terminal-and-quiescence.log 2>&1
+          swift test -j 4 --filter 'CloudKitTerminalReceiptTests|BigSyncOutboundQuiescenceTests' > ../../evidence/terminal-and-quiescence.log 2>&1 || { tail -180 ../../evidence/terminal-and-quiescence.log; exit 1; }
           tail -12 ../../evidence/terminal-and-quiescence.log
-          swift test -j 4 --filter 'CloudKitCursorPersistenceTests|CloudKitSynchronizerAccountFencingTests|AccountAuthorityPersistenceTests|ChangeFeedRecoveryStateTests|CloudKitAccountAvailabilityGateTests|BigSyncRecordIdentityBoundaryTests|BigSyncRecordConflictPolicyTests|ModelAdapterDeletionConflictSafetyTests' > ../../evidence/adjacent.log 2>&1
+          swift test -j 4 --filter 'CloudKitCursorPersistenceTests|CloudKitSynchronizerAccountFencingTests|AccountAuthorityPersistenceTests|ChangeFeedRecoveryStateTests|CloudKitAccountAvailabilityGateTests|BigSyncRecordIdentityBoundaryTests|BigSyncRecordConflictPolicyTests|ModelAdapterDeletionConflictSafetyTests' > ../../evidence/adjacent.log 2>&1 || { tail -180 ../../evidence/adjacent.log; exit 1; }
           tail -12 ../../evidence/adjacent.log
+          swift test -j 4 --filter 'BigSyncKitTests.test(StrictJournalUploadAcknowledgesOnlyItsPreparedGeneration|BoundUploadAcknowledgesPreparedGenerationAndForwardsNewerEdit|UploadAcknowledgesOnlyTheGenerationThatWasPrepared|DeletionAcknowledgesOnlyTheGenerationThatWasPrepared|OpaquePreparedUploadBatchSupportsPartialAcknowledgement|OpaqueUploadBatchReplayDoesNotOverwriteNewerGeneration|SuspendedUploadPreparationCannotJoinANewerAttempt|AccountSwitchDuringUploadPreparationSkipsCloudKitMutation|MixedPartialUploadFailureDoesNotDiscardTheUnresolvedError|MixedDeletePartialFailureAcknowledgesOnlySuccessfulGeneration|CrossRecordSaveResultCannotRetireAnotherPendingGeneration|UploadSuccessRequiresTheRequestedZoneOwnerZoneNameAndType)' > ../../evidence/journal-boundaries.log 2>&1 || { tail -180 ../../evidence/journal-boundaries.log; exit 1; }
+          tail -12 ../../evidence/journal-boundaries.log
       - name: Publish only reviewed source on normal PR history
         run: |
           set -euo pipefail
           cd source/BigSyncKit
-          test "$(git write-tree)" = 2899fd19c11bafaf1bd55a5305ddc07f06fe2626
+          test "$(git write-tree)" = e2fe9e9e9e81166711dd0fc56d18cece39cf3751
           git diff --cached --check
           git config user.name 'Codex'
           git config user.email 'codex@users.noreply.github.com'
