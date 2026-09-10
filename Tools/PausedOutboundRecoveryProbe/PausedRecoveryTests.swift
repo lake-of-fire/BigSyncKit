@@ -25,7 +25,6 @@ final class PausedOutboundRecoveryTests: XCTestCase {
     private func sealedFixture() async throws -> Fixture {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("PausedOutboundRecovery-\(UUID().uuidString)")
-        addTeardownBlock { try? FileManager.default.removeItem(at: base) }
         let principal = BigSyncOutboundPrincipal(
             durableStateNamespace: "probe",
             installationIdentifier: "install",
@@ -58,6 +57,7 @@ final class PausedOutboundRecoveryTests: XCTestCase {
     @BigSyncBackgroundActor
     func testPausedRecoveryRetainsRecoveryPhaseAndAdmitsNoOutboundBatch() async throws {
         let fixture = try await sealedFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.base) }
         let synchronizer = CloudKitSynchronizer(directory: fixture.base, principal: fixture.principal)
         let authority = Authority()
         let token = try await synchronizer.acquirePostBarrierRecoveryOwnership(
@@ -85,6 +85,7 @@ final class PausedOutboundRecoveryTests: XCTestCase {
     @BigSyncBackgroundActor
     func testRejectedDomainProofReleasesPhysicalRecoveryLocksButPreservesFence() async throws {
         let fixture = try await sealedFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.base) }
         let first = CloudKitSynchronizer(directory: fixture.base, principal: fixture.principal)
         do {
             _ = try await first.acquirePostBarrierRecoveryOwnership(
@@ -108,6 +109,7 @@ final class PausedOutboundRecoveryTests: XCTestCase {
     @BigSyncBackgroundActor
     func testDomainRevocationAfterProofCannotReturnLiveOwner() async throws {
         let fixture = try await sealedFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.base) }
         let synchronizer = CloudKitSynchronizer(directory: fixture.base, principal: fixture.principal)
         let authority = Authority()
         do {
@@ -130,6 +132,7 @@ final class PausedOutboundRecoveryTests: XCTestCase {
     @BigSyncBackgroundActor
     func testAccountReplacementOnFinalReadRejectsPausedOwner() async throws {
         let fixture = try await sealedFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.base) }
         let synchronizer = CloudKitSynchronizer(directory: fixture.base, principal: fixture.principal)
         synchronizer.replaceAccountOnRead = 2
         do {
@@ -148,18 +151,19 @@ final class PausedOutboundRecoveryTests: XCTestCase {
     @BigSyncBackgroundActor
     func testWorkerReplacementDuringProofCannotDeliverOldPausedOwner() async throws {
         let fixture = try await sealedFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.base) }
         let original = CloudKitSynchronizer(directory: fixture.base, principal: fixture.principal)
         let replacementBase = FileManager.default.temporaryDirectory
             .appendingPathComponent("PausedOutboundReplacement-\(UUID().uuidString)")
-        addTeardownBlock { try? FileManager.default.removeItem(at: replacementBase) }
+        defer { try? FileManager.default.removeItem(at: replacementBase) }
         let replacement = CloudKitSynchronizer(directory: replacementBase, principal: fixture.principal)
         let worker = BigSyncBackgroundActor.shared
-        await worker.install(original)
+        worker.install(original)
         do {
             _ = try await worker.acquirePostBarrierRecoveryOwnership(
                 expected: fixture.expected, revalidatingDomainOwner: {}
             ) { _ in
-                await worker.install(replacement)
+                worker.install(replacement)
                 return "proof-from-displaced-worker"
             }
             XCTFail("Displaced worker delivered old owner")
@@ -170,6 +174,6 @@ final class PausedOutboundRecoveryTests: XCTestCase {
         XCTAssertNil(original.postBarrierOutboundLease)
         XCTAssertNil(original.postBarrierOutboundTicket)
         try assertDurableFenceUnchanged(fixture)
-        await worker.install(nil)
+        worker.install(nil)
     }
 }
