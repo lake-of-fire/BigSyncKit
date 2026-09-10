@@ -1,100 +1,10 @@
-name: Deep transport refinement and native qualification
+name: Deep transport refinement audit evidence
 on:
-  push:
-    branches: [audit/transport-deep-review-20260910]
-    paths: [.github/workflows/transport-deep-refine.yml]
+  workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
-  native:
-    runs-on: macos-15
-    timeout-minutes: 25
+  evidence:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          path: review
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          ref: e73a7adc759ee25992dd8ed43129eabf2127b478
-          path: source/BigSyncKit
-      - uses: actions/checkout@v4
-        with:
-          repository: lake-of-fire/RealmSwiftGaps
-          ref: 3c0ccf00d734cae997bd34654a4f2efd01397531
-          path: source/RealmSwiftGaps
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: lake-of-fire/SwiftUtilities
-          ref: f437c7d06fc631cd7a67731279411c417cdf8077
-          path: source/SwiftUtilities
-          persist-credentials: false
-      - uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: '26.3'
-      - name: Qualify exact source and fast-forward PR 8
-        env:
-          BASE: e73a7adc759ee25992dd8ed43129eabf2127b478
-          BASE_TREE: 3c7ae540e566e116ba195a881700126a2f785e28
-          FINAL_TREE: 04f01caed422e53e033c2bea21355be40d287774
-          TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
-        run: |
-          set -euo pipefail
-          mkdir evidence
-          EVIDENCE="$PWD/evidence"
-          cat review/.review/deep-patch.1 review/.review/deep-patch.2 > "$EVIDENCE/refinement.patch.gz"
-          test "$(shasum -a 256 "$EVIDENCE/refinement.patch.gz" | cut -d' ' -f1)" = 5c89aa554bb61e1206a00092f884943aae0b26c964a0f415784c92b982e7521c
-          gzip -dc "$EVIDENCE/refinement.patch.gz" > "$EVIDENCE/refinement.patch"
-          test "$(shasum -a 256 "$EVIDENCE/refinement.patch" | cut -d' ' -f1)" = 1b61dec1eeeabe2b0ae8433ab65605d118f3bc51d7223f26a8a790ac71c0e554
-          test "$(git -C review hash-object .review/harness.patch)" = ad1c59df6ba1f48a0d8dfc1c403663319ec7beb7
-          cp review/.review/harness.patch "$EVIDENCE/harness.patch"
-          echo 'Before/after native regression evidence: run 34483778746, artifact 10154970718. Nine cases failed on original runtime; all 228 selected native tests passed with runtime patch before the standalone macOS harness deployment-target error stopped publication.' > "$EVIDENCE/prior-regression-evidence.txt"
-          cd source/BigSyncKit
-          test "$(git rev-parse HEAD)" = "$BASE"
-          test "$(git rev-parse HEAD^{tree})" = "$BASE_TREE"
-          git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/before.txt"
-          swift --version > "$EVIDENCE/swift.txt"
-          git apply --check "$EVIDENCE/refinement.patch"
-          git apply "$EVIDENCE/refinement.patch"
-          git apply --check "$EVIDENCE/harness.patch"
-          git apply "$EVIDENCE/harness.patch"
-          git diff --check
-          while IFS= read -r file; do
-            if [[ "$file" == *.swift ]]; then swiftc -frontend -parse "$file"; fi
-          done < <(git diff --name-only)
-          Tools/run-outbound-quiescence-portable-tests.sh > "$EVIDENCE/portable.log" 2>&1
-          Tools/run-outbound-quiescence-process-tests.sh > "$EVIDENCE/process.log" 2>&1
-          set +e
-          swift test -j 4 --filter 'CloudKitTerminalReceiptTests|BigSyncOutboundQuiescenceTests|CloudKitOutboundSettlementTests|CloudKitCursorPersistenceTests|CloudKitSynchronizerAccountFencingTests|AccountAuthorityPersistenceTests|ChangeFeedRecoveryStateTests|CloudKitAccountAvailabilityGateTests|BigSyncRecordIdentityBoundaryTests|BigSyncKitTests.testDeepRealm|BigSyncKitTests.testOutboundLeaseDoesNotAcknowledgeANewerRealmJournalGeneration' > "$EVIDENCE/native-fixed.log" 2>&1
-          result=$?
-          set -e
-          cp Package.resolved "$EVIDENCE/Package.resolved"
-          echo "$result" > "$EVIDENCE/native-exit.txt"
-          test "$result" -eq 0
-          grep -q 'Executed 228 tests, with 0 failures' "$EVIDENCE/native-fixed.log"
-          git restore Package.resolved
-          git add Documentation Sources Tests Tools
-          test "$(git write-tree)" = "$FINAL_TREE"
-          git diff --cached --check
-          git diff --cached --binary > "$EVIDENCE/fix.patch"
-          git config user.name Codex
-          git config user.email codex@users.noreply.github.com
-          git commit -m 'Fence resumed source ownership, restart promotion and terminal settlement'
-          test "$(git rev-parse HEAD^)" = "$BASE"
-          git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/after.txt"
-          git ls-tree -r HEAD > "$EVIDENCE/source-manifest.txt"
-          git archive --format=tar.gz HEAD > "$EVIDENCE/source.tar.gz"
-          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
-          test "$current" = "$BASE"
-          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
-          git ls-remote origin "refs/heads/$TARGET_BRANCH" > "$EVIDENCE/published.txt"
-          echo "PUBLISHED_COMMIT=$(git rev-parse HEAD)"
-          echo "PUBLISHED_TREE=$(git rev-parse HEAD^{tree})"
-          tail -25 "$EVIDENCE/native-fixed.log"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: deep-transport-refinement-final-evidence
-          path: evidence
-          retention-days: 30
+      - run: echo 'Publication completed at 9d10b6ebb742c3b900711c489c88604313f622ea; evidence is in run 34484922810. This audit branch cannot publish further source changes.'
