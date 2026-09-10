@@ -1,0 +1,536 @@
+name: Publish BigSync recovery descriptor
+
+on:
+  push:
+    branches:
+      - codex/bigsync-recovery-descriptor-20260910
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
+      EXPECTED_HEAD: 16c8e2acfcdfd44872d52e820f6020eb6bcea736
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Guard exact live parent
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$remote_head" = "$EXPECTED_HEAD"
+
+      - name: Apply structural recovery identity edits
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"{path}: expected one match for {old[:80]!r}, found {text.count(old)}")
+              p.write_text(text.replace(old, new, 1))
+
+          def replace_region(path, start, end, new):
+              p = Path(path)
+              text = p.read_text()
+              i = text.find(start)
+              if i < 0:
+                  raise SystemExit(f"{path}: missing start marker {start!r}")
+              j = text.find(end, i + len(start))
+              if j < 0:
+                  raise SystemExit(f"{path}: missing end marker {end!r}")
+              if text.find(start, i + 1) >= 0:
+                  raise SystemExit(f"{path}: non-unique start marker {start!r}")
+              p.write_text(text[:i] + new + text[j:])
+
+          q = "Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift"
+          replace_region(
+              q,
+              "public struct BigSyncOutboundSubmission: Codable, Equatable, Sendable {",
+              "public struct BigSyncOutboundQuiescenceSnapshot: Codable, Equatable, Sendable {",
+              '''public struct BigSyncOutboundSubmissionItem: Codable, Equatable, Sendable {
+              public enum Mutation: String, Codable, Sendable {
+                  case save
+                  case delete
+              }
+
+              public let mutation: Mutation
+              public let recordName: String
+              public let zoneName: String
+              public let zoneOwnerName: String
+              /// Present for saves; omitted for deletions. This is identity only,
+              /// never a persisted retry payload.
+              public let recordType: String?
+              /// Exact durable journal generation that prepared this item when the
+              /// adapter exposes one. A nil generation remains explicitly unsupported
+              /// for automatic journal reconciliation after an indeterminate crash.
+              public let preparedGeneration: String?
+              /// Change-tag witness carried by the prepared save, if one existed.
+              /// The record body itself remains exclusively in the Realm journal.
+              public let priorRecordChangeTag: String?
+
+              public init(
+                  mutation: Mutation,
+                  recordName: String,
+                  zoneName: String,
+                  zoneOwnerName: String,
+                  recordType: String?,
+                  preparedGeneration: String?,
+                  priorRecordChangeTag: String?
+              ) {
+                  self.mutation = mutation
+                  self.recordName = recordName
+                  self.zoneName = zoneName
+                  self.zoneOwnerName = zoneOwnerName
+                  self.recordType = recordType
+                  self.preparedGeneration = preparedGeneration
+                  self.priorRecordChangeTag = priorRecordChangeTag
+              }
+          }
+
+          /// Bounded recovery identity for one actual CloudKit mutation request.
+          /// It deliberately contains no field values, assets, retry payloads or
+          /// acknowledgement authority; the Realm journal remains authoritative.
+          public struct BigSyncOutboundSubmissionRecoveryDescriptor: Codable, Equatable, Sendable {
+              public let version: Int
+              public let items: [BigSyncOutboundSubmissionItem]
+
+              public init(items: [BigSyncOutboundSubmissionItem]) {
+                  version = 1
+                  self.items = items.sorted(by: Self.canonicalOrder)
+              }
+
+              fileprivate static func canonicalOrder(
+                  _ lhs: BigSyncOutboundSubmissionItem,
+                  _ rhs: BigSyncOutboundSubmissionItem
+              ) -> Bool {
+                  if lhs.zoneOwnerName != rhs.zoneOwnerName {
+                      return lhs.zoneOwnerName < rhs.zoneOwnerName
+                  }
+                  if lhs.zoneName != rhs.zoneName {
+                      return lhs.zoneName < rhs.zoneName
+                  }
+                  if lhs.recordName != rhs.recordName {
+                      return lhs.recordName < rhs.recordName
+                  }
+                  return lhs.mutation.rawValue < rhs.mutation.rawValue
+              }
+          }
+
+          public struct BigSyncOutboundSubmission: Codable, Equatable, Sendable {
+              public let identifier: UUID
+              public let principal: BigSyncOutboundPrincipal
+              /// Nil is accepted only for checkpoints written by older builds (and
+              /// low-level debug tests). New production requests persist this before
+              /// transport so a crash does not leave an opaque immortal UUID.
+              public let recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor?
+
+              public init(
+                  identifier: UUID,
+                  principal: BigSyncOutboundPrincipal,
+                  recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor? = nil
+              ) {
+                  self.identifier = identifier
+                  self.principal = principal
+                  self.recoveryDescriptor = recoveryDescriptor
+              }
+          }
+
+          /// An exact durable recovery checkpoint. Outstanding submissions carry
+          /// bounded record/journal identity but never record values, assets, retry
+          /// payloads or merge clocks. The existing Realm journal remains the sole
+          /// mutation and acknowledgement authority.
+          ''')
+
+          replace_once(
+              q,
+              "    static let maximumStateBytes = 8 * 1_024 * 1_024\n\n    let directory: URL",
+              '''    static let maximumStateBytes = 8 * 1_024 * 1_024
+              /// CloudKitSynchronizer itself never prepares more than 400 records
+              /// in one request. Keep recovery identity bounded to the same limit.
+              static let maximumRecoveryItemsPerSubmission = 400
+
+              private struct RecoveryRecordKey: Hashable {
+                  let recordName: String
+                  let zoneName: String
+                  let zoneOwnerName: String
+              }
+
+              let directory: URL'''
+          )
+
+          replace_region(
+              q,
+              "    fileprivate func willSubmit(_ batch: BigSyncOutboundBatchLease) throws -> UUID {",
+              "    fileprivate func didSettle(",
+              '''    fileprivate func willSubmit(
+                  _ batch: BigSyncOutboundBatchLease,
+                  recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor?
+              ) throws -> UUID {
+                  try batch.validateSubmissionAdmission()
+                  if let recoveryDescriptor,
+                     !validRecoveryDescriptor(recoveryDescriptor) {
+                      throw BigSyncOutboundQuiescenceError.invalidState
+                  }
+                  let id = UUID()
+                  try withState { state in
+                      // Already-admitted peers may finish even after a cutoff was
+                      // published. Their shared batch leases still prevent exclusive
+                      // acquisition; rejecting them here is unnecessary and loses work.
+                      var submissions = state.outstandingSubmissions
+                      guard submissions.count < 4_096 else {
+                          throw BigSyncOutboundQuiescenceError.recoveryRequired
+                      }
+                      submissions.append(BigSyncOutboundSubmission(
+                          identifier: id,
+                          principal: batch.principal,
+                          recoveryDescriptor: recoveryDescriptor
+                      ))
+                      try write(BigSyncOutboundQuiescenceSnapshot(
+                          barrier: state.barrier,
+                          submissions: submissions,
+                          recoveryEvidenceID: state.lastRecoveryEvidenceID
+                      ))
+                  }
+                  return id
+              }
+
+          ''')
+
+          replace_once(
+              q,
+              "state.outstandingSubmissions.allSatisfy({ validPrincipal($0.principal) })",
+              "state.outstandingSubmissions.allSatisfy(validSubmission)"
+          )
+
+          replace_once(
+              q,
+              "    private func validBarrier(_ barrier: BigSyncOutboundBarrier) -> Bool {\n",
+              '''    private func validSubmission(_ submission: BigSyncOutboundSubmission) -> Bool {
+                  validPrincipal(submission.principal)
+                      && submission.recoveryDescriptor.map(validRecoveryDescriptor) != false
+              }
+
+              private func validRecoveryDescriptor(
+                  _ descriptor: BigSyncOutboundSubmissionRecoveryDescriptor
+              ) -> Bool {
+                  guard descriptor.version == 1,
+                        !descriptor.items.isEmpty,
+                        descriptor.items.count <= Self.maximumRecoveryItemsPerSubmission,
+                        descriptor.items == descriptor.items.sorted(
+                            by: BigSyncOutboundSubmissionRecoveryDescriptor.canonicalOrder
+                        ) else {
+                      return false
+                  }
+                  let keys = descriptor.items.map {
+                      RecoveryRecordKey(
+                          recordName: $0.recordName,
+                          zoneName: $0.zoneName,
+                          zoneOwnerName: $0.zoneOwnerName
+                      )
+                  }
+                  guard Set(keys).count == keys.count else { return false }
+                  return descriptor.items.allSatisfy { item in
+                      guard validRecoveryComponent(item.recordName),
+                            validRecoveryComponent(item.zoneName),
+                            validRecoveryComponent(item.zoneOwnerName) else {
+                          return false
+                      }
+                      if let generation = item.preparedGeneration,
+                         !validRecoveryComponent(generation) {
+                          return false
+                      }
+                      if let changeTag = item.priorRecordChangeTag,
+                         !validRecoveryComponent(changeTag) {
+                          return false
+                      }
+                      switch item.mutation {
+                      case .save:
+                          guard let recordType = item.recordType,
+                                validRecoveryComponent(recordType) else {
+                              return false
+                          }
+                      case .delete:
+                          guard item.recordType == nil,
+                                item.priorRecordChangeTag == nil else {
+                              return false
+                          }
+                      }
+                      return true
+                  }
+              }
+
+              private func validRecoveryComponent(_ value: String) -> Bool {
+                  !value.isEmpty && value.utf8.count <= 4_096
+              }
+
+              private func validBarrier(_ barrier: BigSyncOutboundBarrier) -> Bool {
+          ''')
+
+          replace_region(
+              q,
+              "    func willSubmit() throws {",
+              "    /// Remember a definitive server outcome",
+              '''    func willSubmit(
+                  recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor
+              ) throws {
+                  guard submissionID == nil else {
+                      throw BigSyncOutboundQuiescenceError.invalidState
+                  }
+                  transportOutcomeIsDefinitive = false
+                  submissionID = try coordinator.willSubmit(
+                      self,
+                      recoveryDescriptor: recoveryDescriptor
+                  )
+              }
+
+              /// Compatibility for low-level debug tests that exercise only lock and
+              /// marker lifetime. Release transport must always provide real recovery
+              /// identity before entering CloudKit.
+              @available(*, deprecated, message: "Production submissions must provide a recovery descriptor")
+              func willSubmit() throws {
+                  guard _isDebugAssertConfiguration(), submissionID == nil else {
+                      throw BigSyncOutboundQuiescenceError.invalidState
+                  }
+                  transportOutcomeIsDefinitive = false
+                  submissionID = try coordinator.willSubmit(self, recoveryDescriptor: nil)
+              }
+
+          ''')
+
+          replace_region(
+              q,
+              "    func willSubmitCooperatively() async throws {",
+              "    func didSettleCooperatively() async throws {",
+              '''    func willSubmitCooperatively(
+                  recoveryDescriptor: BigSyncOutboundSubmissionRecoveryDescriptor
+              ) async throws {
+                  while true {
+                      try Task.checkCancellation()
+                      do {
+                          try willSubmit(recoveryDescriptor: recoveryDescriptor)
+                          return
+                      } catch BigSyncOutboundQuiescenceError.busy {
+                          try await Task.sleep(nanoseconds: 1_000_000)
+                      }
+                  }
+              }
+
+              @available(*, deprecated, message: "Production submissions must provide a recovery descriptor")
+              func willSubmitCooperatively() async throws {
+                  guard _isDebugAssertConfiguration() else {
+                      throw BigSyncOutboundQuiescenceError.invalidState
+                  }
+                  while true {
+                      try Task.checkCancellation()
+                      do { try willSubmit(); return }
+                      catch BigSyncOutboundQuiescenceError.busy {
+                          try await Task.sleep(nanoseconds: 1_000_000)
+                      }
+                  }
+              }
+
+          ''')
+
+          o = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift"
+          replace_region(
+              o,
+              "    internal func modifyRecordsHoldingOutboundLease(",
+              "    internal func validateOutboundBatch(",
+              '''    private func outboundRecoveryDescriptor(
+                  saving records: [CKRecord],
+                  deleting recordIDs: [CKRecord.ID],
+                  preparedGenerations: [String: String]
+              ) -> BigSyncOutboundSubmissionRecoveryDescriptor {
+                  let saves = records.map { record in
+                      BigSyncOutboundSubmissionItem(
+                          mutation: .save,
+                          recordName: record.recordID.recordName,
+                          zoneName: record.recordID.zoneID.zoneName,
+                          zoneOwnerName: record.recordID.zoneID.ownerName,
+                          recordType: record.recordType,
+                          preparedGeneration: preparedGenerations[record.recordID.recordName],
+                          priorRecordChangeTag: record.recordChangeTag
+                      )
+                  }
+                  let deletes = recordIDs.map { recordID in
+                      BigSyncOutboundSubmissionItem(
+                          mutation: .delete,
+                          recordName: recordID.recordName,
+                          zoneName: recordID.zoneID.zoneName,
+                          zoneOwnerName: recordID.zoneID.ownerName,
+                          recordType: nil,
+                          preparedGeneration: preparedGenerations[recordID.recordName],
+                          priorRecordChangeTag: nil
+                      )
+                  }
+                  return BigSyncOutboundSubmissionRecoveryDescriptor(items: saves + deletes)
+              }
+
+              internal func modifyRecordsHoldingOutboundLease(
+                  _ outbound: BigSyncOutboundBatchLease,
+                  attemptID: UUID,
+                  saving records: [CKRecord],
+                  deleting recordIDs: [CKRecord.ID],
+                  preparedGenerations: [String: String]
+              ) async throws -> CloudKitRecordMutationResults {
+                  let recoveryDescriptor = outboundRecoveryDescriptor(
+                      saving: records,
+                      deleting: recordIDs,
+                      preparedGenerations: preparedGenerations
+                  )
+                  try await outbound.willSubmitCooperatively(
+                      recoveryDescriptor: recoveryDescriptor
+                  )
+                  do {
+                      try validateOutboundBatch(outbound, for: attemptID)
+                      try outbound.validateSubmissionAdmission()
+                  } catch {
+                      // No request has entered transport. Cancellation/epoch replacement
+                      // here cannot manufacture an unknown server outcome.
+                      try await outbound.didSettleCooperatively()
+                      throw error
+                  }
+                  let results: CloudKitRecordMutationResults
+                  do {
+                      results = try await recordStore.modifyRecords(
+                          saving: records,
+                          deleting: recordIDs,
+                          savePolicy: .ifServerRecordUnchanged,
+                          atomically: false
+                      )
+                  } catch {
+                      // An operation-wide definitive rejection (for example the batch
+                      // limit) did not commit either and requires no per-item local ack.
+                      // Preserve the original retry/error behavior without leaving a
+                      // phantom indeterminate submission.
+                      if CloudKitRecordMutationResults.isDefinitiveOperationRejection(error) {
+                          try await outbound.didSettleCooperatively()
+                      }
+                      throw error
+                  }
+                  // A definitive server response is not enough to release the durable
+                  // marker yet. Record it in the batch, then let the caller release the
+                  // marker only after generation-matched local response processing. If
+                  // cancellation or an authority fence wins in that window, process death
+                  // loses this in-memory note but deliberately leaves the durable marker.
+                  if results.provesDefinitiveSettlement(
+                      saving: records,
+                      deleting: recordIDs
+                  ) {
+                      try outbound.noteDefinitiveTransportOutcome()
+                  }
+                  return results
+              }
+
+          ''')
+
+          r = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift"
+          replace_once(
+              r,
+              "                outbound, attemptID: attemptID, saving: records, deleting: [])",
+              '''                outbound,
+                              attemptID: attemptID,
+                              saving: records,
+                              deleting: [],
+                              preparedGenerations: generations
+                          )'''
+          )
+          replace_once(
+              r,
+              "                outbound, attemptID: attemptID, saving: [], deleting: recordIDs)",
+              '''                outbound,
+                              attemptID: attemptID,
+                              saving: [],
+                              deleting: recordIDs,
+                              preparedGenerations: generations
+                          )'''
+          )
+
+          t = "Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift"
+          marker = "    func testPeerScopeMustFinishBeforeExclusiveQuiescence() async throws {\n"
+          replace_once(t, marker, '''    func testSubmissionPersistsExactRecoveryIdentity() throws {
+                  let (_, peer, _, principal) = fixture()
+                  let batch = try peer.admit(principal: principal)
+                  let descriptor = BigSyncOutboundSubmissionRecoveryDescriptor(items: [
+                      BigSyncOutboundSubmissionItem(
+                          mutation: .save,
+                          recordName: "record-1",
+                          zoneName: "zone",
+                          zoneOwnerName: "owner",
+                          recordType: "Article",
+                          preparedGeneration: "generation-1",
+                          priorRecordChangeTag: "change-tag-1"
+                      )
+                  ])
+                  try batch.willSubmit(recoveryDescriptor: descriptor)
+                  let submission = try XCTUnwrap(
+                      peer.snapshot().outstandingSubmissions.first
+                  )
+                  XCTAssertEqual(submission.recoveryDescriptor, descriptor)
+                  try batch.didSettle()
+              }
+
+              func testSubmissionRejectsDuplicateRecoveryRecordIdentity() throws {
+                  let (_, peer, _, principal) = fixture()
+                  let batch = try peer.admit(principal: principal)
+                  let item = BigSyncOutboundSubmissionItem(
+                      mutation: .save,
+                      recordName: "record-1",
+                      zoneName: "zone",
+                      zoneOwnerName: "owner",
+                      recordType: "Article",
+                      preparedGeneration: "generation-1",
+                      priorRecordChangeTag: nil
+                  )
+                  let duplicate = BigSyncOutboundSubmissionRecoveryDescriptor(
+                      items: [item, item]
+                  )
+                  XCTAssertThrowsError(
+                      try batch.willSubmit(recoveryDescriptor: duplicate)
+                  ) {
+                      XCTAssertEqual(
+                          $0 as? BigSyncOutboundQuiescenceError,
+                          .invalidState
+                      )
+                  }
+                  XCTAssertTrue(try peer.snapshot().outstandingSubmissions.isEmpty)
+              }
+
+          ''' + marker)
+          PY
+
+          test "$(git grep -n 'modifyRecordsHoldingOutboundLease(' -- Sources/BigSyncKit | wc -l | tr -d ' ')" = "3"
+          if git grep -n 'willSubmitCooperatively()' -- Sources/BigSyncKit | grep -v 'func willSubmitCooperatively' ; then
+            echo 'Unexpected production call without recovery descriptor' >&2
+            exit 1
+          fi
+          git diff --check
+          git diff --stat
+
+      - name: Commit and guarded fast-forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$remote_head" = "$EXPECTED_HEAD"
+          git config user.name "Alex Ehlke"
+          git config user.email "alex.ehlke@gmail.com"
+          git add Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift \
+                  Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift
+          git commit -m "Persist exact outbound submission recovery identity [skip ci]"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
