@@ -38,6 +38,7 @@ extension CloudKitSynchronizer {
         outboundRecoveryID = requestID
         defer { if outboundRecoveryID == requestID { outboundRecoveryID = nil } }
 
+        @BigSyncBackgroundActor
         func validateOwnership() throws {
             try Task.checkCancellation()
             try revalidatingDomainOwner()
@@ -95,12 +96,15 @@ extension BigSyncBackgroundActor {
             revalidatingDomainOwner: { @BigSyncBackgroundActor in
                 guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
                 try revalidatingDomainOwner()
+                // A synchronous host callback can replace the installed worker.
+                guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
             },
             authorizingRecovery: authorizingRecovery)
         do {
             try Task.checkCancellation()
             guard realmSynchronizer === synchronizer else { throw CancellationError() }
             try revalidatingDomainOwner()
+            guard realmSynchronizer === synchronizer else { throw CancellationError() }
             _ = try synchronizer.validatePostBarrierOutboundQuiescence(token)
         } catch {
             synchronizer.abandonPostBarrierOutboundQuiescence(token)
