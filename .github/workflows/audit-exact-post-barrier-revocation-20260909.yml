@@ -1,0 +1,97 @@
+name: Audit exact post barrier revocation
+on:
+  push:
+    branches:
+      - audit/push-immediate-account-fence-tests-20260909
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/ordered-v2-followup-ownership-20260909
+          fetch-depth: 0
+      - name: Add exact post-barrier revocation API
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=369306381434fdea0c02743c57d05a2cd30dfdf7
+          test "$(git rev-parse HEAD)" = "$expected"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
+          s=p.read_text()
+          anchor='''        postBarrierDrainAuthorization = authorization
+        return authorization
+    }
+
+    /// Materializes an opaque completed-drain capability from the exact
+'''
+          insert='''        postBarrierDrainAuthorization = authorization
+        return authorization
+    }
+
+    /// Revokes only the exact post-barrier authorization supplied by its
+    /// holder. An in-flight synchronization may continue as an ordinary drain,
+    /// but it can no longer mint a completed cutover capability. If that exact
+    /// drain already completed before the caller observed failure, invalidate
+    /// the unconsumed completed capability as well. Ordinary receipts and
+    /// publication evidence remain untouched.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func revokePostBarrierDrainAuthorization(
+        _ authorization: PostBarrierDrainAuthorization
+    ) -> Bool {
+        guard authorization.issuerID == synchronizationReceiptIssuerID else {
+            return false
+        }
+        var revoked = false
+        if postBarrierDrainAuthorization == authorization {
+            postBarrierDrainAuthorization = nil
+            revoked = true
+        }
+        if completedPostBarrierDrain?.postBarrierDrainAuthorizationID
+            == authorization.authorizationID {
+            completedPostBarrierDrain = nil
+            revoked = true
+        }
+        return revoked
+    }
+
+    /// Materializes an opaque completed-drain capability from the exact
+'''
+          if s.count(anchor)!=1: raise SystemExit('authorization anchor mismatch')
+          p.write_text(s.replace(anchor,insert,1))
+
+          p=Path('Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift')
+          s=p.read_text()
+          anchor='''    @BigSyncBackgroundActor
+    public func completedPostBarrierDrain(
+'''
+          insert='''    /// Revokes only a capability issued by the currently installed worker.
+    /// This does not cancel or await an ordinary synchronization run.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func revokePostBarrierDrainAuthorization(
+        _ authorization: CloudKitSynchronizer.PostBarrierDrainAuthorization
+    ) -> Bool {
+        guard let synchronizer = realmSynchronizer else { return false }
+        return synchronizer.revokePostBarrierDrainAuthorization(authorization)
+    }
+
+    @BigSyncBackgroundActor
+    public func completedPostBarrierDrain(
+'''
+          if s.count(anchor)!=1: raise SystemExit('worker anchor mismatch')
+          p.write_text(s.replace(anchor,insert,1))
+          PY
+          git diff --check
+          swiftc -frontend -parse Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          swiftc -frontend -parse Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
+          git config user.name 'Alex Ehlke'
+          git config user.email '71601+aehlke@users.noreply.github.com'
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
+          git commit -m 'Allow exact post-barrier authorization revocation'
+          git push origin HEAD:codex/ordered-v2-followup-ownership-20260909
