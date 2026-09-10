@@ -26,7 +26,7 @@ jobs:
           BASE: 4d33bce325e68b5e2c3b61317e3a42dee61064a9
           BASE_TREE: 7508f0ff846c4011dbfc7b5d3a6fab74d713b383
           TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
-          PATCH_SHA256: 3f24c6688301baba6a68305bf0ee3cb7c6969a9b33f705f5aeead8afd467ea7a
+          PATCH_SHA256: 5867d1f561cb6a9eeea4af5475c269084300d3a0f59b907ae24409727f8dd834e
         run: |
           set -euo pipefail
           test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
