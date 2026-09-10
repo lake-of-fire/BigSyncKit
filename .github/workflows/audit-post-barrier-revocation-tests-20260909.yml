@@ -1,0 +1,37 @@
+name: Audit post barrier revocation tests
+on:
+  push:
+    branches:
+      - audit/post-barrier-revocation-tests-20260909
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/ordered-v2-followup-ownership-20260909
+          fetch-depth: 0
+      - name: Add revocation regression cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=2934cf19e2735f157e001822b67ce3f84640dfee
+          test "$(git rev-parse HEAD)" = "$expected"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift')
+          s=p.read_text()
+          marker='\nprivate actor ReceiptAccount {'
+          if s.count(marker)!=1: raise SystemExit('test insertion anchor mismatch')
+          tests='''\n\nextension CloudKitTerminalReceiptTests {\n    @BigSyncBackgroundActor\n    func testRevokingArmedPostBarrierAuthorizationDowngradesDrainAndAllowsRearm() async throws {\n        let fixture = Fixture(useReplicaBinding: true)\n        _ = try await fixture.drain()\n        fixture.synchronizer.postBarrierSnapshotIdentifierProvider = { "snapshot-scope" }\n        let authorization = try fixture.synchronizer.establishPostBarrierDrain(\n            writerBarrierEvidenceID: "test-barrier")\n        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))\n        let receipt = try await fixture.drain()\n        XCTAssertNil(receipt.postBarrierDrainAuthorizationID)\n        await assertRejected {\n            _ = try await fixture.synchronizer.completedPostBarrierDrain(\n                using: receipt, authorizedBy: authorization)\n        }\n        let next = try fixture.synchronizer.establishPostBarrierDrain(\n            writerBarrierEvidenceID: "test-barrier-2")\n        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(next))\n    }\n\n    @BigSyncBackgroundActor\n    func testRevokingCompletedPostBarrierAuthorizationInvalidatesOnlyCutoverCapability() async throws {\n        let fixture = Fixture(useReplicaBinding: true)\n        let (receipt, authorization) = try await fixture.postBarrierDrain()\n        let completed = try await fixture.synchronizer.completedPostBarrierDrain(\n            using: receipt, authorizedBy: authorization)\n        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))\n        XCTAssertThrowsError(try fixture.synchronizer.validatePostBarrierDrainPrincipal(completed))\n        try await fixture.synchronizer.revalidateTerminalReceipt(receipt)\n        XCTAssertFalse(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))\n    }\n}\n'''
+          p.write_text(s.replace(marker, tests + marker, 1))
+          PY
+          git diff --check
+          swiftc -frontend -parse Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          git config user.name 'Alex Ehlke'
+          git config user.email '71601+aehlke@users.noreply.github.com'
+          git add Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          git commit -m 'Cover exact post-barrier authorization revocation'
+          git push origin HEAD:codex/ordered-v2-followup-ownership-20260909
