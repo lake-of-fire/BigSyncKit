@@ -1,0 +1,52 @@
+name: Publish paused outbound recovery without tests
+on:
+  push:
+    branches: [audit/paused-recovery-publish-20260910]
+permissions:
+  contents: write
+concurrency:
+  group: paused-recovery-publish-20260910
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Publish exact source increment
+        env:
+          BASE: cccee00faeab5855941f270f5ad6fa0ab484caf1
+          TARGET: codex/ordered-v2-followup-ownership-20260909
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object .review/paused-recovery.patch)" = d7a45151629b585c08fde81ab0d7daa77612f64b
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p = Path('.review/paused-recovery.patch').read_bytes()
+          assert p.count(b'\n diff --git ') == 1
+          p = p.replace(b'\n diff --git ', b'\ndiff --git ', 1)
+          assert hashlib.sha256(p).hexdigest() == 'e2d831224cd13ee8de36f2f4bcf94e49cdf7e554f749ab3cd5508c775d58597a'
+          Path('/tmp/paused.patch').write_bytes(p)
+          PY
+          test "$(git ls-remote origin "refs/heads/$TARGET" | cut -f1)" = "$BASE"
+          git checkout --detach "$BASE"
+          git apply --index /tmp/paused.patch
+          git diff --cached --check
+          test "$(git diff --cached --name-only | wc -l)" -eq 3
+          test "$(git hash-object Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift)" = 0dc78f9e8f6a9c719db87352d1a2f68cd49eccf1
+          test "$(git hash-object Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+PausedOutboundRecovery.swift)" = 62c34f587ff99e746ca42acee4782de9f659619c
+          test "$(git hash-object Documentation/OutboundConsumerIntegration.md)" = 2d2a9ef25ac3d275617c21d28dc83add8ebca4a4
+          git config user.name Codex
+          git config user.email codex@users.noreply.github.com
+          git commit -m 'Reacquire sealed domain recovery without enabling uploads [skip ci]'
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          test "$(git ls-remote origin "refs/heads/$TARGET" | cut -f1)" = "$BASE"
+          git push origin "HEAD:refs/heads/$TARGET"
+          test "$(git ls-remote origin "refs/heads/$TARGET" | cut -f1)" = "$(git rev-parse HEAD)"
+          echo "PUBLISHED_COMMIT=$(git rev-parse HEAD)"
+          echo "PUBLISHED_TREE=$(git rev-parse HEAD^{tree})"
+          echo 'No test, compiler, Tuist or CloudKit execution in this publication.'

@@ -1,0 +1,203 @@
+diff --git a/Documentation/OutboundConsumerIntegration.md b/Documentation/OutboundConsumerIntegration.md
+index 83cb230..2d2a9ef 100644
+--- a/Documentation/OutboundConsumerIntegration.md
++++ b/Documentation/OutboundConsumerIntegration.md
+@@ -44,3 +44,28 @@ New completion APIs are in `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchroniz
+ ## Qualification
+ 
+ This completion increment is implementation-only. No tests, native build, Tuist regeneration or CloudKit account operations were run for it. Earlier evidence belongs to its exact earlier source revision. Keep source PRs draft and production activation disabled pending the composed release qualification.
++
++## Restart before the accepted domain graph is ready
++
++A restarted sealed reservation may need exclusive physical ownership to finish
++its accepted snapshot or archive/adopt a winner, while the local graph is not yet
++ready for source publication. Neither clearing the peer fence nor claiming a
++source-only graph early is a valid acquisition shortcut.
++
++`acquirePostBarrierRecoveryOwnership(expected:revalidatingDomainOwner:authorizingRecovery:)`
++exists on both the synchronizer and background worker. It takes exclusive owner
++and batch locks, holds them across the host's exact settlement/operation proof,
++rechecks the real account and host admission after the final suspension, and
++returns a fresh live acquisition in **the same `recoveryRequired` phase**. All
++outbound admission remains disabled. The host proof must reconcile every
++outstanding request and its required generation-matched local handling. Missing
++settlement support must throw and preserve the original checkpoint.
++
++This API cannot reacquire `preparing` as an aggregate-drain authorization and
++cannot be used to downgrade `sourcePublication`. It does not assert a committed
++domain graph, authorize a conditional head save, or fabricate a terminal receipt.
++After the host finishes its exact accepted-domain decision and durably switches
++writers/outbound selection, the existing `beginPostBarrierSourcePublication`
++handoff can enable this owner's source batches. Final release still follows
++source acknowledgement and durable domain completion. Failure or cancellation
++abandons only this live acquisition and never reopens peer admission.
+ diff --git a/Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift b/Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift
+index 7825da8..0dc78f9 100644
+--- a/Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift
++++ b/Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift
+@@ -304,6 +304,48 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
+         recovery.close()
+     }
+ 
++    /// Reacquire a sealed reservation without enabling ANY outbound work. The
++    /// host may still need to finish/adopt its accepted graph before it can
++    /// truthfully authorize source publication. Unlike generic resolution this
++    /// keeps peers fenced; unlike source resume this does not claim a committed
++    /// source graph. No preparing/final-aggregate capability can be recreated.
++    func retainPausedRecoveryOwnership(
++        _ recovery: BigSyncOutboundRecoveryLease,
++        principal: BigSyncOutboundPrincipal,
++        recoveryEvidenceID: String
++    ) throws -> BigSyncOutboundQuiescenceLease {
++        guard recovery.directory == directory, !recovery.closed,
++              validEvidence(recoveryEvidenceID), validPrincipal(principal),
++              let ownership = recovery.owner, let batches = recovery.batches else {
++            throw BigSyncOutboundQuiescenceError.staleAuthority
++        }
++        try ownership.validateIdentity()
++        try batches.validateIdentity()
++        let barrier = try withState { state -> BigSyncOutboundBarrier in
++            guard state == recovery.snapshot,
++                  let barrier = state.barrier,
++                  barrier.phase == .recoveryRequired,
++                  barrier.principal == principal else {
++                throw BigSyncOutboundQuiescenceError.staleAuthority
++            }
++            // The required host proof covers definitive settlement AND local
++            // generation reconciliation of every marker in this exact snapshot.
++            // The existing Realm journal remains the sole mutation authority.
++            try write(BigSyncOutboundQuiescenceSnapshot(
++                barrier: barrier, submissions: [],
++                recoveryEvidenceID: recoveryEvidenceID))
++            return barrier
++        }
++        recovery.owner = nil
++        recovery.batches = nil
++        recovery.closed = true
++        let owner = BigSyncOutboundQuiescenceLease(
++            coordinator: self, ownerLease: ownership, barrier: barrier)
++        owner.batchLease = batches
++        // Both admission flags deliberately retain their false defaults.
++        return owner
++    }
++
+     /// Convert exact crash/restart recovery ownership into owner-only source
+     /// publication without ever opening peer admission. The caller's durable
+     /// proof authorizes settlement of every uncertainty marker in `snapshot`;
+diff --git a/Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+PausedOutboundRecovery.swift b/Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+PausedOutboundRecovery.swift
+new file mode 100644
+index 0000000..62c34f5
+--- /dev/null
++++ b/Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+PausedOutboundRecovery.swift
+@@ -0,0 +1,111 @@
++import Foundation
++
++extension CloudKitSynchronizer {
++    /// Recover physical ownership of an exact sealed reservation while leaving
++    /// ALL outbound admission disabled. This is for finishing/adopting a domain
++    /// graph that is not yet ready for `beginPostBarrierSourcePublication`.
++    ///
++    /// The required proof must validate the original operation/principal and
++    /// reconcile every unresolved submission, including generation-matched local
++    /// response handling. An empty journal, a fetch, or a disappeared OS lock is
++    /// not settlement evidence. The proof must not reopen domain/legacy writers.
++    ///
++    /// The returned acquisition retains `recoveryRequired`: it cannot arm an
++    /// aggregate drain or admit a source batch. After the host durably commits
++    /// its source-only graph, use the existing source-publication handoff. On
++    /// failure abandon this exact token without reopening the durable fence.
++    public func acquirePostBarrierRecoveryOwnership(
++        expected: BigSyncOutboundQuiescenceSnapshot,
++        revalidatingDomainOwner: @Sendable @BigSyncBackgroundActor () throws -> Void,
++        authorizingRecovery: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
++    ) async throws -> PostBarrierOutboundQuiescence {
++        try Task.checkCancellation()
++        try revalidatingDomainOwner()
++        guard !syncing, !synchronizationDrainIsActive,
++              postBarrierOutboundLease == nil, postBarrierOutboundTicket == nil,
++              postBarrierDrainAuthorization == nil, outboundRecoveryID == nil else {
++            throw BigSyncOutboundQuiescenceError.busy
++        }
++        let principal = try currentOutboundPrincipal()
++        guard let barrier = expected.barrier,
++              barrier.phase == .recoveryRequired,
++              barrier.principal == principal else {
++            throw BigSyncOutboundQuiescenceError.staleAuthority
++        }
++        let attemptID = synchronizationAttemptID
++        let requestID = UUID()
++        let recovery = try outboundQuiescenceCoordinator.takeRecoveryOwnership(expected: expected)
++        outboundRecoveryID = requestID
++        defer { if outboundRecoveryID == requestID { outboundRecoveryID = nil } }
++
++        func validateOwnership() throws {
++            try Task.checkCancellation()
++            try revalidatingDomainOwner()
++            guard outboundRecoveryID == requestID,
++                  synchronizationAttemptID == attemptID,
++                  !syncing, !synchronizationDrainIsActive,
++                  try currentOutboundPrincipal() == principal else {
++                throw BigSyncOutboundQuiescenceError.staleAuthority
++            }
++        }
++        try validateOwnership()
++        let account = try await accountIdentifierProvider()
++        try validateOwnership()
++        guard Self.accountScopeIdentifier(for: account) == principal.accountScopeIdentifier else {
++            throw BigSyncOutboundQuiescenceError.staleAuthority
++        }
++        let evidence = try await authorizingRecovery(expected)
++        try validateOwnership()
++        let confirmedAccount = try await accountIdentifierProvider()
++        try validateOwnership()
++        guard confirmedAccount == account else {
++            throw BigSyncOutboundQuiescenceError.staleAuthority
++        }
++        let owner = try outboundQuiescenceCoordinator.retainPausedRecoveryOwnership(
++            recovery, principal: principal, recoveryEvidenceID: evidence)
++        let token = PostBarrierOutboundQuiescence(
++            identifier: owner.barrier.identifier,
++            writerBarrierEvidenceID: owner.barrier.writerBarrierEvidenceID,
++            issuerID: synchronizationReceiptIssuerID, principal: principal)
++        postBarrierOutboundLease = owner
++        postBarrierOutboundTicket = token
++        do {
++            try validateOwnership()
++            _ = try validatePostBarrierOutboundQuiescence(token)
++        } catch {
++            abandonPostBarrierOutboundQuiescence(token)
++            throw error
++        }
++        return token
++    }
++}
++
++extension BigSyncBackgroundActor {
++    /// Same paused recovery handoff, additionally fenced to the worker that
++    /// was installed before the proof and account-provider suspensions.
++    @BigSyncBackgroundActor
++    public func acquirePostBarrierRecoveryOwnership(
++        expected: BigSyncOutboundQuiescenceSnapshot,
++        revalidatingDomainOwner: @Sendable @BigSyncBackgroundActor () throws -> Void,
++        authorizingRecovery: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
++    ) async throws -> CloudKitSynchronizer.PostBarrierOutboundQuiescence {
++        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
++        let token = try await synchronizer.acquirePostBarrierRecoveryOwnership(
++            expected: expected,
++            revalidatingDomainOwner: { @BigSyncBackgroundActor in
++                guard self.realmSynchronizer === synchronizer else { throw CancellationError() }
++                try revalidatingDomainOwner()
++            },
++            authorizingRecovery: authorizingRecovery)
++        do {
++            try Task.checkCancellation()
++            guard realmSynchronizer === synchronizer else { throw CancellationError() }
++            try revalidatingDomainOwner()
++            _ = try synchronizer.validatePostBarrierOutboundQuiescence(token)
++        } catch {
++            synchronizer.abandonPostBarrierOutboundQuiescence(token)
++            throw error
++        }
++        return token
++    }
++}
