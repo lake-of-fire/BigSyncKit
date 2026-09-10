@@ -1,4 +1,4 @@
-name: Worker 1 worker-establishment cancellation publish
+name: Worker 1 worker recovery ownership publish
 
 on:
   push:
@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: worker1-establish-cancellation-pr8
-  cancel-in-progress: false
+  group: worker1-recovery-ownership-pr8
+  cancel-in-progress: true
 
 jobs:
   publish:
@@ -20,25 +20,30 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Verify worker cancellation cleanup and fast-forward PR 8
+      - name: Verify worker recovery ownership and fast-forward PR 8
         shell: bash
         env:
           BASE: 4d33bce325e68b5e2c3b61317e3a42dee61064a9
           BASE_TREE: 7508f0ff846c4011dbfc7b5d3a6fab74d713b383
           TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
-          PATCH_SHA256: 5867d1f561cb6a9eea4af5475c269084300d3a0f59b907ae24409727f8dd834e
+          SCRIPT_BLOB: 26ef306e8eac6d994647062777b9a5341b7791f0
         run: |
           set -euo pipefail
           test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
-          test "$(sha256sum .worker1-publish/worker-establish-cancellation.patch | cut -d' ' -f1)" = "$PATCH_SHA256"
-          cp .worker1-publish/worker-establish-cancellation.patch /tmp/refinement.patch
+          test "$(git hash-object .worker1-publish/apply-worker-recovery-fixes.py)" = "$SCRIPT_BLOB"
+          cp .worker1-publish/apply-worker-recovery-fixes.py /tmp/apply.py
           current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
           test "$current" = "$BASE"
           git checkout --detach "$BASE"
-          git apply --check /tmp/refinement.patch
-          git apply /tmp/refinement.patch
+          python3 /tmp/apply.py
           git diff --check
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n%s' \
+            'Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift' \
+            'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift' | sort)"
+          test "$changed" = "$expected"
           swiftc -frontend -parse Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
+          swiftc -frontend -parse Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift
           Tools/run-outbound-quiescence-portable-tests.sh
           Tools/run-outbound-quiescence-process-tests.sh
           git add -A
@@ -46,8 +51,8 @@ jobs:
           export GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
           export GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
           commit="$(printf '%s\n\n%s\n' \
-            'Revoke lost final-drain authorization on worker cancellation' \
-            'If cancellation lands after post-barrier establishment succeeds but before the worker returns the authorization, revoke that exact authorization so a capability the caller never received cannot remain armed. Keep the durable cutoff/token for explicit abort or recovery.' \
+            'Fence worker ownership through final recovery suspension' \
+            'Revoke a post-barrier authorization if caller cancellation lands after establishment but before delivery, and carry the background-worker ownership check through every recovery suspension so a displaced synchronizer cannot reopen the durable outbound gate after the final account lookup.' \
             | git commit-tree "$tree" -p "$BASE")"
           test "$(git rev-parse "$commit^")" = "$BASE"
           current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
