@@ -1980,6 +1980,7 @@ public class CloudKitSynchronizer: NSObject {
         guard activeRunContext == context,
               synchronizationAttemptID == context.attemptID,
               synchronizationRunID == context.runID,
+              !accountScopeAuthorityFence.requiresGenerationRotation,
               !cancelSync else {
             throw CancellationError()
         }
