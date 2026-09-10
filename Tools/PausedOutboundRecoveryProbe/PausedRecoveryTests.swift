@@ -45,11 +45,15 @@ final class PausedOutboundRecoveryTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    private func observer(_ fixture: Fixture) -> BigSyncOutboundQuiescenceCoordinator {
+        .init(sharedStateBaseURL: fixture.base, durableStateNamespace: "probe")
+    }
+
+    @BigSyncBackgroundActor
     private func assertDurableFenceUnchanged(
         _ fixture: Fixture, file: StaticString = #filePath, line: UInt = #line
     ) throws {
-        let observer = BigSyncOutboundQuiescenceCoordinator(
-            sharedStateBaseURL: fixture.base, durableStateNamespace: "probe")
+        let observer = observer(fixture)
         XCTAssertEqual(try observer.snapshot(), fixture.expected, file: file, line: line)
         XCTAssertThrowsError(try observer.admit(principal: fixture.principal), file: file, line: line)
     }
@@ -75,11 +79,19 @@ final class PausedOutboundRecoveryTests: XCTestCase {
             principal: fixture.principal,
             owner: XCTUnwrap(synchronizer.postBarrierOutboundLease)
         ))
-        let peer = BigSyncOutboundQuiescenceCoordinator(
-            sharedStateBaseURL: fixture.base, durableStateNamespace: "probe")
-        XCTAssertThrowsError(try peer.admit(principal: fixture.principal))
+        XCTAssertThrowsError(try observer(fixture).admit(principal: fixture.principal))
         XCTAssertTrue(synchronizer.abandonPostBarrierOutboundQuiescence(token))
-        try assertDurableFenceUnchanged(fixture)
+
+        // Successful recovery is not byte-identical to its input checkpoint:
+        // retaining paused ownership durably records the recovery evidence and
+        // therefore advances the state revision. The barrier identity/phase and
+        // empty uncertainty set are preserved, and peers remain fenced.
+        let after = try observer(fixture).snapshot()
+        XCTAssertEqual(after.barrier, fixture.expected.barrier)
+        XCTAssertTrue(after.outstandingSubmissions.isEmpty)
+        XCTAssertEqual(after.lastRecoveryEvidenceID, "settled-reservation")
+        XCTAssertNotEqual(after.revisionIdentifier, fixture.expected.revisionIdentifier)
+        XCTAssertThrowsError(try observer(fixture).admit(principal: fixture.principal))
     }
 
     @BigSyncBackgroundActor
