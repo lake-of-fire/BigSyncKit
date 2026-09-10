@@ -72,6 +72,8 @@ public struct BigSyncOutboundQuiescenceSnapshot: Codable, Equatable, Sendable {
 /// Lock order: owner (if any) -> admission -> batch (NONBLOCKING). No admission
 /// mutex is held across an await or while waiting for existing batches.
 internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
+    static let maximumStateBytes = 8 * 1_024 * 1_024
+
     let directory: URL
     private var stateURL: URL { directory.appendingPathComponent("state.json") }
     private var initializedURL: URL { directory.appendingPathComponent("initialized") }
@@ -413,8 +415,8 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         defer { withExtendedLifetime(admission) {} }
         var state: BigSyncOutboundQuiescenceSnapshot
         do {
-            let data = try Data(contentsOf: stateURL)
-            guard data.count <= 8 * 1_024 * 1_024 else { throw BigSyncOutboundQuiescenceError.invalidState }
+            let data = try bigSyncReadDataBoundedly(
+                from: stateURL, maximumBytes: Self.maximumStateBytes)
             state = try JSONDecoder().decode(BigSyncOutboundQuiescenceSnapshot.self, from: data)
             guard state.version == 1,
                   state.outstandingSubmissions.count <= 4_096,
@@ -441,7 +443,14 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
     }
 
     private func write(_ state: BigSyncOutboundQuiescenceSnapshot) throws {
-        try bigSyncWriteDataDurably(JSONEncoder().encode(state), to: stateURL)
+        let data = try JSONEncoder().encode(state)
+        // Per-field and submission-count bounds do not bound encoded JSON:
+        // escaping and repeated principals can exceed the reader's byte limit.
+        // Reject BEFORE replacing the last readable recovery checkpoint.
+        guard data.count <= Self.maximumStateBytes else {
+            throw BigSyncOutboundQuiescenceError.recoveryRequired
+        }
+        try bigSyncWriteDataDurably(data, to: stateURL)
     }
 
     private func validBarrier(_ barrier: BigSyncOutboundBarrier) -> Bool {

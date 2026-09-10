@@ -192,3 +192,43 @@ internal func bigSyncWriteDataDurably(_ data: Data, to url: URL) throws {
     try bigSyncSynchronizeDirectory(at: url.deletingLastPathComponent())
     guard try Data(contentsOf: url) == data else { throw CocoaError(.fileReadCorruptFile) }
 }
+
+/// Read a bounded regular file from the opened descriptor, not a pathname
+/// preflight. Nonblocking open rejects a FIFO without parking the admission
+/// lock; no-follow keeps a missing symlink target from looking like first use.
+/// The caller still owns locking and decoding/semantic validation.
+internal func bigSyncReadDataBoundedly(from url: URL, maximumBytes: Int) throws -> Data {
+    guard url.isFileURL, maximumBytes >= 0, maximumBytes < Int.max else {
+        throw CocoaError(.fileReadCorruptFile)
+    }
+    let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+    guard descriptor >= 0 else {
+        // Preserve the existing caller's first-use versus missing-state policy.
+        if errno == ENOENT { throw CocoaError(.fileReadNoSuchFile) }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    defer { try? handle.close() }
+    var metadata = stat()
+    guard fstat(descriptor, &metadata) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    guard (metadata.st_mode & S_IFMT) == S_IFREG,
+          metadata.st_size >= 0, metadata.st_size <= maximumBytes else {
+        throw CocoaError(.fileReadCorruptFile)
+    }
+    let expectedBytes = Int(metadata.st_size)
+    var data = Data()
+    data.reserveCapacity(expectedBytes)
+    while true {
+        // Short reads are legal. Read at most one extra byte to detect growth;
+        // never let a growing file extend this bounded admission-lock scope.
+        let remaining = expectedBytes - data.count
+        guard let chunk = try handle.read(upToCount: min(65_536, remaining + 1)),
+              !chunk.isEmpty else { break }
+        guard chunk.count <= remaining else { throw CocoaError(.fileReadCorruptFile) }
+        data.append(chunk)
+    }
+    guard data.count == expectedBytes else { throw CocoaError(.fileReadCorruptFile) }
+    return data
+}
