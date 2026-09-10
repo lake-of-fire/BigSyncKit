@@ -36,7 +36,11 @@ extension CloudKitTerminalReceiptTests {
         var firstResult: Result<CloudKitSynchronizer.SynchronizationResult, Error>?
         var secondResult: Result<CloudKitSynchronizer.SynchronizationResult, Error>?
         var successorResult: Result<CloudKitSynchronizer.SynchronizationResult, Error>?
-        let originalError = retryable ? CKError(.networkFailure) : CKError(.permissionFailure)
+        // Preserve retry semantics without spending the five-second default
+        // fallback budget before the successor reaches our held transport.
+        let originalError = retryable
+            ? CKError(.networkFailure, userInfo: [CKErrorRetryAfterKey: 0])
+            : CKError(.permissionFailure)
         observer.reenter = { [weak synchronizer] in
             guard let synchronizer else { return }
             if replaceAtHealth {
@@ -106,11 +110,13 @@ extension CloudKitTerminalReceiptTests {
             }
             defer { successor.cancel() }
             try await waitFor { synchronizer._testSynchronizationWaiterCount == 1 }
+            XCTAssertEqual(synchronizer.synchronizationAttemptID, successorAttempt)
             await successorRelease.release()
             try await waitFor { successorResult != nil }
             let result = try XCTUnwrap(successorResult).get()
             XCTAssertEqual(result.publicationState, .complete)
-            XCTAssertEqual(synchronizer.synchronizationAttemptID, successorAttempt)
+            // Joining a live drain can legitimately request a tail attempt.
+            // Ownership was checked while B was suspended, not after its tail.
             XCTAssertNil(synchronizer.retrySleepUntil)
         } else {
             XCTAssertTrue(synchronizer.cancelSync)
