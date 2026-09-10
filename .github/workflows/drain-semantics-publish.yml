@@ -1,0 +1,39 @@
+name: Publish exact coalesced-drain fixture semantics
+on:
+  push:
+    branches: [audit/drain-semantics-publish-20260909]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: transport
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 163df1a978d353820a4b40cad2f68fc94fa5be19
+          path: source
+      - shell: bash
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          test "$(sha256sum transport/.audit/drain-semantics.patch | cut -d' ' -f1)" = 9926a3617a40636d5ddb7945947491a3089900689559e12d7a69508d85bb051f
+          cd source
+          test "$(git rev-parse HEAD^{tree})" = ea74bcdc2512e89c13d72d19ed0a11a10ba0b592
+          test "$(git ls-remote origin refs/heads/codex/ordered-v2-followup-ownership-20260909 | cut -f1)" = 163df1a978d353820a4b40cad2f68fc94fa5be19
+          git apply --index ../transport/.audit/drain-semantics.patch
+          git diff --cached --check
+          test "$(git write-tree)" = 612b66c749044d76c115b8824e0ea54cb6925f7c
+          git -c user.name='OpenAI assistant' -c user.email='noreply@openai.com' commit -m 'Assert one terminal drain rather than suppressing requested refresh attempts'
+          git push origin HEAD:refs/heads/codex/ordered-v2-followup-ownership-20260909
+          git rev-parse HEAD HEAD^{tree} > ../evidence/source-identity.txt
+          git diff HEAD^ HEAD --binary --full-index > ../evidence/source.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drain-semantics-publication
+          path: evidence
+          retention-days: 14
+          if-no-files-found: error
