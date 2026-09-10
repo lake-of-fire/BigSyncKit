@@ -1,13 +1,67 @@
-name: Worker 1 refined transport publish
+name: Worker 1 recovery-seal hardening publish
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - codex/worker1-transport-publish-20260910
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: worker1-recovery-seal-publish-pr8
+  cancel-in-progress: false
 
 jobs:
-  dormant:
+  publish:
+    if: github.repository == 'lake-of-fire/BigSyncKit'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Publication complete; staging branch retained only as audit evidence."
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify hardening, test, and fast-forward PR 8
+        shell: bash
+        env:
+          BASE: 8a87f0b6d812ce6a21aeb9ce04afeb4546dd5203
+          BASE_TREE: 966a76cf373ed9ebb671584eeaf027549cbef9ad
+          EXPECTED_TREE: 69fdb89966778f3d691e4dc573b7ab30deb452c3
+          TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
+          PATCH_SHA256: e1eac673e418e59b0ab0e1476f1bb6c8ef8651252dec0efcbebafe4abaa7ce91
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
+          printf '%s  %s\n' "$PATCH_SHA256" .worker1-publish/refinement-2.patch | sha256sum -c -
+
+          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$current" = "$BASE"
+
+          git checkout --detach "$BASE"
+          git apply --check .worker1-publish/refinement-2.patch
+          git apply .worker1-publish/refinement-2.patch
+          git diff --check
+          git add -A
+          tree="$(git write-tree)"
+          test "$tree" = "$EXPECTED_TREE"
+
+          while IFS= read -r file; do
+            if [[ -f "$file" ]]; then swiftc -frontend -parse "$file"; fi
+          done < <(git diff --cached --name-only -- '*.swift')
+          Tools/run-outbound-quiescence-portable-tests.sh
+          Tools/run-outbound-quiescence-process-tests.sh
+
+          export GIT_AUTHOR_NAME=Codex
+          export GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
+          export GIT_COMMITTER_NAME=Codex
+          export GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
+          commit="$(printf '%s\n\n%s\n' \
+            'Require recovery seal before live cutoff resolution' \
+            'Prevent a drained live owner from using resolution as a shortcut around the durable recoveryRequired phase. Pre-reservation rollback remains the exact abort path; committed transitions must first seal recovery before reservation.' \
+            | git commit-tree "$tree" -p "$BASE")"
+          test "$(git rev-parse "$commit^")" = "$BASE"
+          test "$(git rev-parse "$commit^{tree}")" = "$EXPECTED_TREE"
+
+          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$current" = "$BASE"
+          git push origin "$commit:refs/heads/$TARGET_BRANCH"
+          echo "PUBLISHED_COMMIT=$commit"
