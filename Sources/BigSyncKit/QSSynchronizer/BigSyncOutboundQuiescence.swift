@@ -304,6 +304,48 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         recovery.close()
     }
 
+    /// Reacquire a sealed reservation without enabling ANY outbound work. The
+    /// host may still need to finish/adopt its accepted graph before it can
+    /// truthfully authorize source publication. Unlike generic resolution this
+    /// keeps peers fenced; unlike source resume this does not claim a committed
+    /// source graph. No preparing/final-aggregate capability can be recreated.
+    func retainPausedRecoveryOwnership(
+        _ recovery: BigSyncOutboundRecoveryLease,
+        principal: BigSyncOutboundPrincipal,
+        recoveryEvidenceID: String
+    ) throws -> BigSyncOutboundQuiescenceLease {
+        guard recovery.directory == directory, !recovery.closed,
+              validEvidence(recoveryEvidenceID), validPrincipal(principal),
+              let ownership = recovery.owner, let batches = recovery.batches else {
+            throw BigSyncOutboundQuiescenceError.staleAuthority
+        }
+        try ownership.validateIdentity()
+        try batches.validateIdentity()
+        let barrier = try withState { state -> BigSyncOutboundBarrier in
+            guard state == recovery.snapshot,
+                  let barrier = state.barrier,
+                  barrier.phase == .recoveryRequired,
+                  barrier.principal == principal else {
+                throw BigSyncOutboundQuiescenceError.staleAuthority
+            }
+            // The required host proof covers definitive settlement AND local
+            // generation reconciliation of every marker in this exact snapshot.
+            // The existing Realm journal remains the sole mutation authority.
+            try write(BigSyncOutboundQuiescenceSnapshot(
+                barrier: barrier, submissions: [],
+                recoveryEvidenceID: recoveryEvidenceID))
+            return barrier
+        }
+        recovery.owner = nil
+        recovery.batches = nil
+        recovery.closed = true
+        let owner = BigSyncOutboundQuiescenceLease(
+            coordinator: self, ownerLease: ownership, barrier: barrier)
+        owner.batchLease = batches
+        // Both admission flags deliberately retain their false defaults.
+        return owner
+    }
+
     /// Convert exact crash/restart recovery ownership into owner-only source
     /// publication without ever opening peer admission. The caller's durable
     /// proof authorizes settlement of every uncertainty marker in `snapshot`;

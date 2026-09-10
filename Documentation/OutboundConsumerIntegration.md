@@ -44,3 +44,28 @@ New completion APIs are in `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchroniz
 ## Qualification
 
 This completion increment is implementation-only. No tests, native build, Tuist regeneration or CloudKit account operations were run for it. Earlier evidence belongs to its exact earlier source revision. Keep source PRs draft and production activation disabled pending the composed release qualification.
+
+## Restart before the accepted domain graph is ready
+
+A restarted sealed reservation may need exclusive physical ownership to finish
+its accepted snapshot or archive/adopt a winner, while the local graph is not yet
+ready for source publication. Neither clearing the peer fence nor claiming a
+source-only graph early is a valid acquisition shortcut.
+
+`acquirePostBarrierRecoveryOwnership(expected:revalidatingDomainOwner:authorizingRecovery:)`
+exists on both the synchronizer and background worker. It takes exclusive owner
+and batch locks, holds them across the host's exact settlement/operation proof,
+rechecks the real account and host admission after the final suspension, and
+returns a fresh live acquisition in **the same `recoveryRequired` phase**. All
+outbound admission remains disabled. The host proof must reconcile every
+outstanding request and its required generation-matched local handling. Missing
+settlement support must throw and preserve the original checkpoint.
+
+This API cannot reacquire `preparing` as an aggregate-drain authorization and
+cannot be used to downgrade `sourcePublication`. It does not assert a committed
+domain graph, authorize a conditional head save, or fabricate a terminal receipt.
+After the host finishes its exact accepted-domain decision and durably switches
+writers/outbound selection, the existing `beginPostBarrierSourcePublication`
+handoff can enable this owner's source batches. Final release still follows
+source acknowledgement and durable domain completion. Failure or cancellation
+abandons only this live acquisition and never reopens peer admission.
