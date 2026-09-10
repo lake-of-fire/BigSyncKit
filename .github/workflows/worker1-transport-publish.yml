@@ -1,13 +1,113 @@
 name: Worker 1 refined transport publish
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - codex/worker1-transport-publish-20260910
 
 permissions:
   contents: write
 
+concurrency:
+  group: worker1-refined-transport-publish-pr8
+  cancel-in-progress: false
+
 jobs:
-  dormant:
+  publish:
+    if: github.repository == 'lake-of-fire/BigSyncKit'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Payload staging in progress"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify exact payload, test, and fast-forward PR 8
+        shell: bash
+        env:
+          BASE: 98619d90e771107c6a9ee5b27e7840b906eb887b
+          BASE_TREE: 567fa150a358412a7c480737721fac6766b3ff26
+          EXPECTED_TREE: 966a76cf373ed9ebb671584eeaf027549cbef9ad
+          TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
+          B64_SHA256: d255e6b2f7db9ccf3929045836ffb61113b0faf5dfd43a68b22cdfe5f1b6d4ff
+          PATCH_SHA256: 2b007a97e9d1b4d1765b6ce21b101485da208cc26de94c49c5209ad73c3b3498
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
+          printf '%s  %s\n' \
+            3e2e407b6b55562fd967adee926b10b82930c8792ef5372da0e5ea482730fe50 .worker1-publish/chunks/00a.part \
+            84f4b1bc8620479962e753a88912d2f637e2991e042567812b246ab66e4061fe .worker1-publish/chunks/00b.part \
+            1aeb5a245bc0305921f81bba091773abddc61cac3fd039522459ba6c7bdf9ccf .worker1-publish/chunks/00c.part \
+            966db775a679ceda8741e04dbd5e3200a237dd3263ff1db9f3380753ecc51be1 .worker1-publish/chunks/00d.part \
+            d822a4b709f152e84a7cdb386afba6abfc2265c590bfbdce4defbdad9a62fdbb .worker1-publish/chunks/01.part \
+            d092fc6da20ad6165c6520aacefa06a1855cec73b43569ae4f2a376670b27c68 .worker1-publish/chunks/02.part \
+            5803a0c6ce77fdc457c88f5a13b05c3acf4d36403565e6caadfb98f206bf2f33 .worker1-publish/chunks/03a.part \
+            3e72632fb4811e2b2852cae64ed4187ea0c172114cd33cb1d514e23557db15f8 .worker1-publish/chunks/03b.part \
+            7f83204166e969958d9308a6db8624b0660cfe3d39affe1593546018f4cf565d .worker1-publish/chunks/03c.part \
+            0b06db3fedd8162a343ce405d1e24d222efd5e9632aaea1d91bff45e1ff3ea11 .worker1-publish/chunks/03d.part \
+            1bc0867984bbdf4c8d931f638e8c21361954ce394a80cfb93f4a6efa07323806 .worker1-publish/chunks/04.part \
+            02022378ca0d04057280c5066d0f6b170e0e667d57bc4313211203ff7dad87ca .worker1-publish/chunks/05a.part \
+            9ce33f393cb2a0914b74cb7c1106eea3b323ff8acaae0a236c81ca84013289de .worker1-publish/chunks/05b.part \
+            ea41b8edb044f7d8b712fed1a9aed2918b3bc15b8c7fcddcfaeda9c5a5d64040 .worker1-publish/chunks/05c.part \
+            a8bc8e29e1b8573c9adeacfbd951d0b12a73c49ec55653ef77014e7ee04b2f54 .worker1-publish/chunks/05d.part \
+            | sha256sum -c -
+
+          cat \
+            .worker1-publish/chunks/00a.part \
+            .worker1-publish/chunks/00b.part \
+            .worker1-publish/chunks/00c.part \
+            .worker1-publish/chunks/00d.part \
+            .worker1-publish/chunks/01.part \
+            .worker1-publish/chunks/02.part \
+            .worker1-publish/chunks/03a.part \
+            .worker1-publish/chunks/03b.part \
+            .worker1-publish/chunks/03c.part \
+            .worker1-publish/chunks/03d.part \
+            .worker1-publish/chunks/04.part \
+            .worker1-publish/chunks/05a.part \
+            .worker1-publish/chunks/05b.part \
+            .worker1-publish/chunks/05c.part \
+            .worker1-publish/chunks/05d.part \
+            > /tmp/refined.b64
+
+          printf '%s  %s\n' "$B64_SHA256" /tmp/refined.b64 | sha256sum -c -
+          base64 --decode /tmp/refined.b64 | gzip -dc > /tmp/refined.diff
+          printf '%s  %s\n' "$PATCH_SHA256" /tmp/refined.diff | sha256sum -c -
+
+          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$current" = "$BASE"
+
+          git checkout --detach "$BASE"
+          git apply --check /tmp/refined.diff
+          git apply /tmp/refined.diff
+          git diff --check
+          git add -A
+          tree="$(git write-tree)"
+          test "$tree" = "$EXPECTED_TREE"
+
+          swift --version
+          while IFS= read -r file; do
+            if [[ -f "$file" ]]; then
+              swiftc -frontend -parse "$file"
+            fi
+          done < <(git diff --cached --name-only -- '*.swift')
+
+          Tools/run-outbound-quiescence-portable-tests.sh
+          Tools/run-outbound-quiescence-process-tests.sh
+
+          export GIT_AUTHOR_NAME=Codex
+          export GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
+          export GIT_COMMITTER_NAME=Codex
+          export GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
+          commit="$(printf '%s\n\n%s\n\n%s\n' \
+            'Fence cross-process outbound batches and bind final drains to durable cutoff ownership' \
+            'Hold ordinary uploads behind a process-shared durable cutoff, retain admission through acknowledgement, preserve unresolved submitted requests for explicit recovery, and bind final drains to the exact cutoff owner.' \
+            'Refine exact abort diagnostics so stale account/binding authority is distinguished from a genuinely busy synchronizer.' \
+            | git commit-tree "$tree" -p "$BASE")"
+
+          test "$(git rev-parse "$commit^")" = "$BASE"
+          test "$(git rev-parse "$commit^{tree}")" = "$EXPECTED_TREE"
+          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$current" = "$BASE"
+          git push origin "$commit:refs/heads/$TARGET_BRANCH"
+          echo "PUBLISHED_COMMIT=$commit"
