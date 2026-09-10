@@ -1,0 +1,40 @@
+name: Audit push immediate account fence tests
+on:
+  push:
+    branches:
+      - audit/push-immediate-account-fence-tests-20260909
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/ordered-v2-followup-ownership-20260909
+          fetch-depth: 0
+      - name: Add exact regression cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=776b8388b29c9940a345d32781589a459caeca54
+          test "$(git rev-parse HEAD)" = "$expected"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift')
+          s = p.read_text()
+          if 'testCompletedPrincipalRejectsImmediateNotificationFenceBeforeQueuedCancellation' in s:
+              raise SystemExit('test already present unexpectedly')
+          anchor = '''    @BigSyncBackgroundActor\n    private func assertCancelled(file: StaticString = #filePath, line: UInt = #line,\n'''
+          if s.count(anchor) != 1:
+              raise SystemExit('assertCancelled anchor not found exactly once')
+          tests = '''    @BigSyncBackgroundActor\n    func testCompletedPrincipalRejectsImmediateNotificationFenceBeforeQueuedCancellation() async throws {\n        let fixture = Fixture(useReplicaBinding: true)\n        let (receipt, authorization) = try await fixture.postBarrierDrain()\n        let completed = try await fixture.synchronizer.completedPostBarrierDrain(\n            using: receipt, authorizedBy: authorization)\n        let attempt = fixture.synchronizer.synchronizationAttemptID\n        let writes = fixture.store.writes\n        XCTAssertNotNil(try fixture.synchronizer.accountScopeLease())\n        // Exact synchronous first phase of CKAccountChanged. Intentionally do\n        // not run its queued cancellation yet. This is not a real account switch.\n        fixture.synchronizer.accountScopeAuthorityFence.poison()\n        XCTAssertNil(try fixture.synchronizer.accountScopeLease())\n        XCTAssertThrowsError(try fixture.synchronizer.validatePostBarrierDrainPrincipal(completed))\n        await assertCancelled {\n            try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed)\n        }\n        XCTAssertEqual(fixture.synchronizer.synchronizationAttemptID, attempt)\n        XCTAssertFalse(fixture.synchronizer.cancelSync)\n        XCTAssertEqual(fixture.store.writes, writes)\n        XCTAssertEqual(fixture.adapter.acknowledgements, 0)\n    }\n\n    @BigSyncBackgroundActor\n    func testPostBootstrapPrincipalRejectsSameAccountReturnAfterImmediateFence() async throws {\n        let fixture = Fixture(useReplicaBinding: true)\n        let (receipt, authorization) = try await fixture.postBarrierDrain()\n        let completed = try await fixture.synchronizer.completedPostBarrierDrain(\n            using: receipt, authorizedBy: authorization)\n        // New source work remains legitimate. Rejection must come from the\n        // revoked principal, not from weakening or reusing the drain predicate.\n        fixture.adapter.hasPendingTerminalChanges = true\n        await fixture.account.onNextRead { @BigSyncBackgroundActor in\n            fixture.synchronizer.accountScopeAuthorityFence.poison()\n        }\n        await assertCancelled {\n            try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed)\n        }\n        XCTAssertTrue(fixture.adapter.hasPendingTerminalChanges)\n        XCTAssertEqual(fixture.adapter.acknowledgements, 0)\n    }\n\n'''
+          p.write_text(s.replace(anchor, tests + anchor, 1))
+          PY
+          git diff --check
+          swiftc -frontend -parse Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          git config user.name 'Alex Ehlke'
+          git config user.email '71601+aehlke@users.noreply.github.com'
+          git add Tests/BigSyncKitTests/CloudKitTerminalReceiptTests.swift
+          git commit -m 'Cover immediate account revocation before queued cancellation'
+          git push origin HEAD:codex/ordered-v2-followup-ownership-20260909
