@@ -1128,6 +1128,48 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCompletedPrincipalRejectsImmediateNotificationFenceBeforeQueuedCancellation() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
+            using: receipt, authorizedBy: authorization)
+        let attempt = fixture.synchronizer.synchronizationAttemptID
+        let writes = fixture.store.writes
+        XCTAssertNotNil(try fixture.synchronizer.accountScopeLease())
+        // Exact synchronous first phase of CKAccountChanged. Intentionally do
+        // not run its queued cancellation yet. This is not a real account switch.
+        fixture.synchronizer.accountScopeAuthorityFence.poison()
+        XCTAssertNil(try fixture.synchronizer.accountScopeLease())
+        XCTAssertThrowsError(try fixture.synchronizer.validatePostBarrierDrainPrincipal(completed))
+        await assertCancelled {
+            try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed)
+        }
+        XCTAssertEqual(fixture.synchronizer.synchronizationAttemptID, attempt)
+        XCTAssertFalse(fixture.synchronizer.cancelSync)
+        XCTAssertEqual(fixture.store.writes, writes)
+        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testPostBootstrapPrincipalRejectsSameAccountReturnAfterImmediateFence() async throws {
+        let fixture = Fixture(useReplicaBinding: true)
+        let (receipt, authorization) = try await fixture.postBarrierDrain()
+        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
+            using: receipt, authorizedBy: authorization)
+        // New source work remains legitimate. Rejection must come from the
+        // revoked principal, not from weakening or reusing the drain predicate.
+        fixture.adapter.hasPendingTerminalChanges = true
+        await fixture.account.onNextRead { @BigSyncBackgroundActor in
+            fixture.synchronizer.accountScopeAuthorityFence.poison()
+        }
+        await assertCancelled {
+            try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed)
+        }
+        XCTAssertTrue(fixture.adapter.hasPendingTerminalChanges)
+        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
+    }
+
+    @BigSyncBackgroundActor
     private func assertCancelled(file: StaticString = #filePath, line: UInt = #line,
                                  _ operation: () async throws -> Void) async {
         do { try await operation(); XCTFail("Expected cancellation", file: file, line: line) }
