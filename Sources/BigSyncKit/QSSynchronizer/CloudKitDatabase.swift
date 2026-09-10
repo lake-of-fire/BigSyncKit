@@ -30,11 +30,20 @@ import CloudKit
     
     /// The `CKDatabase` used by this adapter
     public let database: CKDatabase
+    /// Owning container when the caller can supply it. Production Realm
+    /// setup does so, enabling exact long-lived operation recovery after
+    /// process death without changing the public database adapter protocol.
+    public let container: CKContainer?
     
-    /// Initialize a `DefaultCloudKitDatabaseAdapter` with a given `CKDatabase`. All calls to the adapter methods will be forwarded to the database instance.
-    /// - Parameter database:
+    /// Initialize a `DefaultCloudKitDatabaseAdapter` with a given `CKDatabase`.
     public init(database: CKDatabase) {
         self.database = database
+        self.container = nil
+    }
+
+    public init(database: CKDatabase, container: CKContainer) {
+        self.database = database
+        self.container = container
     }
     
     /// See https://developer.apple.com/documentation/cloudkit/ckdatabase/1640398-databasescope

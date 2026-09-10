@@ -156,11 +156,11 @@ extension CloudKitSynchronizer {
             try await revalidateOutboundBatch(outbound, for: attemptID)
             let mutationResults = try await modifyRecordsHoldingOutboundLease(
                 outbound,
-                    attemptID: attemptID,
-                    saving: records,
-                    deleting: [],
-                    preparedGenerations: generations
-                )
+                attemptID: attemptID,
+                saving: records,
+                deleting: [],
+                preparedGenerations: generations
+            )
             try Task.checkCancellation()
             try await revalidateOutboundBatch(outbound, for: attemptID)
 
@@ -346,11 +346,11 @@ extension CloudKitSynchronizer {
             try await revalidateOutboundBatch(outbound, for: attemptID)
             let mutationResults = try await modifyRecordsHoldingOutboundLease(
                 outbound,
-                    attemptID: attemptID,
-                    saving: [],
-                    deleting: recordIDs,
-                    preparedGenerations: generations
-                )
+                attemptID: attemptID,
+                saving: [],
+                deleting: recordIDs,
+                preparedGenerations: generations
+            )
             try Task.checkCancellation()
             try await revalidateOutboundBatch(outbound, for: attemptID)
 

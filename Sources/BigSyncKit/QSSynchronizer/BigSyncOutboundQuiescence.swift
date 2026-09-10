@@ -79,16 +79,35 @@ public struct BigSyncOutboundSubmissionItem: Codable, Equatable, Sendable {
     }
 }
 
+public struct BigSyncOutboundSubmissionTransportIdentity: Codable, Equatable, Sendable {
+    /// CloudKit echoes this value from the record-zone change stream after
+    /// it has received the corresponding modify request.
+    public let clientChangeTokenData: Data
+    /// Exact CKOperation.ID for the long-lived modify operation. A relaunch
+    /// can ask the same CKContainer for this operation and replay callbacks.
+    public let longLivedOperationID: String
+
+    public init(clientChangeTokenData: Data, longLivedOperationID: String) {
+        self.clientChangeTokenData = clientChangeTokenData
+        self.longLivedOperationID = longLivedOperationID
+    }
+}
+
 /// Bounded recovery identity for one actual CloudKit mutation request.
 /// It deliberately contains no field values, assets, retry payloads or
 /// acknowledgement authority; the Realm journal remains authoritative.
 public struct BigSyncOutboundSubmissionRecoveryDescriptor: Codable, Equatable, Sendable {
     public let version: Int
     public let items: [BigSyncOutboundSubmissionItem]
+    public let transportIdentity: BigSyncOutboundSubmissionTransportIdentity?
 
-    public init(items: [BigSyncOutboundSubmissionItem]) {
+    public init(
+        items: [BigSyncOutboundSubmissionItem],
+        transportIdentity: BigSyncOutboundSubmissionTransportIdentity? = nil
+    ) {
         version = 1
         self.items = items.sorted(by: Self.canonicalOrder)
+        self.transportIdentity = transportIdentity
     }
 
     fileprivate static func canonicalOrder(
@@ -636,7 +655,10 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
                 zoneOwnerName: $0.zoneOwnerName
             )
         }
-        guard Set(keys).count == keys.count else { return false }
+        guard Set(keys).count == keys.count,
+              descriptor.transportIdentity.map(validTransportIdentity) != false else {
+            return false
+        }
         return descriptor.items.allSatisfy { item in
             guard validRecoveryComponent(item.recordName),
                   validRecoveryComponent(item.zoneName),
@@ -669,6 +691,14 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
 
     private func validRecoveryComponent(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 4_096
+    }
+
+    private func validTransportIdentity(
+        _ identity: BigSyncOutboundSubmissionTransportIdentity
+    ) -> Bool {
+        !identity.clientChangeTokenData.isEmpty
+            && identity.clientChangeTokenData.count <= 1_024
+            && validRecoveryComponent(identity.longLivedOperationID)
     }
 
     private func validBarrier(_ barrier: BigSyncOutboundBarrier) -> Bool {

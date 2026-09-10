@@ -194,7 +194,8 @@ extension CloudKitSynchronizer {
         )
         let container = CKContainer(identifier: containerName)
         let database = DefaultCloudKitDatabaseAdapter(
-            database: container.privateCloudDatabase
+            database: container.privateCloudDatabase,
+            container: container
         )
         let synchronizer = CloudKitSynchronizer(
             identifier: synchronizerName,

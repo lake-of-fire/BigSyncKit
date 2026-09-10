@@ -397,7 +397,8 @@ extension CloudKitSynchronizer {
     private func outboundRecoveryDescriptor(
         saving records: [CKRecord],
         deleting recordIDs: [CKRecord.ID],
-        preparedGenerations: [String: String]
+        preparedGenerations: [String: String],
+        transportIdentity: BigSyncOutboundSubmissionTransportIdentity?
     ) -> BigSyncOutboundSubmissionRecoveryDescriptor {
         let saves = records.map { record in
             BigSyncOutboundSubmissionItem(
@@ -421,7 +422,10 @@ extension CloudKitSynchronizer {
                 priorRecordChangeTag: nil
             )
         }
-        return BigSyncOutboundSubmissionRecoveryDescriptor(items: saves + deletes)
+        return BigSyncOutboundSubmissionRecoveryDescriptor(
+            items: saves + deletes,
+            transportIdentity: transportIdentity
+        )
     }
 
     internal func modifyRecordsHoldingOutboundLease(
@@ -431,10 +435,18 @@ extension CloudKitSynchronizer {
         deleting recordIDs: [CKRecord.ID],
         preparedGenerations: [String: String]
     ) async throws -> CloudKitRecordMutationResults {
+        let recoverableStore = recordStore as? any CloudKitRecoverableRecordStore
+        let preparedTransport = recoverableStore?.prepareRecoverableModifyRecords(
+            saving: records,
+            deleting: recordIDs,
+            savePolicy: .ifServerRecordUnchanged,
+            atomically: false
+        )
         let recoveryDescriptor = outboundRecoveryDescriptor(
             saving: records,
             deleting: recordIDs,
-            preparedGenerations: preparedGenerations
+            preparedGenerations: preparedGenerations,
+            transportIdentity: preparedTransport?.transportIdentity
         )
         try await outbound.willSubmitCooperatively(
             recoveryDescriptor: recoveryDescriptor
@@ -450,12 +462,18 @@ extension CloudKitSynchronizer {
         }
         let results: CloudKitRecordMutationResults
         do {
-            results = try await recordStore.modifyRecords(
-                saving: records,
-                deleting: recordIDs,
-                savePolicy: .ifServerRecordUnchanged,
-                atomically: false
-            )
+            if let recoverableStore, let preparedTransport {
+                results = try await recoverableStore.executeRecoverableModifyRecords(
+                    preparedTransport
+                )
+            } else {
+                results = try await recordStore.modifyRecords(
+                    saving: records,
+                    deleting: recordIDs,
+                    savePolicy: .ifServerRecordUnchanged,
+                    atomically: false
+                )
+            }
         } catch {
             // An operation-wide definitive rejection (for example the batch
             // limit) did not commit either and requires no per-item local ack.
