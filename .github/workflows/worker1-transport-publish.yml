@@ -32,13 +32,15 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
           printf '%s  %s\n' "$PATCH_SHA256" .worker1-publish/refinement-2.patch | sha256sum -c -
+          cp .worker1-publish/refinement-2.patch /tmp/refinement-2.patch
+          printf '%s  %s\n' "$PATCH_SHA256" /tmp/refinement-2.patch | sha256sum -c -
 
           current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
           test "$current" = "$BASE"
 
           git checkout --detach "$BASE"
-          git apply --check .worker1-publish/refinement-2.patch
-          git apply .worker1-publish/refinement-2.patch
+          git apply --check /tmp/refinement-2.patch
+          git apply /tmp/refinement-2.patch
           git diff --check
           git add -A
           tree="$(git write-tree)"
