@@ -391,6 +391,9 @@ internal final class BigSyncOutboundBatchLease {
     private let batchLease: BigSyncFileLease?
     private let owner: BigSyncOutboundQuiescenceLease?
     private var submissionID: UUID?
+    /// Process-local only. Losing it must never lose the durable submission
+    /// marker; that is precisely why the marker is not cleared at server return.
+    private var transportOutcomeIsDefinitive = false
 
     fileprivate init(coordinator: BigSyncOutboundQuiescenceCoordinator, principal: BigSyncOutboundPrincipal,
                      batchLease: BigSyncFileLease?, owner: BigSyncOutboundQuiescenceLease?) {
@@ -402,15 +405,36 @@ internal final class BigSyncOutboundBatchLease {
 
     func willSubmit() throws {
         guard submissionID == nil else { throw BigSyncOutboundQuiescenceError.invalidState }
+        transportOutcomeIsDefinitive = false
         submissionID = try coordinator.willSubmit(self)
     }
 
-    /// Only a definitive operation result can remove this marker. Never call
-    /// from a cancellation handler, timeout, deinit, or a malformed response.
+    /// Remember a definitive server outcome without yet clearing durable
+    /// uncertainty. Local generation-matched response processing is part of the
+    /// physical batch lifetime and must finish first.
+    func noteDefinitiveTransportOutcome() throws {
+        guard submissionID != nil else { throw BigSyncOutboundQuiescenceError.invalidState }
+        transportOutcomeIsDefinitive = true
+    }
+
+    /// Remove this marker only after the request has a definitive outcome AND
+    /// all required generation-matched local response processing has completed.
+    /// A whole-operation definitive rejection that entered no per-item callback
+    /// may settle immediately. Never call from cancellation, timeout, deinit, or
+    /// a malformed/indeterminate response path.
     func didSettle() throws {
         guard let submissionID else { throw BigSyncOutboundQuiescenceError.invalidState }
         try coordinator.didSettle(submissionID, batch: self)
         self.submissionID = nil
+        transportOutcomeIsDefinitive = false
+    }
+
+    /// Called after the caller has finished all required generation-matched
+    /// acknowledgement/requeue/conflict callbacks for the returned response.
+    /// Non-definitive responses intentionally leave their marker unresolved.
+    func completeLocalResponseProcessingCooperatively() async throws {
+        guard transportOutcomeIsDefinitive else { return }
+        try await didSettleCooperatively()
     }
 
     /// A short metadata-lock collision must not manufacture an unresolved

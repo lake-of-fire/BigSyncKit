@@ -262,6 +262,12 @@ extension CloudKitSynchronizer {
                 try await revalidateOutboundBatch(outbound, for: attemptID)
             }
 
+            // A definitive CloudKit response becomes physically settled only
+            // after every required generation-matched local callback above has
+            // completed. Cancellation before here deliberately retains the
+            // durable uncertainty marker for explicit recovery.
+            try await outbound.completeLocalResponseProcessingCooperatively()
+
             guard unresolvedFailures.isEmpty else {
                 if unresolvedFailures.values.contains(where: {
                     $0.domain == CKErrorDomain
@@ -410,6 +416,11 @@ extension CloudKitSynchronizer {
                 )
                 try await revalidateOutboundBatch(outbound, for: attemptID)
             }
+
+            // Keep the submission marker through the generation-matched local
+            // delete/rebase callbacks. A cancellation in that interval must not
+            // let a cutoff mistake server response for completed local handling.
+            try await outbound.completeLocalResponseProcessingCooperatively()
             guard unresolvedFailures.isEmpty else {
                 if unresolvedFailures.values.contains(where: {
                     $0.domain == CKErrorDomain

@@ -46,13 +46,21 @@ final class BigSyncOutboundQuiescenceTests: XCTestCase {
         let (_, peer, candidate, principal) = fixture()
         var batch: BigSyncOutboundBatchLease? = try peer.admit(principal: principal)
         try batch?.willSubmit()
-        try batch?.didSettle()
-        XCTAssertTrue(try peer.snapshot().outstandingSubmissions.isEmpty)
+        try batch?.noteDefinitiveTransportOutcome()
+        // A definitive server result alone is deliberately not settlement.
+        // The durable marker protects cancellation/process death before the
+        // generation-matched local acknowledgement finishes.
+        XCTAssertEqual(try peer.snapshot().outstandingSubmissions.count, 1)
         let owner = try candidate.begin(principal: principal, writerBarrierEvidenceID: "barrier")
         let waiting = Task { try await candidate.waitUntilDrained(owner) }
         try await Task.sleep(nanoseconds: 20_000_000)
         XCTAssertThrowsError(try candidate.validateDrained(owner, principal: principal))
-        batch = nil // Only now did the response/Realm acknowledgement scope exit.
+        try await batch?.completeLocalResponseProcessingCooperatively()
+        XCTAssertTrue(try peer.snapshot().outstandingSubmissions.isEmpty)
+        // Clearing the marker after acknowledgement still does not shorten the
+        // physical batch scope: the OS admission lives until this lease exits.
+        XCTAssertThrowsError(try candidate.validateDrained(owner, principal: principal))
+        batch = nil
         try await waiting.value
         try candidate.abort(owner)
     }

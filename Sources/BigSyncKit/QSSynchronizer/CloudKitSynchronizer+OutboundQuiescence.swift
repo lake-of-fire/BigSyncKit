@@ -282,15 +282,21 @@ extension CloudKitSynchronizer {
                 savePolicy: .ifServerRecordUnchanged, atomically: false)
         } catch {
             // An operation-wide definitive rejection (for example the batch
-            // limit) did not commit either. Preserve the original retry/error
-            // behavior without leaving a phantom indeterminate submission.
+            // limit) did not commit either and requires no per-item local ack.
+            // Preserve the original retry/error behavior without leaving a
+            // phantom indeterminate submission.
             if CloudKitRecordMutationResults.isDefinitiveOperationRejection(error) {
                 try await outbound.didSettleCooperatively()
             }
             throw error
         }
+        // A definitive server response is not enough to release the durable
+        // marker yet. Record it in the batch, then let the caller release the
+        // marker only after generation-matched local response processing. If
+        // cancellation or an authority fence wins in that window, process death
+        // loses this in-memory note but deliberately leaves the durable marker.
         if results.provesDefinitiveSettlement(saving: records, deleting: recordIDs) {
-            try await outbound.didSettleCooperatively()
+            try outbound.noteDefinitiveTransportOutcome()
         }
         return results
     }
