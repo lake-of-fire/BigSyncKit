@@ -145,6 +145,29 @@ extension CloudKitSynchronizer {
         return try outboundQuiescenceCoordinator.snapshot()
     }
 
+    /// After the host has durably committed the new authority/bootstrap, allow
+    /// this exact live owner to publish source journals while every peer remains
+    /// fenced. The returned checkpoint is the new durable source-publication
+    /// phase and should be retained for crash/restart recovery.
+    @discardableResult
+    public func beginPostBarrierSourcePublication(
+        _ token: PostBarrierOutboundQuiescence,
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        sourcePublicationEvidenceID: String
+    ) throws -> BigSyncOutboundQuiescenceSnapshot {
+        guard !syncing, !synchronizationDrainIsActive,
+              postBarrierDrainAuthorization == nil, outboundRecoveryID == nil,
+              let owner = matchingOutboundOwner(token),
+              try currentOutboundPrincipal() == token.principal else {
+            throw BigSyncOutboundQuiescenceError.staleAuthority
+        }
+        return try outboundQuiescenceCoordinator.authorizeSourcePublication(
+            owner,
+            expected: expected,
+            evidenceID: sourcePublicationEvidenceID
+        )
+    }
+
     /// Relinquish only this token's pre-reservation fence. Domain cancellation
     /// must first ensure it will not persist a reservation; this is not an
     /// automatic side effect of cancelSynchronization or permit revocation.
@@ -168,7 +191,7 @@ extension CloudKitSynchronizer {
     @discardableResult
     public func abandonPostBarrierOutboundQuiescence(_ token: PostBarrierOutboundQuiescence) -> Bool {
         guard let owner = matchingOutboundOwner(token) else { return false }
-        owner.sealFinalDrain()
+        owner.sealOutboundAdmission()
         retireOutboundCapabilities(token)
         return true
     }
@@ -191,6 +214,85 @@ extension CloudKitSynchronizer {
               try currentOutboundPrincipal() == token.principal else { throw BigSyncOutboundQuiescenceError.staleAuthority }
         try outboundQuiescenceCoordinator.resolveOwned(owner, expected: expected, evidenceID: recoveryEvidenceID)
         retireOutboundCapabilities(token)
+    }
+
+    /// Resume a previously committed source-publication phase after process or
+    /// worker loss. The host proof must reconcile the exact checkpoint and every
+    /// outstanding source submission; unlike generic recovery this retains the
+    /// peer fence and returns a new process-local owner token.
+    public func resumePostBarrierSourcePublication(
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        authorizingResume: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
+    ) async throws -> PostBarrierOutboundQuiescence {
+        let token = try await resumePostBarrierSourcePublication(
+            expected: expected,
+            revalidatingExternalOwner: { @BigSyncBackgroundActor in },
+            authorizingResume: authorizingResume
+        )
+        do {
+            try Task.checkCancellation()
+        } catch {
+            abandonPostBarrierOutboundQuiescence(token)
+            throw error
+        }
+        return token
+    }
+
+    internal func resumePostBarrierSourcePublication(
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        revalidatingExternalOwner: @Sendable @BigSyncBackgroundActor () throws -> Void,
+        authorizingResume: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
+    ) async throws -> PostBarrierOutboundQuiescence {
+        guard !syncing, !synchronizationDrainIsActive,
+              postBarrierOutboundLease == nil, postBarrierOutboundTicket == nil,
+              postBarrierDrainAuthorization == nil, outboundRecoveryID == nil else {
+            throw BigSyncOutboundQuiescenceError.busy
+        }
+        let principal = try currentOutboundPrincipal()
+        guard let persistedBarrier = expected.barrier,
+              persistedBarrier.phase == .sourcePublication,
+              persistedBarrier.principal == principal else {
+            throw BigSyncOutboundQuiescenceError.staleAuthority
+        }
+        let attemptID = synchronizationAttemptID
+        let requestID = UUID()
+        let recovery = try outboundQuiescenceCoordinator.takeRecoveryOwnership(expected: expected)
+        outboundRecoveryID = requestID
+        defer { if outboundRecoveryID == requestID { outboundRecoveryID = nil } }
+        func validateOwnership() throws {
+            try revalidatingExternalOwner()
+            guard outboundRecoveryID == requestID,
+                  synchronizationAttemptID == attemptID,
+                  !syncing, !synchronizationDrainIsActive,
+                  try currentOutboundPrincipal() == principal else {
+                throw BigSyncOutboundQuiescenceError.staleAuthority
+            }
+        }
+        try validateOwnership()
+        let account = try await accountIdentifierProvider()
+        try validateOwnership()
+        guard Self.accountScopeIdentifier(for: account) == principal.accountScopeIdentifier else {
+            throw BigSyncOutboundQuiescenceError.staleAuthority
+        }
+        let evidence = try await authorizingResume(expected)
+        try validateOwnership()
+        let confirmedAccount = try await accountIdentifierProvider()
+        try validateOwnership()
+        guard confirmedAccount == account else { throw BigSyncOutboundQuiescenceError.staleAuthority }
+        let owner = try outboundQuiescenceCoordinator.resumeSourcePublication(
+            recovery,
+            principal: principal,
+            recoveryEvidenceID: evidence
+        )
+        let token = PostBarrierOutboundQuiescence(
+            identifier: owner.barrier.identifier,
+            writerBarrierEvidenceID: owner.barrier.writerBarrierEvidenceID,
+            issuerID: synchronizationReceiptIssuerID,
+            principal: principal
+        )
+        postBarrierOutboundLease = owner
+        postBarrierOutboundTicket = token
+        return token
     }
 
     /// Crash/account/restart recovery. Ownership is held across the host's
@@ -276,7 +378,17 @@ extension CloudKitSynchronizer {
                     throw BigSyncOutboundQuiescenceError.staleAuthority
                 }
                 owner = postBarrierOutboundLease
-            } else { owner = nil }
+            } else if let ticket = postBarrierOutboundTicket,
+                      let sourceOwner = postBarrierOutboundLease,
+                      sourceOwner.barrier.identifier == ticket.identifier,
+                      sourceOwner.barrier.phase == .sourcePublication {
+                // Post-bootstrap source publication uses the ordinary sync and
+                // terminal receipt pipeline, but only this durable barrier owner
+                // may enter outbound preparation while peers remain blocked.
+                owner = sourceOwner
+            } else {
+                owner = nil
+            }
             do { return try outboundQuiescenceCoordinator.admit(principal: principal, owner: owner) }
             catch BigSyncOutboundQuiescenceError.busy { try await Task.sleep(nanoseconds: 1_000_000) }
         }

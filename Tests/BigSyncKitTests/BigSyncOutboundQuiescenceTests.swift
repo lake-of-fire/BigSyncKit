@@ -223,6 +223,113 @@ final class BigSyncOutboundQuiescenceTests: XCTestCase {
         try candidate.abort(owner)
     }
 
+    func testSourcePublicationKeepsPeersFencedAndAllowsOwnerBatches() async throws {
+        let (_, peer, candidate, principal) = fixture()
+        let owner = try candidate.begin(principal: principal, writerBarrierEvidenceID: "barrier")
+        try await candidate.waitUntilDrained(owner)
+        try owner.armFinalDrain()
+        owner.sealFinalDrain()
+        try candidate.requireRecovery(owner)
+        let recoveryRequired = try candidate.snapshot()
+        let source = try candidate.authorizeSourcePublication(
+            owner,
+            expected: recoveryRequired,
+            evidenceID: "committed-v2-head"
+        )
+        XCTAssertEqual(source.barrier?.phase, .sourcePublication)
+        XCTAssertEqual(source.barrier?.sourcePublicationEvidenceID, "committed-v2-head")
+        XCTAssertThrowsError(try peer.admit(principal: principal))
+        XCTAssertThrowsError(try candidate.requireRecovery(owner))
+
+        var batch: BigSyncOutboundBatchLease? = try candidate.admit(
+            principal: principal,
+            owner: owner
+        )
+        try batch?.willSubmit()
+        try batch?.noteDefinitiveTransportOutcome()
+        XCTAssertEqual(try candidate.snapshot().outstandingSubmissions.count, 1)
+        try await batch?.completeLocalResponseProcessingCooperatively()
+        batch = nil
+        let published = try candidate.snapshot()
+        XCTAssertTrue(published.outstandingSubmissions.isEmpty)
+        try candidate.resolveOwned(
+            owner,
+            expected: published,
+            evidenceID: "durable-source-completion"
+        )
+        XCTAssertNil(try candidate.snapshot().barrier)
+        _ = try peer.admit(principal: principal)
+    }
+
+    func testSourcePublicationResumeRecoversExactUnknownSubmissionWithoutOpeningPeers() async throws {
+        let (_, peer, candidate, principal) = fixture()
+        var owner: BigSyncOutboundQuiescenceLease? = try candidate.begin(
+            principal: principal,
+            writerBarrierEvidenceID: "barrier"
+        )
+        try await candidate.waitUntilDrained(XCTUnwrap(owner))
+        try owner?.armFinalDrain()
+        owner?.sealFinalDrain()
+        try candidate.requireRecovery(XCTUnwrap(owner))
+        let recoveryRequired = try candidate.snapshot()
+        _ = try candidate.authorizeSourcePublication(
+            XCTUnwrap(owner),
+            expected: recoveryRequired,
+            evidenceID: "committed-v2-head"
+        )
+        var sourceBatch: BigSyncOutboundBatchLease? = try candidate.admit(
+            principal: principal,
+            owner: XCTUnwrap(owner)
+        )
+        try sourceBatch?.willSubmit()
+        sourceBatch = nil
+        let ambiguous = try candidate.snapshot()
+        let ids = ambiguous.outstandingSubmissions.map(\.identifier)
+        XCTAssertEqual(ids.count, 1)
+        XCTAssertThrowsError(try candidate.resolveOwned(
+            XCTUnwrap(owner),
+            expected: ambiguous,
+            evidenceID: "must-not-clear-unknown"
+        )) {
+            XCTAssertEqual(
+                $0 as? BigSyncOutboundQuiescenceError,
+                .unresolvedSubmissions(ids)
+            )
+        }
+        owner = nil
+        XCTAssertThrowsError(try peer.admit(principal: principal))
+
+        let recovery = try peer.takeRecoveryOwnership(expected: ambiguous)
+        let resumed = try peer.resumeSourcePublication(
+            recovery,
+            principal: principal,
+            recoveryEvidenceID: "authoritative-source-settlement"
+        )
+        let resumedState = try peer.snapshot()
+        XCTAssertEqual(resumedState.barrier?.phase, .sourcePublication)
+        XCTAssertTrue(resumedState.outstandingSubmissions.isEmpty)
+        XCTAssertEqual(
+            resumedState.lastRecoveryEvidenceID,
+            "authoritative-source-settlement"
+        )
+        XCTAssertThrowsError(try candidate.admit(principal: principal))
+        var retry: BigSyncOutboundBatchLease? = try peer.admit(
+            principal: principal,
+            owner: resumed
+        )
+        try retry?.willSubmit()
+        try retry?.noteDefinitiveTransportOutcome()
+        try await retry?.completeLocalResponseProcessingCooperatively()
+        retry = nil
+        let completed = try peer.snapshot()
+        try peer.resolveOwned(
+            resumed,
+            expected: completed,
+            evidenceID: "durable-source-completion"
+        )
+        _ = try candidate.admit(principal: principal)
+    }
+
     func testSettlementRemovesOnlyItsOwnTicket() throws {
         let (_, peer, candidate, principal) = fixture()
         let first = try peer.admit(principal: principal)

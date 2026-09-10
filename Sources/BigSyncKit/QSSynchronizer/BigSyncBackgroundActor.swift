@@ -706,6 +706,49 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     @discardableResult
+    public func beginPostBarrierSourcePublication(
+        _ token: CloudKitSynchronizer.PostBarrierOutboundQuiescence,
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        sourcePublicationEvidenceID: String
+    ) throws -> BigSyncOutboundQuiescenceSnapshot {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        return try synchronizer.beginPostBarrierSourcePublication(
+            token,
+            expected: expected,
+            sourcePublicationEvidenceID: sourcePublicationEvidenceID
+        )
+    }
+
+    @BigSyncBackgroundActor
+    public func resumePostBarrierSourcePublication(
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        authorizingResume: @Sendable @BigSyncBackgroundActor (BigSyncOutboundQuiescenceSnapshot) async throws -> String
+    ) async throws -> CloudKitSynchronizer.PostBarrierOutboundQuiescence {
+        guard let synchronizer = realmSynchronizer else { throw CancellationError() }
+        let token = try await synchronizer.resumePostBarrierSourcePublication(
+            expected: expected,
+            revalidatingExternalOwner: { @BigSyncBackgroundActor in
+                guard self.realmSynchronizer === synchronizer else {
+                    throw CancellationError()
+                }
+            },
+            authorizingResume: authorizingResume
+        )
+        guard realmSynchronizer === synchronizer else {
+            synchronizer.abandonPostBarrierOutboundQuiescence(token)
+            throw CancellationError()
+        }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            synchronizer.abandonPostBarrierOutboundQuiescence(token)
+            throw error
+        }
+        return token
+    }
+
+    @BigSyncBackgroundActor
+    @discardableResult
     public func abortPostBarrierOutboundQuiescence(
         _ token: CloudKitSynchronizer.PostBarrierOutboundQuiescence
     ) throws -> Bool {

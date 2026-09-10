@@ -25,11 +25,18 @@ public struct BigSyncOutboundBarrier: Codable, Equatable, Sendable {
         /// Set BEFORE the domain is allowed to persist reservation/CAS state.
         /// Generic cancellation or pre-reservation abort can never clear it.
         case recoveryRequired
+        /// The committed domain has switched authority, but peer aggregate
+        /// writers remain fenced while this exact principal publishes source
+        /// journals through the ordinary upload/acknowledgement pipeline.
+        case sourcePublication
     }
     public let identifier: UUID
     public let writerBarrierEvidenceID: String
     public let principal: BigSyncOutboundPrincipal
     public internal(set) var phase: Phase
+    /// Durable host evidence that authority was committed before owner-only
+    /// source publication was enabled. Nil in earlier barrier phases.
+    public internal(set) var sourcePublicationEvidenceID: String? = nil
 }
 
 public struct BigSyncOutboundSubmission: Codable, Equatable, Sendable {
@@ -87,7 +94,10 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         if let owner {
             return try owner.withLock {
                 try validateOwner(owner, principal: principal, requiresDrained: true)
-                guard owner.allowsFinalDrain else { throw BigSyncOutboundQuiescenceError.blocked }
+                let mayUpload =
+                    (owner.allowsFinalDrain && owner.barrier.phase == .preparing)
+                    || (owner.allowsSourcePublication && owner.barrier.phase == .sourcePublication)
+                guard mayUpload else { throw BigSyncOutboundQuiescenceError.blocked }
                 owner.activeBatches += 1
                 return BigSyncOutboundBatchLease(coordinator: self, principal: principal,
                                                  batchLease: nil, owner: owner)
@@ -188,13 +198,66 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         try owner.withLock {
             try validateOwner(owner, principal: owner.barrier.principal)
             guard owner.activeBatches == 0 else { throw BigSyncOutboundQuiescenceError.busy }
+            guard owner.barrier.phase != .sourcePublication else {
+                throw BigSyncOutboundQuiescenceError.recoveryRequired
+            }
+            if owner.barrier.phase == .recoveryRequired {
+                owner.allowsFinalDrain = false
+                owner.allowsSourcePublication = false
+                return
+            }
             try withState { state in
+                guard state.outstandingSubmissions.isEmpty else {
+                    throw BigSyncOutboundQuiescenceError.unresolvedSubmissions(
+                        state.outstandingSubmissions.map(\.identifier))
+                }
                 var barrier = owner.barrier
                 barrier.phase = .recoveryRequired
+                barrier.sourcePublicationEvidenceID = nil
                 try write(BigSyncOutboundQuiescenceSnapshot(barrier: barrier,
                     submissions: state.outstandingSubmissions, recoveryEvidenceID: state.lastRecoveryEvidenceID))
                 owner.barrier = barrier
                 owner.allowsFinalDrain = false
+                owner.allowsSourcePublication = false
+            }
+        }
+    }
+
+    /// After the host durably commits the new authority, keep the same exclusive
+    /// transport owner but permit ordinary source-journal batches. Peer/legacy
+    /// batches remain fenced by the persisted barrier. This never arms another
+    /// aggregate cutoff or manufactures a terminal receipt.
+    func authorizeSourcePublication(
+        _ owner: BigSyncOutboundQuiescenceLease,
+        expected: BigSyncOutboundQuiescenceSnapshot,
+        evidenceID: String
+    ) throws -> BigSyncOutboundQuiescenceSnapshot {
+        try owner.withLock {
+            guard validEvidence(evidenceID) else { throw BigSyncOutboundQuiescenceError.invalidState }
+            try validateOwner(owner, principal: owner.barrier.principal)
+            guard owner.barrier.phase == .recoveryRequired else {
+                throw BigSyncOutboundQuiescenceError.recoveryRequired
+            }
+            guard owner.activeBatches == 0 else { throw BigSyncOutboundQuiescenceError.busy }
+            return try withState { state in
+                guard state == expected else { throw BigSyncOutboundQuiescenceError.staleAuthority }
+                guard state.outstandingSubmissions.isEmpty else {
+                    throw BigSyncOutboundQuiescenceError.unresolvedSubmissions(
+                        state.outstandingSubmissions.map(\.identifier))
+                }
+                var barrier = owner.barrier
+                barrier.phase = .sourcePublication
+                barrier.sourcePublicationEvidenceID = evidenceID
+                let updated = BigSyncOutboundQuiescenceSnapshot(
+                    barrier: barrier,
+                    submissions: [],
+                    recoveryEvidenceID: state.lastRecoveryEvidenceID
+                )
+                try write(updated)
+                owner.barrier = barrier
+                owner.allowsFinalDrain = false
+                owner.allowsSourcePublication = true
+                return updated
             }
         }
     }
@@ -240,17 +303,71 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         recovery.close()
     }
 
+    /// Convert exact crash/restart recovery ownership into owner-only source
+    /// publication without ever opening peer admission. The caller's durable
+    /// proof authorizes settlement of every uncertainty marker in `snapshot`;
+    /// the barrier itself remains installed under the original principal.
+    func resumeSourcePublication(
+        _ recovery: BigSyncOutboundRecoveryLease,
+        principal: BigSyncOutboundPrincipal,
+        recoveryEvidenceID: String
+    ) throws -> BigSyncOutboundQuiescenceLease {
+        guard recovery.directory == directory, validEvidence(recoveryEvidenceID),
+              validPrincipal(principal), !recovery.closed else {
+            throw BigSyncOutboundQuiescenceError.staleAuthority
+        }
+        try recovery.owner?.validateIdentity()
+        try recovery.batches?.validateIdentity()
+        let barrier = try withState { state -> BigSyncOutboundBarrier in
+            guard state == recovery.snapshot,
+                  let barrier = state.barrier,
+                  barrier.phase == .sourcePublication,
+                  barrier.principal == principal,
+                  barrier.sourcePublicationEvidenceID.map(validEvidence) == true else {
+                throw BigSyncOutboundQuiescenceError.staleAuthority
+            }
+            // The host proof covers the exact checkpoint, including every
+            // indeterminate source request. Clear only those exact markers while
+            // retaining the peer fence and recording the recovery decision.
+            try write(BigSyncOutboundQuiescenceSnapshot(
+                barrier: barrier,
+                submissions: [],
+                recoveryEvidenceID: recoveryEvidenceID
+            ))
+            return barrier
+        }
+        guard let ownership = recovery.owner, let batches = recovery.batches else {
+            throw BigSyncOutboundQuiescenceError.staleAuthority
+        }
+        recovery.owner = nil
+        recovery.batches = nil
+        recovery.closed = true
+        let owner = BigSyncOutboundQuiescenceLease(
+            coordinator: self,
+            ownerLease: ownership,
+            barrier: barrier
+        )
+        owner.batchLease = batches
+        owner.allowsSourcePublication = true
+        return owner
+    }
+
     func resolveOwned(_ owner: BigSyncOutboundQuiescenceLease,
                       expected: BigSyncOutboundQuiescenceSnapshot, evidenceID: String) throws {
         try owner.withLock {
             guard validEvidence(evidenceID) else { throw BigSyncOutboundQuiescenceError.invalidState }
             try validateOwner(owner, principal: owner.barrier.principal)
-            guard owner.barrier.phase == .recoveryRequired else {
+            guard owner.barrier.phase == .recoveryRequired
+                    || owner.barrier.phase == .sourcePublication else {
                 throw BigSyncOutboundQuiescenceError.recoveryRequired
             }
             guard owner.activeBatches == 0 else { throw BigSyncOutboundQuiescenceError.busy }
             try withState { state in
                 guard state == expected else { throw BigSyncOutboundQuiescenceError.staleAuthority }
+                guard state.outstandingSubmissions.isEmpty else {
+                    throw BigSyncOutboundQuiescenceError.unresolvedSubmissions(
+                        state.outstandingSubmissions.map(\.identifier))
+                }
                 try write(BigSyncOutboundQuiescenceSnapshot(recoveryEvidenceID: evidenceID))
             }
             owner.close()
@@ -302,7 +419,7 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
             guard state.version == 1,
                   state.outstandingSubmissions.count <= 4_096,
                   state.outstandingSubmissions.allSatisfy({ validPrincipal($0.principal) }),
-                  state.barrier.map({ validEvidence($0.writerBarrierEvidenceID) && validPrincipal($0.principal) }) ?? true,
+                  state.barrier.map(validBarrier) ?? true,
                   Set(state.outstandingSubmissions.map(\.identifier)).count == state.outstandingSubmissions.count else {
                 throw BigSyncOutboundQuiescenceError.invalidState
             }
@@ -327,6 +444,17 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         try bigSyncWriteDataDurably(JSONEncoder().encode(state), to: stateURL)
     }
 
+    private func validBarrier(_ barrier: BigSyncOutboundBarrier) -> Bool {
+        guard validEvidence(barrier.writerBarrierEvidenceID),
+              validPrincipal(barrier.principal) else { return false }
+        switch barrier.phase {
+        case .preparing, .recoveryRequired:
+            return barrier.sourcePublicationEvidenceID == nil
+        case .sourcePublication:
+            return barrier.sourcePublicationEvidenceID.map(validEvidence) == true
+        }
+    }
+
     private func validPrincipal(_ principal: BigSyncOutboundPrincipal) -> Bool {
         principal.durableStateNamespace == directory.lastPathComponent
             && validEvidence(principal.installationIdentifier)
@@ -349,6 +477,7 @@ internal final class BigSyncOutboundQuiescenceLease: @unchecked Sendable {
     fileprivate var activeBatches = 0
     fileprivate var closed = false
     fileprivate var allowsFinalDrain = false
+    fileprivate var allowsSourcePublication = false
     private var hasArmedFinalDrain = false
 
     fileprivate init(coordinator: BigSyncOutboundQuiescenceCoordinator, ownerLease: BigSyncFileLease,
@@ -377,9 +506,19 @@ internal final class BigSyncOutboundQuiescenceLease: @unchecked Sendable {
 
     func sealFinalDrain() { withLock { allowsFinalDrain = false } }
 
+    func sealOutboundAdmission() {
+        withLock {
+            allowsFinalDrain = false
+            allowsSourcePublication = false
+        }
+    }
+
     fileprivate func close() {
-        closed = true; allowsFinalDrain = false
-        batchLease = nil; ownerLease = nil
+        closed = true
+        allowsFinalDrain = false
+        allowsSourcePublication = false
+        batchLease = nil
+        ownerLease = nil
     }
     // No deinit disk mutation. A batch retains this owner until its actual
     // operation and callback scope exits, even if the synchronizer is replaced.
