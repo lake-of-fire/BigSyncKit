@@ -6,65 +6,14 @@ on:
       - codex/worker1-transport-publish-20260910
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: worker1-source-publication-pr8
   cancel-in-progress: true
 
 jobs:
-  publish:
-    if: github.repository == 'lake-of-fire/BigSyncKit'
+  supersede:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Verify source-publication handoff and fast-forward PR 8
-        shell: bash
-        env:
-          BASE: 582a50a1c800f7e965cd630907b684dcd4fa6792
-          BASE_TREE: 954f54ea89d31a2180947126d5411a3c913e91be
-          TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
-          SCRIPT_BLOB: 38421f3dc777227d4c82142f7151f30144d189d4
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse "$BASE^{tree}")" = "$BASE_TREE"
-          test "$(git hash-object .worker1-publish/apply-source-publication-phase.py)" = "$SCRIPT_BLOB"
-          cp .worker1-publish/apply-source-publication-phase.py /tmp/apply.py
-          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
-          test "$current" = "$BASE"
-          git checkout --detach "$BASE"
-          python3 /tmp/apply.py
-          git diff --check
-          changed="$(git diff --name-only | sort)"
-          expected="$(printf '%s\n' \
-            'Documentation/OutboundQuiescence.md' \
-            'Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift' \
-            'Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift' \
-            'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift' \
-            'Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift' | sort)"
-          test "$changed" = "$expected"
-          for file in \
-            Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift \
-            Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift \
-            Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift \
-            Tests/BigSyncKitTests/BigSyncOutboundQuiescenceTests.swift; do
-            swiftc -frontend -parse "$file"
-          done
-          Tools/run-outbound-quiescence-portable-tests.sh
-          Tools/run-outbound-quiescence-process-tests.sh
-          git add -A
-          tree="$(git write-tree)"
-          export GIT_AUTHOR_NAME=Codex GIT_AUTHOR_EMAIL=codex@users.noreply.github.com
-          export GIT_COMMITTER_NAME=Codex GIT_COMMITTER_EMAIL=codex@users.noreply.github.com
-          commit="$(printf '%s\n\n%s\n' \
-            'Add durable owner-only source publication handoff' \
-            'Carry the outbound fence through post-bootstrap source publication: persist a source-publication phase, admit only the exact owner through the ordinary upload/ack pipeline, support crash/restart resume after exact host settlement proof, and refuse live release while uncertainty markers remain. Peer legacy aggregates stay fenced until explicit durable completion and release.' \
-            | git commit-tree "$tree" -p "$BASE")"
-          test "$(git rev-parse "$commit^")" = "$BASE"
-          current="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
-          test "$current" = "$BASE"
-          git push origin "$commit:refs/heads/$TARGET_BRANCH"
-          echo "PUBLISHED_COMMIT=$commit"
-          echo "PUBLISHED_TREE=$tree"
+      - run: echo "Superseding incomplete source-publication candidate before publication."
