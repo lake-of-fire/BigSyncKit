@@ -279,7 +279,15 @@ extension CloudKitSynchronizer {
         guard Self.accountScopeIdentifier(for: account) == principal.accountScopeIdentifier else {
             throw BigSyncOutboundQuiescenceError.staleAuthority
         }
-        let evidence = try await authorizingResume(expected)
+        let replayedCheckpoint = try await replayRecoverableOutboundSubmissions(
+            recovery,
+            principal: principal,
+            revalidatingExternalOwner: { @BigSyncBackgroundActor in
+                try validateOwnership()
+            }
+        )
+        try validateOwnership()
+        let evidence = try await authorizingResume(replayedCheckpoint)
         try validateOwnership()
         let confirmedAccount = try await accountIdentifierProvider()
         try validateOwnership()
@@ -349,7 +357,15 @@ extension CloudKitSynchronizer {
         guard Self.accountScopeIdentifier(for: account) == principal.accountScopeIdentifier else {
             throw BigSyncOutboundQuiescenceError.staleAuthority
         }
-        let evidence = try await authorizingRecovery(expected)
+        let replayedCheckpoint = try await replayRecoverableOutboundSubmissions(
+            recovery,
+            principal: principal,
+            revalidatingExternalOwner: { @BigSyncBackgroundActor in
+                try validateOwnership()
+            }
+        )
+        try validateOwnership()
+        let evidence = try await authorizingRecovery(replayedCheckpoint)
         try validateOwnership()
         let confirmedAccount = try await accountIdentifierProvider()
         try validateOwnership()

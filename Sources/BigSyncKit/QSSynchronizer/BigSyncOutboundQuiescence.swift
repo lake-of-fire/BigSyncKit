@@ -401,6 +401,40 @@ internal final class BigSyncOutboundQuiescenceCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Retire one exact long-lived request only after its saved CloudKit
+    /// callbacks have been reconciled through generation-matched local state.
+    /// Recovery keeps the exclusive owner/batch leases throughout this
+    /// transition, so no peer can race a replacement request into the gate.
+    func settleRecoveredSubmission(
+        _ recovery: BigSyncOutboundRecoveryLease,
+        submission: BigSyncOutboundSubmission,
+        principal: BigSyncOutboundPrincipal
+    ) throws {
+        guard recovery.directory == directory,
+              !recovery.closed,
+              submission.principal == principal else {
+            throw BigSyncOutboundQuiescenceError.staleAuthority
+        }
+        try recovery.owner?.validateIdentity()
+        try recovery.batches?.validateIdentity()
+        let updated = try withState { state -> BigSyncOutboundQuiescenceSnapshot in
+            guard state == recovery.snapshot,
+                  state.outstandingSubmissions.contains(submission) else {
+                throw BigSyncOutboundQuiescenceError.staleAuthority
+            }
+            let next = BigSyncOutboundQuiescenceSnapshot(
+                barrier: state.barrier,
+                submissions: state.outstandingSubmissions.filter {
+                    $0.identifier != submission.identifier
+                },
+                recoveryEvidenceID: state.lastRecoveryEvidenceID
+            )
+            try write(next)
+            return next
+        }
+        recovery.snapshot = updated
+    }
+
     /// The host must prove its exact domain recovery decision AND settle every
     /// indeterminate submitted operation in `expected` before calling this.
     /// A fetch, elapsed time, or OS-lock disappearance alone is NOT that proof.
@@ -939,7 +973,7 @@ internal final class BigSyncOutboundRecoveryLease {
     fileprivate let directory: URL
     fileprivate var owner: BigSyncFileLease?
     fileprivate var batches: BigSyncFileLease?
-    let snapshot: BigSyncOutboundQuiescenceSnapshot
+    var snapshot: BigSyncOutboundQuiescenceSnapshot
     fileprivate var closed = false
     fileprivate init(directory: URL, owner: BigSyncFileLease, batches: BigSyncFileLease, snapshot: BigSyncOutboundQuiescenceSnapshot) {
         self.directory = directory; self.owner = owner; self.batches = batches; self.snapshot = snapshot
