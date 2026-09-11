@@ -1599,15 +1599,19 @@ extension CloudKitSynchronizer {
     func uploadChanges(
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
+        let operationError: Error?
         do {
             for adapter in modelAdapters {
                 try Task.checkCancellation()
                 try await synchronizeAdapter(adapter)
             }
-            try await completion(nil)
+            operationError = nil
         } catch {
-            try await completion(error)
+            operationError = error
         }
+        // Token publication/follow-up fetching belongs to the consumer. A
+        // failure there must not re-enter that consumer as a second result.
+        try await completion(operationError)
     }
     
     @BigSyncBackgroundActor
@@ -1646,28 +1650,24 @@ extension CloudKitSynchronizer {
                 try await completion(error)
                 return
             }
-            do {
-                try await uploadRecordsUsingAsyncStore(
-                    adapter: adapter,
-                    restrictedToEntityType: restrictedToEntityType,
-                    attemptID: attemptID,
-                    completion: { [weak self] (error) in
-                        guard let self else {
-                            try await completion(CancellationError())
-                            return
-                        }
-                        do {
-                            try checkSynchronizationAttempt(attemptID)
-                        } catch {
-                            try await completion(error)
-                            return
-                        }
-                        try await completion(error)
+            try await uploadRecordsUsingAsyncStore(
+                adapter: adapter,
+                restrictedToEntityType: restrictedToEntityType,
+                attemptID: attemptID,
+                completion: { [weak self] error in
+                    guard let self else {
+                        try await completion(CancellationError())
+                        return
                     }
-                )
-            } catch {
-                try await completion(error)
-            }
+                    do {
+                        try checkSynchronizationAttempt(attemptID)
+                    } catch {
+                        try await completion(error)
+                        return
+                    }
+                    try await completion(error)
+                }
+            )
         }
     }
     
@@ -1698,6 +1698,7 @@ extension CloudKitSynchronizer {
         attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
+        let lookupError: Error?
         do {
             // Validate immediately before and after each account-routed await.
             try await revalidateActiveRunContext(for: attemptID)
@@ -1709,70 +1710,73 @@ extension CloudKitSynchronizer {
                     accountScopeIdentifier: context.accountScopeIdentifier
                 )
             }
-            try await completion(nil)
+            lookupError = nil
         } catch {
-            do {
-                // Account replacement or cancellation wins over interpreting
-                // an obsolete zone lookup as evidence that a zone is missing.
-                try await revalidateActiveRunContext(for: attemptID)
-            } catch {
-                try await completion(error)
-                return
-            }
-
-            guard let context = activeRunContext else {
-                try await completion(error)
-                return
-            }
-            let classification = CloudKitLossClassifier.classify(
-                error: error,
-                defaultZoneID: zoneID
-            )
-            guard let disposition = classification.zoneDispositions[zoneID]
-            else {
-                try await completion(error)
-                return
-            }
-            if let lifecycleError = applyCloudKitLoss(
-                disposition,
-                zoneID: zoneID,
-                context: context,
-                allowsEncryptedBootstrapAbsence:
-                    isEncryptedDataResetRecoveryActive
-            ) {
-                try await completion(lifecycleError)
-                return
-            }
-
-            let newZone = CKRecordZone(zoneID: zoneID)
-            do {
-                try await revalidateActiveRunContext(for: attemptID)
-                let savedZone = try await zoneStore.save(recordZone: newZone)
-                try await revalidateActiveRunContext(for: attemptID)
-                guard savedZone.zoneID == zoneID else {
-                    throw CocoaError(.coderValueNotFound)
-                }
-                try markConfiguredZoneEstablished(
-                    zoneID,
-                    accountScopeIdentifier: context.accountScopeIdentifier
-                )
-                logger.info(
-                    "QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)"
-                )
-                try await completion(nil)
-            } catch {
-                if let lifecycleError = applyCloudKitLoss(
-                    error: error,
-                    defaultZoneID: zoneID,
-                    context: context,
-                    allowsEncryptedBootstrapAbsence: false
-                ) {
-                    try await completion(lifecycleError)
-                } else {
-                    try await completion(error)
-                }
-            }
+            lookupError = error
         }
+        guard let lookupError else {
+            try await completion(nil)
+            return
+        }
+
+        do {
+            // Account replacement or cancellation wins over interpreting
+            // an obsolete zone lookup as evidence that a zone is missing.
+            try await revalidateActiveRunContext(for: attemptID)
+        } catch {
+            try await completion(error)
+            return
+        }
+        guard let context = activeRunContext else {
+            try await completion(lookupError)
+            return
+        }
+        let classification = CloudKitLossClassifier.classify(
+            error: lookupError,
+            defaultZoneID: zoneID
+        )
+        guard let disposition = classification.zoneDispositions[zoneID] else {
+            try await completion(lookupError)
+            return
+        }
+        if let lifecycleError = applyCloudKitLoss(
+            disposition,
+            zoneID: zoneID,
+            context: context,
+            allowsEncryptedBootstrapAbsence: isEncryptedDataResetRecoveryActive
+        ) {
+            try await completion(lifecycleError)
+            return
+        }
+
+        let newZone = CKRecordZone(zoneID: zoneID)
+        let saveError: Error?
+        do {
+            try await revalidateActiveRunContext(for: attemptID)
+            let savedZone = try await zoneStore.save(recordZone: newZone)
+            try await revalidateActiveRunContext(for: attemptID)
+            guard savedZone.zoneID == zoneID else {
+                throw CocoaError(.coderValueNotFound)
+            }
+            try markConfiguredZoneEstablished(
+                zoneID,
+                accountScopeIdentifier: context.accountScopeIdentifier
+            )
+            logger.info(
+                "QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)"
+            )
+            saveError = nil
+        } catch {
+            saveError = applyCloudKitLoss(
+                error: error,
+                defaultZoneID: zoneID,
+                context: context,
+                allowsEncryptedBootstrapAbsence: false
+            ) ?? error
+        }
+        // Deliver outside both operation catches. A completion may itself
+        // perform a fallible upload; that must never become zone-loss evidence.
+        try await completion(saveError)
     }
 
     @BigSyncBackgroundActor
