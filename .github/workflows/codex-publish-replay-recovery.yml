@@ -1,0 +1,152 @@
+name: Publish exact outbound replay recovery
+
+on:
+  push:
+    branches:
+      - codex/bigsync-replay-publish-20260910
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: codex/ordered-v2-followup-ownership-20260909
+      SOURCE_BRANCH: codex/bigsync-replay-source-20260910
+      EXPECTED_HEAD: e5f85a4ca5809b9cee2f9dc8eb91f3242a3b0e0e
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Guard exact live parent
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$remote_head" = "$EXPECTED_HEAD"
+
+      - name: Apply replay recovery source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin "$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH"
+          mkdir -p Sources/BigSyncKit/QSSynchronizer
+          git show "refs/remotes/origin/$SOURCE_BRANCH:Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundReplayRecovery.swift" \
+            > Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundReplayRecovery.swift
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          q = "Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift"
+          replace_once(
+              q,
+              "    let snapshot: BigSyncOutboundQuiescenceSnapshot\n",
+              "    var snapshot: BigSyncOutboundQuiescenceSnapshot\n",
+          )
+          marker = '''    /// The host must prove its exact domain recovery decision AND settle every
+              /// indeterminate submitted operation in `expected` before calling this.
+          '''
+          insertion = '''    /// Retire one exact long-lived request only after its saved CloudKit
+              /// callbacks have been reconciled through generation-matched local state.
+              /// Recovery keeps the exclusive owner/batch leases throughout this
+              /// transition, so no peer can race a replacement request into the gate.
+              func settleRecoveredSubmission(
+                  _ recovery: BigSyncOutboundRecoveryLease,
+                  submission: BigSyncOutboundSubmission,
+                  principal: BigSyncOutboundPrincipal
+              ) throws {
+                  guard recovery.directory == directory,
+                        !recovery.closed,
+                        submission.principal == principal else {
+                      throw BigSyncOutboundQuiescenceError.staleAuthority
+                  }
+                  try recovery.owner?.validateIdentity()
+                  try recovery.batches?.validateIdentity()
+                  let updated = try withState { state -> BigSyncOutboundQuiescenceSnapshot in
+                      guard state == recovery.snapshot,
+                            state.outstandingSubmissions.contains(submission) else {
+                          throw BigSyncOutboundQuiescenceError.staleAuthority
+                      }
+                      let next = BigSyncOutboundQuiescenceSnapshot(
+                          barrier: state.barrier,
+                          submissions: state.outstandingSubmissions.filter {
+                              $0.identifier != submission.identifier
+                          },
+                          recoveryEvidenceID: state.lastRecoveryEvidenceID
+                      )
+                      try write(next)
+                      return next
+                  }
+                  recovery.snapshot = updated
+              }
+
+          ''' + marker
+          replace_once(q, marker, insertion)
+
+          o = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift"
+          replace_once(
+              o,
+              '''        let evidence = try await authorizingResume(expected)
+                  try validateOwnership()
+          ''',
+              '''        let replayedCheckpoint = try await replayRecoverableOutboundSubmissions(
+                      recovery,
+                      principal: principal,
+                      revalidatingExternalOwner: { @BigSyncBackgroundActor in
+                          try validateOwnership()
+                      }
+                  )
+                  try validateOwnership()
+                  let evidence = try await authorizingResume(replayedCheckpoint)
+                  try validateOwnership()
+          ''',
+          )
+          replace_once(
+              o,
+              '''        let evidence = try await authorizingRecovery(expected)
+                  try validateOwnership()
+          ''',
+              '''        let replayedCheckpoint = try await replayRecoverableOutboundSubmissions(
+                      recovery,
+                      principal: principal,
+                      revalidatingExternalOwner: { @BigSyncBackgroundActor in
+                          try validateOwnership()
+                      }
+                  )
+                  try validateOwnership()
+                  let evidence = try await authorizingRecovery(replayedCheckpoint)
+                  try validateOwnership()
+          ''',
+          )
+          PY
+
+          git diff --check
+          test "$(git grep -n 'replayRecoverableOutboundSubmissions(' -- Sources/BigSyncKit/QSSynchronizer | wc -l | tr -d ' ')" -ge 3
+          test "$(git grep -n 'settleRecoveredSubmission(' -- Sources/BigSyncKit/QSSynchronizer | wc -l | tr -d ' ')" -eq 2
+          git diff --stat
+
+      - name: Commit and guarded fast-forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          test "$remote_head" = "$EXPECTED_HEAD"
+          git config user.name 'Alex Ehlke'
+          git config user.email 'alex.ehlke@gmail.com'
+          git add Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundReplayRecovery.swift
+          git commit -m 'Replay long-lived outbound uncertainty during recovery [skip ci]'
+          git push origin "HEAD:$TARGET_BRANCH"
