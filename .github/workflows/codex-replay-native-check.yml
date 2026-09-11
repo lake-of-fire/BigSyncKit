@@ -1,0 +1,42 @@
+name: Replay recovery native check
+
+on:
+  push:
+    branches:
+      - audit/replay-native-20260910
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Compile exact replay source and run focused suites
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_26.3.app ]; then sudo xcode-select -s /Applications/Xcode_26.3.app; fi
+          git rev-parse HEAD HEAD^{tree}
+          swift --version
+          xcodebuild -version
+          swift test --filter BigSyncOutboundQuiescenceTests
+          swift test --filter CloudKitOutboundSettlementTests
+          swift test --filter ModelAdapterDeletionConflictSafetyTests
+          git diff --exit-code
