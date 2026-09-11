@@ -133,9 +133,12 @@ jobs:
           PY
 
           git diff --check
+          git add Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift \
+                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundReplayRecovery.swift
           test "$(git grep -n 'replayRecoverableOutboundSubmissions(' -- Sources/BigSyncKit/QSSynchronizer | wc -l | tr -d ' ')" -ge 3
           test "$(git grep -n 'settleRecoveredSubmission(' -- Sources/BigSyncKit/QSSynchronizer | wc -l | tr -d ' ')" -eq 2
-          git diff --stat
+          git diff --cached --stat
 
       - name: Commit and guarded fast-forward
         shell: bash
@@ -145,8 +148,5 @@ jobs:
           test "$remote_head" = "$EXPECTED_HEAD"
           git config user.name 'Alex Ehlke'
           git config user.email 'alex.ehlke@gmail.com'
-          git add Sources/BigSyncKit/QSSynchronizer/BigSyncOutboundQuiescence.swift \
-                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundQuiescence.swift \
-                  Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+OutboundReplayRecovery.swift
           git commit -m 'Replay long-lived outbound uncertainty during recovery [skip ci]'
           git push origin "HEAD:$TARGET_BRANCH"
