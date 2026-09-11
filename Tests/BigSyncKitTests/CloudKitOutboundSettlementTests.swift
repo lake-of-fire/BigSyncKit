@@ -212,3 +212,48 @@ extension CloudKitOutboundSettlementTests {
         XCTAssertTrue(try capture.result().saveResults.isEmpty)
     }
 }
+
+
+extension CloudKitOutboundSettlementTests {
+    func testReplayLookupRejectionsCannotSettleTheOriginalMutation() {
+        for code in [CKError.Code.limitExceeded, .invalidArguments, .badDatabase, .badContainer] {
+            let lookupError = CKError(code)
+            XCTAssertTrue(CloudKitRecordMutationResults.isDefinitiveOperationRejection(lookupError))
+            XCTAssertFalse(CloudKitRecordMutationResults.isDefinitiveReplayedOperationRejection(lookupError))
+        }
+        XCTAssertFalse(CloudKitRecordMutationResults.isDefinitiveReplayedOperationRejection(
+            BigSyncLongLivedReplayError.transportIdentityMismatch))
+        XCTAssertFalse(CloudKitRecordMutationResults.isDefinitiveReplayedOperationRejection(CancellationError()))
+    }
+
+    func testReplayTerminalProvenanceDoesNotMakeUnknownErrorsDefinitive() throws {
+        let record = CKRecord(recordType: "Item", recordID: .init(recordName: "Item.one"))
+        for code in [CKError.Code.limitExceeded, .badContainer, .networkFailure, .operationCancelled] {
+            let request = prepared(saving: [record]), capture = PreparedMutationCapture()
+            try request.installResultHandlers {
+                capture.receive(BigSyncLongLivedReplayTerminalFailure.markingTerminalDelivery($0))
+            }
+            request.operation.modifyRecordsResultBlock?(.failure(CKError(code)))
+            XCTAssertThrowsError(try capture.result()) { error in
+                XCTAssertTrue(error is BigSyncLongLivedReplayTerminalFailure)
+                XCTAssertEqual(CloudKitRecordMutationResults.isDefinitiveReplayedOperationRejection(error),
+                    code == .limitExceeded || code == .badContainer)
+            }
+        }
+    }
+
+    func testPartialReplayCallbackSetCannotBeMarkedAsWholeOperationRejection() throws {
+        let saved = CKRecord(recordType: "Item", recordID: .init(recordName: "Item.one"))
+        let missing = CKRecord(recordType: "Item", recordID: .init(recordName: "Item.two"))
+        let request = prepared(saving: [saved, missing]), capture = PreparedMutationCapture()
+        try request.installResultHandlers {
+            capture.receive(BigSyncLongLivedReplayTerminalFailure.markingTerminalDelivery($0))
+        }
+        request.operation.perRecordSaveBlock?(saved.recordID, .success(saved))
+        request.operation.modifyRecordsResultBlock?(.failure(CKError(.limitExceeded)))
+        let result = try capture.result()
+        XCTAssertNotNil(result.saveResults[saved.recordID])
+        XCTAssertNil(result.saveResults[missing.recordID])
+        XCTAssertFalse(result.provesDefinitiveSettlement(saving: [saved, missing], deleting: []))
+    }
+}

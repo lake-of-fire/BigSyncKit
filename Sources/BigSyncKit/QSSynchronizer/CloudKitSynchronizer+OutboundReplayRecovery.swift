@@ -14,8 +14,26 @@ enum BigSyncLongLivedReplayError: Error, Equatable, Sendable {
     case missingAdapter
 }
 
+/// Only errors delivered by the exact recovered modify operation's terminal
+/// callback carry this provenance. A fetchLongLivedOperation lookup error (even
+/// badContainer/invalidArguments/limitExceeded) says nothing about whether the
+/// ORIGINAL mutation committed and must never retire its submission marker.
+@available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
+internal struct BigSyncLongLivedReplayTerminalFailure: Error {
+    let underlyingError: Error
+
+    static func markingTerminalDelivery(
+        _ result: Result<CloudKitRecordMutationResults, Error>
+    ) -> Result<CloudKitRecordMutationResults, Error> {
+        result.mapError { Self(underlyingError: $0) }
+    }
+}
+
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
 internal protocol CloudKitLongLivedRecordRecovering: CloudKitRecordStore {
+    /// Raw lookup/identity/admission errors never certify the original request.
+    /// Only an exact terminal modify callback may wrap its error in
+    /// BigSyncLongLivedReplayTerminalFailure; item outcomes remain unwrapped.
     func recoverLongLivedModifyRecords(
         identity: BigSyncOutboundSubmissionTransportIdentity,
         descriptor: BigSyncOutboundSubmissionRecoveryDescriptor
@@ -117,7 +135,8 @@ extension DefaultCloudKitDatabaseAdapter: CloudKitLongLivedRecordRecovering {
             (continuation: CheckedContinuation<CloudKitRecordMutationResults, Error>) in
             do {
                 try prepared.installResultHandlers { result in
-                    continuation.resume(with: result)
+                    continuation.resume(with:
+                        BigSyncLongLivedReplayTerminalFailure.markingTerminalDelivery(result))
                 }
                 // Resume this exact proxy; never allocate a replacement request.
                 container.add(operation)
@@ -130,6 +149,13 @@ extension DefaultCloudKitDatabaseAdapter: CloudKitLongLivedRecordRecovering {
 
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
 extension CloudKitRecordMutationResults {
+    internal static func isDefinitiveReplayedOperationRejection(_ error: Error) -> Bool {
+        guard let terminal = error as? BigSyncLongLivedReplayTerminalFailure else {
+            return false
+        }
+        return isDefinitiveOperationRejection(terminal.underlyingError)
+    }
+
     internal func provesDefinitiveSettlement(
         descriptor: BigSyncOutboundSubmissionRecoveryDescriptor
     ) -> Bool {
@@ -245,11 +271,12 @@ extension CloudKitSynchronizer {
             }
             mutationResults = recovered
         } catch {
-            // A whole-operation rejection known not to have committed is
-            // definitive transport settlement. The Realm generation remains
-            // pending for normal retry, but this uncertainty marker can retire.
+            // Only a definitive rejection from the original modify operation's
+            // terminal callback can settle without per-item handling. Lookup or
+            // proxy setup failures have no authority over that older mutation.
+            try revalidatingExternalOwner()
             if CloudKitRecordMutationResults
-                .isDefinitiveOperationRejection(error) {
+                .isDefinitiveReplayedOperationRejection(error) {
                 return true
             }
             throw error
