@@ -22,34 +22,6 @@ internal protocol CloudKitLongLivedRecordRecovering: CloudKitRecordStore {
     ) async throws -> CloudKitRecordMutationResults?
 }
 
-@available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
-private final class BigSyncReplayedMutationCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var saves = [CKRecord.ID: Result<CKRecord, Error>]()
-    private var deletes = [CKRecord.ID: Result<Void, Error>]()
-
-    func recordSave(_ recordID: CKRecord.ID, result: Result<CKRecord, Error>) {
-        lock.lock()
-        saves[recordID] = result
-        lock.unlock()
-    }
-
-    func recordDelete(_ recordID: CKRecord.ID, result: Result<Void, Error>) {
-        lock.lock()
-        deletes[recordID] = result
-        lock.unlock()
-    }
-
-    func snapshot() -> CloudKitRecordMutationResults {
-        lock.lock()
-        defer { lock.unlock() }
-        return CloudKitRecordMutationResults(
-            saveResults: saves,
-            deleteResults: deletes
-        )
-    }
-}
-
 private extension BigSyncOutboundSubmissionItem {
     var recordID: CKRecord.ID {
         CKRecord.ID(
@@ -134,39 +106,24 @@ extension DefaultCloudKitDatabaseAdapter: CloudKitLongLivedRecordRecovering {
             throw BigSyncLongLivedReplayError.requestIdentityMismatch
         }
 
-        let collector = BigSyncReplayedMutationCollector()
+        // Replay uses the same single-delivery collector as live mutations.
+        // Incomplete item callbacks must not become an operation-wide rejection
+        // which the recovery loop could use to retire an uncertain submission.
+        let prepared = CloudKitPreparedRecordMutation(
+            operation: operation, transportIdentity: identity,
+            expectedSaveIDs: expectedSaveIDs, expectedDeleteIDs: expectedDeleteIDs
+        )
         return try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<CloudKitRecordMutationResults, Error>) in
-            operation.perRecordSaveBlock = { recordID, result in
-                collector.recordSave(recordID, result: result)
-            }
-            operation.perRecordDeleteBlock = { recordID, result in
-                collector.recordDelete(recordID, result: result)
-            }
-            operation.modifyRecordsResultBlock = { result in
-                let collected = collector.snapshot()
-                let hasEveryPerItemResult =
-                    Set(collected.saveResults.keys) == expectedSaveIDs
-                    && Set(collected.deleteResults.keys) == expectedDeleteIDs
-                switch result {
-                case .success:
-                    continuation.resume(returning: collected)
-                case .failure(let error):
-                    // Non-atomic partial failure still carries authoritative
-                    // per-item outcomes. Preserve those instead of collapsing
-                    // them into one operation-level error.
-                    if hasEveryPerItemResult {
-                        continuation.resume(returning: collected)
-                    } else {
-                        continuation.resume(throwing: error)
-                    }
+            do {
+                try prepared.installResultHandlers { result in
+                    continuation.resume(with: result)
                 }
+                // Resume this exact proxy; never allocate a replacement request.
+                container.add(operation)
+            } catch {
+                continuation.resume(throwing: error)
             }
-            // Apple requires callback blocks to be installed before starting a
-            // recovered long-lived operation. Adding the proxy replays callbacks
-            // saved while this process was absent; it does not create a new
-            // mutation request with a new operation ID.
-            container.add(operation)
         }
     }
 }

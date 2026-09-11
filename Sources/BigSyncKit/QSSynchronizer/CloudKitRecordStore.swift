@@ -34,12 +34,18 @@ public protocol CloudKitRecordStore: Sendable {
     ) async throws -> CloudKitRecordMutationResults
 }
 
+internal enum CloudKitPreparedRecordMutationError: Error, Equatable {
+    case alreadyExecuted
+}
+
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
 internal final class CloudKitPreparedRecordMutation: @unchecked Sendable {
     let operation: CKModifyRecordsOperation
     let transportIdentity: BigSyncOutboundSubmissionTransportIdentity
     let expectedSaveIDs: Set<CKRecord.ID>
     let expectedDeleteIDs: Set<CKRecord.ID>
+    private let executionLock = NSLock()
+    private var hasInstalledResultHandlers = false
 
     init(
         operation: CKModifyRecordsOperation,
@@ -51,6 +57,34 @@ internal final class CloudKitPreparedRecordMutation: @unchecked Sendable {
         self.transportIdentity = transportIdentity
         self.expectedSaveIDs = expectedSaveIDs
         self.expectedDeleteIDs = expectedDeleteIDs
+    }
+
+    /// The actual operation owns these callbacks, so none may retain this
+    /// prepared wrapper (which in turn owns the operation). Installation is
+    /// single-use: a second executor must not replace an outstanding continuation.
+    func installResultHandlers(
+        completion: @escaping @Sendable (Result<CloudKitRecordMutationResults, Error>) -> Void
+    ) throws {
+        executionLock.lock()
+        defer { executionLock.unlock() }
+        guard !hasInstalledResultHandlers else {
+            throw CloudKitPreparedRecordMutationError.alreadyExecuted
+        }
+        hasInstalledResultHandlers = true
+        let collector = CloudKitMutationResultCollector(
+            expectedSaveIDs: expectedSaveIDs,
+            expectedDeleteIDs: expectedDeleteIDs,
+            completion: completion
+        )
+        operation.perRecordSaveBlock = { recordID, result in
+            collector.recordSave(recordID, result)
+        }
+        operation.perRecordDeleteBlock = { recordID, result in
+            collector.recordDelete(recordID, result)
+        }
+        operation.modifyRecordsResultBlock = { result in
+            collector.finish(result)
+        }
     }
 }
 
@@ -73,28 +107,66 @@ internal protocol CloudKitRecoverableRecordStore: CloudKitRecordStore {
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
 private final class CloudKitMutationResultCollector: @unchecked Sendable {
     private let lock = NSLock()
+    private let expectedSaveIDs: Set<CKRecord.ID>
+    private let expectedDeleteIDs: Set<CKRecord.ID>
+    private var completion: (@Sendable (Result<CloudKitRecordMutationResults, Error>) -> Void)?
     private var saves = [CKRecord.ID: Result<CKRecord, Error>]()
     private var deletes = [CKRecord.ID: Result<Void, Error>]()
 
+    init(
+        expectedSaveIDs: Set<CKRecord.ID>,
+        expectedDeleteIDs: Set<CKRecord.ID>,
+        completion: @escaping @Sendable (Result<CloudKitRecordMutationResults, Error>) -> Void
+    ) {
+        self.expectedSaveIDs = expectedSaveIDs
+        self.expectedDeleteIDs = expectedDeleteIDs
+        self.completion = completion
+    }
+
     func recordSave(_ recordID: CKRecord.ID, _ result: Result<CKRecord, Error>) {
         lock.lock()
+        defer { lock.unlock() }
+        guard completion != nil else { return }
         saves[recordID] = result
-        lock.unlock()
     }
 
     func recordDelete(_ recordID: CKRecord.ID, _ result: Result<Void, Error>) {
         lock.lock()
+        defer { lock.unlock() }
+        guard completion != nil else { return }
         deletes[recordID] = result
-        lock.unlock()
     }
 
-    func snapshot() -> CloudKitRecordMutationResults {
+    func finish(_ result: Result<Void, Error>) {
         lock.lock()
-        defer { lock.unlock() }
-        return CloudKitRecordMutationResults(
-            saveResults: saves,
-            deleteResults: deletes
-        )
+        guard let completion else { lock.unlock(); return }
+        self.completion = nil
+        let collected = CloudKitRecordMutationResults(saveResults: saves, deleteResults: deletes)
+        let hasEveryPerItemResult = Set(saves.keys) == expectedSaveIDs
+            && Set(deletes.keys) == expectedDeleteIDs
+        let hasAnyPerItemResult = !saves.isEmpty || !deletes.isEmpty
+        // A retained CKOperation must not retain the caller's continuation or
+        // completed result payloads after terminal delivery.
+        saves.removeAll()
+        deletes.removeAll()
+        lock.unlock()
+
+        switch result {
+        case .success:
+            completion(.success(collected))
+        case .failure(let error):
+            // Never discard an observed item outcome in favor of an operation
+            // error. In particular, a partial callback set plus limitExceeded
+            // must not look like a definitive whole-operation rejection.
+            // Missing items remain absent: the existing settlement validator
+            // retains the durable marker, while exact known successes can be
+            // generation-matched locally. No missing result is synthesized.
+            if hasEveryPerItemResult || hasAnyPerItemResult {
+                completion(.success(collected))
+            } else {
+                completion(.failure(error))
+            }
+        }
     }
 }
 
@@ -166,35 +238,16 @@ extension DefaultCloudKitDatabaseAdapter: CloudKitRecordStore, CloudKitRecoverab
     internal func executeRecoverableModifyRecords(
         _ prepared: CloudKitPreparedRecordMutation
     ) async throws -> CloudKitRecordMutationResults {
-        let collector = CloudKitMutationResultCollector()
         return try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<CloudKitRecordMutationResults, Error>) in
-            prepared.operation.perRecordSaveBlock = { recordID, result in
-                collector.recordSave(recordID, result)
-            }
-            prepared.operation.perRecordDeleteBlock = { recordID, result in
-                collector.recordDelete(recordID, result)
-            }
-            prepared.operation.modifyRecordsResultBlock = { result in
-                let collected = collector.snapshot()
-                let hasEveryPerItemResult =
-                    Set(collected.saveResults.keys) == prepared.expectedSaveIDs
-                    && Set(collected.deleteResults.keys) == prepared.expectedDeleteIDs
-                switch result {
-                case .success:
-                    continuation.resume(returning: collected)
-                case .failure(let error):
-                    // Non-atomic partial failure still carries authoritative
-                    // per-item outcomes. Preserve those instead of collapsing
-                    // them into one operation-level error.
-                    if hasEveryPerItemResult {
-                        continuation.resume(returning: collected)
-                    } else {
-                        continuation.resume(throwing: error)
-                    }
+            do {
+                try prepared.installResultHandlers { result in
+                    continuation.resume(with: result)
                 }
+                database.add(prepared.operation)
+            } catch {
+                continuation.resume(throwing: error)
             }
-            database.add(prepared.operation)
         }
     }
 }
