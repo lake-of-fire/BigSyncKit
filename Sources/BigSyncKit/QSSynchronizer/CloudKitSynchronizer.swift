@@ -2169,11 +2169,8 @@ public class CloudKitSynchronizer: NSObject {
         _ result: SynchronizationResult,
         context: RunContext
     ) async {
-        // A revoked callback cannot hold a replacement drain hostage.
-        // Suppress duplicate delivery only for the current attempt.
-        do { try checkRunContext(context) } catch { return }
         guard synchronizationDrainIsActive,
-              completingPublicationAttemptID != context.attemptID else { return }
+              completingPublicationAttemptID == nil else { return }
         completingPublicationAttemptID = context.attemptID
         defer {
             if completingPublicationAttemptID == context.attemptID {
