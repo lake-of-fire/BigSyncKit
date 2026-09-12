@@ -1,105 +1,84 @@
-# RA-1 Worker 2 — actual implementation and remaining joins
+# RA-1 Worker 2 — published code and remaining removal boundary
 
-## Published source
+## Source and ownership
 
-PR #10 merged normally at `5923cdccc39d90952865d27041ee7ac1168a1ac8`.
-PR #11 continues on `codex/reading-analytics-w2-review-20260911`, targeting
-`codex/reading-analytics-integration-20260911`. Coordinator: root issue #21.
-Only W1 merges integration batches; W2 does not modify completed milestone branches.
+PR #10 merged at `5923cdccc39d90952865d27041ee7ac1168a1ac8`. PR #11 continues on
+`codex/reading-analytics-w2-review-20260911`, targeting the dedicated integration
+branch. W2 edits BigSync only; W1 alone approves/merges integration and root pins.
+Latest production checkpoint: **634aed9f2ff52a39275f11004a909be3deea0599**.
 
-| Commit | Implemented change |
+| Commit | Actual implementation |
 | --- | --- |
-| `7b5183b4e38320af92ce9817fc990936f0cc2ca0` | Save/delete drain completions are delivered outside operation catches, preventing downstream errors from causing a second delivery. |
-| `3cbed7cd89f9413ab2d03fe765a95013fbad8950` | Apply that separation through upload composition and zone lookup/creation; a consumer error is not zone-loss evidence. |
-| `33e72a7500d0d7e13b7d827f68a0442c107b7a83` | Revalidate original run/account on zone failures; require the fetched zone identity to match. |
-| `95e25ba7119733e0fb91e3ff17a5bd12846d2b55` | Reconciled manual restore queues unchanged known records under the new identity before releasing its existing durable intent. Completed intent cleanup is retryable without repeating replacement. |
+| 7b5183b4 / 3cbed7cd | Deliver save/delete/upload/zone completions outside operation catches; a throwing consumer is not a second result or zone-loss evidence. |
+| 33e72a75 | Original account/run revalidation on failed zone IO; fetched zone identity must match. |
+| 95e25ba7 | Reconciled manual restore uses existing current-identity repair journals before intent release; completed-but-unremoved intent retries cleanup only. |
+| 634aed9f | Reject nested lease downgrades/restores; validate complete manual event bytes; require reconciled completion for identity admission and event acknowledgement independently of the optional intent file. |
 
-The latest restore commit changes four paths: BackupDetection, BigSyncClientIdentity,
-SyncedEntityProtocol, and a 104-line Realm-specific handoff extension. It does not
-modify RealmSwiftAdapter, introduce another restore mode, or change revision ordering.
+## Reconciled restore: actual caller join exists
 
-## Concrete restore defect and correction
+`BigSyncClientIdentity.withReconciledManualBackupRestore(transactionIdentifier:
+configurations:reconciledObjectTypes:_:rollback:)` is the concrete Realm extension.
+It uses the existing exclusive identity lease and durable manual intent/event/receipt.
+The caller installs final copies reconciled against preserved originals: independently
+known current rows are admitted; backup-only rows remain withheld. After publishing the
+new sentinel/binding, the helper validates admitted rows and journals their unchanged
+values before completing the handoff. It does not change owner, stateRevision, payload
+or audit timestamps. The existing backupRestore adapter preserves current-identity
+journals, so a known empty43 stays admitted/repairable against stale42.
 
-W8's final-copy normalizer can correctly preserve independently current empty A@43
-against backup A@42, setting known43 awaiting=false and copied-only rows awaiting=true.
-But the existing `.backupRestore` preparation calls retainForRestoreRecovery again
-unless a record already has a journal generation in the current installation/binding.
-The flag alone is therefore not sufficient to preserve known43 through that later step.
+The earlier missing-caller report is obsolete:
+- W8 Common **190d5d5d5ad5ec510086c1e4aa57a76c8f64508d**, ReadingAnalyticsManualRestore,
+  registers the live journal provider, invokes this API, validates final installed
+  copies without reflagging known rows, and rebinds the local guard after the actual
+  returned receipt/current identity.
+- W8 Core **0296c8c4620d66d4b47974368d52916c8176415f** calls that Common method from
+  the real UserDataBackupManager.resumeRestore production path.
+- W3 Common **9dccf505cf2799f94ac0a4538b235708f6a9686c**, policy blob27481a93,
+  delegates its stable-ID replacement overload to the same real W8 method and removes
+  the obsolete blanket normalizer. These owner branches still need W1 composition;
+  source binding is not an executed physical restore qualification.
 
-The correction uses that existing current-identity journal exception. The new API is:
+Pass final installed configurations and concrete reconciled model types, not originals
+or staged files. Register the existing live provider before calling; never prepare a
+new installation from inside the replacement/finalizer. Required schema, model,
+identity and journal failures throw. A post-event failure retains handoffPending and
+the caller's physical journal; it does not authorize rollback to the old files.
+Automatic/raw backup restoration still withholds copied state. No second journal,
+restore mode, record-floor registry, cloud save API or blanket admission was added.
 
-```swift
-BigSyncClientIdentity.withReconciledManualBackupRestore(
-    transactionIdentifier: UUID,
-    configurations: [Realm.Configuration],
-    reconciledObjectTypes: [Object.Type],
-    _ replacement: () throws -> Void,
-    rollback: () throws -> Void = {}
-) throws -> BigSyncManualBackupRestoreReceipt
-```
+## Latest source review corrections
 
-The actual sequence is: existing exclusive identity lease and durable intent; caller
-installs/normalizes final files; publish the new sentinel and replica binding; validate
-and journal admitted rows as unchanged repairs; persist the existing completion receipt;
-remove the intent. Only then may ordinary startup resume.
+The recursive registry mutex allowed read-only identity inspection, but also allowed
+retainShared to downgrade the outer exclusive file lease or a nested withExclusive
+defer to release it. Both mutating reentry paths now throw restoreInProgress before
+altering that lease. Read-only current identity remains usable by the existing
+finalizer. This uses the same mutex/file lease, not another lock coordinator.
 
-The journal changes transport attribution, not record owner, stateRevision, payload or
-audit dates. The adapter's existing backupRestore preparation retains those generations
-and their admitted records. Lower server versions then use the normal model preference;
-backup-only records remain withheld. Automatic/raw restoration remains conservative.
+Manual restore event identity previously accepted only a header and UUID, even when
+the full receipt was truncated or its required contract unknown. Event decoding now
+uses the same full receipt parser; old complete raw receipts and automatic UUID events
+retain their format. Malformed manual data is not treated as absence or automatic
+recovery permission.
 
-Required repair work is recorded as an optional requirement in the existing manual
-intent/event/completion receipt. Six-line old receipts still decode unchanged. A new
-reconciled receipt has one required marker; unknown shapes reject. A raw caller cannot
-resume a reconciled transaction and silently skip repair. The existing event identifier
-and public receipt identity remain unchanged.
+Reconciled journal completion is a requirement of the event itself. A missing intent
+file no longer bypasses matching completed-receipt checks in prepareInstallation,
+currentInstallationIdentifier or markRestoreResetCompleted. The event check also
+requires the expected new sentinel. Failure leaves the state pending; no file-clearing
+operation or user restore was executed during this coding pass.
 
-A repair failure after event publication keeps the same durable intent and returns
-handoffPending. Partial per-Realm journal work can retry; it cannot become permission
-to roll back installed files. A completed receipt with failed intent cleanup retries
-cleanup only, not replacement or repair. Restore-event acknowledgement cannot bypass
-an unfinished reconciled handoff. There is no new journal, floor registry, cloud
-publication, general phase machine, or unconditional restore-admission flag.
+## Revision APIs and test source
 
-## Required application binding — not claimed finished
-
-W3 owns BigSyncCloudKitPolicy; W8 owns the real comparison/physical replacement.
-Both ends must be composed. At reviewed Common b4846243, policy still called the raw
-manual restore and old unconditional copy normalizer, and installed journaling only
-after the receipt. The new helper alone does not fix that unmodified application path.
-Exact instructions were posted to Common #7 comment5642314851 and Core #6 comment5642294934.
-
-Before invoking the reconciled overload, register the already-existing mutation policy
-with identity.makeMutationJournalIdentityProvider(). Registration itself does not publish
-identity. Do not call prepareInstallation/installMutationTracking from inside the locked
-finalizer; those paths correctly reject a pending intent and may reacquire the lease.
-The helper requires that registered live provider to match the new identity.
-
-Pass final installed configurations, not staged or original files. Pass only concrete
-model types actually normalized against preserved originals by W8. They must implement
-BigSyncRestoredObjectRecovering, outbound validation and ChangeMetadataRecordable.
-The last normalizer must preserve known=false versus copied=true; do not run the old
-blanket retainForRestoreRecovery over these rows after comparison. Sessions require W5's
-real recoverable conformance, not a cast that silently skips them. Missing schema,
-registration, identity or model validation throws, rather than granting completion.
-
-The caller's existing replacement journal must retain originals and the exact transaction
-on handoffPending. Its replacement closure is idempotent for already-installed files.
-Guard rebinding and process receipt clearing belong to W4/W8's real restore completion,
-not to BigSync's record transport. No actual user restore or history selection was run.
-
-## Revision APIs and existing test source
-
-The existing preferIncomingRecord/preferExistingObject hooks and strict journals are
-unchanged. See [ReadingAnalyticsRevisionContract.md](ReadingAnalyticsRevisionContract.md).
-Test implementation e8b899e57cf5493eca82c4598e449c2bafb08c44, blob
-e14062aeaa9ce1edb164fde2503993765eab5b6e, remains unchanged in the coding passes.
-It uses real Realm/journal/adapter implementations and two actual synchronizeAdapter
-conflict loops. Only remote IO and existing boundary/identity-failure hooks are controlled.
-The model is not Common, and scripted records have no actual server change tags.
+Existing preferIncomingRecord/preferExistingObject, strict journaling, target-write
+revalidation and generation-matched acknowledgements remain unchanged. See
+[ReadingAnalyticsRevisionContract.md](ReadingAnalyticsRevisionContract.md).
+The existing native fixture is real Realm/journal/adapter code, not Common's models.
+Two tests call the real synchronizeAdapter loop with scripted remote IO. Scripted
+records have no real server-assigned change tags. The older fixture's permissive
+backup selector is not W3's corrected restore-admission policy.
 
 Already-registered file: Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift.
-Exact 21 native method IDs:
+Test implementation e8b899e57cf5493eca82c4598e449c2bafb08c44, blobe14062ae,
+is unchanged by the production coding passes. Exact 21 native methods:
 
 ```text
 OwnedRecordRevisionTests/testLatePopulatedDownloadRequeuesNewerEmptyValueWithoutReauthoring
@@ -125,54 +104,49 @@ OwnedRecordRevisionTests/testIncomingHardDeletionCannotEraseAcknowledgedEmptyRev
 OwnedRecordRevisionTests/testBackupRestoreWithholdsCopiedRowsUntilActualServerImport
 ```
 
-These tests cover adapter backup admission, not the newly added reconciled manual
-file-handoff helper. Qualification must compose W8's physical replacement with actual
-BigSync backupRestore and a later server42, plus interrupted repair/cleanup retries.
-No tests, compiler/typecheck, syntax checks, native tooling or CloudKit operations were
-run in the two production coding passes. Earlier parsing evidence is historical and
-must not be applied to these changes. Only preimage/postimage hashes, diffs and GitHub
-publication identities were inspected for safe source publication.
+No tests, compiler/typecheck, syntax checks, native tools or CloudKit ran in this pass.
+Only source/blob/diff and GitHub publication integrity were inspected. Earlier syntax
+results do not apply to new production code. Native qualification must exercise the
+bound physical restore -> adapter backupRestore -> late42 path, interrupted repair,
+missing/malformed handoff records and reentrant preparation, as well as the preserved
+account/cancellation/partial-outcome suites. None is claimed passed or newly authored.
 
-## Cutover removal: actual code dependency remains
+## Remaining code removal is caller-dependent
 
-Current inspected W6 Core #7 still retains ReaderOrderedV2BigSyncTransport and old
-startup/cutover callers. W8 has begun retiring owned orchestration files, but complete
-caller-removal SHAs for BigSync's exported cutover family have not been supplied.
-Removing mutation UI does not close those calls. No export or old authority family
-is falsely reported as removed in this PR.
+Live W6 Core #7 still at1fa7174e retains ReaderOrderedV2BigSyncTransport and old
+startup/cutover callers. W8/W3 source retirement is not complete closure of those
+exported calls. The repeated coordinator request names the actual APIs; no false
+compatibility alias or disabled check is used to pretend they disappeared.
 
-| Surface | Disposition |
+| Surface | Remaining action |
 | --- | --- |
-| AcceptedHeadQuiescence / PausedOutboundRecovery | Exact 120/115-line source deletion patch prepared separately, not applied while callers remain. Exclusive probes/test and manifest references need closure in the same batch. |
+| AcceptedHeadQuiescence / PausedOutboundRecovery | Apply prepared120/115-line deletions only with caller closure and their exclusive probe/script/manifest references. |
 | OutboundCompletion | Remove source-publication wrappers with callers; distinguish supported external-owner recovery. |
-| Synchronizer OutboundQuiescence | Mixed final-drain/source exports and ordinary principal/admission/submission handling. No blanket deletion. |
-| Persistent outbound coordinator / replay | Retain current decoding, outstanding submissions, exact operation identity, generation-matched handling and unknown outcomes. Existing barriers are not automatically settled. |
-| RecordStore / RecordMutations / journals / identity / preferences | Retain ordinary synchronization safety. |
+| Synchronizer OutboundQuiescence | Separate final-drain/source exports from ordinary principal/admission/submission functions. |
+| Persistent outbound coordinator / replay | Keep existing checkpoint decoding, uncertain submissions, original operation identity and generation-matched reconciliation. |
+| RecordStore / RecordMutations / journals / identity / preferences | Retain general synchronization safety. |
 
-Ordinary save/delete still reaches admitOutboundBatch and modifyRecordsHoldingOutboundLease.
-Their physical submission bookkeeping is not an Undo protocol. A missing proxy, empty
-journal, expired timeout, unavailable old provider or lost lock is not settlement.
-The pending two-file source patch is only a first removal slice, not a completed mixed
-runtime collapse or a dependency-closed test/manifest batch. W1/W6/W8 must authorize
-its application after actual calls disappear. No successful compatibility alias exists.
+Ordinary save/delete still invokes admitOutboundBatch and
+modifyRecordsHoldingOutboundLease. No old checkpoint is cleared/reinterpreted as
+settled. The235-line source patch in the prior handoff is unapplied, only a first
+slice, not the entire mixed-code cleanup and not counted as production deletion.
+No cutover export was removed in this latest commit. W6/W8 caller-closure evidence
+remains required before that dependency-closed W2 batch can be published.
 
-## Accounting and next boundaries
+W1 excluded cloud baseline election/CAS/publication; W8 withdrew its raw-save API
+request. Explicit selected local input suffices for isolated composition. Production
+multi-install baseline distribution remains a release decision, not another W2 API.
 
-Restore coding delta vs d664de02: **+201/-20 production**, four files, including one
-104-line new helper; no test changes, no identical moves, no manifest/workflow changes.
-Cumulative PR #11 production delta: **+304/-100**, including the prior two-file callback
-fix. Prior test refinement remains +314/-6; documentation and unapplied patch preparation
-are separate. The 235 prepared source deletions are NOT counted as runtime reduction.
-SwiftPM's existing source discovery includes the helper; actual app composition remains
-W1-owned. No cap increase or scope expansion is implied by this supported restore fix.
+## Accounting and completion boundary
 
-W1 excluded cloud baseline election/CAS/publication in comment5641950120; W8 withdrew
-its create-only API request in5641954172. Explicit selected local input is sufficient
-for isolated composition; production multi-install baseline policy remains separate.
-No raw-bootstrap save API or another transport family was added.
+Latest production delta vs0e7c9f1e: **+53/-17**, two existing files, no new API/file/model,
+framework, source move, test or manifest change. Cumulative PR#11 production vs5923:
+**+357/-117** across six source files (including the earlier104-line restore helper).
+Prior test refinement+314/-6 is unchanged; docs and prepared-but-unapplied deletions
+are separate. No cap increase is implied.
 
-Remaining: W3/W8's actual reconciled restore caller binding; W6/W8's cutover caller
-closure and resulting export/probe removal; W1-approved native and composed qualification.
-Published code is not an integrated app or release authorization. No release/default
-merge, forced ref, live migration, account/zone/journal clearing, source activation,
-foreign-source edit or protected Mac worktree operation was performed.
+Published independent W2 corrections and actual application restore bindings are now
+identified. Export/probe removal is still unfinished coding, not merely a test gate.
+W1 owns exact source composition, native qualification and release authorization.
+No integration/default/release merge, force push, live migration/baseline choice,
+account/zone/journal clearing, production activation or foreign/Mac-worktree edit.
