@@ -18701,3 +18701,110 @@ extension BigSyncKitTests {
         XCTAssertTrue(try fixture.adapter.hasPendingChangesAtTerminalBoundary())
     }
 }
+
+
+extension BigSyncKitTests {
+    @BigSyncBackgroundActor
+    func testReevaluationNonJournaledImportCollisionRetainsPageForReplay() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let base = Date(timeIntervalSinceReferenceDate: 10000)
+        let object = BigSyncTrackedObject(id: "derived-collision", createdAt: base,
+                                          modifiedAt: base, explicitlyModifiedAt: base)
+        object.tags.append("baseline")
+        try await fixture.targetRealm.asyncWrite { fixture.targetRealm.add(object) }
+        let remote = makeRecord(type: BigSyncTrackedObject.className(), id: object.id,
+                                zoneID: fixture.adapter.recordZoneID)
+        remote["createdAt"] = base as CKRecordValue
+        remote["modifiedAt"] = base.addingTimeInterval(120) as CKRecordValue
+        remote["explicitlyModifiedAt"] = base.addingTimeInterval(120) as CKRecordValue
+        remote["isDeleted"] = false as CKRecordValue
+        remote["tags"] = ["remote"] as CKRecordValue
+        fixture.adapter._testBeforeImportedRecordTargetWrite = {
+            try await fixture.targetRealm.asyncWrite {
+                object.refreshChangeMetadata(explicitlyModified: false,
+                                             at: base.addingTimeInterval(60))
+            }
+        }
+        do {
+            _ = try await fixture.adapter.saveChanges(in: [remote], forceSave: true)
+            XCTFail("A stale, unjournaled target must not be acknowledged as unchanged")
+        } catch let error as RealmSwiftInboundTargetChangedError {
+            XCTAssertEqual(error.recordName, remote.recordID.recordName)
+        }
+        fixture.targetRealm.refresh()
+        fixture.persistenceRealm.refresh()
+        XCTAssertEqual(Array(object.tags), ["baseline"])
+        XCTAssertTrue(fixture.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
+        XCTAssertNil(fixture.persistenceRealm.objects(ServerToken.self).first?.token)
+        XCTAssertNil(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+                                                    forPrimaryKey: remote.recordID.recordName))
+        fixture.adapter._testBeforeImportedRecordTargetWrite = nil
+        let replay = try await fixture.adapter.saveChanges(in: [remote], forceSave: true)
+        fixture.targetRealm.refresh()
+        XCTAssertEqual(replay.first?.disposition, .applied)
+        XCTAssertEqual(Array(object.tags), ["remote"])
+        XCTAssertTrue(fixture.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+}
+
+
+extension BigSyncKitTests {
+    @BigSyncBackgroundActor
+    func testReevaluationObjectCollectionsEncodeAndRoundTrip() async throws {
+        let source = try await makeRealmAdapterFixture()
+        let receiver = try await makeRealmAdapterFixture()
+        receiver.adapter.mergePolicy = .server
+        let first = BigSyncRelationshipChild()
+        first.id = "first"
+        let second = BigSyncRelationshipChild()
+        second.id = "second"
+        let parent = BigSyncRelationshipParent()
+        parent.id = "parent"
+        parent.children.append(objectsIn: [second, first])
+        parent.relatedChildren.insert(objectsIn: [first, second])
+        parent.favoriteChild = first
+        try await source.targetRealm.asyncWrite {
+            source.targetRealm.add([first, second, parent])
+            first.refreshChangeMetadata(explicitlyModified: true)
+            second.refreshChangeMetadata(explicitlyModified: true)
+            parent.refreshChangeMetadata(explicitlyModified: true)
+        }
+        // Preparation consumes tracking state. Exercise the real journal
+        // forwarder first rather than depending on a debounced observer.
+        try await source.adapter.didFinishImport()
+        let batch = try await source.adapter.prepareUploadBatch(limit: 100)
+        let record = try XCTUnwrap(batch.records.first { $0.recordType == BigSyncRelationshipParent.className() })
+        let firstID = BigSyncRelationshipChild.className() + ".first"
+        let secondID = BigSyncRelationshipChild.className() + ".second"
+        XCTAssertEqual(record["children"] as? [String], [secondID, firstID])
+        XCTAssertEqual(Set(record["relatedChildren"] as? [String] ?? []), Set([firstID, secondID]))
+        XCTAssertEqual(record["favoriteChild"] as? String, firstID)
+        _ = try await receiver.adapter.saveChanges(in: batch.records, forceSave: true)
+        try await receiver.adapter.persistImportedChanges()
+        receiver.targetRealm.refresh()
+        let received = try XCTUnwrap(receiver.targetRealm.object(ofType: BigSyncRelationshipParent.self,
+                                                                forPrimaryKey: parent.id))
+        XCTAssertEqual(received.children.map(\.id), ["second", "first"])
+        XCTAssertEqual(Set(received.relatedChildren.map(\.id)), Set(["first", "second"]))
+        XCTAssertEqual(received.favoriteChild?.id, "first")
+        try await source.adapter.acknowledgeUploadedRecords(batch.records, from: batch)
+        try await source.targetRealm.asyncWrite {
+            parent.children.removeAll()
+            parent.relatedChildren.removeAll()
+            parent.favoriteChild = nil
+            parent.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await source.adapter.didFinishImport()
+        let empty = try await source.adapter.prepareUploadBatch(limit: 100)
+        let cleared = try XCTUnwrap(empty.records.first { $0.recordType == BigSyncRelationshipParent.className() })
+        XCTAssertNil(cleared["children"])
+        XCTAssertNil(cleared["relatedChildren"])
+        XCTAssertNil(cleared["favoriteChild"])
+        _ = try await receiver.adapter.saveChanges(in: empty.records, forceSave: true)
+        try await receiver.adapter.persistImportedChanges()
+        receiver.targetRealm.refresh()
+        XCTAssertTrue(received.children.isEmpty)
+        XCTAssertTrue(received.relatedChildren.isEmpty)
+        XCTAssertNil(received.favoriteChild)
+    }
+}
