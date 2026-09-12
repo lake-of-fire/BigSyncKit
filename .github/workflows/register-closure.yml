@@ -2,10 +2,9 @@ name: Complete hotfix register qualification
 on:
   push:
     branches: [fix/hotfix-register-closure-20260912]
-    paths: [.github/workflows/register-closure.yml]
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: hotfix-register-closure
   cancel-in-progress: false
@@ -18,25 +17,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: BigSyncKit
-          fetch-depth: 0
-      - name: Complete debug delivery actor isolation
-        working-directory: BigSyncKit
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift')
-          value = path.read_text()
-          old = '    private func recordRestoredPublicationEvidence('
-          assert value.count(old) == 1
-          if '    @BigSyncBackgroundActor\n' + old not in value:
-              path.write_text(value.replace(old, '    @BigSyncBackgroundActor\n' + old, 1))
-          PY
-          git diff --check
-          if ! git diff --quiet; then
-            git add Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: keep restored evidence diagnostics on the configured global actor'
-            git push origin HEAD:refs/heads/fix/hotfix-register-closure-20260912
-          fi
+          persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/RealmSwiftGaps
