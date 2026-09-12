@@ -40,7 +40,7 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         let receipt = try await first.drain()
         _ = try await second.drain()
         await assertRejected { try await second.synchronizer.revalidateTerminalReceipt(receipt) }
-        try await first.synchronizer.revalidateTerminalReceipt(first)
+        try await first.synchronizer.revalidateTerminalReceipt(receipt)
     }
 
     @BigSyncBackgroundActor
