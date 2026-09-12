@@ -15,48 +15,25 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: BigSyncKit
-      - name: Compose checked incremental repair
+      - name: Qualify synchronous inspection fixtures
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
-          import hashlib, pathlib
-          patch = pathlib.Path('.github/deeper-reevaluation.patch').read_bytes().replace(b'\n diff --git ', b'\ndiff --git ')
-          assert hashlib.sha256(patch).hexdigest() == 'adc20d501370687926ebefeaa293d39f1a3b50a2743ea6b400564df4bacdda33'
-          def replace(path, old, new):
-              p = pathlib.Path(path)
-              s = p.read_text()
-              if new in s:
-                  return
-              assert s.count(old) == 1, path
-              p.write_text(s.replace(old, new))
-          replace('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift',
-              '        guard synchronizationDrainIsActive,\n              completingPublicationAttemptID == nil else { return }',
-              '        // A revoked callback cannot hold a replacement drain hostage.\n        // Suppress duplicate delivery only for the current attempt.\n        do { try checkRunContext(context) } catch { return }\n        guard synchronizationDrainIsActive,\n              completingPublicationAttemptID != context.attemptID else { return }')
-          replace('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift',
-              '                    if !configuration.readOnly { realm.refresh() }\n                    for mutation in realm.objects(BigSyncPendingMutation.self) {',
-              '                    if !configuration.readOnly { realm.refresh() }\n                    guard realm.schema.objectSchema.contains(where: {\n                        $0.className == BigSyncPendingMutation.className()\n                    }) else { continue }\n                    for mutation in realm.objects(BigSyncPendingMutation.self) {')
-          replace('Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift',
-              '        guard confirmedAccount == accountIdentifier,\n              try persistedDurablePublicationEvidence() == evidence,',
-              '        guard confirmedAccount == accountIdentifier,\n              evidence.replicaBindingGenerationIdentifier == (try\n                activeReplicaBindingGenerationIdentifierForRun(\n                    accountScopeIdentifier: accountScopeIdentifier\n                )),\n              try persistedDurablePublicationEvidence() == evidence,')
-          # Reuse only the new tests from the staged patch. Its older cold
-          # implementation is superseded by the already composed contract fix.
-          text = patch.decode().split('diff --git a/Tests/BigSyncKitTests/BigSyncKitTests.swift ')[1]
-          additions = []
-          for hunk in text.split('\n@@ ')[1:]:
-              additions.append('\n'.join(line[1:] for line in hunk.splitlines()[1:] if line.startswith('+')) + '\n')
-          assert len(additions) == 2
-          replace('Tests/BigSyncKitTests/BigSyncKitTests.swift',
-              'final class BigSyncKitTests: XCTestCase {',
-              additions[0] + 'final class BigSyncKitTests: XCTestCase {')
-          methods = additions[1].replace('publicationRestorationGeneration', 'publicationInspectionGeneration')
-          replace('Tests/BigSyncKitTests/BigSyncKitTests.swift',
-              '    @BigSyncBackgroundActor\n    private func makeSynchronizer(\n',
-              methods + '    @BigSyncBackgroundActor\n    private func makeSynchronizer(\n')
+          from pathlib import Path
+          p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
+          s = p.read_text()
+          for name in ['warmTarget', 'targetRealm']:
+              old = 'let ' + name + ' = try Realm(configuration: target)'
+              new = 'let ' + name + ' = try autoreleasepool { try Realm(configuration: target) }'
+              if old in s:
+                  assert s.count(old) == 1
+                  s = s.replace(old, new)
+          p.write_text(s)
           PY
           git diff --check
-          git add Sources Tests
+          git add Tests
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: prevent canceled completion from blocking replacement and recheck cold inspection inputs'
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: open scoped Realm inspection fixtures synchronously'
             git push origin HEAD:refs/heads/fix/hotfix-sync-deeper-20260912
           fi
           git rev-parse HEAD > qualification-commit.txt
