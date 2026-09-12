@@ -2208,7 +2208,10 @@ public class CloudKitSynchronizer: NSObject {
         // release or clear a replacement run's state here.
         do {
             try checkRunContext(context)
-        } catch { return }
+        } catch {
+            settleCancellation(ifOwnedBy: context.attemptID)
+            return
+        }
         let needsFollowUp = synchronizationRequestedWhileRunning
             && result.completionScope == .fullSynchronization
         finishSynchronizationDrain(with: .success(result))

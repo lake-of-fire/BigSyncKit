@@ -238,8 +238,7 @@ final class WorkerReviewReconciliationTests: XCTestCase {
         let received = try XCTUnwrap(target.object(ofType: WorkerReviewReceiver.self,
                                                     forPrimaryKey: object.id))
         XCTAssertEqual(Array(received.relatedIDs), [second, first, second])
-        try await sender.didUpload(savedRecords: batch.records,
-                                   matchingGenerations: batch.matchingGenerations)
+        try await sender.acknowledgeUploadedRecords(batch.records, from: batch)
         try await source.asyncWrite {
             object.relatedIDs.removeAll()
             object.refreshChangeMetadata(explicitlyModified: true)
