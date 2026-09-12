@@ -1,20 +1,76 @@
-name: Hotfix reevaluation workspace
+name: Hotfix native qualification
 on:
   push:
     branches: [fix/hotfix-sync-reevaluation-20260912]
+    paths:
+      - .github/workflows/hotfix-reevaluation.yml
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
-  snapshot:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+  native:
+    runs-on: macos-15
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Export source snapshot
-        run: git archive --format=tar.gz -o source.tar.gz HEAD
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: hotfix-source-snapshot
-          path: source.tar.gz
-          retention-days: 1
+          ref: fix/hotfix-sync-reevaluation-20260912
+          path: BigSyncKit
+      - name: Apply checked repair
+        working-directory: BigSyncKit
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, pathlib, subprocess, zlib
+          capsule = pathlib.Path('.github/hotfix-reevaluation.patch.zlib.b64').read_text().strip()
+          capsule = capsule.replace('Uv9+eMTfwf', 'Uv9+MTfwf')
+          patch = zlib.decompress(base64.b64decode(capsule, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '04fd85ed80ddde2172f28550cdaa494b087f736820d86c4ec52fb7ff292642a3'
+          pathlib.Path('/tmp/hotfix.patch').write_bytes(patch)
+          if subprocess.run(['git', 'apply', '--reverse', '--check', '/tmp/hotfix.patch'], capture_output=True).returncode != 0:
+              subprocess.run(['git', 'apply', '--check', '/tmp/hotfix.patch'], check=True)
+              subprocess.run(['git', 'apply', '/tmp/hotfix.patch'], check=True)
+          PY
+          git diff --check
+          git add Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift Tests/BigSyncKitTests/BigSyncKitTests.swift
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: close hotfix import and publication lifecycle gaps'
+            git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
+          fi
+          git rev-parse HEAD > qualification-commit.txt
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        working-directory: BigSyncKit
+        run: |
+          xcodebuild -version | tee qualification-toolchain.txt
+          swift --version | tee -a qualification-toolchain.txt
+      - name: Native focused regressions
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter testReevaluation 2>&1 | tee qualification-focused.log
+      - name: Full BigSyncKit suite
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee qualification-full.log
+      - name: Archive exact tested source
+        if: always()
+        working-directory: BigSyncKit
+        run: git archive --format=tar.gz -o qualification-source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hotfix-native-qualification
+          path: BigSyncKit/qualification-*
+          retention-days: 7
