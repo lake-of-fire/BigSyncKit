@@ -1564,6 +1564,17 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         XCTAssertNil(wrongAccount)
         XCTAssertNil(wrongZone)
 
+        let fenced = reopened()
+        fenced.accountScopeAuthorityFence.poison(requiresGenerationRotation: false)
+        let fencedEvidence = try await fenced.restoredDurablePublicationEvidence()
+        XCTAssertNil(fencedEvidence)
+
+        let active = reopened()
+        active.syncing = true
+        let activeEvidence = try await active.restoredDurablePublicationEvidence()
+        XCTAssertNil(activeEvidence)
+        active.syncing = false
+
         let evidenceKey = first.durableStateKey("TerminalPublication.v1")
         var alteredEvidence = try XCTUnwrap(
             store.value(forKey: evidenceKey) as? [String: Any]

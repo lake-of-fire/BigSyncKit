@@ -616,9 +616,21 @@ final class AccountScopeAuthorityFence: @unchecked Sendable {
     private let lock = NSLock()
     private var isPoisoned = true
     private var rotatesGeneration = false
+    private var invalidationGeneration: UInt64 = 0
+
+    /// Initial writer authority is closed until normal account validation.
+    /// Read-only publication inspection may still verify saved evidence then;
+    /// an actual subsequent invalidation must reject or supersede that probe.
+    var publicationInspectionGeneration: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isPoisoned || invalidationGeneration == 0 else { return nil }
+        return invalidationGeneration
+    }
 
     func poison(requiresGenerationRotation: Bool = true) {
         lock.lock()
+        invalidationGeneration += 1
         isPoisoned = true
         rotatesGeneration = rotatesGeneration || requiresGenerationRotation
         lock.unlock()

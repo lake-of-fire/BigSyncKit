@@ -14187,19 +14187,38 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNil(cold.activeAccountScopeIdentifier)
         XCTAssertEqual(try Data(contentsOf: target.fileURL!), beforeTarget)
         XCTAssertEqual(try Data(contentsOf: persistence.fileURL!), beforeTracking)
-        // A subsequent local commit must be visible to a fresh inspection,
-        // even when an earlier inspection used an immutable read-only view.
+        // Production targets can remain open in the UI/reader while this
+        // adapter is cold. Inspection must coexist with a live writer and
+        // observe its later commit, not switch the file to immutable mode.
         try autoreleasepool {
             let writer = try Realm(configuration: target)
+            XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
             try writer.write {
                 let object = BigSyncTrackedObject(id: "after-inspection", createdAt: Date(),
                                                   modifiedAt: Date(), explicitlyModifiedAt: nil)
                 writer.add(object)
                 object.refreshChangeMetadata(explicitlyModified: true)
             }
+            XCTAssertFalse(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
         }
         XCTAssertFalse(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
         XCTAssertNil(cold.realmProvider)
+    }
+
+    func testReevaluationInitialInspectionDoesNotGrantWriterAuthority() throws {
+        let fence = AccountScopeAuthorityFence()
+        let initial = try XCTUnwrap(fence.publicationInspectionGeneration)
+        XCTAssertTrue(fence.rejectsAuthority)
+        fence.poison(requiresGenerationRotation: false)
+        XCTAssertNil(fence.publicationInspectionGeneration)
+        fence.clear()
+        let validated = try XCTUnwrap(fence.publicationInspectionGeneration)
+        XCTAssertNotEqual(initial, validated)
+        XCTAssertFalse(fence.rejectsAuthority)
+        fence.poison()
+        XCTAssertNil(fence.publicationInspectionGeneration)
+        fence.clear()
+        XCTAssertNotEqual(validated, fence.publicationInspectionGeneration)
     }
 
     @BigSyncBackgroundActor

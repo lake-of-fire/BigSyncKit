@@ -142,23 +142,29 @@ extension CloudKitSynchronizer {
     func restoredDurablePublicationEvidence() async throws
         -> BigSyncDurablePublicationEvidence? {
         let expectedAttemptID = synchronizationAttemptID
-        func validateInspectionOwner() throws {
+        let expectedFenceGeneration = accountScopeAuthorityFence
+            .publicationInspectionGeneration
+        func inspectionOwnerIsCurrent() throws -> Bool {
             try Task.checkCancellation()
-            guard synchronizationAttemptID == expectedAttemptID,
-                  !syncing, !synchronizationDrainIsActive,
-                  !backupRestoreDetected,
-                  !accountScopeAuthorityFence.rejectsAuthority else {
-                throw CancellationError()
-            }
+            // Ineligible saved evidence is an ordinary absence, not task
+            // cancellation. In particular, a restore/account fence must not
+            // prevent the caller from receiving nil and discarding old UI
+            // readiness. Actual canceled tasks still throw above.
+            return synchronizationAttemptID == expectedAttemptID
+                && !syncing && !synchronizationDrainIsActive
+                && !backupRestoreDetected
+                && expectedFenceGeneration != nil
+                && accountScopeAuthorityFence.publicationInspectionGeneration
+                    == expectedFenceGeneration
         }
-        try validateInspectionOwner()
+        guard try inspectionOwnerIsCurrent() else { return nil }
         guard let evidence = try persistedDurablePublicationEvidence(),
               evidence.zoneOwnerName == recordZoneID.ownerName,
               evidence.zoneName == recordZoneID.zoneName else {
             return nil
         }
         let accountIdentifier = try await accountIdentifierProvider()
-        try validateInspectionOwner()
+        guard try inspectionOwnerIsCurrent() else { return nil }
         let accountScopeIdentifier = Self.accountScopeIdentifier(for: accountIdentifier)
         guard evidence.accountScopeIdentifier == accountScopeIdentifier,
               evidence.replicaBindingGenerationIdentifier == (try
@@ -172,9 +178,9 @@ extension CloudKitSynchronizer {
             // without invoking setup or changing transport ownership.
             guard let inspection = try await realmAdapter
                 .preparePublicationRestorationInspection() else { return nil }
-            try validateInspectionOwner()
+            guard try inspectionOwnerIsCurrent() else { return nil }
             let confirmedAccount = try await accountIdentifierProvider()
-            try validateInspectionOwner()
+            guard try inspectionOwnerIsCurrent() else { return nil }
             guard confirmedAccount == accountIdentifier,
                   evidence.replicaBindingGenerationIdentifier == (try
                     activeReplicaBindingGenerationIdentifierForRun(
@@ -195,16 +201,16 @@ extension CloudKitSynchronizer {
                 containerIdentifier: containerIdentifier,
                 databaseScope: database.databaseScope
             )
-            try validateInspectionOwner()
+            guard try inspectionOwnerIsCurrent() else { return nil }
             try await adapter.activateReplicaBinding(
                 accountScopeIdentifier: accountScopeIdentifier,
                 replicaBindingGenerationIdentifier:
                     evidence.replicaBindingGenerationIdentifier
             )
-            try validateInspectionOwner()
+            guard try inspectionOwnerIsCurrent() else { return nil }
         }
         let confirmedAccount = try await accountIdentifierProvider()
-        try validateInspectionOwner()
+        guard try inspectionOwnerIsCurrent() else { return nil }
         guard confirmedAccount == accountIdentifier,
               try persistedDurablePublicationEvidence() == evidence,
               try !adaptersHavePendingChangesAtTerminalBoundary(),

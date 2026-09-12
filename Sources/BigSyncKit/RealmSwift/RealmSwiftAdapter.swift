@@ -1069,8 +1069,9 @@ public final class RealmSwiftAdapter:
 
     /// Captures inspection configurations without opening the operational
     /// provider, starting observers, or discovering/forwarding mutations.
-    /// Read-only disk Realms are immutable snapshots, so they are opened only
-    /// inside the final non-suspending inspection after account validation.
+    /// Inspection performs no writes, but retains each Realm's coordinated
+    /// access mode: an immutable readOnly open is unsafe beside live writers.
+    /// Only existing files at the exact schema version are eligible.
     @BigSyncBackgroundActor
     func preparePublicationRestorationInspection() async throws
         -> PublicationRestorationInspection? {
@@ -1082,9 +1083,12 @@ public final class RealmSwiftAdapter:
                       FileManager.default.fileExists(atPath: url.path) else {
                     return nil
                 }
-                inspection.readOnly = true
+                guard (try? schemaVersionAtURL(url)) == configuration.schemaVersion
+                else { return nil }
                 inspection.migrationBlock = nil
                 inspection.shouldCompactOnLaunch = nil
+                inspection.deleteRealmIfMigrationNeeded = false
+                inspection.seedFilePath = nil
             }
             return inspection
         }
@@ -1116,17 +1120,25 @@ public final class RealmSwiftAdapter:
             databaseScope: CKDatabase.Scope
         ) throws -> Bool {
             // Drain Objective-C autoreleases here as well as Swift references.
-            // Otherwise immutable inspection handles survive this call and
-            // can conflict with the next operational read/write Realm open.
+            // Inspection must not retain old snapshots or prolong Realm
+            // handles beyond the non-suspending local cutoff.
             return try autoreleasepool {
                 try Task.checkCancellation()
                 guard adapter.recordZoneID.ownerName == evidence.zoneOwnerName,
                       adapter.recordZoneID.zoneName == evidence.zoneName else {
                     return false
                 }
-                // Synchronous, scoped views cannot straddle an account-provider
-                // await. Never refresh a read-only Realm: Realm rejects that call.
-                // Do not retain these snapshots between matches() invocations.
+                // Recheck existence/version after suspended account work, before
+                // any open. No operational adapter setup, migration callbacks,
+                // compaction, seed copying, or model mutations occur here.
+                for configuration in [persistenceConfiguration] + targetConfigurations {
+                    if configuration.inMemoryIdentifier == nil {
+                        guard let url = configuration.fileURL,
+                              FileManager.default.fileExists(atPath: url.path),
+                              (try? schemaVersionAtURL(url)) == configuration.schemaVersion
+                        else { return false }
+                    }
+                }
                 let persistenceRealm = try Realm(configuration: persistenceConfiguration)
                 for configuration in targetConfigurations {
                     let realm = try Realm(configuration: configuration)
