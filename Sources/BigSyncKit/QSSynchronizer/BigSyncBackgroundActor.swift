@@ -431,12 +431,14 @@ public actor BigSyncBackgroundActor {
                 priority: .utility
             ) { @BigSyncBackgroundActor in
                 do {
-                    let evidence = try await synchronizer
-                        .restoredDurablePublicationEvidence()
+                    try await synchronizer.restoreDurablePublicationEvidence(
+                        deliveringTo: { evidence in
 #if DEBUG
-                    self.cloudKitE2ELastRestoredPublicationEvidence = evidence
+                            await self.recordRestoredPublicationEvidence(evidence)
 #endif
-                    try await restorationHandler(evidence)
+                            try await restorationHandler(evidence)
+                        }
+                    )
                 } catch {
                     configuration.logger.error(
                         "QSCloudKitSynchronizer >> Could not restore terminal publication evidence: \(error)"
@@ -464,6 +466,12 @@ public actor BigSyncBackgroundActor {
     }
 
 #if DEBUG
+    private func recordRestoredPublicationEvidence(
+        _ evidence: BigSyncDurablePublicationEvidence?
+    ) {
+        cloudKitE2ELastRestoredPublicationEvidence = evidence
+    }
+
     /// Waits only for configuration's pre-sync restoration task. It does not
     /// begin or request a synchronization drain.
     @_spi(CloudKitE2E)

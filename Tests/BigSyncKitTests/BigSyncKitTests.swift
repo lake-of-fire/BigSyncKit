@@ -1327,6 +1327,12 @@ final class BigSyncKitTests: XCTestCase {
         let database = FakeCloudKitDatabase()
         let sync = makeSynchronizer(database: database, recordZoneID: adapter.recordZoneID)
         sync.addModelAdapter(adapter)
+        // This test drives the low-level phase. Own its drain before the
+        // injected local edit, so the ordinary journal delegate coalesces
+        // instead of starting a competing orchestration attempt.
+        sync.syncing = true
+        sync.synchronizationDrainIsActive = true
+        sync.activeRunContext = reviewContext(sync)
         func recordID(_ object: BigSyncTrackedObject) -> CKRecord.ID {
             .init(recordName: BigSyncTrackedObject.className() + "." + object.id, zoneID: adapter.recordZoneID)
         }
@@ -1349,6 +1355,8 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Mixed transient/limit failures cannot immediately retry")
         } catch { observedError = error }
         let error = try XCTUnwrap(observedError)
+        XCTAssertEqual((error as? CKError)?.code, .partialFailure)
+        XCTAssertTrue(CloudKitRetryConstraints(error).requiresDeferredRetry)
         XCTAssertFalse(sync.shouldRetryUpload(for: error as NSError))
         XCTAssertEqual(database.reviewMutationBatchCounts, [3])
         realm.refresh()
