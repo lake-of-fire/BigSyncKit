@@ -88,11 +88,12 @@ enum BigSyncClientIdentityLeaseRegistry {
         lock.lock()
         defer { lock.unlock() }
         let lease = try lease(at: url)
-        guard lease.mode != .shared else { return }
-        guard bigSyncFlock(lease.descriptor, LOCK_SH) == 0 else {
-            throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
+        // A replacement may query current identity, but must not prepare it
+        // recursively: that would downgrade LOCK_EX and can reenter the event
+        // file lock. Only the outer withExclusive scope releases its lease.
+        guard lease.mode == .shared else {
+            throw BigSyncClientIdentityLeaseError.restoreInProgress
         }
-        lease.mode = .shared
     }
 
     static func cachedInstallationIdentifier(at url: URL) -> String? {
@@ -127,10 +128,13 @@ enum BigSyncClientIdentityLeaseRegistry {
         lock.lock()
         defer { lock.unlock() }
         let lease = try lease(at: url)
-        if lease.mode == .shared {
-            guard bigSyncFlock(lease.descriptor, LOCK_UN) == 0 else {
-                throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
-            }
+        // The recursive registry lock permits read-only identity checks, not
+        // nested restore mutations whose defer would release the outer lease.
+        guard lease.mode == .shared else {
+            throw BigSyncClientIdentityLeaseError.restoreInProgress
+        }
+        guard bigSyncFlock(lease.descriptor, LOCK_UN) == 0 else {
+            throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
         }
         guard bigSyncFlock(lease.descriptor, LOCK_EX | LOCK_NB) == 0 else {
             let lockError = Int32(errno)
@@ -286,9 +290,11 @@ public struct BigSyncClientIdentity: Sendable {
                 // replacement with the old installation identity.
                 throw BigSyncManualBackupRestoreError.handoffPending(receipt)
             }
-            guard identifier == receipt.newInstallationIdentifier,
-                  pendingManualEvent != nil else {
+            guard identifier == receipt.newInstallationIdentifier else {
                 throw BigSyncManualBackupRestoreError.stateAmbiguous
+            }
+            guard manualRestoreHasRequiredCompletion(pendingManualRestore) else {
+                throw BigSyncManualBackupRestoreError.handoffPending(receipt)
             }
         } else if BackupDetection.restoreResetIsRequired(
             namespace: durableStateNamespace,
@@ -337,7 +343,7 @@ public struct BigSyncClientIdentity: Sendable {
             // proves the event's new installation, making such a write fail
             // closed instead of attributing it to the old installation.
             guard identifier == pendingManualRestore.newInstallationIdentifier,
-                  pendingManualEvent != nil
+                  manualRestoreHasRequiredCompletion(pendingManualRestore)
             else { return nil }
         } else if BackupDetection.restoreResetIsRequired(
             namespace: durableStateNamespace,
@@ -666,6 +672,20 @@ public struct BigSyncClientIdentity: Sendable {
             oldInstallationIdentifier: receipt.oldInstallationIdentifier,
             newInstallationIdentifier: receipt.newInstallationIdentifier
         )
+    }
+
+    /// A lost intent cannot promote an unfinished reconciled handoff. The
+    /// already-existing completion receipt covers its required repair journals.
+    private func manualRestoreHasRequiredCompletion(
+        _ receipt: BackupDetection.ManualRestoreReceipt
+    ) -> Bool {
+        guard receipt.requiresReconciledJournal else { return true }
+        let sentinelURL = BackupDetection.defaultSentinelURL(
+            namespace: durableStateNamespace, sharedBaseURL: sharedStateBaseURL
+        )
+        return BackupDetection.manualRestoreReceipt(
+            at: BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinelURL)
+        ) == receipt
     }
 
     private func publishedInstallationIdentifier() -> String? {

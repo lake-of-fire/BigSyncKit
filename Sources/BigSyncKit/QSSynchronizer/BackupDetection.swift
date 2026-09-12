@@ -714,10 +714,11 @@ enum BackupDetection {
             return nil
         }
         let lines = value.split(separator: "\n").map(String.init)
-        if lines.first == "BigSyncKit manual restore v1",
-           lines.count >= 3,
-           let identifier = UUID(uuidString: lines[2]) {
-            return identifier.uuidString.lowercased()
+        if lines.first == "BigSyncKit manual restore v1" {
+            // An event ID alone must not admit a truncated or unknown manual
+            // handoff contract as if it were an ordinary automatic restore.
+            return manualRestoreReceipt(data: data)?
+                .restoreEventIdentifier.uuidString.lowercased()
         }
         guard let firstLine = lines.first,
               let identifier = UUID(uuidString: firstLine) else { return nil }
@@ -762,6 +763,17 @@ enum BackupDetection {
                     fileManager: fileManager
                   ) == expectedEventIdentifier else {
                 throw Error.restoreEventAcknowledgementVerificationFailed
+            }
+            if let event = manualRestoreReceipt(data: eventData),
+               event.requiresReconciledJournal {
+                // Required preparation belongs to the event, not merely the
+                // optional intent file. Missing intent is not completion proof.
+                guard manualRestoreReceipt(at: completedManualRestoreReceiptURL(
+                    sentinelURL: sentinelURL)) == event,
+                      installationIdentifier(sentinelURL: sentinelURL,
+                        fileManager: fileManager) == event.newInstallationIdentifier else {
+                    throw Error.restoreEventAcknowledgementVerificationFailed
+                }
             }
             do {
                 // Retire the optional pre-replacement intent first. A crash
@@ -980,8 +992,12 @@ enum BackupDetection {
     }
 
     static func manualRestoreReceipt(at url: URL) -> ManualRestoreReceipt? {
-        guard let data = try? Data(contentsOf: url),
-              let value = String(data: data, encoding: .utf8) else { return nil }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return manualRestoreReceipt(data: data)
+    }
+
+    private static func manualRestoreReceipt(data: Data) -> ManualRestoreReceipt? {
+        guard let value = String(data: data, encoding: .utf8) else { return nil }
         let lines = value.split(separator: "\n").map(String.init)
         guard lines.count == 6 || lines.count == 7,
               lines[0] == "BigSyncKit manual restore v1",
