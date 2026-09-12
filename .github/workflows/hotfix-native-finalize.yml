@@ -14,9 +14,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: BigSyncKit
-      - name: Correct the regression premise and commit clean source
+          fetch-depth: 0
+      - name: Compose checked tests and commit clean source
         working-directory: BigSyncKit
         run: |
+          git cherry-pick --no-commit 8b9fbd6c0025a12ea283a6bdd6d0d1b56698a69c
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -32,6 +34,11 @@ jobs:
           p.write_text(s.replace(old, new))
           p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
           s = p.read_text()
+          # The composed disk and initial-fence tests already cover these;
+          # remove duplicate tests and their invalid byte-layout premise.
+          start = s.index('    @BigSyncBackgroundActor\n    func testReevaluationWarmDiskInspectionCoexistsWithOperationalRealm')
+          end = s.index('    @BigSyncBackgroundActor\n    func testReevaluationCanceledCallbackCannotBlockReplacementDrain', start)
+          s = s[:start] + s[end:]
           s = s.replace('testReevaluationCanceledCallbackCannotBlockReplacementDrain', 'testReevaluationCanceledCallbackRetainsBarrierUntilQuiescent')
           old = '''        synchronizer.cancelSynchronization()
                   synchronizer.beginSynchronization()
@@ -54,8 +61,8 @@ jobs:
                   synchronizer.beginSynchronization()
                   let replacementAttempt = synchronizer.synchronizationAttemptID
                   XCTAssertNotEqual(replacementAttempt, firstContext.attemptID)
-                  // Production callbacks may mutate domain state across awaits.
-                  // The replacement must wait for that callback to leave.
+                  // The production callback may mutate domain state across
+                  // awaits. Its replacement must wait for that work to leave.
                   try await Task.sleep(nanoseconds: 10_000_000)
                   XCTAssertNil(synchronizer.activeRunContext)
                   let heldCount = await held.count()
@@ -92,7 +99,7 @@ jobs:
           PY
           git diff --check
           git add Sources Tests .github/workflows
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: retain callback quiescence and reject the disproven replacement-race premise'
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: preserve callback quiescence and compose logical cold-restoration controls'
           git push origin HEAD:refs/heads/fix/hotfix-sync-deeper-20260912
           git rev-parse HEAD > qualification-commit.txt
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
