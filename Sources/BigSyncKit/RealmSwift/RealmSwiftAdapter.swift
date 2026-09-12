@@ -491,6 +491,9 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     private var cancelSync: Bool = false
+    // New runs may prepare provenance after cancellation without enabling
+    // normal setup or asynchronous journal forwarding ahead of that barrier.
+    private var isPreparingFencedMigration = false
     @BigSyncBackgroundActor
     private var cancellationGeneration: UInt64 = 0
     @BigSyncBackgroundActor
@@ -1676,9 +1679,22 @@ public final class RealmSwiftAdapter:
         return pendingMutationIsEligibleForActiveTransport(mutation)
     }
 
+    /// The owning synchronizer has awaited callback/adapter quiescence and
+    /// revalidated its run before calling this synchronous preparation hook.
+    /// Unlike unsetCancellation(), it must not open the target Realm, restart
+    /// setup, or drain observed journals before migration provenance exists.
+    @BigSyncBackgroundActor
+    func prepareForFencedMigrationAfterCancellation() throws {
+        try Task.checkCancellation()
+        isPreparingFencedMigration = true
+        cancelSync = false
+    }
+
     @BigSyncBackgroundActor
     public func unsetCancellation() async throws {
-        //        debugPrint("# unset cancel")
+        // Normal setup and observers become eligible only after migration
+        // preparation has installed the run's recovery/provenance boundary.
+        isPreparingFencedMigration = false
         cancelSync = false
         // `waitForCancellation()` also owns a queued bootstrap task. If that
         // task was cancelled before it could install the provider, a normal
@@ -2176,7 +2192,8 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     private func startObservedRealmChangesTaskIfNeeded() {
-        guard !cancelSync, observedRealmChangesTask == nil else { return }
+        guard !cancelSync, !isPreparingFencedMigration,
+              observedRealmChangesTask == nil else { return }
         let taskID = UUID()
         observedRealmChangesTaskID = taskID
         observedRealmChangesTask = Task(priority: .background) {
@@ -2195,7 +2212,7 @@ public final class RealmSwiftAdapter:
             if observedRealmChangesTaskID == taskID {
                 observedRealmChangesTask = nil
                 observedRealmChangesTaskID = nil
-                if !cancelSync,
+                if !cancelSync, !isPreparingFencedMigration,
                    !observedJournalRecordNames.isEmpty {
                     realmChangesSubject.send(())
                 }
@@ -3649,10 +3666,22 @@ public final class RealmSwiftAdapter:
                             entityType: entityType
                         )
                 }
-                changeMetadata.refreshChangeMetadata(
-                    explicitlyModified: true,
-                    at: Date()
-                )
+                if delegate != nil {
+                    // A custom delegate may have intentionally changed the
+                    // local object while deciding to keep it. Preserve the
+                    // historical authoring behavior for that model-owned merge.
+                    changeMetadata.refreshChangeMetadata(
+                        explicitlyModified: true,
+                        at: Date()
+                    )
+                } else {
+                    // The built-in timestamp policy selected an unchanged,
+                    // already-authored local value. Retransmit it under a new
+                    // journal generation without inventing a new conflict clock.
+                    changeMetadata.journalCurrentValuePreservingChangeMetadata(
+                        at: Date()
+                    )
+                }
             }
         }
         return pendingRelationships
@@ -7760,6 +7789,11 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     public func didFinishImport() async throws {
+        // Failure cleanup can arrive before migration has installed recovery
+        // provenance. Keep the target journal untouched at this boundary;
+        // normal setup/forwarding resumes through unsetCancellation only
+        // after the owning run completes preparation successfully.
+        guard !isPreparingFencedMigration else { return }
         try await ensureSetup()
         guard let realmProvider, let persistenceRealm = realmProvider.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable

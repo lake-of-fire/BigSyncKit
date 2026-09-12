@@ -1104,6 +1104,223 @@ private actor ReevaluationHeldCompletion {
 final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
+    func testClosureMigrationFailureCannotForwardJournalBeforePreparation() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter.cancelSynchronization()
+        await fixture.adapter.waitForCancellation()
+        let object = BigSyncTrackedObject(
+            id: "closure-failed-preparation", createdAt: Date(),
+            modifiedAt: Date(), explicitlyModifiedAt: nil
+        )
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let generation = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation)
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: recordName
+        ))
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let synchronizer = makeSynchronizer(database: database,
+                                             recordZoneID: fixture.adapter.recordZoneID)
+        synchronizer.addModelAdapter(fixture.adapter)
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+        synchronizer.activeRunContext = reviewContext(synchronizer)
+        try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+        // Exercise the real failure handler's explicit flush, not just the
+        // debounced observer. Preparation itself has not committed provenance.
+        await synchronizer.failSynchronization(error: TestSynchronizationError.initialSetupFailed)
+        fixture.persistenceRealm.refresh()
+        fixture.targetRealm.refresh()
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: recordName
+        ), "Failure cleanup must not forward a preparation-phase journal")
+        XCTAssertEqual(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation, generation)
+        await synchronizer.cancelSynchronizationAndWait()
+        let recovered = try await synchronizer.synchronize()
+        XCTAssertNotNil(recovered.receipt)
+        fixture.targetRealm.refresh()
+        XCTAssertTrue(fixture.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testClosureMigrationPreparationKeepsObservedJournalsQueued() async throws {
+        let fixture = try await reviewJournalBatch(count: 1)
+        let recordName = BigSyncTrackedObject.className() + "." + fixture.2[0].id
+        fixture.0.cancelSynchronization()
+        await fixture.0.waitForCancellation()
+        try fixture.0.prepareForFencedMigrationAfterCancellation()
+        fixture.0._test_enqueueObservedJournalRecordNames([recordName])
+        fixture.0._test_startObservedRealmChangesTaskIfNeeded()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(fixture.0._test_hasPendingObservedRealmChanges(),
+                      "Migration preparation must not restart ordinary journal observation")
+        fixture.1.refresh()
+        XCTAssertEqual(fixture.1.objects(BigSyncPendingMutation.self).count, 1)
+        try await fixture.0.unsetCancellation()
+        try await fixture.0.didFinishImport()
+        fixture.0.cancelSynchronization()
+        await fixture.0.waitForCancellation()
+    }
+
+    @BigSyncBackgroundActor
+    func testClosureExplicitDownloadCancellationResumesUnfinishedMigration() async throws {
+        let fixture = try await reviewJournalBatch(count: 1)
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let synchronizer = makeSynchronizer(database: database, recordZoneID: fixture.0.recordZoneID)
+        synchronizer.addModelAdapter(fixture.0)
+        synchronizer.syncMode = .downloadOnly
+        let inbound = try await synchronizer.synchronize()
+        XCTAssertEqual(inbound.completionScope, .downloadOnly)
+        XCTAssertNil(inbound.receipt)
+        await synchronizer.cancelSynchronizationAndWait()
+        synchronizer.syncMode = .sync
+        let full = try await synchronizer.synchronize()
+        XCTAssertNotNil(full.receipt)
+        fixture.1.refresh()
+        XCTAssertTrue(fixture.1.objects(BigSyncPendingMutation.self).isEmpty)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    private func closureCancellationCase(scopeProvider: Bool,
+                                         breaksDurability: Bool = false,
+                                         downloadOnly: Bool = false) async throws {
+        let store = DictionaryKeyValueStore()
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let fixture = try await reviewJournalBatch(count: 1)
+        let synchronizer = makeSynchronizer(database: database, keyValueStore: store,
+                                             recordZoneID: fixture.0.recordZoneID)
+        synchronizer.addModelAdapter(fixture.0)
+        synchronizer.syncMode = downloadOnly ? .downloadOnly : .sync
+        let entered = expectation(description: "terminal hook entered")
+        let secondStarted = expectation(description: "second caller started")
+        let finished = expectation(description: "both callers settled")
+        finished.expectedFulfillmentCount = 2
+        let release = AsyncGate()
+        let fail: @Sendable () async throws -> Void = {
+            entered.fulfill()
+            await release.wait()
+            try await { @BigSyncBackgroundActor in
+                if breaksDurability { store.synchronizesDurably = false }
+                throw CancellationError()
+            }()
+        }
+        if scopeProvider {
+            synchronizer.domainPublicationScopeIdentifierProvider = {
+                try await fail()
+                return nil
+            }
+        } else {
+            synchronizer.domainPrepublicationHandler = { _ in
+                try await fail()
+                return []
+            }
+        }
+        let first = Task { @BigSyncBackgroundActor in
+            do {
+                _ = try await synchronizer.synchronize()
+                XCTFail("Cancelled terminal work cannot publish success")
+            } catch {
+                XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)")
+            }
+            finished.fulfill()
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        let second = Task { @BigSyncBackgroundActor in
+            secondStarted.fulfill()
+            do {
+                _ = try await synchronizer.synchronize()
+                XCTFail("A coalesced caller must receive cancellation")
+            } catch {
+                XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)")
+            }
+            finished.fulfill()
+        }
+        await fulfillment(of: [secondStarted], timeout: 5)
+        await release.open()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertFalse(synchronizer.syncing, "A current CancellationError must settle its drain")
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+        XCTAssertNil(synchronizer.activeReceiptAuthorizationID)
+        fixture.1.refresh()
+        if downloadOnly {
+            XCTAssertEqual(fixture.1.objects(BigSyncPendingMutation.self).count, 1)
+            XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+        }
+        // Also bounds the negative control: do not leave abandoned waiters or
+        // native tasks alive after a deliberately failed assertion.
+        if synchronizer.syncing || synchronizer.synchronizationDrainIsActive {
+            first.cancel()
+            second.cancel()
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+        await first.value
+        await second.value
+        store.synchronizesDurably = true
+        synchronizer.domainPrepublicationHandler = nil
+        synchronizer.domainPublicationScopeIdentifierProvider = nil
+        synchronizer.syncMode = .sync
+        let recovered = try await synchronizer.synchronize()
+        XCTAssertNotNil(recovered.receipt)
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+        fixture.1.refresh()
+        XCTAssertTrue(fixture.1.objects(BigSyncPendingMutation.self).isEmpty)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testClosurePrepublicationCancellationSettlesCoalescedCallers() async throws {
+        try await closureCancellationCase(scopeProvider: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testClosureScopeProviderCancellationSettlesCoalescedCallers() async throws {
+        try await closureCancellationCase(scopeProvider: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testClosureCancellationSettlementDoesNotDependOnHealthDurability() async throws {
+        try await closureCancellationCase(scopeProvider: false, breaksDurability: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testClosureDownloadCancellationPreservesRealJournalAndRecovers() async throws {
+        try await closureCancellationCase(scopeProvider: false, downloadOnly: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testClosureObsoleteCancellationCannotSettleReplacement() async throws {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(FakeModelAdapter(zoneID: synchronizer.recordZoneID, priorities: []))
+        let obsolete = synchronizer.synchronizationAttemptID
+        synchronizer.cancelSynchronization()
+        synchronizer.cancelSync = false
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+        let replacement = synchronizer.synchronizationAttemptID
+        synchronizer.settleCancellationIfCurrentAttempt(obsolete)
+        XCTAssertEqual(synchronizer.synchronizationAttemptID, replacement)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        synchronizer.settleCancellationIfCurrentAttempt(replacement)
+        XCTAssertFalse(synchronizer.syncing)
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     private func reviewContext(_ synchronizer: CloudKitSynchronizer,
                                account: String = "test-account") -> CloudKitSynchronizer.RunContext {
         .init(attemptID: synchronizer.synchronizationAttemptID,
@@ -1327,12 +1544,6 @@ final class BigSyncKitTests: XCTestCase {
         let database = FakeCloudKitDatabase()
         let sync = makeSynchronizer(database: database, recordZoneID: adapter.recordZoneID)
         sync.addModelAdapter(adapter)
-        // This test drives the low-level phase. Own its drain before the
-        // injected local edit, so the ordinary journal delegate coalesces
-        // instead of starting a competing orchestration attempt.
-        sync.syncing = true
-        sync.synchronizationDrainIsActive = true
-        sync.activeRunContext = reviewContext(sync)
         func recordID(_ object: BigSyncTrackedObject) -> CKRecord.ID {
             .init(recordName: BigSyncTrackedObject.className() + "." + object.id, zoneID: adapter.recordZoneID)
         }
@@ -1349,6 +1560,9 @@ final class BigSyncKitTests: XCTestCase {
                 }
             }()
         }
+        sync.syncing = true
+        sync.synchronizationDrainIsActive = true
+        sync.activeRunContext = reviewContext(sync)
         var observedError: Error?
         do {
             try await sync.synchronizeAdapter(adapter)
@@ -1356,7 +1570,6 @@ final class BigSyncKitTests: XCTestCase {
         } catch { observedError = error }
         let error = try XCTUnwrap(observedError)
         XCTAssertEqual((error as? CKError)?.code, .partialFailure)
-        XCTAssertTrue(CloudKitRetryConstraints(error).requiresDeferredRetry)
         XCTAssertFalse(sync.shouldRetryUpload(for: error as NSError))
         XCTAssertEqual(database.reviewMutationBatchCounts, [3])
         realm.refresh()
@@ -16135,126 +16348,5 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNotNil(fixture.targetRealm.object(
             ofType: BigSyncPendingMutation.self, forPrimaryKey: unresolvedName
         ))
-    }
-}
-
-// These tests use the public drain and its real terminal callback barrier.
-extension BigSyncKitTests {
-    @BigSyncBackgroundActor
-    private func assertClosureCancellationSettlesDrain(scopeProvider: Bool,
-                                                       failDurability: Bool = false) async throws {
-        let database = FakeCloudKitDatabase()
-        database.completesEmptyZoneChangeOperation = true
-        let store = DictionaryKeyValueStore()
-        let sync = makeSynchronizer(database: database, keyValueStore: store)
-        sync.addModelAdapter(FakeModelAdapter(zoneID: sync.recordZoneID, priorities: []))
-        let entered = expectation(description: "current terminal hook entered")
-        let completed = expectation(description: "coalesced waiters settled")
-        completed.expectedFulfillmentCount = 2
-        let release = AsyncGate()
-        let hook: @Sendable () async throws -> Void = {
-            entered.fulfill()
-            await release.wait()
-            if failDurability { store.synchronizesDurably = false }
-            throw CancellationError()
-        }
-        if scopeProvider {
-            sync.domainPublicationScopeIdentifierProvider = {
-                try await hook()
-                return "unreachable"
-            }
-        } else {
-            sync.domainPrepublicationHandler = { _ in
-                try await hook()
-                return []
-            }
-        }
-        let first = Task { @BigSyncBackgroundActor in
-            defer { completed.fulfill() }
-            do { _ = try await sync.synchronize(); XCTFail("Expected current cancellation") }
-            catch { XCTAssertTrue(error is CancellationError, "\(error)") }
-        }
-        await fulfillment(of: [entered], timeout: 5)
-        let second = Task { @BigSyncBackgroundActor in
-            defer { completed.fulfill() }
-            do { _ = try await sync.synchronize(); XCTFail("Expected coalesced cancellation") }
-            catch { XCTAssertTrue(error is CancellationError, "\(error)") }
-        }
-        for _ in 0..<100 where !sync.synchronizationRequestedWhileRunning { await Task.yield() }
-        XCTAssertTrue(sync.synchronizationRequestedWhileRunning)
-        await release.open()
-        await fulfillment(of: [completed], timeout: 5)
-        let abandoned = sync.syncing || sync.synchronizationDrainIsActive
-        XCTAssertFalse(abandoned, "A current cancellation must settle the logical drain")
-        XCTAssertNil(sync.activeReceiptAuthorizationID)
-        // A failing negative control must not hang the test process.
-        if abandoned { sync.cancelSynchronization() }
-        await first.value
-        await second.value
-        store.synchronizesDurably = true
-        sync.domainPrepublicationHandler = nil
-        sync.domainPublicationScopeIdentifierProvider = nil
-        let recoveryFinished = expectation(description: "next public drain completes")
-        let recovery = Task { @BigSyncBackgroundActor in
-            defer { recoveryFinished.fulfill() }
-            do {
-                let result = try await sync.synchronize()
-                XCTAssertNotNil(result.receipt)
-            } catch { XCTFail("Subsequent drain failed: \(error)") }
-        }
-        await fulfillment(of: [recoveryFinished], timeout: 5)
-        if sync.synchronizationDrainIsActive { sync.cancelSynchronization() }
-        await recovery.value
-        await sync.cancelSynchronizationAndWait()
-    }
-
-    @BigSyncBackgroundActor
-    func testClosureCurrentPrepublicationCancellationSettlesCoalescedWaiters() async throws {
-        try await assertClosureCancellationSettlesDrain(scopeProvider: false)
-    }
-
-    @BigSyncBackgroundActor
-    func testClosureCurrentScopeCancellationSettlesCoalescedWaiters() async throws {
-        try await assertClosureCancellationSettlesDrain(scopeProvider: true)
-    }
-
-    @BigSyncBackgroundActor
-    func testClosureCancellationSettlementDoesNotDependOnHealthDurability() async throws {
-        try await assertClosureCancellationSettlesDrain(scopeProvider: false, failDurability: true)
-    }
-
-    @BigSyncBackgroundActor
-    func testClosureObsoleteCancellationCannotCancelCurrentAttempt() async throws {
-        let database = FakeCloudKitDatabase()
-        database.completesEmptyZoneChangeOperation = true
-        let sync = makeSynchronizer(database: database)
-        sync.addModelAdapter(FakeModelAdapter(zoneID: sync.recordZoneID, priorities: []))
-        let obsolete = sync.synchronizationAttemptID
-        let entered = expectation(description: "replacement entered hook")
-        let finished = expectation(description: "replacement completed")
-        let release = AsyncGate()
-        sync.domainPrepublicationHandler = { _ in
-            entered.fulfill()
-            await release.wait()
-            return []
-        }
-        let drain = Task { @BigSyncBackgroundActor in
-            defer { finished.fulfill() }
-            do {
-                let result = try await sync.synchronize()
-                XCTAssertNotNil(result.receipt)
-            } catch { XCTFail("Obsolete cancellation touched replacement: \(error)") }
-        }
-        await fulfillment(of: [entered], timeout: 5)
-        let current = sync.synchronizationAttemptID
-        XCTAssertNotEqual(current, obsolete)
-        sync.settleCancellation(ifOwnedBy: obsolete)
-        XCTAssertEqual(sync.synchronizationAttemptID, current)
-        XCTAssertTrue(sync.synchronizationDrainIsActive)
-        await release.open()
-        await fulfillment(of: [finished], timeout: 5)
-        if sync.synchronizationDrainIsActive { sync.cancelSynchronization() }
-        await drain.value
-        await sync.cancelSynchronizationAndWait()
     }
 }

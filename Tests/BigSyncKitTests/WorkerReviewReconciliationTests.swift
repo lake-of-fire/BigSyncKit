@@ -282,3 +282,81 @@ final class WorkerReviewReconciliationTests: XCTestCase {
         XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, generation)
     }
 }
+
+
+extension WorkerReviewReconciliationTests {
+    @BigSyncBackgroundActor
+    func testReviewAutomaticLocalWinnerPreservesConflictClockAndLaterRemoteEditWins() async throws {
+        let (adapter, realm) = try await fixture()
+        let t1 = Date(timeIntervalSinceReferenceDate: 1_000)
+        let t2 = Date(timeIntervalSinceReferenceDate: 2_000)
+        let t3 = Date(timeIntervalSinceReferenceDate: 3_000)
+        let local = WorkerReviewReceiver()
+        local.id = "automatic-local-winner"
+        local.payload = "local-t2"
+        local.createdAt = t2
+        local.modifiedAt = t2
+        local.explicitlyModifiedAt = t2
+        try await realm.asyncWrite {
+            realm.add(local)
+            local.refreshChangeMetadata(explicitlyModified: true, at: t2)
+        }
+        try await adapter.didFinishImport()
+        let authored = try await adapter.prepareUploadBatch(limit: 10)
+        XCTAssertEqual(authored.records.count, 1)
+        try await adapter.acknowledgeUploadedRecords(authored.records, from: authored)
+        realm.refresh()
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+
+        func incoming(_ payload: String, at timestamp: Date) -> CKRecord {
+            let record = CKRecord(
+                recordType: WorkerReviewReceiver.className(),
+                recordID: .init(
+                    recordName: WorkerReviewReceiver.className() + "." + local.id,
+                    zoneID: adapter.recordZoneID
+                )
+            )
+            record["payload"] = payload as CKRecordValue
+            record["createdAt"] = t1 as CKRecordValue
+            record["modifiedAt"] = timestamp as CKRecordValue
+            record["explicitlyModifiedAt"] = timestamp as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            return record
+        }
+
+        _ = try await adapter.saveChanges(
+            in: [incoming("remote-t1", at: t1)],
+            forceSave: true
+        )
+        realm.refresh()
+        XCTAssertEqual(local.payload, "local-t2")
+        XCTAssertEqual(local.modifiedAt, t2,
+                       "Automatic retransmission must not mint a newer modifiedAt")
+        XCTAssertEqual(local.explicitlyModifiedAt, t2,
+                       "Automatic retransmission must not mint a newer explicit edit clock")
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+
+        try await adapter.didFinishImport()
+        let retransmission = try await adapter.prepareUploadBatch(limit: 10)
+        let retransmitted = try XCTUnwrap(retransmission.records.first)
+        XCTAssertEqual(retransmitted["payload"] as? String, "local-t2")
+        XCTAssertEqual(retransmitted["modifiedAt"] as? Date, t2)
+        XCTAssertEqual(retransmitted["explicitlyModifiedAt"] as? Date, t2)
+        try await adapter.acknowledgeUploadedRecords(
+            retransmission.records, from: retransmission
+        )
+        realm.refresh()
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+
+        _ = try await adapter.saveChanges(
+            in: [incoming("remote-t3", at: t3)],
+            forceSave: true
+        )
+        realm.refresh()
+        XCTAssertEqual(local.payload, "remote-t3",
+                       "A genuinely later edit must outrank the original local T2 authoring clock")
+        XCTAssertEqual(local.modifiedAt, t3)
+        XCTAssertEqual(local.explicitlyModifiedAt, t3)
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+}

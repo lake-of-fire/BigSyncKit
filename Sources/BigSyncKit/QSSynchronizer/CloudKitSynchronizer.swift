@@ -1852,6 +1852,17 @@ public class CloudKitSynchronizer: NSObject {
                 try await subscribeForChangesInDatabase()
                 reportProgress("subscription-completed")
                 try await revalidateRunContext(context)
+                // A cancelled partial/download-only migration must be able
+                // to resume its persisted phase. Reset the Realm adapter's
+                // cancellation gate without starting normal discovery or
+                // journal observation before provenance preparation.
+                for adapter in modelAdapters {
+                    await adapter.waitForCancellation()
+                    try checkRunContext(context)
+                    if let realmAdapter = adapter as? RealmSwiftAdapter {
+                        try realmAdapter.prepareForFencedMigrationAfterCancellation()
+                    }
+                }
                 try await beginChangeFeedMigrationIfNeeded(context: context)
                 try await revalidateRunContext(context)
                 reportProgress("change-feed-migration-ready")
@@ -1909,6 +1920,17 @@ public class CloudKitSynchronizer: NSObject {
                 self?.cancelSynchronizationRequest(requestID)
             }
         }
+    }
+
+    /// Settle a current attempt even when CancellationError was thrown by an
+    /// application hook, or its binding was revoked, without cancelling this
+    /// Task. Do not use checkRunContext here: revoked authority is precisely
+    /// why this owner must release its waiters. No suspension separates the
+    /// ownership test from the existing cancellation cleanup.
+    internal func settleCancellationIfCurrentAttempt(_ attemptID: UUID) {
+        guard synchronizationAttemptID == attemptID,
+              synchronizationDrainIsActive else { return }
+        cancelSynchronization()
     }
 
     private func cancelSynchronizationRequest(_ requestID: UUID) {
@@ -2208,8 +2230,12 @@ public class CloudKitSynchronizer: NSObject {
         // release or clear a replacement run's state here.
         do {
             try checkRunContext(context)
+        } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(context.attemptID)
+            return
         } catch {
-            settleCancellation(ifOwnedBy: context.attemptID)
+            guard synchronizationAttemptID == context.attemptID else { return }
+            await failSynchronization(error: error)
             return
         }
         let needsFollowUp = synchronizationRequestedWhileRunning
