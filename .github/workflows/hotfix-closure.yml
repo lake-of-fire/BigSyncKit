@@ -32,7 +32,7 @@ jobs:
           conflicts = subprocess.check_output(['git','diff','--name-only','--diff-filter=U']).decode().splitlines()
           assert conflicts and set(conflicts) <= {'.github/workflows/hotfix-reevaluation.yml'}, conflicts
           for path in conflicts:
-              subprocess.run(['git','checkout','--theirs','--',path],check=True)
+              subprocess.run(['git','checkout','--ours','--',path],check=True)
               subprocess.run(['git','add','--',path],check=True)
           PY
             fi
@@ -44,8 +44,6 @@ jobs:
               for path in Path('.github').glob(pattern):
                   path.unlink()
           Path('.github/close_hotfix.py').unlink()
-          workflow = Path('.github/workflows/hotfix-closure.yml')
-          workflow.write_text(workflow.read_text().replace('  contents: write\n','  contents: read\n'))
           PY
             git diff --check
             git add -A
