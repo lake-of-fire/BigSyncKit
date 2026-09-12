@@ -40,7 +40,7 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         let receipt = try await first.drain()
         _ = try await second.drain()
         await assertRejected { try await second.synchronizer.revalidateTerminalReceipt(receipt) }
-        try await first.synchronizer.revalidateTerminalReceipt(receipt)
+        try await first.synchronizer.revalidateTerminalReceipt(first)
     }
 
     @BigSyncBackgroundActor
@@ -206,77 +206,6 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         XCTAssertNotEqual(first.runID, replacement.runID)
         try await fixture.synchronizer.revalidateTerminalReceipt(replacement)
         await assertRejected { try await fixture.synchronizer.revalidateTerminalReceipt(first) }
-    }
-
-    @BigSyncBackgroundActor
-    func testPostBarrierCapabilityValidatesOnUnchangedWorker() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let worker = BigSyncBackgroundActor()
-        await worker._test_installSynchronizer(fixture.synchronizer)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        let operations = fixture.transport.operations
-        let writes = fixture.store.writes
-        try await worker.revalidateCompletedPostBarrierDrain(completed)
-        XCTAssertEqual(fixture.transport.operations, operations)
-        XCTAssertEqual(fixture.store.writes, writes)
-    }
-
-    @BigSyncBackgroundActor
-    func testPostBarrierCompletionRejectsWorkerReplacementDuringAccountRead() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let replacement = Fixture(useReplicaBinding: true)
-        let worker = BigSyncBackgroundActor()
-        await worker._test_installSynchronizer(fixture.synchronizer)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        await fixture.account.onNextRead {
-            await worker._test_installSynchronizer(replacement.synchronizer)
-        }
-        await assertRejected {
-            _ = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        }
-        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
-    }
-
-    @BigSyncBackgroundActor
-    func testCompletedPostBarrierRevalidationRejectsWorkerReplacementDuringAccountRead() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let replacement = Fixture(useReplicaBinding: true)
-        let worker = BigSyncBackgroundActor()
-        await worker._test_installSynchronizer(fixture.synchronizer)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        await fixture.account.onNextRead {
-            await worker._test_installSynchronizer(replacement.synchronizer)
-        }
-        await assertRejected { try await worker.revalidateCompletedPostBarrierDrain(completed) }
-        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
-    }
-
-    @BigSyncBackgroundActor
-    func testNewPendingEditRejectsCompletedPostBarrierCapability() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
-            using: receipt, authorizedBy: authorization)
-        fixture.adapter.hasPendingTerminalChanges = true
-        await assertRejected { try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed) }
-        XCTAssertTrue(fixture.adapter.hasPendingTerminalChanges)
-        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
-    }
-
-    @BigSyncBackgroundActor
-    func testPendingEditDuringAccountAwaitRejectsCompletedPostBarrierCapability() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
-            using: receipt, authorizedBy: authorization)
-        await fixture.account.onNextRead {
-            await fixture.introducePendingEdit()
-        }
-        await assertRejected { try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed) }
-        XCTAssertTrue(fixture.adapter.hasPendingTerminalChanges)
-        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
     }
 
 
@@ -511,84 +440,6 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
             }
         }
         XCTAssertFalse(successor.synchronizer.cancelSync)
-    }
-
-    @BigSyncBackgroundActor
-    func testPostBootstrapPrincipalAllowsNewWorkButDoesNotRenewAggregateProof() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
-            using: receipt, authorizedBy: authorization)
-        // Bootstrap legitimately creates source journals. The principal is not
-        // an empty-journal capability and must not acknowledge those writes.
-        fixture.adapter.hasPendingTerminalChanges = true
-        let writes = fixture.store.writes
-        try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed)
-        try fixture.synchronizer.validatePostBarrierDrainPrincipal(completed)
-        await assertRejected { try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed) }
-        XCTAssertEqual(fixture.store.writes, writes)
-        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
-        XCTAssertTrue(fixture.adapter.hasPendingTerminalChanges)
-    }
-
-    @BigSyncBackgroundActor
-    func testPostBootstrapPrincipalRejectsBindingReplacementDuringAccountRead() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
-            using: receipt, authorizedBy: authorization)
-        await fixture.account.onNextRead { try await fixture.replacePersistedBinding() }
-        await assertRejected { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
-    }
-
-    @BigSyncBackgroundActor
-    func testPostBootstrapPrincipalRejectsWorkerReplacementDuringAccountRead() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let successor = Fixture(useReplicaBinding: true)
-        let worker = BigSyncBackgroundActor()
-        await worker._test_installSynchronizer(fixture.synchronizer)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        await fixture.account.onNextRead { await worker._test_installSynchronizer(successor.synchronizer) }
-        await assertCancelled { try await worker.revalidatePostBarrierDrainPrincipal(completed) }
-    }
-
-    @BigSyncBackgroundActor
-    func testPostBootstrapPrincipalRejectsNextRunAndCancellation() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
-            using: receipt, authorizedBy: authorization)
-        _ = try await fixture.drain()
-        await assertRejected { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
-        fixture.synchronizer.cancelSynchronization()
-        await assertCancelled { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
-    }
-
-    @BigSyncBackgroundActor
-    func testPostBootstrapFinalOwnershipRejectsBindingChangeAfterAccountCheck() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let worker = BigSyncBackgroundActor()
-        await worker._test_installSynchronizer(fixture.synchronizer)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        try await worker.revalidatePostBarrierDrainPrincipal(completed)
-        // Models a domain read yielding AFTER the actual-account revalidation.
-        try await fixture.replacePersistedBinding()
-        XCTAssertThrowsError(try worker.validatePostBarrierDrainPrincipal(completed))
-    }
-
-    @BigSyncBackgroundActor
-    func testPostBootstrapFinalOwnershipRejectsReplacementAfterAccountCheck() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let replacement = Fixture(useReplicaBinding: true)
-        let worker = BigSyncBackgroundActor()
-        await worker._test_installSynchronizer(fixture.synchronizer)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await worker.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        try await worker.revalidatePostBarrierDrainPrincipal(completed)
-        await worker._test_installSynchronizer(replacement.synchronizer)
-        XCTAssertThrowsError(try worker.validatePostBarrierDrainPrincipal(completed))
     }
 
     @BigSyncBackgroundActor
@@ -1235,11 +1086,9 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testCompletedPrincipalRejectsImmediateNotificationFenceBeforeQueuedCancellation() async throws {
+    func testOrdinaryReceiptRejectsImmediateNotificationFenceBeforeQueuedCancellation() async throws {
         let fixture = Fixture(useReplicaBinding: true)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
-            using: receipt, authorizedBy: authorization)
+        let receipt = try await fixture.drain()
         let attempt = fixture.synchronizer.synchronizationAttemptID
         let writes = fixture.store.writes
         XCTAssertNotNil(try fixture.synchronizer.accountScopeLease())
@@ -1247,10 +1096,8 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         // not run its queued cancellation yet. This is not a real account switch.
         fixture.synchronizer.accountScopeAuthorityFence.poison()
         XCTAssertNil(try fixture.synchronizer.accountScopeLease())
-        XCTAssertThrowsError(try fixture.synchronizer.validatePostBarrierDrainPrincipal(completed))
-        await assertCancelled {
-            try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed)
-        }
+        XCTAssertThrowsError(try fixture.synchronizer.validateTerminalReceipt(receipt))
+        await assertCancelled { try await fixture.synchronizer.revalidateTerminalReceipt(receipt) }
         XCTAssertEqual(fixture.synchronizer.synchronizationAttemptID, attempt)
         XCTAssertFalse(fixture.synchronizer.cancelSync)
         XCTAssertEqual(fixture.store.writes, writes)
@@ -1258,21 +1105,15 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testPostBootstrapPrincipalRejectsSameAccountReturnAfterImmediateFence() async throws {
+    func testOrdinaryReceiptRejectsSameAccountReturnAfterImmediateFence() async throws {
         let fixture = Fixture(useReplicaBinding: true)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
-            using: receipt, authorizedBy: authorization)
-        // New source work remains legitimate. Rejection must come from the
-        // revoked principal, not from weakening or reusing the drain predicate.
-        fixture.adapter.hasPendingTerminalChanges = true
+        let receipt = try await fixture.drain()
         await fixture.account.onNextRead { @BigSyncBackgroundActor in
+            fixture.injected = true
             fixture.synchronizer.accountScopeAuthorityFence.poison()
         }
-        await assertCancelled {
-            try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed)
-        }
-        XCTAssertTrue(fixture.adapter.hasPendingTerminalChanges)
+        await assertCancelled { try await fixture.synchronizer.revalidateTerminalReceipt(receipt) }
+        XCTAssertTrue(fixture.injected, "Must reach the actual-account suspension boundary")
         XCTAssertEqual(fixture.adapter.acknowledgements, 0)
     }
 
@@ -1380,57 +1221,11 @@ final class CloudKitTerminalReceiptTests: XCTestCase {
         }
 
 
-        func postBarrierDrain() async throws -> (
-            CloudKitSynchronizer.SynchronizationReceipt,
-            CloudKitSynchronizer.PostBarrierDrainAuthorization
-        ) {
-            // Establish real account/binding state through the normal drain.
-            _ = try await drain()
-            synchronizer.postBarrierSnapshotIdentifierProvider = { "snapshot-scope" }
-            let authorization = try synchronizer.establishPostBarrierDrain(
-                writerBarrierEvidenceID: "test-barrier")
-            return (try await drain(), authorization)
-        }
-
         func drain() async throws -> CloudKitSynchronizer.SynchronizationReceipt {
             let result = try await synchronizer.synchronize()
             XCTAssertEqual(result.publicationState, .complete)
             return try XCTUnwrap(result.receipt)
         }
-    }
-}
-
-
-extension CloudKitTerminalReceiptTests {
-    @BigSyncBackgroundActor
-    func testRevokingArmedPostBarrierAuthorizationDowngradesDrainAndAllowsRearm() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        _ = try await fixture.drain()
-        fixture.synchronizer.postBarrierSnapshotIdentifierProvider = { "snapshot-scope" }
-        let authorization = try fixture.synchronizer.establishPostBarrierDrain(
-            writerBarrierEvidenceID: "test-barrier")
-        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))
-        let receipt = try await fixture.drain()
-        XCTAssertNil(receipt.postBarrierDrainAuthorizationID)
-        await assertRejected {
-            _ = try await fixture.synchronizer.completedPostBarrierDrain(
-                using: receipt, authorizedBy: authorization)
-        }
-        let next = try fixture.synchronizer.establishPostBarrierDrain(
-            writerBarrierEvidenceID: "test-barrier-2")
-        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(next))
-    }
-
-    @BigSyncBackgroundActor
-    func testRevokingCompletedPostBarrierAuthorizationInvalidatesOnlyCutoverCapability() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let (receipt, authorization) = try await fixture.postBarrierDrain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(
-            using: receipt, authorizedBy: authorization)
-        XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))
-        XCTAssertThrowsError(try fixture.synchronizer.validatePostBarrierDrainPrincipal(completed))
-        try await fixture.synchronizer.revalidateTerminalReceipt(receipt)
-        XCTAssertFalse(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))
     }
 }
 
@@ -1833,318 +1628,120 @@ private final class ReceiptFailureHealthObserver: NSObject {
 // Native composition of the real synchronizer/worker with the production
 // filesystem gate. Injected account/transport only; no live CloudKit data.
 extension CloudKitTerminalReceiptTests {
+    /// Compatibility fixture for an abandoned checkpoint written by an older
+    /// client. RA-1 never establishes a Reader cutoff or source-publication phase.
     @BigSyncBackgroundActor
-    private func prepareOutboundCutoff(_ fixture: Fixture) async throws -> CloudKitSynchronizer.PostBarrierOutboundQuiescence {
+    private func abandonedLegacyCheckpoint(_ fixture: Fixture) async throws -> BigSyncOutboundQuiescenceSnapshot {
         _ = try await fixture.drain()
-        fixture.synchronizer.postBarrierSnapshotIdentifierProvider = { "snapshot-scope" }
-        return try fixture.synchronizer.beginPostBarrierOutboundQuiescence(writerBarrierEvidenceID: "durable-domain-preparing")
-    }
-
-    @BigSyncBackgroundActor
-    func testCrossProcessCutoffComposesWithInboundDrainReceiptAndReservationSeal() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareOutboundCutoff(fixture)
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token) }
-        let authorization = try await fixture.synchronizer.establishPostBarrierDrain(quiescence: token)
-        let principal = try fixture.synchronizer.currentOutboundPrincipal()
         let gate = fixture.synchronizer.outboundQuiescenceCoordinator
-        fixture.transport.databaseChangesHook = {
-            fixture.injected = true // The final drain is still allowed to fetch.
-            XCTAssertThrowsError(try gate.admit(principal: principal))
-        }
-        let receipt = try await fixture.drain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        XCTAssertTrue(fixture.injected)
-        XCTAssertEqual(authorization.outboundQuiescenceIdentifier, token.identifier)
-        XCTAssertEqual(completed.outboundQuiescenceIdentifier, token.identifier)
-        XCTAssertTrue(try gate.snapshot().outstandingSubmissions.isEmpty)
-        let preparingCheckpoint = try fixture.synchronizer.outboundQuiescenceSnapshot()
-        XCTAssertThrowsError(try fixture.synchronizer.resolvePostBarrierOutboundQuiescence(
-            token, expected: preparingCheckpoint, recoveryEvidenceID: "premature-transition"
-        )) {
-            XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .recoveryRequired)
-        }
-        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot(), preparingCheckpoint)
-        let checkpoint = try await fixture.synchronizer.requirePostBarrierDrainRecoveryBeforeReservation(completed)
-        XCTAssertEqual(checkpoint.barrier?.phase, .recoveryRequired)
-        XCTAssertThrowsError(try fixture.synchronizer.abortPostBarrierOutboundQuiescence(token)) {
-            XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .recoveryRequired)
-        }
-        // Expected bootstrap-created journals invalidate the strict witness,
-        // not principal continuity. The transport remains closed meanwhile.
-        fixture.introducePendingEdit()
-        try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed)
-        await assertRejected { try await fixture.synchronizer.revalidateCompletedPostBarrierDrain(completed) }
-        fixture.synchronizer.cancelSynchronization()
-        XCTAssertEqual(try gate.snapshot().barrier?.phase, .recoveryRequired)
-        XCTAssertThrowsError(try gate.admit(principal: principal))
-    }
-
-    @BigSyncBackgroundActor
-    func testLogicalCancellationStopsCutoffWaitWithoutReleasingPeersEarly() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        _ = try await fixture.drain()
-        fixture.synchronizer.postBarrierSnapshotIdentifierProvider = { "snapshot-scope" }
-        let gate = fixture.synchronizer.outboundQuiescenceCoordinator
-        let principal = try fixture.synchronizer.currentOutboundPrincipal()
-        let peer = try gate.admit(principal: principal)
-        let token = try fixture.synchronizer.beginPostBarrierOutboundQuiescence(writerBarrierEvidenceID: "barrier")
-        let establishment = Task { @BigSyncBackgroundActor in
-            try await fixture.synchronizer.establishPostBarrierDrain(quiescence: token)
-        }
-        defer { establishment.cancel(); withExtendedLifetime(peer) {} }
-        for _ in 0..<1_000 {
-            if fixture.synchronizer.postBarrierOutboundEstablishmentID != nil { break }
-            await Task.yield()
-        }
-        XCTAssertNotNil(fixture.synchronizer.postBarrierOutboundEstablishmentID)
-        fixture.synchronizer.cancelSynchronization()
-        await assertRejected { _ = try await establishment.value }
-        XCTAssertEqual(try gate.snapshot().barrier?.identifier, token.identifier)
-        XCTAssertTrue(try fixture.synchronizer.abortPostBarrierOutboundQuiescence(token))
-        XCTAssertNil(try gate.snapshot().barrier)
-    }
-
-    @BigSyncBackgroundActor
-    func testPersistedAccountEpochReplacementRevokesCutoffButNeverReopensIt() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareOutboundCutoff(fixture)
-        try fixture.advancePersistedLeaseGeneration()
-        await assertRejected { _ = try await fixture.synchronizer.establishPostBarrierDrain(quiescence: token) }
-        XCTAssertThrowsError(try fixture.synchronizer.abortPostBarrierOutboundQuiescence(token)) {
-            XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .staleAuthority)
-        }
-        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot().barrier?.identifier, token.identifier)
-        XCTAssertTrue(fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token))
-    }
-
-    @BigSyncBackgroundActor
-    func testBindingReplacementRevokesCompletedTransportCutoff() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareOutboundCutoff(fixture)
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token) }
-        let permit = try await fixture.synchronizer.establishPostBarrierDrain(quiescence: token)
-        let receipt = try await fixture.drain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(using: receipt, authorizedBy: permit)
-        try fixture.replacePersistedBinding()
-        await assertRejected { try await fixture.synchronizer.revalidatePostBarrierDrainPrincipal(completed) }
-        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot().barrier?.identifier, token.identifier)
-    }
-
-    @BigSyncBackgroundActor
-    func testExactAbortCannotClearSuccessorOutboundOwner() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let old = try await prepareOutboundCutoff(fixture)
-        let permit = try await fixture.synchronizer.establishPostBarrierDrain(quiescence: old)
-        XCTAssertTrue(try fixture.synchronizer.abortPostBarrierOutboundQuiescence(old))
-        let next = try fixture.synchronizer.beginPostBarrierOutboundQuiescence(writerBarrierEvidenceID: "successor")
-        XCTAssertFalse(try fixture.synchronizer.abortPostBarrierOutboundQuiescence(old))
-        XCTAssertFalse(fixture.synchronizer.revokePostBarrierDrainAuthorization(permit))
-        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot().barrier?.identifier, next.identifier)
-        _ = try await fixture.synchronizer.establishPostBarrierDrain(quiescence: next)
-        XCTAssertTrue(try fixture.synchronizer.abortPostBarrierOutboundQuiescence(next))
+        var oldOwner: BigSyncOutboundQuiescenceLease? = try gate.begin(
+            principal: fixture.synchronizer.currentOutboundPrincipal(),
+            writerBarrierEvidenceID: "TEST-ONLY-abandoned-legacy-checkpoint")
+        XCTAssertNotNil(oldOwner)
+        oldOwner = nil // Drop OS ownership, not the persisted uncertainty.
+        return try gate.snapshot()
     }
 
     @BigSyncBackgroundActor
     func testWorkerReplacementDuringRecoveryProofCannotReopenOldGate() async throws {
         let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareOutboundCutoff(fixture)
-        XCTAssertTrue(fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token))
-        let expected = try fixture.synchronizer.outboundQuiescenceSnapshot()
+        let expected = try await abandonedLegacyCheckpoint(fixture)
         let worker = BigSyncBackgroundActor()
         let replacement = Fixture(useReplicaBinding: true)
         await worker._test_installSynchronizer(fixture.synchronizer)
         await assertRejected {
             try await worker.recoverOutboundQuiescence(expected: expected) { _ in
+                fixture.injected = true
                 await worker._test_installSynchronizer(replacement.synchronizer)
                 return "TEST-ONLY-domain-proof"
             }
         }
+        XCTAssertTrue(fixture.injected, "A prior rejection must not masquerade as owner fencing")
         XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot(), expected)
         XCTAssertNil(try replacement.synchronizer.outboundQuiescenceSnapshot().barrier)
     }
 
-    @BigSyncBackgroundActor
-    func testBackgroundWorkerForwardsOwnedCutoffAndPreservesOrdinaryReceiptOnAbort() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let ordinaryReceipt = try await fixture.drain()
-        fixture.synchronizer.postBarrierSnapshotIdentifierProvider = { "snapshot-scope" }
-        let worker = BigSyncBackgroundActor()
-        await worker._test_installSynchronizer(fixture.synchronizer)
-        let token = try worker.beginPostBarrierOutboundQuiescence(writerBarrierEvidenceID: "barrier")
-        let authorization = try await worker.establishPostBarrierDrain(quiescence: token)
-        XCTAssertEqual(authorization.outboundQuiescenceIdentifier, token.identifier)
-        XCTAssertTrue(try worker.abortPostBarrierOutboundQuiescence(token))
-        try await fixture.synchronizer.revalidateTerminalReceipt(ordinaryReceipt)
-        XCTAssertNil(try worker.outboundQuiescenceSnapshot().barrier)
-    }
 }
 
 
 extension CloudKitTerminalReceiptTests {
     @BigSyncBackgroundActor
-    private func prepareSourcePublication(_ fixture: Fixture) async throws -> CloudKitSynchronizer.PostBarrierOutboundQuiescence {
-        let token = try await prepareOutboundCutoff(fixture)
-        let authorization = try await fixture.synchronizer.establishPostBarrierDrain(quiescence: token)
-        let receipt = try await fixture.drain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        let checkpoint = try await fixture.synchronizer.requirePostBarrierDrainRecoveryBeforeReservation(completed)
-        _ = try fixture.synchronizer.beginPostBarrierSourcePublication(token,
-            expected: checkpoint, sourcePublicationEvidenceID: "TEST-ONLY-committed-domain")
-        return token
-    }
-
-    @BigSyncBackgroundActor
-    func testDeepSourcePublicationUsesRealUploadAndDeletePipelineUntilExactRelease() async throws {
+    func testOrdinaryUploadAndDeleteRetainPhysicalSubmissionThroughAcknowledgement() async throws {
         let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareSourcePublication(fixture)
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token) }
+        _ = try await fixture.drain()
         let gate = fixture.synchronizer.outboundQuiescenceCoordinator
         let principal = try fixture.synchronizer.currentOutboundPrincipal()
-        let record = CKRecord(recordType: "Source", recordID: .init(recordName: "Source.one", zoneID: fixture.adapter.recordZoneID))
+        let record = CKRecord(recordType: "Item", recordID: .init(
+            recordName: "Item.one", zoneID: fixture.adapter.recordZoneID))
         fixture.adapter.preparedUploads = [.init(record: record, generation: "generation-one")]
-        fixture.adapter.preparedDeletions = [.init(recordID: .init(recordName: "Source.deleted", zoneID: fixture.adapter.recordZoneID), generation: "delete-generation")]
+        fixture.adapter.preparedDeletions = [.init(recordID: .init(
+            recordName: "Item.deleted", zoneID: fixture.adapter.recordZoneID), generation: "delete-generation")]
         fixture.transport.mutationHook = {
-            XCTAssertThrowsError(try gate.admit(principal: principal))
+            XCTAssertNil(try gate.snapshot().barrier)
             XCTAssertEqual(try gate.snapshot().outstandingSubmissions.count, 1)
+            XCTAssertThrowsError(try gate.takeRecoveryOwnership(expected: gate.snapshot()))
         }
         fixture.adapter.acknowledgementHook = {
-            XCTAssertThrowsError(try gate.admit(principal: principal))
+            XCTAssertNil(try gate.snapshot().barrier)
             XCTAssertEqual(try gate.snapshot().outstandingSubmissions.count, 1)
+            XCTAssertThrowsError(try gate.takeRecoveryOwnership(expected: gate.snapshot()))
         }
         let receipt = try await fixture.drain()
         XCTAssertEqual(fixture.transport.mutationCalls, 2)
         XCTAssertEqual(fixture.adapter.acknowledgements, 2)
-        XCTAssertNil(receipt.postBarrierDrainAuthorizationID)
-        XCTAssertNil(fixture.synchronizer.completedPostBarrierDrain)
-        let checkpoint = try gate.snapshot()
-        XCTAssertEqual(checkpoint.barrier?.phase, .sourcePublication)
-        XCTAssertTrue(checkpoint.outstandingSubmissions.isEmpty)
-        XCTAssertThrowsError(try gate.admit(principal: principal))
-        try fixture.synchronizer.resolvePostBarrierOutboundQuiescence(token,
-            expected: checkpoint, recoveryEvidenceID: "TEST-ONLY-durable-completion")
+        XCTAssertTrue(fixture.adapter.preparedUploads.isEmpty)
+        XCTAssertTrue(fixture.adapter.preparedDeletions.isEmpty)
+        XCTAssertNil(try gate.snapshot().barrier)
+        XCTAssertTrue(try gate.snapshot().outstandingSubmissions.isEmpty)
         try await fixture.synchronizer.revalidateTerminalReceipt(receipt)
         _ = try gate.admit(principal: principal)
     }
 
     @BigSyncBackgroundActor
-    func testDeepSameSynchronizerResumeDoesNotReviveAbandonedToken() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let old = try await prepareSourcePublication(fixture)
-        XCTAssertTrue(fixture.synchronizer.abandonPostBarrierOutboundQuiescence(old))
-        let checkpoint = try fixture.synchronizer.outboundQuiescenceSnapshot()
-        let resumed = try await fixture.synchronizer.resumePostBarrierSourcePublication(expected: checkpoint) { _ in
-            "TEST-ONLY-reproved-domain"
+    func testOrdinaryPreparationRevocationCannotSubmitOrAcknowledgePreparedGeneration() async throws {
+        enum Revocation { case cancellation, accountFence, bindingReplacement }
+        for revocation: Revocation in [.cancellation, .accountFence, .bindingReplacement] {
+            let fixture = Fixture(useReplicaBinding: true)
+            _ = try await fixture.drain()
+            let record = CKRecord(recordType: "Item", recordID: .init(
+                recordName: "Item.one", zoneID: fixture.adapter.recordZoneID))
+            fixture.adapter.preparedUploads = [.init(record: record, generation: "unsubmitted-generation")]
+            fixture.adapter.preparationHook = {
+                fixture.adapter.preparationHook = nil
+                fixture.injected = true
+                switch revocation {
+                case .cancellation: fixture.synchronizer.cancelSynchronization()
+                case .accountFence: fixture.synchronizer.accountScopeAuthorityFence.poison()
+                case .bindingReplacement: try fixture.replacePersistedBinding()
+                }
+            }
+            await assertRejected { _ = try await fixture.synchronizer.synchronize() }
+            XCTAssertTrue(fixture.injected, "Must revoke after actual preparation entry")
+            XCTAssertEqual(fixture.transport.mutationCalls, 0)
+            XCTAssertEqual(fixture.adapter.acknowledgements, 0)
+            XCTAssertEqual(fixture.adapter.preparedUploads.first?.generation, "unsubmitted-generation")
+            XCTAssertTrue(try fixture.synchronizer.outboundQuiescenceSnapshot().outstandingSubmissions.isEmpty)
         }
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(resumed) }
-        XCTAssertEqual(old.identifier, resumed.identifier) // Same durable cutoff.
-        XCTAssertNotEqual(old, resumed) // Different live acquisition.
-        XCTAssertFalse(fixture.synchronizer.abandonPostBarrierOutboundQuiescence(old))
-        let current = try fixture.synchronizer.outboundQuiescenceSnapshot()
-        XCTAssertThrowsError(try fixture.synchronizer.resolvePostBarrierOutboundQuiescence(old,
-            expected: current, recoveryEvidenceID: "stale-completion"))
-        _ = try await fixture.drain() // The old callback did not seal/drop the successor.
     }
 
     @BigSyncBackgroundActor
-    func testDeepCancellationSealsSourcePublicationUntilExplicitResume() async throws {
+    func testWorkerReplacementAtFinalRecoveryAccountLookupKeepsFence() async throws {
         let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareSourcePublication(fixture)
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token) }
-        let before = try fixture.synchronizer.outboundQuiescenceSnapshot()
-        fixture.synchronizer.cancelSynchronization()
-        await assertRejected { _ = try await fixture.synchronizer.synchronize() }
-        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot(), before)
-        XCTAssertEqual(fixture.transport.mutationCalls, 0)
-        XCTAssertTrue(fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token))
-        let resumed = try await fixture.synchronizer.resumePostBarrierSourcePublication(expected: before) { _ in
-            "TEST-ONLY-reproved-after-cancel"
-        }
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(resumed) }
-        _ = try await fixture.drain()
-    }
-
-    @BigSyncBackgroundActor
-    func testDeepSourceReceiptRejectsUnresolvedEarlierSubmission() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareSourcePublication(fixture)
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token) }
-        let gate = fixture.synchronizer.outboundQuiescenceCoordinator
-        let principal = try fixture.synchronizer.currentOutboundPrincipal()
-        var earlier: BigSyncOutboundBatchLease? = try gate.admit(principal: principal,
-            owner: fixture.synchronizer.postBarrierOutboundLease)
-        try earlier?.willSubmit()
-        earlier = nil // A returned request with unknown outcome from a prior source drain.
-        let checkpoint = try gate.snapshot()
-        XCTAssertEqual(checkpoint.outstandingSubmissions.count, 1)
-        await assertRejected { _ = try await fixture.synchronizer.synchronize() }
-        XCTAssertEqual(try gate.snapshot(), checkpoint)
-        XCTAssertEqual(fixture.adapter.acknowledgements, 0)
-    }
-
-    @BigSyncBackgroundActor
-    func testDeepAbandonmentDuringSourcePrepublicationCannotIssueSuccess() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareSourcePublication(fixture)
-        fixture.adapter.semanticHook = {
-            XCTAssertTrue(fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token))
-        }
-        await assertRejected { _ = try await fixture.synchronizer.synchronize() }
-        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot().barrier?.phase, .sourcePublication)
-    }
-
-    @BigSyncBackgroundActor
-    func testDeepRestartBeforeSourcePhaseWritePromotesCommittedRecovery() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareOutboundCutoff(fixture)
-        let authorization = try await fixture.synchronizer.establishPostBarrierDrain(quiescence: token)
-        let receipt = try await fixture.drain()
-        let completed = try await fixture.synchronizer.completedPostBarrierDrain(using: receipt, authorizedBy: authorization)
-        let checkpoint = try await fixture.synchronizer.requirePostBarrierDrainRecoveryBeforeReservation(completed)
-        fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token)
-        // A durable host proof—not the checkpoint phase—establishes the domain commit.
-        let resumed = try await fixture.synchronizer.resumePostBarrierSourcePublication(expected: checkpoint) { _ in
-            "TEST-ONLY-domain-committed-before-crash"
-        }
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(resumed) }
-        XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot().barrier?.phase, .sourcePublication)
-        _ = try await fixture.drain()
-    }
-
-    @BigSyncBackgroundActor
-    func testDeepFinalDrainRevokedDuringPreparationDoesNotEnterTransport() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareOutboundCutoff(fixture)
-        defer { fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token) }
-        let authorization = try await fixture.synchronizer.establishPostBarrierDrain(quiescence: token)
-        let record = CKRecord(recordType: "Item", recordID: .init(recordName: "Item.one", zoneID: fixture.adapter.recordZoneID))
-        fixture.adapter.preparedUploads = [.init(record: record, generation: "unsubmitted-generation")]
-        fixture.adapter.preparationHook = {
-            XCTAssertTrue(fixture.synchronizer.revokePostBarrierDrainAuthorization(authorization))
-        }
-        await assertRejected { _ = try await fixture.synchronizer.synchronize() }
-        XCTAssertEqual(fixture.transport.mutationCalls, 0)
-        XCTAssertEqual(fixture.adapter.preparedUploads.first?.generation, "unsubmitted-generation")
-        XCTAssertTrue(try fixture.synchronizer.outboundQuiescenceSnapshot().outstandingSubmissions.isEmpty)
-    }
-
-    @BigSyncBackgroundActor
-    func testDeepWorkerReplacementAtFinalRecoveryAccountLookupKeepsFence() async throws {
-        let fixture = Fixture(useReplicaBinding: true)
-        let token = try await prepareSourcePublication(fixture)
-        fixture.synchronizer.abandonPostBarrierOutboundQuiescence(token)
-        let checkpoint = try fixture.synchronizer.outboundQuiescenceSnapshot()
+        let checkpoint = try await abandonedLegacyCheckpoint(fixture)
         let worker = BigSyncBackgroundActor()
         let replacement = Fixture(useReplicaBinding: true)
         await worker._test_installSynchronizer(fixture.synchronizer)
         await assertRejected {
             try await worker.recoverOutboundQuiescence(expected: checkpoint) { _ in
-                await fixture.account.onNextRead {
+                await fixture.account.onNextRead { @BigSyncBackgroundActor in
+                    fixture.injected = true
                     await worker._test_installSynchronizer(replacement.synchronizer)
                 }
                 return "TEST-ONLY-proof-before-final-account-await"
             }
         }
+        XCTAssertTrue(fixture.injected, "Must reach the final account lookup")
         XCTAssertEqual(try fixture.synchronizer.outboundQuiescenceSnapshot(), checkpoint)
     }
+
 }
