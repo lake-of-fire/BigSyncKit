@@ -3666,10 +3666,22 @@ public final class RealmSwiftAdapter:
                             entityType: entityType
                         )
                 }
-                changeMetadata.refreshChangeMetadata(
-                    explicitlyModified: true,
-                    at: Date()
-                )
+                if delegate != nil {
+                    // A custom delegate may have intentionally changed the
+                    // local object while deciding to keep it. Preserve the
+                    // historical authoring behavior for that model-owned merge.
+                    changeMetadata.refreshChangeMetadata(
+                        explicitlyModified: true,
+                        at: Date()
+                    )
+                } else {
+                    // The built-in timestamp policy selected an unchanged,
+                    // already-authored local value. Retransmit it under a new
+                    // journal generation without inventing a new conflict clock.
+                    changeMetadata.journalCurrentValuePreservingChangeMetadata(
+                        at: Date()
+                    )
+                }
             }
         }
         return pendingRelationships

@@ -27,6 +27,14 @@ public extension ChangeMetadataRecordable {
         }
     }
 
+    /// BigSync has already selected the complete existing value as the winner.
+    /// Queue that value for retransmission without manufacturing a later user
+    /// edit clock. Custom delegates that mutate the object continue to use the
+    /// ordinary explicit refresh path in RealmSwiftAdapter.
+    internal func journalCurrentValuePreservingChangeMetadata(at timestamp: Date) {
+        recordBigSyncMutation(at: timestamp)
+    }
+
     private func recordBigSyncMutation(at timestamp: Date) {
         guard let object = self as? Object else {
             assertionFailure("BigSync mutations require a Realm Object")
