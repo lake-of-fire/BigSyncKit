@@ -1,0 +1,111 @@
+name: RA1 replay source publication and baseline control
+on:
+  push:
+    branches: [codex/ra1-bigsync-inbound-replay-20260912]
+    paths: [.github/workflows/ra1-replay-evidence-publication.yml]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish-reviewed-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 84571b4c2a5262dfa52b66772d0276485d150f20
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: ra1-inbound-replay-evidence
+          run-id: 34725995904
+          github-token: ${{ github.token }}
+          path: ../evidence
+      - name: Validate archived source and exact evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '1f3e6fe83653c4cf1de92c86ae2ef5d10159f47c37d789919786ef8134ec4a6d  ../evidence/source.patch' | sha256sum -c -
+          test "$(cat ../evidence/source-head.txt)" = 84571b4c2a5262dfa52b66772d0276485d150f20
+          grep -q 'Executed 4 tests, with 0 failures' ../evidence/ra1-focused.log
+          grep -q 'Executed 1 test, with 0 failures' ../evidence/ra1-adapter.log
+          grep -q 'Executed 680 tests, with 49 failures' ../evidence/ra1-full.log
+          git apply --index ../evidence/source.patch
+          git diff --cached --check
+          test "$(git diff --cached --name-only | sort | tr '\n' ' ')" = 'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/RA1InboundReplayTests.swift '
+      - name: Publish source candidate without claiming full-suite qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Replay stale inbound target selections through ordinary fenced retry' -m 'Exact patch from run 34725995904, artifact 10307099501. Four focused tests and real adapter regression pass. Full suite remains red: 680 executed, 49 assertion failures across 37 cases. No package-wide, app-native, CloudKit or release qualification is claimed.'
+          git push origin HEAD:refs/heads/codex/ra1-final-inbound-replay-20260912
+          git show --stat --oneline HEAD
+  unchanged-base-control:
+    runs-on: macos-15
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 84571b4c2a5262dfa52b66772d0276485d150f20
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ra1-inbound-replay-evidence
+          run-id: 34725995904
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Execute unchanged base suite
+        id: baseline
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        shell: bash
+        run: |
+          set -uo pipefail
+          test "$(git rev-parse HEAD)" = 84571b4c2a5262dfa52b66772d0276485d150f20
+          test -z "$(git status --porcelain)"
+          swift --version | tee ../evidence/base-toolchain.txt
+          swift test 2>&1 | tee ../evidence/base-full.log
+          status=${PIPESTATUS[0]}
+          echo "$status" > ../evidence/base-exit-code.txt
+          exit "$status"
+      - name: Compare failed cases without waiving them
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+          root = Path('evidence')
+          def failures(path):
+              return sorted(set(re.findall(r"Test Case '(.*?)' failed", path.read_text())))
+          base = failures(root / 'base-full.log')
+          patched = failures(root / 'ra1-full.log')
+          result = {'base':'84571b4c2a5262dfa52b66772d0276485d150f20', 'source_patch_sha256':'1f3e6fe83653c4cf1de92c86ae2ef5d10159f47c37d789919786ef8134ec4a6d', 'base_failed_cases':base, 'patched_failed_cases':patched, 'new_failed_cases':sorted(set(patched)-set(base)), 'resolved_failed_cases':sorted(set(base)-set(patched)), 'full_package_qualified':False}
+          text=json.dumps(result,indent=2)+'\n'
+          (root/'baseline-comparison.json').write_text(text)
+          print(text)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ra1-replay-base-control
+          path: evidence
