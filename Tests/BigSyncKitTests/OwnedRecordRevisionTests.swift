@@ -292,6 +292,33 @@ final class OwnedRecordRevisionTests: XCTestCase {
     private let undo = RA1DomainValue(revision: 43, segments: [], characters: 0)
 
     @BigSyncBackgroundActor
+    func testSkippedLocalRecoveryFlagUsesDefaultFalseInManagedUploadAndOwnEcho() async throws {
+        let f = try await RA1RealmFixture.make()
+        let generation = try await f.author(mark)
+        let upload = try await f.nextUpload()
+
+        // Skipped scalar properties use the model default on the wire. A real
+        // managed upload therefore includes false, although fixture records omit it.
+        XCTAssertNotNil(upload.record["isAwaitingRecoveryEvidence"])
+        XCTAssertEqual(BigSyncCloudKitBooleanCodec.decode(
+            upload.record["isAwaitingRecoveryEvidence"]), false)
+        XCTAssertEqual(upload.generation, generation)
+        XCTAssertEqual(try RA1OwnedRevisionObject.decode(upload.record), mark)
+
+        let results = try await f.adapter.validateAuthoritativeOwnUploadRecords([upload.record])
+        XCTAssertEqual(results.first?.disposition, .validatedAuthoritativeOwnUpload)
+        XCTAssertTrue(f.tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        XCTAssertEqual(f.generation(), generation)
+
+        try await f.acknowledge(upload)
+        XCTAssertNil(f.generation())
+        XCTAssertEqual(try f.value(), mark)
+        let object = try XCTUnwrap(f.target.object(
+            ofType: RA1OwnedRevisionObject.self, forPrimaryKey: mark.id))
+        XCTAssertFalse(object.isAwaitingRecoveryEvidence)
+    }
+
+    @BigSyncBackgroundActor
     func testLatePopulatedDownloadRequeuesNewerEmptyValueWithoutReauthoring() async throws {
         for forceSave in [false, true] {
             for retainedTombstone in [false, true] {
