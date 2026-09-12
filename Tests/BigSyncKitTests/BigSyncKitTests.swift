@@ -14278,7 +14278,7 @@ final class BigSyncKitTests: XCTestCase {
         )
         let opened = try await cold.preparePublicationRestorationInspection()
         let inspection = try XCTUnwrap(opened)
-        let warmTarget = try autoreleasepool { try Realm(configuration: target) }
+        let warmTarget = try await Realm(configuration: target, actor: BigSyncBackgroundActor.shared)
         defer { withExtendedLifetime(warmTarget) {} }
         XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
         XCTAssertNil(cold.realmProvider)
@@ -14377,7 +14377,7 @@ final class BigSyncKitTests: XCTestCase {
         var target = Realm.Configuration()
         target.inMemoryIdentifier = "journal-free-\(UUID().uuidString)"
         target.objectTypes = [BigSyncTrackedObject.self]
-        let targetRealm = try autoreleasepool { try Realm(configuration: target) }
+        let targetRealm = try await Realm(configuration: target, actor: BigSyncBackgroundActor.shared)
         let cold = RealmSwiftAdapter(
             persistenceRealmConfiguration: fixture.persistenceRealm.configuration,
             targetRealmConfigurations: [target], excludedClassNames: [],
