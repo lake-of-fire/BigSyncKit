@@ -1109,7 +1109,7 @@ final class BigSyncKitTests: XCTestCase {
             let original = reviewContext(sync)
             sync.activeRunContext = original
             let entered = AsyncGate(), release = AsyncGate()
-            let error = CKError(.userDeletedZone, userInfo: encrypted
+            let error = CKError(encrypted ? .zoneNotFound : .userDeletedZone, userInfo: encrypted
                 ? [CKErrorUserDidResetEncryptedDataKey: true] : [:])
             let gate: @Sendable () async throws -> Void = {
                 await entered.open()
@@ -1196,7 +1196,7 @@ final class BigSyncKitTests: XCTestCase {
             let database = FakeCloudKitDatabase()
             let sync = makeSynchronizer(database: database, keyValueStore: store)
             sync.activeRunContext = reviewContext(sync)
-            database.nextDatabaseChangesError = CKError(.userDeletedZone,
+            database.nextDatabaseChangesError = CKError(encrypted ? .zoneNotFound : .userDeletedZone,
                 userInfo: encrypted ? [CKErrorUserDidResetEncryptedDataKey: true] : [:])
             do {
                 _ = try await sync.fetchDatabaseChanges()
@@ -1223,6 +1223,7 @@ final class BigSyncKitTests: XCTestCase {
                 object.refreshChangeMetadata(explicitlyModified: true)
             }
         }
+        try await fixture.adapter.didFinishImport()
         if deletion {
             let prepared = try await fixture.adapter.preparedRecordsToUpload(
                 limit: count, restrictedToEntityType: nil)
@@ -1239,6 +1240,7 @@ final class BigSyncKitTests: XCTestCase {
                 }
             }
         }
+        try await fixture.adapter.didFinishImport()
         return (fixture.adapter, fixture.targetRealm, objects)
     }
 
@@ -1450,6 +1452,37 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNotNil(full.receipt)
         realm.refresh()
         XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+        await sync.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testReviewDownloadOnlyCursorDriftRejectsStalePublication() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let sync = makeSynchronizer(database: database)
+        let adapter = FakeModelAdapter(zoneID: sync.recordZoneID, priorities: [])
+        sync.addModelAdapter(adapter)
+        sync.syncMode = .downloadOnly
+        sync.domainPublicationScopeIdentifierProvider = {
+            XCTFail("Download-only must not request full publication evidence")
+            return nil
+        }
+        sync.domainPrepublicationHandler = { _ in
+            try await adapter.saveToken(RecordZoneChangeCursor(
+                serializedData: Data("changed-during-domain-reconciliation".utf8)
+            ))
+            return []
+        }
+        do {
+            _ = try await sync.synchronize()
+            XCTFail("A result for an obsolete consumed boundary must not publish")
+        } catch let error as CloudKitSynchronizer.SyncError {
+            XCTAssertEqual(error, .inboundBoundaryChanged)
+        }
+        XCTAssertNil(sync.activeReceiptAuthorizationID)
+        XCTAssertFalse(sync.syncing)
+        XCTAssertFalse(sync.synchronizationDrainIsActive)
+        XCTAssertEqual(database.modifyRecordsOperationCount, 0)
         await sync.cancelSynchronizationAndWait()
     }
 

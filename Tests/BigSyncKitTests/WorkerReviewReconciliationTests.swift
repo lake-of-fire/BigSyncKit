@@ -10,6 +10,18 @@ private final class WorkerReviewReceiver: Object, ChangeMetadataRecordable {
     @Persisted(primaryKey: true) var id = ""
     @Persisted var payload = "constructor-default"
     @Persisted var categoryID: UUID?
+    @Persisted var requiredUUID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+    @Persisted var relatedIDs: List<UUID>
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+}
+
+@objc(WorkerReviewObjectMap)
+private final class WorkerReviewObjectMap: Object, ChangeMetadataRecordable {
+    @Persisted(primaryKey: true) var id = ""
+    @Persisted var children: Map<String, WorkerReviewReceiver?>
     @Persisted var createdAt = Date()
     @Persisted var modifiedAt = Date()
     @Persisted var explicitlyModifiedAt: Date?
@@ -26,7 +38,7 @@ final class WorkerReviewReconciliationTests: XCTestCase {
         persistence.inMemoryIdentifier = "worker-review-tracking-" + nonce
         var target = Realm.Configuration()
         target.inMemoryIdentifier = "worker-review-target-" + nonce
-        target.objectTypes = [WorkerReviewReceiver.self, BigSyncPendingMutation.self]
+        target.objectTypes = [WorkerReviewReceiver.self, WorkerReviewObjectMap.self, BigSyncPendingMutation.self]
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistence,
             targetRealmConfigurations: [target],
@@ -159,5 +171,115 @@ final class WorkerReviewReconciliationTests: XCTestCase {
         realm.refresh()
         XCTAssertNil(realm.object(ofType: WorkerReviewReceiver.self, forPrimaryKey: "malformed"))
         XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testReviewNilReplayAndAbsentRequiredUUIDPreserveCompatibility() async throws {
+        let (adapter, realm) = try await fixture()
+        let incoming = remote(id: "nil-replay", zone: adapter.recordZoneID,
+                              date: Date(timeIntervalSinceReferenceDate: 1000), explicit: false)
+        _ = try await adapter.saveChanges(in: [incoming], forceSave: true)
+        realm.refresh()
+        let object = try XCTUnwrap(realm.object(ofType: WorkerReviewReceiver.self,
+                                                forPrimaryKey: "nil-replay"))
+        let expected = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        XCTAssertEqual(object.requiredUUID, expected)
+        for _ in 0..<2 {
+            _ = try await adapter.saveChanges(in: [incoming], forceSave: true)
+        }
+        realm.refresh()
+        XCTAssertNil(object.categoryID)
+        XCTAssertEqual(object.requiredUUID, expected)
+        XCTAssertEqual(object.payload, "remote-payload")
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testReviewRemoteClearCannotReplacePendingLocalUUID() async throws {
+        let (adapter, realm) = try await fixture()
+        let local = WorkerReviewReceiver()
+        local.id = "pending-local"
+        local.payload = "genuine-local"
+        local.categoryID = UUID()
+        let uuid = local.categoryID
+        try await realm.asyncWrite {
+            realm.add(local)
+            local.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let generation = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        let incoming = remote(id: local.id, zone: adapter.recordZoneID,
+                              date: Date().addingTimeInterval(1000), explicit: true)
+        _ = try await adapter.saveChanges(in: [incoming], forceSave: true)
+        realm.refresh()
+        XCTAssertEqual(local.categoryID, uuid)
+        XCTAssertEqual(local.payload, "genuine-local")
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testReviewPrimitiveUUIDListRoundTripsAndClearsInOrder() async throws {
+        let (sender, source) = try await fixture()
+        let (receiver, target) = try await fixture()
+        let object = WorkerReviewReceiver()
+        object.id = "uuid-list"
+        let first = UUID(), second = UUID()
+        try await source.asyncWrite {
+            source.add(object)
+            object.relatedIDs.append(objectsIn: [second, first, second])
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await sender.didFinishImport()
+        let batch = try await sender.prepareUploadBatch(limit: 10)
+        let outgoing = try XCTUnwrap(batch.records.first)
+        XCTAssertEqual(outgoing["relatedIDs"] as? [String],
+                       [second.uuidString, first.uuidString, second.uuidString])
+        _ = try await receiver.saveChanges(in: batch.records, forceSave: true)
+        target.refresh()
+        let received = try XCTUnwrap(target.object(ofType: WorkerReviewReceiver.self,
+                                                    forPrimaryKey: object.id))
+        XCTAssertEqual(Array(received.relatedIDs), [second, first, second])
+        try await sender.didUpload(savedRecords: batch.records,
+                                   matchingGenerations: batch.matchingGenerations)
+        try await source.asyncWrite {
+            object.relatedIDs.removeAll()
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await sender.didFinishImport()
+        let cleared = try await sender.prepareUploadBatch(limit: 10)
+        XCTAssertNil(try XCTUnwrap(cleared.records.first)["relatedIDs"])
+        _ = try await receiver.saveChanges(in: cleared.records, forceSave: true)
+        target.refresh()
+        XCTAssertTrue(received.relatedIDs.isEmpty)
+        XCTAssertTrue(target.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testReviewUnsupportedObjectMapFailsWithoutAcknowledgingJournal() async throws {
+        let (adapter, realm) = try await fixture()
+        let child = WorkerReviewReceiver()
+        child.id = "child"
+        let parent = WorkerReviewObjectMap()
+        parent.id = "parent"
+        try await realm.asyncWrite {
+            realm.add(child)
+            realm.add(parent)
+            parent.children["child"] = child
+            parent.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let generation = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        do {
+            _ = try await adapter.preparedRecordsToUpload(limit: 10,
+                restrictedToEntityType: WorkerReviewObjectMap.className())
+            XCTFail("An unsupported object map cannot silently become an absent field")
+        } catch let error as RealmSwiftRemoteRecordDecodingError {
+            guard case .malformedField(_, let property, _) = error else {
+                return XCTFail("Unexpected map error: \(error)")
+            }
+            XCTAssertEqual(property, "children")
+        }
+        realm.refresh()
+        XCTAssertEqual(parent.children["child"]??.id, child.id)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, generation)
     }
 }

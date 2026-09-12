@@ -176,7 +176,7 @@ extension CloudKitSynchronizer {
                 )
             }
             try await revalidateRunContext(terminalContext)
-            if publicationBlockers.isEmpty,
+            if !isDownloadOnly, publicationBlockers.isEmpty,
                let provider = domainPublicationScopeIdentifierProvider {
                 let scope = try await provider()
                 guard scope?.isEmpty != true else {
@@ -206,6 +206,12 @@ extension CloudKitSynchronizer {
             if try currentConsumedServerBoundaryIdentifier(
                 for: terminalContext
             ) != consumedServerBoundaryIdentifier {
+                if isDownloadOnly {
+                    // Outbound wakeups are intentionally ignored in this
+                    // mode; a changed inbound cursor is not such a wakeup.
+                    // Do not publish a result for the stale domain boundary.
+                    throw SyncError.inboundBoundaryChanged
+                }
                 synchronizationRequestedWhileRunning = true
             }
         } catch is CancellationError {
@@ -774,6 +780,8 @@ extension CloudKitSynchronizer {
         context: RunContext,
         allowsEncryptedBootstrapAbsence: Bool = false
     ) -> Error? {
+        let constraints = CloudKitRetryConstraints(error: error)
+        guard !constraints.blocksAccountOperations else { return nil }
         let classification = CloudKitLossClassifier.classify(
             error: error,
             defaultZoneID: defaultZoneID
@@ -1523,15 +1531,19 @@ extension CloudKitSynchronizer {
             try await completion(nil)
         } catch {
             do {
-                // Account replacement or cancellation wins over interpreting
-                // an obsolete zone lookup as evidence that a zone is missing.
-                try await revalidateActiveRunContext(for: attemptID)
+                // A returned account stop forbids further CloudKit work,
+                // including an otherwise routine account revalidation.
+                try checkSynchronizationAttempt(attemptID)
+                if !CloudKitRetryConstraints(error: error).blocksAccountOperations {
+                    try await revalidateActiveRunContext(for: attemptID)
+                }
             } catch {
                 try await completion(error)
                 return
             }
 
-            guard let context = activeRunContext else {
+            guard !CloudKitRetryConstraints(error: error).blocksAccountOperations,
+                  let context = activeRunContext else {
                 try await completion(error)
                 return
             }

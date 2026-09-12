@@ -887,6 +887,10 @@ public class CloudKitSynchronizer: NSObject {
         case cancelled = 3
         /// Synchronization cannot start until an iCloud account is available.
         case notAuthenticated = 4
+        /// The inbound cursor changed during download-only domain reconciliation.
+        /// No result or full-drain authorization was published; a new download
+        /// may retry the now-current boundary.
+        case inboundBoundaryChanged = 5
     }
     
     /// `CloudKitSynchronizer` can be configured to only download changes, never uploading local changes to CloudKit.
