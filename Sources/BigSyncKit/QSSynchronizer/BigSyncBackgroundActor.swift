@@ -351,10 +351,6 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     private var performsAccountAvailabilityPreflight = true
     @BigSyncBackgroundActor
-    private var synchronizationCompletionHandler:
-        BigSyncBackgroundWorkerConfiguration.SynchronizationCompletionHandler?
-
-    @BigSyncBackgroundActor
     public private(set) var realmSynchronizer: CloudKitSynchronizer?
     @BigSyncBackgroundActor
     public private(set) var logger: Logging.Logger?
@@ -423,7 +419,7 @@ public actor BigSyncBackgroundActor {
 #endif
         performsAccountAvailabilityPreflight =
             configuration.performsAccountAvailabilityPreflight
-        synchronizationCompletionHandler =
+        synchronizer.synchronizationCompletionHandler =
             configuration.synchronizationCompletionHandler
 #if DEBUG
         cloudKitE2ELastRestoredPublicationEvidence = nil
@@ -707,7 +703,6 @@ public actor BigSyncBackgroundActor {
                   realmSynchronizer === expectedSynchronizer else {
                 return nil
             }
-            await synchronizationCompletionHandler?(result)
             return result
         } catch is CancellationError {
             return nil
@@ -889,7 +884,7 @@ public actor BigSyncBackgroundActor {
         realmSynchronizer = synchronizer
         self.performsAccountAvailabilityPreflight =
             performsAccountAvailabilityPreflight
-        self.synchronizationCompletionHandler =
+        synchronizer.synchronizationCompletionHandler =
             synchronizationCompletionHandler
     }
 

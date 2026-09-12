@@ -753,6 +753,36 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
+    /// Identity of a terminal outcome, including blocked outcomes. This is
+    /// not a success receipt and cannot authorize destructive transport work.
+    public struct TerminalSynchronizationBoundary: Sendable, Equatable {
+        public let accountScopeIdentifier: String
+        public let replicaBindingGenerationIdentifier: String?
+        public let runID: UUID
+        public let consumedServerBoundaryIdentifier: String?
+
+        public init(
+            accountScopeIdentifier: String,
+            replicaBindingGenerationIdentifier: String?,
+            runID: UUID,
+            consumedServerBoundaryIdentifier: String?
+        ) {
+            self.accountScopeIdentifier = accountScopeIdentifier
+            self.replicaBindingGenerationIdentifier = replicaBindingGenerationIdentifier
+            self.runID = runID
+            self.consumedServerBoundaryIdentifier = consumedServerBoundaryIdentifier
+        }
+
+        internal init(_ receipt: SynchronizationReceipt) {
+            self.init(
+                accountScopeIdentifier: receipt.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier: receipt.replicaBindingGenerationIdentifier,
+                runID: receipt.runID,
+                consumedServerBoundaryIdentifier: receipt.consumedServerBoundaryIdentifier
+            )
+        }
+    }
+
     public struct SynchronizationResult: Sendable, Equatable {
         public enum PublicationState: Sendable, Equatable {
             case complete
@@ -762,19 +792,28 @@ public class CloudKitSynchronizer: NSObject {
         public let didImportChanges: Bool
         public let receipt: SynchronizationReceipt?
         public let publicationState: PublicationState
+        public let terminalBoundary: TerminalSynchronizationBoundary?
 
         public init(
             didImportChanges: Bool,
             receipt: SynchronizationReceipt? = nil,
-            publicationState: PublicationState = .complete
+            publicationState: PublicationState = .complete,
+            terminalBoundary: TerminalSynchronizationBoundary? = nil
         ) {
             precondition(
                 publicationState == .complete || receipt == nil,
                 "A semantically blocked synchronization cannot publish a terminal receipt"
             )
+            let receiptBoundary = receipt.map(TerminalSynchronizationBoundary.init)
+            precondition(
+                receiptBoundary == nil || terminalBoundary == nil
+                    || receiptBoundary == terminalBoundary,
+                "A terminal boundary must match its success receipt"
+            )
             self.didImportChanges = didImportChanges
             self.receipt = receipt
             self.publicationState = publicationState
+            self.terminalBoundary = terminalBoundary ?? receiptBoundary
         }
     }
 
@@ -860,6 +899,11 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationWillConsumeServerChangesHandler:
         SynchronizationWillConsumeServerChangesHandler?
     internal var domainPrepublicationHandler: DomainPrepublicationHandler?
+    /// Once per terminal drain, before its waiters are resumed. The handler
+    /// must not synchronously await a new synchronize() on this synchronizer.
+    internal var synchronizationCompletionHandler:
+        BigSyncBackgroundWorkerConfiguration.SynchronizationCompletionHandler?
+    private var completingPublicationAttemptID: UUID?
     internal var domainPublicationScopeIdentifierProvider:
         DomainPublicationScopeIdentifierProvider?
     private let backupDetectionBaseURL: URL?
@@ -2106,6 +2150,39 @@ public class CloudKitSynchronizer: NSObject {
             throw CKError(.accountTemporarilyUnavailable)
         @unknown default:
             throw CKError(.accountTemporarilyUnavailable)
+        }
+    }
+
+    internal func publishSynchronizationResult(
+        _ result: SynchronizationResult,
+        context: RunContext
+    ) async {
+        guard synchronizationDrainIsActive,
+              completingPublicationAttemptID == nil else { return }
+        completingPublicationAttemptID = context.attemptID
+        defer {
+            if completingPublicationAttemptID == context.attemptID {
+                completingPublicationAttemptID = nil
+            }
+        }
+        await synchronizationCompletionHandler?(result)
+        // Cancellation/account replacement may cross the domain await. The
+        // cancellation path already released this drain's waiters; never
+        // release or clear a replacement run's state here.
+        do {
+            try checkRunContext(context)
+        } catch { return }
+        let needsFollowUp = synchronizationRequestedWhileRunning
+        finishSynchronizationDrain(with: .success(result))
+        syncing = false
+        synchronizationTask = nil
+        if result.publicationState == .complete {
+            postNotification(.SynchronizerDidSynchronize)
+            delegate?.synchronizerDidSync(self)
+        }
+        // A notification observer may already have started the follow-up.
+        if needsFollowUp, !syncing, !cancelSync {
+            beginSynchronization()
         }
     }
 

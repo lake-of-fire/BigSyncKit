@@ -201,13 +201,15 @@ extension CloudKitSynchronizer {
         }
 
         do {
-            // Application reconciliation is allowed to create upload work.
-            // Repeat the exact terminal journal predicate after it returns;
-            // any new generation is drained before a receipt can exist.
+            // Account validation is the last suspension before the local
+            // cutoff. Every eligible generation visible to the following
+            // refreshed Realm views belongs to this drain. Later concurrent
+            // writes remain journaled for the next drain; the receipt is not
+            // an assertion that all writers have stopped.
+            try await revalidateRunContext(terminalContext)
             if try adaptersHavePendingChangesAtTerminalBoundary() {
                 synchronizationRequestedWhileRunning = true
             }
-            try await revalidateRunContext(terminalContext)
             if try currentConsumedServerBoundaryIdentifier(
                 for: terminalContext
             ) != consumedServerBoundaryIdentifier {
@@ -244,19 +246,20 @@ extension CloudKitSynchronizer {
                 return
             }
             activeReceiptAuthorizationID = nil
-            finishSynchronizationDrain(
-                with: .success(SynchronizationResult(
-                    didImportChanges:
-                        synchronizationDrainDidImportChanges,
-                    publicationState: .blocked(publicationBlockers)
-                ))
+            await publishSynchronizationResult(
+                SynchronizationResult(
+                    didImportChanges: synchronizationDrainDidImportChanges,
+                    publicationState: .blocked(publicationBlockers),
+                    terminalBoundary: .init(
+                        accountScopeIdentifier: terminalContext.accountScopeIdentifier,
+                        replicaBindingGenerationIdentifier:
+                            terminalContext.replicaBindingGenerationIdentifier,
+                        runID: terminalContext.runID,
+                        consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
+                    )
+                ),
+                context: terminalContext
             )
-            // Keep the terminal run owner until the drain waiters have been
-            // resumed and shared drain state has been closed. A resumed caller
-            // may immediately request another run; releasing ownership first
-            // would let that run race the old drain's cleanup.
-            syncing = false
-            synchronizationTask = nil
             return
         }
 
@@ -334,13 +337,7 @@ extension CloudKitSynchronizer {
         }
 #endif
         reportProgress("terminal-receipt")
-        finishSynchronizationDrain(with: .success(result))
-        // See the blocked path above: close the logical drain before allowing
-        // a new synchronization to become the owner of its task/state.
-        syncing = false
-        synchronizationTask = nil
-        postNotification(.SynchronizerDidSynchronize)
-        delegate?.synchronizerDidSync(self)
+        await publishSynchronizationResult(result, context: terminalContext)
     }
 
     @BigSyncBackgroundActor
@@ -412,7 +409,13 @@ extension CloudKitSynchronizer {
         let terminalZoneDeletionKind = (error as? ChangeFeedMigrationError)?
             .deletionKind
 
-        if let migrationError = error as? ChangeFeedMigrationError,
+        if error is RealmSwiftInboundTargetChangedError {
+            // A non-journaled local write invalidated an inbound selection.
+            // The page cursor did not commit. Replay through ordinary fetch,
+            // with a delay so sustained cache writers cannot spin the drain.
+            shouldRetry = true
+            retryDelay = 1
+        } else if let migrationError = error as? ChangeFeedMigrationError,
            migrationError.deletionKind == .encryptedDataReset {
             // The database-history event already persisted a dedicated
             // recovery request. Retry immediately; the next attempt performs

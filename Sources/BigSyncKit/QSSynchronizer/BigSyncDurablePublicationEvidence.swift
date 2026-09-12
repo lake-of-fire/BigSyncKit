@@ -141,45 +141,78 @@ extension CloudKitSynchronizer {
     /// replica binding, local cursor, and feed epoch still match it exactly.
     func restoredDurablePublicationEvidence() async throws
         -> BigSyncDurablePublicationEvidence? {
+        let expectedAttemptID = synchronizationAttemptID
+        func validateInspectionOwner() throws {
+            try Task.checkCancellation()
+            guard synchronizationAttemptID == expectedAttemptID,
+                  !syncing, !synchronizationDrainIsActive,
+                  !backupRestoreDetected,
+                  !accountScopeAuthorityFence.rejectsAuthority else {
+                throw CancellationError()
+            }
+        }
+        try validateInspectionOwner()
         guard let evidence = try persistedDurablePublicationEvidence(),
               evidence.zoneOwnerName == recordZoneID.ownerName,
               evidence.zoneName == recordZoneID.zoneName else {
             return nil
         }
         let accountIdentifier = try await accountIdentifierProvider()
-        let accountScopeIdentifier = Self.accountScopeIdentifier(
-            for: accountIdentifier
-        )
-        guard evidence.accountScopeIdentifier == accountScopeIdentifier else {
-            return nil
+        try validateInspectionOwner()
+        let accountScopeIdentifier = Self.accountScopeIdentifier(for: accountIdentifier)
+        guard evidence.accountScopeIdentifier == accountScopeIdentifier,
+              evidence.replicaBindingGenerationIdentifier == (try
+                activeReplicaBindingGenerationIdentifierForRun(
+                    accountScopeIdentifier: accountScopeIdentifier
+                )) else { return nil }
+
+        if let realmAdapter = modelAdapters.first as? RealmSwiftAdapter {
+            // Cold production adapters intentionally have no operational
+            // provider until recovery is fenced. Inspect existing files
+            // without invoking setup or changing transport ownership.
+            guard let inspection = try await realmAdapter
+                .preparePublicationRestorationInspection() else { return nil }
+            try validateInspectionOwner()
+            let confirmedAccount = try await accountIdentifierProvider()
+            try validateInspectionOwner()
+            guard confirmedAccount == accountIdentifier,
+                  evidence.replicaBindingGenerationIdentifier == (try
+                    activeReplicaBindingGenerationIdentifierForRun(
+                        accountScopeIdentifier: accountScopeIdentifier
+                    )),
+                  try persistedDurablePublicationEvidence() == evidence,
+                  try inspection.matches(
+                    evidence,
+                    containerIdentifier: containerIdentifier,
+                    databaseScope: database.databaseScope
+                  ) else { return nil }
+            return evidence
         }
-        let replicaBindingGenerationIdentifier = try
-            activeReplicaBindingGenerationIdentifierForRun(
-            accountScopeIdentifier: accountScopeIdentifier
-        )
-        guard evidence.replicaBindingGenerationIdentifier
-                == replicaBindingGenerationIdentifier else {
-            return nil
-        }
+
+        // Non-Realm adapters retain their existing inspection contract.
         for adapter in modelAdapters {
             try await adapter.activateTransportNamespace(
                 containerIdentifier: containerIdentifier,
                 databaseScope: database.databaseScope
             )
+            try validateInspectionOwner()
             try await adapter.activateReplicaBinding(
                 accountScopeIdentifier: accountScopeIdentifier,
                 replicaBindingGenerationIdentifier:
-                    replicaBindingGenerationIdentifier
+                    evidence.replicaBindingGenerationIdentifier
             )
+            try validateInspectionOwner()
         }
-        guard try !adaptersHavePendingChangesAtTerminalBoundary() else {
-            return nil
-        }
-        guard let adapter = modelAdapters.first,
+        let confirmedAccount = try await accountIdentifierProvider()
+        try validateInspectionOwner()
+        guard confirmedAccount == accountIdentifier,
+              try persistedDurablePublicationEvidence() == evidence,
+              try !adaptersHavePendingChangesAtTerminalBoundary(),
+              let adapter = modelAdapters.first,
               try adapter.consumedServerBoundaryIdentifier(
                 accountScopeIdentifier: accountScopeIdentifier,
                 replicaBindingGenerationIdentifier:
-                    replicaBindingGenerationIdentifier,
+                    evidence.replicaBindingGenerationIdentifier,
                 containerIdentifier: containerIdentifier,
                 databaseScope: database.databaseScope
               ) == evidence.consumedServerBoundaryIdentifier,
