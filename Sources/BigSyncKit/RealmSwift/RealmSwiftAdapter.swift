@@ -1115,61 +1115,66 @@ public final class RealmSwiftAdapter:
             containerIdentifier: String,
             databaseScope: CKDatabase.Scope
         ) throws -> Bool {
-            try Task.checkCancellation()
-            guard adapter.recordZoneID.ownerName == evidence.zoneOwnerName,
-                  adapter.recordZoneID.zoneName == evidence.zoneName else {
-                return false
-            }
-            // Synchronous, scoped views cannot straddle an account-provider
-            // await. Never refresh a read-only Realm: Realm rejects that call.
-            // Do not retain these snapshots between matches() invocations.
-            let persistenceRealm = try Realm(configuration: persistenceConfiguration)
-            for configuration in targetConfigurations {
-                let realm = try Realm(configuration: configuration)
-                if !configuration.readOnly { realm.refresh() }
-                for mutation in realm.objects(BigSyncPendingMutation.self) {
-                    guard adapter.isOwnedEntityType(mutation.entityType),
-                          mutation.replicaBindingGenerationIdentifier
-                            == evidence.replicaBindingGenerationIdentifier
-                    else { continue }
-                    if adapter.accountScopePropertyByClassName[mutation.entityType] == nil
-                        || mutation.accountScopeIdentifier == evidence.accountScopeIdentifier {
-                        return false
+            // Drain Objective-C autoreleases here as well as Swift references.
+            // Otherwise immutable inspection handles survive this call and
+            // can conflict with the next operational read/write Realm open.
+            return try autoreleasepool {
+                try Task.checkCancellation()
+                guard adapter.recordZoneID.ownerName == evidence.zoneOwnerName,
+                      adapter.recordZoneID.zoneName == evidence.zoneName else {
+                    return false
+                }
+                // Synchronous, scoped views cannot straddle an account-provider
+                // await. Never refresh a read-only Realm: Realm rejects that call.
+                // Do not retain these snapshots between matches() invocations.
+                let persistenceRealm = try Realm(configuration: persistenceConfiguration)
+                for configuration in targetConfigurations {
+                    let realm = try Realm(configuration: configuration)
+                    if !configuration.readOnly { realm.refresh() }
+                    for mutation in realm.objects(BigSyncPendingMutation.self) {
+                        guard adapter.isOwnedEntityType(mutation.entityType),
+                              mutation.replicaBindingGenerationIdentifier
+                                == evidence.replicaBindingGenerationIdentifier
+                        else { continue }
+                        if adapter.accountScopePropertyByClassName[mutation.entityType] == nil
+                            || mutation.accountScopeIdentifier == evidence.accountScopeIdentifier {
+                            return false
+                        }
                     }
                 }
-            }
-            if !persistenceConfiguration.readOnly { persistenceRealm.refresh() }
-            let rebuild = persistenceRealm.object(
-                ofType: RebuildProvenanceState.self,
-                forPrimaryKey: RebuildProvenanceState.primaryKeyValue
-            )
-            guard rebuild?.isActive != true,
-                  (rebuild?.epoch ?? 0) == evidence.changeFeedEpoch else {
-                return false
-            }
-            for entity in persistenceRealm.objects(SyncedEntity.self) {
-                guard adapter.isOwnedEntityType(entity.entityType),
-                      entity.pendingReplicaBindingGenerationIdentifier
-                        == evidence.replicaBindingGenerationIdentifier else { continue }
-                switch entity.entityState {
-                case .new, .changed, .deletedLocally:
+                if !persistenceConfiguration.readOnly { persistenceRealm.refresh() }
+                let rebuild = persistenceRealm.object(
+                    ofType: RebuildProvenanceState.self,
+                    forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+                )
+                guard rebuild?.isActive != true,
+                      (rebuild?.epoch ?? 0) == evidence.changeFeedEpoch else {
                     return false
-                default:
-                    break
                 }
+                for entity in persistenceRealm.objects(SyncedEntity.self) {
+                    guard adapter.isOwnedEntityType(entity.entityType),
+                          entity.pendingReplicaBindingGenerationIdentifier
+                            == evidence.replicaBindingGenerationIdentifier else { continue }
+                    switch entity.entityState {
+                    case .new, .changed, .deletedLocally:
+                        return false
+                    default:
+                        break
+                    }
+                }
+                guard let token = persistenceRealm.objects(ServerToken.self).first?.token
+                else { return false }
+                return CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+                    containerIdentifier: containerIdentifier,
+                    databaseScope: databaseScope,
+                    accountScopeIdentifier: evidence.accountScopeIdentifier,
+                    replicaBindingGenerationIdentifier:
+                        evidence.replicaBindingGenerationIdentifier,
+                    recordZoneID: adapter.recordZoneID,
+                    changeFeedEpoch: evidence.changeFeedEpoch,
+                    cursorData: token
+                ) == evidence.consumedServerBoundaryIdentifier
             }
-            guard let token = persistenceRealm.objects(ServerToken.self).first?.token
-            else { return false }
-            return CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
-                containerIdentifier: containerIdentifier,
-                databaseScope: databaseScope,
-                accountScopeIdentifier: evidence.accountScopeIdentifier,
-                replicaBindingGenerationIdentifier:
-                    evidence.replicaBindingGenerationIdentifier,
-                recordZoneID: adapter.recordZoneID,
-                changeFeedEpoch: evidence.changeFeedEpoch,
-                cursorData: token
-            ) == evidence.consumedServerBoundaryIdentifier
         }
     }
 
