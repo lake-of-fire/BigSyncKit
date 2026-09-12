@@ -19,41 +19,21 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           path: BigSyncKit
-      - name: Compose bounded repairs once
+      - name: Apply bounded followup once
         working-directory: BigSyncKit
         run: |
-          if test -f .github/close_hotfix.py; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git fetch --no-tags origin e4089d86f49e3874753d37198b108551f9420eed
-            if ! git merge --no-commit --no-ff e4089d86f49e3874753d37198b108551f9420eed; then
-              python3 - <<'PY'
-          import subprocess
-          conflicts = subprocess.check_output(['git','diff','--name-only','--diff-filter=U']).decode().splitlines()
-          assert conflicts and set(conflicts) <= {'.github/workflows/hotfix-reevaluation.yml'}, conflicts
-          for path in conflicts:
-              subprocess.run(['git','checkout','--ours','--',path],check=True)
-              subprocess.run(['git','add','--',path],check=True)
-          PY
-            fi
-            git commit -m 'merge: preserve deeper restoration fencing and callback barrier tests'
-            python3 .github/close_hotfix.py
-            python3 - <<'PY'
-          from pathlib import Path
-          for pattern in ('*hotfix*.patch.zlib.b64', '*reevaluation.patch'):
-              for path in Path('.github').glob(pattern):
-                  path.unlink()
-          Path('.github/close_hotfix.py').unlink()
-          PY
+          if test -f .github/closure_followup.py; then
+            python3 .github/closure_followup.py
+            rm .github/closure_followup.py
             git diff --check
-            git add -A
-            git commit -m 'fix: settle owned cancellation and preserve opaque upload acknowledgements'
+            git add Sources Tests .github/closure_followup.py
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: resume cancelled migration without enabling premature journal discovery'
             git push origin HEAD:refs/heads/fix/hotfix-sync-closure-20260912
           fi
           git diff --exit-code
           git rev-parse HEAD > qualification-commit.txt
           git rev-parse HEAD:Sources > qualification-source-tree.txt
-          git log -3 --format=fuller > qualification-history.txt
+          git log -5 --format=fuller > qualification-history.txt
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/RealmSwiftGaps
@@ -66,55 +46,12 @@ jobs:
           ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
-      - name: Native regressions, negative control, full suite and repetition
+      - name: Native regressions, negative controls, full suite and repetition
         working-directory: BigSyncKit
         run: |
           xcodebuild -version > qualification-toolchain.txt
           swift --version >> qualification-toolchain.txt
-          python3 - <<'PY'
-          import json, os, pathlib, re, subprocess, sys
-          results = []
-          def run(name, args, negative=False, env=None):
-              path = pathlib.Path('qualification-' + name + '.log')
-              with path.open('w') as out:
-                  try:
-                      code = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, timeout=900, env=env).returncode
-                  except subprocess.TimeoutExpired:
-                      out.write('\nQUALIFICATION_TIMEOUT\n')
-                      code = 124
-              text = path.read_text()
-              counts = [int(x) for x in re.findall(r'Executed (\d+) tests?', text)]
-              passed = code == 0 and bool(counts) and max(counts) > 0
-              if negative:
-                  passed = code not in (0,124) and bool(counts) and 'A current CancellationError must settle its drain' in text
-              results.append(dict(name=name, exit_code=code, expected_failure=negative, passed=passed, executed=max(counts,default=0)))
-              pathlib.Path('qualification-results.json').write_text(json.dumps(results,indent=2)+'\n')
-              print(name, code, passed, flush=True)
-              print('\n'.join(line for line in text.splitlines() if re.search(r': error:|^error:|Executed | failed |benchmark:',line)),flush=True)
-              return passed
-          pattern = 'testClosure|testReview|testReevaluation|testTerminalPublicationEvidenceRestoresOnlyForExactTransportBoundary'
-          focused = run('focused',['swift','test','--filter',pattern])
-          if focused:
-              source = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift')
-              original = source.read_text()
-              start = original.index('    func changesFinishedSynchronizing() async {')
-              end = original.index('    func adaptersHavePendingChangesAtTerminalBoundary()',start)
-              broken = re.sub(r'^\s*settleCancellationIfCurrentAttempt\(attemptID\)\n','',original[start:end],flags=re.M)
-              try:
-                  source.write_text(original[:start]+broken+original[end:])
-                  run('negative-cancellation',['swift','test','--filter','testClosurePrepublicationCancellationSettlesCoalescedCallers'],negative=True)
-              finally:
-                  source.write_text(original)
-          full = run('full',['swift','test'],env=dict(os.environ,BIGSYNC_RUN_MUTATION_BENCHMARK='1'))
-          if focused and full:
-              for i in range(10):
-                  if not run('repeat-'+str(i+1),['swift','test','--skip-build','--filter',pattern]):
-                      break
-          subprocess.run(['git','diff','--exit-code'],check=True)
-          if pathlib.Path('Package.resolved').exists():
-              pathlib.Path('qualification-Package.resolved').write_bytes(pathlib.Path('Package.resolved').read_bytes())
-          sys.exit(0 if len(results)==13 and all(r['passed'] for r in results) else 1)
-          PY
+          python3 .github/qualify_hotfix_closure.py
       - name: Archive exact candidate
         if: always()
         working-directory: BigSyncKit
