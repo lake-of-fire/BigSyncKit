@@ -44,6 +44,7 @@ extension CloudKitSynchronizer {
             reportProgress("terminal-tail-start")
             try await revalidateActiveRunContext(for: attemptID)
         } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
             await failSynchronization(error: error)
@@ -67,6 +68,7 @@ extension CloudKitSynchronizer {
                 try await adapter.didFinishImport()
                 try await revalidateActiveRunContext(for: attemptID)
             } catch is CancellationError {
+                settleCancellationIfCurrentAttempt(attemptID)
                 return
             } catch {
                 await failSynchronization(error: error)
@@ -84,6 +86,7 @@ extension CloudKitSynchronizer {
                 synchronizationRequestedWhileRunning = true
             }
         } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
             await failSynchronization(error: error)
@@ -103,6 +106,7 @@ extension CloudKitSynchronizer {
                 try await revalidateRunContext(context)
             }
         } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
             await failSynchronization(error: error)
@@ -113,6 +117,7 @@ extension CloudKitSynchronizer {
             consumedServerBoundaryIdentifier = try
                 currentConsumedServerBoundaryIdentifier(for: activeRunContext)
         } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
             await failSynchronization(error: error)
@@ -162,6 +167,7 @@ extension CloudKitSynchronizer {
                     try await revalidateRunContext(terminalContext)
                 }
             } catch is CancellationError {
+                settleCancellationIfCurrentAttempt(attemptID)
                 return
             } catch {
                 await failSynchronization(error: error)
@@ -186,6 +192,7 @@ extension CloudKitSynchronizer {
                 try await revalidateRunContext(terminalContext)
             }
         } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
             await failSynchronization(error: error)
@@ -215,6 +222,7 @@ extension CloudKitSynchronizer {
                 synchronizationRequestedWhileRunning = true
             }
         } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
             await failSynchronization(error: error)
@@ -270,6 +278,7 @@ extension CloudKitSynchronizer {
                 )
                 try keyValueStore.bigSyncValidateDurability()
             } catch is CancellationError {
+                settleCancellationIfCurrentAttempt(attemptID)
                 return
             } catch {
                 await failSynchronization(error: error)
@@ -328,6 +337,7 @@ extension CloudKitSynchronizer {
                     changeFeedEpoch: changeFeedEpoch
                 )
             } catch is CancellationError {
+                settleCancellationIfCurrentAttempt(attemptID)
                 return
             } catch {
                 await failSynchronization(error: error)
@@ -338,6 +348,7 @@ extension CloudKitSynchronizer {
             do {
                 try recordSyncHealth(.succeeded, context: context)
             } catch is CancellationError {
+                settleCancellationIfCurrentAttempt(attemptID)
                 return
             } catch {
                 await failSynchronization(error: error)
@@ -360,6 +371,7 @@ extension CloudKitSynchronizer {
                 .terminalEvidenceBeforeCompletionDelivery
             )
         } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
             await failSynchronization(error: error)
@@ -415,6 +427,10 @@ extension CloudKitSynchronizer {
 //    @BigSyncBackgroundActor
     func failSynchronization(error: Error) async {
         let attemptID = synchronizationAttemptID
+        if error is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
+            return
+        }
         logger.info("QSCloudKitSynchronizer >> Failing or backing off synchronization...")
         
         resetActiveTokens()
@@ -432,6 +448,7 @@ extension CloudKitSynchronizer {
         
         self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [cloudKitSynchronizerErrorKey: error])
         self.delegate?.synchronizerDidfailToSync(self, error: error)
+        guard synchronizationAttemptID == attemptID else { return }
         
         var shouldRetry = false
         var retryDelay: TimeInterval = 0
@@ -488,6 +505,7 @@ extension CloudKitSynchronizer {
                         recoveryRequestIsDurable = true
                         shouldRetry = true
                     } catch is CancellationError {
+                        settleCancellationIfCurrentAttempt(attemptID)
                         return
                     } catch {
                         logger.error("QSCloudKitSynchronizer >> Could not durably prepare token recovery: \(error)")
@@ -550,7 +568,9 @@ extension CloudKitSynchronizer {
                 do {
                     try resetDatabaseToken()
                     for adapter in modelAdapters {
+                        try checkSynchronizationAttempt(attemptID)
                         try await adapter.saveToken(nil)
+                        try checkSynchronizationAttempt(attemptID)
                     }
                     shouldRetry = true
                 } catch {
@@ -588,12 +608,14 @@ extension CloudKitSynchronizer {
                     )
                 }
             } catch is CancellationError {
+                settleCancellationIfCurrentAttempt(attemptID)
                 return
             } catch {
                 logger.error("QSCloudKitSynchronizer >> Failed to persist sync health: \(error)")
             }
         }
 
+        guard synchronizationAttemptID == attemptID else { return }
         guard shouldRetry, !cancelSync else {
             // A final journal drain can discover a local mutation while this
             // failed attempt is still marked as running. Its delegate wakeup

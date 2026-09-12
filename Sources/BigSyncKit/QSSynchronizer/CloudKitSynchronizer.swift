@@ -1911,6 +1911,17 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
+    /// Settle a current attempt even when CancellationError was thrown by an
+    /// application hook, or its binding was revoked, without cancelling this
+    /// Task. Do not use checkRunContext here: revoked authority is precisely
+    /// why this owner must release its waiters. No suspension separates the
+    /// ownership test from the existing cancellation cleanup.
+    internal func settleCancellationIfCurrentAttempt(_ attemptID: UUID) {
+        guard synchronizationAttemptID == attemptID,
+              synchronizationDrainIsActive else { return }
+        cancelSynchronization()
+    }
+
     private func cancelSynchronizationRequest(_ requestID: UUID) {
         synchronizationWaiters.removeValue(forKey: requestID)?
             .resume(throwing: CancellationError())
@@ -2208,7 +2219,14 @@ public class CloudKitSynchronizer: NSObject {
         // release or clear a replacement run's state here.
         do {
             try checkRunContext(context)
-        } catch { return }
+        } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(context.attemptID)
+            return
+        } catch {
+            guard synchronizationAttemptID == context.attemptID else { return }
+            await failSynchronization(error: error)
+            return
+        }
         let needsFollowUp = synchronizationRequestedWhileRunning
             && result.completionScope == .fullSynchronization
         finishSynchronizationDrain(with: .success(result))
