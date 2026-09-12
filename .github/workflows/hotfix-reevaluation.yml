@@ -1,7 +1,7 @@
-name: Hotfix native qualification
+name: Hotfix deeper native qualification
 on:
   push:
-    branches: [fix/hotfix-sync-reevaluation-20260912]
+    branches: [fix/hotfix-sync-deeper-20260912]
     paths: [.github/workflows/hotfix-reevaluation.yml]
   workflow_dispatch:
 permissions:
@@ -9,29 +9,55 @@ permissions:
 jobs:
   native:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: fix/hotfix-sync-reevaluation-20260912
+          ref: ${{ github.sha }}
           path: BigSyncKit
-      - name: Apply verified cold contract repair
+      - name: Compose checked incremental repair
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
-          import base64, hashlib, pathlib, subprocess, zlib
-          patch = zlib.decompress(base64.b64decode(pathlib.Path('.github/hotfix-cold-contract.patch.zlib.b64').read_text().strip(), validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '79a47d3a4639486e5e355100eae8d4b93b7af155f460179cdc12ba02e4bdf84e'
-          pathlib.Path('/tmp/cold-contract.patch').write_bytes(patch)
-          if subprocess.run(['git', 'apply', '--reverse', '--check', '/tmp/cold-contract.patch'], capture_output=True).returncode != 0:
-              subprocess.run(['git', 'apply', '--check', '/tmp/cold-contract.patch'], check=True)
-              subprocess.run(['git', 'apply', '/tmp/cold-contract.patch'], check=True)
+          import hashlib, pathlib
+          patch = pathlib.Path('.github/deeper-reevaluation.patch').read_bytes().replace(b'\n diff --git ', b'\ndiff --git ')
+          assert hashlib.sha256(patch).hexdigest() == 'adc20d501370687926ebefeaa293d39f1a3b50a2743ea6b400564df4bacdda33'
+          def replace(path, old, new):
+              p = pathlib.Path(path)
+              s = p.read_text()
+              if new in s:
+                  return
+              assert s.count(old) == 1, path
+              p.write_text(s.replace(old, new))
+          replace('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift',
+              '        guard synchronizationDrainIsActive,\n              completingPublicationAttemptID == nil else { return }',
+              '        // A revoked callback cannot hold a replacement drain hostage.\n        // Suppress duplicate delivery only for the current attempt.\n        do { try checkRunContext(context) } catch { return }\n        guard synchronizationDrainIsActive,\n              completingPublicationAttemptID != context.attemptID else { return }')
+          replace('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift',
+              '                    if !configuration.readOnly { realm.refresh() }\n                    for mutation in realm.objects(BigSyncPendingMutation.self) {',
+              '                    if !configuration.readOnly { realm.refresh() }\n                    guard realm.schema.objectSchema.contains(where: {\n                        $0.className == BigSyncPendingMutation.className()\n                    }) else { continue }\n                    for mutation in realm.objects(BigSyncPendingMutation.self) {')
+          replace('Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift',
+              '        guard confirmedAccount == accountIdentifier,\n              try persistedDurablePublicationEvidence() == evidence,',
+              '        guard confirmedAccount == accountIdentifier,\n              evidence.replicaBindingGenerationIdentifier == (try\n                activeReplicaBindingGenerationIdentifierForRun(\n                    accountScopeIdentifier: accountScopeIdentifier\n                )),\n              try persistedDurablePublicationEvidence() == evidence,')
+          # Reuse only the new tests from the staged patch. Its older cold
+          # implementation is superseded by the already composed contract fix.
+          text = patch.decode().split('diff --git a/Tests/BigSyncKitTests/BigSyncKitTests.swift ')[1]
+          additions = []
+          for hunk in text.split('\n@@ ')[1:]:
+              additions.append('\n'.join(line[1:] for line in hunk.splitlines()[1:] if line.startswith('+')) + '\n')
+          assert len(additions) == 2
+          replace('Tests/BigSyncKitTests/BigSyncKitTests.swift',
+              'final class BigSyncKitTests: XCTestCase {',
+              additions[0] + 'final class BigSyncKitTests: XCTestCase {')
+          methods = additions[1].replace('publicationRestorationGeneration', 'publicationInspectionGeneration')
+          replace('Tests/BigSyncKitTests/BigSyncKitTests.swift',
+              '    @BigSyncBackgroundActor\n    private func makeSynchronizer(\n',
+              methods + '    @BigSyncBackgroundActor\n    private func makeSynchronizer(\n')
           PY
           git diff --check
-          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift Tests/BigSyncKitTests/BigSyncKitTests.swift Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
+          git add Sources Tests
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: preserve cold inspection admission and Realm writer coordination'
-            git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: prevent canceled completion from blocking replacement and recheck cold inspection inputs'
+            git push origin HEAD:refs/heads/fix/hotfix-sync-deeper-20260912
           fi
           git rev-parse HEAD > qualification-commit.txt
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -49,36 +75,27 @@ jobs:
       - name: Toolchain
         working-directory: BigSyncKit
         run: |
-          xcodebuild -version | tee qualification-toolchain.txt
-          swift --version | tee -a qualification-toolchain.txt
-      - name: Native focused regressions
-        id: focused
-        continue-on-error: true
-        working-directory: BigSyncKit
-        run: |
-          set -o pipefail
-          swift test --filter 'testReevaluation|testTerminalPublicationEvidenceRestoresOnlyForExactTransportBoundary' 2>&1 | tee qualification-focused.log
-      - name: Full BigSyncKit suite
+          xcodebuild -version > qualification-toolchain.txt
+          swift --version >> qualification-toolchain.txt
+      - name: Focused regressions and full suite
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
           import pathlib, subprocess, sys
-          path = pathlib.Path('qualification-full.log')
-          with path.open('w') as output:
-              try:
-                  result = subprocess.run(['swift', 'test'], stdout=output, stderr=subprocess.STDOUT, timeout=600)
-                  code = result.returncode
-              except subprocess.TimeoutExpired:
-                  output.write('\nQUALIFICATION_TIMEOUT: full suite exceeded 600 seconds\n')
-                  code = 124
-          print(path.read_text()[-24000:])
-          sys.exit(code)
+          failed = False
+          for name, args in [('focused', ['swift', 'test', '--filter', 'testReevaluation']), ('full', ['swift', 'test'])]:
+              path = pathlib.Path('qualification-' + name + '.log')
+              with path.open('w') as output:
+                  try:
+                      code = subprocess.run(args, stdout=output, stderr=subprocess.STDOUT, timeout=900).returncode
+                  except subprocess.TimeoutExpired:
+                      output.write('\nQUALIFICATION_TIMEOUT\n')
+                      code = 124
+              print(name, 'exit', code)
+              print('\n'.join(line for line in path.read_text().splitlines() if 'error:' in line or 'Executed ' in line or ' failed ' in line))
+              failed |= code != 0
+          sys.exit(1 if failed else 0)
           PY
-      - name: Require focused regressions
-        if: always()
-        env:
-          OUTCOME: ${{ steps.focused.outcome }}
-        run: test "$OUTCOME" = success
       - name: Archive exact tested source
         if: always()
         working-directory: BigSyncKit
