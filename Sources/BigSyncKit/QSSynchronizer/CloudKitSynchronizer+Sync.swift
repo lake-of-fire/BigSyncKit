@@ -23,16 +23,6 @@ fileprivate func isZoneNotFoundOrDeletedError(_ error: Error?) -> Bool {
     }
 }
 
-private func cloudKitErrors(in error: Error) -> [CKError] {
-    guard let cloudKitError = error as? CKError else { return [] }
-    guard cloudKitError.code == .partialFailure,
-          let partialErrors = cloudKitError.userInfo[CKPartialErrorsByItemIDKey]
-            as? [AnyHashable: Error] else {
-        return [cloudKitError]
-    }
-    return [cloudKitError] + partialErrors.values.flatMap(cloudKitErrors(in:))
-}
-
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func performSynchronization() async {
@@ -47,6 +37,7 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func changesFinishedSynchronizing() async {
         let attemptID = synchronizationAttemptID
+        let isDownloadOnly = activeSynchronizationMode == .downloadOnly
         guard beginRunCallback(for: attemptID) else { return }
         defer { endRunCallback() }
         do {
@@ -88,7 +79,8 @@ extension CloudKitSynchronizer {
             // while durable tracking work remains.
             // Recheck all adapters after the last suspension and convert any
             // pending state into a tail drain before authorizing a receipt.
-            if try adaptersHavePendingChangesAtTerminalBoundary() {
+            if !isDownloadOnly,
+               try adaptersHavePendingChangesAtTerminalBoundary() {
                 synchronizationRequestedWhileRunning = true
             }
         } catch is CancellationError {
@@ -99,14 +91,14 @@ extension CloudKitSynchronizer {
         }
         
 //        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
-        if synchronizationRequestedWhileRunning {
+        if !isDownloadOnly, synchronizationRequestedWhileRunning {
             restartSynchronizationForTerminalWork()
             return
         }
         // The migration may finish only after final import forwarding and the
         // terminal pending-state check have proven this drain quiescent.
         do {
-            if let context = activeRunContext {
+            if !isDownloadOnly, let context = activeRunContext {
                 try await finishChangeFeedMigrationIfNeeded(context: context)
                 try await revalidateRunContext(context)
             }
@@ -207,7 +199,8 @@ extension CloudKitSynchronizer {
             // writes remain journaled for the next drain; the receipt is not
             // an assertion that all writers have stopped.
             try await revalidateRunContext(terminalContext)
-            if try adaptersHavePendingChangesAtTerminalBoundary() {
+            if !isDownloadOnly,
+               try adaptersHavePendingChangesAtTerminalBoundary() {
                 synchronizationRequestedWhileRunning = true
             }
             if try currentConsumedServerBoundaryIdentifier(
@@ -221,8 +214,39 @@ extension CloudKitSynchronizer {
             await failSynchronization(error: error)
             return
         }
-        if synchronizationRequestedWhileRunning {
+        if !isDownloadOnly, synchronizationRequestedWhileRunning {
             restartSynchronizationForTerminalWork()
+            return
+        }
+
+        if isDownloadOnly {
+            // Journal forwarding and domain reconciliation may create local
+            // work, but this mode promises not to upload it. Finish the inbound
+            // request once without completing migration, minting a receipt or
+            // persisting full-drain publication evidence.
+            activeReceiptAuthorizationID = nil
+            do {
+                try checkRunContext(terminalContext)
+                try keyValueStore.bigSyncValidateDurability()
+            } catch {
+                await failSynchronization(error: error)
+                return
+            }
+            let result = SynchronizationResult(
+                didImportChanges: synchronizationDrainDidImportChanges,
+                publicationState: publicationBlockers.isEmpty
+                    ? .complete : .blocked(publicationBlockers),
+                terminalBoundary: .init(
+                    accountScopeIdentifier: terminalContext.accountScopeIdentifier,
+                    replicaBindingGenerationIdentifier:
+                        terminalContext.replicaBindingGenerationIdentifier,
+                    runID: terminalContext.runID,
+                    consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
+                ),
+                completionScope: .downloadOnly
+            )
+            reportProgress("download-only-completed")
+            await publishSynchronizationResult(result, context: terminalContext)
             return
         }
 
@@ -440,84 +464,65 @@ extension CloudKitSynchronizer {
                 //                print("# ")
             }
         } else if let topLevelError = error as? CKError {
-            let errors = cloudKitErrors(in: topLevelError)
-            let codes = Set(errors.map(\.code))
-            if codes.contains(.changeTokenExpired) {
+            let constraints = CloudKitRetryConstraints(topLevelError)
+            let codes = constraints.codes
+            var recoveryRequestIsDurable = !constraints.requestsTokenRecovery
+            if constraints.requestsTokenRecovery {
                 logger.info("QSCloudKitSynchronizer >> Change token expired, requesting a fenced server-first tracking rebuild...")
-                var recoveryRequestIsDurable = false
                 if let context = activeRunContext {
                     do {
+                        try checkRunContext(context)
                         try requestChangeFeedRecovery(context: context)
-                        recoveryRequestIsDurable = true
-                    } catch {
-                        logger.error(
-                            "QSCloudKitSynchronizer >> Could not durably request change-token recovery: \(error)"
-                        )
-                    }
-                }
-                if recoveryRequestIsDurable {
-                    do {
-                        try self.resetDatabaseToken()
+                        try resetDatabaseToken()
                         for adapter in modelAdapters {
+                            try checkRunContext(context)
                             try await adapter.saveToken(nil)
+                            try checkRunContext(context)
                         }
+                        recoveryRequestIsDurable = true
                         shouldRetry = true
+                    } catch is CancellationError {
+                        return
                     } catch {
-                        logger.error("QSCloudKitSynchronizer >> Failed to clear expired adapter token: \(error)")
+                        logger.error("QSCloudKitSynchronizer >> Could not durably prepare token recovery: \(error)")
                     }
                 }
-            } else if codes.contains(.notAuthenticated) {
-                logger.error("QSCloudKitSynchronizer >> Not Authenticated. Aborting sync")
+            }
+
+            // Account stops take precedence over *retrying*, not over recording
+            // a local recovery request. Do not issue another account/CloudKit
+            // request here; CKAccountChanged reopens the availability gate.
+            if codes.contains(.notAuthenticated) {
+                shouldRetry = false
                 changeRequestProcessor.reset()
                 cancelledDueToUnauthentication = true
                 accountValidationRequired = true
-                accountScopeAuthorityFence.poison(
-                    requiresGenerationRotation: false
-                )
+                accountScopeAuthorityFence.poison(requiresGenerationRotation: false)
                 terminalHealthCategory = .notAuthenticated
             } else if codes.contains(.accountTemporarilyUnavailable) {
-                // Apple explicitly requires waiting for CKAccountChanged and
-                // rechecking account availability. Do not enqueue another
-                // database/zone/record operation on the generic retry timer.
-                logger.info(
-                    "QSCloudKitSynchronizer >> iCloud account is temporarily unavailable; waiting for account status to change"
-                )
+                shouldRetry = false
                 changeRequestProcessor.reset()
                 accountValidationRequired = true
-                accountScopeAuthorityFence.poison(
-                    requiresGenerationRotation: false
-                )
+                accountScopeAuthorityFence.poison(requiresGenerationRotation: false)
                 clearPersistedTransientRetryState()
                 terminalHealthCategory = .accountTemporarilyUnavailable
-            } else if !codes.isDisjoint(with: [
-                .serviceUnavailable,
-                .requestRateLimited,
-                .zoneBusy,
-                .networkFailure,
-                .networkUnavailable,
-            ]) {
-                let requestedDelays = errors.compactMap {
-                    ($0.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
-                }.filter { $0.isFinite && $0 >= 0 }
+            } else if constraints.requiresDeferredRetry {
                 consecutiveTransientCloudKitFailures += 1
                 retryDelay = CloudKitRetryBackoff.delay(
-                    serverMinimum: requestedDelays.max(),
+                    serverMinimum: constraints.serverMinimum,
                     consecutiveFailures: consecutiveTransientCloudKitFailures
                 )
                 if let context = activeRunContext {
                     persistTransientRetryState(
                         context: context,
                         notBefore: Date().addingTimeInterval(retryDelay),
-                        consecutiveFailures:
-                            consecutiveTransientCloudKitFailures
+                        consecutiveFailures: consecutiveTransientCloudKitFailures
                     )
                 }
-                logger.warning(
-                    "QSCloudKitSynchronizer >> Transient CloudKit error. Retrying in \(retryDelay.rounded()) seconds."
-                )
+                logger.warning("QSCloudKitSynchronizer >> CloudKit retry constrained to \(retryDelay.rounded()) seconds or later.")
                 reduceBatchSize()
-                shouldRetry = true
-            } else {
+                shouldRetry = recoveryRequestIsDurable
+            } else if !constraints.requestsTokenRecovery {
                 logger.error("QSCloudKitSynchronizer >> Error: \(topLevelError)")
             }
         } else if error as? CloudKitChangeFeedError == .corruptCursor {
@@ -679,6 +684,14 @@ extension CloudKitSynchronizer {
         context: RunContext,
         allowsEncryptedBootstrapAbsence: Bool = false
     ) -> Error? {
+        // All callers must revalidate account-routed awaits before reaching
+        // this local write. Also reject obsolete captured contexts here so a
+        // late failure can never mutate either a replacement or old scope.
+        do {
+            try checkRunContext(context)
+        } catch {
+            return error
+        }
         switch disposition {
         case .encryptedDataReset:
             let recoveryWasActive = isEncryptedDataResetRecoveryActive
@@ -820,30 +833,27 @@ extension CloudKitSynchronizer {
     }
     
     func shouldRetryUpload(for error: NSError) -> Bool {
-        if isLimitExceededError(error)
-            || isZoneNotFoundOrDeletedError(error) {
+        let constraints = CloudKitRetryConstraints(error)
+        guard !constraints.blocksAccountOperations,
+              !constraints.requestsTokenRecovery,
+              !constraints.requiresDeferredRetry else { return false }
+        if constraints.containsOnlySizeLimitFailures {
+            // A singleton limit cannot be repaired by resending it. Reducible
+            // limits are normally handled inside the bounded shrinking drain.
+            return batchSize > 1 && uploadRetries < 5
+        }
+        if isZoneNotFoundOrDeletedError(error) {
             return uploadRetries < 5
         }
-        // Record conflicts are reconciled and retried inside the iterative
-        // mutation drain. Once that bounded loop reports a conflict, beginning
-        // another outer fetch/upload cycle would reset its retry counter and
-        // could loop forever on an irreconcilable record.
+        // Record conflict budgets belong to the mutation drain, not a fresh
+        // outer attempt that would reset their counters.
         return false
     }
-    
+
     func isLimitExceededError(_ error: NSError) -> Bool {
-        if error.code == CKError.partialFailure.rawValue,
-           let errorsByItemID = error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError],
-           errorsByItemID.values.contains(where: { (error) -> Bool in
-               return error.code == CKError.limitExceeded.rawValue
-           }) {
-            
-            return true
-        }
-        
-        return error.code == CKError.limitExceeded.rawValue
+        CloudKitRetryConstraints(error).codes.contains(.limitExceeded)
     }
-    
+
     @BigSyncBackgroundActor
     func sequential<T>(
         objects: [T],
@@ -934,7 +944,7 @@ extension CloudKitSynchronizer {
             }
 
             serverChangeToken = token
-            if syncMode == .sync {
+            if activeSynchronizationMode == .sync {
                 if afterUpload,
                    !modelAdapters.contains(where: { $0.hasChanges }) {
                     // A successful upload is not terminal until one more
@@ -978,15 +988,23 @@ extension CloudKitSynchronizer {
                     resultsLimit: 200
                 )
             } catch {
+                try checkSynchronizationAttempt(attemptID)
+                let classification = CloudKitLossClassifier.classify(
+                    error: error, defaultZoneID: recordZoneID
+                )
                 if let context = activeRunContext,
-                   let lifecycleError = applyCloudKitLoss(
-                    error: error,
-                    defaultZoneID: recordZoneID,
-                    context: context,
-                    allowsEncryptedBootstrapAbsence:
-                        isEncryptedDataResetRecoveryActive
-                   ) {
-                    throw lifecycleError
+                   let disposition = classification.zoneDispositions[recordZoneID],
+                   !CloudKitRetryConstraints(error).blocksAccountOperations {
+                    try await revalidateRunContext(context)
+                    if let lifecycleError = applyCloudKitLoss(
+                        disposition,
+                        zoneID: recordZoneID,
+                        context: context,
+                        allowsEncryptedBootstrapAbsence:
+                            isEncryptedDataResetRecoveryActive
+                    ) {
+                        throw lifecycleError
+                    }
                 }
                 throw error
             }
@@ -1098,7 +1116,9 @@ extension CloudKitSynchronizer {
                         resultsLimit: 200
                     )
                 } catch {
-                    guard let context = activeRunContext else {
+                    try checkSynchronizationAttempt(attemptID)
+                    guard let context = activeRunContext,
+                          !CloudKitRetryConstraints(error).blocksAccountOperations else {
                         throw error
                     }
                     let classification = CloudKitLossClassifier.classify(
@@ -1109,6 +1129,7 @@ extension CloudKitSynchronizer {
                         .zoneDispositions[zoneID] else {
                         throw error
                     }
+                    try await revalidateRunContext(context)
                     if let lifecycleError = applyCloudKitLoss(
                         disposition,
                         zoneID: zoneID,
@@ -1551,7 +1572,17 @@ extension CloudKitSynchronizer {
                 )
                 try await completion(nil)
             } catch {
-                if let lifecycleError = applyCloudKitLoss(
+                do {
+                    try checkSynchronizationAttempt(attemptID)
+                    if !CloudKitRetryConstraints(error).blocksAccountOperations {
+                        try await revalidateRunContext(context)
+                    }
+                } catch {
+                    try await completion(error)
+                    return
+                }
+                if !CloudKitRetryConstraints(error).blocksAccountOperations,
+                   let lifecycleError = applyCloudKitLoss(
                     error: error,
                     defaultZoneID: zoneID,
                     context: context,

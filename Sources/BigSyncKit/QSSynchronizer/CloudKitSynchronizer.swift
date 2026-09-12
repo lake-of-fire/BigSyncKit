@@ -796,6 +796,13 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     public struct SynchronizationResult: Sendable, Equatable {
+        public enum CompletionScope: Sendable, Equatable {
+            case fullSynchronization
+            /// Inbound work completed; local upload work may remain. This
+            /// result cannot authorize reset, cutover or full publication.
+            case downloadOnly
+        }
+
         public enum PublicationState: Sendable, Equatable {
             case complete
             case blocked([DomainBlocker])
@@ -804,14 +811,20 @@ public class CloudKitSynchronizer: NSObject {
         public let didImportChanges: Bool
         public let receipt: SynchronizationReceipt?
         public let publicationState: PublicationState
+        public let completionScope: CompletionScope
         public let terminalBoundary: TerminalSynchronizationBoundary?
 
         public init(
             didImportChanges: Bool,
             receipt: SynchronizationReceipt? = nil,
             publicationState: PublicationState = .complete,
-            terminalBoundary: TerminalSynchronizationBoundary? = nil
+            terminalBoundary: TerminalSynchronizationBoundary? = nil,
+            completionScope: CompletionScope = .fullSynchronization
         ) {
+            precondition(
+                completionScope == .fullSynchronization || receipt == nil,
+                "Download-only completion cannot carry full-drain authorization"
+            )
             precondition(
                 publicationState == .complete || receipt == nil,
                 "A semantically blocked synchronization cannot publish a terminal receipt"
@@ -825,6 +838,7 @@ public class CloudKitSynchronizer: NSObject {
             self.didImportChanges = didImportChanges
             self.receipt = receipt
             self.publicationState = publicationState
+            self.completionScope = completionScope
             self.terminalBoundary = terminalBoundary ?? receiptBoundary
         }
     }
@@ -1072,6 +1086,12 @@ public class CloudKitSynchronizer: NSObject {
     
     /// Whether the synchronizer will only download data or also upload any local changes.
     public var syncMode: SynchronizeMode = .sync
+    // Configuration changes during a suspension apply to the next logical
+    // drain, never to the completion authority of an already-running one.
+    internal var synchronizationDrainMode: SynchronizeMode?
+    internal var activeSynchronizationMode: SynchronizeMode {
+        synchronizationDrainMode ?? syncMode
+    }
     
 //    @BigSyncBackgroundActor
     public var delegate: CloudKitSynchronizerDelegate?
@@ -1714,6 +1734,7 @@ public class CloudKitSynchronizer: NSObject {
         if !synchronizationDrainIsActive {
             synchronizationDrainIsActive = true
             synchronizationDrainDidImportChanges = false
+            synchronizationDrainMode = syncMode
         }
         cancelSync = false
         syncing = true
@@ -2185,6 +2206,7 @@ public class CloudKitSynchronizer: NSObject {
             try checkRunContext(context)
         } catch { return }
         let needsFollowUp = synchronizationRequestedWhileRunning
+            && result.completionScope == .fullSynchronization
         finishSynchronizationDrain(with: .success(result))
         syncing = false
         synchronizationTask = nil
@@ -2202,6 +2224,7 @@ public class CloudKitSynchronizer: NSObject {
         with result: Result<SynchronizationResult, Error>
     ) {
         synchronizationDrainIsActive = false
+        synchronizationDrainMode = nil
         synchronizationRequestedWhileRunning = false
         let waiters = synchronizationWaiters.values
         synchronizationWaiters.removeAll(keepingCapacity: false)

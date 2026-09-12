@@ -3511,7 +3511,8 @@ public final class RealmSwiftAdapter:
         to object: Object,
         syncedEntityID: String,
         syncedEntityState: SyncedEntityState,
-        entityType: String
+        entityType: String,
+        isNewlyCreatedReceiver: Bool
     ) throws -> [PendingRelationshipRequest] {
         let objectProperties = object.objectSchema.properties
         var pendingRelationships = [PendingRelationshipRequest]()
@@ -3546,9 +3547,15 @@ public final class RealmSwiftAdapter:
             }
         }
 
-        if mergePolicy == .server
+        if isNewlyCreatedReceiver
+            || mergePolicy == .server
             || syncedEntityState == .deletedRemotely
             || syncedEntityState == .recreatingRemotely {
+            // A receiver created solely for this admitted inbound record has
+            // no local revision to resolve. Constructor timestamps/defaults
+            // must never become journaled local authority. Identity, semantic
+            // validation and pending-generation fences ran before creation;
+            // property processing still runs through the ordinary decoder.
             // A live record delivered after a remote deletion is a recreation
             // in CloudKit change-feed order. The prior tombstone is not a
             // competing local edit, so it must not win timestamp conflict
@@ -4068,6 +4075,13 @@ public final class RealmSwiftAdapter:
                 object.setValue(uuid, forKey: key)
             } else if value != nil {
                 throw malformed("a UUID string")
+            } else if property.isOptional {
+                // The change feed supplies full records (desiredKeys: nil).
+                // Absence clears an optional scalar just as it does in the
+                // generic decoder. Missing nonoptional fields deliberately
+                // retain their compatibility default for older records.
+                try Task.checkCancellation()
+                object.setValue(nil, forKey: key)
             }
         } else if let asset = value as? CKAsset {
             if let fileURL = asset.fileURL,
@@ -6737,7 +6751,8 @@ public final class RealmSwiftAdapter:
                                         }
                                         try Task.checkCancellation()
 
-                                        if object == nil {
+                                        let isNewlyCreatedReceiver = object == nil
+                                        if isNewlyCreatedReceiver {
                                             object = candidate.objectType.init()
                                             try Task.checkCancellation()
 
@@ -6761,7 +6776,8 @@ public final class RealmSwiftAdapter:
                                                     to: object,
                                                     syncedEntityID: candidate.syncedEntityID,
                                                     syncedEntityState: candidate.syncedEntityState,
-                                                    entityType: candidate.entityType
+                                                    entityType: candidate.entityType,
+                                                    isNewlyCreatedReceiver: isNewlyCreatedReceiver
                                                 )
                                             )
                                             appliedRecordNames.insert(
