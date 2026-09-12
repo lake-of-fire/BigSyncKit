@@ -1,21 +1,16 @@
-name: Ordered-V2 transport verification
+name: Transport verification
 on:
   push:
     branches: [codex/ordered-v2-followup-ownership-20260909]
     paths:
       - 'Sources/BigSyncKit/QSSynchronizer/**'
       - 'Tests/BigSyncKitTests/**'
-      - 'Tools/PausedOutboundRecoveryProbe/**'
-      - 'Tools/run-paused-outbound-recovery-probes.sh'
       - 'Tools/run-outbound-quiescence-*.sh'
-      - 'Tools/run-accepted-head-boundary-probes.sh'
       - '.github/workflows/ordered-v2-native-review.yml'
   pull_request:
     paths:
       - 'Sources/BigSyncKit/QSSynchronizer/**'
       - 'Tests/BigSyncKitTests/**'
-      - 'Tools/PausedOutboundRecoveryProbe/**'
-      - 'Tools/run-paused-outbound-recovery-probes.sh'
       - '.github/workflows/ordered-v2-native-review.yml'
 permissions:
   contents: read
@@ -23,31 +18,6 @@ concurrency:
   group: ordered-v2-transport-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  paused-recovery-portable:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - name: Capture exact source identity
-        run: |
-          mkdir -p "$RUNNER_TEMP/paused-review"
-          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/paused-review/identity.txt"
-          swift --version > "$RUNNER_TEMP/paused-review/toolchain.txt"
-      - name: Compile actual paused-recovery extension and run boundary tests
-        shell: bash
-        run: |
-          set -o pipefail
-          bash Tools/run-paused-outbound-recovery-probes.sh 2>&1 | tee "$RUNNER_TEMP/paused-review/tests.log"
-          git diff --exit-code
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: paused-recovery-portable
-          path: ${{ runner.temp }}/paused-review/
-          retention-days: 7
-          if-no-files-found: error
-
   native-selected:
     runs-on: macos-15
     timeout-minutes: 30
@@ -116,10 +86,9 @@ jobs:
       - name: Select Xcode
         run: |
           if [ -d /Applications/Xcode_26.3.app ]; then sudo xcode-select -s /Applications/Xcode_26.3.app; fi
-      - name: Cross-process and accepted-head probes
+      - name: Cross-process transport probes
         shell: bash
         run: |
           bash Tools/run-outbound-quiescence-portable-tests.sh
           bash Tools/run-outbound-quiescence-process-tests.sh
-          bash Tools/run-accepted-head-boundary-probes.sh
           git diff --exit-code
