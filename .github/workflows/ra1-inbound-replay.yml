@@ -17,27 +17,26 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Print crash-recovery fixture and submittedOperationID call sites
+      - name: Locate crash-recovery fixture and operation identity state
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
-          t = p.read_text()
-          n = 'testCrashRecoveryResendsTheSameLogicalGeneration'
-          i = t.find(n)
-          print('TEST_INDEX', i)
-          if i >= 0:
-              print(t[max(0, i-3500):i+9000])
-          print('\n=== submittedOperationID call sites ===')
+          needles = ['testCrashRecoveryResendsTheSameLogicalGeneration', 'CrashRecoveryResends', 'SameLogicalGeneration', 'submittedOperationID', 'submittedOperation', 'operationID']
           for root in [Path('Sources'), Path('Tests')]:
               for f in root.rglob('*.swift'):
                   s = f.read_text(errors='replace')
-                  if 'submittedOperationID' in s:
-                      print(f'--- {f} ---')
-                      for no, line in enumerate(s.splitlines(), 1):
-                          if 'submittedOperationID' in line:
-                              lo=max(1,no-12); hi=min(len(s.splitlines()),no+16)
-                              lines=s.splitlines()
-                              for j in range(lo,hi+1): print(f'{j}: {lines[j-1]}')
-                              print()
+                  hits = [n for n in needles if n in s]
+                  if not hits:
+                      continue
+                  print(f'=== {f} hits={hits} ===')
+                  lines = s.splitlines()
+                  emitted=set()
+                  for no,line in enumerate(lines,1):
+                      if any(n in line for n in needles):
+                          lo=max(1,no-20); hi=min(len(lines),no+40)
+                          key=(lo,hi)
+                          if key in emitted: continue
+                          emitted.add(key)
+                          for j in range(lo,hi+1): print(f'{j}: {lines[j-1]}')
+                          print()
           PY
