@@ -72,6 +72,24 @@ if focused:
             negative_marker='Failure cleanup must not forward a preparation-phase journal')
     finally:
         source.write_text(original)
+if focused:
+    source = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+    original = source.read_text()
+    good = """                    changeMetadata.journalCurrentValuePreservingChangeMetadata(
+                        at: Date()
+                    )"""
+    bad = """                    changeMetadata.refreshChangeMetadata(
+                        explicitlyModified: true,
+                        at: Date()
+                    )"""
+    assert original.count(good) == 1
+    try:
+        source.write_text(original.replace(good, bad))
+        run('negative-clock-inflation', ['swift', 'test', '--filter',
+            'testReviewAutomaticLocalWinnerPreservesConflictClockAndLaterRemoteEditWins'],
+            negative_marker='Automatic retransmission must not mint')
+    finally:
+        source.write_text(original)
 full = run('full', ['swift', 'test'], env=dict(os.environ, BIGSYNC_RUN_MUTATION_BENCHMARK='1'))
 if focused and full:
     for index in range(10):
@@ -81,4 +99,4 @@ if focused and full:
 subprocess.run(['git', 'diff', '--exit-code'], check=True)
 if Path('Package.resolved').exists():
     Path('qualification-Package.resolved').write_bytes(Path('Package.resolved').read_bytes())
-sys.exit(0 if len(results) == 15 and all(result['passed'] for result in results) else 1)
+sys.exit(0 if len(results) == 16 and all(result['passed'] for result in results) else 1)
