@@ -13922,6 +13922,9 @@ final class BigSyncKitTests: XCTestCase {
             second.refreshChangeMetadata(explicitlyModified: true)
             parent.refreshChangeMetadata(explicitlyModified: true)
         }
+        // Preparation consumes tracking state. Exercise the real journal
+        // forwarder first rather than depending on a debounced observer.
+        try await source.adapter.didFinishImport()
         let batch = try await source.adapter.prepareUploadBatch(limit: 100)
         let record = try XCTUnwrap(batch.records.first { $0.recordType == BigSyncRelationshipParent.className() })
         let firstID = BigSyncRelationshipChild.className() + ".first"
@@ -13944,6 +13947,7 @@ final class BigSyncKitTests: XCTestCase {
             parent.favoriteChild = nil
             parent.refreshChangeMetadata(explicitlyModified: true)
         }
+        try await source.adapter.didFinishImport()
         let empty = try await source.adapter.prepareUploadBatch(limit: 100)
         let cleared = try XCTUnwrap(empty.records.first { $0.recordType == BigSyncRelationshipParent.className() })
         XCTAssertNil(cleared["children"])
@@ -14183,6 +14187,19 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNil(cold.activeAccountScopeIdentifier)
         XCTAssertEqual(try Data(contentsOf: target.fileURL!), beforeTarget)
         XCTAssertEqual(try Data(contentsOf: persistence.fileURL!), beforeTracking)
+        // A subsequent local commit must be visible to a fresh inspection,
+        // even when an earlier inspection used an immutable read-only view.
+        try autoreleasepool {
+            let writer = try Realm(configuration: target)
+            try writer.write {
+                let object = BigSyncTrackedObject(id: "after-inspection", createdAt: Date(),
+                                                  modifiedAt: Date(), explicitlyModifiedAt: nil)
+                writer.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        XCTAssertFalse(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
+        XCTAssertNil(cold.realmProvider)
     }
 
     @BigSyncBackgroundActor

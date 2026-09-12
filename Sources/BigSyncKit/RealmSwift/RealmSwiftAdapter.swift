@@ -1067,13 +1067,15 @@ public final class RealmSwiftAdapter:
         }
     }
 
-    /// Opens inspection views only. It must not install the operational
-    /// provider, observers, recovery markers, or forward/discover mutations.
-    /// A schema requiring migration cannot be restored through this path.
+    /// Captures inspection configurations without opening the operational
+    /// provider, starting observers, or discovering/forwarding mutations.
+    /// Read-only disk Realms are immutable snapshots, so they are opened only
+    /// inside the final non-suspending inspection after account validation.
     @BigSyncBackgroundActor
     func preparePublicationRestorationInspection() async throws
         -> PublicationRestorationInspection? {
-        func open(_ configuration: Realm.Configuration) async throws -> Realm? {
+        func inspectionConfiguration(_ configuration: Realm.Configuration)
+            -> Realm.Configuration? {
             var inspection = configuration
             if configuration.inMemoryIdentifier == nil {
                 guard let url = configuration.fileURL,
@@ -1084,30 +1086,27 @@ public final class RealmSwiftAdapter:
                 inspection.migrationBlock = nil
                 inspection.shouldCompactOnLaunch = nil
             }
-            return try await Realm(
-                configuration: inspection,
-                actor: BigSyncBackgroundActor.shared
-            )
+            return inspection
         }
-        guard let persistence = try await open(persistenceRealmConfiguration)
+        guard let persistence = inspectionConfiguration(persistenceRealmConfiguration)
         else { return nil }
-        var targets = [Realm]()
+        var targets = [Realm.Configuration]()
         for configuration in targetRealmConfigurations {
-            guard let target = try await open(configuration) else { return nil }
+            guard let target = inspectionConfiguration(configuration) else { return nil }
             targets.append(target)
         }
         return PublicationRestorationInspection(
             adapter: self,
-            persistenceRealm: persistence,
-            targetRealms: targets
+            persistenceConfiguration: persistence,
+            targetConfigurations: targets
         )
     }
 
     @BigSyncBackgroundActor
     struct PublicationRestorationInspection {
         fileprivate let adapter: RealmSwiftAdapter
-        fileprivate let persistenceRealm: Realm
-        fileprivate let targetRealms: [Realm]
+        fileprivate let persistenceConfiguration: Realm.Configuration
+        fileprivate let targetConfigurations: [Realm.Configuration]
 
         /// Non-suspending final inspection, after account revalidation. These
         /// views never become the operational adapter's setup-completion flag.
@@ -1121,8 +1120,13 @@ public final class RealmSwiftAdapter:
                   adapter.recordZoneID.zoneName == evidence.zoneName else {
                 return false
             }
-            for realm in targetRealms {
-                realm.refresh()
+            // Synchronous, scoped views cannot straddle an account-provider
+            // await. Never refresh a read-only Realm: Realm rejects that call.
+            // Do not retain these snapshots between matches() invocations.
+            let persistenceRealm = try Realm(configuration: persistenceConfiguration)
+            for configuration in targetConfigurations {
+                let realm = try Realm(configuration: configuration)
+                if !configuration.readOnly { realm.refresh() }
                 for mutation in realm.objects(BigSyncPendingMutation.self) {
                     guard adapter.isOwnedEntityType(mutation.entityType),
                           mutation.replicaBindingGenerationIdentifier
@@ -1134,7 +1138,7 @@ public final class RealmSwiftAdapter:
                     }
                 }
             }
-            persistenceRealm.refresh()
+            if !persistenceConfiguration.readOnly { persistenceRealm.refresh() }
             let rebuild = persistenceRealm.object(
                 ofType: RebuildProvenanceState.self,
                 forPrimaryKey: RebuildProvenanceState.primaryKeyValue
