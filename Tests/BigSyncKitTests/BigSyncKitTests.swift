@@ -1082,6 +1082,25 @@ private actor ReevaluationTerminalRecorder {
     func results() -> [CloudKitSynchronizer.SynchronizationResult] { values }
 }
 
+private actor ReevaluationHeldCompletion {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var values = [CloudKitSynchronizer.SynchronizationResult]()
+
+    func receive(_ result: CloudKitSynchronizer.SynchronizationResult) async {
+        values.append(result)
+        if values.count == 1 {
+            await withCheckedContinuation { continuation = $0 }
+        }
+    }
+
+    func isHolding() -> Bool { continuation != nil }
+    func count() -> Int { values.count }
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
@@ -14696,6 +14715,66 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNil(fence.publicationInspectionGeneration)
         fence.clear()
         XCTAssertNotEqual(validated, fence.publicationInspectionGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testReevaluationCanceledCallbackRetainsBarrierUntilQuiescent() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "held-completion"), priorities: []
+        ))
+        let held = ReevaluationHeldCompletion()
+        synchronizer.synchronizationCompletionHandler = { await held.receive($0) }
+        synchronizer.beginSynchronization()
+        for _ in 0..<1000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let firstContext = try XCTUnwrap(synchronizer.activeRunContext)
+        let firstDelivery = Task { @BigSyncBackgroundActor in
+            await synchronizer.changesFinishedSynchronizing()
+        }
+        for _ in 0..<1000 {
+            if await held.isHolding() { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let isHolding = await held.isHolding()
+        XCTAssertTrue(isHolding)
+        guard isHolding else {
+            firstDelivery.cancel()
+            await held.release()
+            await synchronizer.cancelSynchronizationAndWait()
+            return
+        }
+        synchronizer.cancelSynchronization()
+        synchronizer.beginSynchronization()
+        let replacementAttempt = synchronizer.synchronizationAttemptID
+        XCTAssertNotEqual(replacementAttempt, firstContext.attemptID)
+        // The production callback may mutate domain state across
+        // awaits. Its replacement must wait for that work to leave.
+        try await Task.sleep(nanoseconds: 10_000_000)
+        XCTAssertNil(synchronizer.activeRunContext)
+        let heldCount = await held.count()
+        XCTAssertEqual(heldCount, 1)
+        await held.release()
+        await firstDelivery.value
+        for _ in 0..<1000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        guard let replacementContext = synchronizer.activeRunContext else {
+            XCTFail("Replacement must start after the old callback is quiescent")
+            await synchronizer.cancelSynchronizationAndWait()
+            return
+        }
+        XCTAssertEqual(replacementContext.attemptID, replacementAttempt)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        await synchronizer.changesFinishedSynchronizing()
+        let deliveredCount = await held.count()
+        XCTAssertEqual(deliveredCount, 2)
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+        XCTAssertFalse(synchronizer.syncing)
+        await synchronizer.cancelSynchronizationAndWait()
     }
 
     @BigSyncBackgroundActor

@@ -1,11 +1,8 @@
-name: Hotfix native qualification
+name: Hotfix deeper native qualification
 on:
-  push:
-    branches: [fix/hotfix-sync-reevaluation-20260912]
-    paths: [.github/workflows/hotfix-reevaluation.yml]
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
   native:
     runs-on: macos-15
@@ -15,28 +12,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: BigSyncKit
-      - name: Complete boundary type checking
-        working-directory: BigSyncKit
-        run: |
-          python3 - <<'PY'
-          import pathlib, subprocess
-          assert subprocess.check_output(['git', 'rev-parse', 'HEAD:Sources']).decode().strip() == '99ef96012aac04c72176b4d4ba02b9bd12e06fab'
-          path = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift')
-          value = path.read_text()
-          assert value.count('CloudKitRetryConstraints(error: error)') == 3
-          path.write_text(value.replace('CloudKitRetryConstraints(error: error)', 'CloudKitRetryConstraints(error)'))
-          health = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSyncHealth.swift')
-          value = health.read_text()
-          old = '            case .cancelled:\n                return .idle\n'
-          assert value.count(old) == 1
-          health.write_text(value.replace(old, old + '            case .inboundBoundaryChanged:\n                return .failed\n'))
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          subprocess.run(['git', 'add', '--', str(path), str(health)], check=True)
-          PY
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: complete inbound-boundary health and retry constraint handling'
-          git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
-          git rev-parse HEAD > qualification-commit.txt
-          git rev-parse HEAD:Sources > qualification-source-tree.txt
+          persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/RealmSwiftGaps
@@ -49,60 +25,70 @@ jobs:
           ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
-      - name: Toolchain
+      - name: Record immutable inputs
         working-directory: BigSyncKit
-        run: swift --version > qualification-toolchain.txt
-      - name: Native boundary regressions
-        id: focused
-        continue-on-error: true
+        run: |
+          git diff --exit-code
+          git rev-parse HEAD > qualification-commit.txt
+          xcodebuild -version > qualification-toolchain.txt
+          swift --version >> qualification-toolchain.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > qualification-RealmSwiftGaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > qualification-SwiftUtilities.txt
+      - name: Regressions, negative control, full suite and repeated runs
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
-          import pathlib, subprocess, sys
-          path = pathlib.Path('qualification-focused.log')
-          with path.open('w') as output:
+          import json, os, pathlib, re, subprocess, sys
+          results = []
+          def run(name, args, *, expected_failure=False, env=None):
+              path = pathlib.Path('qualification-' + name + '.log')
+              with path.open('w') as output:
+                  try:
+                      code = subprocess.run(args, stdout=output, stderr=subprocess.STDOUT, timeout=900, env=env).returncode
+                  except subprocess.TimeoutExpired:
+                      output.write('\nQUALIFICATION_TIMEOUT\n')
+                      code = 124
+              text = path.read_text()
+              counts = re.findall(r'Executed (\d+) tests?', text)
+              passed = code == 0 and bool(counts) and max(map(int, counts)) > 0
+              if expected_failure:
+                  passed = code not in (0, 124) and bool(counts) and 'A stale, unjournaled target must not be acknowledged as unchanged' in text
+              results.append(dict(name=name, exit_code=code, expected_failure=expected_failure, passed=passed, executed_counts=counts))
+              print(name, 'exit', code, 'accepted', passed, flush=True)
+              print('\n'.join(line for line in text.splitlines() if re.search(r': error:|^error:|Executed | failed ', line)), flush=True)
+              pathlib.Path('qualification-results.json').write_text(json.dumps(results, indent=2) + '\n')
+              return passed
+          focused = run('focused', ['swift', 'test', '--filter', 'testReevaluation'])
+          if focused:
+              source = pathlib.Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+              original = source.read_bytes()
+              match = re.search(rb'throw RealmSwiftInboundTargetChangedError\(\s*recordName: candidate\.syncedEntityID\s*\)', original)
+              assert match is not None
+              old = match.group(0)
+              assert original.count(old) == 1
               try:
-                  code = subprocess.run(['swift', 'test', '--filter', 'testReview|testReevaluation|testTerminalPublicationEvidenceRestoresOnlyForExactTransportBoundary'], stdout=output, stderr=subprocess.STDOUT, timeout=600).returncode
-              except subprocess.TimeoutExpired:
-                  output.write('\nQUALIFICATION_TIMEOUT: focused suite exceeded 600 seconds\n')
-                  code = 124
-          print(path.read_text()[-32000:])
-          sys.exit(code)
+                  source.write_bytes(original.replace(old, b'continue'))
+                  pathlib.Path('qualification-negative-control.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', str(source)]))
+                  run('negative-control', ['swift', 'test', '--filter', 'testReevaluationNonJournaledImportCollisionRetainsPageForReplay'], expected_failure=True)
+              finally:
+                  source.write_bytes(original)
+          full = run('full', ['swift', 'test'], env=dict(os.environ, BIGSYNC_RUN_MUTATION_BENCHMARK='1'))
+          if focused and full:
+              for index in range(1, 11):
+                  if not run('repeat-' + str(index), ['swift', 'test', '--skip-build', '--filter', 'testReevaluation']):
+                      break
+          subprocess.run(['git', 'diff', '--exit-code'], check=True)
+          if pathlib.Path('Package.resolved').exists():
+              pathlib.Path('qualification-Package.resolved').write_bytes(pathlib.Path('Package.resolved').read_bytes())
+          sys.exit(0 if len(results) == 13 and all(item['passed'] for item in results) else 1)
           PY
-      - name: Full suite including mutation benchmark
-        id: full
-        continue-on-error: true
-        env:
-          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
-        working-directory: BigSyncKit
-        run: |
-          python3 - <<'PY'
-          import pathlib, subprocess, sys
-          path = pathlib.Path('qualification-full.log')
-          with path.open('w') as output:
-              try:
-                  code = subprocess.run(['swift', 'test'], stdout=output, stderr=subprocess.STDOUT, timeout=600).returncode
-              except subprocess.TimeoutExpired:
-                  output.write('\nQUALIFICATION_TIMEOUT: full suite exceeded 600 seconds\n')
-                  code = 124
-          print(path.read_text()[-32000:])
-          sys.exit(code)
-          PY
-      - name: Archive exact tested source
+      - name: Archive exact source
         if: always()
         working-directory: BigSyncKit
-        run: |
-          cp Package.resolved qualification-Package.resolved
-          git archive --format=tar.gz -o qualification-source.tar.gz HEAD
+        run: git archive --format=tar.gz -o qualification-source.tar.gz HEAD
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: hotfix-native-qualification
           path: BigSyncKit/qualification-*
-          retention-days: 7
-      - name: Require every qualification stage
-        if: always()
-        env:
-          FOCUSED: ${{ steps.focused.outcome }}
-          FULL: ${{ steps.full.outcome }}
-        run: test "$FOCUSED" = success && test "$FULL" = success
+          retention-days: 14

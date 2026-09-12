@@ -212,6 +212,10 @@ extension CloudKitSynchronizer {
         let confirmedAccount = try await accountIdentifierProvider()
         guard try inspectionOwnerIsCurrent() else { return nil }
         guard confirmedAccount == accountIdentifier,
+              evidence.replicaBindingGenerationIdentifier == (try
+                activeReplicaBindingGenerationIdentifierForRun(
+                    accountScopeIdentifier: accountScopeIdentifier
+                )),
               try persistedDurablePublicationEvidence() == evidence,
               try !adaptersHavePendingChangesAtTerminalBoundary(),
               let adapter = modelAdapters.first,
