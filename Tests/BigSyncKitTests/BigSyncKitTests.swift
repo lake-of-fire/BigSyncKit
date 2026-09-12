@@ -14145,14 +14145,28 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testReevaluationColdDiskInspectionDoesNotWriteOrInitializeProvider() async throws {
+    func testReevaluationColdDiskInspectionPreservesDataAndCoexistsWithWriter() async throws {
         let fixture = try await makeRealmAdapterFixture()
         let token = Data("disk-terminal-cursor".utf8)
+        let originalDate = Date(timeIntervalSinceReferenceDate: 40_000)
+        try await fixture.targetRealm.asyncWrite {
+            let retained = BigSyncTrackedObject(id: "retained-without-intent", createdAt: originalDate,
+                                               modifiedAt: originalDate, explicitlyModifiedAt: nil)
+            retained.tags.append(objectsIn: ["retained", "content"])
+            retained.payload = Data([1, 2, 3])
+            // Old/local data without mutation intent must not be discovered
+            // as an upload by a saved-publication inspection.
+            fixture.targetRealm.add(retained)
+        }
         try await fixture.persistenceRealm.asyncWrite {
             let value = ServerToken()
             value.token = token
             fixture.persistenceRealm.add(value)
         }
+        let originalTrackingCount = fixture.persistenceRealm.objects(SyncedEntity.self).count
+        let originalRebuildCount = fixture.persistenceRealm.objects(RebuildProvenanceState.self).count
+        let originalMarkers = Dictionary(uniqueKeysWithValues:
+            fixture.persistenceRealm.objects(SyncedEntityType.self).map { ($0.entityType, $0.recoveryVersion) })
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -14164,8 +14178,6 @@ final class BigSyncKitTests: XCTestCase {
         persistence.fileURL = directory.appendingPathComponent("tracking.realm")
         try fixture.targetRealm.writeCopy(configuration: target)
         try fixture.persistenceRealm.writeCopy(configuration: persistence)
-        let beforeTarget = try Data(contentsOf: target.fileURL!)
-        let beforeTracking = try Data(contentsOf: persistence.fileURL!)
         let cold = RealmSwiftAdapter(persistenceRealmConfiguration: persistence,
                                     targetRealmConfigurations: [target], excludedClassNames: [],
                                     recordZoneID: fixture.adapter.recordZoneID,
@@ -14185,13 +14197,26 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
         XCTAssertNil(cold.realmProvider)
         XCTAssertNil(cold.activeAccountScopeIdentifier)
-        XCTAssertEqual(try Data(contentsOf: target.fileURL!), beforeTarget)
-        XCTAssertEqual(try Data(contentsOf: persistence.fileURL!), beforeTracking)
-        // Production targets can remain open in the UI/reader while this
-        // adapter is cold. Inspection must coexist with a live writer and
-        // observe its later commit, not switch the file to immutable mode.
+        // Realm may grow/reorganize a compact writeCopy file on a coordinated
+        // open. Prove persisted logical state, not byte-identical file layout.
         try autoreleasepool {
             let writer = try Realm(configuration: target)
+            let tracking = try Realm(configuration: persistence)
+            let retained = try XCTUnwrap(writer.object(ofType: BigSyncTrackedObject.self,
+                                                       forPrimaryKey: "retained-without-intent"))
+            XCTAssertEqual(writer.objects(BigSyncTrackedObject.self).count, 1)
+            XCTAssertEqual(retained.createdAt, originalDate)
+            XCTAssertEqual(retained.modifiedAt, originalDate)
+            XCTAssertNil(retained.explicitlyModifiedAt)
+            XCTAssertFalse(retained.isDeleted)
+            XCTAssertEqual(Array(retained.tags), ["retained", "content"])
+            XCTAssertEqual(retained.payload, Data([1, 2, 3]))
+            XCTAssertTrue(writer.objects(BigSyncPendingMutation.self).isEmpty)
+            XCTAssertEqual(tracking.objects(SyncedEntity.self).count, originalTrackingCount)
+            XCTAssertEqual(tracking.objects(RebuildProvenanceState.self).count, originalRebuildCount)
+            XCTAssertEqual(Dictionary(uniqueKeysWithValues:
+                tracking.objects(SyncedEntityType.self).map { ($0.entityType, $0.recoveryVersion) }), originalMarkers)
+            XCTAssertEqual(tracking.objects(ServerToken.self).first?.token, token)
             XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
             try writer.write {
                 let object = BigSyncTrackedObject(id: "after-inspection", createdAt: Date(),
@@ -14203,6 +14228,16 @@ final class BigSyncKitTests: XCTestCase {
         }
         XCTAssertFalse(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
         XCTAssertNil(cold.realmProvider)
+
+        var requiresMigration = target
+        requiresMigration.schemaVersion += 1
+        let mismatched = RealmSwiftAdapter(persistenceRealmConfiguration: persistence,
+            targetRealmConfigurations: [requiresMigration], excludedClassNames: [],
+            recordZoneID: cold.recordZoneID, logger: Logger(label: "ColdVersionMismatch"), startSetupTask: false)
+        let rejected = try await mismatched.preparePublicationRestorationInspection()
+        XCTAssertNil(rejected)
+        XCTAssertEqual(try schemaVersionAtURL(target.fileURL!), target.schemaVersion)
+        XCTAssertNil(mismatched.realmProvider)
     }
 
     func testReevaluationInitialInspectionDoesNotGrantWriterAuthority() throws {
