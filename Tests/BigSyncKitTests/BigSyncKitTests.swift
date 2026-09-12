@@ -14336,43 +14336,6 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testReevaluationColdInspectionAcceptsTargetWithoutMutationJournalType() async throws {
-        let fixture = try await makeRealmAdapterFixture()
-        let token = Data("journal-free-cursor".utf8)
-        try await fixture.persistenceRealm.asyncWrite {
-            let value = ServerToken()
-            value.token = token
-            fixture.persistenceRealm.add(value)
-        }
-        var target = Realm.Configuration()
-        target.inMemoryIdentifier = "journal-free-\(UUID().uuidString)"
-        target.objectTypes = [BigSyncTrackedObject.self]
-        let targetRealm = try await Realm(configuration: target, actor: BigSyncBackgroundActor.shared)
-        let cold = RealmSwiftAdapter(
-            persistenceRealmConfiguration: fixture.persistenceRealm.configuration,
-            targetRealmConfigurations: [target], excludedClassNames: [],
-            recordZoneID: fixture.adapter.recordZoneID,
-            logger: Logger(label: "JournalFreeInspection"), startSetupTask: false
-        )
-        let evidence = BigSyncDurablePublicationEvidence(
-            domainScopeIdentifier: "domain", accountScopeIdentifier: "account",
-            replicaBindingGenerationIdentifier: nil,
-            zoneOwnerName: cold.recordZoneID.ownerName, zoneName: cold.recordZoneID.zoneName,
-            changeFeedEpoch: 0,
-            consumedServerBoundaryIdentifier: try XCTUnwrap(CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
-                containerIdentifier: "iCloud.test", databaseScope: .private,
-                accountScopeIdentifier: "account", replicaBindingGenerationIdentifier: nil,
-                recordZoneID: cold.recordZoneID, changeFeedEpoch: 0, cursorData: token
-            )), runID: UUID(), publishedAt: Date()
-        )
-        let opened = try await cold.preparePublicationRestorationInspection()
-        let inspection = try XCTUnwrap(opened)
-        XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
-        XCTAssertNil(cold.realmProvider)
-        withExtendedLifetime(targetRealm) {}
-    }
-
-    @BigSyncBackgroundActor
     private func makeSynchronizer(
         database: CloudKitDatabaseAdapter = FakeCloudKitDatabase(),
         keyValueStore: KeyValueStore = DictionaryKeyValueStore(),

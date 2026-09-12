@@ -1143,9 +1143,6 @@ public final class RealmSwiftAdapter:
                 for configuration in targetConfigurations {
                     let realm = try Realm(configuration: configuration)
                     if !configuration.readOnly { realm.refresh() }
-                    guard realm.schema.objectSchema.contains(where: {
-                        $0.className == BigSyncPendingMutation.className()
-                    }) else { continue }
                     for mutation in realm.objects(BigSyncPendingMutation.self) {
                         guard adapter.isOwnedEntityType(mutation.entityType),
                               mutation.replicaBindingGenerationIdentifier
