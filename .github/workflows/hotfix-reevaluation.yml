@@ -16,22 +16,28 @@ jobs:
         with:
           ref: fix/hotfix-sync-reevaluation-20260912
           path: BigSyncKit
-      - name: Apply verified native corrections
+      - name: Scope cold inspection handles
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
-          import base64, hashlib, pathlib, subprocess, zlib
-          patch = zlib.decompress(base64.b64decode(pathlib.Path('.github/hotfix-native-corrections.patch.zlib.b64').read_text().strip(), validate=True))
-          assert hashlib.sha256(patch).hexdigest() == 'f47cb69355f18e64c59e6a3606e6023085e8777a2493b045b019138f044a26be'
-          pathlib.Path('/tmp/corrections.patch').write_bytes(patch)
-          if subprocess.run(['git', 'apply', '--reverse', '--check', '/tmp/corrections.patch'], capture_output=True).returncode != 0:
-              subprocess.run(['git', 'apply', '--check', '/tmp/corrections.patch'], check=True)
-              subprocess.run(['git', 'apply', '/tmp/corrections.patch'], check=True)
+          from pathlib import Path
+          import subprocess
+          p = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+          actual = subprocess.check_output(['git', 'hash-object', str(p)], text=True).strip()
+          if actual != '15739b42c14d6ab536457c7f14900223e558e387':
+              assert actual == 'a74dddda06c8247abf2e04b341da2aedf476ef55', actual
+              s = p.read_text()
+              start = s.index('            try Task.checkCancellation()', s.index('    struct PublicationRestorationInspection {'))
+              end = s.index('\n        }\n    }\n\n    @BigSyncBackgroundActor\n    public func currentServerBoundaryIdentifier(', start)
+              header = '            // Drain Objective-C autoreleases here as well as Swift references.\n            // Otherwise immutable inspection handles survive this call and\n            // can conflict with the next operational read/write Realm open.\n            return try autoreleasepool {\n'
+              s = s[:start] + header + ''.join('    ' + line if line.strip() else line for line in s[start:end].splitlines(True)) + '\n            }' + s[end:]
+              p.write_text(s)
+              assert subprocess.check_output(['git', 'hash-object', str(p)], text=True).strip() == '15739b42c14d6ab536457c7f14900223e558e387'
           PY
           git diff --check
-          git add Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift Tests/BigSyncKitTests/BigSyncKitTests.swift
+          git add Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: inspect fresh cold Realm views at the terminal cut'
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: release cold inspection Realm handles before operational opens'
             git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
           fi
           git rev-parse HEAD > qualification-commit.txt
