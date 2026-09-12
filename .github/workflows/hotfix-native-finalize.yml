@@ -12,83 +12,29 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 04caf6776dec03b1c3888571d7c955d3cac46ba8
+          ref: e39111513fce377f3d4e55cc1e082e8dfcb6f7ae
           path: BigSyncKit
           fetch-depth: 0
-      - name: Compose checked source and tests
+      - name: Remove unsupported missing-journal premise
         working-directory: BigSyncKit
         run: |
-          test "$(git rev-parse HEAD)" = 04caf6776dec03b1c3888571d7c955d3cac46ba8
-          git cherry-pick --no-commit 8b9fbd6c0025a12ea283a6bdd6d0d1b56698a69c
+          test "$(git rev-parse HEAD)" = e39111513fce377f3d4e55cc1e082e8dfcb6f7ae
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
+          p = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
           s = p.read_text()
-          old = '''        // A revoked callback cannot hold a replacement drain hostage.
-                  // Suppress duplicate delivery only for the current attempt.
-                  do { try checkRunContext(context) } catch { return }
-                  guard synchronizationDrainIsActive,
-                        completingPublicationAttemptID != context.attemptID else { return }'''
-          new = '        guard synchronizationDrainIsActive,\n              completingPublicationAttemptID == nil else { return }'
+          old = '                    guard realm.schema.objectSchema.contains(where: {\n                        $0.className == BigSyncPendingMutation.className()\n                    }) else { continue }\n'
           assert s.count(old) == 1
-          p.write_text(s.replace(old, new))
+          p.write_text(s.replace(old, ''))
           p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
           s = p.read_text()
-          start = s.index('    @BigSyncBackgroundActor\n    func testReevaluationWarmDiskInspectionCoexistsWithOperationalRealm')
-          end = s.index('    @BigSyncBackgroundActor\n    func testReevaluationCanceledCallbackCannotBlockReplacementDrain', start)
-          s = s[:start] + s[end:]
-          s = s.replace('testReevaluationCanceledCallbackCannotBlockReplacementDrain', 'testReevaluationCanceledCallbackRetainsBarrierUntilQuiescent')
-          old = '''        synchronizer.cancelSynchronization()
-                  synchronizer.beginSynchronization()
-                  for _ in 0..<1000 where synchronizer.activeRunContext == nil {
-                      try await Task.sleep(nanoseconds: 1_000_000)
-                  }
-                  XCTAssertNotEqual(synchronizer.activeRunContext?.attemptID, firstContext.attemptID)
-                  await synchronizer.changesFinishedSynchronizing()
-                  let beforeOldRelease = await held.count()
-                  XCTAssertEqual(beforeOldRelease, 2, "The new result cannot wait for a revoked callback")
-                  XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
-                  XCTAssertFalse(synchronizer.syncing)
-                  await held.release()
-                  await firstDelivery.value
-                  let afterOldRelease = await held.count()
-                  XCTAssertEqual(afterOldRelease, 2)
-                  XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
-                  await synchronizer.cancelSynchronizationAndWait()'''
-          new = '''        synchronizer.cancelSynchronization()
-                  synchronizer.beginSynchronization()
-                  let replacementAttempt = synchronizer.synchronizationAttemptID
-                  XCTAssertNotEqual(replacementAttempt, firstContext.attemptID)
-                  // The production callback may mutate domain state across
-                  // awaits. Its replacement must wait for that work to leave.
-                  try await Task.sleep(nanoseconds: 10_000_000)
-                  XCTAssertNil(synchronizer.activeRunContext)
-                  let heldCount = await held.count()
-                  XCTAssertEqual(heldCount, 1)
-                  await held.release()
-                  await firstDelivery.value
-                  for _ in 0..<1000 where synchronizer.activeRunContext == nil {
-                      try await Task.sleep(nanoseconds: 1_000_000)
-                  }
-                  guard let replacementContext = synchronizer.activeRunContext else {
-                      XCTFail("Replacement must start after the old callback is quiescent")
-                      await synchronizer.cancelSynchronizationAndWait()
-                      return
-                  }
-                  XCTAssertEqual(replacementContext.attemptID, replacementAttempt)
-                  XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
-                  await synchronizer.changesFinishedSynchronizing()
-                  let deliveredCount = await held.count()
-                  XCTAssertEqual(deliveredCount, 2)
-                  XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
-                  XCTAssertFalse(synchronizer.syncing)
-                  await synchronizer.cancelSynchronizationAndWait()'''
-          assert s.count(old) == 1
-          p.write_text(s.replace(old, new))
+          start = s.index('    @BigSyncBackgroundActor\n    func testReevaluationColdInspectionAcceptsTargetWithoutMutationJournalType')
+          end = s.index('    @BigSyncBackgroundActor\n    private func makeSynchronizer', start)
+          p.write_text(s[:start] + s[end:])
           PY
           git diff --check
           git add Sources Tests
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: preserve callback quiescence and compose logical cold-restoration controls'
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: retain the mandatory mutation journal configuration contract'
           git push origin HEAD:refs/heads/fix/hotfix-sync-deeper-20260912
           git rev-parse HEAD > qualification-commit.txt
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -121,8 +67,7 @@ jobs:
           end = s.index('\n          PY', start)
           lines = s[start:end].splitlines()
           assert all(line.startswith('          ') for line in lines)
-          code = '\n'.join(line[10:] for line in lines) + '\n'
-          Path('/tmp/hotfix-final-qualification.py').write_text(code)
+          Path('/tmp/hotfix-final-qualification.py').write_text('\n'.join(line[10:] for line in lines) + '\n')
           subprocess.run(['python3', '/tmp/hotfix-final-qualification.py'], check=True)
           PY
       - name: Archive exact committed source
