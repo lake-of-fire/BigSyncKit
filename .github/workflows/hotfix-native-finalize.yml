@@ -1,0 +1,144 @@
+name: Finalize native hotfix regressions
+on:
+  push:
+    branches: [fix/hotfix-sync-native-fixture-20260912]
+    paths: [.github/workflows/hotfix-native-finalize.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: BigSyncKit
+      - name: Correct the regression premise and commit clean source
+        working-directory: BigSyncKit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
+          s = p.read_text()
+          old = '''        // A revoked callback cannot hold a replacement drain hostage.
+                  // Suppress duplicate delivery only for the current attempt.
+                  do { try checkRunContext(context) } catch { return }
+                  guard synchronizationDrainIsActive,
+                        completingPublicationAttemptID != context.attemptID else { return }'''
+          old = old.replace('\n          ', '\n')
+          new = '        guard synchronizationDrainIsActive,\n              completingPublicationAttemptID == nil else { return }'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+          p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
+          s = p.read_text()
+          s = s.replace('testReevaluationCanceledCallbackCannotBlockReplacementDrain', 'testReevaluationCanceledCallbackRetainsBarrierUntilQuiescent')
+          old = '''        synchronizer.cancelSynchronization()
+                  synchronizer.beginSynchronization()
+                  for _ in 0..<1000 where synchronizer.activeRunContext == nil {
+                      try await Task.sleep(nanoseconds: 1_000_000)
+                  }
+                  XCTAssertNotEqual(synchronizer.activeRunContext?.attemptID, firstContext.attemptID)
+                  await synchronizer.changesFinishedSynchronizing()
+                  let beforeOldRelease = await held.count()
+                  XCTAssertEqual(beforeOldRelease, 2, "The new result cannot wait for a revoked callback")
+                  XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+                  XCTAssertFalse(synchronizer.syncing)
+                  await held.release()
+                  await firstDelivery.value
+                  let afterOldRelease = await held.count()
+                  XCTAssertEqual(afterOldRelease, 2)
+                  XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+                  await synchronizer.cancelSynchronizationAndWait()'''.replace('\n          ', '\n')
+          new = '''        synchronizer.cancelSynchronization()
+                  synchronizer.beginSynchronization()
+                  let replacementAttempt = synchronizer.synchronizationAttemptID
+                  XCTAssertNotEqual(replacementAttempt, firstContext.attemptID)
+                  // Production callbacks may mutate domain state across awaits.
+                  // The replacement must wait for that callback to leave.
+                  try await Task.sleep(nanoseconds: 10_000_000)
+                  XCTAssertNil(synchronizer.activeRunContext)
+                  let heldCount = await held.count()
+                  XCTAssertEqual(heldCount, 1)
+                  await held.release()
+                  await firstDelivery.value
+                  for _ in 0..<1000 where synchronizer.activeRunContext == nil {
+                      try await Task.sleep(nanoseconds: 1_000_000)
+                  }
+                  guard let replacementContext = synchronizer.activeRunContext else {
+                      XCTFail("Replacement must start after the old callback is quiescent")
+                      await synchronizer.cancelSynchronizationAndWait()
+                      return
+                  }
+                  XCTAssertEqual(replacementContext.attemptID, replacementAttempt)
+                  XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+                  await synchronizer.changesFinishedSynchronizing()
+                  let deliveredCount = await held.count()
+                  XCTAssertEqual(deliveredCount, 2)
+                  XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+                  XCTAssertFalse(synchronizer.syncing)
+                  await synchronizer.cancelSynchronizationAndWait()'''.replace('\n          ', '\n')
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+          p = Path('.github/workflows/hotfix-reevaluation.yml')
+          s = p.read_text()
+          s = s.replace('The new result cannot wait for a revoked callback', 'A stale, unjournaled target must not be acknowledged as unchanged')
+          s = s.replace("source = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')", "source = pathlib.Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')")
+          s = s.replace("old = b'completingPublicationAttemptID != context.attemptID else { return }'", "old = re.search(rb'throw RealmSwiftInboundTargetChangedError\\(\\s*recordName: candidate\\.syncedEntityID\\s*\\)', original).group(0)")
+          s = s.replace("b'completingPublicationAttemptID == nil else { return }'", "b'continue'")
+          s = s.replace('testReevaluationCanceledCallbackCannotBlockReplacementDrain', 'testReevaluationNonJournaledImportCollisionRetainsPageForReplay')
+          p.write_text(s)
+          # This temporary action is not retained in the integrated source.
+          Path('.github/workflows/hotfix-native-finalize.yml').unlink()
+          PY
+          git diff --check
+          git add Sources Tests .github/workflows
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: retain callback quiescence and reject the disproven replacement-race premise'
+          git push origin HEAD:refs/heads/fix/hotfix-sync-deeper-20260912
+          git rev-parse HEAD > qualification-commit.txt
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record inputs
+        working-directory: BigSyncKit
+        run: |
+          xcodebuild -version > qualification-toolchain.txt
+          swift --version >> qualification-toolchain.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > qualification-RealmSwiftGaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > qualification-SwiftUtilities.txt
+      - name: Execute final committed qualification recipe
+        working-directory: BigSyncKit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          # Extract the explicitly marked Python run block, not arbitrary YAML.
+          s = Path('.github/workflows/hotfix-reevaluation.yml').read_text()
+          start = s.index("          python3 - <<'PY'\n") + len("          python3 - <<'PY'\n")
+          end = s.index('\n          PY', start)
+          lines = s[start:end].splitlines()
+          assert all(line.startswith('          ') for line in lines)
+          code = '\n'.join(line[10:] for line in lines) + '\n'
+          Path('/tmp/hotfix-final-qualification.py').write_text(code)
+          subprocess.run(['python3', '/tmp/hotfix-final-qualification.py'], check=True)
+          PY
+      - name: Archive exact committed source
+        if: always()
+        working-directory: BigSyncKit
+        run: git archive --format=tar.gz -o qualification-source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hotfix-native-qualification
+          path: BigSyncKit/qualification-*
+          retention-days: 14
