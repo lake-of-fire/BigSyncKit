@@ -15,37 +15,26 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: BigSyncKit
-      - name: Apply hash-verified followup
+      - name: Complete boundary type checking
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
-          import base64, hashlib, pathlib, subprocess, zlib
-          source = pathlib.Path('.github/hotfix-boundary-followup.patch.zlib.b64')
-          encoded = source.read_text().strip().replace('NxqTf6+0NxqTf6+0NBlv', 'NxqTf6+0NBlv')
-          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '7f78afe0343328a3b0ef170bbab7568828fed6b75cf950b0145471388d4bcc64'
-          allowed = {
-              'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift',
-              'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift',
-              'Tests/BigSyncKitTests/BigSyncKitTests.swift',
-              'Tests/BigSyncKitTests/WorkerReviewReconciliationTests.swift',
-          }
-          path = pathlib.Path('/tmp/hotfix-followup.patch')
-          path.write_bytes(patch)
-          names = subprocess.check_output(['git', 'apply', '--numstat', str(path)]).decode().splitlines()
-          assert {line.split('\t', 2)[2] for line in names} == allowed
-          if subprocess.run(['git', 'apply', '--reverse', '--check', str(path)], capture_output=True).returncode != 0:
-              assert subprocess.check_output(['git', 'rev-parse', 'HEAD:Sources']).decode().strip() == '669359e2836d463b08db9de5c14e691cc9a1f5e3'
-              subprocess.run(['git', 'apply', '--check', str(path)], check=True)
-              subprocess.run(['git', 'apply', str(path)], check=True)
-          source.write_text(encoded + '\n')
+          import pathlib, subprocess
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD:Sources']).decode().strip() == '99ef96012aac04c72176b4d4ba02b9bd12e06fab'
+          path = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift')
+          value = path.read_text()
+          assert value.count('CloudKitRetryConstraints(error: error)') == 3
+          path.write_text(value.replace('CloudKitRetryConstraints(error: error)', 'CloudKitRetryConstraints(error)'))
+          health = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSyncHealth.swift')
+          value = health.read_text()
+          old = '            case .cancelled:\n                return .idle\n'
+          assert value.count(old) == 1
+          health.write_text(value.replace(old, old + '            case .inboundBoundaryChanged:\n                return .failed\n'))
           subprocess.run(['git', 'diff', '--check'], check=True)
-          subprocess.run(['git', 'add', '--', *sorted(allowed), str(source)], check=True)
+          subprocess.run(['git', 'add', '--', str(path), str(health)], check=True)
           PY
-          if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: reject stale download boundaries and qualify transport fixtures'
-            git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
-          fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: complete inbound-boundary health and retry constraint handling'
+          git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
           git rev-parse HEAD > qualification-commit.txt
           git rev-parse HEAD:Sources > qualification-source-tree.txt
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
