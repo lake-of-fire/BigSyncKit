@@ -58,6 +58,20 @@ if focused:
             negative_marker='caught error: "CancellationError()"')
     finally:
         source.write_text(original)
+    source = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+    original = source.read_text()
+    start = original.index('    public func didFinishImport() async throws {')
+    end = original.index('    func hasPendingChangesAtTerminalBoundary()', start)
+    segment = original[start:end]
+    guard = '        guard !isPreparingFencedMigration else { return }\n'
+    assert segment.count(guard) == 1
+    try:
+        source.write_text(original[:start] + segment.replace(guard, '') + original[end:])
+        run('negative-preparation-flush', ['swift', 'test', '--filter',
+            'testClosureMigrationFailureCannotForwardJournalBeforePreparation'],
+            negative_marker='Failure cleanup must not forward a preparation-phase journal')
+    finally:
+        source.write_text(original)
 full = run('full', ['swift', 'test'], env=dict(os.environ, BIGSYNC_RUN_MUTATION_BENCHMARK='1'))
 if focused and full:
     for index in range(10):
@@ -67,4 +81,4 @@ if focused and full:
 subprocess.run(['git', 'diff', '--exit-code'], check=True)
 if Path('Package.resolved').exists():
     Path('qualification-Package.resolved').write_bytes(Path('Package.resolved').read_bytes())
-sys.exit(0 if len(results) == 14 and all(result['passed'] for result in results) else 1)
+sys.exit(0 if len(results) == 15 and all(result['passed'] for result in results) else 1)

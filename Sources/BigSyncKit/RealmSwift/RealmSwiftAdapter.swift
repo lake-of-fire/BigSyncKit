@@ -7777,6 +7777,11 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     public func didFinishImport() async throws {
+        // Failure cleanup can arrive before migration has installed recovery
+        // provenance. Keep the target journal untouched at this boundary;
+        // normal setup/forwarding resumes through unsetCancellation only
+        // after the owning run completes preparation successfully.
+        guard !isPreparingFencedMigration else { return }
         try await ensureSetup()
         guard let realmProvider, let persistenceRealm = realmProvider.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable

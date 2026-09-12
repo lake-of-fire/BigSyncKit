@@ -1104,6 +1104,54 @@ private actor ReevaluationHeldCompletion {
 final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
+    func testClosureMigrationFailureCannotForwardJournalBeforePreparation() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter.cancelSynchronization()
+        await fixture.adapter.waitForCancellation()
+        let object = BigSyncTrackedObject(
+            id: "closure-failed-preparation", createdAt: Date(),
+            modifiedAt: Date(), explicitlyModifiedAt: nil
+        )
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let generation = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation)
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: recordName
+        ))
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let synchronizer = makeSynchronizer(database: database,
+                                             recordZoneID: fixture.adapter.recordZoneID)
+        synchronizer.addModelAdapter(fixture.adapter)
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+        synchronizer.activeRunContext = reviewContext(synchronizer)
+        try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+        // Exercise the real failure handler's explicit flush, not just the
+        // debounced observer. Preparation itself has not committed provenance.
+        await synchronizer.failSynchronization(error: TestSynchronizationError.initialSetupFailed)
+        fixture.persistenceRealm.refresh()
+        fixture.targetRealm.refresh()
+        XCTAssertNil(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: recordName
+        ), "Failure cleanup must not forward a preparation-phase journal")
+        XCTAssertEqual(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation, generation)
+        await synchronizer.cancelSynchronizationAndWait()
+        let recovered = try await synchronizer.synchronize()
+        XCTAssertNotNil(recovered.receipt)
+        fixture.targetRealm.refresh()
+        XCTAssertTrue(fixture.targetRealm.objects(BigSyncPendingMutation.self).isEmpty)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     func testClosureMigrationPreparationKeepsObservedJournalsQueued() async throws {
         let fixture = try await reviewJournalBatch(count: 1)
         let recordName = BigSyncTrackedObject.className() + "." + fixture.2[0].id
