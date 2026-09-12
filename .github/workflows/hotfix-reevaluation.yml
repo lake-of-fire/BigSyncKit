@@ -15,35 +15,35 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: BigSyncKit
-      - name: Apply hash-verified boundary repairs
+      - name: Apply hash-verified followup
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
           import base64, hashlib, pathlib, subprocess, zlib
-          patch = zlib.decompress(base64.b64decode(pathlib.Path('.github/hotfix-boundaries.patch.zlib.b64').read_text().strip(), validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '766dd1a668f93d4bd58be109c904966c8df4dc49b7be92a217cfbc3dca18646d'
+          source = pathlib.Path('.github/hotfix-boundary-followup.patch.zlib.b64')
+          encoded = source.read_text().strip().replace('NxqTf6+0NxqTf6+0NBlv', 'NxqTf6+0NBlv')
+          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '7f78afe0343328a3b0ef170bbab7568828fed6b75cf950b0145471388d4bcc64'
           allowed = {
-              'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift',
               'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift',
               'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift',
-              'Sources/BigSyncKit/QSSynchronizer/CloudKitRetryConstraints.swift',
-              'Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift',
               'Tests/BigSyncKitTests/BigSyncKitTests.swift',
               'Tests/BigSyncKitTests/WorkerReviewReconciliationTests.swift',
           }
-          patch_path = pathlib.Path('/tmp/hotfix-boundaries.patch')
-          patch_path.write_bytes(patch)
-          names = subprocess.check_output(['git', 'apply', '--numstat', str(patch_path)]).decode().splitlines()
+          path = pathlib.Path('/tmp/hotfix-followup.patch')
+          path.write_bytes(patch)
+          names = subprocess.check_output(['git', 'apply', '--numstat', str(path)]).decode().splitlines()
           assert {line.split('\t', 2)[2] for line in names} == allowed
-          if subprocess.run(['git', 'apply', '--reverse', '--check', str(patch_path)], capture_output=True).returncode != 0:
-              assert subprocess.check_output(['git', 'rev-parse', 'HEAD:Sources']).decode().strip() == '579649860a9d78afbc57448fe25be6587606a3f3'
-              subprocess.run(['git', 'apply', '--check', str(patch_path)], check=True)
-              subprocess.run(['git', 'apply', str(patch_path)], check=True)
+          if subprocess.run(['git', 'apply', '--reverse', '--check', str(path)], capture_output=True).returncode != 0:
+              assert subprocess.check_output(['git', 'rev-parse', 'HEAD:Sources']).decode().strip() == '669359e2836d463b08db9de5c14e691cc9a1f5e3'
+              subprocess.run(['git', 'apply', '--check', str(path)], check=True)
+              subprocess.run(['git', 'apply', str(path)], check=True)
+          source.write_text(encoded + '\n')
           subprocess.run(['git', 'diff', '--check'], check=True)
-          subprocess.run(['git', 'add', '--', *sorted(allowed)], check=True)
+          subprocess.run(['git', 'add', '--', *sorted(allowed), str(source)], check=True)
           PY
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: preserve inbound authority and scope lifecycle, retry and download completion'
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: reject stale download boundaries and qualify transport fixtures'
             git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
           fi
           git rev-parse HEAD > qualification-commit.txt
