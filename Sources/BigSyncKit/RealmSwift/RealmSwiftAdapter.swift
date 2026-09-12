@@ -4,6 +4,12 @@
     }
 }
 
+/// A downloaded candidate became stale without a durable local generation to
+/// replace it. The page must be replayed; this is not a semantic quarantine.
+struct RealmSwiftInboundTargetChangedError: Error, Equatable, Sendable {
+    let recordName: String
+}
+
 enum RealmSwiftAdapterError: Error, LocalizedError {
     case setupUnavailable
     case malformedRecordIdentifier(recordName: String, entityType: String)
@@ -22,6 +28,9 @@ enum RealmSwiftAdapterError: Error, LocalizedError {
                 object.setValue(uuid, forKey: key)
             } else if value != nil {
                 throw malformed("a UUID string")
+            } else if property.isOptional {
+                try Task.checkCancellation()
+                object.setValue(nil, forKey: key)
             }
         } else if let asset = value as? CKAsset {
             if let fileURL = asset.fileURL,
@@ -36,7 +45,8 @@ enum RealmSwiftAdapterError: Error, LocalizedError {
                     continue
                 }
 
-                if property.type == PropertyType.object {
+                if property.type == PropertyType.object,
+                   !property.isArray, !property.isSet, !property.isMap {
                     if let target = object[property.name] as? Object {
                         let targetPrimaryKey = (type(of: target).primaryKey() ?? target.objectSchema.primaryKeyProperty?.name)!
                         let targetIdentifier = Self.getTargetObjectStringIdentifier(for: target, usingPrimaryKey: targetPrimaryKey)
@@ -61,7 +71,11 @@ enum RealmSwiftAdapterError: Error, LocalizedError {
                             ? nil
                             : try encodedCloudKitMap(mapValue) as CKRecordValue
                     } else {
-                        logger.warning("Warning: Unsupported recordToUpload map property type \(property.type) for \(String(describing: type(of: object)))")
+                        throw RealmSwiftRemoteRecordDecodingError.malformedField(
+                            recordName: syncedEntity.identifier,
+                            propertyName: property.name,
+                            expected: "a supported scalar Realm map for upload"
+                        )
                     }
                 } else if property.isArray {
                     // Array handling forked from IceCream: https://github.com/caiyue1993/IceCream/blob/b29dfe81e41cc929c8191c3266189a7070cb5bc5/IceCream/Classes/CKRecordConvertible.swift
@@ -77,6 +91,14 @@ enum RealmSwiftAdapterError: Error, LocalizedError {
                                                 ] = .preservedPendingLocal(
                                                     generation:
                                                         currentMutationGeneration
+                                                )
+                                            }
+                                            guard currentMutationGeneration != nil else {
+                                                // Derived metadata is not journaled user intent.
+                                                // Fail the page rather than acknowledge an
+                                                // unapplied server payload as unchanged.
+                                                throw RealmSwiftInboundTargetChangedError(
+                                                    recordName: candidate.syncedEntityID
                                                 )
                                             }
                                             logger.info(
