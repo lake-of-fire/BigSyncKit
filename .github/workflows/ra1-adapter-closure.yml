@@ -1,0 +1,93 @@
+name: RA1 adapter closure native
+on:
+  push:
+    branches: [codex/ra1-completion-20260912]
+    paths: [.github/workflows/ra1-adapter-closure.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Apply and commit exact reviewed source before testing
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_NAME" = codex/ra1-completion-20260912
+          python3 .github/ra1-adapter-closure.py
+          git diff --check
+          git add Sources Tests
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: preserve RA1 while closing UUID, collection and stale-selection adapter gaps'
+          git push origin HEAD:refs/heads/codex/ra1-completion-20260912
+          git diff --exit-code
+          git rev-parse HEAD > qualification-commit.txt
+          git rev-parse HEAD:Sources > qualification-source-tree.txt
+          git rev-parse HEAD:Tests > qualification-test-tree.txt
+          swift --version > qualification-toolchain.txt
+          sw_vers >> qualification-toolchain.txt
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Actual Realm adapter regressions and full library suite
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, subprocess, json, re, os
+          results = []
+          for name, args in [
+              ('focused', ['swift', 'test', '--filter', 'WorkerReviewReconciliationTests|testReevaluationNonJournaledImportCollisionRetainsPageForReplay|testReevaluationObjectCollectionsEncodeAndRoundTrip']),
+              ('full', ['swift', 'test'])
+          ]:
+              log = pathlib.Path('qualification-' + name + '.log')
+              with log.open('w') as f:
+                  code = subprocess.run(args, stdout=f, stderr=subprocess.STDOUT,
+                      env=dict(os.environ, BIGSYNC_RUN_MUTATION_BENCHMARK='1'), timeout=1100).returncode
+              text = log.read_text()
+              counts = [int(x) for x in re.findall(r'Executed (\d+) tests?', text)]
+              count = max(counts, default=0)
+              ok = code == 0 and count >= (12 if name == 'focused' else 350)
+              results.append(dict(name=name, exit_code=code, executed=count, passed=ok))
+              pathlib.Path('qualification-results.json').write_text(json.dumps(results, indent=2) + '\n')
+              print(name, code, count, ok, flush=True)
+              for line in text.splitlines():
+                  if ': error:' in line or line.startswith('error:') or 'Executed ' in line:
+                      print(line, flush=True)
+              if not ok: break
+          subprocess.run(['git', 'diff', '--exit-code'], check=True)
+          raise SystemExit(0 if len(results) == 2 and all(x['passed'] for x in results) else 1)
+          PY
+      - name: Archive exact committed source and dependency evidence
+        if: always()
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          git rev-parse HEAD > qualification-commit.txt
+          git archive --format=tar.gz -o qualification-source.tar.gz HEAD
+          git -C ../RealmSwiftGaps rev-parse HEAD > qualification-RealmSwiftGaps.txt || true
+          git -C ../SwiftUtilities rev-parse HEAD > qualification-SwiftUtilities.txt || true
+          test ! -f Package.resolved || cp Package.resolved qualification-Package.resolved
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ra1-adapter-closure
+          path: BigSyncKit/qualification-*
+          retention-days: 14
+          if-no-files-found: error
