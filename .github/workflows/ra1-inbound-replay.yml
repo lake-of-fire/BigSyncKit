@@ -1,4 +1,4 @@
-name: RA-1 inbound replay diagnostic
+name: RA-1 clean inbound replay qualification
 
 on:
   push:
@@ -6,37 +6,108 @@ on:
       - codex/ra1-bigsync-inbound-replay-20260912
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  qualify-and-publish:
     runs-on: macos-15
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.sha }}
+          repository: lake-of-fire/BigSyncKit
+          ref: codex/ra1-final-inbound-replay-20260912
+          path: BigSyncKit
           fetch-depth: 0
-      - name: Locate crash-recovery fixture and operation identity state
+          persist-credentials: true
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Apply bounded replay correction
+        working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          needles = ['testCrashRecoveryResendsTheSameLogicalGeneration', 'CrashRecoveryResends', 'SameLogicalGeneration', 'submittedOperationID', 'submittedOperation', 'operationID']
-          for root in [Path('Sources'), Path('Tests')]:
-              for f in root.rglob('*.swift'):
-                  s = f.read_text(errors='replace')
-                  hits = [n for n in needles if n in s]
-                  if not hits:
-                      continue
-                  print(f'=== {f} hits={hits} ===')
-                  lines = s.splitlines()
-                  emitted=set()
-                  for no,line in enumerate(lines,1):
-                      if any(n in line for n in needles):
-                          lo=max(1,no-20); hi=min(len(lines),no+40)
-                          key=(lo,hi)
-                          if key in emitted: continue
-                          emitted.add(key)
-                          for j in range(lo,hi+1): print(f'{j}: {lines[j-1]}')
-                          print()
+          p=Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift')
+          t=p.read_text()
+          old='''        if let migrationError = error as? ChangeFeedMigrationError,\n           migrationError.deletionKind == .encryptedDataReset {'''
+          new='''        if error is RealmSwiftInboundTargetChangedError {\n            // A non-journaled local write invalidated an inbound selection.\n            // The inbound page/cursor was not committed, so replay through an\n            // ordinary delayed synchronization rather than terminating the drain.\n            shouldRetry = true\n            retryDelay = 1\n        } else if let migrationError = error as? ChangeFeedMigrationError,\n           migrationError.deletionKind == .encryptedDataReset {'''
+          assert t.count(old)==1, t.count(old)
+          assert 'error is RealmSwiftInboundTargetChangedError' not in t
+          p.write_text(t.replace(old,new,1))
+          test=Path('Tests/BigSyncKitTests/RA1InboundReplayTests.swift')
+          assert not test.exists()
+          test.write_text(r'''import XCTest
+          @testable import BigSyncKit
+
+          extension BigSyncKitTests {
+              @BigSyncBackgroundActor
+              func testRA1InboundTargetChangedFailureSchedulesReplay() async throws {
+                  let synchronizer = makeSynchronizer()
+                  synchronizer.syncing = true
+                  synchronizer.synchronizationDrainIsActive = true
+                  let attemptID = synchronizer.synchronizationAttemptID
+                  let started = Date()
+
+                  await synchronizer.failSynchronization(
+                      error: RealmSwiftInboundTargetChangedError(
+                          recordName: "RA1ParityRecord.collision"
+                      )
+                  )
+
+                  XCTAssertEqual(synchronizer.synchronizationAttemptID, attemptID)
+                  XCTAssertTrue(synchronizer.syncing)
+                  let retryAt = try XCTUnwrap(synchronizer.retrySleepUntil)
+                  XCTAssertGreaterThanOrEqual(
+                      retryAt,
+                      started.addingTimeInterval(0.9),
+                      "A transient non-journaled target race must replay through a delayed ordinary sync"
+                  )
+
+                  synchronizer.cancelSynchronization()
+                  await synchronizer.cancelSynchronizationAndWait()
+              }
+          }
+          ''')
           PY
+      - name: Focused replay classification
+        working-directory: BigSyncKit
+        run: swift test --filter testRA1InboundTargetChangedFailureSchedulesReplay
+      - name: Existing real adapter collision and replay
+        working-directory: BigSyncKit
+        run: swift test --filter testNonJournaledTargetChangeRejectsOrdinaryAndForcedImportThenReplays
+      - name: Full BigSyncKit suite
+        id: full
+        continue-on-error: true
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        run: swift test 2>&1 | tee /tmp/bigsync-full.log
+      - name: Diagnose full-suite failure
+        if: steps.full.outcome != 'success'
+        working-directory: BigSyncKit
+        run: |
+          echo '=== failure excerpts ==='
+          grep -n -E 'failed|error:|CrashRecovery|LogicalGeneration|submittedOperation|operationID' /tmp/bigsync-full.log | tail -160 || true
+          echo '=== source occurrences ==='
+          git grep -n -E 'CrashRecovery|SameLogicalGeneration|submittedOperationID|submittedOperation' -- Sources Tests || true
+          exit 1
+      - name: Verify bounded diff and publish clean continuation
+        working-directory: BigSyncKit
+        run: |
+          git diff --check
+          test "$(git diff --name-only | sort | tr '\n' ' ')" = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/RA1InboundReplayTests.swift "
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/RA1InboundReplayTests.swift
+          git commit -m 'Replay transient inbound target races through ordinary sync'
+          git push origin HEAD:codex/ra1-final-inbound-replay-20260912
