@@ -13,27 +13,41 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: fix/hotfix-sync-reevaluation-20260912
+          ref: ${{ github.sha }}
           path: BigSyncKit
-      - name: Apply verified logical-state regression
+      - name: Apply hash-verified boundary repairs
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
           import base64, hashlib, pathlib, subprocess, zlib
-          patch = zlib.decompress(base64.b64decode(pathlib.Path('.github/hotfix-logical-state.patch.zlib.b64').read_text().strip(), validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '3f3b072bcca1452e9ef7cc51cdab08dae2da222457e550c86455576076ad05e8'
-          pathlib.Path('/tmp/logical-state.patch').write_bytes(patch)
-          if subprocess.run(['git', 'apply', '--reverse', '--check', '/tmp/logical-state.patch'], capture_output=True).returncode != 0:
-              subprocess.run(['git', 'apply', '--check', '/tmp/logical-state.patch'], check=True)
-              subprocess.run(['git', 'apply', '/tmp/logical-state.patch'], check=True)
+          patch = zlib.decompress(base64.b64decode(pathlib.Path('.github/hotfix-boundaries.patch.zlib.b64').read_text().strip(), validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '766dd1a668f93d4bd58be109c904966c8df4dc49b7be92a217cfbc3dca18646d'
+          allowed = {
+              'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift',
+              'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift',
+              'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift',
+              'Sources/BigSyncKit/QSSynchronizer/CloudKitRetryConstraints.swift',
+              'Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift',
+              'Tests/BigSyncKitTests/BigSyncKitTests.swift',
+              'Tests/BigSyncKitTests/WorkerReviewReconciliationTests.swift',
+          }
+          patch_path = pathlib.Path('/tmp/hotfix-boundaries.patch')
+          patch_path.write_bytes(patch)
+          names = subprocess.check_output(['git', 'apply', '--numstat', str(patch_path)]).decode().splitlines()
+          assert {line.split('\t', 2)[2] for line in names} == allowed
+          if subprocess.run(['git', 'apply', '--reverse', '--check', str(patch_path)], capture_output=True).returncode != 0:
+              assert subprocess.check_output(['git', 'rev-parse', 'HEAD:Sources']).decode().strip() == '579649860a9d78afbc57448fe25be6587606a3f3'
+              subprocess.run(['git', 'apply', '--check', str(patch_path)], check=True)
+              subprocess.run(['git', 'apply', str(patch_path)], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          subprocess.run(['git', 'add', '--', *sorted(allowed)], check=True)
           PY
-          git diff --check
-          git add Tests/BigSyncKitTests/BigSyncKitTests.swift
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: prove cold inspection preserves logical state beside live writers'
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: preserve inbound authority and scope lifecycle, retry and download completion'
             git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
           fi
           git rev-parse HEAD > qualification-commit.txt
+          git rev-parse HEAD:Sources > qualification-source-tree.txt
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/RealmSwiftGaps
@@ -48,17 +62,27 @@ jobs:
           persist-credentials: false
       - name: Toolchain
         working-directory: BigSyncKit
-        run: |
-          xcodebuild -version | tee qualification-toolchain.txt
-          swift --version | tee -a qualification-toolchain.txt
-      - name: Native focused regressions
+        run: swift --version > qualification-toolchain.txt
+      - name: Native boundary regressions
         id: focused
         continue-on-error: true
         working-directory: BigSyncKit
         run: |
-          set -o pipefail
-          swift test --filter 'testReevaluation|testTerminalPublicationEvidenceRestoresOnlyForExactTransportBoundary' 2>&1 | tee qualification-focused.log
-      - name: Full BigSyncKit suite including mutation benchmark
+          python3 - <<'PY'
+          import pathlib, subprocess, sys
+          path = pathlib.Path('qualification-focused.log')
+          with path.open('w') as output:
+              try:
+                  code = subprocess.run(['swift', 'test', '--filter', 'testReview|testReevaluation|testTerminalPublicationEvidenceRestoresOnlyForExactTransportBoundary'], stdout=output, stderr=subprocess.STDOUT, timeout=600).returncode
+              except subprocess.TimeoutExpired:
+                  output.write('\nQUALIFICATION_TIMEOUT: focused suite exceeded 600 seconds\n')
+                  code = 124
+          print(path.read_text()[-32000:])
+          sys.exit(code)
+          PY
+      - name: Full suite including mutation benchmark
+        id: full
+        continue-on-error: true
         env:
           BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
         working-directory: BigSyncKit
@@ -68,19 +92,13 @@ jobs:
           path = pathlib.Path('qualification-full.log')
           with path.open('w') as output:
               try:
-                  result = subprocess.run(['swift', 'test'], stdout=output, stderr=subprocess.STDOUT, timeout=600)
-                  code = result.returncode
+                  code = subprocess.run(['swift', 'test'], stdout=output, stderr=subprocess.STDOUT, timeout=600).returncode
               except subprocess.TimeoutExpired:
                   output.write('\nQUALIFICATION_TIMEOUT: full suite exceeded 600 seconds\n')
                   code = 124
-          print(path.read_text()[-24000:])
+          print(path.read_text()[-32000:])
           sys.exit(code)
           PY
-      - name: Require focused regressions
-        if: always()
-        env:
-          OUTCOME: ${{ steps.focused.outcome }}
-        run: test "$OUTCOME" = success
       - name: Archive exact tested source
         if: always()
         working-directory: BigSyncKit
@@ -93,3 +111,9 @@ jobs:
           name: hotfix-native-qualification
           path: BigSyncKit/qualification-*
           retention-days: 7
+      - name: Require every qualification stage
+        if: always()
+        env:
+          FOCUSED: ${{ steps.focused.outcome }}
+          FULL: ${{ steps.full.outcome }}
+        run: test "$FOCUSED" = success && test "$FULL" = success
