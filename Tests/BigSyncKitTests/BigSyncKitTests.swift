@@ -14080,11 +14080,11 @@ final class BigSyncKitTests: XCTestCase {
             replicaBindingGenerationIdentifier: nil,
             zoneOwnerName: cold.recordZoneID.ownerName, zoneName: cold.recordZoneID.zoneName,
             changeFeedEpoch: 0,
-            consumedServerBoundaryIdentifier: CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+            consumedServerBoundaryIdentifier: try XCTUnwrap(CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
                 containerIdentifier: "iCloud.test", databaseScope: .private,
                 accountScopeIdentifier: scope, replicaBindingGenerationIdentifier: nil,
                 recordZoneID: cold.recordZoneID, changeFeedEpoch: 0, cursorData: token
-            ), runID: UUID(), publishedAt: Date()
+            )), runID: UUID(), publishedAt: Date()
         )
         let beforeMarkers = fixture.persistenceRealm.objects(SyncedEntityType.self).count
         let opened = try await cold.preparePublicationRestorationInspection()
@@ -14170,11 +14170,11 @@ final class BigSyncKitTests: XCTestCase {
             domainScopeIdentifier: "disk-scope", accountScopeIdentifier: "disk-account",
             replicaBindingGenerationIdentifier: nil, zoneOwnerName: cold.recordZoneID.ownerName,
             zoneName: cold.recordZoneID.zoneName, changeFeedEpoch: 0,
-            consumedServerBoundaryIdentifier: CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+            consumedServerBoundaryIdentifier: try XCTUnwrap(CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
                 containerIdentifier: "iCloud.test", databaseScope: .private,
                 accountScopeIdentifier: "disk-account", replicaBindingGenerationIdentifier: nil,
                 recordZoneID: cold.recordZoneID, changeFeedEpoch: 0, cursorData: token
-            ), runID: UUID(), publishedAt: Date()
+            )), runID: UUID(), publishedAt: Date()
         )
         let opened = try await cold.preparePublicationRestorationInspection()
         let inspection = try XCTUnwrap(opened)
