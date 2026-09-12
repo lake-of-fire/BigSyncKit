@@ -1,0 +1,20 @@
+name: Hotfix reevaluation workspace
+on:
+  push:
+    branches: [fix/hotfix-sync-reevaluation-20260912]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Export source snapshot
+        run: git archive --format=tar.gz -o source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hotfix-source-snapshot
+          path: source.tar.gz
+          retention-days: 1
