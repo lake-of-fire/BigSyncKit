@@ -16,24 +16,25 @@ jobs:
         with:
           ref: fix/hotfix-sync-reevaluation-20260912
           path: BigSyncKit
-      - name: Apply checked repair
+      - name: Correct checked restoration fixtures
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
-          import base64, hashlib, pathlib, subprocess, zlib
-          capsule = pathlib.Path('.github/hotfix-reevaluation.patch.zlib.b64').read_text().strip()
-          capsule = capsule.replace('Uv9+eMTfwf', 'Uv9+MTfwf')
-          patch = zlib.decompress(base64.b64decode(capsule, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '04fd85ed80ddde2172f28550cdaa494b087f736820d86c4ec52fb7ff292642a3'
-          pathlib.Path('/tmp/hotfix.patch').write_bytes(patch)
-          if subprocess.run(['git', 'apply', '--reverse', '--check', '/tmp/hotfix.patch'], capture_output=True).returncode != 0:
-              subprocess.run(['git', 'apply', '--check', '/tmp/hotfix.patch'], check=True)
-              subprocess.run(['git', 'apply', '/tmp/hotfix.patch'], check=True)
+          from pathlib import Path
+          p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
+          s = p.read_text()
+          old = 'consumedServerBoundaryIdentifier: CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier('
+          new = 'consumedServerBoundaryIdentifier: try XCTUnwrap(CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier('
+          if old in s:
+              assert s.count(old) == 2
+              assert s.count('            ), runID: UUID(), publishedAt: Date()') == 2
+              s = s.replace(old, new).replace('            ), runID: UUID(), publishedAt: Date()', '            )), runID: UUID(), publishedAt: Date()')
+              p.write_text(s)
           PY
           git diff --check
-          git add Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift Tests/BigSyncKitTests/BigSyncKitTests.swift
+          git add Tests/BigSyncKitTests/BigSyncKitTests.swift
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: close hotfix import and publication lifecycle gaps'
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: unwrap restoration fixture boundary identifiers'
             git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
           fi
           git rev-parse HEAD > qualification-commit.txt
