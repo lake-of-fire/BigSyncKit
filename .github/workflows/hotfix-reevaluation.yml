@@ -15,22 +15,22 @@ jobs:
         with:
           ref: fix/hotfix-sync-reevaluation-20260912
           path: BigSyncKit
-      - name: Apply verified cold contract repair
+      - name: Apply verified logical-state regression
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
           import base64, hashlib, pathlib, subprocess, zlib
-          patch = zlib.decompress(base64.b64decode(pathlib.Path('.github/hotfix-cold-contract.patch.zlib.b64').read_text().strip(), validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '79a47d3a4639486e5e355100eae8d4b93b7af155f460179cdc12ba02e4bdf84e'
-          pathlib.Path('/tmp/cold-contract.patch').write_bytes(patch)
-          if subprocess.run(['git', 'apply', '--reverse', '--check', '/tmp/cold-contract.patch'], capture_output=True).returncode != 0:
-              subprocess.run(['git', 'apply', '--check', '/tmp/cold-contract.patch'], check=True)
-              subprocess.run(['git', 'apply', '/tmp/cold-contract.patch'], check=True)
+          patch = zlib.decompress(base64.b64decode(pathlib.Path('.github/hotfix-logical-state.patch.zlib.b64').read_text().strip(), validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '3f3b072bcca1452e9ef7cc51cdab08dae2da222457e550c86455576076ad05e8'
+          pathlib.Path('/tmp/logical-state.patch').write_bytes(patch)
+          if subprocess.run(['git', 'apply', '--reverse', '--check', '/tmp/logical-state.patch'], capture_output=True).returncode != 0:
+              subprocess.run(['git', 'apply', '--check', '/tmp/logical-state.patch'], check=True)
+              subprocess.run(['git', 'apply', '/tmp/logical-state.patch'], check=True)
           PY
           git diff --check
-          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift Tests/BigSyncKitTests/BigSyncKitTests.swift Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
+          git add Tests/BigSyncKitTests/BigSyncKitTests.swift
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: preserve cold inspection admission and Realm writer coordination'
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: prove cold inspection preserves logical state beside live writers'
             git push origin HEAD:refs/heads/fix/hotfix-sync-reevaluation-20260912
           fi
           git rev-parse HEAD > qualification-commit.txt
@@ -58,7 +58,9 @@ jobs:
         run: |
           set -o pipefail
           swift test --filter 'testReevaluation|testTerminalPublicationEvidenceRestoresOnlyForExactTransportBoundary' 2>&1 | tee qualification-focused.log
-      - name: Full BigSyncKit suite
+      - name: Full BigSyncKit suite including mutation benchmark
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
@@ -82,7 +84,9 @@ jobs:
       - name: Archive exact tested source
         if: always()
         working-directory: BigSyncKit
-        run: git archive --format=tar.gz -o qualification-source.tar.gz HEAD
+        run: |
+          cp Package.resolved qualification-Package.resolved
+          git archive --format=tar.gz -o qualification-source.tar.gz HEAD
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
