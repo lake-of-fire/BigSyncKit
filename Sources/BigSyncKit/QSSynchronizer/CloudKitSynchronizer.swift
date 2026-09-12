@@ -616,9 +616,21 @@ final class AccountScopeAuthorityFence: @unchecked Sendable {
     private let lock = NSLock()
     private var isPoisoned = true
     private var rotatesGeneration = false
+    private var invalidationGeneration: UInt64 = 0
+
+    /// Initial writer authority is closed until normal account validation.
+    /// Read-only publication inspection may still verify saved evidence then;
+    /// an actual subsequent invalidation must reject or supersede that probe.
+    var publicationInspectionGeneration: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isPoisoned || invalidationGeneration == 0 else { return nil }
+        return invalidationGeneration
+    }
 
     func poison(requiresGenerationRotation: Bool = true) {
         lock.lock()
+        invalidationGeneration += 1
         isPoisoned = true
         rotatesGeneration = rotatesGeneration || requiresGenerationRotation
         lock.unlock()
@@ -753,7 +765,44 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
+    /// Identity of a terminal outcome, including blocked outcomes. This is
+    /// not a success receipt and cannot authorize destructive transport work.
+    public struct TerminalSynchronizationBoundary: Sendable, Equatable {
+        public let accountScopeIdentifier: String
+        public let replicaBindingGenerationIdentifier: String?
+        public let runID: UUID
+        public let consumedServerBoundaryIdentifier: String?
+
+        public init(
+            accountScopeIdentifier: String,
+            replicaBindingGenerationIdentifier: String?,
+            runID: UUID,
+            consumedServerBoundaryIdentifier: String?
+        ) {
+            self.accountScopeIdentifier = accountScopeIdentifier
+            self.replicaBindingGenerationIdentifier = replicaBindingGenerationIdentifier
+            self.runID = runID
+            self.consumedServerBoundaryIdentifier = consumedServerBoundaryIdentifier
+        }
+
+        internal init(_ receipt: SynchronizationReceipt) {
+            self.init(
+                accountScopeIdentifier: receipt.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier: receipt.replicaBindingGenerationIdentifier,
+                runID: receipt.runID,
+                consumedServerBoundaryIdentifier: receipt.consumedServerBoundaryIdentifier
+            )
+        }
+    }
+
     public struct SynchronizationResult: Sendable, Equatable {
+        public enum CompletionScope: Sendable, Equatable {
+            case fullSynchronization
+            /// Inbound work completed; local upload work may remain. This
+            /// result cannot authorize reset, cutover or full publication.
+            case downloadOnly
+        }
+
         public enum PublicationState: Sendable, Equatable {
             case complete
             case blocked([DomainBlocker])
@@ -762,19 +811,35 @@ public class CloudKitSynchronizer: NSObject {
         public let didImportChanges: Bool
         public let receipt: SynchronizationReceipt?
         public let publicationState: PublicationState
+        public let completionScope: CompletionScope
+        public let terminalBoundary: TerminalSynchronizationBoundary?
 
         public init(
             didImportChanges: Bool,
             receipt: SynchronizationReceipt? = nil,
-            publicationState: PublicationState = .complete
+            publicationState: PublicationState = .complete,
+            terminalBoundary: TerminalSynchronizationBoundary? = nil,
+            completionScope: CompletionScope = .fullSynchronization
         ) {
+            precondition(
+                completionScope == .fullSynchronization || receipt == nil,
+                "Download-only completion cannot carry full-drain authorization"
+            )
             precondition(
                 publicationState == .complete || receipt == nil,
                 "A semantically blocked synchronization cannot publish a terminal receipt"
             )
+            let receiptBoundary = receipt.map(TerminalSynchronizationBoundary.init)
+            precondition(
+                receiptBoundary == nil || terminalBoundary == nil
+                    || receiptBoundary == terminalBoundary,
+                "A terminal boundary must match its success receipt"
+            )
             self.didImportChanges = didImportChanges
             self.receipt = receipt
             self.publicationState = publicationState
+            self.completionScope = completionScope
+            self.terminalBoundary = terminalBoundary ?? receiptBoundary
         }
     }
 
@@ -822,6 +887,10 @@ public class CloudKitSynchronizer: NSObject {
         case cancelled = 3
         /// Synchronization cannot start until an iCloud account is available.
         case notAuthenticated = 4
+        /// The inbound cursor changed during download-only domain reconciliation.
+        /// No result or full-drain authorization was published; a new download
+        /// may retry the now-current boundary.
+        case inboundBoundaryChanged = 5
     }
     
     /// `CloudKitSynchronizer` can be configured to only download changes, never uploading local changes to CloudKit.
@@ -860,6 +929,11 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationWillConsumeServerChangesHandler:
         SynchronizationWillConsumeServerChangesHandler?
     internal var domainPrepublicationHandler: DomainPrepublicationHandler?
+    /// Once per terminal drain, before its waiters are resumed. The handler
+    /// must not synchronously await a new synchronize() on this synchronizer.
+    internal var synchronizationCompletionHandler:
+        BigSyncBackgroundWorkerConfiguration.SynchronizationCompletionHandler?
+    private var completingPublicationAttemptID: UUID?
     internal var domainPublicationScopeIdentifierProvider:
         DomainPublicationScopeIdentifierProvider?
     private let backupDetectionBaseURL: URL?
@@ -1016,6 +1090,12 @@ public class CloudKitSynchronizer: NSObject {
     
     /// Whether the synchronizer will only download data or also upload any local changes.
     public var syncMode: SynchronizeMode = .sync
+    // Configuration changes during a suspension apply to the next logical
+    // drain, never to the completion authority of an already-running one.
+    internal var synchronizationDrainMode: SynchronizeMode?
+    internal var activeSynchronizationMode: SynchronizeMode {
+        synchronizationDrainMode ?? syncMode
+    }
     
 //    @BigSyncBackgroundActor
     public var delegate: CloudKitSynchronizerDelegate?
@@ -1658,6 +1738,7 @@ public class CloudKitSynchronizer: NSObject {
         if !synchronizationDrainIsActive {
             synchronizationDrainIsActive = true
             synchronizationDrainDidImportChanges = false
+            synchronizationDrainMode = syncMode
         }
         cancelSync = false
         syncing = true
@@ -2109,10 +2190,48 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
+    internal func publishSynchronizationResult(
+        _ result: SynchronizationResult,
+        context: RunContext
+    ) async {
+        guard synchronizationDrainIsActive,
+              completingPublicationAttemptID == nil else { return }
+        completingPublicationAttemptID = context.attemptID
+        defer {
+            if completingPublicationAttemptID == context.attemptID {
+                completingPublicationAttemptID = nil
+            }
+        }
+        await synchronizationCompletionHandler?(result)
+        // Cancellation/account replacement may cross the domain await. The
+        // cancellation path already released this drain's waiters; never
+        // release or clear a replacement run's state here.
+        do {
+            try checkRunContext(context)
+        } catch {
+            settleCancellation(ifOwnedBy: context.attemptID)
+            return
+        }
+        let needsFollowUp = synchronizationRequestedWhileRunning
+            && result.completionScope == .fullSynchronization
+        finishSynchronizationDrain(with: .success(result))
+        syncing = false
+        synchronizationTask = nil
+        if result.publicationState == .complete {
+            postNotification(.SynchronizerDidSynchronize)
+            delegate?.synchronizerDidSync(self)
+        }
+        // A notification observer may already have started the follow-up.
+        if needsFollowUp, !syncing, !cancelSync {
+            beginSynchronization()
+        }
+    }
+
     internal func finishSynchronizationDrain(
         with result: Result<SynchronizationResult, Error>
     ) {
         synchronizationDrainIsActive = false
+        synchronizationDrainMode = nil
         synchronizationRequestedWhileRunning = false
         let waiters = synchronizationWaiters.values
         synchronizationWaiters.removeAll(keepingCapacity: false)

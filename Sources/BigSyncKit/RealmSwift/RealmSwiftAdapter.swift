@@ -43,6 +43,12 @@ enum BigSyncCloudKitRecordNameError: Error, Equatable, LocalizedError {
     }
 }
 
+/// A downloaded candidate became stale without a durable local generation to
+/// replace it. The page must be replayed; this is not a semantic quarantine.
+struct RealmSwiftInboundTargetChangedError: Error, Equatable, Sendable {
+    let recordName: String
+}
+
 enum RealmSwiftAdapterError: Error, LocalizedError {
     case setupUnavailable
     case malformedRecordIdentifier(recordName: String, entityType: String)
@@ -1058,6 +1064,129 @@ public final class RealmSwiftAdapter:
                 return lhs.entityType < rhs.entityType
             }
             return lhs.recordName < rhs.recordName
+        }
+    }
+
+    /// Captures inspection configurations without opening the operational
+    /// provider, starting observers, or discovering/forwarding mutations.
+    /// Inspection performs no writes, but retains each Realm's coordinated
+    /// access mode: an immutable readOnly open is unsafe beside live writers.
+    /// Only existing files at the exact schema version are eligible.
+    @BigSyncBackgroundActor
+    func preparePublicationRestorationInspection() async throws
+        -> PublicationRestorationInspection? {
+        func inspectionConfiguration(_ configuration: Realm.Configuration)
+            -> Realm.Configuration? {
+            var inspection = configuration
+            if configuration.inMemoryIdentifier == nil {
+                guard let url = configuration.fileURL,
+                      FileManager.default.fileExists(atPath: url.path) else {
+                    return nil
+                }
+                guard (try? schemaVersionAtURL(url)) == configuration.schemaVersion
+                else { return nil }
+                inspection.migrationBlock = nil
+                inspection.shouldCompactOnLaunch = nil
+                inspection.deleteRealmIfMigrationNeeded = false
+                inspection.seedFilePath = nil
+            }
+            return inspection
+        }
+        guard let persistence = inspectionConfiguration(persistenceRealmConfiguration)
+        else { return nil }
+        var targets = [Realm.Configuration]()
+        for configuration in targetRealmConfigurations {
+            guard let target = inspectionConfiguration(configuration) else { return nil }
+            targets.append(target)
+        }
+        return PublicationRestorationInspection(
+            adapter: self,
+            persistenceConfiguration: persistence,
+            targetConfigurations: targets
+        )
+    }
+
+    @BigSyncBackgroundActor
+    struct PublicationRestorationInspection {
+        fileprivate let adapter: RealmSwiftAdapter
+        fileprivate let persistenceConfiguration: Realm.Configuration
+        fileprivate let targetConfigurations: [Realm.Configuration]
+
+        /// Non-suspending final inspection, after account revalidation. These
+        /// views never become the operational adapter's setup-completion flag.
+        func matches(
+            _ evidence: BigSyncDurablePublicationEvidence,
+            containerIdentifier: String,
+            databaseScope: CKDatabase.Scope
+        ) throws -> Bool {
+            // Drain Objective-C autoreleases here as well as Swift references.
+            // Inspection must not retain old snapshots or prolong Realm
+            // handles beyond the non-suspending local cutoff.
+            return try autoreleasepool {
+                try Task.checkCancellation()
+                guard adapter.recordZoneID.ownerName == evidence.zoneOwnerName,
+                      adapter.recordZoneID.zoneName == evidence.zoneName else {
+                    return false
+                }
+                // Recheck existence/version after suspended account work, before
+                // any open. No operational adapter setup, migration callbacks,
+                // compaction, seed copying, or model mutations occur here.
+                for configuration in [persistenceConfiguration] + targetConfigurations {
+                    if configuration.inMemoryIdentifier == nil {
+                        guard let url = configuration.fileURL,
+                              FileManager.default.fileExists(atPath: url.path),
+                              (try? schemaVersionAtURL(url)) == configuration.schemaVersion
+                        else { return false }
+                    }
+                }
+                let persistenceRealm = try Realm(configuration: persistenceConfiguration)
+                for configuration in targetConfigurations {
+                    let realm = try Realm(configuration: configuration)
+                    if !configuration.readOnly { realm.refresh() }
+                    for mutation in realm.objects(BigSyncPendingMutation.self) {
+                        guard adapter.isOwnedEntityType(mutation.entityType),
+                              mutation.replicaBindingGenerationIdentifier
+                                == evidence.replicaBindingGenerationIdentifier
+                        else { continue }
+                        if adapter.accountScopePropertyByClassName[mutation.entityType] == nil
+                            || mutation.accountScopeIdentifier == evidence.accountScopeIdentifier {
+                            return false
+                        }
+                    }
+                }
+                if !persistenceConfiguration.readOnly { persistenceRealm.refresh() }
+                let rebuild = persistenceRealm.object(
+                    ofType: RebuildProvenanceState.self,
+                    forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+                )
+                guard rebuild?.isActive != true,
+                      (rebuild?.epoch ?? 0) == evidence.changeFeedEpoch else {
+                    return false
+                }
+                for entity in persistenceRealm.objects(SyncedEntity.self) {
+                    guard adapter.isOwnedEntityType(entity.entityType),
+                          entity.pendingReplicaBindingGenerationIdentifier
+                            == evidence.replicaBindingGenerationIdentifier else { continue }
+                    switch entity.entityState {
+                    case .new, .changed, .deletedLocally:
+                        return false
+                    default:
+                        break
+                    }
+                }
+                guard let token = persistenceRealm.objects(ServerToken.self).first?.token
+                else { return false }
+                return CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+                    containerIdentifier: containerIdentifier,
+                    databaseScope: databaseScope,
+                    accountScopeIdentifier: evidence.accountScopeIdentifier,
+                    replicaBindingGenerationIdentifier:
+                        evidence.replicaBindingGenerationIdentifier,
+                    recordZoneID: adapter.recordZoneID,
+                    changeFeedEpoch: evidence.changeFeedEpoch,
+                    cursorData: token
+                ) == evidence.consumedServerBoundaryIdentifier
+            }
         }
     }
 
@@ -3382,7 +3511,8 @@ public final class RealmSwiftAdapter:
         to object: Object,
         syncedEntityID: String,
         syncedEntityState: SyncedEntityState,
-        entityType: String
+        entityType: String,
+        isNewlyCreatedReceiver: Bool
     ) throws -> [PendingRelationshipRequest] {
         let objectProperties = object.objectSchema.properties
         var pendingRelationships = [PendingRelationshipRequest]()
@@ -3417,9 +3547,15 @@ public final class RealmSwiftAdapter:
             }
         }
 
-        if mergePolicy == .server
+        if isNewlyCreatedReceiver
+            || mergePolicy == .server
             || syncedEntityState == .deletedRemotely
             || syncedEntityState == .recreatingRemotely {
+            // A receiver created solely for this admitted inbound record has
+            // no local revision to resolve. Constructor timestamps/defaults
+            // must never become journaled local authority. Identity, semantic
+            // validation and pending-generation fences ran before creation;
+            // property processing still runs through the ordinary decoder.
             // A live record delivered after a remote deletion is a recreation
             // in CloudKit change-feed order. The prior tombstone is not a
             // competing local edit, so it must not win timestamp conflict
@@ -3939,6 +4075,13 @@ public final class RealmSwiftAdapter:
                 object.setValue(uuid, forKey: key)
             } else if value != nil {
                 throw malformed("a UUID string")
+            } else if property.isOptional {
+                // The change feed supplies full records (desiredKeys: nil).
+                // Absence clears an optional scalar just as it does in the
+                // generic decoder. Missing nonoptional fields deliberately
+                // retain their compatibility default for older records.
+                try Task.checkCancellation()
+                object.setValue(nil, forKey: key)
             }
         } else if let asset = value as? CKAsset {
             if let fileURL = asset.fileURL,
@@ -5543,7 +5686,8 @@ public final class RealmSwiftAdapter:
                     continue
                 }
 
-                if property.type == PropertyType.object {
+                if property.type == PropertyType.object,
+                   !property.isArray, !property.isSet, !property.isMap {
                     if let target = object[property.name] as? Object {
                         let targetPrimaryKey = (type(of: target).primaryKey() ?? target.objectSchema.primaryKeyProperty?.name)!
                         let targetIdentifier = Self.getTargetObjectStringIdentifier(for: target, usingPrimaryKey: targetPrimaryKey)
@@ -5665,7 +5809,11 @@ public final class RealmSwiftAdapter:
                             ? nil
                             : try encodedCloudKitMap(mapValue) as CKRecordValue
                     } else {
-                        logger.warning("Warning: Unsupported recordToUpload map property type \(property.type) for \(String(describing: type(of: object)))")
+                        throw RealmSwiftRemoteRecordDecodingError.malformedField(
+                            recordName: syncedEntity.identifier,
+                            propertyName: property.name,
+                            expected: "a supported scalar Realm map for upload"
+                        )
                     }
                 } else if property.isArray {
                     // Array handling forked from IceCream: https://github.com/caiyue1993/IceCream/blob/b29dfe81e41cc929c8191c3266189a7070cb5bc5/IceCream/Classes/CKRecordConvertible.swift
@@ -6557,6 +6705,14 @@ public final class RealmSwiftAdapter:
                                                         currentMutationGeneration
                                                 )
                                             }
+                                            guard currentMutationGeneration != nil else {
+                                                // A derived/cache write may change timestamps
+                                                // without journaling user intent. Do not advance
+                                                // the cursor over an unapplied server payload.
+                                                throw RealmSwiftInboundTargetChangedError(
+                                                    recordName: candidate.syncedEntityID
+                                                )
+                                            }
                                             logger.info(
                                                 "QSCloudKitSynchronizer >> Skipped downloaded record after a newer local mutation: \(candidate.syncedEntityID)"
                                             )
@@ -6595,7 +6751,8 @@ public final class RealmSwiftAdapter:
                                         }
                                         try Task.checkCancellation()
 
-                                        if object == nil {
+                                        let isNewlyCreatedReceiver = object == nil
+                                        if isNewlyCreatedReceiver {
                                             object = candidate.objectType.init()
                                             try Task.checkCancellation()
 
@@ -6619,7 +6776,8 @@ public final class RealmSwiftAdapter:
                                                     to: object,
                                                     syncedEntityID: candidate.syncedEntityID,
                                                     syncedEntityState: candidate.syncedEntityState,
-                                                    entityType: candidate.entityType
+                                                    entityType: candidate.entityType,
+                                                    isNewlyCreatedReceiver: isNewlyCreatedReceiver
                                                 )
                                             )
                                             appliedRecordNames.insert(

@@ -167,6 +167,8 @@ extension CloudKitSynchronizer {
                 return .higherModelVersion
             case .cancelled:
                 return .idle
+            case .inboundBoundaryChanged:
+                return .failed
             }
         }
         if error is ChangeFeedMigrationError {

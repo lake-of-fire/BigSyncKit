@@ -1,0 +1,57 @@
+name: Complete hotfix register qualification
+on:
+  push:
+    branches: [fix/hotfix-register-closure-20260912]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: hotfix-register-closure
+  cancel-in-progress: false
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record immutable qualification inputs
+        working-directory: BigSyncKit
+        run: |
+          git diff --exit-code
+          git rev-parse HEAD > qualification-commit.txt
+          git rev-parse HEAD:Sources > qualification-source-tree.txt
+          swift --version > qualification-toolchain.txt
+          sw_vers >> qualification-toolchain.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > qualification-RealmSwiftGaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > qualification-SwiftUtilities.txt
+      - name: Native regressions, full suite and repetitions
+        working-directory: BigSyncKit
+        run: python3 .github/qualify-register.py
+      - name: Archive exact committed source
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD > qualification-commit.txt
+          git archive --format=tar.gz -o qualification-source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hotfix-register-closure
+          path: BigSyncKit/qualification-*
+          retention-days: 14

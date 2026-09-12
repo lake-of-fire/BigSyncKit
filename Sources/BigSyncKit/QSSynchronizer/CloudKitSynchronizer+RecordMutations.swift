@@ -76,6 +76,25 @@ extension CloudKitSynchronizer {
         )
     }
 
+    /// Every immediate retry strictly reduces the attempted multi-item size.
+    /// Keep that ceiling for this drain so successful pieces do not regrow
+    /// into the rejected request. No journal generation is acknowledged here.
+    @BigSyncBackgroundActor
+    private func retrySmallerMutationBatch(
+        after error: Error,
+        attemptedCount: Int,
+        ceiling: inout Int?
+    ) -> Bool {
+        let constraints = CloudKitRetryConstraints(error)
+        guard constraints.codes.contains(.limitExceeded) else { return false }
+        let reduced = max(1, attemptedCount / 2)
+        batchSize = min(batchSize, reduced)
+        ceiling = min(ceiling ?? batchSize, batchSize)
+        return attemptedCount > 1
+            && constraints.containsOnlySizeLimitFailures
+            && !constraints.requiresDeferredRetry
+    }
+
     @BigSyncBackgroundActor
     func uploadRecordsUsingAsyncStore(
         adapter: ModelAdapter,
@@ -102,9 +121,10 @@ extension CloudKitSynchronizer {
         attemptID: UUID
     ) async throws {
         var retryBudget = HandledMutationRetryBudget()
+        var sizeLimitCeiling: Int?
         while true {
             try checkSynchronizationAttempt(attemptID)
-            let requestedBatchSize = batchSize
+            let requestedBatchSize = min(batchSize, sizeLimitCeiling ?? batchSize)
             let prepared = try await adapter.preparedRecordsToUpload(
                 limit: requestedBatchSize,
                 restrictedToEntityType: restrictedToEntityType
@@ -130,12 +150,26 @@ extension CloudKitSynchronizer {
 
             addMetadata(to: records)
             try await revalidateActiveRunContext(for: attemptID)
-            let mutationResults = try await recordStore.modifyRecords(
-                saving: records,
-                deleting: [],
-                savePolicy: .ifServerRecordUnchanged,
-                atomically: false
-            )
+            let mutationResults: CloudKitRecordMutationResults
+            do {
+                mutationResults = try await recordStore.modifyRecords(
+                    saving: records,
+                    deleting: [],
+                    savePolicy: .ifServerRecordUnchanged,
+                    atomically: false
+                )
+            } catch {
+                try checkSynchronizationAttempt(attemptID)
+                if let context = activeRunContext { try checkRunContext(context) }
+                guard retrySmallerMutationBatch(
+                    after: error, attemptedCount: records.count,
+                    ceiling: &sizeLimitCeiling
+                ) else { throw error }
+                // Only pure, reducible limits retry here. Account stops,
+                // server delays and unrelated failures retain the outer path.
+                try await revalidateActiveRunContext(for: attemptID)
+                continue
+            }
             try Task.checkCancellation()
             try await revalidateActiveRunContext(for: attemptID)
 
@@ -231,18 +265,20 @@ extension CloudKitSynchronizer {
             }
 
             guard unresolvedFailures.isEmpty else {
-                if unresolvedFailures.values.contains(where: {
-                    $0.domain == CKErrorDomain
-                        && $0.code == CKError.limitExceeded.rawValue
-                }) {
-                    reduceBatchSize()
+                let error = partialMutationError(unresolvedFailures)
+                if retrySmallerMutationBatch(
+                    after: error, attemptedCount: records.count,
+                    ceiling: &sizeLimitCeiling
+                ) {
+                    await Task.yield()
+                    continue
                 }
-                throw partialMutationError(unresolvedFailures)
+                throw error
             }
 
             let handledFailures = missingRecordIDs.count
                 + conflictedRecordsByID.count
-            if handledFailures == 0,
+            if sizeLimitCeiling == nil, handledFailures == 0,
                records.count >= requestedBatchSize {
                 increaseBatchSize()
             }
@@ -278,9 +314,10 @@ extension CloudKitSynchronizer {
         attemptID: UUID
     ) async throws {
         var retryBudget = HandledMutationRetryBudget()
+        var sizeLimitCeiling: Int?
         while true {
             try checkSynchronizationAttempt(attemptID)
-            let requestedBatchSize = batchSize
+            let requestedBatchSize = min(batchSize, sizeLimitCeiling ?? batchSize)
             let prepared = try await adapter.preparedRecordDeletions(
                 limit: requestedBatchSize,
                 restrictedToEntityType: restrictedToEntityType
@@ -294,12 +331,26 @@ extension CloudKitSynchronizer {
                 $0[$1.recordID.recordName] = generation
             }
             try await revalidateActiveRunContext(for: attemptID)
-            let mutationResults = try await recordStore.modifyRecords(
-                saving: [],
-                deleting: recordIDs,
-                savePolicy: .ifServerRecordUnchanged,
-                atomically: false
-            )
+            let mutationResults: CloudKitRecordMutationResults
+            do {
+                mutationResults = try await recordStore.modifyRecords(
+                    saving: [],
+                    deleting: recordIDs,
+                    savePolicy: .ifServerRecordUnchanged,
+                    atomically: false
+                )
+            } catch {
+                try checkSynchronizationAttempt(attemptID)
+                if let context = activeRunContext { try checkRunContext(context) }
+                guard retrySmallerMutationBatch(
+                    after: error, attemptedCount: recordIDs.count,
+                    ceiling: &sizeLimitCeiling
+                ) else { throw error }
+                // Only pure, reducible limits retry here. Account stops,
+                // server delays and unrelated failures retain the outer path.
+                try await revalidateActiveRunContext(for: attemptID)
+                continue
+            }
             try Task.checkCancellation()
             try await revalidateActiveRunContext(for: attemptID)
 
@@ -373,16 +424,19 @@ extension CloudKitSynchronizer {
                 try await revalidateActiveRunContext(for: attemptID)
             }
             guard unresolvedFailures.isEmpty else {
-                if unresolvedFailures.values.contains(where: {
-                    $0.domain == CKErrorDomain
-                        && $0.code == CKError.limitExceeded.rawValue
-                }) {
-                    reduceBatchSize()
+                let error = partialMutationError(unresolvedFailures)
+                if retrySmallerMutationBatch(
+                    after: error, attemptedCount: recordIDs.count,
+                    ceiling: &sizeLimitCeiling
+                ) {
+                    await Task.yield()
+                    continue
                 }
-                throw partialMutationError(unresolvedFailures)
+                throw error
             }
             let handledFailures = conflictedRecordsByID.count
-            if handledFailures == 0, recordIDs.count >= requestedBatchSize {
+            if sizeLimitCeiling == nil, handledFailures == 0,
+               recordIDs.count >= requestedBatchSize {
                 increaseBatchSize()
             }
             guard handledFailures > 0 || recordIDs.count >= requestedBatchSize else { return }
