@@ -466,6 +466,7 @@ public actor BigSyncBackgroundActor {
     }
 
 #if DEBUG
+    @BigSyncBackgroundActor
     private func recordRestoredPublicationEvidence(
         _ evidence: BigSyncDurablePublicationEvidence?
     ) {
