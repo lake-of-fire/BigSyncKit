@@ -15,7 +15,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: BigSyncKit
-      - name: Qualify synchronous inspection fixtures
+      - name: Bind retained fixtures to the test actor
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
@@ -23,8 +23,8 @@ jobs:
           p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
           s = p.read_text()
           for name in ['warmTarget', 'targetRealm']:
-              old = 'let ' + name + ' = try Realm(configuration: target)'
-              new = 'let ' + name + ' = try autoreleasepool { try Realm(configuration: target) }'
+              old = 'let ' + name + ' = try autoreleasepool { try Realm(configuration: target) }'
+              new = 'let ' + name + ' = try await Realm(configuration: target, actor: BigSyncBackgroundActor.shared)'
               if old in s:
                   assert s.count(old) == 1
                   s = s.replace(old, new)
@@ -33,7 +33,7 @@ jobs:
           git diff --check
           git add Tests
           if ! git diff --cached --quiet; then
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: open scoped Realm inspection fixtures synchronously'
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: use actor-bound retained Realm fixtures'
             git push origin HEAD:refs/heads/fix/hotfix-sync-deeper-20260912
           fi
           git rev-parse HEAD > qualification-commit.txt
@@ -58,7 +58,7 @@ jobs:
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
-          import pathlib, subprocess, sys
+          import pathlib, re, subprocess, sys
           failed = False
           for name, args in [('focused', ['swift', 'test', '--filter', 'testReevaluation']), ('full', ['swift', 'test'])]:
               path = pathlib.Path('qualification-' + name + '.log')
@@ -69,7 +69,7 @@ jobs:
                       output.write('\nQUALIFICATION_TIMEOUT\n')
                       code = 124
               print(name, 'exit', code)
-              print('\n'.join(line for line in path.read_text().splitlines() if 'error:' in line or 'Executed ' in line or ' failed ' in line))
+              print('\n'.join(line for line in path.read_text().splitlines() if re.search(r': error:|^error:|Executed | failed ', line)))
               failed |= code != 0
           sys.exit(1 if failed else 0)
           PY
