@@ -37,7 +37,9 @@ private struct RA1DomainValue: Equatable, Sendable {
 private final class RA1OwnedRevisionObject: Object, ChangeMetadataRecordable,
     BigSyncStringEncodedIntegerModel, BigSyncInboundSemanticRecordValidating,
     BigSyncInboundSemanticReplacementValidating,
-    BigSyncOutboundSemanticObjectValidating, BigSyncRetainsSyncedTombstone {
+    BigSyncOutboundSemanticObjectValidating, BigSyncRetainsSyncedTombstone,
+    BigSyncInboundSemanticDeletionValidating, BigSyncRestoredObjectRecovering,
+    SyncSkippablePropertiesModel {
     static let bigSyncStringEncodedIntegerPropertyNames: Set<String> = [
         "stateRevision", "characters", "activeMicroseconds",
     ]
@@ -53,7 +55,30 @@ private final class RA1OwnedRevisionObject: Object, ChangeMetadataRecordable,
     @Persisted var modifiedAt = Date()
     @Persisted var explicitlyModifiedAt: Date?
     @Persisted var isDeleted = false
+    @Persisted var isAwaitingRecoveryEvidence = false
     var retainsSyncedTombstone: Bool { true }
+    func skipSyncingProperties() -> Set<String>? { ["isAwaitingRecoveryEvidence"] }
+
+    func retainForRestoreRecovery() throws {
+        guard realm?.isInWriteTransaction == true else {
+            throw BigSyncMutationJournalError.writeTransactionRequired
+        }
+        isAwaitingRecoveryEvidence = true
+    }
+
+    func admitAfterServerEvidence() throws {
+        guard realm?.isInWriteTransaction == true else {
+            throw BigSyncMutationJournalError.writeTransactionRequired
+        }
+        isAwaitingRecoveryEvidence = false
+    }
+
+    static func validateInboundSemanticDeletion(
+        _ recordID: CKRecord.ID, existingObject: Object?
+    ) throws {
+        // Retaining local tombstones alone does not reject an incoming hard delete.
+        throw RA1RevisionError.invalidPayload
+    }
 
     var domain: RA1DomainValue {
         RA1DomainValue(owner: owner, key: logicalKey, revision: stateRevision,
@@ -119,6 +144,9 @@ private final class RA1OwnedRevisionObject: Object, ChangeMetadataRecordable,
               incoming.owner == local.owner, incoming.key == local.key else {
             throw RA1RevisionError.changedIdentity
         }
+        // Copied bytes are not current authored authority. This mirrors W3's
+        // restore admission, including equal-revision server re-admission.
+        if existing.isAwaitingRecoveryEvidence { return .preferIncomingRecord }
         if incoming.revision > local.revision { return .preferIncomingRecord }
         if incoming.revision < local.revision { return .preferExistingObject }
         guard incoming == local else { throw RA1RevisionError.divergentEqualRevision }
@@ -127,6 +155,9 @@ private final class RA1OwnedRevisionObject: Object, ChangeMetadataRecordable,
     }
 
     func validateOutboundSemanticObject(in realm: Realm) throws {
+        guard !isAwaitingRecoveryEvidence else {
+            throw BigSyncSemanticAdmissionUnavailable(entityType: Self.className())
+        }
         try domain.validate()
         guard id == domain.id else { throw RA1RevisionError.changedIdentity }
         // A foreign-owned unchanged relay is allowed; it is not a new authored read.
@@ -216,10 +247,16 @@ private final class RA1RealmFixture {
     func refresh() async {
         await target.asyncRefresh()
         await tracking.asyncRefresh()
+        for realm in adapter.realmProvider?.targetReaderRealms ?? [] {
+            await realm.asyncRefresh()
+        }
     }
 
     @discardableResult
     func author(_ value: RA1DomainValue, auditTime: TimeInterval = 1_000) async throws -> String {
+        guard value.owner == journalIdentity.installationIdentifier else {
+            throw RA1RevisionError.changedIdentity
+        }
         try await target.asyncWrite {
             let object = self.target.object(ofType: RA1OwnedRevisionObject.self, forPrimaryKey: value.id)
                 ?? RA1OwnedRevisionObject()
@@ -462,6 +499,235 @@ final class OwnedRecordRevisionTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testNewerLocalRevisionAtFinalWriteOverridesSelectionSnapshot() async throws {
+        for forceSave in [false, true] {
+            let f = try await RA1RealmFixture.make()
+            _ = try await f.adapter.saveChanges(in: [f.record(mark)], forceSave: true)
+            await f.refresh()
+            var value = undo
+            value.revision = 44
+            let newest = value
+            f.adapter._testBeforeImportedRecordTargetWrite = {
+                // Same audit timestamp: only the final domain comparison can win.
+                _ = try await f.author(newest)
+            }
+            defer { f.adapter._testBeforeImportedRecordTargetWrite = nil }
+            _ = try await f.adapter.saveChanges(in: [f.record(undo)], forceSave: forceSave)
+            await f.refresh()
+            XCTAssertEqual(try f.value(), newest)
+            let upload = try await f.nextUpload()
+            XCTAssertEqual(try RA1OwnedRevisionObject.decode(upload.record), newest)
+            XCTAssertTrue(f.tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testHigherRemoteRevisionStillWinsAfterLocalJournalChangesDuringSelection() async throws {
+        let f = try await RA1RealmFixture.make()
+        _ = try await f.author(mark)
+        let sent = try await f.nextUpload()
+        var clock = mark
+        clock.revision = 43
+        clock.activeMicroseconds = 200
+        let concurrent = clock
+        var value = undo
+        value.revision = 44
+        value.activeMicroseconds = 250
+        let newest = value
+        f.adapter._testBeforeImportedRecordTargetWrite = {
+            _ = try await f.author(concurrent, auditTime: 99_000)
+        }
+        defer { f.adapter._testBeforeImportedRecordTargetWrite = nil }
+        _ = try await f.adapter.saveChanges(in: [f.record(newest, auditTime: 10)], forceSave: false)
+        await f.refresh()
+        let generation = try XCTUnwrap(f.generation())
+        XCTAssertEqual(try f.value(), newest)
+        try await f.acknowledge(sent)
+        XCTAssertEqual(f.generation(), generation)
+        let upload = try await f.nextUpload()
+        XCTAssertEqual(try RA1OwnedRevisionObject.decode(upload.record), newest)
+    }
+
+    @BigSyncBackgroundActor
+    func testEqualRevisionDivergenceAtFinalWriteCannotBeHiddenByNewPendingWork() async throws {
+        let f = try await RA1RealmFixture.make()
+        _ = try await f.adapter.saveChanges(in: [f.record(mark)], forceSave: true)
+        await f.refresh()
+        var value = undo
+        value.activeMicroseconds = 200
+        let concurrent = value
+        f.adapter._testBeforeImportedRecordTargetWrite = { _ = try await f.author(concurrent) }
+        defer { f.adapter._testBeforeImportedRecordTargetWrite = nil }
+        let results = try await f.adapter.saveChanges(in: [f.record(undo)], forceSave: false)
+        await f.refresh()
+        guard let result = results.first, case .quarantined = result.disposition else {
+            return XCTFail("Final-write equality must be checked before pending-local preservation")
+        }
+        XCTAssertEqual(try f.value(), concurrent)
+        XCTAssertNotNil(f.generation())
+        XCTAssertEqual(f.tracking.objects(BigSyncInboundSemanticQuarantine.self).count, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testSecondIncomingWinnerJournalFailureRollsBackBothTargets() async throws {
+        let f = try await RA1RealmFixture.make()
+        var other = mark
+        other.key = "article-a:page-1"
+        let firstGeneration = try await f.author(mark)
+        let secondGeneration = try await f.author(other)
+        _ = try await f.prepared()
+        var otherUndo = undo
+        otherUndo.key = other.key
+        let failure = RA1IdentityFailure(identity: f.journalIdentity, failsOnCall: 2)
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [f.target.configuration],
+            mutationJournalIdentityProvider: { failure.next() })
+        do {
+            _ = try await f.adapter.saveChanges(in: [f.record(undo), f.record(otherUndo)], forceSave: true)
+            XCTFail("The second required journal failure must escape the whole target write")
+        } catch BigSyncMutationJournalError.identityUnavailable { }
+        XCTAssertEqual(failure.callCount, 2)
+        await f.refresh()
+        XCTAssertEqual(try f.value(), mark)
+        XCTAssertEqual(try f.value(other.id), other)
+        XCTAssertEqual(f.generation(), firstGeneration)
+        XCTAssertEqual(f.generation(other.id), secondGeneration)
+        XCTAssertTrue(f.tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        try await f.bind(f.journalIdentity, scope: f.scope)
+        _ = try await f.adapter.saveChanges(in: [f.record(undo), f.record(otherUndo)], forceSave: true)
+        await f.refresh()
+        XCTAssertEqual(try f.value(), undo)
+        XCTAssertEqual(try f.value(other.id), otherUndo)
+        XCTAssertNotEqual(f.generation(), firstGeneration)
+        XCTAssertNotEqual(f.generation(other.id), secondGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testTrackingFailureAfterTargetCommitPreservesWinnerForReplayAndOldAck() async throws {
+        let f = try await RA1RealmFixture.make()
+        _ = try await f.author(mark)
+        let sent = try await f.nextUpload()
+        f.adapter._testBeforeImportedRecordPersistenceWrite = { throw RA1RevisionError.unexpectedIO }
+        defer { f.adapter._testBeforeImportedRecordPersistenceWrite = nil }
+        do {
+            _ = try await f.adapter.saveChanges(in: [f.record(undo)], forceSave: true)
+            XCTFail("Expected the failure between the two physical Realm commits")
+        } catch RA1RevisionError.unexpectedIO { }
+        await f.refresh()
+        let winnerGeneration = try XCTUnwrap(f.generation())
+        XCTAssertEqual(try f.value(), undo, "Target committed; tracking failure is not a target rollback")
+        XCTAssertNotEqual(winnerGeneration, sent.generation)
+        f.adapter._testBeforeImportedRecordPersistenceWrite = nil
+        try await f.acknowledge(sent)
+        XCTAssertEqual(f.generation(), winnerGeneration)
+        _ = try await f.adapter.saveChanges(in: [f.record(undo)], forceSave: false)
+        await f.refresh()
+        XCTAssertEqual(f.generation(), winnerGeneration, "Equal replay must not mint another domain edit")
+        let retry = try await f.nextUpload()
+        XCTAssertEqual(try RA1OwnedRevisionObject.decode(retry.record), undo)
+        try await f.acknowledge(retry)
+        XCTAssertNil(f.generation())
+    }
+
+    @BigSyncBackgroundActor
+    func testPayloadAheadOfForwardedGenerationStillDrainsNewerJournal() async throws {
+        let f = try await RA1RealmFixture.make()
+        let g1 = try await f.author(mark)
+        _ = try await f.nextUpload()
+        let g2 = try await f.author(undo)
+        // No fixture forward here: exercise the real materialization/ack window.
+        let prepared = try await f.adapter.preparedRecordsToUpload(limit: 1, restrictedToEntityType: nil)
+        let retry = try XCTUnwrap(prepared.first)
+        XCTAssertEqual(retry.generation, g1)
+        XCTAssertEqual(try RA1OwnedRevisionObject.decode(retry.record), undo)
+        try await f.acknowledge(retry)
+        XCTAssertEqual(f.generation(), g2)
+        let remaining = try await f.adapter.preparedRecordsToUpload(limit: 1, restrictedToEntityType: nil)
+        let final = try XCTUnwrap(remaining.first)
+        XCTAssertEqual(final.generation, g2)
+        XCTAssertEqual(try RA1OwnedRevisionObject.decode(final.record), undo)
+        try await f.acknowledge(final)
+        XCTAssertNil(f.generation())
+    }
+
+    @BigSyncBackgroundActor
+    func testDivergentOwnEchoIsQuarantinedWithoutApplyingOrAcknowledgingIt() async throws {
+        let f = try await RA1RealmFixture.make()
+        let generation = try await f.author(undo)
+        var divergent = undo
+        divergent.title = "Different authored title at the same revision"
+        let results = try await f.adapter.validateAuthoritativeOwnUploadRecords([f.record(divergent)])
+        await f.refresh()
+        guard let result = results.first, case .quarantined = result.disposition else {
+            return XCTFail("Own-echo validation must not bypass domain equality")
+        }
+        XCTAssertEqual(try f.value(), undo)
+        XCTAssertEqual(f.generation(), generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testIncomingHardDeletionCannotEraseAcknowledgedEmptyRevision() async throws {
+        for deleted in [false, true] {
+            let f = try await RA1RealmFixture.make()
+            var value = undo
+            value.deleted = deleted
+            _ = try await f.author(value)
+            let upload = try await f.nextUpload()
+            try await f.acknowledge(upload)
+            let results = try await f.adapter.deleteRecords(with: [upload.record.recordID])
+            await f.refresh()
+            guard let result = results.first, case .quarantined = result.disposition else {
+                return XCTFail("Retained version requires model deletion admission as well as a live upsert")
+            }
+            XCTAssertEqual(try f.value(), value)
+            XCTAssertNil(f.generation())
+            _ = try await f.adapter.saveChanges(in: [f.record(mark)], forceSave: true)
+            await f.refresh()
+            let repair = try await f.nextUpload()
+            XCTAssertEqual(try RA1OwnedRevisionObject.decode(repair.record), value)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testBackupRestoreWithholdsCopiedRowsUntilActualServerImport() async throws {
+        var newer = undo
+        newer.revision = 44
+        let serverValues: [RA1DomainValue?] = [nil, mark, undo, newer]
+        for server in serverValues {
+            let f = try await RA1RealmFixture.make()
+            _ = try await f.author(undo)
+            _ = try await f.nextUpload()
+            let replacement = BigSyncMutationJournalIdentity(installationIdentifier: "restored-installation",
+                replicaBindingGenerationIdentifier: String(repeating: "b", count: 64))
+            try await f.bind(replacement, scope: f.scope)
+            let epoch = 4_000_000_002
+            try await f.adapter.prepareChangeFeedReset(accountScopeIdentifier: f.scope, epoch: epoch,
+                                                       mode: .backupRestore)
+            await f.refresh()
+            let copy = try XCTUnwrap(f.target.object(ofType: RA1OwnedRevisionObject.self, forPrimaryKey: undo.id))
+            XCTAssertTrue(copy.isAwaitingRecoveryEvidence)
+            XCTAssertEqual(copy.domain, undo)
+            XCTAssertNil(f.generation(), "Copied upload work is not a new installation's intent")
+            try await f.adapter.beginChangeFeedServerBootstrap(accountScopeIdentifier: f.scope, epoch: epoch,
+                                                               mode: .backupRestore)
+            if let server {
+                _ = try await f.adapter.validateAuthoritativeOwnUploadRecords([f.record(server)])
+                await f.refresh()
+                XCTAssertTrue(copy.isAwaitingRecoveryEvidence, "Validation-only echoes cannot admit copied bytes")
+                _ = try await f.adapter.saveChanges(in: [f.record(server)], forceSave: true)
+            }
+            try await f.adapter.reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: f.scope,
+                                                                         epoch: epoch, mode: .backupRestore)
+            await f.refresh()
+            XCTAssertEqual(copy.isAwaitingRecoveryEvidence, server == nil)
+            XCTAssertEqual(copy.domain, server ?? undo)
+            XCTAssertEqual(copy.owner, "owner-a")
+            XCTAssertNil(f.generation())
+            let uploads = try await f.prepared()
+            XCTAssertTrue(uploads.isEmpty, "Restore neither reauthors original ownership nor resurrects absent data")
+        }
+    }
+
+    @BigSyncBackgroundActor
     private func exerciseConflictLoop(local: RA1DomainValue, server: RA1DomainValue,
                                       expected: RA1DomainValue) async throws {
         let f = try await RA1RealmFixture.make()
@@ -488,12 +754,27 @@ final class OwnedRecordRevisionTests: XCTestCase {
             runID: sync.synchronizationRunID, accountIdentifier: account,
             accountScopeIdentifier: lease.accountScopeIdentifier,
             replicaBindingGenerationIdentifier: binding, accountInvalidationGeneration: lease.invalidationGeneration)
-        _ = try await f.author(local)
+        // Seed an unchanged foreign value through inbound replication, then make
+        // it a normal repair upload. Do not author owner-a with this random
+        // installation's identity merely to arrange the transport fixture.
+        _ = try await f.adapter.saveChanges(in: [f.record(local)], forceSave: true)
+        var stale = local
+        stale.revision -= 1
+        _ = try await f.adapter.saveChanges(in: [f.record(stale)], forceSave: true)
+        await f.refresh()
         _ = try await f.prepared()
+        // Keep journal forwarding paused. An incoming preference can replace G1
+        // with G2 in the target while the tracking cache still knows only G1.
+        // Refresh values at that boundary without manually forwarding G2.
+        f.adapter._testBeforeImportedRecordPersistenceWrite = { await f.refresh() }
+        defer { f.adapter._testBeforeImportedRecordPersistenceWrite = nil }
         try await sync.synchronizeAdapter(f.adapter)
         await f.refresh()
         let uploads = await io.uploadedValues()
-        XCTAssertEqual(uploads, [local, expected])
+        XCTAssertEqual(uploads.first, local)
+        XCTAssertTrue((2...3).contains(uploads.count))
+        XCTAssertTrue(uploads.dropFirst().allSatisfy { $0 == expected },
+                      "Every retry must transport the selected complete domain value")
         XCTAssertEqual(try f.value(), expected)
         XCTAssertNil(f.generation(), "Retry must reach real generation acknowledgement")
         XCTAssertTrue(f.tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
@@ -502,8 +783,9 @@ final class OwnedRecordRevisionTests: XCTestCase {
     }
 }
 
-// Deliberately bounded remote script: exactly one serverRecordChanged followed
-// by one successful retry. Unexpected operations throw rather than succeeding.
+// One conflict, then at most two saves of the selected value. G1 may acknowledge
+// a retry before the replacement G2 reaches tracking; G2 must then drain too.
+// This is not a CloudKit change-tag/CAS simulator (records have no server tags).
 private actor RA1MutationScript {
     let conflict: CKRecord
     var uploads: [RA1DomainValue] = []
@@ -511,7 +793,7 @@ private actor RA1MutationScript {
     func modify(_ records: [CKRecord], deleting: [CKRecord.ID],
                 savePolicy: CKModifyRecordsOperation.RecordSavePolicy, atomically: Bool) throws -> CloudKitRecordMutationResults {
         guard records.count == 1, deleting.isEmpty, !atomically,
-              savePolicy == .ifServerRecordUnchanged, uploads.count < 2,
+              savePolicy == .ifServerRecordUnchanged, uploads.count < 3,
               records[0].recordID == conflict.recordID else { throw RA1RevisionError.unexpectedIO }
         let record = records[0]
         uploads.append(try RA1OwnedRevisionObject.decode(record))
@@ -546,6 +828,32 @@ private final class RA1ScriptedIO: NSObject, CloudKitDatabaseAdapter, CloudKitRe
     func recordZoneChanges(in id: CKRecordZone.ID, since cursor: RecordZoneChangeCursor?,
                            desiredKeys: [CKRecord.FieldKey]?, resultsLimit: Int?) async throws -> CloudKitRecordZoneChangePage {
         throw RA1RevisionError.unexpectedIO
+    }
+}
+
+// Faults only the existing journal identity provider, never Realm rollback.
+private final class RA1IdentityFailure: @unchecked Sendable {
+    private let lock = NSLock()
+    private let identity: BigSyncMutationJournalIdentity
+    private let failsOnCall: Int
+    private var calls = 0
+
+    init(identity: BigSyncMutationJournalIdentity, failsOnCall: Int) {
+        self.identity = identity
+        self.failsOnCall = failsOnCall
+    }
+
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+
+    func next() -> BigSyncMutationJournalIdentity? {
+        lock.lock()
+        defer { lock.unlock() }
+        calls += 1
+        return calls == failsOnCall ? nil : identity
     }
 }
 
