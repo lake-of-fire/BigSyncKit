@@ -2,10 +2,9 @@ name: Hotfix closure qualification
 on:
   push:
     branches: [fix/hotfix-sync-closure-20260912]
-    paths: [.github/workflows/hotfix-closure.yml]
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: hotfix-closure-${{ github.ref }}
   cancel-in-progress: false
@@ -19,17 +18,10 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           path: BigSyncKit
-      - name: Apply bounded failure-flush repair once
+          persist-credentials: false
+      - name: Record immutable candidate
         working-directory: BigSyncKit
         run: |
-          if test -f .github/closure_failure_flush.py; then
-            python3 .github/closure_failure_flush.py
-            rm .github/closure_failure_flush.py
-            git diff --check
-            git add Sources Tests .github/closure_failure_flush.py .github/qualify_hotfix_closure.py
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: prevent failure cleanup forwarding before migration preparation completes'
-            git push origin HEAD:refs/heads/fix/hotfix-sync-closure-20260912
-          fi
           git diff --exit-code
           git rev-parse HEAD > qualification-commit.txt
           git rev-parse HEAD:Sources > qualification-source-tree.txt
