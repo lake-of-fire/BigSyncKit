@@ -2,7 +2,8 @@ name: RA-1 inbound replay closure
 
 on:
   push:
-    branches: [codex/ra1-bigsync-inbound-replay-20260912]
+    branches:
+      - codex/ra1-bigsync-inbound-replay-20260912
 
 permissions:
   contents: write
@@ -34,99 +35,30 @@ jobs:
           ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
-
-      - name: Apply paired replay repair and behavioral regression
+      - name: Apply bounded source and regression patch
         working-directory: BigSyncKit
-        run: |
-          python3 <<'PY'
-          from pathlib import Path
-
-          source = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift')
-          text = source.read_text()
-          needle = '''        if let migrationError = error as? ChangeFeedMigrationError,
-             migrationError.deletionKind == .encryptedDataReset {'''.replace('\n             migration', '\n           migration')
-          replacement = '''        if error is RealmSwiftInboundTargetChangedError {
-            // A non-journaled local write invalidated an inbound selection.
-            // Its page cursor did not commit, so replay the ordinary fetch
-            // after a bounded delay rather than acknowledging or quarantining it.
-            shouldRetry = true
-            retryDelay = 1
-        } else if let migrationError = error as? ChangeFeedMigrationError,
-           migrationError.deletionKind == .encryptedDataReset {'''
-          if text.count(needle) != 1:
-              raise SystemExit(f'expected exactly one inbound-replay insertion point, got {text.count(needle)}')
-          if 'error is RealmSwiftInboundTargetChangedError' in text:
-              raise SystemExit('selected source already classifies inbound target races')
-          source.write_text(text.replace(needle, replacement, 1))
-
-          tests = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
-          test_text = tests.read_text()
-          marker = 'testRA1InboundTargetChangedFailureSchedulesReplay'
-          if marker in test_text:
-              raise SystemExit('focused RA-1 replay test already exists')
-          test_text += r'''
-
-          extension BigSyncKitTests {
-              @BigSyncBackgroundActor
-              func testRA1InboundTargetChangedFailureSchedulesReplay() async throws {
-                  let synchronizer = makeSynchronizer()
-                  synchronizer.syncing = true
-                  synchronizer.synchronizationDrainIsActive = true
-                  let attemptID = synchronizer.synchronizationAttemptID
-                  let started = Date()
-
-                  await synchronizer.failSynchronization(
-                      error: RealmSwiftInboundTargetChangedError(
-                          recordName: "RA1ParityRecord.collision"
-                      )
-                  )
-
-                  XCTAssertEqual(synchronizer.synchronizationAttemptID, attemptID)
-                  XCTAssertTrue(synchronizer.syncing)
-                  let retryAt = try XCTUnwrap(synchronizer.retrySleepUntil)
-                  XCTAssertGreaterThanOrEqual(
-                      retryAt,
-                      started.addingTimeInterval(0.9),
-                      "A transient non-journaled target race must replay through a delayed ordinary sync"
-                  )
-
-                  synchronizer.cancelSynchronization()
-                  await synchronizer.cancelSynchronizationAndWait()
-              }
-          }
-          '''
-          tests.write_text(test_text)
-          PY
-
-      - name: Focused replay regressions
+        run: python3 .github/ra1-inbound-replay.py
+      - name: Focused replay classification
         working-directory: BigSyncKit
-        run: |
-          swift test --filter testRA1InboundTargetChangedFailureSchedulesReplay
-          swift test --filter testNonJournaledTargetChangeRejectsOrdinaryAndForcedImportThenReplays
-
+        run: swift test --filter testRA1InboundTargetChangedFailureSchedulesReplay
+      - name: Real adapter rejection and replay
+        working-directory: BigSyncKit
+        run: swift test --filter testNonJournaledTargetChangeRejectsOrdinaryAndForcedImportThenReplays
       - name: Full BigSyncKit suite
         working-directory: BigSyncKit
         env:
           BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
         run: swift test
-
-      - name: Verify exact bounded diff and publish clean continuation
+      - name: Verify bounded diff
+        working-directory: BigSyncKit
+        run: git diff --check
+      - name: Publish clean continuation
         working-directory: BigSyncKit
         run: |
-          python3 - <<'PY'
-          import subprocess
-          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          expected = {
-              'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift',
-              'Tests/BigSyncKitTests/BigSyncKitTests.swift',
-          }
-          actual = set(changed)
-          if actual != expected:
-              raise SystemExit(f'unexpected source/test diff: {sorted(actual)}')
-          PY
-          rm .github/workflows/ra1-inbound-replay.yml
+          rm .github/workflows/ra1-inbound-replay.yml .github/ra1-inbound-replay.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/BigSyncKitTests.swift .github/workflows/ra1-inbound-replay.yml
+          git add -A
+          test "$(git diff --cached --name-only | sort | tr '\n' ' ')" = ".github/ra1-inbound-replay.py .github/workflows/ra1-inbound-replay.yml Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/BigSyncKitTests.swift "
           git commit -m 'RA-1: replay inbound target races through ordinary sync [skip ci]'
           git push origin HEAD:codex/ra1-bigsync-inbound-replay-20260912
