@@ -1,0 +1,56 @@
+name: Worker review native counterexamples
+on:
+  push:
+    branches: [test/worker-review-reconciliation-20260912]
+    paths: [.github/workflows/worker-review-reconciliation.yml, Tests/BigSyncKitTests/WorkerReviewReconciliationTests.swift]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  review:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record immutable inputs
+        working-directory: BigSyncKit
+        run: |
+          mkdir -p review-evidence
+          git rev-parse HEAD > review-evidence/test-commit.txt
+          git rev-parse HEAD:Sources > review-evidence/production-source-tree.txt
+          git rev-parse 8b9fbd6c0025a12ea283a6bdd6d0d1b56698a69c:Sources > review-evidence/expected-source-tree.txt || true
+          xcodebuild -version > review-evidence/toolchain.txt
+          swift --version >> review-evidence/toolchain.txt
+      - name: Assert desired first-import and UUID behavior
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter WorkerReviewReconciliationTests 2>&1 | tee review-evidence/native-review.log
+      - name: Archive tested source and dependency resolution
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git archive --format=tar.gz -o review-evidence/tested-source.tar.gz HEAD
+          cp Package.resolved review-evidence/Package.resolved
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: worker-review-native-evidence
+          path: BigSyncKit/review-evidence
+          retention-days: 7
