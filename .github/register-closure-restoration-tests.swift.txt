@@ -1,0 +1,125 @@
+
+private actor ClosureRestorationGate {
+    private var isOpen = false
+    private var waiters = [CheckedContinuation<Void, Never>]()
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func open() {
+        isOpen = true
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
+}
+
+private actor ClosureRestorationAccount {
+    private var hold = false
+    let entered: XCTestExpectation
+    let release = ClosureRestorationGate()
+    init(entered: XCTestExpectation) { self.entered = entered }
+    func arm() { hold = true }
+    func current() async -> String {
+        if hold {
+            hold = false
+            entered.fulfill()
+            await release.wait()
+        }
+        return "account-a"
+    }
+}
+
+private actor ClosureRestorationDelivery {
+    private(set) var count = 0
+    private(set) var sawNil = false
+    func receive(_ evidence: BigSyncDurablePublicationEvidence?) {
+        count += 1
+        sawNil = evidence == nil
+    }
+}
+
+extension CloudKitSynchronizerAccountFencingTests {
+    @BigSyncBackgroundActor
+    func testClosureObsoleteNegativeRestorationDoesNotInvalidateNewLiveCompletion() async throws {
+        let entered = expectation(description: "restoration account inspection held")
+        let account = ClosureRestorationAccount(entered: entered)
+        let transport = AccountFencingTransport()
+        let sync = makeSynchronizer(
+            transport: transport,
+            store: AccountFencingStore(),
+            identifier: "negative-delivery-\(UUID().uuidString)",
+            recordZoneID: makeZoneID(),
+            accountIdentifierProvider: { await account.current() },
+            accountReplacementPolicy: .localDatasetRebootstrap,
+            initialReplicaBindingAdmissionHandler: { _ in }
+        )
+        let adapter = AccountFencingModelAdapter(zoneID: sync.recordZoneID)
+        adapter.consumedBoundaryIdentifier = "boundary-a"
+        adapter.feedEpoch = 7
+        sync.addModelAdapter(adapter)
+        sync.domainPublicationScopeIdentifierProvider = { "dataset-a" }
+        let original = try await sync.synchronize()
+        XCTAssertNotNil(original.receipt)
+        await account.arm()
+        let delivery = ClosureRestorationDelivery()
+        let inspection = Task { @BigSyncBackgroundActor in
+            try await sync.restoreDurablePublicationEvidence(deliveringTo: {
+                await delivery.receive($0)
+            })
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        // Direct synchronize() is public and can overtake the worker's earlier
+        // read-only inspection; no internal attempt state is fabricated here.
+        let newer = try await sync.synchronize()
+        XCTAssertNotNil(newer.receipt)
+        XCTAssertNotEqual(original.receipt?.runID, newer.receipt?.runID)
+        await account.release.open()
+        try await inspection.value
+        let count = await delivery.count
+        XCTAssertEqual(count, 0, "Obsolete nil evidence must not discard a newer live completion")
+        XCTAssertFalse(sync.synchronizationDrainIsActive)
+        await sync.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testClosureCurrentNegativeRestorationDeliversOnceAndRetainsCallbackBarrier() async throws {
+        let transport = AccountFencingTransport()
+        let sync = makeSynchronizer(transport: transport)
+        sync.addModelAdapter(AccountFencingModelAdapter(zoneID: sync.recordZoneID))
+        let entered = expectation(description: "negative restoration handler entered")
+        let finished = expectation(description: "replacement completes after restoration")
+        let release = ClosureRestorationGate()
+        let delivery = ClosureRestorationDelivery()
+        let restoration = Task { @BigSyncBackgroundActor in
+            try await sync.restoreDurablePublicationEvidence(deliveringTo: { evidence in
+                await delivery.receive(evidence)
+                entered.fulfill()
+                await release.wait()
+            })
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        let before = transport.databaseChangeFetchCount
+        let replacement = Task { @BigSyncBackgroundActor in
+            defer { finished.fulfill() }
+            do {
+                let result = try await sync.synchronize()
+                XCTAssertNotNil(result.receipt)
+            } catch { XCTFail("Replacement failed: \(error)") }
+        }
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertTrue(sync.synchronizationDrainIsActive)
+        XCTAssertNil(sync.activeRunContext)
+        XCTAssertEqual(transport.databaseChangeFetchCount, before)
+        await release.open()
+        try await restoration.value
+        await fulfillment(of: [finished], timeout: 5)
+        if sync.synchronizationDrainIsActive { sync.cancelSynchronization() }
+        await replacement.value
+        let count = await delivery.count
+        let sawNil = await delivery.sawNil
+        XCTAssertEqual(count, 1)
+        XCTAssertTrue(sawNil)
+        await sync.cancelSynchronizationAndWait()
+    }
+}
