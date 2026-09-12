@@ -1,66 +1,70 @@
-# RA-1 Worker 2 — revision review and remaining collapse boundary
+# RA-1 Worker 2 — implementation and remaining integration boundary
 
-## Status and revisions
+## Current production work
 
-PR #10 was merged normally by W1 at `5923cdccc39d90952865d27041ee7ac1168a1ac8`.
-This continuation does not modify that completed milestone branch. The existing
-production preferences remain unchanged; native qualification and cutover removal
-are NOT complete. Do not label authored tests as executed behavior.
+PR #10 merged normally at `5923cdccc39d90952865d27041ee7ac1168a1ac8`.
+PR #11 continues on `codex/reading-analytics-w2-review-20260911`, targeting
+`codex/reading-analytics-integration-20260911`. Coordinator: root issue #21.
+The completed milestone branch and integration refs are not edited by W2.
 
-- Production input: `2a28f8cfa48fa16c471fa4d54c2689f21567905f`.
-- Continuation base: `5923cdccc39d90952865d27041ee7ac1168a1ac8`.
-- Work branch: `codex/reading-analytics-w2-review-20260911`.
-- Target: `codex/reading-analytics-integration-20260911`.
-- Coordinator: https://github.com/aehlke/manabi-reader/issues/21 .
-- Revised test commit: `e8b899e57cf5493eca82c4598e449c2bafb08c44`.
-- Revised test blob: `e14062aeaa9ce1edb164fde2503993765eab5b6e`.
-- Test SHA-256: `7472ad3235f64f8b862ab8675258d5b2fe76155d2d7bcb9b59083750fa3de8c3`.
-- API clarification commit: `501f62791c0fd18295c3d2af0cf94accc9c784db`,
-  [ReadingAnalyticsRevisionContract.md](ReadingAnalyticsRevisionContract.md).
+Code-first continuation after `9185ef1d3ba488a7b4febcace4249f79b6d791bb`:
 
-## Findings and refinements
+| Commit | Implemented change |
+| --- | --- |
+| `7b5183b4e38320af92ce9817fc990936f0cc2ca0` | Record save/delete drain wrappers capture only the operation error and call their completion outside the operation catch. |
+| `3cbed7cd89f9413ab2d03fe765a95013fbad8950` | Upload composition and zone setup likewise separate downstream completion failures from operation failures; remove the nested upload catch that redelivered completion. |
+| `33e72a7500d0d7e13b7d827f68a0442c107b7a83` | Revalidate zone-fetch and zone-save failures before lifecycle writes; verify the returned zone identity before recording establishment. |
 
-1. The original conflict script required exactly two uploads. Source permits a
-   target G2 journal to outrun tracking G1: a retry can serialize the selected
-   current payload while acknowledging only G1, then drain the surviving G2.
-   The script now permits one conflict and at most two successful saves. Every
-   retry must contain the selected complete value and the final journal must drain.
-   A separate test explicitly freezes forwarding and asserts G1/G2 behavior without
-   fixture forwarding between preparation and acknowledgement. This is a corrected
-   harness assumption, not a native-reproduced production failure.
-2. The original conflict fixture authored owner-a under a random synchronizer
-   installation. The test author now checks owner equality. Conflict setup uses
-   actual inbound replication plus lower-version repair to queue a foreign value
-   unchanged. It does not relabel ownership or invent an authored revision.
-3. Local-dataset reseeding is not backup restoration. The real Realm test model now
-   implements the existing restore interface and local-only recovery flag, matching
-   W3's admission policy. Actual backupRestore preparation/bootstrap/reconciliation
-   is tested with absent, older, equal and newer server records. Validation-only own
-   echoes must not clear copied-state admission; normal import may re-admit it.
-4. Retained tombstone upserts do not themselves reject incoming hard deletions.
-   The fixture now implements the existing deletion validator, and a test checks
-   acknowledged empty/live and empty/tombstone state survives actual deletion input
-   and still repairs a subsequently received older positive version.
-5. New tests cover final-write selection races, equal-version divergence hidden by
-   a new pending journal, failure on the second required winner journal in one
-   target transaction, and failure between target and tracking Realm commits.
-   The former rolls back both target objects; the latter preserves the committed
-   winner and its journal for replay. No compensating downgrade is introduced.
+The source defect was `do { operation; completion(nil) } catch { completion(error) }`.
+A throwing consumer could receive a second result; zone setup could misinterpret a
+consumer's error as a failed zone operation. Each repaired wrapper now delivers
+one result. A completion error propagates to its caller rather than recursively
+invoking that completion or turning it into zone-loss evidence.
 
-The model is not Common. The suite uses real Realm objects, target/tracking Realms,
-registration, journals, adapter application, serialization and acknowledgements.
-Only remote IO and existing scheduling/identity-failure hooks are controlled. The
-clock case transports an explicitly supplied complete payload; it does not test
-Common's Undo delta. Backup cases do not replace real Realm files or exercise the
-manual restore handoff. Scripted CKRecords have no real server change tags, so these
-are not CloudKit CAS or signed multidevice tests.
+Failed remote IO also suspends. Zone-fetch failure now revalidates the original
+attempt/account before inspecting the active context. Failed zone creation
+revalidates the captured run before classifying the original error. A mismatched
+fetched zone is not establishment evidence. These checks use existing APIs.
 
-## Native test membership
+Final production blobs:
+- RecordMutations: `cc4e76eeb76e3115d962d9a2a0b015c480df7fe2`.
+- Sync: `69dc38a2ed0f8613f77bfff3a68566383c1d3914`.
 
-The same file remains `Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift`; W1's
-root registration for #10 covers it when this revision is selected. No new manifest
-entry is needed, but native discovery and execution remain required. There are now
-21 methods, not 12:
+Exactly two existing production files changed: **+103/-80 (net +23)** relative to
+9185ef1d. There is no new API, model, framework, phase, ledger, source move,
+manifest change, or ordinary cancellation-bridge replacement. Record selection,
+required journaling, G1/G2 acknowledgement, per-item results, actual request leases,
+long-lived replay and persisted physical uncertainty are unchanged.
+
+Per Alex's code-first instruction, this continuation did **not** run tests,
+compiler/typecheck, syntax checks, native tooling, or CloudKit operations. Exact
+source preimage/postimage hashes and GitHub publication were checked to avoid
+replacing unrelated source. That is publication integrity, not behavior evidence.
+New callback/error-path regression execution remains a native gate; the earlier
+21-method revision suite does not by itself qualify these new callback changes.
+
+## Existing revision contract and authored tests
+
+The model preference APIs remain sufficient at the source level; they are not
+newly invented or patched by this continuation. See
+[ReadingAnalyticsRevisionContract.md](ReadingAnalyticsRevisionContract.md).
+API clarification: `501f62791c0fd18295c3d2af0cf94accc9c784db`.
+Real Realm test source: `e8b899e57cf5493eca82c4598e449c2bafb08c44`;
+blob `e14062aeaa9ce1edb164fde2503993765eab5b6e`.
+
+That earlier test refinement corrected the overly exact two-upload script,
+foreign-author fixture setup, reseed-versus-backupRestore distinction and missing
+incoming deletion admission. It added final-write races, divergent own echoes,
+second-journal rollback and target-commit/tracking-failure replay cases.
+
+The fixture uses real Realm/journal/adapter implementations and two actual
+synchronizeAdapter conflict loops. Only remote IO and existing boundary/identity
+failure hooks are controlled. It is not Common's model, inverse, or application
+composition. Scripted CKRecords have no actual server change tags. Backup tests
+exercise adapter admission, not physical file replacement or process loss.
+
+The same already-registered source file remains
+`Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift`. Exact 21 method IDs:
 
 ```text
 OwnedRecordRevisionTests/testLatePopulatedDownloadRequeuesNewerEmptyValueWithoutReauthoring
@@ -86,63 +90,60 @@ OwnedRecordRevisionTests/testIncomingHardDeletionCannotEraseAcknowledgedEmptyRev
 OwnedRecordRevisionTests/testBackupRestoreWithholdsCopiedRowsUntilActualServerImport
 ```
 
-Executed: DEBUG Swift frontend syntax parse and exact published-blob verification.
-NOT executed: Apple typecheck, native Realm methods, composed Reader tests, live
-CloudKit requests, filesystem/process-loss restore or signed multidevice scenarios.
-Existing account/cancellation/partial-result/callback suites were left unchanged,
-not claimed rerun. Their native execution remains part of W1's approved gate.
+Historical evidence for e8b899e5: DEBUG syntax parse and published-blob comparison.
+Apple typecheck, the 21 native methods, Common/application composition, filesystem
+restore and signed multidevice qualification have not run. Historical parse results
+must not be extended to the new production changes. Existing account/cancellation,
+partial-result and callback suites remain unchanged and are not claimed rerun.
 
-## Removal boundary rechecked against actual callers
+## Cutover removal: actual remaining code dependency
 
-Core PR #7 at `012d9fb4aa0a0717213c454076d0602550f5eb8a` still contains
-`ReaderOrderedV2BigSyncTransport` (blob `228a53ffb7c2c74c71927636ed3f7022189d0feb`).
-Its acquire path still calls beginPostBarrierOutboundQuiescence and
-establishPostBarrierDrain; it retains source-resume/adoption/completion composition.
-Removing the recovery panel's mutation UI is not removal of these runtime callers.
-W6/W8 have not supplied the required complete caller-removal SHAs.
+W6 Core #7 at `1fa7174e09ee22326d20500875ca40358c9aa532` still reports old
+startup/lifecycle/cutover families as reachable. W8 Core #6 at
+`a841f46153574a40557eded7191b1c440d0e42cd` likewise has not closed its old
+orchestration callers. Neither owner has supplied complete caller-removal SHAs.
+Removing mutation UI is not removal of ReaderOrderedV2BigSyncTransport callers.
+The required coordination request is posted in root #21.
 
 | BigSync surface | Remaining responsibility |
 | --- | --- |
-| AcceptedHeadQuiescence (120 lines), PausedOutboundRecovery (115 lines) | Host-only deletion candidates after accepted-head/paused-reservation callers and their exclusive tests close. Neither is deleted here. |
-| OutboundCompletion | Remove source-publication wrappers only with callers; distinguish generic external-owner recovery. |
-| OutboundQuiescence synchronizer extension | Mixed final-drain/source APIs and ordinary principal/admission/submission handling. Keep the latter. |
-| BigSyncOutboundQuiescence persistent coordinator | Preserve decoding, real outstanding submissions and generic admission; never reinterpret an old barrier as settled. |
-| OutboundReplayRecovery | Keep exact operation identity, shared callback collector, generation-matched reconciliation and unknown outcomes. |
-| CloudKitRecordStore / RecordMutations | Keep once-only result delivery, partial results, record identity checks, retries and acknowledgements. |
-| SyncedEntityProtocol / journal / identity / model hooks | Keep general local atomicity, owner/binding and version selection contracts. |
+| AcceptedHeadQuiescence / PausedOutboundRecovery | Delete host-only exports with actual caller removal and exclusively matching tests. Not deleted yet. |
+| OutboundCompletion | Retire source-publication wrappers with callers; preserve independently supported external-owner recovery. |
+| Synchronizer OutboundQuiescence extension | Mixed final-drain/source APIs and ordinary principal/admission/submission handling; do not blanket-delete. |
+| BigSyncOutboundQuiescence persistent coordinator | Preserve decoding and actual outstanding submissions; old barriers must not silently become settled. |
+| OutboundReplayRecovery | Preserve exact operation identity, single-delivery collector, generation-matched reconciliation and unknown outcomes. |
+| RecordStore / RecordMutations / journal / identity / model hooks | Preserve ordinary synchronization safety and owned-version selection. |
 
 Ordinary save/delete still reaches admitOutboundBatch and
-modifyRecordsHoldingOutboundLease. The 982-line low-level outbound file, 633-line
-mixed synchronizer extension, 439-line replay extension and host-only extensions
-remain present. This continuation removes zero runtime paths, and introduces no
-new barrier, publication requirement, phase machine, second journal or success stub.
+modifyRecordsHoldingOutboundLease. Host-only exports remain callable by the old
+Core runtime. This pass deletes no old authority family and does not claim full
+collapse. No empty-success aliases, disabled guards, checkpoint clearing or forced
+old-state downgrade are used to make caller dependencies disappear.
 
-## W8 raw bootstrap-save question
+## Bootstrap scope decision
 
-The inspected ordinary-save path has no public arbitrary-CKRecord admission entry.
-`admitOutboundBatch(for:)` and `modifyRecordsHoldingOutboundLease(...)` are internal,
-require the actual active run/principal, and are used with model-prepared journal
-generations and the ordinary response handler. Calling public
-`CloudKitRecordStore.modifyRecords` directly is raw IO, not that admission contract.
-An account precheck alone does not supply outstanding-submission bookkeeping.
+W1 issue comment 5641950120 explicitly excludes a cloud winner-election/CAS or
+publication service from this batch. W8 withdrew its create-only transport API
+request in comment 5641954172. Explicit selected-snapshot/local installation is
+sufficient for isolated development composition. Production multi-install baseline
+selection remains a release/product decision, not an unfinished new W2 API.
 
-W8's create-once baseline selection is not automatically implemented by the RA-1
-revision preferences. Journal-backed model replication may reuse the ordinary path,
-but its selection semantics and real initialization binding require W8/W1 agreement.
-Do not fabricate a public wrapper, transport grant or claim a direct CKDatabase save
-is covered. Fixture/local baseline work may proceed; production raw-bootstrap
-transport binding remains an explicit unresolved boundary. The project-wide 5k stop
-is not permission to add another API family in this continuation.
+The existing admitted mutation entry remains internal/run-and-generation-bound.
+Raw CloudKitRecordStore/CKDatabase saves do not inherit its admission/settlement
+contract. No raw-baseline write wrapper or second synchronization path was added.
 
-## Accounting and next gates
+## Completion and release gates
 
-This continuation: **0 new/reimplemented production lines, 0 production deletions,
-0 source moves, +314/-6 test lines** (870 total test lines), two existing docs updated.
-No unrelated production test, manifest, workflow, identity format or callback changed.
-The earlier merged batch had 562 test lines and 276 documentation lines.
+Independent production fixes above are published. Export removal remains blocked
+on W6/W8's actual caller closure; W2 does not edit their repositories to fake closure.
+W1 alone approves integration and the exact composed tuple. Native qualification
+and production baseline/live-data permission remain separate gates.
 
-W1 must execute the 21 methods on the approved native runner and compose actual
-Common conformance. W6/W8 must supply caller-closure evidence before export removal.
-Until those gates close, this is a test/contract refinement, not completed transport
-collapse or qualification. No release/default merge, forced ref update, live baseline
-selection/migration, account/zone deletion, journal clearing or Mac worktree change.
+Accounting: production +103/-80; prior PR #11 test refinement +314/-6 unchanged;
+documentation separate; zero source moves and zero new production files. Existing
+21-method file is unchanged in this coding pass. No tests were deleted to hide a
+regression. This remains a draft, not a fully completed or qualified RA-1 app.
+
+No release/default merge, forced ref update, live migration, user baseline choice,
+account/zone deletion, journal clearing, source activation, native runner or
+protected Mac worktree operation was performed.
