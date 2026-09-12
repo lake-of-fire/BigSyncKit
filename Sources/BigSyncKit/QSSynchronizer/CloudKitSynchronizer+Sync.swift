@@ -143,7 +143,6 @@ extension CloudKitSynchronizer {
         }
         var publicationBlockers = [DomainBlocker]()
         var domainPublicationScopeIdentifier: String?
-        var postBarrierSnapshotIdentifier: String?
         var inboundIdentityDeliveries = [
             (adapter: ModelAdapter, batch: CommittedInboundIdentityBatch)
         ]()
@@ -194,22 +193,6 @@ extension CloudKitSynchronizer {
                 )
             }
             try await revalidateRunContext(terminalContext)
-            if publicationBlockers.isEmpty, let barrier = postBarrierDrainAuthorization {
-                try validatePostBarrierOutboundDrain(barrier)
-                guard barrier.accountScopeIdentifier == terminalContext.accountScopeIdentifier,
-                      barrier.replicaBindingGenerationIdentifier == terminalContext.replicaBindingGenerationIdentifier,
-                      let lease = try accountScopeLease(),
-                      lease.accountScopeIdentifier == barrier.accountScopeIdentifier,
-                      lease.invalidationGeneration == barrier.accountInvalidationGeneration else {
-                    throw DurableKeyValueStoreError.mutationNotDurable
-                }
-                guard let provider = postBarrierSnapshotIdentifierProvider,
-                      let snapshot = try await provider(), !snapshot.isEmpty else {
-                    throw DurableKeyValueStoreError.mutationNotDurable
-                }
-                postBarrierSnapshotIdentifier = snapshot
-                try await revalidateRunContext(terminalContext)
-            }
             if publicationBlockers.isEmpty,
                let provider = domainPublicationScopeIdentifierProvider {
                 let scope = try await provider()
@@ -291,15 +274,6 @@ extension CloudKitSynchronizer {
             return
         }
 
-        do {
-            if let barrier = postBarrierDrainAuthorization {
-                try validatePostBarrierOutboundDrain(barrier)
-            }
-        } catch {
-            await failTerminalSynchronization(error: error, for: attemptID)
-            return
-        }
-
         // Only now authorize and publish the receipt. A notification observer
         // may request a fresh synchronization, so snapshot the result before
         // releasing run ownership.
@@ -311,9 +285,7 @@ extension CloudKitSynchronizer {
             authorizationID: authorizationID,
             consumedServerBoundaryIdentifier:
                 consumedServerBoundaryIdentifier,
-            domainPublicationScopeIdentifier: domainPublicationScopeIdentifier,
-            postBarrierDrainAuthorizationID:
-                postBarrierDrainAuthorization?.authorizationID
+            domainPublicationScopeIdentifier: domainPublicationScopeIdentifier
         )
         let result = SynchronizationResult(
             didImportChanges: synchronizationDrainDidImportChanges,
@@ -387,47 +359,6 @@ extension CloudKitSynchronizer {
             return
         }
 #endif
-        do {
-            // Recheck after every terminal collaborator/checkpoint suspension.
-            try validateSourcePublicationRun(terminalContext, requiresDrained: true)
-            if let barrier = postBarrierDrainAuthorization {
-                try validatePostBarrierOutboundDrain(barrier)
-            }
-        } catch {
-            await failTerminalSynchronization(error: error, for: attemptID)
-            return
-        }
-        if let postBarrierDrainAuthorization,
-           let consumedServerBoundaryIdentifier,
-           let postBarrierSnapshotIdentifier,
-           let recordZoneName = modelAdapters.first?.recordZoneID.zoneName {
-            completedPostBarrierDrain = CompletedPostBarrierDrain(
-                writerBarrierEvidenceID:
-                    postBarrierDrainAuthorization.writerBarrierEvidenceID,
-                accountScopeIdentifier: terminalContext.accountScopeIdentifier,
-                replicaBindingGenerationIdentifier:
-                    terminalContext.replicaBindingGenerationIdentifier,
-                runID: terminalContext.runID,
-                recordZoneName: recordZoneName,
-                consumedServerBoundaryIdentifier:
-                    consumedServerBoundaryIdentifier,
-                snapshotScopeIdentifier:
-                    postBarrierSnapshotIdentifier,
-                accountIdentifier: terminalContext.accountIdentifier,
-                issuerID: synchronizationReceiptIssuerID,
-                receiptAuthorizationID: authorizationID,
-                postBarrierDrainAuthorizationID:
-                    postBarrierDrainAuthorization.authorizationID,
-                outboundQuiescenceIdentifier:
-                    postBarrierDrainAuthorization.outboundQuiescenceIdentifier
-            )
-            if postBarrierDrainAuthorization.outboundQuiescenceIdentifier != nil {
-                postBarrierOutboundLease?.sealFinalDrain()
-            }
-            // The completed capability retains the exact authorization. A
-            // future drain must be explicitly armed after its own barrier.
-            self.postBarrierDrainAuthorization = nil
-        }
         finishSynchronizationDrain(with: .success(result))
         // See the blocked path above: close the logical drain before allowing
         // a new synchronization to become the owner of its task/state.
@@ -465,7 +396,6 @@ extension CloudKitSynchronizer {
         context: RunContext, consumedBoundary: String?
     ) throws -> Bool {
         try checkRunContext(context)
-        try validateSourcePublicationRun(context, requiresDrained: true)
         let pending = try adaptersHavePendingChangesAtTerminalBoundary()
         let currentBoundary = try currentConsumedServerBoundaryIdentifier(for: context)
         return pending || currentBoundary != consumedBoundary || synchronizationRequestedWhileRunning

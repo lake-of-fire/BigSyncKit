@@ -1,152 +1,93 @@
-# RA-1 Worker 2 — published code and remaining removal boundary
+# RA-1 Worker 2 — cutover API retirement
 
-## Source and ownership
+## Current batch
 
-PR #10 merged at `5923cdccc39d90952865d27041ee7ac1168a1ac8`. PR #11 continues on
-`codex/reading-analytics-w2-review-20260911`, targeting the dedicated integration
-branch. W2 edits BigSync only; W1 alone approves/merges integration and root pins.
-Latest production checkpoint: **634aed9f2ff52a39275f11004a909be3deea0599**.
+The requested production decoupling is implemented on
+`codex/reading-analytics-w2-cutover-removal-20260911`, based on the normal BigSync
+integration merge `5fd6064578645e7356636cf6d9dd6605cad557c6`. That merge includes
+PR #11's reconciled restore, identity-lease and completion-delivery corrections.
+This continuation does not rewrite its completed branch or change integration refs.
 
-| Commit | Actual implementation |
-| --- | --- |
-| 7b5183b4 / 3cbed7cd | Deliver save/delete/upload/zone completions outside operation catches; a throwing consumer is not a second result or zone-loss evidence. |
-| 33e72a75 | Original account/run revalidation on failed zone IO; fetched zone identity must match. |
-| 95e25ba7 | Reconciled manual restore uses existing current-identity repair journals before intent release; completed-but-unremoved intent retries cleanup only. |
-| 634aed9f | Reject nested lease downgrades/restores; validate complete manual event bytes; require reconciled completion for identity admission and event acknowledgement independently of the optional intent file. |
+Paired application prerequisite: Core PR #11 at
+`ffcfe79157ecdc35d8417c682b9c2cae959f3c1e`. It removes the ReaderOrderedV2 and
+ReaderOrderedCutover runtime families and binds installed-state startup validation
+to ordinary synchronization. The older blocked-on-Core status is superseded.
+W1 selects the exact composed tuple and alone approves/merges integration.
 
-## Reconciled restore: actual caller join exists
+## Actual production removal
 
-`BigSyncClientIdentity.withReconciledManualBackupRestore(transactionIdentifier:
-configurations:reconciledObjectTypes:_:rollback:)` is the concrete Realm extension.
-It uses the existing exclusive identity lease and durable manual intent/event/receipt.
-The caller installs final copies reconciled against preserved originals: independently
-known current rows are admitted; backup-only rows remain withheld. After publishing the
-new sentinel/binding, the helper validates admitted rows and journals their unchanged
-values before completing the handoff. It does not change owner, stateRevision, payload
-or audit timestamps. The existing backupRestore adapter preserves current-identity
-journals, so a known empty43 stays admitted/repairable against stale42.
+Deleted complete extensions:
 
-The earlier missing-caller report is obsolete:
-- W8 Common **190d5d5d5ad5ec510086c1e4aa57a76c8f64508d**, ReadingAnalyticsManualRestore,
-  registers the live journal provider, invokes this API, validates final installed
-  copies without reflagging known rows, and rebinds the local guard after the actual
-  returned receipt/current identity.
-- W8 Core **0296c8c4620d66d4b47974368d52916c8176415f** calls that Common method from
-  the real UserDataBackupManager.resumeRestore production path.
-- W3 Common **9dccf505cf2799f94ac0a4538b235708f6a9686c**, policy blob27481a93,
-  delegates its stable-ID replacement overload to the same real W8 method and removes
-  the obsolete blanket normalizer. These owner branches still need W1 composition;
-  source binding is not an executed physical restore qualification.
+- `CloudKitSynchronizer+AcceptedHeadQuiescence.swift`.
+- `CloudKitSynchronizer+PausedOutboundRecovery.swift`.
+- `CloudKitSynchronizer+OutboundCompletion.swift`.
 
-Pass final installed configurations and concrete reconciled model types, not originals
-or staged files. Register the existing live provider before calling; never prepare a
-new installation from inside the replacement/finalizer. Required schema, model,
-identity and journal failures throw. A post-event failure retains handoffPending and
-the caller's physical journal; it does not authorize rollback to the old files.
-Automatic/raw backup restoration still withholds copied state. No second journal,
-restore mode, record-floor registry, cloud save API or blanket admission was added.
+Removed cutover exports from `BigSyncBackgroundActor` and the synchronizer:
+accepted-head sealing, beginning/establishing/completing final drains, reservation
+sealing, source-publication start/resume/validation/completion, paused ownership,
+cutover token abort/abandon and the domain-owner convenience wrappers. No substitute
+API, success alias or always-permitted guard was added.
 
-## Latest source review corrections
+Removed the associated PostBarrierDrainAuthorization/CompletedPostBarrierDrain/
+PostBarrierOutboundQuiescence capabilities, snapshot-provider configuration,
+source-owner run field, terminal-receipt field, held cutover ownership state and
+begin/cancel/terminal branches. Ordinary batch admission now takes only the current
+principal, not a cutover/source owner. Terminal completion retains its normal
+journal, cursor, account, binding, reentrancy and durability checks.
 
-The recursive registry mutex allowed read-only identity inspection, but also allowed
-retainShared to downgrade the outer exclusive file lease or a nested withExclusive
-defer to release it. Both mutating reentry paths now throw restoreInProgress before
-altering that lease. Read-only current identity remains usable by the existing
-finalizer. This uses the same mutex/file lease, not another lock coordinator.
+The mixed OutboundQuiescence extension retains its existing ordinary principal,
+admission, request descriptor, submission and settlement implementation plus generic
+checkpoint inspection/recovery. No persistence format, account-generation algorithm,
+journal-selection rule or physical-uncertainty contract changed.
 
-Manual restore event identity previously accepted only a header and UUID, even when
-the full receipt was truncated or its required contract unknown. Event decoding now
-uses the same full receipt parser; old complete raw receipts and automatic UUID events
-retain their format. Malformed manual data is not treated as absence or automatic
-recovery permission.
+## Explicitly retained
 
-Reconciled journal completion is a requirement of the event itself. A missing intent
-file no longer bypasses matching completed-receipt checks in prepareInstallation,
-currentInstallationIdentifier or markRestoreResetCompleted. The event check also
-requires the expected new sentinel. Failure leaves the state pending; no file-clearing
-operation or user restore was executed during this coding pass.
+- `BigSyncOutboundQuiescence.swift`: checkpoint decoding, historical barrier fields,
+  ordinary admission/leases and submitted-state bookkeeping. Its internal barrier
+  primitives and low-level process tests remain; no public cutover grant or ordinary
+  source-owner branch reaches those obsolete application transitions.
+- `CloudKitSynchronizer+OutboundReplayRecovery.swift`: exact long-lived identity,
+  replay collector, provenance of terminal failures and generation-matched repair.
+- `CloudKitRecordStore`, `CloudKitSynchronizer+RecordMutations`, Realm adapter/model
+  preferences, target/tracking recovery and the sole pending mutation journal.
+- Installation/account/binding fencing and all reconciled manual-restore lease,
+  intent, event, receipt and unchanged-record journal handling from merged PR #11.
+- Ordinary terminal receipts, optional generic semantic callbacks and change-feed
+  recovery. They contain no new Reader baseline, Mark/Undo or lifetime policy.
 
-## Revision APIs and test source
+An old barrier still blocks ordinary admission. An absent proxy, empty journal,
+expired wait or lost process lock never settles a submitted request. Existing
+checkpoint decoding and explicit generic recovery are preserved, not repurposed
+as Reader migration. See [Outbound transport](OutboundQuiescence.md).
 
-Existing preferIncomingRecord/preferExistingObject, strict journaling, target-write
-revalidation and generation-matched acknowledgements remain unchanged. See
-[ReadingAnalyticsRevisionContract.md](ReadingAnalyticsRevisionContract.md).
-The existing native fixture is real Realm/journal/adapter code, not Common's models.
-Two tests call the real synchronizeAdapter loop with scripted remote IO. Scripted
-records have no real server-assigned change tags. The older fixture's permissive
-backup selector is not W3's corrected restore-admission policy.
+## Exclusive tooling removal
 
-Already-registered file: Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift.
-Test implementation e8b899e57cf5493eca82c4598e449c2bafb08c44, blobe14062ae,
-is unchanged by the production coding passes. Exact 21 native methods:
+Deleted the AcceptedHeadQuiescence and PausedOutboundRecoveryProbe collaborator/test
+files, their two runner scripts, and their two obsolete integration documents.
+Removed the dedicated paused-recovery workflow job and accepted-head command/path
+references. General native transport and cross-process jobs/scripts remain; no new
+workflow or runner was introduced.
 
-```text
-OwnedRecordRevisionTests/testLatePopulatedDownloadRequeuesNewerEmptyValueWithoutReauthoring
-OwnedRecordRevisionTests/testHigherIncomingRevisionReplacesPendingValueAndMintsNewGeneration
-OwnedRecordRevisionTests/testOlderOwnEchoAndG1AcknowledgementCannotRetireG2
-OwnedRecordRevisionTests/testClockRevisionThenUndoTransportsNewestCompletePayload
-OwnedRecordRevisionTests/testEqualRevisionReplayNormalizesSetsAndIgnoresAuditMetadata
-OwnedRecordRevisionTests/testEqualRevisionDivergenceIsQuarantinedWithoutLosingPendingWork
-OwnedRecordRevisionTests/testOmittedEmptyMembershipIsTheSameDomainReplay
-OwnedRecordRevisionTests/testChangedOwnerCannotAddressExistingRecordEvenWithHigherRevision
-OwnedRecordRevisionTests/testRequiredJournalIdentityFailureRollsBackDomainAndRevision
-OwnedRecordRevisionTests/testReseedKeepsOriginalOwnerAndRevisionUnderNewJournalIdentity
-OwnedRecordRevisionTests/testRealUploadLoopRetriesLowerServerConflictWithNewerLocalEmptyState
-OwnedRecordRevisionTests/testRealUploadLoopReplacesStalePendingMarkWithNewerServerEmptyState
-OwnedRecordRevisionTests/testNewerLocalRevisionAtFinalWriteOverridesSelectionSnapshot
-OwnedRecordRevisionTests/testHigherRemoteRevisionStillWinsAfterLocalJournalChangesDuringSelection
-OwnedRecordRevisionTests/testEqualRevisionDivergenceAtFinalWriteCannotBeHiddenByNewPendingWork
-OwnedRecordRevisionTests/testSecondIncomingWinnerJournalFailureRollsBackBothTargets
-OwnedRecordRevisionTests/testTrackingFailureAfterTargetCommitPreservesWinnerForReplayAndOldAck
-OwnedRecordRevisionTests/testPayloadAheadOfForwardedGenerationStillDrainsNewerJournal
-OwnedRecordRevisionTests/testDivergentOwnEchoIsQuarantinedWithoutApplyingOrAcknowledgingIt
-OwnedRecordRevisionTests/testIncomingHardDeletionCannotEraseAcknowledgedEmptyRevision
-OwnedRecordRevisionTests/testBackupRestoreWithholdsCopiedRowsUntilActualServerImport
-```
+## Evidence and remaining work
 
-No tests, compiler/typecheck, syntax checks, native tools or CloudKit ran in this pass.
-Only source/blob/diff and GitHub publication integrity were inspected. Earlier syntax
-results do not apply to new production code. Native qualification must exercise the
-bound physical restore -> adapter backupRestore -> late42 path, interrupted repair,
-missing/malformed handoff records and reentrant preparation, as well as the preserved
-account/cancellation/partial-outcome suites. None is claimed passed or newly authored.
+No tests, compiler/typecheck, syntax checks, native runner or CloudKit operations
+were run in this coding pass. Source preimages, generated postimage hashes, Git
+ancestry and changed-file diffs were reviewed for safe publication only.
 
-## Remaining code removal is caller-dependent
+The existing 21 OwnedRecordRevisionTests methods are unchanged. General
+account/cancellation/partial-result/replay/journal/restore tests remain. Native
+terminal/settlement tests which name removed cutover capabilities still require
+compile/test follow-through; retire only the obsolete cases or retarget their
+independent safety assertion. Do not restore deleted production APIs for old tests.
+W1 also owns root explicit source/test membership cleanup for the paired Core batch.
 
-Live W6 Core #7 still at1fa7174e retains ReaderOrderedV2BigSyncTransport and old
-startup/cutover callers. W8/W3 source retirement is not complete closure of those
-exported calls. The repeated coordinator request names the actual APIs; no false
-compatibility alias or disabled check is used to pretend they disappeared.
+The production architecture for this assignment stops here unless composition
+exposes a concrete BigSync defect. Remaining work is source selection and compile/
+test fallout, not another transport design, cloud baseline-election service or
+application migration framework. Production readiness, live-user-data permission
+and signed multidevice qualification remain separate and are not claimed.
 
-| Surface | Remaining action |
-| --- | --- |
-| AcceptedHeadQuiescence / PausedOutboundRecovery | Apply prepared120/115-line deletions only with caller closure and their exclusive probe/script/manifest references. |
-| OutboundCompletion | Remove source-publication wrappers with callers; distinguish supported external-owner recovery. |
-| Synchronizer OutboundQuiescence | Separate final-drain/source exports from ordinary principal/admission/submission functions. |
-| Persistent outbound coordinator / replay | Keep existing checkpoint decoding, uncertain submissions, original operation identity and generation-matched reconciliation. |
-| RecordStore / RecordMutations / journals / identity / preferences | Retain general synchronization safety. |
-
-Ordinary save/delete still invokes admitOutboundBatch and
-modifyRecordsHoldingOutboundLease. No old checkpoint is cleared/reinterpreted as
-settled. The235-line source patch in the prior handoff is unapplied, only a first
-slice, not the entire mixed-code cleanup and not counted as production deletion.
-No cutover export was removed in this latest commit. W6/W8 caller-closure evidence
-remains required before that dependency-closed W2 batch can be published.
-
-W1 excluded cloud baseline election/CAS/publication; W8 withdrew its raw-save API
-request. Explicit selected local input suffices for isolated composition. Production
-multi-install baseline distribution remains a release decision, not another W2 API.
-
-## Accounting and completion boundary
-
-Latest production delta vs0e7c9f1e: **+53/-17**, two existing files, no new API/file/model,
-framework, source move, test or manifest change. Cumulative PR#11 production vs5923:
-**+357/-117** across six source files (including the earlier104-line restore helper).
-Prior test refinement+314/-6 is unchanged; docs and prepared-but-unapplied deletions
-are separate. No cap increase is implied.
-
-Published independent W2 corrections and actual application restore bindings are now
-identified. Export/probe removal is still unfinished coding, not merely a test gate.
-W1 owns exact source composition, native qualification and release authorization.
-No integration/default/release merge, force push, live migration/baseline choice,
-account/zone/journal clearing, production activation or foreign/Mac-worktree edit.
+All persisted state is untouched. No default/release/integration merge, force push,
+account/zone deletion, journal clearing, live restore or protected Mac worktree
+operation was performed. Exact line accounting belongs to this batch's GitHub
+compare; prior additions and deleted lines are never netted to hide the project cap.

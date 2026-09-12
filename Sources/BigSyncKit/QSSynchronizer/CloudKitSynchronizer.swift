@@ -610,9 +610,6 @@ public class CloudKitSynchronizer: NSObject {
         /// Captured before the run's first suspension after account validation.
         /// Nil is reserved for non-upload recovery contexts/older test fixtures.
         let accountInvalidationGeneration: Int64?
-        /// Exact live source-publication owner captured at run admission, before
-        /// any suspension. Nil for ordinary and aggregate-cutoff runs.
-        let sourcePublicationOwnershipID: UUID?
 
         init(
             attemptID: UUID,
@@ -620,10 +617,8 @@ public class CloudKitSynchronizer: NSObject {
             accountIdentifier: String,
             accountScopeIdentifier: String,
             replicaBindingGenerationIdentifier: String? = nil,
-            accountInvalidationGeneration: Int64? = nil,
-            sourcePublicationOwnershipID: UUID? = nil
+            accountInvalidationGeneration: Int64? = nil
         ) {
-            self.sourcePublicationOwnershipID = sourcePublicationOwnershipID
             self.accountInvalidationGeneration = accountInvalidationGeneration
             self.attemptID = attemptID
             self.runID = runID
@@ -647,17 +642,13 @@ public class CloudKitSynchronizer: NSObject {
         internal let accountIdentifier: String
         internal let issuerID: UUID
         internal let authorizationID: UUID
-        /// Present only for a drain explicitly armed while no synchronization
-        /// was in flight after an operator-established writer barrier.
-        internal let postBarrierDrainAuthorizationID: UUID?
 
         internal init(
             context: RunContext,
             issuerID: UUID,
             authorizationID: UUID,
             consumedServerBoundaryIdentifier: String? = nil,
-            domainPublicationScopeIdentifier: String? = nil,
-            postBarrierDrainAuthorizationID: UUID? = nil
+            domainPublicationScopeIdentifier: String? = nil
         ) {
             accountScopeIdentifier = context.accountScopeIdentifier
             replicaBindingGenerationIdentifier =
@@ -669,43 +660,7 @@ public class CloudKitSynchronizer: NSObject {
             accountIdentifier = context.accountIdentifier
             self.issuerID = issuerID
             self.authorizationID = authorizationID
-            self.postBarrierDrainAuthorizationID =
-                postBarrierDrainAuthorizationID
         }
-    }
-
-    /// Opaque authorization established after an external writer/upload
-    /// barrier and before a new synchronization starts. It can authorize one
-    /// later terminal drain only; it is neither a server cursor nor a general
-    /// certificate.
-    public struct PostBarrierDrainAuthorization: Sendable, Equatable {
-        public let writerBarrierEvidenceID: String
-        internal let issuerID: UUID
-        internal let authorizationID: UUID
-        internal let accountScopeIdentifier: String
-        internal let replicaBindingGenerationIdentifier: String
-        internal let accountInvalidationGeneration: Int64
-        /// Nil means the legacy, externally-established upload-barrier API.
-        /// Production cutoff consumers must require a non-nil identifier.
-        public internal(set) var outboundQuiescenceIdentifier: UUID? = nil
-    }
-
-    /// A successful, terminal receipt bound to a post-barrier authorization.
-    /// The capability is valid only until this synchronizer starts a newer run,
-    /// its account/binding changes, or its receipt authorization is replaced.
-    public struct CompletedPostBarrierDrain: Sendable, Equatable {
-        public let writerBarrierEvidenceID: String
-        public let accountScopeIdentifier: String
-        public let replicaBindingGenerationIdentifier: String?
-        public let runID: UUID
-        public let recordZoneName: String
-        public let consumedServerBoundaryIdentifier: String
-        public let snapshotScopeIdentifier: String
-        internal let accountIdentifier: String
-        internal let issuerID: UUID
-        internal let receiptAuthorizationID: UUID
-        internal let postBarrierDrainAuthorizationID: UUID
-        public internal(set) var outboundQuiescenceIdentifier: UUID? = nil
     }
 
     public struct SynchronizationResult: Sendable, Equatable {
@@ -826,13 +781,10 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationWillConsumeServerChangesHandler:
         SynchronizationWillConsumeServerChangesHandler?
     internal var domainPrepublicationHandler: DomainPrepublicationHandler?
-    /// One terminal snapshot capture for an explicitly armed cutover drain.
-    /// Ordinary source publication and aggregate publication keep their existing semantics.
     internal var publicationFetchDeferralHandler: PublicationFetchDeferralHandler?
     internal var publicationConsumptionHandler: SynchronizationWillConsumeServerChangesHandler?
     internal var publicationConsumptionPending = false
     internal var publicationFetchDeferralEligible = false
-    internal var postBarrierSnapshotIdentifierProvider: DomainPublicationScopeIdentifierProvider?
     internal var domainPublicationScopeIdentifierProvider:
         DomainPublicationScopeIdentifierProvider?
     internal let backupDetectionBaseURL: URL?
@@ -1057,11 +1009,6 @@ public class CloudKitSynchronizer: NSObject {
     internal var activeRunContext: RunContext?
     internal var activeReceiptAuthorizationID: UUID?
     private var reservedReceiptAuthorizationID: UUID?
-    internal var postBarrierDrainAuthorization: PostBarrierDrainAuthorization?
-    internal var completedPostBarrierDrain: CompletedPostBarrierDrain?
-    internal var postBarrierOutboundLease: BigSyncOutboundQuiescenceLease?
-    internal var postBarrierOutboundTicket: PostBarrierOutboundQuiescence?
-    internal var postBarrierOutboundEstablishmentID: UUID?
     internal var outboundRecoveryID: UUID?
     /// Non-nil only for the attempt currently performing the durable
     /// change-feed migration.  Adapter state remains the source of truth for
@@ -1651,20 +1598,12 @@ public class CloudKitSynchronizer: NSObject {
         syncing = true
         retrySleepUntil = nil
         let attemptID = UUID()
-        let sourcePublicationOwnershipID =
-            postBarrierOutboundLease?.barrier.phase == .sourcePublication
-                ? postBarrierOutboundTicket?.ownershipID : nil
         synchronizationAttemptID = attemptID
         activeRunContext = nil
         publicationConsumptionPending = false
         publicationFetchDeferralEligible = false
         activeReceiptAuthorizationID = nil
         reservedReceiptAuthorizationID = nil
-        // A completed drain may never be replayed after another run begins.
-        // Keep an armed post-barrier authorization through a failed retry: the
-        // retry itself also begins after the barrier, but it cannot mint a
-        // capability until it reaches this terminal receipt path.
-        completedPostBarrierDrain = nil
 
         synchronizationTask?.cancel()
         // Synchronization is deferrable user-data work, but it must still make
@@ -1714,11 +1653,9 @@ public class CloudKitSynchronizer: NSObject {
                     ),
                     replicaBindingGenerationIdentifier:
                         replicaBindingGenerationIdentifier,
-                    accountInvalidationGeneration: validatedLease.invalidationGeneration,
-                    sourcePublicationOwnershipID: sourcePublicationOwnershipID
+                    accountInvalidationGeneration: validatedLease.invalidationGeneration
                 )
                 activeRunContext = context
-                try validateSourcePublicationRun(context)
                 for adapter in modelAdapters {
                     try await adapter.activateTransportNamespace(
                         containerIdentifier: containerIdentifier,
@@ -1866,162 +1803,6 @@ public class CloudKitSynchronizer: NSObject {
                 self?.cancelSynchronizationRequest(requestID)
             }
         }
-    }
-
-    /// Arms the next successful terminal drain after an operator has
-    /// established writer/upload quiescence outside BigSyncKit. This legacy
-    /// API does NOT prove cross-process quiescence; production cutoff callers
-    /// must use beginPostBarrierOutboundQuiescence followed by
-    /// establishPostBarrierDrain(quiescence:). It deliberately refuses an
-    /// already-running drain, so a receipt from work that began before the
-    /// barrier can never be relabelled as post-barrier evidence.
-    @BigSyncBackgroundActor
-    public func establishPostBarrierDrain(
-        writerBarrierEvidenceID: String
-    ) throws -> PostBarrierDrainAuthorization {
-        guard !writerBarrierEvidenceID.isEmpty,
-              writerBarrierEvidenceID.utf8.count <= 1_024,
-              !syncing,
-              !synchronizationDrainIsActive,
-              postBarrierSnapshotIdentifierProvider != nil,
-              completedPostBarrierDrain == nil,
-              postBarrierDrainAuthorization == nil else {
-            throw CancellationError()
-        }
-        guard let lease = try accountScopeLease(),
-              let binding = try BigSyncReplicaBindingStateStore.load(store: keyValueStore, key: replicaBindingStateKey),
-              binding.pendingPort == nil,
-              binding.activeAccountScopeIdentifier == lease.accountScopeIdentifier,
-              !binding.activeGenerationIdentifier.isEmpty else { throw CancellationError() }
-        // The legacy API cannot borrow another request's in-progress fence.
-        // Use establishPostBarrierDrain(quiescence:) for library-owned cutoff.
-        guard postBarrierOutboundLease == nil else {
-            throw BigSyncOutboundQuiescenceError.blocked
-        }
-        let authorization = PostBarrierDrainAuthorization(
-            writerBarrierEvidenceID: writerBarrierEvidenceID,
-            issuerID: synchronizationReceiptIssuerID, authorizationID: UUID(),
-            accountScopeIdentifier: lease.accountScopeIdentifier,
-            replicaBindingGenerationIdentifier: binding.activeGenerationIdentifier,
-            accountInvalidationGeneration: lease.invalidationGeneration
-        )
-        postBarrierDrainAuthorization = authorization
-        return authorization
-    }
-
-    /// Revokes only the exact post-barrier authorization supplied by its holder.
-    /// An in-flight synchronization may continue as an ordinary drain, but it
-    /// can no longer mint a completed cutover capability. A matching completed
-    /// capability is invalidated too; ordinary receipts remain untouched.
-    @BigSyncBackgroundActor
-    @discardableResult
-    public func revokePostBarrierDrainAuthorization(
-        _ authorization: PostBarrierDrainAuthorization
-    ) -> Bool {
-        guard authorization.issuerID == synchronizationReceiptIssuerID else { return false }
-        var revoked = false
-        if let identifier = authorization.outboundQuiescenceIdentifier,
-           postBarrierOutboundTicket?.identifier == identifier {
-            // Revocation must not reopen peers or release an in-flight batch.
-            postBarrierOutboundLease?.sealFinalDrain()
-        }
-        if postBarrierDrainAuthorization == authorization {
-            postBarrierDrainAuthorization = nil
-            revoked = true
-        }
-        if completedPostBarrierDrain?.postBarrierDrainAuthorizationID == authorization.authorizationID {
-            completedPostBarrierDrain = nil
-            revoked = true
-        }
-        return revoked
-    }
-
-    /// Materializes an opaque completed-drain capability from the exact
-    /// terminal receipt issued for an armed post-barrier run. This remains
-    /// valid after that run has released its waiters, but a newer run, account
-    /// replacement, binding replacement, cancellation, or receipt replacement
-    /// invalidates it before it can authorize a local reservation.
-    @BigSyncBackgroundActor
-    public func completedPostBarrierDrain(
-        using receipt: SynchronizationReceipt,
-        authorizedBy authorization: PostBarrierDrainAuthorization
-    ) async throws -> CompletedPostBarrierDrain {
-        guard receipt.issuerID == synchronizationReceiptIssuerID,
-              authorization.issuerID == synchronizationReceiptIssuerID,
-              receipt.postBarrierDrainAuthorizationID == authorization.authorizationID,
-              let completed = completedPostBarrierDrain,
-              completed.postBarrierDrainAuthorizationID == authorization.authorizationID,
-              completed.receiptAuthorizationID == receipt.authorizationID,
-              completed.runID == receipt.runID,
-              completed.accountScopeIdentifier == receipt.accountScopeIdentifier,
-              completed.replicaBindingGenerationIdentifier == receipt.replicaBindingGenerationIdentifier else {
-            throw CancellationError()
-        }
-        try await revalidateCompletedPostBarrierDrain(completed)
-        guard try !adaptersHavePendingChangesAtTerminalBoundary() else { throw CancellationError() }
-        return completed
-    }
-
-    /// Revalidates the original transport principal after the application has
-    /// consumed a completed aggregate drain by committing its bootstrap. New
-    /// source journals and a changed cursor are allowed here. This proves only
-    /// worker/run/account/binding continuity, NOT an empty journal or an approved
-    /// snapshot. Never use it to reserve, authorize a head CAS, or publish success;
-    /// those require the full completed drain or a new ordinary source receipt.
-    @BigSyncBackgroundActor
-    public func revalidatePostBarrierDrainPrincipal(
-        _ completed: CompletedPostBarrierDrain
-    ) async throws {
-        try validatePostBarrierDrainPrincipal(completed)
-        try await ensureCurrentAccount(completed.accountIdentifier)
-        try validatePostBarrierDrainPrincipal(completed)
-    }
-
-    /// Synchronous ownership/persisted-binding check after a domain-owned
-    /// suspension. This does not query the account provider or require an empty
-    /// journal. Pair it with revalidatePostBarrierDrainPrincipal before the
-    /// suspension; neither method grants a new drain or publication capability.
-    @BigSyncBackgroundActor
-    public func validatePostBarrierDrainPrincipal(
-        _ completed: CompletedPostBarrierDrain
-    ) throws {
-        guard completed.issuerID == synchronizationReceiptIssuerID,
-              completedPostBarrierDrain == completed,
-              activeReceiptAuthorizationID == completed.receiptAuthorizationID,
-              let activeRunContext,
-              activeRunContext.runID == completed.runID,
-              activeRunContext.accountScopeIdentifier == completed.accountScopeIdentifier,
-              activeRunContext.replicaBindingGenerationIdentifier == completed.replicaBindingGenerationIdentifier,
-              !cancelSync else {
-            throw CancellationError()
-        }
-        try checkRunContext(activeRunContext)
-        if let quiescenceID = completed.outboundQuiescenceIdentifier {
-            try validatePostBarrierOutboundPrincipal(identifier: quiescenceID)
-        }
-    }
-
-    /// Revalidates a completed post-barrier capability around an application
-    /// suspension BEFORE consuming the aggregate snapshot. A failed recheck
-    /// after Realm reservation prevents the head CAS; the reservation remains
-    /// for fenced recovery. Realm also compares its exact snapshot and journal
-    /// identity inside the write. Do not reuse this precondition after bootstrap
-    /// has deliberately created source journals.
-    @BigSyncBackgroundActor
-    public func revalidateCompletedPostBarrierDrain(
-        _ completed: CompletedPostBarrierDrain
-    ) async throws {
-        try validatePostBarrierDrainPrincipal(completed)
-        guard try !adaptersHavePendingChangesAtTerminalBoundary() else { throw CancellationError() }
-        try await ensureCurrentAccount(completed.accountIdentifier)
-        try validatePostBarrierDrainPrincipal(completed)
-        guard try !adaptersHavePendingChangesAtTerminalBoundary(),
-              let adapter = modelAdapters.first,
-              try adapter.consumedServerBoundaryIdentifier(
-                accountScopeIdentifier: completed.accountScopeIdentifier,
-                replicaBindingGenerationIdentifier: completed.replicaBindingGenerationIdentifier,
-                containerIdentifier: containerIdentifier, databaseScope: database.databaseScope
-              ) == completed.consumedServerBoundaryIdentifier else { throw CancellationError() }
     }
 
     private func cancelSynchronizationRequest(_ requestID: UUID) {
@@ -2314,12 +2095,6 @@ public class CloudKitSynchronizer: NSObject {
     internal func finishSynchronizationDrain(
         with result: Result<SynchronizationResult, Error>
     ) {
-        // Failed, cancelled, blocked, or scope-less terminal work must not
-        // leave an armed barrier authorization reusable. A later attempt needs
-        // a newly established barrier and a new full successful drain.
-        if completedPostBarrierDrain == nil {
-            postBarrierDrainAuthorization = nil
-        }
         synchronizationDrainIsActive = false
         synchronizationRequestedWhileRunning = false
         let waiters = synchronizationWaiters.values
@@ -3460,7 +3235,7 @@ public class CloudKitSynchronizer: NSObject {
             // marker makes the crash window safely resumable.
             try clearConfiguredZoneTerminal(
                 modelAdapter.recordZoneID,
-                accountScopeIdentifier: migration.accountScopeIdentifier
+                accountScopeIdentifier: context.accountScopeIdentifier
             )
         }
         migration.phase = .completed
@@ -3495,12 +3270,6 @@ public class CloudKitSynchronizer: NSObject {
         publicationFetchDeferralEligible = false
         activeReceiptAuthorizationID = nil
         reservedReceiptAuthorizationID = nil
-        completedPostBarrierDrain = nil
-        postBarrierDrainAuthorization = nil
-        postBarrierOutboundEstablishmentID = nil
-        postBarrierOutboundLease?.sealOutboundAdmission()
-        // Cancellation drops receipt authority, never the durable cutoff.
-        // Actual batch scopes retain OS ownership until they really unwind.
         changeRequestProcessor.reset()
         synchronizationTask?.cancel()
         synchronizationTask = nil
