@@ -1,0 +1,110 @@
+name: Complete hotfix register qualification
+on:
+  push:
+    branches: [fix/hotfix-register-closure-20260912]
+    paths: [.github/workflows/register-closure.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: hotfix-register-closure
+  cancel-in-progress: false
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Compose reviewed branches and commit source repairs
+        working-directory: BigSyncKit
+        run: python3 .github/register-closure-prepare.py
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record immutable qualification inputs
+        working-directory: BigSyncKit
+        run: |
+          git diff --exit-code
+          git rev-parse HEAD > qualification-commit.txt
+          git rev-parse HEAD:Sources > qualification-source-tree.txt
+          swift --version > qualification-toolchain.txt
+          sw_vers >> qualification-toolchain.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > qualification-RealmSwiftGaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > qualification-SwiftUtilities.txt
+      - name: Native regressions, full suite and repetitions
+        working-directory: BigSyncKit
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess, sys
+          results = []
+          def run(name, args, minimum=1, expected=None, env=None):
+              path = pathlib.Path('qualification-' + name + '.log')
+              with path.open('w') as output:
+                  try:
+                      code = subprocess.run(args, stdout=output, stderr=subprocess.STDOUT, timeout=900, env=env).returncode
+                  except subprocess.TimeoutExpired:
+                      output.write('\nQUALIFICATION_TIMEOUT\n')
+                      code = 124
+              text = path.read_text()
+              counts = [int(n) for n in re.findall(r'Executed (\d+) tests?', text)]
+              passed = code == 0 and max(counts, default=0) >= minimum
+              if expected is not None:
+                  passed = code not in (0, 124) and bool(counts) and expected in text
+              results.append(dict(name=name, exit_code=code, passed=passed, executed=max(counts, default=0), expected_failure=expected is not None))
+              pathlib.Path('qualification-results.json').write_text(json.dumps(results, indent=2) + '\n')
+              print(name, 'exit', code, 'accepted', passed, flush=True)
+              for line in text.splitlines():
+                  if re.search(r': error:|^error:|Executed | failed |REVIEW_', line): print(line, flush=True)
+              return passed
+          pattern = 'testReview|testClosure|testReevaluation|testTerminalPublicationEvidenceRestoresOnlyForExactTransportBoundary'
+          focused = run('focused', ['swift', 'test', '--filter', pattern], minimum=30)
+          full = run('full', ['swift', 'test'], minimum=400, env=dict(os.environ, BIGSYNC_RUN_MUTATION_BENCHMARK='1'))
+          if focused and full:
+              for i in range(1, 11):
+                  if not run('repeat-' + str(i), ['swift', 'test', '--skip-build', '--filter', pattern], minimum=30): break
+              source = pathlib.Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+              original = source.read_bytes()
+              old = b'if isNewlyCreatedReceiver\n            || mergePolicy'
+              assert original.count(old) == 1
+              try:
+                  source.write_bytes(original.replace(old, b'if false\n            || mergePolicy'))
+                  run('negative-creation', ['swift', 'test', '--filter', 'testReviewFirstImportWithoutExplicitTimestampMustNotInventLocalAuthority'], expected='Constructor defaults are not a competing local revision')
+              finally: source.write_bytes(original)
+              helper = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Cancellation.swift')
+              original_helper = helper.read_bytes()
+              try:
+                  assert original_helper.count(b'        cancelSynchronization()') == 1
+                  helper.write_bytes(original_helper.replace(b'        cancelSynchronization()', b'        return'))
+                  run('negative-cancellation', ['swift', 'test', '--filter', 'testClosureCurrentPrepublicationCancellationSettlesCoalescedWaiters'], expected='A current cancellation must settle the logical drain')
+              finally: helper.write_bytes(original_helper)
+              run('restored-focused', ['swift', 'test', '--filter', pattern], minimum=30)
+          subprocess.run(['git', 'diff', '--exit-code'], check=True)
+          if pathlib.Path('Package.resolved').exists():
+              pathlib.Path('qualification-Package.resolved').write_bytes(pathlib.Path('Package.resolved').read_bytes())
+          sys.exit(0 if len(results) == 15 and all(r['passed'] for r in results) else 1)
+          PY
+      - name: Archive exact committed source
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD > qualification-commit.txt
+          git archive --format=tar.gz -o qualification-source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hotfix-register-closure
+          path: BigSyncKit/qualification-*
+          retention-days: 14
