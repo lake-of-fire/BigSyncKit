@@ -12,16 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ github.sha }}
+          ref: 04caf6776dec03b1c3888571d7c955d3cac46ba8
           path: BigSyncKit
           fetch-depth: 0
-      - name: Compose checked tests and commit clean source
+      - name: Compose checked source and tests
         working-directory: BigSyncKit
         run: |
+          test "$(git rev-parse HEAD)" = 04caf6776dec03b1c3888571d7c955d3cac46ba8
           git cherry-pick --no-commit 8b9fbd6c0025a12ea283a6bdd6d0d1b56698a69c
           python3 - <<'PY'
           from pathlib import Path
-          import re
           p = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
           s = p.read_text()
           old = '''        // A revoked callback cannot hold a replacement drain hostage.
@@ -34,8 +34,6 @@ jobs:
           p.write_text(s.replace(old, new))
           p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
           s = p.read_text()
-          # The composed disk and initial-fence tests already cover these;
-          # remove duplicate tests and their invalid byte-layout premise.
           start = s.index('    @BigSyncBackgroundActor\n    func testReevaluationWarmDiskInspectionCoexistsWithOperationalRealm')
           end = s.index('    @BigSyncBackgroundActor\n    func testReevaluationCanceledCallbackCannotBlockReplacementDrain', start)
           s = s[:start] + s[end:]
@@ -87,18 +85,9 @@ jobs:
                   await synchronizer.cancelSynchronizationAndWait()'''
           assert s.count(old) == 1
           p.write_text(s.replace(old, new))
-          p = Path('.github/workflows/hotfix-reevaluation.yml')
-          s = p.read_text()
-          s = s.replace('The new result cannot wait for a revoked callback', 'A stale, unjournaled target must not be acknowledged as unchanged')
-          s = s.replace("source = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')", "source = pathlib.Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')")
-          s = s.replace("old = b'completingPublicationAttemptID != context.attemptID else { return }'", "old = re.search(rb'throw RealmSwiftInboundTargetChangedError\\(\\s*recordName: candidate\\.syncedEntityID\\s*\\)', original).group(0)")
-          s = s.replace("b'completingPublicationAttemptID == nil else { return }'", "b'continue'")
-          s = s.replace('testReevaluationCanceledCallbackCannotBlockReplacementDrain', 'testReevaluationNonJournaledImportCollisionRetainsPageForReplay')
-          p.write_text(s)
-          Path('.github/workflows/hotfix-native-finalize.yml').unlink()
           PY
           git diff --check
-          git add Sources Tests .github/workflows
+          git add Sources Tests
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'test: preserve callback quiescence and compose logical cold-restoration controls'
           git push origin HEAD:refs/heads/fix/hotfix-sync-deeper-20260912
           git rev-parse HEAD > qualification-commit.txt
@@ -121,7 +110,7 @@ jobs:
           swift --version >> qualification-toolchain.txt
           git -C ../RealmSwiftGaps rev-parse HEAD > qualification-RealmSwiftGaps.txt
           git -C ../SwiftUtilities rev-parse HEAD > qualification-SwiftUtilities.txt
-      - name: Execute final committed qualification recipe
+      - name: Execute committed qualification recipe
         working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
