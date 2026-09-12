@@ -1,13 +1,8 @@
 name: Hotfix deeper native qualification
 on:
-  push:
-    branches: [fix/hotfix-sync-deeper-20260912]
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: hotfix-deeper-${{ github.ref }}
-  cancel-in-progress: false
 jobs:
   native:
     runs-on: macos-15
@@ -57,7 +52,7 @@ jobs:
               counts = re.findall(r'Executed (\d+) tests?', text)
               passed = code == 0 and bool(counts) and max(map(int, counts)) > 0
               if expected_failure:
-                  passed = code not in (0, 124) and bool(counts) and 'The new result cannot wait for a revoked callback' in text
+                  passed = code not in (0, 124) and bool(counts) and 'A stale, unjournaled target must not be acknowledged as unchanged' in text
               results.append(dict(name=name, exit_code=code, expected_failure=expected_failure, passed=passed, executed_counts=counts))
               print(name, 'exit', code, 'accepted', passed, flush=True)
               print('\n'.join(line for line in text.splitlines() if re.search(r': error:|^error:|Executed | failed ', line)), flush=True)
@@ -65,19 +60,19 @@ jobs:
               return passed
           focused = run('focused', ['swift', 'test', '--filter', 'testReevaluation'])
           if focused:
-              source = pathlib.Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
+              source = pathlib.Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
               original = source.read_bytes()
-              old = b'completingPublicationAttemptID != context.attemptID else { return }'
+              match = re.search(rb'throw RealmSwiftInboundTargetChangedError\(\s*recordName: candidate\.syncedEntityID\s*\)', original)
+              assert match is not None
+              old = match.group(0)
               assert original.count(old) == 1
               try:
-                  source.write_bytes(original.replace(old, b'completingPublicationAttemptID == nil else { return }'))
-                  diff = subprocess.check_output(['git', 'diff', '--', str(source)])
-                  pathlib.Path('qualification-negative-control.patch').write_bytes(diff)
-                  run('negative-control', ['swift', 'test', '--filter', 'testReevaluationCanceledCallbackCannotBlockReplacementDrain'], expected_failure=True)
+                  source.write_bytes(original.replace(old, b'continue'))
+                  pathlib.Path('qualification-negative-control.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', str(source)]))
+                  run('negative-control', ['swift', 'test', '--filter', 'testReevaluationNonJournaledImportCollisionRetainsPageForReplay'], expected_failure=True)
               finally:
                   source.write_bytes(original)
-          full_env = dict(os.environ, BIGSYNC_RUN_MUTATION_BENCHMARK='1')
-          full = run('full', ['swift', 'test'], env=full_env)
+          full = run('full', ['swift', 'test'], env=dict(os.environ, BIGSYNC_RUN_MUTATION_BENCHMARK='1'))
           if focused and full:
               for index in range(1, 11):
                   if not run('repeat-' + str(index), ['swift', 'test', '--skip-build', '--filter', 'testReevaluation']):
