@@ -1303,6 +1303,9 @@ extension CloudKitSynchronizer {
                         resultsLimit: 200
                     )
                 } catch {
+                    // Failed IO suspends just like successful IO. Reject an old
+                    // attempt/account before writing zone-loss recovery state.
+                    try await revalidateActiveRunContext(for: attemptID)
                     guard let context = activeRunContext else {
                         throw error
                     }
@@ -1702,8 +1705,11 @@ extension CloudKitSynchronizer {
         do {
             // Validate immediately before and after each account-routed await.
             try await revalidateActiveRunContext(for: attemptID)
-            _ = try await zoneStore.recordZone(withID: zoneID)
+            let zone = try await zoneStore.recordZone(withID: zoneID)
             try await revalidateActiveRunContext(for: attemptID)
+            guard zone.zoneID == zoneID else {
+                throw CocoaError(.coderValueNotFound)
+            }
             if let context = activeRunContext {
                 try markConfiguredZoneEstablished(
                     zoneID,
@@ -1767,12 +1773,19 @@ extension CloudKitSynchronizer {
             )
             saveError = nil
         } catch {
-            saveError = applyCloudKitLoss(
-                error: error,
-                defaultZoneID: zoneID,
-                context: context,
-                allowsEncryptedBootstrapAbsence: false
-            ) ?? error
+            let operationError = error
+            do {
+                // Never classify an old save's failure under a new account/run.
+                try await revalidateRunContext(context)
+                saveError = applyCloudKitLoss(
+                    error: operationError,
+                    defaultZoneID: zoneID,
+                    context: context,
+                    allowsEncryptedBootstrapAbsence: false
+                ) ?? operationError
+            } catch {
+                saveError = error
+            }
         }
         // Deliver outside both operation catches. A completion may itself
         // perform a fallible upload; that must never become zone-loss evidence.
