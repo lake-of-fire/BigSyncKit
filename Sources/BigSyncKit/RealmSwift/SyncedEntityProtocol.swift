@@ -114,9 +114,12 @@ public extension ChangeMetadataRecordable {
     /// is a new user edit. In particular, catalog repair must not advance the
     /// broad control record's conflict clock. Application commands use the
     /// expected-identity refresh API instead.
-    internal func journalCurrentValuePreservingChangeMetadata(at timestamp: Date) throws {
+    internal func journalCurrentValuePreservingChangeMetadata(
+        at timestamp: Date,
+        expectedJournalIdentity: BigSyncMutationJournalIdentity? = nil
+    ) throws {
         _ = try recordBigSyncMutation(
-            at: timestamp, expectedJournalIdentity: nil,
+            at: timestamp, expectedJournalIdentity: expectedJournalIdentity,
             requiresAvailableIdentity: true
         )
     }

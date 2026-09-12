@@ -360,6 +360,18 @@ public struct BigSyncClientIdentity: Sendable {
     @discardableResult
     public func prepareReplicaBindingGenerationIdentifier() throws -> String {
         let installationIdentifier = try prepareInstallation()
+        return try prepareReplicaBindingGenerationIdentifier(forPublishedInstallation: installationIdentifier)
+    }
+
+    /// The reconciled restore calls this while it still owns the exclusive
+    /// lease and durable intent. Do not reacquire a shared lease or recursively
+    /// run backup detection from inside that locked handoff.
+    internal func prepareReplicaBindingGenerationIdentifier(
+        forPublishedInstallation installationIdentifier: String
+    ) throws -> String {
+        guard publishedInstallationIdentifier() == installationIdentifier else {
+            throw BigSyncManualBackupRestoreError.stateAmbiguous
+        }
         let store = FileKeyValueStore(
             fileURL: synchronizationStateFileURL
         )
@@ -476,7 +488,8 @@ public struct BigSyncClientIdentity: Sendable {
         transactionIdentifier: UUID,
         _ replacement: () throws -> Void,
         rollback: () throws -> Void = {},
-        sentinelPublisher: ((URL, FileManager) throws -> Void)?
+        sentinelPublisher: ((URL, FileManager) throws -> Void)?,
+        beforeCompletingHandoff: ((BackupDetection.ManualRestoreReceipt) throws -> Void)? = nil
     ) throws -> BigSyncManualBackupRestoreReceipt {
         try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
             let preflight: BackupDetection.ManualRestorePreflight
@@ -494,9 +507,31 @@ public struct BigSyncClientIdentity: Sendable {
 
             switch preflight {
             case .completed(let existingReceipt):
-                return makeManualRestoreReceipt(existingReceipt)
+                guard existingReceipt.requiresReconciledJournal == (beforeCompletingHandoff != nil) else {
+                    throw BigSyncManualBackupRestoreError.transactionMismatch
+                }
+                // Completion may have reached disk before intent cleanup.
+                // Resume that exact cleanup, without replacing files or
+                // queueing the reconciled values again. Cleanup failure is
+                // still post-event: the caller must not roll back its files.
+                do {
+                    return try makeManualRestoreReceipt(BackupDetection.beginManualRestore(
+                        namespace: durableStateNamespace,
+                        transactionIdentifier: transactionIdentifier,
+                        sharedSentinelBaseURL: sharedStateBaseURL,
+                        sentinelPublisher: sentinelPublisher,
+                        beforeCompletingHandoff: beforeCompletingHandoff
+                    ))
+                } catch {
+                    throw BigSyncManualBackupRestoreError.handoffPending(
+                        makeManualRestoreReceipt(existingReceipt)
+                    )
+                }
 
             case .resumeEvent(let existingReceipt):
+                guard existingReceipt.requiresReconciledJournal == (beforeCompletingHandoff != nil) else {
+                    throw BigSyncManualBackupRestoreError.transactionMismatch
+                }
                 let publicReceipt = makeManualRestoreReceipt(existingReceipt)
                 // The caller's journal determines whether this closure is an
                 // idempotent verification/no-op or must finish installing the
@@ -515,7 +550,8 @@ public struct BigSyncClientIdentity: Sendable {
                             namespace: durableStateNamespace,
                             transactionIdentifier: transactionIdentifier,
                             sharedSentinelBaseURL: sharedStateBaseURL,
-                            sentinelPublisher: sentinelPublisher
+                            sentinelPublisher: sentinelPublisher,
+                            beforeCompletingHandoff: beforeCompletingHandoff
                         )
                     )
                 } catch {
@@ -537,7 +573,8 @@ public struct BigSyncClientIdentity: Sendable {
                     intentReceipt = try BackupDetection.prepareManualRestoreIntent(
                         namespace: durableStateNamespace,
                         transactionIdentifier: transactionIdentifier,
-                        sharedSentinelBaseURL: sharedStateBaseURL
+                        sharedSentinelBaseURL: sharedStateBaseURL,
+                        requiresReconciledJournal: beforeCompletingHandoff != nil
                     )
                 } catch BackupDetection.Error.manualRestoreTransactionMismatch {
                     throw BigSyncManualBackupRestoreError.transactionMismatch
@@ -562,7 +599,8 @@ public struct BigSyncClientIdentity: Sendable {
                             namespace: durableStateNamespace,
                             transactionIdentifier: transactionIdentifier,
                             sharedSentinelBaseURL: sharedStateBaseURL,
-                            sentinelPublisher: sentinelPublisher
+                            sentinelPublisher: sentinelPublisher,
+                            beforeCompletingHandoff: beforeCompletingHandoff
                         )
                     )
                 } catch let publicationError {
@@ -583,7 +621,12 @@ public struct BigSyncClientIdentity: Sendable {
                     }
                     switch stateAfterFailure {
                     case .completed(let receipt):
-                        return makeManualRestoreReceipt(receipt)
+                        // The receipt may precede a failed intent cleanup.
+                        // Let the exact retry finish that cleanup before the
+                        // host records a successful handoff and stops retrying.
+                        throw BigSyncManualBackupRestoreError.handoffPending(
+                            makeManualRestoreReceipt(receipt)
+                        )
                     case .resumeEvent(let receipt):
                         let publicReceipt = makeManualRestoreReceipt(receipt)
                         let currentIdentifier = publishedInstallationIdentifier()
@@ -646,7 +689,7 @@ public struct BigSyncClientIdentity: Sendable {
         ).newInstallationIdentifier
     }
 
-    private var leaseURL: URL {
+    internal var leaseURL: URL {
         BackupDetection.defaultSentinelURL(
             namespace: durableStateNamespace,
             sharedBaseURL: sharedStateBaseURL

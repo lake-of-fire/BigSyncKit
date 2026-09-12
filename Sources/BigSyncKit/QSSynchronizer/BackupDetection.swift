@@ -51,6 +51,9 @@ enum BackupDetection {
         let restoreEventIdentifier: UUID
         let oldInstallationIdentifier: String
         let newInstallationIdentifier: String
+        // Recorded in the existing intent/event/receipt, not a second ledger.
+        // A raw restore caller cannot finish a reconciled restore after a crash.
+        var requiresReconciledJournal = false
     }
 
     enum ManualRestorePreflight: Equatable, Sendable {
@@ -356,7 +359,8 @@ enum BackupDetection {
         transactionIdentifier: UUID,
         sharedSentinelBaseURL: URL? = nil,
         fileManager: FileManager = .default,
-        sentinelPublisher: ((URL, FileManager) throws -> Void)? = nil
+        sentinelPublisher: ((URL, FileManager) throws -> Void)? = nil,
+        beforeCompletingHandoff: ((ManualRestoreReceipt) throws -> Void)? = nil
     ) throws -> ManualRestoreReceipt {
         let sentinelURL = defaultSentinelURL(
             namespace: namespace,
@@ -374,12 +378,20 @@ enum BackupDetection {
                 sentinelURL: sentinelURL,
                 fileManager: fileManager
             ) {
+                guard receipt.requiresReconciledJournal == (beforeCompletingHandoff != nil) else {
+                    throw Error.manualRestoreTransactionMismatch
+                }
+                // The completion receipt also covers journal preparation. A
+                // crash during intent cleanup must retry cleanup, not the work.
+                try removeManualRestoreIntentLocked(receipt, sentinelURL: sentinelURL,
+                    fileManager: fileManager)
                 return receipt
             }
             let receipt = try prepareManualRestoreIntentLocked(
                 transactionIdentifier: transactionIdentifier,
                 sentinelURL: sentinelURL,
-                fileManager: fileManager
+                fileManager: fileManager,
+                requiresReconciledJournal: beforeCompletingHandoff != nil
             )
             let eventURL = restoreEventURL(sentinelURL: sentinelURL)
             if !fileManager.fileExists(atPath: eventURL.path) {
@@ -418,6 +430,10 @@ enum BackupDetection {
             ) == receipt.newInstallationIdentifier else {
                 throw Error.manualRestoreStateAmbiguous
             }
+            // The durable intent keeps other writers fenced even if this
+            // fails after identity publication. Never mark the handoff complete
+            // or remove that intent until required unchanged repairs are queued.
+            try beforeCompletingHandoff?(receipt)
             try persistManualRestoreReceiptExcludingBackup(
                 receipt,
                 at: completedManualRestoreReceiptURL(
@@ -439,7 +455,8 @@ enum BackupDetection {
         namespace: String,
         transactionIdentifier: UUID,
         sharedSentinelBaseURL: URL? = nil,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        requiresReconciledJournal: Bool = false
     ) throws -> ManualRestoreReceipt {
         let sentinelURL = defaultSentinelURL(
             namespace: namespace,
@@ -455,7 +472,8 @@ enum BackupDetection {
             try prepareManualRestoreIntentLocked(
                 transactionIdentifier: transactionIdentifier,
                 sentinelURL: sentinelURL,
-                fileManager: fileManager
+                fileManager: fileManager,
+                requiresReconciledJournal: requiresReconciledJournal
             )
         }
     }
@@ -583,7 +601,8 @@ enum BackupDetection {
     private static func prepareManualRestoreIntentLocked(
         transactionIdentifier: UUID,
         sentinelURL: URL,
-        fileManager: FileManager
+        fileManager: FileManager,
+        requiresReconciledJournal: Bool = false
     ) throws -> ManualRestoreReceipt {
         let receipt: ManualRestoreReceipt
         switch try manualRestorePreflightLocked(
@@ -593,6 +612,9 @@ enum BackupDetection {
         ) {
         case .resumeIntent(let existing), .resumeEvent(let existing),
              .completed(let existing):
+            guard existing.requiresReconciledJournal == requiresReconciledJournal else {
+                throw Error.manualRestoreTransactionMismatch
+            }
             receipt = existing
         case .newTransaction:
             guard let oldInstallationIdentifier = installationIdentifier(
@@ -605,7 +627,8 @@ enum BackupDetection {
                 transactionIdentifier: transactionIdentifier,
                 restoreEventIdentifier: UUID(),
                 oldInstallationIdentifier: oldInstallationIdentifier,
-                newInstallationIdentifier: UUID().uuidString.lowercased()
+                newInstallationIdentifier: UUID().uuidString.lowercased(),
+                requiresReconciledJournal: requiresReconciledJournal
             )
             try persistManualRestoreIntent(
                 receipt,
@@ -751,6 +774,11 @@ enum BackupDetection {
                     at: manualRestoreIntentURL(sentinelURL: sentinelURL)
                 ), intent.restoreEventIdentifier.uuidString.lowercased()
                     == expectedEventIdentifier {
+                    if intent.requiresReconciledJournal,
+                       manualRestoreReceipt(at: completedManualRestoreReceiptURL(
+                        sentinelURL: sentinelURL)) != intent {
+                        throw Error.restoreEventAcknowledgementVerificationFailed
+                    }
                     try removeManualRestoreIntentLocked(
                         intent,
                         sentinelURL: sentinelURL,
@@ -955,18 +983,20 @@ enum BackupDetection {
         guard let data = try? Data(contentsOf: url),
               let value = String(data: data, encoding: .utf8) else { return nil }
         let lines = value.split(separator: "\n").map(String.init)
-        guard lines.count == 6,
+        guard lines.count == 6 || lines.count == 7,
               lines[0] == "BigSyncKit manual restore v1",
               let transactionIdentifier = UUID(uuidString: lines[1]),
               let restoreEventIdentifier = UUID(uuidString: lines[2]),
               let oldInstallationIdentifier = UUID(uuidString: lines[3]),
               let newInstallationIdentifier = UUID(uuidString: lines[4]),
-              lines[5] == "end" else { return nil }
+              lines.last == "end",
+              lines.count == 6 || lines[5] == "reconciled-journal" else { return nil }
         return ManualRestoreReceipt(
             transactionIdentifier: transactionIdentifier,
             restoreEventIdentifier: restoreEventIdentifier,
             oldInstallationIdentifier: oldInstallationIdentifier.uuidString.lowercased(),
-            newInstallationIdentifier: newInstallationIdentifier.uuidString.lowercased()
+            newInstallationIdentifier: newInstallationIdentifier.uuidString.lowercased(),
+            requiresReconciledJournal: lines.count == 7
         )
     }
 
@@ -1052,8 +1082,9 @@ enum BackupDetection {
     private static func manualRestoreData(
         _ receipt: ManualRestoreReceipt
     ) -> Data {
-        Data(
-            "BigSyncKit manual restore v1\n\(receipt.transactionIdentifier.uuidString.lowercased())\n\(receipt.restoreEventIdentifier.uuidString.lowercased())\n\(receipt.oldInstallationIdentifier)\n\(receipt.newInstallationIdentifier)\nend\n".utf8
+        let preparation = receipt.requiresReconciledJournal ? "reconciled-journal\n" : ""
+        return Data(
+            "BigSyncKit manual restore v1\n\(receipt.transactionIdentifier.uuidString.lowercased())\n\(receipt.restoreEventIdentifier.uuidString.lowercased())\n\(receipt.oldInstallationIdentifier)\n\(receipt.newInstallationIdentifier)\n\(preparation)end\n".utf8
         )
     }
 
