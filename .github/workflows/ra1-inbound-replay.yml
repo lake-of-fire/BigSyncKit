@@ -44,15 +44,15 @@ jobs:
           source = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift')
           text = source.read_text()
           needle = '''        if let migrationError = error as? ChangeFeedMigrationError,
-               migrationError.deletionKind == .encryptedDataReset {'''
+             migrationError.deletionKind == .encryptedDataReset {'''.replace('\n             migration', '\n           migration')
           replacement = '''        if error is RealmSwiftInboundTargetChangedError {
-              // A non-journaled local write invalidated an inbound selection.
-              // Its page cursor did not commit, so replay the ordinary fetch
-              // after a bounded delay rather than acknowledging or quarantining it.
-              shouldRetry = true
-              retryDelay = 1
-          } else if let migrationError = error as? ChangeFeedMigrationError,
-               migrationError.deletionKind == .encryptedDataReset {'''
+            // A non-journaled local write invalidated an inbound selection.
+            // Its page cursor did not commit, so replay the ordinary fetch
+            // after a bounded delay rather than acknowledging or quarantining it.
+            shouldRetry = true
+            retryDelay = 1
+        } else if let migrationError = error as? ChangeFeedMigrationError,
+           migrationError.deletionKind == .encryptedDataReset {'''
           if text.count(needle) != 1:
               raise SystemExit(f'expected exactly one inbound-replay insertion point, got {text.count(needle)}')
           if 'error is RealmSwiftInboundTargetChangedError' in text:
