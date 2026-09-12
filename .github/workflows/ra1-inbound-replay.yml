@@ -1,4 +1,4 @@
-name: RA-1 inbound replay closure
+name: RA-1 inbound replay diagnostic
 
 on:
   push:
@@ -6,59 +6,38 @@ on:
       - codex/ra1-bigsync-inbound-replay-20260912
 
 permissions:
-  contents: write
-
-concurrency:
-  group: ra1-inbound-replay-closure
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  patch-test-publish:
+  diagnose:
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.sha }}
-          path: BigSyncKit
           fetch-depth: 0
-          persist-credentials: true
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: lake-of-fire/RealmSwiftGaps
-          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
-          path: RealmSwiftGaps
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: lake-of-fire/SwiftUtilities
-          ref: f437c7d06fc631cd7a67731279411c417cdf8077
-          path: SwiftUtilities
-          persist-credentials: false
-      - name: Apply bounded source and regression patch
-        working-directory: BigSyncKit
-        run: python3 .github/ra1-inbound-replay.py
-      - name: Focused replay classification
-        working-directory: BigSyncKit
-        run: swift test --filter testRA1InboundTargetChangedFailureSchedulesReplay
-      - name: Real adapter rejection and replay
-        working-directory: BigSyncKit
-        run: swift test --filter testNonJournaledTargetChangeRejectsOrdinaryAndForcedImportThenReplays
-      - name: Full BigSyncKit suite
-        working-directory: BigSyncKit
-        env:
-          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
-        run: swift test
-      - name: Verify bounded diff
-        working-directory: BigSyncKit
-        run: git diff --check
-      - name: Publish clean continuation
-        working-directory: BigSyncKit
+      - name: Print crash-recovery fixture and submittedOperationID call sites
         run: |
-          rm .github/workflows/ra1-inbound-replay.yml .github/ra1-inbound-replay.py
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          test "$(git diff --cached --name-only | sort | tr '\n' ' ')" = ".github/ra1-inbound-replay.py .github/workflows/ra1-inbound-replay.yml Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/BigSyncKitTests.swift "
-          git commit -m 'RA-1: replay inbound target races through ordinary sync [skip ci]'
-          git push origin HEAD:codex/ra1-bigsync-inbound-replay-20260912
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Tests/BigSyncKitTests/BigSyncKitTests.swift')
+          t = p.read_text()
+          n = 'testCrashRecoveryResendsTheSameLogicalGeneration'
+          i = t.find(n)
+          print('TEST_INDEX', i)
+          if i >= 0:
+              print(t[max(0, i-3500):i+9000])
+          print('\n=== submittedOperationID call sites ===')
+          for root in [Path('Sources'), Path('Tests')]:
+              for f in root.rglob('*.swift'):
+                  s = f.read_text(errors='replace')
+                  if 'submittedOperationID' in s:
+                      print(f'--- {f} ---')
+                      for no, line in enumerate(s.splitlines(), 1):
+                          if 'submittedOperationID' in line:
+                              lo=max(1,no-12); hi=min(len(s.splitlines()),no+16)
+                              lines=s.splitlines()
+                              for j in range(lo,hi+1): print(f'{j}: {lines[j-1]}')
+                              print()
+          PY
