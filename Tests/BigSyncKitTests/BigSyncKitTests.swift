@@ -1067,6 +1067,25 @@ private actor ReevaluationTerminalRecorder {
     func results() -> [CloudKitSynchronizer.SynchronizationResult] { values }
 }
 
+private actor ReevaluationHeldCompletion {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var values = [CloudKitSynchronizer.SynchronizationResult]()
+
+    func receive(_ result: CloudKitSynchronizer.SynchronizationResult) async {
+        values.append(result)
+        if values.count == 1 {
+            await withCheckedContinuation { continuation = $0 }
+        }
+    }
+
+    func isHolding() -> Bool { continuation != nil }
+    func count() -> Int { values.count }
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 final class BigSyncKitTests: XCTestCase {
 
     func testCloudKitBooleanCodecAcceptsOnlyBooleanOrIntegralZeroAndOne() {
@@ -14219,6 +14238,168 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNil(fence.publicationInspectionGeneration)
         fence.clear()
         XCTAssertNotEqual(validated, fence.publicationInspectionGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testReevaluationWarmDiskInspectionCoexistsWithOperationalRealm() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let token = Data("disk-terminal-cursor".utf8)
+        try await fixture.persistenceRealm.asyncWrite {
+            let value = ServerToken()
+            value.token = token
+            fixture.persistenceRealm.add(value)
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var target = fixture.targetRealm.configuration
+        target.inMemoryIdentifier = nil
+        target.fileURL = directory.appendingPathComponent("target.realm")
+        var persistence = fixture.persistenceRealm.configuration
+        persistence.inMemoryIdentifier = nil
+        persistence.fileURL = directory.appendingPathComponent("tracking.realm")
+        try fixture.targetRealm.writeCopy(configuration: target)
+        try fixture.persistenceRealm.writeCopy(configuration: persistence)
+        let beforeTarget = try Data(contentsOf: target.fileURL!)
+        let beforeTracking = try Data(contentsOf: persistence.fileURL!)
+        let cold = RealmSwiftAdapter(persistenceRealmConfiguration: persistence,
+                                    targetRealmConfigurations: [target], excludedClassNames: [],
+                                    recordZoneID: fixture.adapter.recordZoneID,
+                                    logger: Logger(label: "ColdDiskInspection"), startSetupTask: false)
+        let evidence = BigSyncDurablePublicationEvidence(
+            domainScopeIdentifier: "disk-scope", accountScopeIdentifier: "disk-account",
+            replicaBindingGenerationIdentifier: nil, zoneOwnerName: cold.recordZoneID.ownerName,
+            zoneName: cold.recordZoneID.zoneName, changeFeedEpoch: 0,
+            consumedServerBoundaryIdentifier: try XCTUnwrap(CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+                containerIdentifier: "iCloud.test", databaseScope: .private,
+                accountScopeIdentifier: "disk-account", replicaBindingGenerationIdentifier: nil,
+                recordZoneID: cold.recordZoneID, changeFeedEpoch: 0, cursorData: token
+            )), runID: UUID(), publishedAt: Date()
+        )
+        let opened = try await cold.preparePublicationRestorationInspection()
+        let inspection = try XCTUnwrap(opened)
+        let warmTarget = try Realm(configuration: target)
+        defer { withExtendedLifetime(warmTarget) {} }
+        XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
+        XCTAssertNil(cold.realmProvider)
+        XCTAssertNil(cold.activeAccountScopeIdentifier)
+        XCTAssertEqual(try Data(contentsOf: target.fileURL!), beforeTarget)
+        XCTAssertEqual(try Data(contentsOf: persistence.fileURL!), beforeTracking)
+        // A subsequent local commit must be visible to a fresh inspection,
+        // even when an earlier inspection used an immutable read-only view.
+        try autoreleasepool {
+            let writer = try Realm(configuration: target)
+            try writer.write {
+                let object = BigSyncTrackedObject(id: "after-inspection", createdAt: Date(),
+                                                  modifiedAt: Date(), explicitlyModifiedAt: nil)
+                writer.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        XCTAssertFalse(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
+        XCTAssertNil(cold.realmProvider)
+    }
+
+    func testReevaluationColdInspectionDoesNotGrantAccountLease() {
+        let fence = AccountScopeAuthorityFence()
+        let coldGeneration = fence.publicationInspectionGeneration
+        XCTAssertTrue(fence.rejectsAuthority)
+        XCTAssertNotNil(coldGeneration)
+        fence.poison(requiresGenerationRotation: false)
+        XCTAssertNil(fence.publicationInspectionGeneration)
+        XCTAssertTrue(fence.rejectsAuthority)
+        fence.clear()
+        XCTAssertFalse(fence.rejectsAuthority)
+        XCTAssertNotNil(fence.publicationInspectionGeneration)
+        XCTAssertNotEqual(fence.publicationInspectionGeneration, coldGeneration)
+        fence.poison()
+        XCTAssertNil(fence.publicationInspectionGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testReevaluationCanceledCallbackCannotBlockReplacementDrain() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "held-completion"), priorities: []
+        ))
+        let held = ReevaluationHeldCompletion()
+        synchronizer.synchronizationCompletionHandler = { await held.receive($0) }
+        synchronizer.beginSynchronization()
+        for _ in 0..<1000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let firstContext = try XCTUnwrap(synchronizer.activeRunContext)
+        let firstDelivery = Task { @BigSyncBackgroundActor in
+            await synchronizer.changesFinishedSynchronizing()
+        }
+        for _ in 0..<1000 {
+            if await held.isHolding() { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let isHolding = await held.isHolding()
+        XCTAssertTrue(isHolding)
+        guard isHolding else {
+            firstDelivery.cancel()
+            await held.release()
+            await synchronizer.cancelSynchronizationAndWait()
+            return
+        }
+        synchronizer.cancelSynchronization()
+        synchronizer.beginSynchronization()
+        for _ in 0..<1000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNotEqual(synchronizer.activeRunContext?.attemptID, firstContext.attemptID)
+        await synchronizer.changesFinishedSynchronizing()
+        let beforeOldRelease = await held.count()
+        XCTAssertEqual(beforeOldRelease, 2, "The new result cannot wait for a revoked callback")
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+        XCTAssertFalse(synchronizer.syncing)
+        await held.release()
+        await firstDelivery.value
+        let afterOldRelease = await held.count()
+        XCTAssertEqual(afterOldRelease, 2)
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testReevaluationColdInspectionAcceptsTargetWithoutMutationJournalType() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let token = Data("journal-free-cursor".utf8)
+        try await fixture.persistenceRealm.asyncWrite {
+            let value = ServerToken()
+            value.token = token
+            fixture.persistenceRealm.add(value)
+        }
+        var target = Realm.Configuration()
+        target.inMemoryIdentifier = "journal-free-\(UUID().uuidString)"
+        target.objectTypes = [BigSyncTrackedObject.self]
+        let targetRealm = try Realm(configuration: target)
+        let cold = RealmSwiftAdapter(
+            persistenceRealmConfiguration: fixture.persistenceRealm.configuration,
+            targetRealmConfigurations: [target], excludedClassNames: [],
+            recordZoneID: fixture.adapter.recordZoneID,
+            logger: Logger(label: "JournalFreeInspection"), startSetupTask: false
+        )
+        let evidence = BigSyncDurablePublicationEvidence(
+            domainScopeIdentifier: "domain", accountScopeIdentifier: "account",
+            replicaBindingGenerationIdentifier: nil,
+            zoneOwnerName: cold.recordZoneID.ownerName, zoneName: cold.recordZoneID.zoneName,
+            changeFeedEpoch: 0,
+            consumedServerBoundaryIdentifier: try XCTUnwrap(CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+                containerIdentifier: "iCloud.test", databaseScope: .private,
+                accountScopeIdentifier: "account", replicaBindingGenerationIdentifier: nil,
+                recordZoneID: cold.recordZoneID, changeFeedEpoch: 0, cursorData: token
+            )), runID: UUID(), publishedAt: Date()
+        )
+        let opened = try await cold.preparePublicationRestorationInspection()
+        let inspection = try XCTUnwrap(opened)
+        XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test", databaseScope: .private))
+        XCTAssertNil(cold.realmProvider)
+        withExtendedLifetime(targetRealm) {}
     }
 
     @BigSyncBackgroundActor
