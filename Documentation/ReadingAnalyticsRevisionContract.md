@@ -1,187 +1,169 @@
 # RA-1: owned-record revision contract
 
-Worker 2 / BigSyncKit. Production inspected: `2a28f8cfa48fa16c471fa4d54c2689f21567905f`,
-unchanged through the first integration merge `5923cdccc39d90952865d27041ee7ac1168a1ac8`.
-This is the application-model integration contract for W3, not a new transport API.
-Normal Mark/Undo needs no quiescence acquisition, source activation or publication proof.
-See [Worker 2 status](ReadingAnalyticsWorker2.md) for exact test commits and unrun gates.
+Worker 2 / BigSyncKit. Adapter preferences inspected at
+`2a28f8cfa48fa16c471fa4d54c2689f21567905f` remain unchanged. Reconciled manual
+restore handoff: `95e25ba7119733e0fb91e3ff17a5bd12846d2b55`. See
+[Worker 2 status](ReadingAnalyticsWorker2.md) for actual commits, caller joins and
+unrun qualification. Normal Mark/Undo needs no quiescence, activation or publication proof.
 
-## Existing APIs W3 should implement
+## Existing APIs
 
-A synchronized owned model implements `ChangeMetadataRecordable`, its normal Realm
-primary key, and the existing semantic validation protocols:
+A synchronized owned model implements ChangeMetadataRecordable, its normal Realm
+primary key, and the existing semantic protocols:
 
-- `BigSyncInboundSemanticRecordValidating`: validate the complete received domain
-  payload and its record type/key/immutable owner. Validate bounds before decoding
-  large assets. An unavailable local resource is not corrupt remote data.
-- `BigSyncInboundSemanticReplacementValidating`: implement both
-  `validateInboundSemanticReplacement(_:existingObject:)` and
-  `inboundSemanticReplacementDisposition(_:existingObject:)`. The latter is the
-  winner decision. Delegate both to one model-owned validation/selection function.
-- Use `BigSyncInboundSemanticTargetValidating` instead only when the decision
-  genuinely requires other state in the target Realm. That hook takes precedence
-  over the replacement hook. Do not introduce a readiness graph for owned analytics.
-- `BigSyncOutboundSemanticObjectValidating`: validate the actual local payload
-  before serialization. Unchanged relay/reseed of a foreign-owned version is
-  replication, not permission to change its owner or increment its revision.
+- BigSyncInboundSemanticRecordValidating validates complete received domain values,
+  record type/key/immutable owner and bounded assets. Missing local resources are
+  not corrupt remote data.
+- BigSyncInboundSemanticReplacementValidating implements both validation and
+  inboundSemanticReplacementDisposition. Delegate to one model-owned selector.
+- BigSyncInboundSemanticTargetValidating takes precedence when selection genuinely
+  requires other target-Realm state. It is not a reason for another readiness graph.
+- BigSyncOutboundSemanticObjectValidating validates actual local values before
+  serialization. Foreign unchanged relay is replication, not reauthoring.
 
-All validators are synchronous and read-only. The adapter calls replacement/target
-selection again inside the actual target write, with the current managed preimage.
-The model must not create journals itself while selecting an inbound winner.
+Validators are synchronous and read-only. Replacement/target selection is repeated
+inside the actual target write against its current preimage. Do not journal from
+inside a model's inbound selector.
 
-For the same immutable owner and logical record key, with admitted local state:
+For one immutable owner/key with admitted local state:
 
-| Received version | Disposition |
+| Received value | Disposition |
 | --- | --- |
-| No existing object | `applyIncomingRecord` after full validation |
-| Higher state revision | `preferIncomingRecord` |
-| Lower state revision | `preferExistingObject` |
-| Equal revision and equal normalized domain value | `preserveExistingObject` (replay) |
-| Equal revision and different domain value, or incompatible immutable identity | Throw a model error using `BigSyncInboundSemanticValidationFailure` diagnostics |
+| No local object | Apply validated incoming state. |
+| Greater revision | preferIncomingRecord |
+| Lower revision | preferExistingObject |
+| Equal revision/equal normalized domain | preserveExistingObject |
+| Equal revision/different domain or incompatible identity | Throw existing model semantic-validation failure. |
 
-Do not return `applyIncomingRecord` for a higher-version winner: that permits the
-ordinary timestamp/pending-local policy to make the final choice. Do not use
-`preserveExistingObject` for an older server value that needs repair: preservation
-alone does not create upload work when none exists.
+Do not use applyIncomingRecord for a greater winner: it leaves ordinary timestamp
+and pending-local selection in charge. Do not use preserveExistingObject when a
+lower server value requires repair: that alone does not queue upload work.
 
-A semantic rejection is reported through existing per-record quarantine/disposition
-results. It is not necessarily a thrown failure of the entire `saveChanges` batch.
-Cancellation/resource/admission-unavailable errors retain their operational error
-contract; do not reclassify them as an equal-version conflict.
+Semantic rejection is a per-record quarantine/disposition, not necessarily a thrown
+failure of the entire saveChanges batch. Cancellation, resource and unavailable
+admission errors retain their operational meaning.
 
-## What equality means
+## Equality and revisions
 
-Compare typed, normalized authored domain values. This includes immutable identity,
-revision, reading memberships/facts/counters/classifications, the domain tombstone,
-and every other authored synchronized field on that same record. On Sessions (or
-owned records containing clocks), duration, clock ownership, end state, metadata and
-pace receipts are part of the versioned payload. Those writes advance record revision
-without necessarily invalidating Undo.
+Compare typed authored domain values: identity, revision, coverage/facts/counters,
+classification, domain tombstone and every other authored synchronized field on that
+record. Session clocks, duration, end state, metadata and pace receipts participate in
+record versioning without necessarily advancing Undo's semantic guard.
 
-Exclude CloudKit system fields (record change tag, server creation/modification dates,
-encoded system-field archive), synchronizer transport metadata/device UUID, journal
-generation/binding, and deliberately local-only recovery or presentation fields.
-`modifiedAt`/`explicitlyModifiedAt` are conflict/audit metadata, not a fallback winner
-clock after revision selection. Treat `createdAt` according to its actual model
-meaning: exclude a mere audit field, retain it when it represents domain history.
+Exclude CloudKit system fields/change tags, server audit dates, serialized system
+archives, transport process metadata, journal generation/binding, and intentionally
+local-only recovery/presentation state. modifiedAt/explicitlyModifiedAt never override
+an explicit model-selected revision. createdAt is excluded only when it is mere audit
+metadata rather than domain history.
 
-Compare sets/maps by semantic membership and values, not iteration order, JSON bytes,
-CKAsset paths, or checksums of unordered serialization. Preserve order for genuinely
-ordered domain lists. Empty-collection omission must have one explicit decoding rule.
+Compare sets/maps by membership/values, not traversal order, unordered JSON bytes,
+CKAsset paths or checksums of unordered encoding. Preserve genuine list ordering.
+Define one explicit empty-collection omission rule.
 
-BigSync's existing `BigSyncStringEncodedIntegerModel` and
-`BigSyncStringEncodedIntegerCodec` use canonical decimal **Int64** on the wire.
-Use a nonnegative representable revision and checked advancement; W3's actual model
-requires positive revisions. A conceptual UInt64 is not an implicit promise that
-Realm or this codec accepts values above Int64.max. Never wrap a revision.
+BigSyncStringEncodedIntegerModel/Codec use canonical decimal Int64. Revisions must be
+representable and checked on advancement; actual W3 models require positive revisions.
+Never wrap. Record revision, local semantic guard and upload journal generation are
+three distinct values. Undo restores reading fields, not old revisions or generations.
 
-## How the real adapter handles the preferences
+## Real adapter and upload behavior
 
-`RealmSwiftAdapter.saveChanges(in:forceSave:)` evaluates the model decision in its
-final target transaction before ordinary pending-local/timestamp selection:
+RealmSwiftAdapter.saveChanges(in:forceSave:) validates/selects inside the final write:
 
-- A higher incoming winner bypasses ordinary metadata ordering in `applyChanges`.
-  If stale local upload work exists, the selected payload and a **fresh** journal
-  generation replace it together. An old acknowledgement cannot retire that new work.
-- A preferred local winner with a pending journal preserves that journal and payload.
-  With no pending journal, the adapter calls its internal
-  `journalCurrentValuePreservingChangeMetadata(at:)` in the target transaction.
-  This creates ordinary upload work without incrementing the model's revision,
-  changing its owner, or advancing its modification timestamps.
-- The server record's system fields are retained in tracking storage for subsequent
-  conditional retransmission. Target and tracking Realms are not one physical
-  transaction; the existing redelivery/journal mechanisms remain responsible for that
-  boundary. No second outbox is added by RA-1.
-- `forceSave: true` forces import consideration, not unconditional server victory.
+- A greater incoming winner bypasses metadata ordering. Existing stale local upload
+  work is replaced atomically with the selected payload and a fresh journal generation.
+- A preferred local winner preserves existing pending work. Without a journal, the
+  adapter's internal journalCurrentValuePreservingChangeMetadata creates repair work
+  without changing record ownership, revision or audit dates.
+- Server system fields remain in tracking storage for conditional retransmission.
+  Target/tracking Realms are separate transactions, not one atomic file.
+- forceSave forces consideration, not unconditional server victory.
 
-A local write between candidate selection and application does not defeat an explicit
-model preference. Both winner selection and equal-version divergence must be checked
-against that final preimage, even when the local journal changed in the interval.
+A local change after candidate selection does not defeat an explicit model preference.
+Both winner choice and equal-version divergence use the final transaction preimage.
+serverRecordChanged follows forceSave import, persistImportedChanges and the normal
+upload loop; it uses the same model preferences as ordinary inbound data.
 
-The real `CloudKitSynchronizer` upload path receives `serverRecordChanged`, imports
-its server record with `saveChanges(... forceSave: true)`, persists imported changes,
-and uses the ordinary upload loop again. The same preferences therefore govern
-conflict retry, not only ordinary downloads.
+Journal forwarding can lag payload materialization. Tracking G1 may prepare the
+current payload while target journal G2 is newer. Acknowledging G1 must preserve and
+forward G2; another idempotent upload is valid. No authored version advances solely
+for retransmission. An exact two-request test script is not the transport contract.
 
-Journal forwarding and payload materialization are separate. For the unscoped owned
-records exercised here, tracking may still carry G1 while a retry serializes the
-current target value whose journal has advanced to G2. `didUpload` may acknowledge
-G1 in tracking, but must leave G2 in the target journal and forward it for another
-ordinary upload. Two successful saves of the same selected value are permitted; an
-exact two-request script is not the transport contract. No authored revision changes
-merely because a value needs retransmission.
+validateAuthoritativeOwnUploadRecords is validation-only. It cannot apply its returned
+preference, rewrite values or clear restore flags. A late lower-version echo against
+admitted newer state is valid old input, not necessarily corruption. didUpload uses
+the prepared generation, never a fresh sample. Process echo metadata is not record
+installation ownership.
 
-An authoritative same-process own echo is validation-only via
-`validateAuthoritativeOwnUploadRecords`. Its returned preference is not applied to
-rewrite the target. A late lower-version own echo must be valid historical input,
-not a semantic conflict merely because the current target is newer. A mutation result
-is acknowledged separately by `didUpload(savedRecords:matchingGenerations:)` using the
-prepared generation, never a newly sampled one. Echo detection is process metadata,
-not a domain installation-ownership check.
+## Authored transaction boundary
 
-## Local authored transaction boundary
+Capture/recheck the existing BigSyncClientIdentity/BigSyncMutationJournalIdentity.
+In one owning Realm transaction validate the application guard/owner/lifetime, change
+domain values, advance record revision, and require the journal. Ordinary writes use
+refreshChangeMetadataRequiringJournal; identity-bound commands use the throwing
+refreshChangeMetadata(explicitlyModified:at:expectedJournalIdentity:) overload.
+A nonthrowing refresh inside an outer try does not establish rollback semantics.
 
-Use the existing installation/binding APIs, including `BigSyncClientIdentity` and
-`BigSyncMutationJournalIdentity`. A prepared command retains/rechecks its original
-identity. In the same owning Realm write:
+Failure of a second required journal rolls back earlier changes in that same target
+transaction. A tracking-Realm failure after the target commit cannot roll that earlier
+commit back. Keep its selected value/journal for replay; do not compensate to stale state.
 
-1. Validate the application's owner/lifetime/semantic guard.
-2. Change the domain fields and advance the owned record revision.
-3. Require the throwing journal refresh.
+## Empty state and incoming deletion
 
-Ordinary writers use `try refreshChangeMetadataRequiringJournal(at:)`. A command
-capturing an identity uses the throwing
-`refreshChangeMetadata(explicitlyModified:at:expectedJournalIdentity:)` overload.
-Let any error escape the enclosing transaction. Do not call the nonthrowing overload
-and assume an outer `try` makes it atomic.
+A newer empty record remains a live version. Do not hard-delete it merely because it
+has no coverage. BigSyncRetainsSyncedTombstone chooses the retained outbound-upsert
+lane; it does not itself reject inbound hard deletion. Models also implement the
+existing BigSyncInboundSemanticDeletionValidating according to their domain policy.
+Ordinary generic deletion is not an indefinite negative-state guarantee.
 
-A second journal failure in one target transaction rolls back earlier objects in
-that transaction. Conversely, a later tracking-Realm failure cannot roll back an
-already committed target-Realm winner. Preserve that value and its journal for
-redelivery; do not implement a compensating downgrade across the two physical files.
+## Raw backup versus reconciled manual restore
 
-Record revision, local Undo semantic guard, and upload journal generation are three
-different values. A clock-only authored edit advances the first and third, not the
-second. Undo restores reading fields, not clocks, old revisions or old generations.
+localDatasetRebootstrap and backupRestore are different contracts. For recovering
+models, backupRestore withholds copied objects before retiring copied generations.
+Its exception is an existing journal from the current installation/binding. The
+isAwaitingRecoveryEvidence flag alone does not preserve independently known state
+through a later backup-preparation pass.
 
-## Empty state, deletion and restore
+W3 correction848b3f26 validates versions/domain even for a withheld copy: lower server
+input cannot authorize either downgrading it or re-uploading greater unproven bytes;
+it reports unavailable admission. Equal-divergent input rejects. Equal valid or greater
+normal server input can use actual application to re-admit that key. Own-echo validation
+cannot do so. The older BigSync test fixture deliberately exercises a more permissive
+restore selector; it is transport coverage, NOT qualification of this Common policy.
 
-A newer empty owned record remains a live version. Do not turn its empty membership
-into a CloudKit hard deletion. A model using `isDeleted` as retained ordered negative
-state must opt into `BigSyncRetainsSyncedTombstone` and validate actual record deletion
-through `BigSyncInboundSemanticDeletionValidating`. The former chooses the outbound
-upsert lane; it does not by itself reject an incoming hard deletion. W3 owns that
-policy; ordinary generic deletion is not indefinite negative-state retention.
+For W8's actual original-versus-backup normalization, BigSync95e25ba7 provides
+withReconciledManualBackupRestore(transactionIdentifier:configurations:reconciledObjectTypes:_:rollback:).
+Under the existing exclusive lease, the caller installs the final files, with copied-only
+rows withheld and independently validated current rows admitted. The helper publishes the
+new sentinel/binding, then queues admitted values through the existing journal without
+reauthoring them, before releasing the existing restore intent. Current-identity journal
+recognition therefore preserves those known values through the real backupRestore pass.
 
-Restore/reseed preserves original owner/revision/domain values. A new journal
-installation/binding may transport admitted unchanged values; it must not turn copied
-bytes into a newly authored version or silently admit stale history as current truth.
+Register the existing policy/live provider before this call. Do not prepare installation
+inside its locked finalizer. Pass only final target configurations and explicitly
+normalized concrete types. The helper does not establish provenance, choose history,
+normalize raw backup flags or replace W8's physical journal/rollback implementation.
+W3/W8 must bind it instead of a raw restore followed by unconditional normalization.
 
-`localDatasetRebootstrap` and `backupRestore` are different contracts. For models
-implementing `BigSyncRestoredObjectRecovering`, backup preparation withholds copied
-objects before retiring copied pending generations. W3 currently uses the local-only
-`isAwaitingRecoveryEvidence` flag and blocks outbound serialization while it is set.
-A real normal server import can re-admit that exact key through `preferIncomingRecord`,
-even when the unadmitted copy had a higher revision. This is a restore-admission
-policy, not permission to downgrade already admitted revision-ordered state. Absence
-from the restored destination does not authorize republishing the copied object.
-Validation-only own echoes cannot apply that preference or clear the recovery flag.
+Its requirement marker is stored in the existing intent/event/receipt, so a raw retry
+cannot skip repair after a crash. Failed post-event work retains handoffPending and the
+same transaction; no rollback of installed files is authorized. Completed intent cleanup
+retries without repeating file replacement. No second outbox, floor registry, restore
+mode, cloud mutation service or publication protocol is introduced. Existing raw restore
+entry points remain for their own contract; mismatched restore contracts reject rather
+than silently reinterpret an in-flight transaction.
 
-W8 supplies the explicit baseline/restore admission decisions. No live restore,
-baseline choice, state clearing or migration is authorized by this note.
+No real-user baseline selection, live restore or state clearing is authorized here.
 
 ## Qualification and removal boundary
 
-The source above already provides the required preference APIs. No production change
-is justified solely by the need for decreasing owned values. The targeted RA-1 suite
-uses a real Realm model, real target/tracking Realms and the actual adapter; remote IO
-may be scripted. Native tests must run on the W1-approved runner. Syntax checks or a
-portable comparator do not qualify the adapter or the actual Common models. The
-scripted records do not carry real server-assigned change tags: conflict dispatch
-coverage is not signed CloudKit conditional-save qualification.
+No production adapter change is needed solely for decreasing owned values. The authored
+suite uses actual Realm/journal/adapter code; only remote IO and existing boundary hooks
+are controlled. It is not the actual Common inverse or native app. Scripted records have
+no real server change tags. Native tests and the full physical restore/bootstrap journey
+remain unrun; no compiler/test execution occurred in the production coding passes.
 
-W6/W8 must confirm removal of accepted-head/final-drain/seal/source-publication callers
-before W2 deletes their exported APIs. Ordinary upload currently uses outbound admission
-and submitted-operation uncertainty bookkeeping; those are not an Undo dependency and
-must not be removed by filename. Existing persisted physical uncertainty is never
-silently cleared or interpreted as settled.
+W6/W8 must close accepted-head/final-drain/seal/source/completion callers before W2 deletes
+those exports. Ordinary outbound admission, real submitted-operation uncertainty, replay,
+account/binding fencing and generation-matched acknowledgement remain. Existing physical
+checkpoints must never be silently cleared or relabeled settled. An unapplied deletion
+patch is not runtime removal or proof that a cross-repository batch is dependency-closed.
