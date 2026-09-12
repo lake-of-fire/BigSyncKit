@@ -1104,6 +1104,46 @@ private actor ReevaluationHeldCompletion {
 final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
+    func testClosureMigrationPreparationKeepsObservedJournalsQueued() async throws {
+        let fixture = try await reviewJournalBatch(count: 1)
+        let recordName = BigSyncTrackedObject.className() + "." + fixture.2[0].id
+        fixture.0.cancelSynchronization()
+        await fixture.0.waitForCancellation()
+        try fixture.0.prepareForFencedMigrationAfterCancellation()
+        fixture.0._test_enqueueObservedJournalRecordNames([recordName])
+        fixture.0._test_startObservedRealmChangesTaskIfNeeded()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(fixture.0._test_hasPendingObservedRealmChanges(),
+                      "Migration preparation must not restart ordinary journal observation")
+        fixture.1.refresh()
+        XCTAssertEqual(fixture.1.objects(BigSyncPendingMutation.self).count, 1)
+        try await fixture.0.unsetCancellation()
+        try await fixture.0.didFinishImport()
+        fixture.0.cancelSynchronization()
+        await fixture.0.waitForCancellation()
+    }
+
+    @BigSyncBackgroundActor
+    func testClosureExplicitDownloadCancellationResumesUnfinishedMigration() async throws {
+        let fixture = try await reviewJournalBatch(count: 1)
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let synchronizer = makeSynchronizer(database: database, recordZoneID: fixture.0.recordZoneID)
+        synchronizer.addModelAdapter(fixture.0)
+        synchronizer.syncMode = .downloadOnly
+        let inbound = try await synchronizer.synchronize()
+        XCTAssertEqual(inbound.completionScope, .downloadOnly)
+        XCTAssertNil(inbound.receipt)
+        await synchronizer.cancelSynchronizationAndWait()
+        synchronizer.syncMode = .sync
+        let full = try await synchronizer.synchronize()
+        XCTAssertNotNil(full.receipt)
+        fixture.1.refresh()
+        XCTAssertTrue(fixture.1.objects(BigSyncPendingMutation.self).isEmpty)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     private func closureCancellationCase(scopeProvider: Bool,
                                          breaksDurability: Bool = false,
                                          downloadOnly: Bool = false) async throws {
@@ -1172,9 +1212,11 @@ final class BigSyncKitTests: XCTestCase {
         }
         // Also bounds the negative control: do not leave abandoned waiters or
         // native tasks alive after a deliberately failed assertion.
-        first.cancel()
-        second.cancel()
-        await synchronizer.cancelSynchronizationAndWait()
+        if synchronizer.syncing || synchronizer.synchronizationDrainIsActive {
+            first.cancel()
+            second.cancel()
+            await synchronizer.cancelSynchronizationAndWait()
+        }
         await first.value
         await second.value
         store.synchronizesDurably = true
@@ -1470,12 +1512,16 @@ final class BigSyncKitTests: XCTestCase {
                 }
             }()
         }
+        sync.syncing = true
+        sync.synchronizationDrainIsActive = true
+        sync.activeRunContext = reviewContext(sync)
         var observedError: Error?
         do {
             try await sync.synchronizeAdapter(adapter)
             XCTFail("Mixed transient/limit failures cannot immediately retry")
         } catch { observedError = error }
         let error = try XCTUnwrap(observedError)
+        XCTAssertEqual((error as? CKError)?.code, .partialFailure)
         XCTAssertFalse(sync.shouldRetryUpload(for: error as NSError))
         XCTAssertEqual(database.reviewMutationBatchCounts, [3])
         realm.refresh()

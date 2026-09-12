@@ -1852,6 +1852,17 @@ public class CloudKitSynchronizer: NSObject {
                 try await subscribeForChangesInDatabase()
                 reportProgress("subscription-completed")
                 try await revalidateRunContext(context)
+                // A cancelled partial/download-only migration must be able
+                // to resume its persisted phase. Reset the Realm adapter's
+                // cancellation gate without starting normal discovery or
+                // journal observation before provenance preparation.
+                for adapter in modelAdapters {
+                    await adapter.waitForCancellation()
+                    try checkRunContext(context)
+                    if let realmAdapter = adapter as? RealmSwiftAdapter {
+                        try realmAdapter.prepareForFencedMigrationAfterCancellation()
+                    }
+                }
                 try await beginChangeFeedMigrationIfNeeded(context: context)
                 try await revalidateRunContext(context)
                 reportProgress("change-feed-migration-ready")
