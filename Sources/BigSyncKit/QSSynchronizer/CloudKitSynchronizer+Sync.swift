@@ -780,7 +780,7 @@ extension CloudKitSynchronizer {
         context: RunContext,
         allowsEncryptedBootstrapAbsence: Bool = false
     ) -> Error? {
-        let constraints = CloudKitRetryConstraints(error: error)
+        let constraints = CloudKitRetryConstraints(error)
         guard !constraints.blocksAccountOperations else { return nil }
         let classification = CloudKitLossClassifier.classify(
             error: error,
@@ -1534,7 +1534,7 @@ extension CloudKitSynchronizer {
                 // A returned account stop forbids further CloudKit work,
                 // including an otherwise routine account revalidation.
                 try checkSynchronizationAttempt(attemptID)
-                if !CloudKitRetryConstraints(error: error).blocksAccountOperations {
+                if !CloudKitRetryConstraints(error).blocksAccountOperations {
                     try await revalidateActiveRunContext(for: attemptID)
                 }
             } catch {
@@ -1542,7 +1542,7 @@ extension CloudKitSynchronizer {
                 return
             }
 
-            guard !CloudKitRetryConstraints(error: error).blocksAccountOperations,
+            guard !CloudKitRetryConstraints(error).blocksAccountOperations,
                   let context = activeRunContext else {
                 try await completion(error)
                 return
