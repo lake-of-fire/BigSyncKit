@@ -22,7 +22,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 6be6b813e4b3d28300f1c706681399922706a587
+          ref: 22c23211ca3fb04ae6ed7b63be581da0b864f4d4
           path: FixtureInput
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
