@@ -3466,6 +3466,28 @@ public class CloudKitSynchronizer: NSObject {
                 databaseScope: database.databaseScope,
                 recordZoneID: adapter.recordZoneID
             )
+            // DEBUG zone rebind must initialize the rebound durable namespace.
+            do {
+                let result = try BackupDetection.run(
+                    store: keyValueStore,
+                    namespace: durableStateNamespace,
+                    sharedSentinelBaseURL: backupDetectionBaseURL
+                )
+                backupDetectionError = nil
+                refreshBackupRestoreRequirement()
+                if result == .restoredFromBackup || backupRestoreDetected {
+                    accountScopeAuthorityFence.poison()
+                    clearDeviceIdentifier()
+                    try invalidateAccountScopeLeaseDurably()
+                    queueAccountScopeInvalidation(.restoreDetected)
+                }
+            } catch {
+                accountScopeAuthorityFence.poison()
+                backupDetectionError = error
+                logger.error(
+                    "QSCloudKitSynchronizer >> DEBUG rebind backup detection failed: \(error)"
+                )
+            }
         }
         allowsRecordZoneRebindingForTesting = false
 #endif
