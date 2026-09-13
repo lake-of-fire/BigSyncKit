@@ -179,7 +179,10 @@ final class HotfixMutationDrainTailTests: XCTestCase {
             forPrimaryKey: recordName
         )?.generation)
 
+        // Model a genuine newer local mutation while the first tombstone is
+        // in flight. It remains a deletion but must receive a fresh generation.
         try await realm.asyncWrite {
+            object.payload = "changed-while-deleted"
             object.refreshChangeMetadata(explicitlyModified: true)
         }
         let secondGeneration = try XCTUnwrap(realm.object(
