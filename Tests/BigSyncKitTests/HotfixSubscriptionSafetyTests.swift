@@ -49,10 +49,36 @@ private actor SubscriptionReviewServices: CloudKitSubscriptionStore,
     private var lookupEntered: XCTestExpectation?
     private var saveGate: SubscriptionReviewGate?
     private var saveEntered: XCTestExpectation?
+    private var deleteGate: SubscriptionReviewGate?
+    private var deleteEntered: XCTestExpectation?
+    private var accountReadCount = 0
+    private var pausedAccountRead: (
+        number: Int, gate: SubscriptionReviewGate, entered: XCTestExpectation
+    )?
+    private(set) var lookupCount = 0
     private(set) var saveCount = 0
     private(set) var deletedIDs: [String] = []
 
-    func currentAccount() -> String { account }
+    func currentAccount() async -> String {
+        accountReadCount += 1
+        if let pause = pausedAccountRead, pause.number == accountReadCount {
+            pausedAccountRead = nil
+            pause.entered.fulfill()
+            await pause.gate.wait()
+        }
+        return account
+    }
+
+    func pauseAccountRead(
+        number: Int, gate: SubscriptionReviewGate, entered: XCTestExpectation
+    ) {
+        pausedAccountRead = (number, gate, entered)
+    }
+
+    func pauseDeletion(gate: SubscriptionReviewGate, entered: XCTestExpectation) {
+        deleteGate = gate
+        deleteEntered = entered
+    }
 
     func configureDeletion(error: Error?, replacementAccount: String? = nil) {
         deleteError = error
@@ -70,21 +96,33 @@ private actor SubscriptionReviewServices: CloudKitSubscriptionStore,
     }
 
     func subscription(withID identifier: CKSubscription.ID) async throws -> CKSubscription? {
+        lookupCount += 1
+        let gate = lookupGate
+        lookupGate = nil
         lookupEntered?.fulfill()
-        await lookupGate?.wait()
+        lookupEntered = nil
+        await gate?.wait()
         return subscriptions[identifier]
     }
 
     func save(subscription: CKSubscription) async throws -> CKSubscription {
         saveCount += 1
         subscriptions[subscription.subscriptionID] = subscription
+        let gate = saveGate
+        saveGate = nil
         saveEntered?.fulfill()
-        await saveGate?.wait()
+        saveEntered = nil
+        await gate?.wait()
         return subscription
     }
 
     func deleteSubscription(withID identifier: CKSubscription.ID) async throws {
         deletedIDs.append(identifier)
+        let gate = deleteGate
+        deleteGate = nil
+        deleteEntered?.fulfill()
+        deleteEntered = nil
+        await gate?.wait()
         if let replacementAccountOnDelete { account = replacementAccountOnDelete }
         if let deleteError { throw deleteError }
         subscriptions.removeValue(forKey: identifier)
@@ -287,5 +325,128 @@ final class HotfixSubscriptionSafetyTests: XCTestCase {
         XCTAssertNotNil(synchronizer.subscriptionID(forRecordZoneID: synchronizer.recordZoneID))
         let finalSaveCount = await service.saveCount
         XCTAssertEqual(finalSaveCount, 1)
+    }
+
+    // These calls deliberately do not cancel the caller Task. The public
+    // synchronizer lifecycle boundary must retire standalone completions too.
+    @BigSyncBackgroundActor
+    func testLifecycleCancellationDuringInitialAccountReadStopsTransport() async throws {
+        let (synchronizer, service) = fixture()
+        let entered = expectation(description: "initial account read")
+        let gate = SubscriptionReviewGate()
+        await service.pauseAccountRead(number: 1, gate: gate, entered: entered)
+        let task = Task { @BigSyncBackgroundActor in
+            try await synchronizer.subscribeForChangesInDatabase()
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        synchronizer.cancelSynchronization()
+        await gate.open()
+        do {
+            try await task.value
+            XCTFail("Lifecycle cancellation must retire initial account admission")
+        } catch is CancellationError {
+        }
+        let lookups = await service.lookupCount
+        let saves = await service.saveCount
+        XCTAssertEqual(lookups, 0)
+        XCTAssertEqual(saves, 0)
+        XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
+    }
+
+    @BigSyncBackgroundActor
+    func testLifecycleCancellationDuringLookupCannotStartSave() async throws {
+        let (synchronizer, service) = fixture()
+        let entered = expectation(description: "standalone lookup")
+        let gate = SubscriptionReviewGate()
+        await service.pauseLookup(gate: gate, entered: entered)
+        let task = Task { @BigSyncBackgroundActor in
+            try await synchronizer.subscribeForChangesInDatabase()
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        synchronizer.cancelSynchronization()
+        await gate.open()
+        do {
+            try await task.value
+            XCTFail("A retired standalone lookup cannot start another side effect")
+        } catch is CancellationError {
+        }
+        let saves = await service.saveCount
+        XCTAssertEqual(saves, 0)
+        XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
+    }
+
+    @BigSyncBackgroundActor
+    func testLifecycleCancellationDuringSaveFencesPublicationAndAllowsRecovery() async throws {
+        let (synchronizer, service) = fixture()
+        let entered = expectation(description: "standalone save")
+        let gate = SubscriptionReviewGate()
+        await service.pauseSave(gate: gate, entered: entered)
+        let zone = synchronizer.recordZoneID
+        let task = Task { @BigSyncBackgroundActor in
+            try await synchronizer.subscribeForChanges(in: zone)
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        synchronizer.cancelSynchronization()
+        await gate.open()
+        do {
+            try await task.value
+            XCTFail("A retired save may have committed remotely but cannot publish locally")
+        } catch is CancellationError {
+        }
+        XCTAssertNil(synchronizer.subscriptionID(forRecordZoneID: zone))
+        try await synchronizer.subscribeForChanges(in: zone)
+        XCTAssertNotNil(synchronizer.subscriptionID(forRecordZoneID: zone))
+        let saves = await service.saveCount
+        XCTAssertEqual(saves, 1, "The fresh attempt must recover the deterministic server ID")
+    }
+
+    @BigSyncBackgroundActor
+    func testLifecycleCancellationDuringDeletionRetainsRetryMetadata() async throws {
+        let (synchronizer, service) = fixture()
+        try await synchronizer.subscribeForChangesInDatabase()
+        let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
+        let entered = expectation(description: "standalone deletion")
+        let gate = SubscriptionReviewGate()
+        await service.pauseDeletion(gate: gate, entered: entered)
+        let task = Task { @BigSyncBackgroundActor in
+            try await synchronizer.cancelSubscriptionForChangesInDatabase()
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        synchronizer.cancelSynchronization()
+        await gate.open()
+        do {
+            try await task.value
+            XCTFail("A retired deletion cannot erase current local retry state")
+        } catch is CancellationError {
+        }
+        XCTAssertEqual(synchronizer.subscriptionIDForDatabaseSubscription(), identifier)
+        await service.configureDeletion(error: CKError(.unknownItem))
+        try await synchronizer.cancelSubscriptionForChangesInDatabase()
+        XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
+        let deleted = await service.deletedIDs
+        XCTAssertEqual(deleted, [identifier, identifier])
+    }
+
+    @BigSyncBackgroundActor
+    func testLifecycleCancellationDuringPostSaveAccountReadFencesPublication() async throws {
+        let (synchronizer, service) = fixture()
+        let entered = expectation(description: "account read after save")
+        let gate = SubscriptionReviewGate()
+        // Admission, post-lookup validation, then post-save validation.
+        await service.pauseAccountRead(number: 3, gate: gate, entered: entered)
+        let task = Task { @BigSyncBackgroundActor in
+            try await synchronizer.subscribeForChangesInDatabase()
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        synchronizer.cancelSynchronization()
+        await gate.open()
+        do {
+            try await task.value
+            XCTFail("Account equality cannot substitute for the captured lifecycle attempt")
+        } catch is CancellationError {
+        }
+        let saves = await service.saveCount
+        XCTAssertEqual(saves, 1)
+        XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
     }
 }
