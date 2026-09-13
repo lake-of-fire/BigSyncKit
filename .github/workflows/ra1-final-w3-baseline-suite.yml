@@ -1,0 +1,68 @@
+name: RA-1 W3 baseline full-suite A-B
+on:
+  push:
+    branches: [codex/ra1-final-w3-baseline-suite-20260912]
+permissions:
+  contents: read
+concurrency:
+  group: ra1-final-w3-baseline-suite
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  baseline:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/BigSyncKit
+          ref: 84571b4c2a5262dfa52b66772d0276485d150f20
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Capture exact identity
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ra1-w3-baseline"
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-w3-baseline/identity.txt"
+          git -C ../RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-baseline/realm-swift-gaps.txt"
+          git -C ../SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-baseline/swift-utilities.txt"
+          swift --version | tee "$RUNNER_TEMP/ra1-w3-baseline/toolchain.txt"
+      - name: Baseline owned-revision regression
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter testRealUploadLoopReplacesStalePendingMarkWithNewerServerEmptyState 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/owned-revision.log"
+      - name: Baseline authority regression
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter testAccountSwitchDuringUploadPreparationSkipsCloudKitMutation 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/authority.log"
+      - name: Baseline full BigSyncKit suite
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/full.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ra1-final-w3-baseline-suite
+          path: ${{ runner.temp }}/ra1-w3-baseline/
+          retention-days: 7
+          if-no-files-found: error
