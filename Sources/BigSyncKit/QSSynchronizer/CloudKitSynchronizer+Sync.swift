@@ -479,7 +479,13 @@ extension CloudKitSynchronizer {
         let terminalZoneDeletionKind = (error as? ChangeFeedMigrationError)?
             .deletionKind
 
-        if let migrationError = error as? ChangeFeedMigrationError,
+        if error is RealmSwiftInboundTargetChangedError {
+            // A non-journaled local write invalidated an inbound selection.
+            // The inbound page/cursor was not committed, so replay through an
+            // ordinary delayed synchronization rather than terminating the drain.
+            shouldRetry = true
+            retryDelay = 1
+        } else if let migrationError = error as? ChangeFeedMigrationError,
            migrationError.deletionKind == .encryptedDataReset {
             // The database-history event already persisted a dedicated
             // recovery request. Retry immediately; the next attempt performs

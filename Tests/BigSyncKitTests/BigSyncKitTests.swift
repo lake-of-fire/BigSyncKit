@@ -560,6 +560,8 @@ private final class FakeModelAdapter:
     var resetSyncCachesHandler: (@Sendable () async throws -> Void)?
     var saveChangesHandler: (@Sendable () async throws -> Void)?
     var recordsToUploadHandler: (@Sendable () async throws -> Void)?
+    @BigSyncBackgroundActor var didDeleteHandler:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var terminalPendingChanges = false
     var semanticBlockers = [CloudKitSynchronizer.DomainBlocker]()
     var domainHookInvocationCount = 0
@@ -585,6 +587,11 @@ private final class FakeModelAdapter:
         self.priorityEntityTypeNames = priorities
         self.uploadedByEntity = uploadedByEntity
         self.deletedByEntity = deletedByEntity
+    }
+
+    @BigSyncBackgroundActor
+    func enqueueDeletion(_ recordID: CKRecord.ID, entityType: String) {
+        deletedByEntity[entityType, default: []].append(recordID)
     }
 
     func cleanUp() async throws {
@@ -689,6 +696,7 @@ private final class FakeModelAdapter:
     ) async throws {
         let recordNames = recordIDs.map { $0.recordName }.joined(separator: ",")
         events.append("didDelete:\(recordNames)")
+        try await didDeleteHandler?()
         if repeatsPreparedDeletions {
             let acknowledged = Set(recordIDs)
             for entityType in deletedByEntity.keys {
@@ -16138,6 +16146,67 @@ final class BigSyncKitTests: XCTestCase {
     ) async throws {
         try await prepareDirectOutboundAuthority(synchronizer)
         try await synchronizer.synchronizeAdapter(adapter)
+    }
+
+    @BigSyncBackgroundActor
+    func testReboundFixtureInitializesItsActualOutboundNamespace() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rebound-outbound-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let synchronizer = makeSynchronizer(backupDetectionBaseURL: root)
+        let initialNamespace = synchronizer.durableStateNamespace
+        let initialInstallation = try XCTUnwrap(BackupDetection.installationIdentifier(
+            namespace: initialNamespace, sharedSentinelBaseURL: root))
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "rebound-outbound-zone"), priorities: [])
+        synchronizer.addModelAdapter(adapter)
+        let selectedNamespace = synchronizer.durableStateNamespace
+        XCTAssertNotEqual(selectedNamespace, initialNamespace)
+        let selectedInstallation = try XCTUnwrap(BackupDetection.installationIdentifier(
+            namespace: selectedNamespace, sharedSentinelBaseURL: root))
+        XCTAssertEqual(BackupDetection.installationIdentifier(
+            namespace: initialNamespace, sharedSentinelBaseURL: root), initialInstallation)
+        try await prepareDirectOutboundAuthority(synchronizer)
+        let context = try XCTUnwrap(synchronizer.activeRunContext)
+        let principal = try synchronizer.currentOutboundPrincipal(for: context)
+        XCTAssertEqual(principal.installationIdentifier, selectedInstallation)
+        XCTAssertEqual(principal.durableStateNamespace, selectedNamespace)
+        // The fix initializes real evidence; it must not relax its admission.
+        try FileManager.default.removeItem(at: root)
+        XCTAssertThrowsError(try synchronizer.currentOutboundPrincipal(for: context)) {
+            XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .staleAuthority)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionAcknowledgementCreatedDeletionDrainsInSameAdapterPass() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(
+            zoneName: "ack-created-deletion-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let first = CKRecord.ID(recordName: "Bookmark.first", zoneID: zoneID)
+        let second = CKRecord.ID(recordName: "Bookmark.second", zoneID: zoneID)
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: [],
+            deletedByEntity: ["Bookmark": [first]]
+        )
+        adapter.didDeleteHandler = {
+            adapter.didDeleteHandler = nil
+            adapter.enqueueDeletion(second, entityType: "Bookmark")
+        }
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(adapter)
+
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
+
+        XCTAssertEqual(database.modifyRecordsOperationCount, 2)
+        XCTAssertEqual(
+            adapter.events.filter { $0.hasPrefix("didDelete:") },
+            ["didDelete:Bookmark.first", "didDelete:Bookmark.second"]
+        )
+        XCTAssertFalse(adapter.hasChanges)
     }
 
     @BigSyncBackgroundActor

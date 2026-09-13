@@ -3466,6 +3466,28 @@ public class CloudKitSynchronizer: NSObject {
                 databaseScope: database.databaseScope,
                 recordZoneID: adapter.recordZoneID
             )
+            // The initializer created backup/installation state for the original
+            // zone. This legacy DEBUG fixture hook must initialize the rebound
+            // namespace too; ordinary outbound admission still requires its
+            // real installation sentinel and must never bypass that proof.
+            do {
+                let result = try BackupDetection.run(
+                    store: keyValueStore,
+                    namespace: durableStateNamespace,
+                    sharedSentinelBaseURL: backupDetectionBaseURL
+                )
+                refreshBackupRestoreRequirement()
+                if result == .restoredFromBackup || backupRestoreDetected {
+                    accountScopeAuthorityFence.poison()
+                    clearDeviceIdentifier()
+                    try invalidateAccountScopeLeaseDurably()
+                    queueAccountScopeInvalidation(.restoreDetected)
+                }
+            } catch {
+                accountScopeAuthorityFence.poison()
+                backupDetectionError = error
+                logger.error("QSCloudKitSynchronizer >> Rebound fixture backup detection failed: \(error)")
+            }
         }
         allowsRecordZoneRebindingForTesting = false
 #endif
