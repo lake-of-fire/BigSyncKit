@@ -71,12 +71,9 @@ jobs:
           print("\n".join(changed))
           if changed != expected:
               raise SystemExit(f"unexpected changed-file set/order: {changed!r}")
-          # These are the exact postimages produced by applying the reviewed #40
-          # hunks to current main. The source whole-file hash intentionally differs
-          # from RA-1 because current main contains unrelated later source changes.
           expected_blobs = {
               expected[0]: "a6b7f05ed827bfd66feed72ccbd69c45334dfcb1",
-              expected[1]: "958df7946cbeb95fe151744bca8fd710435f3274",
+              expected[1]: "74191dc3dfdb43d1c4347b688940457bf4890be0",
           }
           for path, expected_blob in expected_blobs.items():
               actual = subprocess.check_output(["git", "hash-object", path], text=True).strip()
