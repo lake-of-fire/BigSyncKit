@@ -11,6 +11,7 @@ import CryptoKit
 
 private struct CloudKitSubscriptionAccountFence: Sendable {
     let accountIdentifier: String
+    let attemptID: UUID
     let runContext: CloudKitSynchronizer.RunContext?
 }
 
@@ -21,9 +22,15 @@ public extension CloudKitSynchronizer {
         -> CloudKitSubscriptionAccountFence {
         try Task.checkCancellation()
         try keyValueStore.bigSyncValidateDurability()
+        // Standalone calls have no RunContext, but must still retire when
+        // cancellation, reset or a newer synchronization rotates this fence.
+        let attemptID = synchronizationAttemptID
         let runContext = activeRunContext
         let accountIdentifier = try await accountIdentifierProvider()
         try Task.checkCancellation()
+        guard synchronizationAttemptID == attemptID else {
+            throw CancellationError()
+        }
         if let runContext {
             try checkRunContext(runContext)
             guard accountIdentifier == runContext.accountIdentifier else {
@@ -32,6 +39,7 @@ public extension CloudKitSynchronizer {
         }
         return CloudKitSubscriptionAccountFence(
             accountIdentifier: accountIdentifier,
+            attemptID: attemptID,
             runContext: runContext
         )
     }
@@ -41,12 +49,18 @@ public extension CloudKitSynchronizer {
         _ fence: CloudKitSubscriptionAccountFence
     ) async throws {
         try Task.checkCancellation()
+        guard synchronizationAttemptID == fence.attemptID else {
+            throw CancellationError()
+        }
         if let runContext = fence.runContext {
             try await revalidateRunContext(runContext)
             return
         }
         let currentAccountIdentifier = try await accountIdentifierProvider()
         try Task.checkCancellation()
+        guard synchronizationAttemptID == fence.attemptID else {
+            throw CancellationError()
+        }
         guard currentAccountIdentifier == fence.accountIdentifier else {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
