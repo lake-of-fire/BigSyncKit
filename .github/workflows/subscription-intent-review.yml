@@ -1,0 +1,41 @@
+name: Subscription intent ordering review
+
+on:
+  push:
+    branches: [fix/subscription-intent-ordering-20260913]
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Focused native test
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --filter SubscriptionIntentOrderingTests
+      - name: Verify source stayed clean
+        if: always()
+        working-directory: BigSyncKit
+        run: git diff --exit-code
