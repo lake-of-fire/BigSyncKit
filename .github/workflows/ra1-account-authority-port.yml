@@ -84,18 +84,6 @@ jobs:
                   let previousAccountIdentifier = try durableAccountIdentifier()
           '''
 
-              if (
-                  'persistAccountIdentifier(confirmedAccountIdentifier)' in ours
-                  and 'bigSyncSetDurably' in theirs
-              ):
-                  seen.append('account-publication')
-                  return '''        try persistAccountIdentifier(confirmedAccountIdentifier)
-                  try checkAccountValidationAttempt(
-                      validationAttemptID,
-                      fenceGeneration: validationFenceGeneration
-                  )
-          '''
-
               if 'Activation may commit before the durable store reports failure.' in ours:
                   seen.append('port-activation')
                   return '''        // Fence this worker before the first fallible publication. RA-1
@@ -121,6 +109,18 @@ jobs:
                       }) == true else {
                       throw CancellationError()
                   }
+          '''
+
+              if (
+                  'persistAccountIdentifier(confirmedAccountIdentifier)' in ours
+                  and 'bigSyncSetDurably' in theirs
+              ):
+                  seen.append('account-publication')
+                  return '''        try persistAccountIdentifier(confirmedAccountIdentifier)
+                  try checkAccountValidationAttempt(
+                      validationAttemptID,
+                      fenceGeneration: validationFenceGeneration
+                  )
           '''
 
               if (
