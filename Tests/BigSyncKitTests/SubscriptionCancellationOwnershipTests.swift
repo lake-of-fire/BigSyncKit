@@ -147,9 +147,11 @@ final class SubscriptionCancellationOwnershipTests: XCTestCase {
         } catch {
         }
 
+        let deleteCount = await services.deleteCount
+        let stillExists = await services.containsSubscription(withID: identifier)
         XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
-        XCTAssertEqual(await services.deleteCount, 0)
-        XCTAssertTrue(await services.containsSubscription(withID: identifier))
+        XCTAssertEqual(deleteCount, 0)
+        XCTAssertTrue(stillExists)
     }
 
     @BigSyncBackgroundActor
@@ -176,9 +178,11 @@ final class SubscriptionCancellationOwnershipTests: XCTestCase {
         } catch {
         }
 
+        let deleteCount = await services.deleteCount
+        let stillExists = await services.containsSubscription(withID: identifier)
         XCTAssertNil(synchronizer.subscriptionID(forRecordZoneID: zoneID))
-        XCTAssertEqual(await services.deleteCount, 0)
-        XCTAssertTrue(await services.containsSubscription(withID: identifier))
+        XCTAssertEqual(deleteCount, 0)
+        XCTAssertTrue(stillExists)
     }
 
     @BigSyncBackgroundActor
@@ -192,8 +196,9 @@ final class SubscriptionCancellationOwnershipTests: XCTestCase {
 
         try await synchronizer.cancelSubscriptionForChangesInDatabase()
 
+        let deleteCount = await services.deleteCount
         XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
-        XCTAssertEqual(await services.deleteCount, 0)
+        XCTAssertEqual(deleteCount, 0)
     }
 
     @BigSyncBackgroundActor
@@ -208,8 +213,9 @@ final class SubscriptionCancellationOwnershipTests: XCTestCase {
 
         try await synchronizer.cancelSubscriptionForChanges(in: zoneID)
 
+        let deleteCount = await services.deleteCount
         XCTAssertNil(synchronizer.subscriptionID(forRecordZoneID: zoneID))
-        XCTAssertEqual(await services.deleteCount, 0)
+        XCTAssertEqual(deleteCount, 0)
     }
 
     @BigSyncBackgroundActor
@@ -222,9 +228,11 @@ final class SubscriptionCancellationOwnershipTests: XCTestCase {
 
         try await synchronizer.cancelSubscriptionForChangesInDatabase()
 
+        let deletedIDs = await services.deletedIDs
+        let stillExists = await services.containsSubscription(withID: identifier)
         XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
-        XCTAssertEqual(await services.deletedIDs, [identifier])
-        XCTAssertFalse(await services.containsSubscription(withID: identifier))
+        XCTAssertEqual(deletedIDs, [identifier])
+        XCTAssertFalse(stillExists)
     }
 
     @BigSyncBackgroundActor
@@ -238,8 +246,10 @@ final class SubscriptionCancellationOwnershipTests: XCTestCase {
 
         try await synchronizer.cancelSubscriptionForChanges(in: zoneID)
 
+        let deletedIDs = await services.deletedIDs
+        let stillExists = await services.containsSubscription(withID: identifier)
         XCTAssertNil(synchronizer.subscriptionID(forRecordZoneID: zoneID))
-        XCTAssertEqual(await services.deletedIDs, [identifier])
-        XCTAssertFalse(await services.containsSubscription(withID: identifier))
+        XCTAssertEqual(deletedIDs, [identifier])
+        XCTAssertFalse(stillExists)
     }
 }
