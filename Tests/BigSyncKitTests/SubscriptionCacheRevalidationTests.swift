@@ -159,8 +159,10 @@ final class SubscriptionCacheRevalidationTests: XCTestCase {
         let identifier = try XCTUnwrap(
             synchronizer.subscriptionIDForDatabaseSubscription()
         )
-        XCTAssertEqual(await services.lookupCount, 1)
-        XCTAssertEqual(await services.saveCount, 1)
+        let initialLookupCount = await services.lookupCount
+        let initialSaveCount = await services.saveCount
+        XCTAssertEqual(initialLookupCount, 1)
+        XCTAssertEqual(initialSaveCount, 1)
 
         await services.removeSubscription(withID: identifier)
         try await synchronizer.subscribeForChangesInDatabase()
@@ -168,8 +170,10 @@ final class SubscriptionCacheRevalidationTests: XCTestCase {
         XCTAssertEqual(
             synchronizer.subscriptionIDForDatabaseSubscription(), identifier
         )
-        XCTAssertEqual(await services.lookupCount, 2)
-        XCTAssertEqual(await services.saveCount, 2)
+        let finalLookupCount = await services.lookupCount
+        let finalSaveCount = await services.saveCount
+        XCTAssertEqual(finalLookupCount, 2)
+        XCTAssertEqual(finalSaveCount, 2)
     }
 
     @BigSyncBackgroundActor
@@ -180,8 +184,10 @@ final class SubscriptionCacheRevalidationTests: XCTestCase {
         let identifier = try XCTUnwrap(
             synchronizer.subscriptionID(forRecordZoneID: zoneID)
         )
-        XCTAssertEqual(await services.lookupCount, 1)
-        XCTAssertEqual(await services.saveCount, 1)
+        let initialLookupCount = await services.lookupCount
+        let initialSaveCount = await services.saveCount
+        XCTAssertEqual(initialLookupCount, 1)
+        XCTAssertEqual(initialSaveCount, 1)
 
         await services.removeSubscription(withID: identifier)
         try await synchronizer.subscribeForChanges(in: zoneID)
@@ -189,8 +195,10 @@ final class SubscriptionCacheRevalidationTests: XCTestCase {
         XCTAssertEqual(
             synchronizer.subscriptionID(forRecordZoneID: zoneID), identifier
         )
-        XCTAssertEqual(await services.lookupCount, 2)
-        XCTAssertEqual(await services.saveCount, 2)
+        let finalLookupCount = await services.lookupCount
+        let finalSaveCount = await services.saveCount
+        XCTAssertEqual(finalLookupCount, 2)
+        XCTAssertEqual(finalSaveCount, 2)
     }
 
     @BigSyncBackgroundActor
@@ -219,7 +227,8 @@ final class SubscriptionCacheRevalidationTests: XCTestCase {
         XCTAssertEqual(
             synchronizer.subscriptionIDForDatabaseSubscription(), identifier
         )
-        XCTAssertEqual(await services.saveCount, 1)
+        let finalSaveCount = await services.saveCount
+        XCTAssertEqual(finalSaveCount, 1)
     }
 
     @BigSyncBackgroundActor
@@ -241,6 +250,7 @@ final class SubscriptionCacheRevalidationTests: XCTestCase {
         } catch {
         }
         XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
-        XCTAssertEqual(await services.saveCount, 1)
+        let finalSaveCount = await services.saveCount
+        XCTAssertEqual(finalSaveCount, 1)
     }
 }
