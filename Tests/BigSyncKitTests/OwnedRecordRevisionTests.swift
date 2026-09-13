@@ -754,6 +754,17 @@ final class OwnedRecordRevisionTests: XCTestCase {
             runID: sync.synchronizationRunID, accountIdentifier: account,
             accountScopeIdentifier: lease.accountScopeIdentifier,
             replicaBindingGenerationIdentifier: binding, accountInvalidationGeneration: lease.invalidationGeneration)
+        // This helper owns a direct adapter drain, not a background full sync.
+        // Mirror the enclosing production drain's ownership so normal journal
+        // delegate wakeups coalesce instead of starting a second attempt that
+        // the deliberately upload-only transport cannot service.
+        let attemptID = sync.synchronizationAttemptID
+        sync.syncing = true
+        sync.synchronizationDrainIsActive = true
+        defer {
+            sync.cancelSynchronization()
+            try? FileManager.default.removeItem(at: root)
+        }
         // Seed an unchanged foreign value through inbound replication, then make
         // it a normal repair upload. Do not author owner-a with this random
         // installation's identity merely to arrange the transport fixture.
@@ -771,6 +782,10 @@ final class OwnedRecordRevisionTests: XCTestCase {
         try await sync.synchronizeAdapter(f.adapter)
         await f.refresh()
         let uploads = await io.uploadedValues()
+        XCTAssertEqual(sync.synchronizationAttemptID, attemptID,
+                       "A journal wakeup must not replace the owned direct drain")
+        XCTAssertTrue(sync.syncing)
+        XCTAssertNil(sync.synchronizationTask)
         XCTAssertEqual(uploads.first, local)
         XCTAssertTrue((2...3).contains(uploads.count))
         XCTAssertTrue(uploads.dropFirst().allSatisfy { $0 == expected },
