@@ -1,0 +1,77 @@
+name: RA1 combined integration qualification
+on:
+  push:
+    branches: [codex/ra1-native-suite-closure-20260912]
+    paths:
+      - .github/workflows/ra1-combined-integration-qualification.yml
+permissions:
+  contents: read
+jobs:
+  full-package:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 6ddbfc9584b4e3d879d2ed8b5d6fea018cf2b609
+          path: BigSyncKit
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record exact source and delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test "$(git -C BigSyncKit rev-parse HEAD)" = '6ddbfc9584b4e3d879d2ed8b5d6fea018cf2b609'
+          git -C BigSyncKit rev-parse HEAD > evidence/source-head.txt
+          git -C BigSyncKit diff --name-status 391bf8f5b5fefeee05c53521cdbbebdf7b5fd047..HEAD > evidence/delta-from-qualified-clean-head.txt
+          test "$(wc -l < evidence/delta-from-qualified-clean-head.txt | tr -d ' ')" = '1'
+          grep -Fq $'A\tSources/BigSyncKit/RealmSwift/RealmSwiftAdapter+CloudKitE2EEvidence.swift' evidence/delta-from-qualified-clean-head.txt
+          swift --version > evidence/toolchain.txt
+          git -C RealmSwiftGaps rev-parse HEAD > evidence/realm-gaps-head.txt
+          git -C SwiftUtilities rev-parse HEAD > evidence/swift-utilities-head.txt
+      - name: Execute full package without exclusions
+        id: full
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        shell: bash
+        run: |
+          set -uo pipefail
+          swift test 2>&1 | tee ../evidence/full.log
+          status=${PIPESTATUS[0]}
+          echo "$status" > ../evidence/full-exit-code.txt
+          exit "$status"
+      - name: Summarize exact execution
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+          text = Path('evidence/full.log').read_text() if Path('evidence/full.log').exists() else ''
+          result = {
+              'source_head': '6ddbfc9584b4e3d879d2ed8b5d6fea018cf2b609',
+              'failed_cases': sorted(set(re.findall(r"Test Case '(.*?)' failed", text))),
+              'summaries': re.findall(r'Executed \d+ tests?, with \d+ failures?[^\n]*', text),
+          }
+          Path('evidence/result.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ra1-combined-integration-evidence
+          path: evidence
