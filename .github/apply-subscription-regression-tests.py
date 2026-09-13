@@ -97,6 +97,25 @@ big = replace_once(
 
 big = replace_once(
     big,
+    '''        let identifier = try XCTUnwrap(
+            synchronizer.subscriptionID(forRecordZoneID: zoneID)
+        )
+        database.accountIdentifierAfterNextSubscriptionDelete = "account-b"
+''',
+    '''        let identifier = try XCTUnwrap(
+            synchronizer.subscriptionID(forRecordZoneID: zoneID)
+        )
+        // The cancellation path now resolves the deterministic server object
+        // before delete. Keep this broad fake coherent with the successful
+        // zone-subscription save performed immediately above.
+        database.fetchedSubscriptions = database.savedSubscriptions
+        database.accountIdentifierAfterNextSubscriptionDelete = "account-b"
+''',
+    "zone delete account-replacement fixture",
+)
+
+big = replace_once(
+    big,
     '''        database.accountIdentifier = "account-b"
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
         await Task.yield()
