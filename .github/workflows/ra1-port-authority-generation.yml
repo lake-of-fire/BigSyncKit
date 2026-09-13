@@ -1,0 +1,38 @@
+name: RA-1 port account authority generation
+
+on:
+  push:
+    branches:
+      - fix/ra1-account-validation-generation-fence-20260913
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-bounded-port:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/ra1-account-validation-generation-fence-20260913
+          fetch-depth: 0
+
+      - name: Apply exact RA-1 generation-fence port
+        run: |
+          set -euo pipefail
+          python3 scripts/fix_ra1_authority_patcher.py
+          python3 scripts/apply_ra1_account_validation_generation_fence.py
+          git diff --check
+          git diff -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
+
+      - name: Commit only final source and regressions
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
+          git rm -f .github/workflows/ra1-port-authority-generation.yml scripts/apply_ra1_account_validation_generation_fence.py scripts/fix_ra1_authority_patcher.py
+          git commit -m "RA-1: fence account validation by authority generation"
+          git push origin HEAD:fix/ra1-account-validation-generation-fence-20260913
