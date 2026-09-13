@@ -22,6 +22,7 @@ jobs:
       - name: Apply exact RA-1 generation-fence port
         run: |
           set -euo pipefail
+          python3 scripts/fix_ra1_authority_patcher.py
           python3 scripts/apply_ra1_account_validation_generation_fence.py
           git diff --check
           git diff -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
@@ -32,6 +33,6 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
-          git rm .github/workflows/ra1-port-authority-generation.yml scripts/apply_ra1_account_validation_generation_fence.py
+          git rm .github/workflows/ra1-port-authority-generation.yml scripts/apply_ra1_account_validation_generation_fence.py scripts/fix_ra1_authority_patcher.py
           git commit -m "RA-1: fence account validation by authority generation"
           git push origin HEAD:fix/ra1-account-validation-generation-fence-20260913
