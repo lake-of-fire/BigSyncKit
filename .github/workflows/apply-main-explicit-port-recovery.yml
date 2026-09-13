@@ -34,11 +34,17 @@ jobs:
         run: |
           set -euo pipefail
           git diff --check
-          mapfile -t changed < <(git diff --name-only)
-          printf '%s\n' "${changed[@]}"
-          test "${#changed[@]}" -eq 2
-          test "${changed[0]}" = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift"
-          test "${changed[1]}" = "Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift"
+          python3 - <<'PY'
+          import subprocess
+          expected = [
+              "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift",
+              "Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift",
+          ]
+          changed = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
+          print("\n".join(changed))
+          if changed != expected:
+              raise SystemExit(f"unexpected changed-file set/order: {changed!r}")
+          PY
       - name: Run focused account-fencing suite
         run: swift test --filter CloudKitSynchronizerAccountFencingTests
       - name: Run full package suite
