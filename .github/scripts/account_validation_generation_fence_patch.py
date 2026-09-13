@@ -50,7 +50,14 @@ replace_once(
         lock.unlock()
     }
 """,
-    """    @discardableResult
+    """    func clear() {
+        lock.lock()
+        isPoisoned = false
+        rotatesGeneration = false
+        lock.unlock()
+    }
+
+    @discardableResult
     func clear(ifInvalidationGenerationMatches expected: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -249,6 +256,6 @@ helper = helper.replace(
 source = source[:helper_start] + helper + source[helper_end:]
 
 if "accountScopeAuthorityFence.clear()" in source:
-    raise SystemExit("unconditional authority-fence clear survived")
+    raise SystemExit("unconditional authority-fence clear survived validation path")
 
 path.write_text(source)
