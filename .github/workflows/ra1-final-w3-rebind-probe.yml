@@ -1,4 +1,4 @@
-name: RA-1 W3 DEBUG rebind probe
+name: RA-1 W3 DEBUG rebind probe v2
 on:
   push:
     branches: [codex/ra1-final-w3-rebind-probe-20260913]
