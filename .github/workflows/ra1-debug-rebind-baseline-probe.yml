@@ -35,60 +35,65 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import textwrap
           p = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
           s = p.read_text()
           marker = 'DEBUG zone rebind must initialize the rebound durable namespace'
           if marker not in s:
-              old = '''#if DEBUG
-        if allowsRecordZoneRebindingForTesting,
-           modelAdapterDictionary.isEmpty,
-           adapter.recordZoneID != recordZoneID {
-            recordZoneID = adapter.recordZoneID
-            durableStateNamespace = Self.makeDurableStateNamespace(
-                identifier: identifier,
-                containerIdentifier: containerIdentifier,
-                databaseScope: database.databaseScope,
-                recordZoneID: adapter.recordZoneID
-            )
-        }
-        allowsRecordZoneRebindingForTesting = false
-#endif'''
-              new = '''#if DEBUG
-        if allowsRecordZoneRebindingForTesting,
-           modelAdapterDictionary.isEmpty,
-           adapter.recordZoneID != recordZoneID {
-            recordZoneID = adapter.recordZoneID
-            durableStateNamespace = Self.makeDurableStateNamespace(
-                identifier: identifier,
-                containerIdentifier: containerIdentifier,
-                databaseScope: database.databaseScope,
-                recordZoneID: adapter.recordZoneID
-            )
-            // DEBUG zone rebind must initialize the rebound durable namespace.
-            do {
-                let result = try BackupDetection.run(
-                    store: keyValueStore,
-                    namespace: durableStateNamespace,
-                    sharedSentinelBaseURL: backupDetectionBaseURL
-                )
-                backupDetectionError = nil
-                refreshBackupRestoreRequirement()
-                if result == .restoredFromBackup || backupRestoreDetected {
-                    accountScopeAuthorityFence.poison()
-                    clearDeviceIdentifier()
-                    try invalidateAccountScopeLeaseDurably()
-                    queueAccountScopeInvalidation(.restoreDetected)
-                }
-            } catch {
-                accountScopeAuthorityFence.poison()
-                backupDetectionError = error
-                logger.error("QSCloudKitSynchronizer >> DEBUG rebind backup detection failed: \\(error)")
-            }
-        }
-        allowsRecordZoneRebindingForTesting = false
-#endif'''
+              old = textwrap.dedent('''\
+              #if DEBUG
+                      if allowsRecordZoneRebindingForTesting,
+                         modelAdapterDictionary.isEmpty,
+                         adapter.recordZoneID != recordZoneID {
+                          recordZoneID = adapter.recordZoneID
+                          durableStateNamespace = Self.makeDurableStateNamespace(
+                              identifier: identifier,
+                              containerIdentifier: containerIdentifier,
+                              databaseScope: database.databaseScope,
+                              recordZoneID: adapter.recordZoneID
+                          )
+                      }
+                      allowsRecordZoneRebindingForTesting = false
+              #endif''')
+              new = textwrap.dedent('''\
+              #if DEBUG
+                      if allowsRecordZoneRebindingForTesting,
+                         modelAdapterDictionary.isEmpty,
+                         adapter.recordZoneID != recordZoneID {
+                          recordZoneID = adapter.recordZoneID
+                          durableStateNamespace = Self.makeDurableStateNamespace(
+                              identifier: identifier,
+                              containerIdentifier: containerIdentifier,
+                              databaseScope: database.databaseScope,
+                              recordZoneID: adapter.recordZoneID
+                          )
+                          // DEBUG zone rebind must initialize the rebound durable namespace.
+                          do {
+                              let result = try BackupDetection.run(
+                                  store: keyValueStore,
+                                  namespace: durableStateNamespace,
+                                  sharedSentinelBaseURL: backupDetectionBaseURL
+                              )
+                              backupDetectionError = nil
+                              refreshBackupRestoreRequirement()
+                              if result == .restoredFromBackup || backupRestoreDetected {
+                                  accountScopeAuthorityFence.poison()
+                                  clearDeviceIdentifier()
+                                  try invalidateAccountScopeLeaseDurably()
+                                  queueAccountScopeInvalidation(.restoreDetected)
+                              }
+                          } catch {
+                              accountScopeAuthorityFence.poison()
+                              backupDetectionError = error
+                              logger.error(
+                                  "QSCloudKitSynchronizer >> DEBUG rebind backup detection failed: \\(error)"
+                              )
+                          }
+                      }
+                      allowsRecordZoneRebindingForTesting = false
+              #endif''')
               if s.count(old) != 1:
-                  raise SystemExit('expected one DEBUG rebind block')
+                  raise SystemExit(f'expected one DEBUG rebind block, found {s.count(old)}')
               p.write_text(s.replace(old, new))
           PY
           set +e
@@ -96,6 +101,7 @@ jobs:
           swift test --filter testChangeFeedBootstrapTreatsNeverCreatedZoneAsEmptyAndUploadsJournal
           swift test --filter testRepeatedServerConflictStopsAfterBoundedRetries
           swift test --filter testRealUploadLoopReplacesStalePendingMarkWithNewerServerEmptyState
+          set -o pipefail
           swift test 2>&1 | tee /tmp/ra1-full.log
           full_status=${PIPESTATUS[0]}
           grep -E "Test Suite '.*' (passed|failed)|Executed [0-9]+ tests" /tmp/ra1-full.log || true
