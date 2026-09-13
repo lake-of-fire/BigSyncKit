@@ -424,7 +424,10 @@ final class HotfixSubscriptionSafetyTests: XCTestCase {
         try await synchronizer.cancelSubscriptionForChangesInDatabase()
         XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
         let deleted = await service.deletedIDs
-        XCTAssertEqual(deleted, [identifier, identifier])
+        // The first delete committed remotely before lifecycle retirement, so
+        // the retry's exact ownership lookup observes absence and clears local
+        // retry metadata without issuing a redundant second delete.
+        XCTAssertEqual(deleted, [identifier])
     }
 
     @BigSyncBackgroundActor

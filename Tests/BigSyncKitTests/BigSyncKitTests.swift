@@ -7942,12 +7942,20 @@ final class BigSyncKitTests: XCTestCase {
         let database = FakeCloudKitDatabase()
         let synchronizer = makeSynchronizer(database: database)
 
-        for _ in 0..<2 {
-            await withCheckedContinuation { continuation in
-                synchronizer.subscribeForChangesInDatabase { error in
-                    XCTAssertNil(error)
-                    continuation.resume()
-                }
+        await withCheckedContinuation { continuation in
+            synchronizer.subscribeForChangesInDatabase { error in
+                XCTAssertNil(error)
+                continuation.resume()
+            }
+        }
+        // The broad fake keeps lookup results separate from save bookkeeping.
+        // After cache revalidation became mandatory, make the successful save
+        // visible to the next exact server lookup just as CloudKit would.
+        database.fetchedSubscriptions = database.savedSubscriptions
+        await withCheckedContinuation { continuation in
+            synchronizer.subscribeForChangesInDatabase { error in
+                XCTAssertNil(error)
+                continuation.resume()
             }
         }
 
@@ -7982,6 +7990,10 @@ final class BigSyncKitTests: XCTestCase {
         let identifier = try XCTUnwrap(
             synchronizer.subscriptionIDForDatabaseSubscription()
         )
+        // Cancellation now proves exact deterministic-ID ownership with a
+        // server lookup before deleting. Model the subscription that the
+        // preceding successful save actually created on CloudKit.
+        database.fetchedSubscriptions = database.savedSubscriptions
         database.subscriptionDeleteError =
             TestSynchronizationError.subscriptionMutationFailed
 
@@ -8038,6 +8050,10 @@ final class BigSyncKitTests: XCTestCase {
         let identifier = try XCTUnwrap(
             synchronizer.subscriptionID(forRecordZoneID: zoneID)
         )
+        // The cancellation path now resolves the deterministic server object
+        // before delete. Keep this broad fake coherent with the successful
+        // zone-subscription save performed immediately above.
+        database.fetchedSubscriptions = database.savedSubscriptions
         database.accountIdentifierAfterNextSubscriptionDelete = "account-b"
 
         do {
@@ -8622,8 +8638,10 @@ final class BigSyncKitTests: XCTestCase {
 
         database.accountIdentifier = "account-b"
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        // The account-change observer owns the recovery wakeup. Issuing a
+        // second explicit begin here can race the observer and create a tail
+        // drain, making an exact save-count assertion scheduler-dependent.
         await Task.yield()
-        synchronizer.beginSynchronization()
 
         for _ in 0..<1_000 where database.savedSubscriptionCount < 2 {
             try await Task.sleep(nanoseconds: 1_000_000)
