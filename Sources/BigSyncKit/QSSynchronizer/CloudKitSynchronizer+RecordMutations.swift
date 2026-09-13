@@ -37,6 +37,22 @@ struct HandledMutationRetryBudget {
     }
 }
 
+/// A short successful batch is not proof of quiescence: generation-matched
+/// acknowledgement can expose a newer target journal generation. The owning
+/// drain gets one more preparation turn whenever the adapter still reports
+/// work; a differently-scoped or opposite-kind mutation then yields an empty
+/// preparation immediately and returns to its owning phase.
+func bigSyncMutationDrainShouldContinue(
+    handledFailures: Int,
+    completedCount: Int,
+    requestedBatchSize: Int,
+    adapterHasChanges: Bool
+) -> Bool {
+    handledFailures > 0
+        || completedCount >= requestedBatchSize
+        || adapterHasChanges
+}
+
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
@@ -282,8 +298,12 @@ extension CloudKitSynchronizer {
                records.count >= requestedBatchSize {
                 increaseBatchSize()
             }
-            guard handledFailures > 0
-                    || records.count >= requestedBatchSize else { return }
+            guard bigSyncMutationDrainShouldContinue(
+                handledFailures: handledFailures,
+                completedCount: records.count,
+                requestedBatchSize: requestedBatchSize,
+                adapterHasChanges: adapter.hasChanges
+            ) else { return }
             await Task.yield()
         }
     }
@@ -439,7 +459,12 @@ extension CloudKitSynchronizer {
                recordIDs.count >= requestedBatchSize {
                 increaseBatchSize()
             }
-            guard handledFailures > 0 || recordIDs.count >= requestedBatchSize else { return }
+            guard bigSyncMutationDrainShouldContinue(
+                handledFailures: handledFailures,
+                completedCount: recordIDs.count,
+                requestedBatchSize: requestedBatchSize,
+                adapterHasChanges: adapter.hasChanges
+            ) else { return }
             await Task.yield()
         }
     }
