@@ -36,7 +36,7 @@ jobs:
           set -euo pipefail
           echo "HEAD=$(git rev-parse HEAD)"
           echo "TEST_BLOB=$(git hash-object Tests/BigSyncKitTests/SubscriptionIntentOrderingTests.swift)"
-          test "$(git hash-object Tests/BigSyncKitTests/SubscriptionIntentOrderingTests.swift)" = "398cf5402acf56ae1a924c9422336bfa052cfa32"
+          test "$(git hash-object Tests/BigSyncKitTests/SubscriptionIntentOrderingTests.swift)" = "9d9db0a6354719e8ae8374de70fb11e2f1e5629e"
           if grep -n "permits" Tests/BigSyncKitTests/SubscriptionIntentOrderingTests.swift; then
             echo "unexpected stale permits helper in immutable checkout" >&2
             exit 1
