@@ -52,6 +52,23 @@ new = '''    var recordsToUploadHandler: (@Sendable () async throws -> Void)?
     var terminalPendingChanges = false'''
 replace_once(path, old, new)
 
+old = '''        self.uploadedByEntity = uploadedByEntity
+        self.deletedByEntity = deletedByEntity
+    }
+
+    func cleanUp() async throws {'''
+new = '''        self.uploadedByEntity = uploadedByEntity
+        self.deletedByEntity = deletedByEntity
+    }
+
+    @BigSyncBackgroundActor
+    func enqueueDeletion(_ recordID: CKRecord.ID, entityType: String) {
+        deletedByEntity[entityType, default: []].append(recordID)
+    }
+
+    func cleanUp() async throws {'''
+replace_once(path, old, new)
+
 old = '''        let recordNames = recordIDs.map { $0.recordName }.joined(separator: ",")
         events.append("didDelete:\(recordNames)")
         if repeatsPreparedDeletions {'''
@@ -110,7 +127,7 @@ addition = '''    @BigSyncBackgroundActor
         )
         adapter.didDeleteHandler = {
             adapter.didDeleteHandler = nil
-            adapter.deletedByEntity["Bookmark", default: []].append(second)
+            adapter.enqueueDeletion(second, entityType: "Bookmark")
         }
         let synchronizer = makeSynchronizer(database: database)
         synchronizer.addModelAdapter(adapter)
