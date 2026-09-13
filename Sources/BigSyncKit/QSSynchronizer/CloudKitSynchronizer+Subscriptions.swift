@@ -68,10 +68,14 @@ private final class CloudKitSubscriptionOperationGate {
 private enum CloudKitSubscriptionOperationGates {
     private final class Entry {
         weak var owner: CloudKitSynchronizer?
-        let gate = CloudKitSubscriptionOperationGate()
+        let gate: CloudKitSubscriptionOperationGate
 
-        init(owner: CloudKitSynchronizer) {
+        init(
+            owner: CloudKitSynchronizer,
+            gate: CloudKitSubscriptionOperationGate
+        ) {
             self.owner = owner
+            self.gate = gate
         }
     }
 
@@ -87,7 +91,10 @@ private enum CloudKitSubscriptionOperationGates {
            owner === synchronizer {
             return entry.gate
         }
-        let entry = Entry(owner: synchronizer)
+        let entry = Entry(
+            owner: synchronizer,
+            gate: CloudKitSubscriptionOperationGate()
+        )
         entries[key] = entry
         return entry.gate
     }
