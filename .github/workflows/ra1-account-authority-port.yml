@@ -16,6 +16,40 @@ jobs:
         with:
           ref: 6d5acf7f775ec09791185c969ce72f795536f898
           fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: a99c37a96bb80aa483d39b6b88a7ea3f70825fce
+          path: external/RealmSwiftGaps
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: 766bd55160f504d71fc2eb85f8f06018bb7050cc
+          path: external/SwiftUtilities
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftQueue
+          ref: a417370ee93bb7fc3e0f2180329f30411d29d5cb
+          path: external/SwiftQueue
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/HBLogEntries
+          ref: 5c2110271371452905976387de408354a03c355a
+          path: external/HBLogEntries
+      - uses: actions/checkout@v4
+        with:
+          repository: TateTheReal/RealmSwift
+          ref: 3b4f143aaa1194bda4300a698657909a57cd31e8
+          path: external/RealmSwift
+      - name: Link local package dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          ln -s external/RealmSwiftGaps ../RealmSwiftGaps
+          ln -s external/SwiftUtilities ../SwiftUtilities
+          ln -s external/SwiftQueue ../SwiftQueue
+          ln -s external/HBLogEntries ../HBLogEntries
+          ln -s external/RealmSwift ../RealmSwift
       - name: Compose final reviewed authority patch onto RA-1
         shell: bash
         run: |
