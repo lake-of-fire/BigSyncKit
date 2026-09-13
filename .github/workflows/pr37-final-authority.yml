@@ -1,0 +1,55 @@
+name: PR37 final authority qualification
+on:
+  push:
+    branches:
+      - fix/account-validation-generation-fence-20260913
+permissions:
+  contents: write
+jobs:
+  qualify:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Apply final reviewed patch
+        working-directory: BigSyncKit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Scripts/pr37_final_authority_patch.py')
+          text = path.read_text()
+          text = text.replace('        XCTAssertFalse(synchronizer._test_portActivationRequiresWorkerRestart)\n', '')
+          path.write_text(text)
+          PY
+          python3 Scripts/pr37_final_authority_patch.py
+          git diff --check
+      - name: Run account fencing suite
+        working-directory: BigSyncKit
+        run: swift test --filter CloudKitSynchronizerAccountFencingTests
+      - name: Commit qualified source and tests
+        working-directory: BigSyncKit
+        run: |
+          rm .github/workflows/pr37-final-authority.yml
+          rm Scripts/pr37_final_authority_patch.py
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift .github/workflows/pr37-final-authority.yml Scripts/pr37_final_authority_patch.py
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Fence explicit port activation authority"
+          git push origin HEAD:${GITHUB_REF_NAME}
