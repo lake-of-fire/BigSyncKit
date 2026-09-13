@@ -42,7 +42,21 @@ jobs:
           git -C ../RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-baseline/realm-swift-gaps.txt"
           git -C ../SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-baseline/swift-utilities.txt"
           swift --version | tee "$RUNNER_TEMP/ra1-w3-baseline/toolchain.txt"
+      - name: BigSyncKitTests class alone
+        continue-on-error: true
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter 'BigSyncKitTests\.BigSyncKitTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/bigsync-class.log"
+      - name: OwnedRecordRevisionTests class alone
+        if: always()
+        continue-on-error: true
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter 'BigSyncKitTests\.OwnedRecordRevisionTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/owned-class.log"
       - name: Isolated authority regression
+        if: always()
         continue-on-error: true
         working-directory: BigSyncKit
         run: |
@@ -69,19 +83,10 @@ jobs:
         run: |
           set -o pipefail
           swift test --filter testRealUploadLoopReplacesStalePendingMarkWithNewerServerEmptyState 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/owned-revision.log"
-      - name: Baseline full BigSyncKit suite
-        if: always()
-        continue-on-error: true
-        working-directory: BigSyncKit
-        env:
-          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
-        run: |
-          set -o pipefail
-          swift test 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/full.log"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ra1-final-w3-baseline-suite
+          name: ra1-final-w3-baseline-suite-classes
           path: ${{ runner.temp }}/ra1-w3-baseline/
           retention-days: 7
           if-no-files-found: error
