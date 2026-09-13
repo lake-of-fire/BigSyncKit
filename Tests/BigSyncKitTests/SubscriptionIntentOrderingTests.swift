@@ -182,7 +182,8 @@ final class SubscriptionIntentOrderingTests: XCTestCase {
             try await synchronizer.subscribeForChangesInDatabase()
         }
         await fulfillment(of: [saveEntered], timeout: 2)
-        let identifier = try XCTUnwrap(await services.onlySubscriptionID())
+        let onlySubscriptionID = await services.onlySubscriptionID()
+        let identifier = try XCTUnwrap(onlySubscriptionID)
 
         let cancel = Task { @BigSyncBackgroundActor in
             try await synchronizer.cancelSubscriptionForChangesInDatabase()
@@ -196,7 +197,8 @@ final class SubscriptionIntentOrderingTests: XCTestCase {
         try await cancel.value
 
         XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
-        XCTAssertFalse(await services.containsSubscription(identifier))
+        let containsSubscription = await services.containsSubscription(identifier)
+        XCTAssertFalse(containsSubscription)
         let saveCount = await services.saveCount
         let deleteCount = await services.deleteCount
         XCTAssertEqual(saveCount, 1)
@@ -235,7 +237,8 @@ final class SubscriptionIntentOrderingTests: XCTestCase {
         XCTAssertEqual(
             synchronizer.subscriptionIDForDatabaseSubscription(), identifier
         )
-        XCTAssertTrue(await services.containsSubscription(identifier))
+        let containsSubscription = await services.containsSubscription(identifier)
+        XCTAssertTrue(containsSubscription)
         let saveCount = await services.saveCount
         let deleteCount = await services.deleteCount
         XCTAssertEqual(saveCount, 2)
