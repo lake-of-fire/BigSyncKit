@@ -1,0 +1,48 @@
+name: Apply main explicit-port recovery
+
+on:
+  push:
+    branches:
+      - fix/main-explicit-port-poisoned-recovery-20260913
+    paths:
+      - .github/apply-main-explicit-port-recovery.py
+      - .github/workflows/apply-main-explicit-port-recovery.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-qualify:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Apply exact-preimage patch
+        run: python3 .github/apply-main-explicit-port-recovery.py
+      - name: Verify bounded diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          mapfile -t changed < <(git diff --name-only)
+          printf '%s\n' "${changed[@]}"
+          test "${#changed[@]}" -eq 2
+          test "${changed[0]}" = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift"
+          test "${changed[1]}" = "Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift"
+      - name: Run focused account-fencing suite
+        run: swift test --filter CloudKitSynchronizerAccountFencingTests
+      - name: Run full package suite
+        run: swift test
+      - name: Publish source-only postimage
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/apply-main-explicit-port-recovery.py
+          rm .github/workflows/apply-main-explicit-port-recovery.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix explicit account port recovery on poisoned authority"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
