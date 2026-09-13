@@ -13,16 +13,33 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.sha }}
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
       - name: Apply reviewed source changes
+        working-directory: BigSyncKit
         run: python3 .github/run-authority-poison-followup.py
       - name: Focused account and subscription qualification
+        working-directory: BigSyncKit
         run: |
           swift test --filter CloudKitSynchronizerAccountFencingTests
           swift test --filter SubscriptionIntentOrderingTests
           swift test --filter HotfixSubscriptionSafetyTests
       - name: Full package suite
+        working-directory: BigSyncKit
         run: swift test
       - name: Commit qualified source and remove temporary tooling
+        working-directory: BigSyncKit
         run: |
           rm .github/apply-authority-poison-followup.py
           rm .github/run-authority-poison-followup.py
