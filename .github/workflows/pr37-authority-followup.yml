@@ -14,7 +14,21 @@ jobs:
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
       - name: Apply reviewed authority follow-up
+        working-directory: BigSyncKit
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -29,8 +43,10 @@ jobs:
           python3 Scripts/pr37_authority_followup.py
           git diff --check
       - name: Run account fencing suite
+        working-directory: BigSyncKit
         run: swift test --filter CloudKitSynchronizerAccountFencingTests
       - name: Commit qualified follow-up
+        working-directory: BigSyncKit
         run: |
           rm .github/workflows/pr37-authority-followup.yml
           rm Scripts/pr37_authority_followup.py
