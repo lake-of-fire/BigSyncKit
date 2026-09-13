@@ -1,0 +1,82 @@
+name: RA-1 selected BigSync 704f package qualification
+on:
+  push:
+    branches: [codex/ra1-final-selected-package-704f-20260913]
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/BigSyncKit
+          ref: 704f6165e841ff8ab2c683c0dea3de14da710683
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Capture exact identity
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ra1-selected-bigsync-704f"
+          git -C BigSyncKit rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-selected-bigsync-704f/identity.txt"
+          git -C RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-selected-bigsync-704f/realm-swift-gaps.txt"
+          git -C SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-selected-bigsync-704f/swift-utilities.txt"
+          swift --version | tee "$RUNNER_TEMP/ra1-selected-bigsync-704f/toolchain.txt"
+      - name: Focused collection safety
+        working-directory: BigSyncKit
+        run: |
+          set +e
+          set -o pipefail
+          swift test --filter 'HotfixCollectionSafetyTests' 2>&1 | tee "$RUNNER_TEMP/ra1-selected-bigsync-704f/collection.log"
+          echo ${PIPESTATUS[0]} > "$RUNNER_TEMP/ra1-selected-bigsync-704f/collection.exit"
+          exit 0
+      - name: Focused subscription safety
+        working-directory: BigSyncKit
+        run: |
+          set +e
+          set -o pipefail
+          swift test --filter 'HotfixSubscriptionSafetyTests' 2>&1 | tee "$RUNNER_TEMP/ra1-selected-bigsync-704f/subscription.log"
+          echo ${PIPESTATUS[0]} > "$RUNNER_TEMP/ra1-selected-bigsync-704f/subscription.exit"
+          exit 0
+      - name: Full package
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        run: |
+          set +e
+          set -o pipefail
+          swift test 2>&1 | tee "$RUNNER_TEMP/ra1-selected-bigsync-704f/full.log"
+          echo ${PIPESTATUS[0]} > "$RUNNER_TEMP/ra1-selected-bigsync-704f/full.exit"
+          exit 0
+      - name: Verify exits and exact clean source
+        run: |
+          set -euo pipefail
+          test "$(cat "$RUNNER_TEMP/ra1-selected-bigsync-704f/collection.exit")" = 0
+          test "$(cat "$RUNNER_TEMP/ra1-selected-bigsync-704f/subscription.exit")" = 0
+          test "$(cat "$RUNNER_TEMP/ra1-selected-bigsync-704f/full.exit")" = 0
+          test "$(git -C BigSyncKit rev-parse HEAD)" = 704f6165e841ff8ab2c683c0dea3de14da710683
+          git -C BigSyncKit diff --exit-code
+          test -z "$(git -C BigSyncKit status --porcelain)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ra1-selected-bigsync-704f6165
+          path: ${{ runner.temp }}/ra1-selected-bigsync-704f/
+          retention-days: 7
+          if-no-files-found: error
