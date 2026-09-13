@@ -140,23 +140,29 @@ public extension CloudKitSynchronizer {
     func subscribeForChangesInDatabase() async throws {
         try Task.checkCancellation()
         let expectedSubscriptionID = ownedSubscriptionID(kind: "database")
-        if let storedSubscriptionID = subscriptionIDForDatabaseSubscription() {
-            guard storedSubscriptionID == expectedSubscriptionID else {
-                // Do not perpetuate an older arbitrary ID: it may have been
-                // adopted from another CloudKit client by pre-v2 code.
-                try persistDatabaseSubscriptionID(nil)
-                return try await subscribeForChangesInDatabase()
-            }
-            return
-        }
         let accountFence = try await makeSubscriptionAccountFence()
+        if let storedSubscriptionID = subscriptionIDForDatabaseSubscription(),
+           storedSubscriptionID != expectedSubscriptionID {
+            // Do not perpetuate an older arbitrary ID: it may have been
+            // adopted from another CloudKit client by pre-v2 code. Local
+            // metadata is not proof that any server subscription still exists.
+            try persistDatabaseSubscriptionID(nil)
+        }
         let existing = try await subscriptionStore.subscription(
             withID: expectedSubscriptionID
         )
         try await revalidateSubscriptionAccountFence(accountFence)
-        if let existing = existing as? CKDatabaseSubscription {
-            try persistDatabaseSubscriptionID(existing.subscriptionID)
-            return
+        if let existing {
+            guard existing is CKDatabaseSubscription else {
+                // A deterministic ID resolving to an incompatible server type
+                // is not safe to overwrite or adopt as our registration.
+                try persistDatabaseSubscriptionID(nil)
+                throw CocoaError(.coderValueNotFound)
+            }
+            if existing.notificationInfo?.shouldSendContentAvailable == true {
+                try persistDatabaseSubscriptionID(existing.subscriptionID)
+                return
+            }
         }
 
         let subscription = CKDatabaseSubscription(
@@ -167,7 +173,9 @@ public extension CloudKitSynchronizer {
         subscription.notificationInfo = notificationInfo
         let saved = try await subscriptionStore.save(subscription: subscription)
         try await revalidateSubscriptionAccountFence(accountFence)
-        guard saved.subscriptionID == expectedSubscriptionID else {
+        guard saved.subscriptionID == expectedSubscriptionID,
+              saved is CKDatabaseSubscription,
+              saved.notificationInfo?.shouldSendContentAvailable == true else {
             throw CocoaError(.coderValueNotFound)
         }
         try persistDatabaseSubscriptionID(expectedSubscriptionID)
@@ -200,25 +208,27 @@ public extension CloudKitSynchronizer {
             kind: "zone",
             zoneID: zoneID
         )
-        if let storedSubscriptionID = subscriptionID(forRecordZoneID: zoneID) {
-            guard storedSubscriptionID == expectedSubscriptionID else {
-                // See the database-subscription equivalent above. Clear only
-                // local metadata; an unknown server subscription is not ours
-                // to delete.
-                try persistSubscriptionID(nil, for: zoneID)
-                return try await subscribeForChanges(in: zoneID)
-            }
-            return
-        }
         let accountFence = try await makeSubscriptionAccountFence()
+        if let storedSubscriptionID = subscriptionID(forRecordZoneID: zoneID),
+           storedSubscriptionID != expectedSubscriptionID {
+            // See the database-subscription equivalent above. Clear only local
+            // metadata; an unknown server subscription is not ours to delete.
+            try persistSubscriptionID(nil, for: zoneID)
+        }
         let existing = try await subscriptionStore.subscription(
             withID: expectedSubscriptionID
         )
         try await revalidateSubscriptionAccountFence(accountFence)
-        if let existing = existing as? CKRecordZoneSubscription,
-           existing.zoneID == zoneID {
-            try persistSubscriptionID(existing.subscriptionID, for: zoneID)
-            return
+        if let existing {
+            guard let zoneSubscription = existing as? CKRecordZoneSubscription,
+                  zoneSubscription.zoneID == zoneID else {
+                try persistSubscriptionID(nil, for: zoneID)
+                throw CocoaError(.coderValueNotFound)
+            }
+            if zoneSubscription.notificationInfo?.shouldSendContentAvailable == true {
+                try persistSubscriptionID(zoneSubscription.subscriptionID, for: zoneID)
+                return
+            }
         }
 
         let subscription = CKRecordZoneSubscription(
@@ -230,7 +240,10 @@ public extension CloudKitSynchronizer {
         subscription.notificationInfo = notificationInfo
         let saved = try await subscriptionStore.save(subscription: subscription)
         try await revalidateSubscriptionAccountFence(accountFence)
-        guard saved.subscriptionID == expectedSubscriptionID else {
+        guard let saved = saved as? CKRecordZoneSubscription,
+              saved.subscriptionID == expectedSubscriptionID,
+              saved.zoneID == zoneID,
+              saved.notificationInfo?.shouldSendContentAvailable == true else {
             throw CocoaError(.coderValueNotFound)
         }
         try persistSubscriptionID(expectedSubscriptionID, for: zoneID)
