@@ -39,6 +39,17 @@ jobs:
           set -euo pipefail
           test "$(git -C ../RealmSwiftGaps rev-parse HEAD)" = "2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2"
           test "$(git -C ../SwiftUtilities rev-parse HEAD)" = "f437c7d06fc631cd7a67731279411c417cdf8077"
+      - name: Run unmodified-main full package baseline
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set +e
+          swift test > /tmp/bigsync-baseline.log 2>&1
+          status=$?
+          echo "BASELINE_FULL_STATUS=${status}" >> "$GITHUB_ENV"
+          echo "baseline full-package exit: ${status}"
+          tail -120 /tmp/bigsync-baseline.log || true
+          exit 0
       - name: Apply exact-preimage patch
         working-directory: BigSyncKit
         shell: bash
@@ -70,9 +81,67 @@ jobs:
       - name: Run focused account-fencing suite
         working-directory: BigSyncKit
         run: swift test --filter CloudKitSynchronizerAccountFencingTests
-      - name: Run full package suite
+      - name: Run patched full package suite and retain diagnostics
         working-directory: BigSyncKit
-        run: swift test
+        shell: bash
+        run: |
+          set +e
+          swift test > /tmp/bigsync-patched.log 2>&1
+          patched_status=$?
+          echo "patched full-package exit: ${patched_status}"
+          tail -120 /tmp/bigsync-patched.log || true
+          if [ "$patched_status" -ne 0 ]; then
+            mkdir -p .github/qualification
+            python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          baseline = Path('/tmp/bigsync-baseline.log').read_text(errors='replace').splitlines()
+          patched = Path('/tmp/bigsync-patched.log').read_text(errors='replace').splitlines()
+          pattern = re.compile(r'(fail|error:|XCTAssert|unexpected|fatal|signal|crash|timeout)', re.I)
+
+          def relevant(lines):
+              hits = [line for line in lines if pattern.search(line)]
+              tail = lines[-120:]
+              combined = []
+              seen = set()
+              for line in hits[-160:] + tail:
+                  if line not in seen:
+                      seen.add(line)
+                      combined.append(line)
+              return combined
+
+          text = [
+              '# Explicit-port mainline full-suite diagnostic',
+              '',
+              f'baseline_status: {os.environ.get("BASELINE_FULL_STATUS", "unknown")}',
+              f'patched_status: {os.environ.get("patched_status", "not-exported")}',
+              '',
+              '## Baseline relevant/tail',
+              *relevant(baseline),
+              '',
+              '## Patched relevant/tail',
+              *relevant(patched),
+              '',
+          ]
+          Path('.github/qualification/main-explicit-port-recovery-full-suite.txt').write_text('\n'.join(text) + '\n')
+          PY
+            # Fix the patched status field after Python without depending on shell export semantics.
+            python3 - "$patched_status" <<'PY'
+          import sys
+          from pathlib import Path
+          path = Path('.github/qualification/main-explicit-port-recovery-full-suite.txt')
+          text = path.read_text().replace('patched_status: not-exported', f'patched_status: {sys.argv[1]}')
+          path.write_text(text)
+          PY
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/qualification/main-explicit-port-recovery-full-suite.txt
+            git commit -m "Record explicit-port full-suite diagnostic"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            exit "$patched_status"
+          fi
       - name: Publish source-only postimage
         working-directory: BigSyncKit
         shell: bash
