@@ -1,0 +1,35 @@
+name: RA1 account authority port
+
+on:
+  push:
+    branches:
+      - scratch/ra1-account-authority-port-20260913
+
+permissions:
+  contents: write
+
+jobs:
+  port:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6d5acf7f775ec09791185c969ce72f795536f898
+          fetch-depth: 0
+      - name: Apply final reviewed mainline patch with three-way fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --no-tags
+          curl -L --fail --retry 3 https://github.com/lake-of-fire/BigSyncKit/pull/37.diff -o /tmp/pr37.diff
+          git apply --3way --index /tmp/pr37.diff
+          git diff --cached --check
+          test "$(git diff --cached --name-only)" = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift"
+      - name: Commit bounded RA-1 port
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "fix: fence RA-1 account validation authority generation"
+          git push origin HEAD:refs/heads/fix/ra1-account-validation-authority-20260913 --force-with-lease
