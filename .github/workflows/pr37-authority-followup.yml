@@ -16,6 +16,16 @@ jobs:
           fetch-depth: 0
       - name: Apply reviewed authority follow-up
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Scripts/pr37_authority_followup.py')
+          text = path.read_text()
+          old = """source = replace_once(\n    source,\n    '''        activeRunContext = nil\\n        activeReceiptAuthorizationID = nil\\n        reservedReceiptAuthorizationID = nil\\n''',\n    '''        activeRunContext = nil\\n        activeAccountValidationAuthority = nil\\n        activeReceiptAuthorizationID = nil\\n        reservedReceiptAuthorizationID = nil\\n''',\n    'cancel clears validation authority'\n)"""
+          new = """source = replace_once(\n    source,\n    '''        synchronizationAttemptID = UUID()\\n        cancelAttemptCallbacks(for: cancelledAttemptID)\\n        activeRunContext = nil\\n        activeReceiptAuthorizationID = nil\\n        reservedReceiptAuthorizationID = nil\\n''',\n    '''        synchronizationAttemptID = UUID()\\n        cancelAttemptCallbacks(for: cancelledAttemptID)\\n        activeRunContext = nil\\n        activeAccountValidationAuthority = nil\\n        activeReceiptAuthorizationID = nil\\n        reservedReceiptAuthorizationID = nil\\n''',\n    'cancel clears validation authority'\n)"""
+          if text.count(old) != 1:
+              raise SystemExit(f'cleanup script target count: {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
           python3 Scripts/pr37_authority_followup.py
           git diff --check
       - name: Run account fencing suite
