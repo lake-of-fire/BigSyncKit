@@ -44,6 +44,23 @@ new = '''                recordZoneID: adapter.recordZoneID
 replace_once(path, old, new)
 
 path = 'Tests/BigSyncKitTests/BigSyncKitTests.swift'
+old = '''    var recordsToUploadHandler: (@Sendable () async throws -> Void)?
+    var terminalPendingChanges = false'''
+new = '''    var recordsToUploadHandler: (@Sendable () async throws -> Void)?
+    @BigSyncBackgroundActor var didDeleteHandler:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var terminalPendingChanges = false'''
+replace_once(path, old, new)
+
+old = '''        let recordNames = recordIDs.map { $0.recordName }.joined(separator: ",")
+        events.append("didDelete:\(recordNames)")
+        if repeatsPreparedDeletions {'''
+new = '''        let recordNames = recordIDs.map { $0.recordName }.joined(separator: ",")
+        events.append("didDelete:\(recordNames)")
+        try await didDeleteHandler?()
+        if repeatsPreparedDeletions {'''
+replace_once(path, old, new)
+
 anchor = '''    @BigSyncBackgroundActor
     private func makeSynchronizer(
 '''
@@ -75,6 +92,37 @@ addition = '''    @BigSyncBackgroundActor
         XCTAssertThrowsError(try synchronizer.currentOutboundPrincipal(for: context)) {
             XCTAssertEqual($0 as? BigSyncOutboundQuiescenceError, .staleAuthority)
         }
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionAcknowledgementCreatedDeletionDrainsInSameAdapterPass() async throws {
+        let database = FakeCloudKitDatabase()
+        let zoneID = CKRecordZone.ID(
+            zoneName: "ack-created-deletion-zone",
+            ownerName: CKCurrentUserDefaultName
+        )
+        let first = CKRecord.ID(recordName: "Bookmark.first", zoneID: zoneID)
+        let second = CKRecord.ID(recordName: "Bookmark.second", zoneID: zoneID)
+        let adapter = FakeModelAdapter(
+            zoneID: zoneID,
+            priorities: [],
+            deletedByEntity: ["Bookmark": [first]]
+        )
+        adapter.didDeleteHandler = {
+            adapter.didDeleteHandler = nil
+            adapter.deletedByEntity["Bookmark", default: []].append(second)
+        }
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(adapter)
+
+        try await synchronizeAdapterWithOutboundAuthority(synchronizer, adapter)
+
+        XCTAssertEqual(database.modifyRecordsOperationCount, 2)
+        XCTAssertEqual(
+            adapter.events.filter { $0.hasPrefix("didDelete:") },
+            ["didDelete:Bookmark.first", "didDelete:Bookmark.second"]
+        )
+        XCTAssertFalse(adapter.hasChanges)
     }
 
 '''
@@ -118,6 +166,19 @@ new = '''            // A successful acknowledgement can forward a newer target 
             // record batch and returns immediately to its owning phase.
             guard handledFailures > 0
                     || records.count >= requestedBatchSize
+                    || adapter.hasChanges else { return }
+            await Task.yield()
+'''
+replace_once(path, old, new)
+old = '''            guard handledFailures > 0 || recordIDs.count >= requestedBatchSize else { return }
+            await Task.yield()
+'''
+new = '''            // Deletion acknowledgement has the same journal-forwarding
+            // semantics as upload acknowledgement. If it exposes a newer
+            // deletion generation, consume it in this owned deletion drain
+            // instead of deferring it solely because the prior batch was short.
+            guard handledFailures > 0
+                    || recordIDs.count >= requestedBatchSize
                     || adapter.hasChanges else { return }
             await Task.yield()
 '''
