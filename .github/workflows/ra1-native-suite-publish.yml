@@ -1,0 +1,68 @@
+name: RA1 native suite clean publish
+
+on:
+  push:
+    branches:
+      - codex/ra1-native-suite-closure-20260912
+    paths:
+      - .github/workflows/ra1-native-suite-publish.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-15
+    steps:
+      - name: Checkout qualification tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: tools
+          fetch-depth: 1
+
+      - name: Checkout exact qualified source base
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: b1cde24b2e22e68a5cd056b865bc53f7fd491e2a
+          path: source
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reconstruct exact qualified patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          python3 ../tools/Scripts/ra1_native_suite_closure_patch.py
+          git diff --check
+          git diff --binary > ../source.patch
+          printf '%s  %s\n' 'cb00f0b57ef6b3bd6c29cdac92933e7f62c1443616af334ab4a7459d7b41bacf' '../source.patch' | shasum -a 256 -c -
+          git diff --name-only | sort > ../changed.txt
+          cat > ../expected.txt <<'EOF'
+          Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift
+          Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          Tests/BigSyncKitTests/BigSyncKitTests.swift
+          Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift
+          EOF
+          sort -o ../expected.txt ../expected.txt
+          diff -u ../expected.txt ../changed.txt
+          test "$(git rev-parse HEAD)" = 'b1cde24b2e22e68a5cd056b865bc53f7fd491e2a'
+
+      - name: Commit and push clean continuation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c codex/ra1-native-suite-closure-clean-20260913
+          git add -- \
+            Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift \
+            Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift \
+            Tests/BigSyncKitTests/BigSyncKitTests.swift \
+            Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift
+          test "$(git diff --cached --name-only | wc -l | tr -d ' ')" = '4'
+          git commit -m 'Close native suite authority fixture and mutation tails' \
+            -m 'Exact source.patch qualified by run 34728610055: 682 tests, 0 failures. Rebound DEBUG namespace retains real authority evidence; successful acknowledgement-created upload/deletion generations remain in the owned drain. Durable longLivedOperationID/client-token recovery is unchanged.'
+          git push origin HEAD:refs/heads/codex/ra1-native-suite-closure-clean-20260913
+          git rev-parse HEAD
