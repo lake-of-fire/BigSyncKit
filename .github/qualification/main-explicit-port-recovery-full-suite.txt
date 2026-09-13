@@ -1,0 +1,440 @@
+# Explicit-port mainline full-suite diagnostic
+
+baseline_status: 1
+patched_status: 1
+
+## Baseline relevant/tail
+Test Case '-[BigSyncKitTests.BigSyncKitTests testClosureMigrationFailureCannotForwardJournalBeforePreparation]' started.
+2026-09-13T21:41:32+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.BigSyncKitTests testClosureMigrationFailureCannotForwardJournalBeforePreparation]' passed (0.058 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testCloudKitAccountAvailabilityGateDefersUnavailableAndFailedStatuses]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testCloudKitAccountAvailabilityGateDefersUnavailableAndFailedStatuses]' passed (0.000 seconds).
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:7954: error: -[BigSyncKitTests.BigSyncKitTests testDatabaseSubscriptionIsSavedExactlyOnce] : XCTAssertEqual failed: ("2") is not equal to ("1")
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDatabaseSubscriptionIsSavedExactlyOnce]' failed (0.005 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDisposableClientRetainsAuthorizationAfterTransientZoneFailure]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDisposableClientRetainsAuthorizationAfterTransientZoneFailure]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDurableAccountCommitFailureStopsBeforeCloudKitTransport]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDurableAccountCommitFailureStopsBeforeCloudKitTransport]' passed (0.005 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testEncryptedResetRecordMutationFailuresResumeAndReuploadDurableJournal]' started.
+2026-09-13T21:41:33+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.BigSyncKitTests testEncryptedResetRecordMutationFailuresResumeAndReuploadDurableJournal]' passed (0.127 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testEncryptedResetZoneFetchFailureResumesAndReuploadsDurableJournal]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testEncryptedResetZoneFetchFailureResumesAndReuploadsDurableJournal]' passed (0.052 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFailedAccountPreflightSchedulesADeferredRetry]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFailedAccountPreflightSchedulesADeferredRetry]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreAtomicFailurePreservesOldSnapshotAndCleansTemporaryFile]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreAtomicFailurePreservesOldSnapshotAndCleansTemporaryFile]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreExternalRepairDoesNotMaskFailedMutation]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreExternalRepairDoesNotMaskFailedMutation]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreFailsClosedForMalformedExistingPlist]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreFailsClosedForMalformedExistingPlist]' passed (0.001 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStorePrepareForUseCannotEraseFailedMutation]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStorePrepareForUseCannotEraseFailedMutation]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreSurfacesWriteFailureInsteadOfOnlyAsserting]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreSurfacesWriteFailureInsteadOfOnlyAsserting]' passed (0.006 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInboundPageCursorAndCrashRecoveryIdentitiesCommitTogether]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInboundPageCursorAndCrashRecoveryIdentitiesCommitTogether]' passed (0.022 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInboundSemanticFailureIsQuarantinedWithoutBlockingValidRecord]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInboundSemanticFailureIsQuarantinedWithoutBlockingValidRecord]' passed (0.025 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInitialSetupFailureRemainsRetryable]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInitialSetupFailureRemainsRetryable]' passed (0.010 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInterruptedDurableOperationDoesNotRetryOtherFailures]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInterruptedDurableOperationDoesNotRetryOtherFailures]' passed (0.000 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testLocalWorkForwardedDuringTerminalFailureStartsOneTailDrain]' started.
+2026-09-13T21:41:34+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.BigSyncKitTests testLocalWorkForwardedDuringTerminalFailureStartsOneTailDrain]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedChangeFeedPageFailsBeforeAdapterMutation]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedChangeFeedPageFailsBeforeAdapterMutation]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedInboundDeletionPrimaryKeyFailsWithoutPublishingTrackingState]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedInboundDeletionPrimaryKeyFailsWithoutPublishingTrackingState]' passed (0.015 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedInboundRecordIdentifierFailsWithoutPublishingTrackingState]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedInboundRecordIdentifierFailsWithoutPublishingTrackingState]' passed (0.014 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMixedDeletePartialFailureAcknowledgesOnlySuccessfulGeneration]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMixedDeletePartialFailureAcknowledgesOnlySuccessfulGeneration]' passed (0.036 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMixedPartialUploadFailureDoesNotDiscardTheUnresolvedError]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMixedPartialUploadFailureDoesNotDiscardTheUnresolvedError]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testNormalRedeliveryRepairsSystemFieldsAfterImportedPersistenceFailure]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testNormalRedeliveryRepairsSystemFieldsAfterImportedPersistenceFailure]' passed (0.021 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testOpaqueDeletionBatchValidatesFullIDAndFailsClosed]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testOpaqueDeletionBatchValidatesFullIDAndFailsClosed]' passed (0.030 seconds).
+2026-09-13T21:41:35+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.BigSyncKitTests testPostCleanupJournalForwardingFailureWithholdsReceipt]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testPostCleanupJournalForwardingFailureWithholdsReceipt]' passed (0.004 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testPreSetupCacheResetPropagatesTrackingRealmOpenFailure]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testPreSetupCacheResetPropagatesTrackingRealmOpenFailure]' passed (0.009 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testProcessKillCheckpointFailureCannotPublishSuccess]' started.
+2026-09-13T21:41:35+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Uploading 1 records to <CKRecordZoneID: 0x600001235da0; zoneName=process-kill-failure, ownerName=__defaultOwner__>
+Test Case '-[BigSyncKitTests.BigSyncKitTests testProcessKillCheckpointFailureCannotPublishSuccess]' passed (0.004 seconds).
+2026-09-13T21:41:36+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+2026-09-13T21:41:36+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Error: Error Domain=CKErrorDomain Code=2 "(null)" UserInfo={CKPartialErrors={
+2026-09-13T21:41:37+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+2026-09-13T21:41:37+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Error: inboundBoundaryChanged
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewFailedOperationsRevalidateUnannouncedAccountChange]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewFailedOperationsRevalidateUnannouncedAccountChange]' passed (0.013 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewForeignErrorCodeAndMixedFatalDoNotBecomeSizeRetry]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewForeignErrorCodeAndMixedFatalDoNotBecomeSizeRetry]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateDatabaseFailureCannotFenceEitherScope]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateDatabaseFailureCannotFenceEitherScope]' passed (0.007 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateZoneFailureCannotFenceEitherScope]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateZoneFailureCannotFenceEitherScope]' passed (0.005 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateZoneSaveFailureCannotFenceEitherScope]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateZoneSaveFailureCannotFenceEitherScope]' passed (0.005 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSaveTokenWaitsForCompletedRealmSetupAndPropagatesFailure]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSaveTokenWaitsForCompletedRealmSetupAndPropagatesFailure]' passed (0.014 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSetupRetiresTrackingForNewlyExcludedTypeAndFailsClosed]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSetupRetiresTrackingForNewlyExcludedTypeAndFailsClosed]' passed (0.019 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier]' started.
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:7990: error: -[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier] : failed - Expected subscription deletion failure
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:7996: error: -[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier] : XCTAssertEqual failed: ("nil") is not equal to ("Optional("BigSyncKit.v2.database.0d785a8c1ad4a62ecf7de6ca4995bb0d6e97cffa68951df4852e489bcbab0f24")")
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:8000: error: -[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier] : XCTAssertEqual failed: ("[]") is not equal to ("["BigSyncKit.v2.database.0d785a8c1ad4a62ecf7de6ca4995bb0d6e97cffa68951df4852e489bcbab0f24"]")
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier]' failed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSubscriptionSaveFailureDoesNotPublishLocalIdentifier]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSubscriptionSaveFailureDoesNotPublishLocalIdentifier]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testTerminalForwardingFailureWithholdsSynchronizationReceipt]' started.
+2026-09-13T21:41:38+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+2026-09-13T21:41:38+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failed final import forwarding: terminalForwardingFailed
+Test Case '-[BigSyncKitTests.BigSyncKitTests testTerminalForwardingFailureWithholdsSynchronizationReceipt]' passed (0.007 seconds).
+2026-09-13T21:41:38+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Quarantined unauthorized deletion of BigSyncSemanticallyValidatedObject record BigSyncSemanticallyValidatedObject.crash-prefix-subject: rejected
+2026-09-13T21:41:38+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Preserved immutable target while importing server metadata: BigSyncSemanticallyValidatedObject.crash-prefix-subject
+Test Suite 'BigSyncKitTests' failed at 2026-09-13 21:41:38.809.
+	 Executed 309 tests, with 7 failures (0 unexpected) in 7.813 (7.828) seconds
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.098 (0.098) seconds
+Test Case '-[BigSyncKitTests.CloudKitAccountAvailabilityGateTests testAvailabilityGateReturnsFailedAtItsHardDeadline]' started.
+Test Case '-[BigSyncKitTests.CloudKitAccountAvailabilityGateTests testAvailabilityGateReturnsFailedAtItsHardDeadline]' passed (0.002 seconds).
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.012 (0.012) seconds
+	 Executed 1 test, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testAccountChangeInvalidationFailurePreventsCloudKitAndRetries]' started.
+2026-09-13T21:41:38+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failed to invalidate account-scoped authority: rejected
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testAccountChangeInvalidationFailurePreventsCloudKitAndRetries]' passed (0.014 seconds).
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testAccountReplacementInvalidationFailureDoesNotPublishAndRetries]' started.
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testAccountReplacementInvalidationFailureDoesNotPublishAndRetries]' passed (0.004 seconds).
+2026-09-13T21:41:39+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testExplicitDatasetPortFailsClosedWithoutAdmissionHandler]' started.
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testExplicitDatasetPortFailsClosedWithoutAdmissionHandler]' passed (0.002 seconds).
+	 Executed 49 tests, with 0 failures (0 unexpected) in 0.366 (0.368) seconds
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.010 (0.010) seconds
+	 Executed 9 tests, with 0 failures (0 unexpected) in 0.208 (0.209) seconds
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.058 (0.058) seconds
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/HotfixSubscriptionSafetyTests.swift:427: error: -[BigSyncKitTests.HotfixSubscriptionSafetyTests testLifecycleCancellationDuringDeletionRetainsRetryMetadata] : XCTAssertEqual failed: ("["BigSyncKit.v2.database.ed58c57ca28b848b914dae1a688bceaf4bf651d1437a1ac784c5ced244ff349a"]") is not equal to ("["BigSyncKit.v2.database.ed58c57ca28b848b914dae1a688bceaf4bf651d1437a1ac784c5ced244ff349a", "BigSyncKit.v2.database.ed58c57ca28b848b914dae1a688bceaf4bf651d1437a1ac784c5ced244ff349a"]")
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testLifecycleCancellationDuringDeletionRetainsRetryMetadata]' failed (0.003 seconds).
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testNetworkFailureRetainsCachedSubscription]' started.
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testNetworkFailureRetainsCachedSubscription]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testUnrelatedPartialFailureRetainsCachedSubscription]' started.
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testUnrelatedPartialFailureRetainsCachedSubscription]' passed (0.002 seconds).
+Test Suite 'HotfixSubscriptionSafetyTests' failed at 2026-09-13 21:41:39.601.
+	 Executed 13 tests, with 1 failure (0 unexpected) in 0.035 (0.035) seconds
+Test Case '-[BigSyncKitTests.ModelAdapterDeletionConflictSafetyTests testDefaultDeletionConflictRebaseFailsWithoutMutatingLocalTombstone]' started.
+Test Case '-[BigSyncKitTests.ModelAdapterDeletionConflictSafetyTests testDefaultDeletionConflictRebaseFailsWithoutMutatingLocalTombstone]' passed (0.000 seconds).
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.010 (0.010) seconds
+	 Executed 6 tests, with 0 failures (0 unexpected) in 0.015 (0.015) seconds
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.469 (0.470) seconds
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.005 (0.006) seconds
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewUnsupportedObjectMapFailsWithoutAcknowledgingJournal]' started.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewUnsupportedObjectMapFailsWithoutAcknowledgingJournal]' passed (0.017 seconds).
+	 Executed 11 tests, with 0 failures (0 unexpected) in 0.303 (0.303) seconds
+Test Suite 'BigSyncKitPackageTests.xctest' failed at 2026-09-13 21:41:40.405.
+	 Executed 460 tests, with 1 test skipped and 8 failures (0 unexpected) in 9.672 (9.694) seconds
+Test Suite 'All tests' failed at 2026-09-13 21:41:40.405.
+	 Executed 460 tests, with 1 test skipped and 8 failures (0 unexpected) in 9.672 (9.697) seconds
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedDatabaseIDRejectsIncompatibleServerSubscription]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedIDStillHonorsLifecycleAttemptFence]' started.
+2026-09-13T21:41:39+0000 info SubscriptionCacheRevalidationTests: [BigSyncKit] QSCloudKitSynchronizer >> Cancelling synchronization...
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedIDStillHonorsLifecycleAttemptFence]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedZoneIDRecreatesMissingServerSubscription]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedZoneIDRecreatesMissingServerSubscription]' passed (0.003 seconds).
+Test Suite 'SubscriptionCacheRevalidationTests' passed at 2026-09-13 21:41:39.611.
+Test Suite 'SubscriptionCancellationOwnershipTests' started at 2026-09-13 21:41:39.611.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedDatabaseIDCannotDeleteIncompatibleServerObject]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedDatabaseIDCannotDeleteIncompatibleServerObject]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedDatabaseIDClearsWhenServerObjectIsAlreadyAbsent]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedDatabaseIDClearsWhenServerObjectIsAlreadyAbsent]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedZoneIDCannotDeleteDifferentZoneObject]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedZoneIDCannotDeleteDifferentZoneObject]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedZoneIDClearsWhenServerObjectIsAlreadyAbsent]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedZoneIDClearsWhenServerObjectIsAlreadyAbsent]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testOwnedDatabaseSubscriptionStillDeletesNormally]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testOwnedDatabaseSubscriptionStillDeletesNormally]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testOwnedZoneSubscriptionStillDeletesNormally]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testOwnedZoneSubscriptionStillDeletesNormally]' passed (0.003 seconds).
+Test Suite 'SubscriptionCancellationOwnershipTests' passed at 2026-09-13 21:41:39.627.
+Test Suite 'SubscriptionIntentOrderingTests' started at 2026-09-13 21:41:39.627.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely]' started.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely]' passed (0.113 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely]' started.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely]' passed (0.130 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterZoneCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely]' started.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterZoneCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely]' passed (0.117 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterZoneSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely]' started.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterZoneSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely]' passed (0.107 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testQueuedCallbackIntentCannotReopenAfterLifecycleAttemptRotation]' started.
+2026-09-13T21:41:40+0000 info SubscriptionIntentOrderingTests: [BigSyncKit] QSCloudKitSynchronizer >> Cancelling synchronization...
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testQueuedCallbackIntentCannotReopenAfterLifecycleAttemptRotation]' passed (0.003 seconds).
+Test Suite 'SubscriptionIntentOrderingTests' passed at 2026-09-13 21:41:40.096.
+Test Suite 'SyncStatusViewModelTests' started at 2026-09-13 21:41:40.096.
+Test Case '-[BigSyncKitTests.SyncStatusViewModelTests testHealthNotificationPayloadIsOnlyAWakeup]' started.
+Test Case '-[BigSyncKitTests.SyncStatusViewModelTests testHealthNotificationPayloadIsOnlyAWakeup]' passed (0.001 seconds).
+Test Case '-[BigSyncKitTests.SyncStatusViewModelTests testOlderHealthReloadCannotOverwriteNewerResult]' started.
+Test Case '-[BigSyncKitTests.SyncStatusViewModelTests testOlderHealthReloadCannotOverwriteNewerResult]' passed (0.005 seconds).
+Test Suite 'SyncStatusViewModelTests' passed at 2026-09-13 21:41:40.102.
+Test Suite 'WorkerReviewReconciliationTests' started at 2026-09-13 21:41:40.102.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewAutomaticLocalWinnerPreservesConflictClockAndLaterRemoteEditWins]' started.
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Setup synchronization...
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver automatic-local-winner – local explicitly modified=2001-01-01 00:33:20 +0000, remote explicitly modified=2001-01-01 00:16:40 +0000 => accepted remote: false
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Rejecting remote changes with lower explicitlyModifiedAt: WorkerReviewReceiver automatic-local-winner – local explicitly modified=Optional(2001-01-01 00:33:20 +0000), remote explicitly modified=Optional(2001-01-01 00:16:40 +0000), syncedEntityState=4
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Persisted 1 downloaded records
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver automatic-local-winner – local explicitly modified=2001-01-01 00:33:20 +0000, remote explicitly modified=2001-01-01 00:50:00 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewAutomaticLocalWinnerPreservesConflictClockAndLaterRemoteEditWins]' passed (0.039 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewExistingNewerLocalAuthorityControl]' started.
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver existing – local explicitly modified=2001-01-01 00:50:00 +0000, remote explicitly modified=2001-01-01 00:16:40 +0000 => accepted remote: false
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Rejecting remote changes with lower explicitlyModifiedAt: WorkerReviewReceiver existing – local explicitly modified=Optional(2001-01-01 00:50:00 +0000), remote explicitly modified=Optional(2001-01-01 00:16:40 +0000), syncedEntityState=4
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewExistingNewerLocalAuthorityControl]' passed (0.022 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewFirstImportWithExplicitTimestampControl]' started.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewFirstImportWithExplicitTimestampControl]' passed (0.021 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewFirstImportWithoutExplicitTimestampMustNotInventLocalAuthority]' started.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewFirstImportWithoutExplicitTimestampMustNotInventLocalAuthority]' passed (0.055 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewMalformedNonNilUUIDStillRejectedControl]' started.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewMalformedNonNilUUIDStillRejectedControl]' passed (0.016 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewNilReplayAndAbsentRequiredUUIDPreserveCompatibility]' started.
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver nil-replay – local explicitly modified=0001-01-01 00:00:00 +0000, remote explicitly modified=0001-01-01 00:00:00 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewNilReplayAndAbsentRequiredUUIDPreserveCompatibility]' passed (0.024 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewOptionalUUIDClearMustConvergeAndStayClearedOnLaterUpload]' started.
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver clear – local explicitly modified=2001-01-01 00:16:40 +0000, remote explicitly modified=2001-01-01 00:33:20 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewOptionalUUIDClearMustConvergeAndStayClearedOnLaterUpload]' passed (0.024 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewOptionalUUIDReplacementControl]' started.
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver replace – local explicitly modified=2001-01-01 00:16:40 +0000, remote explicitly modified=2001-01-01 00:33:20 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewOptionalUUIDReplacementControl]' passed (0.020 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewPrimitiveUUIDListRoundTripsAndClearsInOrder]' started.
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver uuid-list – local explicitly modified=2026-09-13 21:41:40 +0000, remote explicitly modified=2026-09-13 21:41:40 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewPrimitiveUUIDListRoundTripsAndClearsInOrder]' passed (0.045 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewRemoteClearCannotReplacePendingLocalUUID]' started.
+2026-09-13T21:41:40+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Preserved journaled local values while importing server metadata: WorkerReviewReceiver.pending-local
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewRemoteClearCannotReplacePendingLocalUUID]' passed (0.019 seconds).
+Test Suite 'WorkerReviewReconciliationTests' passed at 2026-09-13 21:41:40.405.
+REVIEW_FIRST_IMPORT remote-payload pending 0
+REVIEW_FIRST_IMPORT_UPLOAD []
+REVIEW_MALFORMED_UUID_REJECTED malformedField(recordName: "WorkerReviewReceiver.malformed", propertyName: "categoryID", expected: "a UUID string")
+REVIEW_UUID_CLEAR nil
+REVIEW_UUID_REUPLOAD nil
+◇ Test run started.
+↳ Testing Library Version: 124.4
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests passed after 0.001 seconds.
+
+## Patched relevant/tail
+Test Case '-[BigSyncKitTests.BigSyncKitTests testClosureMigrationFailureCannotForwardJournalBeforePreparation]' passed (0.045 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testCloudKitAccountAvailabilityGateDefersUnavailableAndFailedStatuses]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testCloudKitAccountAvailabilityGateDefersUnavailableAndFailedStatuses]' passed (0.000 seconds).
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:7954: error: -[BigSyncKitTests.BigSyncKitTests testDatabaseSubscriptionIsSavedExactlyOnce] : XCTAssertEqual failed: ("2") is not equal to ("1")
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDatabaseSubscriptionIsSavedExactlyOnce]' failed (0.003 seconds).
+2026-09-13T21:42:06+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDisposableClientRetainsAuthorizationAfterTransientZoneFailure]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDisposableClientRetainsAuthorizationAfterTransientZoneFailure]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDurableAccountCommitFailureStopsBeforeCloudKitTransport]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testDurableAccountCommitFailureStopsBeforeCloudKitTransport]' passed (0.005 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testEncryptedResetRecordMutationFailuresResumeAndReuploadDurableJournal]' started.
+2026-09-13T21:42:07+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.BigSyncKitTests testEncryptedResetRecordMutationFailuresResumeAndReuploadDurableJournal]' passed (0.149 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testEncryptedResetZoneFetchFailureResumesAndReuploadsDurableJournal]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testEncryptedResetZoneFetchFailureResumesAndReuploadsDurableJournal]' passed (0.057 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFailedAccountPreflightSchedulesADeferredRetry]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFailedAccountPreflightSchedulesADeferredRetry]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreAtomicFailurePreservesOldSnapshotAndCleansTemporaryFile]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreAtomicFailurePreservesOldSnapshotAndCleansTemporaryFile]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreExternalRepairDoesNotMaskFailedMutation]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreExternalRepairDoesNotMaskFailedMutation]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreFailsClosedForMalformedExistingPlist]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreFailsClosedForMalformedExistingPlist]' passed (0.001 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStorePrepareForUseCannotEraseFailedMutation]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStorePrepareForUseCannotEraseFailedMutation]' passed (0.004 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreSurfacesWriteFailureInsteadOfOnlyAsserting]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testFileKeyValueStoreSurfacesWriteFailureInsteadOfOnlyAsserting]' passed (0.001 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInboundPageCursorAndCrashRecoveryIdentitiesCommitTogether]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInboundPageCursorAndCrashRecoveryIdentitiesCommitTogether]' passed (0.020 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInboundSemanticFailureIsQuarantinedWithoutBlockingValidRecord]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInboundSemanticFailureIsQuarantinedWithoutBlockingValidRecord]' passed (0.026 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInitialSetupFailureRemainsRetryable]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInitialSetupFailureRemainsRetryable]' passed (0.011 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInterruptedDurableOperationDoesNotRetryOtherFailures]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testInterruptedDurableOperationDoesNotRetryOtherFailures]' passed (0.000 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testLocalWorkForwardedDuringTerminalFailureStartsOneTailDrain]' started.
+2026-09-13T21:42:08+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.BigSyncKitTests testLocalWorkForwardedDuringTerminalFailureStartsOneTailDrain]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedChangeFeedPageFailsBeforeAdapterMutation]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedChangeFeedPageFailsBeforeAdapterMutation]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedInboundDeletionPrimaryKeyFailsWithoutPublishingTrackingState]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedInboundDeletionPrimaryKeyFailsWithoutPublishingTrackingState]' passed (0.015 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedInboundRecordIdentifierFailsWithoutPublishingTrackingState]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMalformedInboundRecordIdentifierFailsWithoutPublishingTrackingState]' passed (0.014 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMixedDeletePartialFailureAcknowledgesOnlySuccessfulGeneration]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMixedDeletePartialFailureAcknowledgesOnlySuccessfulGeneration]' passed (0.039 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMixedPartialUploadFailureDoesNotDiscardTheUnresolvedError]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testMixedPartialUploadFailureDoesNotDiscardTheUnresolvedError]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testNormalRedeliveryRepairsSystemFieldsAfterImportedPersistenceFailure]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testNormalRedeliveryRepairsSystemFieldsAfterImportedPersistenceFailure]' passed (0.021 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testOpaqueDeletionBatchValidatesFullIDAndFailsClosed]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testOpaqueDeletionBatchValidatesFullIDAndFailsClosed]' passed (0.034 seconds).
+2026-09-13T21:42:09+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+Test Case '-[BigSyncKitTests.BigSyncKitTests testPostCleanupJournalForwardingFailureWithholdsReceipt]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testPostCleanupJournalForwardingFailureWithholdsReceipt]' passed (0.013 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testPreSetupCacheResetPropagatesTrackingRealmOpenFailure]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testPreSetupCacheResetPropagatesTrackingRealmOpenFailure]' passed (0.006 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testProcessKillCheckpointFailureCannotPublishSuccess]' started.
+2026-09-13T21:42:09+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Uploading 1 records to <CKRecordZoneID: 0x6000025f9530; zoneName=process-kill-failure, ownerName=__defaultOwner__>
+Test Case '-[BigSyncKitTests.BigSyncKitTests testProcessKillCheckpointFailureCannotPublishSuccess]' passed (0.003 seconds).
+2026-09-13T21:42:10+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+2026-09-13T21:42:10+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Error: Error Domain=CKErrorDomain Code=2 "(null)" UserInfo={CKPartialErrors={
+2026-09-13T21:42:11+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+2026-09-13T21:42:11+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Error: inboundBoundaryChanged
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewFailedOperationsRevalidateUnannouncedAccountChange]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewFailedOperationsRevalidateUnannouncedAccountChange]' passed (0.018 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewForeignErrorCodeAndMixedFatalDoNotBecomeSizeRetry]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewForeignErrorCodeAndMixedFatalDoNotBecomeSizeRetry]' passed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateDatabaseFailureCannotFenceEitherScope]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateDatabaseFailureCannotFenceEitherScope]' passed (0.005 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateZoneFailureCannotFenceEitherScope]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateZoneFailureCannotFenceEitherScope]' passed (0.005 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateZoneSaveFailureCannotFenceEitherScope]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testReviewLateZoneSaveFailureCannotFenceEitherScope]' passed (0.005 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSaveTokenWaitsForCompletedRealmSetupAndPropagatesFailure]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSaveTokenWaitsForCompletedRealmSetupAndPropagatesFailure]' passed (0.016 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSetupRetiresTrackingForNewlyExcludedTypeAndFailsClosed]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSetupRetiresTrackingForNewlyExcludedTypeAndFailsClosed]' passed (0.022 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier]' started.
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:7990: error: -[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier] : failed - Expected subscription deletion failure
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:7996: error: -[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier] : XCTAssertEqual failed: ("nil") is not equal to ("Optional("BigSyncKit.v2.database.1b0749f682ebd5af544c0c62387256fdfe1758ea8d4528d6948e42ff11ac737a")")
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:8000: error: -[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier] : XCTAssertEqual failed: ("[]") is not equal to ("["BigSyncKit.v2.database.1b0749f682ebd5af544c0c62387256fdfe1758ea8d4528d6948e42ff11ac737a"]")
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSubscriptionDeleteFailureRetainsLocalIdentifier]' failed (0.003 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSubscriptionSaveFailureDoesNotPublishLocalIdentifier]' started.
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSubscriptionSaveFailureDoesNotPublishLocalIdentifier]' passed (0.002 seconds).
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:8632: error: -[BigSyncKitTests.BigSyncKitTests testSynchronizationAccountSwitchRecreatesDatabaseSubscription] : XCTAssertEqual failed: ("3") is not equal to ("2")
+Test Case '-[BigSyncKitTests.BigSyncKitTests testSynchronizationAccountSwitchRecreatesDatabaseSubscription]' failed (0.019 seconds).
+Test Case '-[BigSyncKitTests.BigSyncKitTests testTerminalForwardingFailureWithholdsSynchronizationReceipt]' started.
+2026-09-13T21:42:12+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+2026-09-13T21:42:12+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failed final import forwarding: terminalForwardingFailed
+Test Case '-[BigSyncKitTests.BigSyncKitTests testTerminalForwardingFailureWithholdsSynchronizationReceipt]' passed (0.008 seconds).
+2026-09-13T21:42:12+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Quarantined unauthorized deletion of BigSyncSemanticallyValidatedObject record BigSyncSemanticallyValidatedObject.crash-prefix-subject: rejected
+2026-09-13T21:42:12+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Preserved immutable target while importing server metadata: BigSyncSemanticallyValidatedObject.crash-prefix-subject
+Test Suite 'BigSyncKitTests' failed at 2026-09-13 21:42:12.644.
+	 Executed 309 tests, with 8 failures (0 unexpected) in 7.522 (7.536) seconds
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.084 (0.084) seconds
+Test Case '-[BigSyncKitTests.CloudKitAccountAvailabilityGateTests testAvailabilityGateReturnsFailedAtItsHardDeadline]' started.
+Test Case '-[BigSyncKitTests.CloudKitAccountAvailabilityGateTests testAvailabilityGateReturnsFailedAtItsHardDeadline]' passed (0.003 seconds).
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.014 (0.014) seconds
+	 Executed 1 test, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testAccountChangeInvalidationFailurePreventsCloudKitAndRetries]' started.
+2026-09-13T21:42:12+0000 error BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failed to invalidate account-scoped authority: rejected
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testAccountChangeInvalidationFailurePreventsCloudKitAndRetries]' passed (0.015 seconds).
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testAccountReplacementInvalidationFailureDoesNotPublishAndRetries]' started.
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testAccountReplacementInvalidationFailureDoesNotPublishAndRetries]' passed (0.004 seconds).
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testExplicitDatasetPortFailsClosedWithoutAdmissionHandler]' started.
+Test Case '-[BigSyncKitTests.CloudKitSynchronizerAccountFencingTests testExplicitDatasetPortFailsClosedWithoutAdmissionHandler]' passed (0.002 seconds).
+2026-09-13T21:42:13+0000 info BigSyncKitTests: [BigSyncKit] QSCloudKitSynchronizer >> Failing or backing off synchronization...
+	 Executed 51 tests, with 0 failures (0 unexpected) in 0.401 (0.403) seconds
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.011 (0.011) seconds
+	 Executed 9 tests, with 0 failures (0 unexpected) in 0.204 (0.205) seconds
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.055 (0.055) seconds
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/HotfixSubscriptionSafetyTests.swift:427: error: -[BigSyncKitTests.HotfixSubscriptionSafetyTests testLifecycleCancellationDuringDeletionRetainsRetryMetadata] : XCTAssertEqual failed: ("["BigSyncKit.v2.database.4333fd11bf7a9a396cd489eb459f4ec9e735c1596db17153cbd9fc5cda765c4d"]") is not equal to ("["BigSyncKit.v2.database.4333fd11bf7a9a396cd489eb459f4ec9e735c1596db17153cbd9fc5cda765c4d", "BigSyncKit.v2.database.4333fd11bf7a9a396cd489eb459f4ec9e735c1596db17153cbd9fc5cda765c4d"]")
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testLifecycleCancellationDuringDeletionRetainsRetryMetadata]' failed (0.003 seconds).
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testNetworkFailureRetainsCachedSubscription]' started.
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testNetworkFailureRetainsCachedSubscription]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testUnrelatedPartialFailureRetainsCachedSubscription]' started.
+Test Case '-[BigSyncKitTests.HotfixSubscriptionSafetyTests testUnrelatedPartialFailureRetainsCachedSubscription]' passed (0.002 seconds).
+Test Suite 'HotfixSubscriptionSafetyTests' failed at 2026-09-13 21:42:13.450.
+	 Executed 13 tests, with 1 failure (0 unexpected) in 0.031 (0.032) seconds
+Test Case '-[BigSyncKitTests.ModelAdapterDeletionConflictSafetyTests testDefaultDeletionConflictRebaseFailsWithoutMutatingLocalTombstone]' started.
+Test Case '-[BigSyncKitTests.ModelAdapterDeletionConflictSafetyTests testDefaultDeletionConflictRebaseFailsWithoutMutatingLocalTombstone]' passed (0.000 seconds).
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.009 (0.009) seconds
+	 Executed 6 tests, with 0 failures (0 unexpected) in 0.013 (0.013) seconds
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.511 (0.512) seconds
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.006 (0.006) seconds
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewUnsupportedObjectMapFailsWithoutAcknowledgingJournal]' started.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewUnsupportedObjectMapFailsWithoutAcknowledgingJournal]' passed (0.027 seconds).
+	 Executed 11 tests, with 0 failures (0 unexpected) in 0.368 (0.369) seconds
+Test Suite 'BigSyncKitPackageTests.xctest' failed at 2026-09-13 21:42:14.360.
+	 Executed 462 tests, with 1 test skipped and 9 failures (0 unexpected) in 9.452 (9.474) seconds
+Test Suite 'All tests' failed at 2026-09-13 21:42:14.360.
+	 Executed 462 tests, with 1 test skipped and 9 failures (0 unexpected) in 9.452 (9.475) seconds
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedDatabaseIDRejectsIncompatibleServerSubscription]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedIDStillHonorsLifecycleAttemptFence]' started.
+2026-09-13T21:42:13+0000 info SubscriptionCacheRevalidationTests: [BigSyncKit] QSCloudKitSynchronizer >> Cancelling synchronization...
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedIDStillHonorsLifecycleAttemptFence]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedZoneIDRecreatesMissingServerSubscription]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCacheRevalidationTests testCachedZoneIDRecreatesMissingServerSubscription]' passed (0.002 seconds).
+Test Suite 'SubscriptionCacheRevalidationTests' passed at 2026-09-13 21:42:13.460.
+Test Suite 'SubscriptionCancellationOwnershipTests' started at 2026-09-13 21:42:13.460.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedDatabaseIDCannotDeleteIncompatibleServerObject]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedDatabaseIDCannotDeleteIncompatibleServerObject]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedDatabaseIDClearsWhenServerObjectIsAlreadyAbsent]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedDatabaseIDClearsWhenServerObjectIsAlreadyAbsent]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedZoneIDCannotDeleteDifferentZoneObject]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedZoneIDCannotDeleteDifferentZoneObject]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedZoneIDClearsWhenServerObjectIsAlreadyAbsent]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testCachedZoneIDClearsWhenServerObjectIsAlreadyAbsent]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testOwnedDatabaseSubscriptionStillDeletesNormally]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testOwnedDatabaseSubscriptionStillDeletesNormally]' passed (0.002 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testOwnedZoneSubscriptionStillDeletesNormally]' started.
+Test Case '-[BigSyncKitTests.SubscriptionCancellationOwnershipTests testOwnedZoneSubscriptionStillDeletesNormally]' passed (0.002 seconds).
+Test Suite 'SubscriptionCancellationOwnershipTests' passed at 2026-09-13 21:42:13.473.
+Test Suite 'SubscriptionIntentOrderingTests' started at 2026-09-13 21:42:13.473.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely]' started.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely]' passed (0.106 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely]' started.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely]' passed (0.105 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterZoneCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely]' started.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterZoneCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely]' passed (0.186 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterZoneSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely]' started.
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testLaterZoneSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely]' passed (0.110 seconds).
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testQueuedCallbackIntentCannotReopenAfterLifecycleAttemptRotation]' started.
+2026-09-13T21:42:13+0000 info SubscriptionIntentOrderingTests: [BigSyncKit] QSCloudKitSynchronizer >> Cancelling synchronization...
+Test Case '-[BigSyncKitTests.SubscriptionIntentOrderingTests testQueuedCallbackIntentCannotReopenAfterLifecycleAttemptRotation]' passed (0.004 seconds).
+Test Suite 'SubscriptionIntentOrderingTests' passed at 2026-09-13 21:42:13.985.
+Test Suite 'SyncStatusViewModelTests' started at 2026-09-13 21:42:13.985.
+Test Case '-[BigSyncKitTests.SyncStatusViewModelTests testHealthNotificationPayloadIsOnlyAWakeup]' started.
+Test Case '-[BigSyncKitTests.SyncStatusViewModelTests testHealthNotificationPayloadIsOnlyAWakeup]' passed (0.001 seconds).
+Test Case '-[BigSyncKitTests.SyncStatusViewModelTests testOlderHealthReloadCannotOverwriteNewerResult]' started.
+Test Case '-[BigSyncKitTests.SyncStatusViewModelTests testOlderHealthReloadCannotOverwriteNewerResult]' passed (0.006 seconds).
+Test Suite 'SyncStatusViewModelTests' passed at 2026-09-13 21:42:13.991.
+Test Suite 'WorkerReviewReconciliationTests' started at 2026-09-13 21:42:13.991.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewAutomaticLocalWinnerPreservesConflictClockAndLaterRemoteEditWins]' started.
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Setup synchronization...
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver automatic-local-winner – local explicitly modified=2001-01-01 00:33:20 +0000, remote explicitly modified=2001-01-01 00:16:40 +0000 => accepted remote: false
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Rejecting remote changes with lower explicitlyModifiedAt: WorkerReviewReceiver automatic-local-winner – local explicitly modified=Optional(2001-01-01 00:33:20 +0000), remote explicitly modified=Optional(2001-01-01 00:16:40 +0000), syncedEntityState=4
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Persisted 1 downloaded records
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver automatic-local-winner – local explicitly modified=2001-01-01 00:33:20 +0000, remote explicitly modified=2001-01-01 00:50:00 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewAutomaticLocalWinnerPreservesConflictClockAndLaterRemoteEditWins]' passed (0.047 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewExistingNewerLocalAuthorityControl]' started.
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver existing – local explicitly modified=2001-01-01 00:50:00 +0000, remote explicitly modified=2001-01-01 00:16:40 +0000 => accepted remote: false
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Rejecting remote changes with lower explicitlyModifiedAt: WorkerReviewReceiver existing – local explicitly modified=Optional(2001-01-01 00:50:00 +0000), remote explicitly modified=Optional(2001-01-01 00:16:40 +0000), syncedEntityState=4
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewExistingNewerLocalAuthorityControl]' passed (0.031 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewFirstImportWithExplicitTimestampControl]' started.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewFirstImportWithExplicitTimestampControl]' passed (0.026 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewFirstImportWithoutExplicitTimestampMustNotInventLocalAuthority]' started.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewFirstImportWithoutExplicitTimestampMustNotInventLocalAuthority]' passed (0.021 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewMalformedNonNilUUIDStillRejectedControl]' started.
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewMalformedNonNilUUIDStillRejectedControl]' passed (0.017 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewNilReplayAndAbsentRequiredUUIDPreserveCompatibility]' started.
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver nil-replay – local explicitly modified=0001-01-01 00:00:00 +0000, remote explicitly modified=0001-01-01 00:00:00 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewNilReplayAndAbsentRequiredUUIDPreserveCompatibility]' passed (0.066 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewOptionalUUIDClearMustConvergeAndStayClearedOnLaterUpload]' started.
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver clear – local explicitly modified=2001-01-01 00:16:40 +0000, remote explicitly modified=2001-01-01 00:33:20 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewOptionalUUIDClearMustConvergeAndStayClearedOnLaterUpload]' passed (0.031 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewOptionalUUIDReplacementControl]' started.
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver replace – local explicitly modified=2001-01-01 00:16:40 +0000, remote explicitly modified=2001-01-01 00:33:20 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewOptionalUUIDReplacementControl]' passed (0.028 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewPrimitiveUUIDListRoundTripsAndClearsInOrder]' started.
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Conflict resolution: WorkerReviewReceiver uuid-list – local explicitly modified=2026-09-13 21:42:14 +0000, remote explicitly modified=2026-09-13 21:42:14 +0000 => accepted remote: true
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewPrimitiveUUIDListRoundTripsAndClearsInOrder]' passed (0.053 seconds).
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewRemoteClearCannotReplacePendingLocalUUID]' started.
+2026-09-13T21:42:14+0000 info WorkerReview: [BigSyncKit] QSCloudKitSynchronizer >> Preserved journaled local values while importing server metadata: WorkerReviewReceiver.pending-local
+Test Case '-[BigSyncKitTests.WorkerReviewReconciliationTests testReviewRemoteClearCannotReplacePendingLocalUUID]' passed (0.020 seconds).
+Test Suite 'WorkerReviewReconciliationTests' passed at 2026-09-13 21:42:14.360.
+REVIEW_FIRST_IMPORT remote-payload pending 0
+REVIEW_FIRST_IMPORT_UPLOAD []
+REVIEW_MALFORMED_UUID_REJECTED malformedField(recordName: "WorkerReviewReceiver.malformed", propertyName: "categoryID", expected: "a UUID string")
+REVIEW_UUID_CLEAR nil
+REVIEW_UUID_REUPLOAD nil
+◇ Test run started.
+↳ Testing Library Version: 124.4
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests passed after 0.001 seconds.
+
