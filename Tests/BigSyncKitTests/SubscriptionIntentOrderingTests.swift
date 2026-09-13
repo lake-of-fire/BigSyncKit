@@ -144,6 +144,13 @@ private actor SubscriptionIntentServices: CloudKitSubscriptionStore,
 }
 
 final class SubscriptionIntentOrderingTests: XCTestCase {
+    private var zoneID: CKRecordZone.ID {
+        CKRecordZone.ID(
+            zoneName: "subscription-intent",
+            ownerName: CKCurrentUserDefaultName
+        )
+    }
+
     @BigSyncBackgroundActor
     private func fixture() -> (CloudKitSynchronizer, SubscriptionIntentServices) {
         let services = SubscriptionIntentServices()
@@ -152,10 +159,7 @@ final class SubscriptionIntentOrderingTests: XCTestCase {
             identifier: "subscription-intent-" + nonce,
             containerIdentifier: "iCloud.test",
             database: SubscriptionIntentDatabase(),
-            recordZoneID: CKRecordZone.ID(
-                zoneName: "subscription-intent",
-                ownerName: CKCurrentUserDefaultName
-            ),
+            recordZoneID: zoneID,
             keyValueStore: SubscriptionIntentStore(),
             accountIdentifierProvider: { "account-a" },
             accountStatusProvider: { .available },
@@ -236,6 +240,79 @@ final class SubscriptionIntentOrderingTests: XCTestCase {
 
         XCTAssertEqual(
             synchronizer.subscriptionIDForDatabaseSubscription(), identifier
+        )
+        let containsSubscription = await services.containsSubscription(identifier)
+        XCTAssertTrue(containsSubscription)
+        let saveCount = await services.saveCount
+        let deleteCount = await services.deleteCount
+        XCTAssertEqual(saveCount, 2)
+        XCTAssertEqual(deleteCount, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testLaterZoneCancelWinsAfterEarlierSubscribeSaveAlreadyCommittedRemotely()
+        async throws {
+        let (synchronizer, services) = fixture()
+        let zoneID = self.zoneID
+        let saveEntered = expectation(description: "zone subscribe save committed")
+        let saveGate = SubscriptionIntentGate()
+        await services.pauseNextSave(gate: saveGate, entered: saveEntered)
+
+        let subscribe = Task { @BigSyncBackgroundActor in
+            try await synchronizer.subscribeForChanges(in: zoneID)
+        }
+        await fulfillment(of: [saveEntered], timeout: 2)
+        let onlySubscriptionID = await services.onlySubscriptionID()
+        let identifier = try XCTUnwrap(onlySubscriptionID)
+
+        let cancel = Task { @BigSyncBackgroundActor in
+            try await synchronizer.cancelSubscriptionForChanges(in: zoneID)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        await saveGate.open()
+
+        try await subscribe.value
+        try await cancel.value
+
+        XCTAssertNil(synchronizer.subscriptionID(forRecordZoneID: zoneID))
+        let containsSubscription = await services.containsSubscription(identifier)
+        XCTAssertFalse(containsSubscription)
+        let saveCount = await services.saveCount
+        let deleteCount = await services.deleteCount
+        XCTAssertEqual(saveCount, 1)
+        XCTAssertEqual(deleteCount, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testLaterZoneSubscribeWinsAfterEarlierCancelDeleteAlreadyCommittedRemotely()
+        async throws {
+        let (synchronizer, services) = fixture()
+        let zoneID = self.zoneID
+        try await synchronizer.subscribeForChanges(in: zoneID)
+        let identifier = try XCTUnwrap(
+            synchronizer.subscriptionID(forRecordZoneID: zoneID)
+        )
+
+        let deleteEntered = expectation(description: "zone cancel delete committed")
+        let deleteGate = SubscriptionIntentGate()
+        await services.pauseNextDelete(gate: deleteGate, entered: deleteEntered)
+
+        let cancel = Task { @BigSyncBackgroundActor in
+            try await synchronizer.cancelSubscriptionForChanges(in: zoneID)
+        }
+        await fulfillment(of: [deleteEntered], timeout: 2)
+
+        let subscribe = Task { @BigSyncBackgroundActor in
+            try await synchronizer.subscribeForChanges(in: zoneID)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        await deleteGate.open()
+
+        try await cancel.value
+        try await subscribe.value
+
+        XCTAssertEqual(
+            synchronizer.subscriptionID(forRecordZoneID: zoneID), identifier
         )
         let containsSubscription = await services.containsSubscription(identifier)
         XCTAssertTrue(containsSubscription)
