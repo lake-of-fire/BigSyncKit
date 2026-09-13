@@ -20,7 +20,15 @@ jobs:
         with:
           fetch-depth: 0
       - name: Apply exact-preimage patch
-        run: python3 .github/apply-main-explicit-port-recovery.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/apply-main-explicit-port-recovery.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift")
+          path.write_text(path.read_text().rstrip() + "\n")
+          PY
       - name: Verify bounded diff
         shell: bash
         run: |
