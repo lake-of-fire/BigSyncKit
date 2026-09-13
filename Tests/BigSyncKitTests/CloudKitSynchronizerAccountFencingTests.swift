@@ -2469,3 +2469,119 @@ extension CloudKitSynchronizerAccountFencingTests {
         await sync.cancelSynchronizationAndWait()
     }
 }
+
+@BigSyncBackgroundActor
+private final class AccountAuthorityFenceReference: @unchecked Sendable {
+    weak var synchronizer: CloudKitSynchronizer?
+    private var shouldPoison = false
+
+    func arm() {
+        shouldPoison = true
+    }
+
+    func poison() {
+        synchronizer?.accountScopeAuthorityFence.poison()
+    }
+
+    func poisonIfArmed() {
+        guard shouldPoison else { return }
+        shouldPoison = false
+        poison()
+    }
+}
+
+extension CloudKitSynchronizerAccountFencingTests {
+    @BigSyncBackgroundActor
+    func testAccountStatusPreflightCannotAdoptAuthorityPoisonedAfterCapture()
+    async throws {
+        let authority = AccountAuthorityFenceReference()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountStatusProvider: {
+                await authority.poison()
+                return .available
+            }
+        )
+        authority.synchronizer = synchronizer
+
+        do {
+            try await synchronizer._test_validateAccountBootstrap()
+            XCTFail("Expected the preflight authority generation to be stale")
+        } catch is CancellationError {
+        }
+
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertTrue(synchronizer.accountValidationRequired)
+    }
+
+    @BigSyncBackgroundActor
+    func testInitialAdmissionRevalidationRejectsAuthorityGenerationChangeBeforeMutation()
+    async throws {
+        let mutations = ApplicationBoundaryMutationRecorder()
+        let admissionReference = InitialAdmissionSynchronizerReference()
+        let authority = AccountAuthorityFenceReference()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { context in
+                await authority.poison()
+                try await admissionReference.revalidate(context)
+                await mutations.recordMutation()
+            }
+        )
+        admissionReference.synchronizer = synchronizer
+        authority.synchronizer = synchronizer
+
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected the admission authority generation to be stale")
+        } catch is CancellationError {
+        }
+
+        let mutationCount = await mutations.mutationCount
+        XCTAssertEqual(mutationCount, 0)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+    }
+
+    @BigSyncBackgroundActor
+    func testExplicitPortActivationRejectsAuthorityGenerationChangeAcrossAccountAwait()
+    async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let authority = AccountAuthorityFenceReference()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: {
+                let account = await identity.current()
+                await authority.poisonIfArmed()
+                return account
+            },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { _ in }
+        )
+        authority.synchronizer = synchronizer
+        try await synchronizer._test_validateSynchronizationAccount()
+        await identity.replace(with: "account-b")
+
+        let requirement: BigSyncCloudAccountPortRequirement
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected an explicit dataset port requirement")
+            return
+        } catch BigSyncCloudAccountPortError.required(let pending) {
+            requirement = pending
+        }
+
+        await authority.arm()
+        do {
+            try await synchronizer.activateCloudAccountPort(requirement)
+            XCTFail("Expected stale port activation authority to be rejected")
+        } catch is CancellationError {
+        }
+
+        XCTAssertEqual(
+            try synchronizer.pendingCloudAccountPortRequirement(),
+            requirement
+        )
+        XCTAssertNil(try synchronizer.accountScopeLease())
+    }
+}
