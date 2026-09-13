@@ -16,20 +16,24 @@ jobs:
         with:
           ref: 6d5acf7f775ec09791185c969ce72f795536f898
           fetch-depth: 0
-      - name: Apply final reviewed mainline patch with three-way fallback
+      - name: Diagnose final reviewed mainline patch composition
         shell: bash
         run: |
           set -euo pipefail
           git fetch origin main --no-tags
           curl -L --fail --retry 3 https://github.com/lake-of-fire/BigSyncKit/pull/37.diff -o /tmp/pr37.diff
+          set +e
           git apply --3way --index /tmp/pr37.diff
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo '=== conflicted paths ==='
+            git status --short
+            echo '=== source conflicts ==='
+            grep -n -B 18 -A 30 -E '^(<<<<<<<|=======|>>>>>>>)' Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift || true
+            echo '=== test conflicts ==='
+            grep -n -B 18 -A 30 -E '^(<<<<<<<|=======|>>>>>>>)' Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift || true
+            exit 1
+          fi
           git diff --cached --check
-          test "$(git diff --cached --name-only)" = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift"
-      - name: Commit bounded RA-1 port
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git commit -m "fix: fence RA-1 account validation authority generation"
-          git push origin HEAD:refs/heads/fix/ra1-account-validation-authority-20260913 --force-with-lease
+          git diff --cached --name-only
