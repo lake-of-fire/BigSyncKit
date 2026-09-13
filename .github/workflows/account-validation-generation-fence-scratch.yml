@@ -38,6 +38,7 @@ jobs:
           TARGET_BRANCH: fix/account-validation-generation-fence-20260913
         run: |
           set -euo pipefail
+          # Always compose onto the live main so concurrent transport merges are retained.
           cp .github/scripts/account_validation_generation_fence_patch.py /tmp/account_validation_generation_fence_patch.py
           git fetch origin main
           BASE_SHA="$(git rev-parse origin/main)"
