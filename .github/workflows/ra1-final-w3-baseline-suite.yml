@@ -1,4 +1,4 @@
-name: RA-1 W3 baseline full-suite A-B
+name: RA-1 W3 baseline contamination bisect
 on:
   push:
     branches: [codex/ra1-final-w3-baseline-suite-20260912]
@@ -37,56 +37,44 @@ jobs:
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ra1-w3-baseline"
-          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-w3-baseline/identity.txt"
-          git -C ../RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-baseline/realm-swift-gaps.txt"
-          git -C ../SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-baseline/swift-utilities.txt"
-          swift --version | tee "$RUNNER_TEMP/ra1-w3-baseline/toolchain.txt"
-      - name: BigSyncKitTests class alone
+          mkdir -p "$RUNNER_TEMP/ra1-w3-bisect"
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-w3-bisect/identity.txt"
+          swift --version | tee "$RUNNER_TEMP/ra1-w3-bisect/toolchain.txt"
+      - name: AccountAuthority then BigSyncKitTests
         continue-on-error: true
         working-directory: BigSyncKit
         run: |
           set -o pipefail
-          swift test --filter 'BigSyncKitTests\.BigSyncKitTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/bigsync-class.log"
-      - name: OwnedRecordRevisionTests class alone
+          swift test --filter 'BigSyncKitTests\.(AccountAuthorityPersistenceTests|BigSyncKitTests)' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-bisect/account-plus-bigsync.log"
+      - name: BackupDetection then BigSyncKitTests
+        if: always()
+        continue-on-error: true
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        run: |
+          set -o pipefail
+          swift test --filter 'BigSyncKitTests\.(BackupDetectionTests|BigSyncKitTests)' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-bisect/backup-plus-bigsync.log"
+      - name: Account plus Backup plus BigSyncKitTests
+        if: always()
+        continue-on-error: true
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        run: |
+          set -o pipefail
+          swift test --filter 'BigSyncKitTests\.(AccountAuthorityPersistenceTests|BackupDetectionTests|BigSyncKitTests)' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-bisect/account-backup-bigsync.log"
+      - name: BigSyncKitTests then OwnedRevision
         if: always()
         continue-on-error: true
         working-directory: BigSyncKit
         run: |
           set -o pipefail
-          swift test --filter 'BigSyncKitTests\.OwnedRecordRevisionTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/owned-class.log"
-      - name: Isolated authority regression
-        if: always()
-        continue-on-error: true
-        working-directory: BigSyncKit
-        run: |
-          set -o pipefail
-          swift test --filter testAccountSwitchDuringUploadPreparationSkipsCloudKitMutation 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/authority.log"
-      - name: Isolated partial-failure regression
-        if: always()
-        continue-on-error: true
-        working-directory: BigSyncKit
-        run: |
-          set -o pipefail
-          swift test --filter testMixedPartialUploadFailureDoesNotDiscardTheUnresolvedError 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/partial-failure.log"
-      - name: Isolated cancellation-barrier regression
-        if: always()
-        continue-on-error: true
-        working-directory: BigSyncKit
-        run: |
-          set -o pipefail
-          swift test --filter testPublicCacheResetCannotBypassCancellationBarrier 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/cancellation-barrier.log"
-      - name: Isolated owned-revision regression
-        if: always()
-        continue-on-error: true
-        working-directory: BigSyncKit
-        run: |
-          set -o pipefail
-          swift test --filter testRealUploadLoopReplacesStalePendingMarkWithNewerServerEmptyState 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/owned-revision.log"
+          swift test --filter 'BigSyncKitTests\.(BigSyncKitTests|OwnedRecordRevisionTests)' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-bisect/bigsync-plus-owned.log"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ra1-final-w3-baseline-suite-classes
-          path: ${{ runner.temp }}/ra1-w3-baseline/
+          name: ra1-final-w3-contamination-bisect
+          path: ${{ runner.temp }}/ra1-w3-bisect/
           retention-days: 7
           if-no-files-found: error
