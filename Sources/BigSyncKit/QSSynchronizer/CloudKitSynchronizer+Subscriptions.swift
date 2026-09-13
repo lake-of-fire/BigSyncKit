@@ -15,17 +15,138 @@ private struct CloudKitSubscriptionAccountFence: Sendable {
     let runContext: CloudKitSynchronizer.RunContext?
 }
 
+private struct CloudKitSubscriptionOperationReservation: Sendable {
+    let id: UUID
+    let attemptID: UUID
+    let runContext: CloudKitSynchronizer.RunContext?
+}
+
+/// CloudKit mutation APIs suspend and `BigSyncBackgroundActor` is reentrant.
+/// Reserve an operation synchronously before any suspension so a later
+/// Subscribe/Cancel intent cannot overtake an earlier opposite intent and then
+/// be undone by the earlier transport response.
+@BigSyncBackgroundActor
+private final class CloudKitSubscriptionOperationGate {
+    private var reservations = [UUID]()
+    private var waiters = [UUID: CheckedContinuation<Void, Never>]()
+
+    func reserve() -> UUID {
+        let id = UUID()
+        reservations.append(id)
+        return id
+    }
+
+    func enter(_ id: UUID) async {
+        precondition(
+            reservations.contains(id),
+            "Subscription operation entered without a reservation"
+        )
+        guard reservations.first != id else { return }
+        await withCheckedContinuation { continuation in
+            precondition(
+                waiters[id] == nil,
+                "Subscription operation waited more than once"
+            )
+            waiters[id] = continuation
+        }
+    }
+
+    func leave(_ id: UUID) {
+        precondition(
+            reservations.first == id,
+            "Subscription operations must leave in reservation order"
+        )
+        reservations.removeFirst()
+        if let next = reservations.first,
+           let continuation = waiters.removeValue(forKey: next) {
+            continuation.resume()
+        }
+    }
+}
+
+@BigSyncBackgroundActor
+private enum CloudKitSubscriptionOperationGates {
+    private final class Entry {
+        weak var owner: CloudKitSynchronizer?
+        let gate: CloudKitSubscriptionOperationGate
+
+        init(
+            owner: CloudKitSynchronizer,
+            gate: CloudKitSubscriptionOperationGate
+        ) {
+            self.owner = owner
+            self.gate = gate
+        }
+    }
+
+    private static var entries = [ObjectIdentifier: Entry]()
+
+    static func gate(
+        for synchronizer: CloudKitSynchronizer
+    ) -> CloudKitSubscriptionOperationGate {
+        entries = entries.filter { $0.value.owner != nil }
+        let key = ObjectIdentifier(synchronizer)
+        if let entry = entries[key],
+           let owner = entry.owner,
+           owner === synchronizer {
+            return entry.gate
+        }
+        let entry = Entry(
+            owner: synchronizer,
+            gate: CloudKitSubscriptionOperationGate()
+        )
+        entries[key] = entry
+        return entry.gate
+    }
+}
+
 @available(iOS 10.0, macOS 10.12, watchOS 6.0, *)
 public extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
-    private func makeSubscriptionAccountFence() async throws
-        -> CloudKitSubscriptionAccountFence {
+    private func reserveSubscriptionOperation()
+        -> CloudKitSubscriptionOperationReservation {
+        let gate = CloudKitSubscriptionOperationGates.gate(for: self)
+        return CloudKitSubscriptionOperationReservation(
+            id: gate.reserve(),
+            attemptID: synchronizationAttemptID,
+            runContext: activeRunContext
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func enterSubscriptionOperation(
+        _ reservation: CloudKitSubscriptionOperationReservation
+    ) async throws -> CloudKitSubscriptionOperationGate {
+        let gate = CloudKitSubscriptionOperationGates.gate(for: self)
+        await gate.enter(reservation.id)
+        do {
+            try Task.checkCancellation()
+            guard synchronizationAttemptID == reservation.attemptID else {
+                throw CancellationError()
+            }
+            if let runContext = reservation.runContext {
+                try checkRunContext(runContext)
+            }
+            return gate
+        } catch {
+            gate.leave(reservation.id)
+            throw error
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func makeSubscriptionAccountFence(
+        attemptID: UUID,
+        runContext: CloudKitSynchronizer.RunContext?
+    ) async throws -> CloudKitSubscriptionAccountFence {
         try Task.checkCancellation()
+        guard synchronizationAttemptID == attemptID else {
+            throw CancellationError()
+        }
+        if let runContext {
+            try checkRunContext(runContext)
+        }
         try keyValueStore.bigSyncValidateDurability()
-        // Standalone calls have no RunContext, but must still retire when
-        // cancellation, reset or a newer synchronization rotates this fence.
-        let attemptID = synchronizationAttemptID
-        let runContext = activeRunContext
         let accountIdentifier = try await accountIdentifierProvider()
         try Task.checkCancellation()
         guard synchronizationAttemptID == attemptID else {
@@ -104,31 +225,25 @@ public extension CloudKitSynchronizer {
         return getStoredSubscriptionID(for: zoneID)
     }
     
-    /// Returns identifier for a registered `CKSubscription` to track changes in the synchronizer's database.
-    /// - Returns: Identifier of an existing `CKSubscription` for this database, if there is one.
+    /// Returns identifier for a registered `CKSubscription` for this database.
     @BigSyncBackgroundActor
     func subscriptionIDForDatabaseSubscription() -> String? {
         return self.databaseSubscriptionID
     }
     
-    /**
-     *  Creates a new database subscription with CloudKit so the application can receive notifications when new changes happen. The application is responsible for registering for remote notifications and initiating synchronization when a notification is received. @see `CKSubscription`
-     *
-     *  -Parameter completion Block that will be called after subscription is created, with an optional error.
-     */
-    
-    
-    /// Creates a new database subscription with CloudKit so the application can receive notifications when new changes happen. The application is responsible for registering for remote notifications and initiating synchronization when a notification is received. @see `CKSubscription`
-    /// - Parameter completion: Block that will be called after subscription is created, with an optional error.
+    /// Creates a database subscription so the application can receive change notifications.
     @BigSyncBackgroundActor
     func subscribeForChangesInDatabase(completion: ((Error?) -> ())?) {
+        let reservation = reserveSubscriptionOperation()
         Task { @BigSyncBackgroundActor [weak self] in
             guard let self else {
                 completion?(CancellationError())
                 return
             }
             do {
-                try await subscribeForChangesInDatabase()
+                try await subscribeForChangesInDatabase(
+                    reservation: reservation
+                )
                 completion?(nil)
             } catch {
                 completion?(error)
@@ -138,9 +253,21 @@ public extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func subscribeForChangesInDatabase() async throws {
-        try Task.checkCancellation()
+        let reservation = reserveSubscriptionOperation()
+        try await subscribeForChangesInDatabase(reservation: reservation)
+    }
+
+    @BigSyncBackgroundActor
+    private func subscribeForChangesInDatabase(
+        reservation: CloudKitSubscriptionOperationReservation
+    ) async throws {
+        let operationGate = try await enterSubscriptionOperation(reservation)
+        defer { operationGate.leave(reservation.id) }
         let expectedSubscriptionID = ownedSubscriptionID(kind: "database")
-        let accountFence = try await makeSubscriptionAccountFence()
+        let accountFence = try await makeSubscriptionAccountFence(
+            attemptID: reservation.attemptID,
+            runContext: reservation.runContext
+        )
         if let storedSubscriptionID = subscriptionIDForDatabaseSubscription(),
            storedSubscriptionID != expectedSubscriptionID {
             // Do not perpetuate an older arbitrary ID: it may have been
@@ -181,19 +308,20 @@ public extension CloudKitSynchronizer {
         try persistDatabaseSubscriptionID(expectedSubscriptionID)
     }
     
-    /// Creates a new subscription with CloudKit so the application can receive notifications when new changes happen. The application is responsible for registering for remote notifications and initiating synchronization when a notification is received. @see `CKSubscription`
-    /// - Parameters:
-    ///   - zoneID: `CKRecordZoneID` to track for changes
-    ///   - completion: Block that will be called after subscription is created, with an optional error.
+    /// Creates a record-zone subscription so the application can receive change notifications.
     @BigSyncBackgroundActor
     func subscribeForChanges(in zoneID: CKRecordZone.ID, completion: ((Error?)->())?) {
+        let reservation = reserveSubscriptionOperation()
         Task { @BigSyncBackgroundActor [weak self] in
             guard let self else {
                 completion?(CancellationError())
                 return
             }
             do {
-                try await subscribeForChanges(in: zoneID)
+                try await subscribeForChanges(
+                    in: zoneID,
+                    reservation: reservation
+                )
                 completion?(nil)
             } catch {
                 completion?(error)
@@ -203,12 +331,25 @@ public extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func subscribeForChanges(in zoneID: CKRecordZone.ID) async throws {
-        try Task.checkCancellation()
+        let reservation = reserveSubscriptionOperation()
+        try await subscribeForChanges(in: zoneID, reservation: reservation)
+    }
+
+    @BigSyncBackgroundActor
+    private func subscribeForChanges(
+        in zoneID: CKRecordZone.ID,
+        reservation: CloudKitSubscriptionOperationReservation
+    ) async throws {
+        let operationGate = try await enterSubscriptionOperation(reservation)
+        defer { operationGate.leave(reservation.id) }
         let expectedSubscriptionID = ownedSubscriptionID(
             kind: "zone",
             zoneID: zoneID
         )
-        let accountFence = try await makeSubscriptionAccountFence()
+        let accountFence = try await makeSubscriptionAccountFence(
+            attemptID: reservation.attemptID,
+            runContext: reservation.runContext
+        )
         if let storedSubscriptionID = subscriptionID(forRecordZoneID: zoneID),
            storedSubscriptionID != expectedSubscriptionID {
             // See the database-subscription equivalent above. Clear only local
@@ -249,23 +390,19 @@ public extension CloudKitSynchronizer {
         try persistSubscriptionID(expectedSubscriptionID, for: zoneID)
     }
     
-    /**
-     *  Delete existing database subscription to stop receiving notifications.
-     *
-     *  -Parameter completion Block that will be called after subscription is deleted, with an optional error.
-     */
-    
-    /// Delete existing database subscription to stop receiving notifications.
-    /// - Parameter completion: Block that will be called after subscription is deleted, with an optional error.
+    /// Deletes the database subscription to stop receiving notifications.
     @BigSyncBackgroundActor
     @objc func cancelSubscriptionForChangesInDatabase(completion: ((Error?)->())?) {
+        let reservation = reserveSubscriptionOperation()
         Task { @BigSyncBackgroundActor [weak self] in
             guard let self else {
                 completion?(CancellationError())
                 return
             }
             do {
-                try await cancelSubscriptionForChangesInDatabase()
+                try await cancelSubscriptionForChangesInDatabase(
+                    reservation: reservation
+                )
                 completion?(nil)
             } catch {
                 completion?(error)
@@ -275,7 +412,22 @@ public extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func cancelSubscriptionForChangesInDatabase() async throws {
-        let accountFence = try await makeSubscriptionAccountFence()
+        let reservation = reserveSubscriptionOperation()
+        try await cancelSubscriptionForChangesInDatabase(
+            reservation: reservation
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func cancelSubscriptionForChangesInDatabase(
+        reservation: CloudKitSubscriptionOperationReservation
+    ) async throws {
+        let operationGate = try await enterSubscriptionOperation(reservation)
+        defer { operationGate.leave(reservation.id) }
+        let accountFence = try await makeSubscriptionAccountFence(
+            attemptID: reservation.attemptID,
+            runContext: reservation.runContext
+        )
         let expectedSubscriptionID = ownedSubscriptionID(kind: "database")
         if let stored = subscriptionIDForDatabaseSubscription(),
            stored != expectedSubscriptionID {
@@ -307,19 +459,20 @@ public extension CloudKitSynchronizer {
         )
     }
     
-    /// Delete existing subscription to stop receiving notifications.
-    /// - Parameters:
-    ///   - zoneID: `CKRecordZoneID` to stop tracking for changes.
-    ///   - completion: Block that will be called after subscription is deleted, with an optional error.
+    /// Deletes a record-zone subscription to stop receiving notifications.
     @BigSyncBackgroundActor
     @objc func cancelSubscriptionForChanges(in zoneID: CKRecordZone.ID, completion: ((Error?)->())?) {
+        let reservation = reserveSubscriptionOperation()
         Task { @BigSyncBackgroundActor [weak self] in
             guard let self else {
                 completion?(CancellationError())
                 return
             }
             do {
-                try await cancelSubscriptionForChanges(in: zoneID)
+                try await cancelSubscriptionForChanges(
+                    in: zoneID,
+                    reservation: reservation
+                )
                 completion?(nil)
             } catch {
                 completion?(error)
@@ -331,7 +484,24 @@ public extension CloudKitSynchronizer {
     func cancelSubscriptionForChanges(
         in zoneID: CKRecordZone.ID
     ) async throws {
-        let accountFence = try await makeSubscriptionAccountFence()
+        let reservation = reserveSubscriptionOperation()
+        try await cancelSubscriptionForChanges(
+            in: zoneID,
+            reservation: reservation
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func cancelSubscriptionForChanges(
+        in zoneID: CKRecordZone.ID,
+        reservation: CloudKitSubscriptionOperationReservation
+    ) async throws {
+        let operationGate = try await enterSubscriptionOperation(reservation)
+        defer { operationGate.leave(reservation.id) }
+        let accountFence = try await makeSubscriptionAccountFence(
+            attemptID: reservation.attemptID,
+            runContext: reservation.runContext
+        )
         let expectedSubscriptionID = ownedSubscriptionID(
             kind: "zone",
             zoneID: zoneID
@@ -361,26 +531,6 @@ public extension CloudKitSynchronizer {
         )
     }
     
-    @BigSyncBackgroundActor
-    fileprivate func cancelSubscription(identifier: String, completion: ((Error?)->())?) {
-        Task { @BigSyncBackgroundActor [weak self] in
-            guard let self else {
-                completion?(CancellationError())
-                return
-            }
-            do {
-                let accountFence = try await makeSubscriptionAccountFence()
-                try await cancelSubscription(
-                    identifier: identifier,
-                    accountFence: accountFence
-                )
-                completion?(nil)
-            } catch {
-                completion?(error)
-            }
-        }
-    }
-
     @BigSyncBackgroundActor
     fileprivate func cancelSubscription(
         identifier: String,
