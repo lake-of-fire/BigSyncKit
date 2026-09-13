@@ -135,15 +135,6 @@ public extension CloudKitSynchronizer {
     }
 
     @BigSyncBackgroundActor
-    private func makeSubscriptionAccountFence() async throws
-        -> CloudKitSubscriptionAccountFence {
-        try await makeSubscriptionAccountFence(
-            attemptID: synchronizationAttemptID,
-            runContext: activeRunContext
-        )
-    }
-
-    @BigSyncBackgroundActor
     private func makeSubscriptionAccountFence(
         attemptID: UUID,
         runContext: CloudKitSynchronizer.RunContext?
@@ -540,26 +531,6 @@ public extension CloudKitSynchronizer {
         )
     }
     
-    @BigSyncBackgroundActor
-    fileprivate func cancelSubscription(identifier: String, completion: ((Error?)->())?) {
-        Task { @BigSyncBackgroundActor [weak self] in
-            guard let self else {
-                completion?(CancellationError())
-                return
-            }
-            do {
-                let accountFence = try await makeSubscriptionAccountFence()
-                try await cancelSubscription(
-                    identifier: identifier,
-                    accountFence: accountFence
-                )
-                completion?(nil)
-            } catch {
-                completion?(error)
-            }
-        }
-    }
-
     @BigSyncBackgroundActor
     fileprivate func cancelSubscription(
         identifier: String,
