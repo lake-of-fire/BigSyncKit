@@ -1,3 +1,4 @@
+# Qualification-only workflow. The job checks out the selected source SHA explicitly.
 name: RA1 selected package qualification
 on:
   push:
