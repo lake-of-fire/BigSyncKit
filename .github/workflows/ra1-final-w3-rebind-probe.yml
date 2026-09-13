@@ -1,0 +1,138 @@
+name: RA-1 W3 DEBUG rebind probe
+on:
+  push:
+    branches: [codex/ra1-final-w3-rebind-probe-20260913]
+permissions:
+  contents: read
+concurrency:
+  group: ra1-final-w3-rebind-probe
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/BigSyncKit
+          ref: b1cde24b2e22e68a5cd056b865bc53f7fd491e2a
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Capture exact identity
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ra1-w3-rebind"
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-w3-rebind/identity.txt"
+          git -C ../RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-rebind/realm-swift-gaps.txt"
+          git -C ../SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-rebind/swift-utilities.txt"
+          swift --version | tee "$RUNNER_TEMP/ra1-w3-rebind/toolchain.txt"
+      - name: Apply DEBUG rebind repair in workspace
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
+          text = path.read_text()
+          old = '''        if allowsRecordZoneRebindingForTesting,
+             modelAdapterDictionary.isEmpty,
+             adapter.recordZoneID != recordZoneID {
+            recordZoneID = adapter.recordZoneID
+            durableStateNamespace = Self.makeDurableStateNamespace(
+                identifier: identifier,
+                containerIdentifier: containerIdentifier,
+                databaseScope: database.databaseScope,
+                recordZoneID: adapter.recordZoneID
+            )
+        }
+'''
+          new = '''        if allowsRecordZoneRebindingForTesting,
+             modelAdapterDictionary.isEmpty,
+             adapter.recordZoneID != recordZoneID {
+            recordZoneID = adapter.recordZoneID
+            durableStateNamespace = Self.makeDurableStateNamespace(
+                identifier: identifier,
+                containerIdentifier: containerIdentifier,
+                databaseScope: database.databaseScope,
+                recordZoneID: adapter.recordZoneID
+            )
+            do {
+                let result = try BackupDetection.run(
+                    store: keyValueStore,
+                    namespace: durableStateNamespace,
+                    sharedSentinelBaseURL: backupDetectionBaseURL
+                )
+                refreshBackupRestoreRequirement()
+                backupDetectionError = nil
+                if result == .restoredFromBackup || backupRestoreDetected {
+                    accountScopeAuthorityFence.poison()
+                    clearDeviceIdentifier()
+                    try invalidateAccountScopeLeaseDurably()
+                    queueAccountScopeInvalidation(.restoreDetected)
+                }
+            } catch {
+                accountScopeAuthorityFence.poison()
+                backupDetectionError = error
+                logger.error("QSCloudKitSynchronizer >> Backup detection failed after test-only zone rebind: \\(error)")
+            }
+        }
+'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected one rebind block, found {count}')
+          path.write_text(text.replace(old, new))
+          PY
+          git diff --check
+          git diff -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift | tee "$RUNNER_TEMP/ra1-w3-rebind/source.patch"
+      - name: Execute focused and full package probes
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        run: |
+          set -u
+          set -o pipefail
+          out="$RUNNER_TEMP/ra1-w3-rebind"
+          : > "$out/status.txt"
+          run_one() {
+            label="$1"
+            filter="$2"
+            set +e
+            swift test --filter "$filter" 2>&1 | tee "$out/$label.log"
+            code=${PIPESTATUS[0]}
+            set -e
+            printf '%s=%s\n' "$label" "$code" | tee -a "$out/status.txt"
+          }
+          set -e
+          run_one authority testAccountSwitchDuringUploadPreparationSkipsCloudKitMutation
+          run_one partial testMixedPartialUploadFailureDoesNotDiscardTheUnresolvedError
+          run_one cancellation testPublicCacheResetCannotBypassCancellationBarrier
+          run_one owned testRealUploadLoopReplacesStalePendingMarkWithNewerServerEmptyState
+          run_one replay RA1InboundReplayTests
+          set +e
+          swift test 2>&1 | tee "$out/full.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          printf 'full=%s\n' "$code" | tee -a "$out/status.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ra1-final-w3-rebind-probe
+          path: ${{ runner.temp }}/ra1-w3-rebind/
+          retention-days: 7
+          if-no-files-found: error
