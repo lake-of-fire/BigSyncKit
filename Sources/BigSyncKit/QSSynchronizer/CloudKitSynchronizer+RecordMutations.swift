@@ -294,8 +294,14 @@ extension CloudKitSynchronizer {
                records.count >= requestedBatchSize {
                 increaseBatchSize()
             }
+            // A successful acknowledgement can forward a newer target journal
+            // generation into tracking. A short batch is therefore not proof of
+            // quiescence. Give newly published record work another preparation
+            // turn; deletion-only or differently restricted work yields an empty
+            // record batch and returns immediately to its owning phase.
             guard handledFailures > 0
-                    || records.count >= requestedBatchSize else { return }
+                    || records.count >= requestedBatchSize
+                    || adapter.hasChanges else { return }
             await Task.yield()
         }
     }
@@ -454,7 +460,13 @@ extension CloudKitSynchronizer {
             if handledFailures == 0, recordIDs.count >= requestedBatchSize {
                 increaseBatchSize()
             }
-            guard handledFailures > 0 || recordIDs.count >= requestedBatchSize else { return }
+            // Deletion acknowledgement has the same journal-forwarding
+            // semantics as upload acknowledgement. If it exposes a newer
+            // deletion generation, consume it in this owned deletion drain
+            // instead of deferring it solely because the prior batch was short.
+            guard handledFailures > 0
+                    || recordIDs.count >= requestedBatchSize
+                    || adapter.hasChanges else { return }
             await Task.yield()
         }
     }
