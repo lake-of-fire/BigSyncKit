@@ -42,17 +42,36 @@ jobs:
           git -C ../RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-baseline/realm-swift-gaps.txt"
           git -C ../SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-baseline/swift-utilities.txt"
           swift --version | tee "$RUNNER_TEMP/ra1-w3-baseline/toolchain.txt"
-      - name: Baseline owned-revision regression
-        working-directory: BigSyncKit
-        run: |
-          set -o pipefail
-          swift test --filter testRealUploadLoopReplacesStalePendingMarkWithNewerServerEmptyState 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/owned-revision.log"
-      - name: Baseline authority regression
+      - name: Isolated authority regression
+        continue-on-error: true
         working-directory: BigSyncKit
         run: |
           set -o pipefail
           swift test --filter testAccountSwitchDuringUploadPreparationSkipsCloudKitMutation 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/authority.log"
+      - name: Isolated partial-failure regression
+        if: always()
+        continue-on-error: true
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter testMixedPartialUploadFailureDoesNotDiscardTheUnresolvedError 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/partial-failure.log"
+      - name: Isolated cancellation-barrier regression
+        if: always()
+        continue-on-error: true
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter testPublicCacheResetCannotBypassCancellationBarrier 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/cancellation-barrier.log"
+      - name: Isolated owned-revision regression
+        if: always()
+        continue-on-error: true
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter testRealUploadLoopReplacesStalePendingMarkWithNewerServerEmptyState 2>&1 | tee "$RUNNER_TEMP/ra1-w3-baseline/owned-revision.log"
       - name: Baseline full BigSyncKit suite
+        if: always()
+        continue-on-error: true
         working-directory: BigSyncKit
         env:
           BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
