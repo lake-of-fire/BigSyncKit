@@ -1,0 +1,107 @@
+name: Apply subscription regression test corrections
+
+on:
+  push:
+    branches:
+      - fix/subscription-regression-tests-20260913
+    paths:
+      - .github/apply-subscription-regression-tests.py
+      - .github/workflows/apply-subscription-regression-tests.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-qualify:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Verify exact composition
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "1922acb092e99bd55d331734bcca97dbb67e946a" || test "$(git merge-base HEAD 1922acb092e99bd55d331734bcca97dbb67e946a)" = "1922acb092e99bd55d331734bcca97dbb67e946a"
+          test "$(git -C ../RealmSwiftGaps rev-parse HEAD)" = "2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2"
+          test "$(git -C ../SwiftUtilities rev-parse HEAD)" = "f437c7d06fc631cd7a67731279411c417cdf8077"
+      - name: Apply exact test corrections
+        working-directory: BigSyncKit
+        run: python3 .github/apply-subscription-regression-tests.py
+      - name: Verify test-only bounded diff
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          python3 - <<'PY'
+          import subprocess
+          expected = [
+              "Tests/BigSyncKitTests/BigSyncKitTests.swift",
+              "Tests/BigSyncKitTests/HotfixSubscriptionSafetyTests.swift",
+          ]
+          changed = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
+          print("\n".join(changed))
+          if changed != expected:
+              raise SystemExit(f"unexpected changed-file set/order: {changed!r}")
+          PY
+      - name: Run focused subscription suites
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --filter HotfixSubscriptionSafetyTests
+          swift test --filter SubscriptionCacheRevalidationTests
+          swift test --filter SubscriptionCancellationOwnershipTests
+          swift test --filter SubscriptionIntentOrderingTests
+      - name: Run full package suite
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set +e
+          swift test > /tmp/bigsync-full.log 2>&1
+          status=$?
+          tail -160 /tmp/bigsync-full.log || true
+          if [ "$status" -ne 0 ]; then
+            mkdir -p .github/qualification
+            {
+              echo "# Subscription regression full-suite failures"
+              echo
+              echo "exit_status: $status"
+              echo
+              grep -E "error: -\\[|Test Case .* failed|Test Suite .* failed|Executed .* failures" /tmp/bigsync-full.log || true
+            } > .github/qualification/subscription-regression-full-suite.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/qualification/subscription-regression-full-suite.txt
+            git commit -m "Record remaining subscription regression failures"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            exit "$status"
+          fi
+      - name: Publish corrected tests only
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/apply-subscription-regression-tests.py
+          rm .github/workflows/apply-subscription-regression-tests.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Align subscription regressions with ownership revalidation"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
