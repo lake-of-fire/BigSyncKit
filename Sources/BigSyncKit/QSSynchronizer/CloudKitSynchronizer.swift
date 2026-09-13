@@ -664,6 +664,20 @@ final class AccountScopeAuthorityFence: @unchecked Sendable {
         return try body()
     }
 
+    /// Serializes a commit which is itself recovery for this exact poisoned
+    /// generation. Explicit account-port activation performs two fresh account
+    /// reads before entering here, but must not reopen ordinary writer authority.
+    /// A newer synchronous poison still wins by advancing the generation first.
+    func withMatchingInvalidationGeneration<T>(
+        _ expected: UInt64,
+        _ body: () throws -> T
+    ) rethrows -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard invalidationGeneration == expected else { return nil }
+        return try body()
+    }
+
     func poison(requiresGenerationRotation: Bool = true) {
         lock.lock()
         invalidationGeneration += 1
@@ -2746,11 +2760,19 @@ public class CloudKitSynchronizer: NSObject {
               try pendingCloudAccountPortRequirement() == expected else {
             throw BigSyncCloudAccountPortError.corruptRequirement
         }
-        let attemptID = synchronizationAttemptID
-        guard let fenceGeneration = accountScopeAuthorityFence
-            .authorizedInvalidationGenerationSnapshot else {
+        // A durable pending port is the recovery gate itself. Activation may
+        // therefore start while ordinary writer authority is poisoned, including
+        // after process restart, but never while restore/account cleanup still
+        // owns application-side invalidation.
+        refreshBackupRestoreRequirement()
+        guard backupDetectionError == nil,
+              !backupRestoreDetected,
+              pendingAccountScopeInvalidation == nil else {
             throw CancellationError()
         }
+        let attemptID = synchronizationAttemptID
+        let fenceGeneration =
+            accountScopeAuthorityFence.invalidationGenerationSnapshot
         let accountIdentifier = try await accountIdentifierProvider()
         try checkAccountValidationAttempt(
             attemptID,
@@ -2774,9 +2796,15 @@ public class CloudKitSynchronizer: NSObject {
             attemptID,
             fenceGeneration: fenceGeneration
         )
+        refreshBackupRestoreRequirement()
+        guard backupDetectionError == nil,
+              !backupRestoreDetected,
+              pendingAccountScopeInvalidation == nil else {
+            throw CancellationError()
+        }
 
         guard try accountScopeAuthorityFence
-            .withAuthorizedInvalidationGeneration(fenceGeneration, {
+            .withMatchingInvalidationGeneration(fenceGeneration, {
                 _ = try BigSyncReplicaBindingStateStore.activatePort(
                     expected,
                     store: keyValueStore,
