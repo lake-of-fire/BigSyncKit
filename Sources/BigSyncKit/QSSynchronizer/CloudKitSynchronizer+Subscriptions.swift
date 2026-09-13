@@ -277,29 +277,32 @@ public extension CloudKitSynchronizer {
     func cancelSubscriptionForChangesInDatabase() async throws {
         let accountFence = try await makeSubscriptionAccountFence()
         let expectedSubscriptionID = ownedSubscriptionID(kind: "database")
-        let subscriptionID: String?
-        if let stored = subscriptionIDForDatabaseSubscription() {
-            if stored == expectedSubscriptionID {
-                subscriptionID = stored
-            } else {
-                // Pre-v2 code may have persisted another client's ID. Clear
-                // only our local pointer; never delete an unowned server
-                // subscription.
-                try persistDatabaseSubscriptionID(nil)
-                subscriptionID = try await subscriptionStore.subscription(
-                    withID: expectedSubscriptionID
-                ).flatMap { $0 is CKDatabaseSubscription ? $0.subscriptionID : nil }
-                try await revalidateSubscriptionAccountFence(accountFence)
-            }
-        } else {
-            subscriptionID = try await subscriptionStore.subscription(
-                withID: expectedSubscriptionID
-            ).flatMap { $0 is CKDatabaseSubscription ? $0.subscriptionID : nil }
-            try await revalidateSubscriptionAccountFence(accountFence)
+        if let stored = subscriptionIDForDatabaseSubscription(),
+           stored != expectedSubscriptionID {
+            // Pre-v2 code may have persisted another client's ID. Clear only
+            // our local pointer; never delete an unowned server subscription.
+            try persistDatabaseSubscriptionID(nil)
         }
-        guard let subscriptionID else { return }
+
+        let existing = try await subscriptionStore.subscription(
+            withID: expectedSubscriptionID
+        )
+        try await revalidateSubscriptionAccountFence(accountFence)
+        guard let existing else {
+            // Exact absence already satisfies cancellation. Clear stale local
+            // registration without issuing a delete for a nonexistent object.
+            try persistDatabaseSubscriptionID(nil)
+            return
+        }
+        guard existing is CKDatabaseSubscription else {
+            // Subscribe already treats an incompatible deterministic-ID object
+            // as unowned. Cancellation must not become a destructive escape
+            // hatch for that same collision.
+            try persistDatabaseSubscriptionID(nil)
+            throw CocoaError(.coderValueNotFound)
+        }
         try await cancelSubscription(
-            identifier: subscriptionID,
+            identifier: expectedSubscriptionID,
             accountFence: accountFence
         )
     }
@@ -333,34 +336,27 @@ public extension CloudKitSynchronizer {
             kind: "zone",
             zoneID: zoneID
         )
-        let resolvedSubscriptionID: String?
-        if let stored = subscriptionID(forRecordZoneID: zoneID) {
-            if stored == expectedSubscriptionID {
-                resolvedSubscriptionID = stored
-            } else {
-                try persistSubscriptionID(nil, for: zoneID)
-                resolvedSubscriptionID = try await subscriptionStore.subscription(
-                    withID: expectedSubscriptionID
-                ).flatMap { subscription in
-                    guard let zoneSubscription = subscription as? CKRecordZoneSubscription,
-                          zoneSubscription.zoneID == zoneID else { return nil }
-                    return zoneSubscription.subscriptionID
-                }
-                try await revalidateSubscriptionAccountFence(accountFence)
-            }
-        } else {
-            resolvedSubscriptionID = try await subscriptionStore.subscription(
-                withID: expectedSubscriptionID
-            ).flatMap { subscription in
-                guard let zoneSubscription = subscription as? CKRecordZoneSubscription,
-                      zoneSubscription.zoneID == zoneID else { return nil }
-                return zoneSubscription.subscriptionID
-            }
-            try await revalidateSubscriptionAccountFence(accountFence)
+        if let stored = subscriptionID(forRecordZoneID: zoneID),
+           stored != expectedSubscriptionID {
+            // A foreign local pointer is never deletion authority.
+            try persistSubscriptionID(nil, for: zoneID)
         }
-        guard let resolvedSubscriptionID else { return }
+
+        let existing = try await subscriptionStore.subscription(
+            withID: expectedSubscriptionID
+        )
+        try await revalidateSubscriptionAccountFence(accountFence)
+        guard let existing else {
+            try persistSubscriptionID(nil, for: zoneID)
+            return
+        }
+        guard let zoneSubscription = existing as? CKRecordZoneSubscription,
+              zoneSubscription.zoneID == zoneID else {
+            try persistSubscriptionID(nil, for: zoneID)
+            throw CocoaError(.coderValueNotFound)
+        }
         try await cancelSubscription(
-            identifier: resolvedSubscriptionID,
+            identifier: expectedSubscriptionID,
             accountFence: accountFence
         )
     }
