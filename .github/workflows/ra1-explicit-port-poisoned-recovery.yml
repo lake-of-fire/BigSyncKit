@@ -1,0 +1,38 @@
+name: RA-1 explicit port poisoned recovery
+
+on:
+  push:
+    branches:
+      - fix/ra1-explicit-port-poisoned-recovery-20260913
+
+permissions:
+  contents: write
+
+jobs:
+  apply-bounded-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/ra1-explicit-port-poisoned-recovery-20260913
+          fetch-depth: 0
+
+      - name: Apply deterministic source correction
+        run: |
+          set -euo pipefail
+          python3 Tools/apply-ra1-explicit-port-poisoned-recovery.py
+          git diff --check
+          git diff -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          grep -q 'withMatchingInvalidationGeneration' Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          grep -q 'pendingAccountScopeInvalidation == nil' Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+
+      - name: Publish source and remove temporary patch machinery
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          git rm -f .github/workflows/ra1-explicit-port-poisoned-recovery.yml Tools/apply-ra1-explicit-port-poisoned-recovery.py
+          git commit -m 'RA-1: recover explicit port while writer authority stays poisoned'
+          git push origin HEAD:fix/ra1-explicit-port-poisoned-recovery-20260913
