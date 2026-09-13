@@ -5,6 +5,10 @@ on:
     branches: [codex/ra1-selected-package-qualification-17323205-20260913]
     paths:
       - .github/workflows/ra1-selected-package-qualification-17323205-20260913.yml
+  pull_request:
+    branches: [codex/ra1-pro-w1-integration-20260912]
+    paths:
+      - .github/workflows/ra1-selected-package-qualification-17323205-20260913.yml
 permissions:
   contents: read
 jobs:
