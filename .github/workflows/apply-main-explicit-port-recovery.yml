@@ -19,7 +19,28 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Verify dependency identities
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C ../RealmSwiftGaps rev-parse HEAD)" = "2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2"
+          test "$(git -C ../SwiftUtilities rev-parse HEAD)" = "f437c7d06fc631cd7a67731279411c417cdf8077"
       - name: Apply exact-preimage patch
+        working-directory: BigSyncKit
         shell: bash
         run: |
           set -euo pipefail
@@ -30,6 +51,7 @@ jobs:
           path.write_text(path.read_text().rstrip() + "\n")
           PY
       - name: Verify bounded diff
+        working-directory: BigSyncKit
         shell: bash
         run: |
           set -euo pipefail
@@ -46,10 +68,13 @@ jobs:
               raise SystemExit(f"unexpected changed-file set/order: {changed!r}")
           PY
       - name: Run focused account-fencing suite
+        working-directory: BigSyncKit
         run: swift test --filter CloudKitSynchronizerAccountFencingTests
       - name: Run full package suite
+        working-directory: BigSyncKit
         run: swift test
       - name: Publish source-only postimage
+        working-directory: BigSyncKit
         shell: bash
         run: |
           set -euo pipefail
