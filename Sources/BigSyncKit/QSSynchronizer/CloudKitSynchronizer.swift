@@ -505,9 +505,45 @@ final class AccountScopeAuthorityFence: @unchecked Sendable {
     private let lock = NSLock()
     private var isPoisoned = true
     private var rotatesGeneration = false
+    private var invalidationGeneration: UInt64 = 0
+
+    /// Monotonic identity for one account-validation authority window. This is
+    /// readable while poisoned because fresh validation is itself responsible
+    /// for reopening authority, but it must lose to every newer synchronous
+    /// account-change poison before actor-isolated cancellation catches up.
+    var invalidationGenerationSnapshot: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return invalidationGeneration
+    }
+
+    /// External commit paths may capture authority only while the synchronous
+    /// fence is already open. Fresh validation uses the raw generation above.
+    var authorizedInvalidationGenerationSnapshot: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isPoisoned else { return nil }
+        return invalidationGeneration
+    }
+
+    /// Makes one non-suspending authority commit atomic with respect to poison.
+    /// If poison wins first, no mutation runs. If it arrives during the body it
+    /// waits for this lock, then immediately revokes the just-published result.
+    func withAuthorizedInvalidationGeneration<T>(
+        _ expected: UInt64,
+        _ body: () throws -> T
+    ) rethrows -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isPoisoned, invalidationGeneration == expected else {
+            return nil
+        }
+        return try body()
+    }
 
     func poison(requiresGenerationRotation: Bool = true) {
         lock.lock()
+        invalidationGeneration &+= 1
         isPoisoned = true
         rotatesGeneration = rotatesGeneration || requiresGenerationRotation
         lock.unlock()
@@ -518,6 +554,16 @@ final class AccountScopeAuthorityFence: @unchecked Sendable {
         isPoisoned = false
         rotatesGeneration = false
         lock.unlock()
+    }
+
+    @discardableResult
+    func clear(ifInvalidationGenerationMatches expected: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard invalidationGeneration == expected else { return false }
+        isPoisoned = false
+        rotatesGeneration = false
+        return true
     }
 
     var rejectsAuthority: Bool {
@@ -1007,6 +1053,10 @@ public class CloudKitSynchronizer: NSObject {
     internal var synchronizationAttemptID = UUID()
     internal var synchronizationRunID = UUID()
     internal var activeRunContext: RunContext?
+    private var activeAccountValidationAuthority: (
+        attemptID: UUID,
+        fenceGeneration: UInt64
+    )?
     internal var activeReceiptAuthorizationID: UUID?
     private var reservedReceiptAuthorizationID: UUID?
     internal var outboundRecoveryID: UUID?
@@ -1597,6 +1647,8 @@ public class CloudKitSynchronizer: NSObject {
         cancelSync = false
         syncing = true
         retrySleepUntil = nil
+        let accountValidationFenceGeneration =
+            accountScopeAuthorityFence.invalidationGenerationSnapshot
         let attemptID = UUID()
         synchronizationAttemptID = attemptID
         activeRunContext = nil
@@ -1628,9 +1680,13 @@ public class CloudKitSynchronizer: NSObject {
                 )
                 try await performPendingAccountScopeInvalidation()
                 try await validateAccountAvailabilityIfNeeded(
-                    attemptID: attemptID
+                    attemptID: attemptID,
+                    fenceGeneration: accountValidationFenceGeneration
                 )
-                let accountIdentifier = try await validateSynchronizationAccount()
+                let accountIdentifier = try await validateSynchronizationAccount(
+                    attemptID: attemptID,
+                    fenceGeneration: accountValidationFenceGeneration
+                )
                 reportProgress("account-identity-validated")
                 let replicaBindingGenerationIdentifier = try
                     activeReplicaBindingGenerationIdentifierForRun(
@@ -1922,13 +1978,21 @@ public class CloudKitSynchronizer: NSObject {
         _ context: BigSyncInitialReplicaBindingContext
     ) async throws {
         guard let expectedAccountIdentifier = context.accountIdentifier,
-              let validationAttemptID = context.validationAttemptID else {
+              let validationAttemptID = context.validationAttemptID,
+              let authority = activeAccountValidationAuthority,
+              authority.attemptID == validationAttemptID else {
             throw CancellationError()
         }
-        try checkAccountValidationAttempt(validationAttemptID)
+        try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: authority.fenceGeneration
+        )
         try validatePendingReplicaBinding(context)
         let currentAccountIdentifier = try await accountIdentifierProvider()
-        try checkAccountValidationAttempt(validationAttemptID)
+        try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: authority.fenceGeneration
+        )
         try validatePendingReplicaBinding(context)
         guard currentAccountIdentifier == expectedAccountIdentifier,
               Self.accountScopeIdentifier(for: currentAccountIdentifier)
@@ -2065,21 +2129,35 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
-    private func checkAccountValidationAttempt(_ attemptID: UUID) throws {
+    private func checkAccountValidationAttempt(
+        _ attemptID: UUID,
+        fenceGeneration: UInt64? = nil
+    ) throws {
         try Task.checkCancellation()
-        guard synchronizationAttemptID == attemptID else {
+        guard synchronizationAttemptID == attemptID,
+              fenceGeneration.map({
+                  accountScopeAuthorityFence.invalidationGenerationSnapshot == $0
+              }) ?? true else {
             throw CancellationError()
         }
     }
 
     @BigSyncBackgroundActor
     private func validateAccountAvailabilityIfNeeded(
-        attemptID: UUID
+        attemptID: UUID,
+        fenceGeneration: UInt64
     ) async throws {
+        try checkAccountValidationAttempt(
+            attemptID,
+            fenceGeneration: fenceGeneration
+        )
         guard accountValidationRequired
                 || cancelledDueToUnauthentication else { return }
         let status = try await accountStatusProvider()
-        try checkAccountValidationAttempt(attemptID)
+        try checkAccountValidationAttempt(
+            attemptID,
+            fenceGeneration: fenceGeneration
+        )
         switch status {
         case .available:
             return
@@ -2105,7 +2183,26 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     @BigSyncBackgroundActor
-    private func validateSynchronizationAccount() async throws -> String {
+    private func validateSynchronizationAccount(
+        attemptID validationAttemptID: UUID,
+        fenceGeneration validationFenceGeneration: UInt64
+    ) async throws -> String {
+        try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: validationFenceGeneration
+        )
+        activeAccountValidationAuthority = (
+            validationAttemptID,
+            validationFenceGeneration
+        )
+        defer {
+            if activeAccountValidationAuthority?.attemptID
+                    == validationAttemptID,
+               activeAccountValidationAuthority?.fenceGeneration
+                    == validationFenceGeneration {
+                activeAccountValidationAuthority = nil
+            }
+        }
         // Every replacement policy must distinguish absent account history
         // from an unreadable or malformed stored marker before account I/O.
         let previousAccountIdentifier = try durableAccountIdentifier()
@@ -2131,9 +2228,11 @@ public class CloudKitSynchronizer: NSObject {
         } else {
             preparedReplicaBinding = nil
         }
-        let validationAttemptID = synchronizationAttemptID
         let currentAccountIdentifier = try await accountIdentifierProvider()
-        try checkAccountValidationAttempt(validationAttemptID)
+        try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: validationFenceGeneration
+        )
         var confirmedAccountIdentifier = currentAccountIdentifier
         let currentAccountScopeIdentifier = Self.accountScopeIdentifier(
             for: currentAccountIdentifier
@@ -2163,7 +2262,10 @@ public class CloudKitSynchronizer: NSObject {
             // Confirm the provider still reports the same replacement account
             // before either publishing a port gate or preparing reconciliation.
             confirmedAccountIdentifier = try await accountIdentifierProvider()
-            try checkAccountValidationAttempt(validationAttemptID)
+            try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: validationFenceGeneration
+        )
         }
         guard confirmedAccountIdentifier == currentAccountIdentifier else {
             accountValidationRequired = true
@@ -2201,7 +2303,8 @@ public class CloudKitSynchronizer: NSObject {
             try await admitInitialReplicaBindingIfNeeded(
                 accountIdentifier: confirmedAccountIdentifier,
                 accountScopeIdentifier: currentScope,
-                validationAttemptID: validationAttemptID
+                validationAttemptID: validationAttemptID,
+                validationFenceGeneration: validationFenceGeneration
             )
             _ = try BigSyncReplicaBindingStateStore.bindInitialAccount(
                 currentScope,
@@ -2253,7 +2356,8 @@ public class CloudKitSynchronizer: NSObject {
                         generationIdentifier:
                             pending.bindingGenerationIdentifier,
                         expectedBinding: binding,
-                        validationAttemptID: validationAttemptID
+                        validationAttemptID: validationAttemptID,
+                        validationFenceGeneration: validationFenceGeneration
                     )
                     binding = try BigSyncReplicaBindingStateStore.activatePort(
                         pending,
@@ -2296,7 +2400,8 @@ public class CloudKitSynchronizer: NSObject {
                     generationIdentifier:
                         pending.bindingGenerationIdentifier,
                     expectedBinding: binding,
-                    validationAttemptID: validationAttemptID
+                    validationAttemptID: validationAttemptID,
+                    validationFenceGeneration: validationFenceGeneration
                 )
                 binding = try BigSyncReplicaBindingStateStore.activatePort(
                     pending,
@@ -2308,7 +2413,8 @@ public class CloudKitSynchronizer: NSObject {
                 try await admitInitialReplicaBindingIfNeeded(
                     accountIdentifier: confirmedAccountIdentifier,
                     accountScopeIdentifier: currentScope,
-                    validationAttemptID: validationAttemptID
+                    validationAttemptID: validationAttemptID,
+                    validationFenceGeneration: validationFenceGeneration
                 )
                 binding = try BigSyncReplicaBindingStateStore
                     .bindInitialAccount(
@@ -2331,7 +2437,10 @@ public class CloudKitSynchronizer: NSObject {
         if didReplaceAccount || requiresLocalDatasetRebootstrap {
             accountValidationRequired = true
             try await invalidateAccountScope(.accountReplaced)
-            try checkAccountValidationAttempt(validationAttemptID)
+            try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: validationFenceGeneration
+        )
             let currentScope = currentAccountScopeIdentifier
             let activeBindingGenerationIdentifier = try
                 activeReplicaBindingGenerationIdentifierForRun(
@@ -2360,6 +2469,10 @@ public class CloudKitSynchronizer: NSObject {
             try clearAllStoredSubscriptionIDs()
             clearPersistedTransientRetryState()
         }
+        try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: validationFenceGeneration
+        )
         try establishAccountScopeLeaseDurably(
             accountIdentifier: confirmedAccountIdentifier,
             forceInvalidation:
@@ -2371,10 +2484,19 @@ public class CloudKitSynchronizer: NSObject {
         // it can never observe a new account paired with an old completed
         // migration and rediscover retained user data as fresh uploads.
         try persistAccountIdentifier(confirmedAccountIdentifier)
+        try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: validationFenceGeneration
+        )
         accountValidationRequired = false
+        guard accountScopeAuthorityFence.clear(
+            ifInvalidationGenerationMatches: validationFenceGeneration
+        ) else {
+            accountValidationRequired = true
+            throw CancellationError()
+        }
         cancelSync = false
         cancelledDueToUnauthentication = false
-        accountScopeAuthorityFence.clear()
         return confirmedAccountIdentifier
     }
 
@@ -2385,7 +2507,8 @@ public class CloudKitSynchronizer: NSObject {
     private func admitInitialReplicaBindingIfNeeded(
         accountIdentifier: String,
         accountScopeIdentifier: String,
-        validationAttemptID: UUID
+        validationAttemptID: UUID,
+        validationFenceGeneration: UInt64
     ) async throws {
         guard let expectedBinding = try BigSyncReplicaBindingStateStore.load(
             store: keyValueStore,
@@ -2405,7 +2528,8 @@ public class CloudKitSynchronizer: NSObject {
             generationIdentifier:
                 expectedBinding.activeGenerationIdentifier,
             expectedBinding: expectedBinding,
-            validationAttemptID: validationAttemptID
+            validationAttemptID: validationAttemptID,
+            validationFenceGeneration: validationFenceGeneration
         )
     }
 
@@ -2414,7 +2538,8 @@ public class CloudKitSynchronizer: NSObject {
         accountScopeIdentifier: String,
         generationIdentifier: String,
         expectedBinding: BigSyncReplicaBindingSnapshot,
-        validationAttemptID: UUID
+        validationAttemptID: UUID,
+        validationFenceGeneration: UInt64
     ) async throws {
         guard let handler = initialReplicaBindingAdmissionHandler else {
             throw BigSyncCloudAccountPortError
@@ -2428,9 +2553,15 @@ public class CloudKitSynchronizer: NSObject {
                 generationIdentifier,
             validationAttemptID: validationAttemptID
         ))
-        try checkAccountValidationAttempt(validationAttemptID)
+        try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: validationFenceGeneration
+        )
         let revalidatedAccountIdentifier = try await accountIdentifierProvider()
-        try checkAccountValidationAttempt(validationAttemptID)
+        try checkAccountValidationAttempt(
+            validationAttemptID,
+            fenceGeneration: validationFenceGeneration
+        )
         guard revalidatedAccountIdentifier == accountIdentifier else {
             accountValidationRequired = true
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
@@ -2494,15 +2625,25 @@ public class CloudKitSynchronizer: NSObject {
             throw BigSyncCloudAccountPortError.corruptRequirement
         }
         let attemptID = synchronizationAttemptID
+        guard let fenceGeneration = accountScopeAuthorityFence
+            .authorizedInvalidationGenerationSnapshot else {
+            throw CancellationError()
+        }
         let accountIdentifier = try await accountIdentifierProvider()
-        try checkAccountValidationAttempt(attemptID)
+        try checkAccountValidationAttempt(
+            attemptID,
+            fenceGeneration: fenceGeneration
+        )
         guard Self.accountScopeIdentifier(for: accountIdentifier)
                 == expected.destinationAccountScopeIdentifier,
               try pendingCloudAccountPortRequirement() == expected else {
             throw BigSyncCloudAccountPortError.corruptRequirement
         }
         let confirmedAccountIdentifier = try await accountIdentifierProvider()
-        try checkAccountValidationAttempt(attemptID)
+        try checkAccountValidationAttempt(
+            attemptID,
+            fenceGeneration: fenceGeneration
+        )
         guard confirmedAccountIdentifier == accountIdentifier,
               try pendingCloudAccountPortRequirement() == expected else {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
@@ -2515,12 +2656,22 @@ public class CloudKitSynchronizer: NSObject {
         accountValidationRequired = true
         cancelSync = true
         portActivationRequiresWorkerRestart = true
-        _ = try BigSyncReplicaBindingStateStore.activatePort(
-            expected,
-            store: keyValueStore,
-            key: replicaBindingStateKey
+        try checkAccountValidationAttempt(
+            attemptID,
+            fenceGeneration: fenceGeneration
         )
-        try persistAccountIdentifier(confirmedAccountIdentifier)
+        guard try accountScopeAuthorityFence
+            .withAuthorizedInvalidationGeneration(fenceGeneration, {
+                _ = try BigSyncReplicaBindingStateStore.activatePort(
+                    expected,
+                    store: keyValueStore,
+                    key: replicaBindingStateKey
+                )
+                try persistAccountIdentifier(confirmedAccountIdentifier)
+                return true
+            }) == true else {
+            throw CancellationError()
+        }
     }
 
     /// Stops an ordinary journal wakeup at the durable replica-binding gate.
@@ -3249,7 +3400,28 @@ public class CloudKitSynchronizer: NSObject {
 #if DEBUG
     @BigSyncBackgroundActor
     func _test_validateSynchronizationAccount() async throws {
-        _ = try await validateSynchronizationAccount()
+        let attemptID = synchronizationAttemptID
+        let fenceGeneration =
+            accountScopeAuthorityFence.invalidationGenerationSnapshot
+        _ = try await validateSynchronizationAccount(
+            attemptID: attemptID,
+            fenceGeneration: fenceGeneration
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func _test_validateAccountBootstrap() async throws {
+        let attemptID = synchronizationAttemptID
+        let fenceGeneration =
+            accountScopeAuthorityFence.invalidationGenerationSnapshot
+        try await validateAccountAvailabilityIfNeeded(
+            attemptID: attemptID,
+            fenceGeneration: fenceGeneration
+        )
+        _ = try await validateSynchronizationAccount(
+            attemptID: attemptID,
+            fenceGeneration: fenceGeneration
+        )
     }
 
     @BigSyncBackgroundActor
@@ -3266,6 +3438,7 @@ public class CloudKitSynchronizer: NSObject {
         synchronizationAttemptID = UUID()
         cancelAttemptCallbacks(for: cancelledAttemptID)
         activeRunContext = nil
+        activeAccountValidationAuthority = nil
         publicationConsumptionPending = false
         publicationFetchDeferralEligible = false
         activeReceiptAuthorizationID = nil
