@@ -2585,3 +2585,42 @@ extension CloudKitSynchronizerAccountFencingTests {
         XCTAssertNil(try synchronizer.accountScopeLease())
     }
 }
+
+extension CloudKitSynchronizerAccountFencingTests {
+    @BigSyncBackgroundActor
+    func testExplicitPortActivationCannotAdoptAlreadyPoisonedAuthority()
+    async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let authority = AccountAuthorityFenceReference()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { _ in }
+        )
+        authority.synchronizer = synchronizer
+        try await synchronizer._test_validateSynchronizationAccount()
+        await identity.replace(with: "account-b")
+
+        let requirement: BigSyncCloudAccountPortRequirement
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected an explicit dataset port requirement")
+            return
+        } catch BigSyncCloudAccountPortError.required(let pending) {
+            requirement = pending
+        }
+
+        await authority.poison()
+        do {
+            try await synchronizer.activateCloudAccountPort(requirement)
+            XCTFail("Expected poisoned port authority to be rejected")
+        } catch is CancellationError {
+        }
+
+        XCTAssertEqual(
+            try synchronizer.pendingCloudAccountPortRequirement(),
+            requirement
+        )
+    }
+}
