@@ -50,23 +50,25 @@ jobs:
           from pathlib import Path
           path = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
           text = path.read_text()
-          needle = '''            durableStateNamespace = Self.makeDurableStateNamespace(
-                identifier: identifier,
-                containerIdentifier: containerIdentifier,
-                databaseScope: database.databaseScope,
-                recordZoneID: adapter.recordZoneID
-            )
-'''
-          replacement = needle + '''            _ = try? BackupDetection.run(
-                store: keyValueStore,
-                namespace: durableStateNamespace,
-                sharedSentinelBaseURL: backupDetectionBaseURL
-            )
-'''
+          needle = (
+              "            durableStateNamespace = Self.makeDurableStateNamespace(\n"
+              "                identifier: identifier,\n"
+              "                containerIdentifier: containerIdentifier,\n"
+              "                databaseScope: database.databaseScope,\n"
+              "                recordZoneID: adapter.recordZoneID\n"
+              "            )\n"
+          )
+          addition = (
+              "            _ = try? BackupDetection.run(\n"
+              "                store: keyValueStore,\n"
+              "                namespace: durableStateNamespace,\n"
+              "                sharedSentinelBaseURL: backupDetectionBaseURL\n"
+              "            )\n"
+          )
           count = text.count(needle)
           if count != 1:
               raise SystemExit(f'expected one DEBUG rebind namespace assignment, found {count}')
-          path.write_text(text.replace(needle, replacement))
+          path.write_text(text.replace(needle, needle + addition))
           PY
           git diff --check
           git diff -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift | tee "$RUNNER_TEMP/ra1-w3-rebind/source.patch"
