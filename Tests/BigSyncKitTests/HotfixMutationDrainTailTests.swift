@@ -1,4 +1,5 @@
 import CloudKit
+import Foundation
 import Logging
 import RealmSwift
 import RealmSwiftGaps
