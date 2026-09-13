@@ -14,7 +14,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
       - name: Apply reviewed source changes
-        run: python3 .github/apply-authority-poison-followup.py
+        run: python3 .github/run-authority-poison-followup.py
       - name: Focused account and subscription qualification
         run: |
           swift test --filter CloudKitSynchronizerAccountFencingTests
@@ -25,6 +25,7 @@ jobs:
       - name: Commit qualified source and remove temporary tooling
         run: |
           rm .github/apply-authority-poison-followup.py
+          rm .github/run-authority-poison-followup.py
           rm .github/workflows/apply-authority-poison-followup.yml
           git add Sources Tests .github
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Fence active-run and subscription authority poison'
