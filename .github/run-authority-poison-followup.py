@@ -2,7 +2,8 @@ from pathlib import Path
 
 path = Path('.github/apply-authority-poison-followup.py')
 code = path.read_text()
-old = '''old_run = "\\n".join([
+
+old_indent = '''old_run = "\\n".join([
     II + "guard activeRunContext == context,",
     III + "synchronizationAttemptID == context.attemptID,",
     III + "synchronizationRunID == context.runID,",
@@ -15,7 +16,7 @@ new_run = "\\n".join([
     III + "!accountScopeAuthorityFence.rejectsAuthority,",
     III + "!cancelSync else {",
 ])'''
-new = '''HANG = "              "
+new_indent = '''HANG = "              "
 old_run = "\\n".join([
     II + "guard activeRunContext == context,",
     HANG + "synchronizationAttemptID == context.attemptID,",
@@ -29,8 +30,26 @@ new_run = "\\n".join([
     HANG + "!accountScopeAuthorityFence.rejectsAuthority,",
     HANG + "!cancelSync else {",
 ])'''
-count = code.count(old)
-if count != 1:
-    raise SystemExit(f'composer hanging-indent block changed: {count}')
-code = code.replace(old, new, 1)
+if code.count(old_indent) != 1:
+    raise SystemExit('composer hanging-indent block changed')
+code = code.replace(old_indent, new_indent, 1)
+
+old_helper = '''    II + "guard try accountScopeAuthorityFence.withAdmissibleOperationGeneration(",
+    III + "fence.authorityGeneration,",
+    III + "{ try body(); return true }",
+    II + ") == true else {",
+    III + "throw CancellationError()",
+    II + "}",'''
+new_helper = '''    II + "let committed = try accountScopeAuthorityFence",
+    III + ".withAdmissibleOperationGeneration(",
+    III + I + "fence.authorityGeneration,",
+    III + I + "{ try body(); return true }",
+    III + ")",
+    II + "guard committed == true else {",
+    III + "throw CancellationError()",
+    II + "}",'''
+if code.count(old_helper) != 1:
+    raise SystemExit('composer metadata-commit helper changed')
+code = code.replace(old_helper, new_helper, 1)
+
 exec(compile(code, str(path), 'exec'))
