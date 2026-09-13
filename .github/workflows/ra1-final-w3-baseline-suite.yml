@@ -1,4 +1,4 @@
-name: RA-1 W3 DEBUG rebind sentinel probe
+name: RA-1 W3 package harness repair probe
 on:
   push:
     branches: [codex/ra1-final-w3-rebind-probe2-20260913]
@@ -37,20 +37,21 @@ jobs:
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ra1-w3-rebind"
-          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-w3-rebind/identity.txt"
-          git -C ../RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-rebind/realm-swift-gaps.txt"
-          git -C ../SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-rebind/swift-utilities.txt"
-          swift --version | tee "$RUNNER_TEMP/ra1-w3-rebind/toolchain.txt"
-      - name: Patch DEBUG rebind sentinel in workspace
+          mkdir -p "$RUNNER_TEMP/ra1-w3-package"
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-w3-package/identity.txt"
+          git -C ../RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-package/realm-swift-gaps.txt"
+          git -C ../SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-package/swift-utilities.txt"
+          swift --version | tee "$RUNNER_TEMP/ra1-w3-package/toolchain.txt"
+      - name: Apply bounded DEBUG and fixture repairs in workspace
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
-          text = path.read_text()
-          needle = (
+
+          source = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
+          text = source.read_text()
+          old = (
               "            durableStateNamespace = Self.makeDurableStateNamespace(\n"
               "                identifier: identifier,\n"
               "                containerIdentifier: containerIdentifier,\n"
@@ -58,20 +59,53 @@ jobs:
               "                recordZoneID: adapter.recordZoneID\n"
               "            )\n"
           )
-          addition = (
-              "            _ = try? BackupDetection.run(\n"
-              "                store: keyValueStore,\n"
-              "                namespace: durableStateNamespace,\n"
-              "                sharedSentinelBaseURL: backupDetectionBaseURL\n"
-              "            )\n"
+          new = old + (
+              "            do {\n"
+              "                let result = try BackupDetection.run(\n"
+              "                    store: keyValueStore,\n"
+              "                    namespace: durableStateNamespace,\n"
+              "                    sharedSentinelBaseURL: backupDetectionBaseURL\n"
+              "                )\n"
+              "                refreshBackupRestoreRequirement()\n"
+              "                backupDetectionError = nil\n"
+              "                if result == .restoredFromBackup || backupRestoreDetected {\n"
+              "                    accountScopeAuthorityFence.poison()\n"
+              "                    clearDeviceIdentifier()\n"
+              "                    try invalidateAccountScopeLeaseDurably()\n"
+              "                    queueAccountScopeInvalidation(.restoreDetected)\n"
+              "                }\n"
+              "            } catch {\n"
+              "                accountScopeAuthorityFence.poison()\n"
+              "                backupDetectionError = error\n"
+              "                logger.error(\"QSCloudKitSynchronizer >> Backup detection failed after test-only zone rebind: \\(error)\")\n"
+              "            }\n"
           )
-          count = text.count(needle)
-          if count != 1:
-              raise SystemExit(f'expected one DEBUG rebind namespace assignment, found {count}')
-          path.write_text(text.replace(needle, needle + addition))
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one DEBUG rebind namespace assignment, found {text.count(old)}')
+          source.write_text(text.replace(old, new))
+
+          test = Path('Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift')
+          text = test.read_text()
+          old = (
+              "        f.adapter._testBeforeImportedRecordPersistenceWrite = { await f.refresh() }\n"
+              "        defer { f.adapter._testBeforeImportedRecordPersistenceWrite = nil }\n"
+              "        try await sync.synchronizeAdapter(f.adapter)\n"
+          )
+          new = (
+              "        f.adapter._testBeforeImportedRecordPersistenceWrite = { await f.refresh() }\n"
+              "        defer { f.adapter._testBeforeImportedRecordPersistenceWrite = nil }\n"
+              "        // This helper drives the lower-level upload loop directly. Detach\n"
+              "        // the ordinary wake delegate so a replacement generation cannot\n"
+              "        // start an unrelated full change-feed drain through this scripted IO.\n"
+              "        f.adapter.modelAdapterDelegate = nil\n"
+              "        try await sync.synchronizeAdapter(f.adapter)\n"
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one conflict-loop call site, found {text.count(old)}')
+          test.write_text(text.replace(old, new))
           PY
           git diff --check
-          git diff -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift | tee "$RUNNER_TEMP/ra1-w3-rebind/source.patch"
+          git diff -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift | tee "$RUNNER_TEMP/ra1-w3-package/source.patch"
       - name: Legacy BigSyncKitTests
         continue-on-error: true
         working-directory: BigSyncKit
@@ -79,21 +113,21 @@ jobs:
           BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
         run: |
           set -o pipefail
-          swift test --filter 'BigSyncKitTests.BigSyncKitTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-rebind/legacy.log"
+          swift test --filter 'BigSyncKitTests.BigSyncKitTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-package/legacy.log"
       - name: Owned revision
         if: always()
         continue-on-error: true
         working-directory: BigSyncKit
         run: |
           set -o pipefail
-          swift test --filter 'OwnedRecordRevisionTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-rebind/owned.log"
+          swift test --filter 'OwnedRecordRevisionTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-package/owned.log"
       - name: Replay regression
         if: always()
         continue-on-error: true
         working-directory: BigSyncKit
         run: |
           set -o pipefail
-          swift test --filter 'RA1InboundReplayTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-rebind/replay.log"
+          swift test --filter 'RA1InboundReplayTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-package/replay.log"
       - name: Full package
         if: always()
         continue-on-error: true
@@ -102,11 +136,11 @@ jobs:
           BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
         run: |
           set -o pipefail
-          swift test 2>&1 | tee "$RUNNER_TEMP/ra1-w3-rebind/full.log"
+          swift test 2>&1 | tee "$RUNNER_TEMP/ra1-w3-package/full.log"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ra1-final-w3-rebind-probe2
-          path: ${{ runner.temp }}/ra1-w3-rebind/
+          name: ra1-final-w3-package-harness-probe
+          path: ${{ runner.temp }}/ra1-w3-package/
           retention-days: 7
           if-no-files-found: error
