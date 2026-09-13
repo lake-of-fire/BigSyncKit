@@ -35,7 +35,11 @@ jobs:
           path = Path('Scripts/pr37_final_authority_patch.py')
           text = path.read_text()
           text = text.replace('        XCTAssertFalse(synchronizer._test_portActivationRequiresWorkerRestart)\n', '')
-          path.write_text(text)
+          old = """def replace_once(text: str, old: str, new: str, label: str) -> str:\n    count = text.count(old)\n    if count != 1:\n        raise SystemExit(f'{label}: expected one match, found {count}')\n    return text.replace(old, new, 1)\n"""
+          new = """def replace_once(text: str, old: str, new: str, label: str) -> str:\n    count = text.count(old)\n    if label == 'replacement confirmation indentation':\n        if count != 2:\n            raise SystemExit(f'{label}: expected two matches, found {count}')\n        return text.replace(old, new)\n    if label == 'post-invalidation indentation' and count == 0:\n        return text\n    if count != 1:\n        raise SystemExit(f'{label}: expected one match, found {count}')\n    return text.replace(old, new, 1)\n"""
+          if text.count(old) != 1:
+              raise SystemExit('replace_once helper changed unexpectedly')
+          path.write_text(text.replace(old, new, 1))
           PY
           python3 Scripts/pr37_final_authority_patch.py
           git diff --check
