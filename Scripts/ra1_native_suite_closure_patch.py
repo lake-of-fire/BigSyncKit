@@ -79,4 +79,30 @@ addition = '''    @BigSyncBackgroundActor
 
 '''
 replace_once(path, anchor, addition + anchor)
+
+path = 'Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift'
+anchor = '''        // Seed an unchanged foreign value through inbound replication, then make
+'''
+addition = '''        // This helper owns a direct adapter drain, not a background full sync.
+        // Mirror the enclosing production drain's ownership so normal journal
+        // delegate wakeups coalesce instead of starting a second attempt that
+        // the deliberately upload-only transport cannot service.
+        let attemptID = sync.synchronizationAttemptID
+        sync.syncing = true
+        sync.synchronizationDrainIsActive = true
+        defer {
+            sync.cancelSynchronization()
+            try? FileManager.default.removeItem(at: root)
+        }
+'''
+replace_once(path, anchor, addition + anchor)
+old = '''        let uploads = await io.uploadedValues()
+        XCTAssertEqual(uploads.first, local)'''
+new = '''        let uploads = await io.uploadedValues()
+        XCTAssertEqual(sync.synchronizationAttemptID, attemptID,
+                       "A journal wakeup must not replace the owned direct drain")
+        XCTAssertTrue(sync.syncing)
+        XCTAssertNil(sync.synchronizationTask)
+        XCTAssertEqual(uploads.first, local)'''
+replace_once(path, old, new)
 subprocess.run(['git', 'diff', '--check'], check=True)
