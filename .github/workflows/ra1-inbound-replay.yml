@@ -1,122 +1,29 @@
-name: RA-1 clean inbound replay qualification
+name: RA1 selected public source inspection
 on:
   push:
     branches: [codex/ra1-bigsync-inbound-replay-20260912]
+    paths: [.github/workflows/ra1-inbound-replay.yml]
 permissions:
-  contents: write
-concurrency:
-  group: ra1-clean-inbound-replay
-  cancel-in-progress: false
-defaults:
-  run:
-    shell: bash
+  contents: read
 jobs:
-  qualify-and-publish:
-    runs-on: macos-15
-    timeout-minutes: 45
+  source-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: 84571b4c2a5262dfa52b66772d0276485d150f20
-          path: BigSyncKit
-          fetch-depth: 0
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: 22c23211ca3fb04ae6ed7b63be581da0b864f4d4
-          path: FixtureInput
           persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: lake-of-fire/RealmSwiftGaps
-          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
-          path: RealmSwiftGaps
-          persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: lake-of-fire/SwiftUtilities
-          ref: f437c7d06fc631cd7a67731279411c417cdf8077
-          path: SwiftUtilities
-          persist-credentials: false
-      - name: Apply exact replay correction and fix assertion isolation
-        working-directory: BigSyncKit
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          import textwrap
-          fixture = Path('../FixtureInput/.github/workflows/ra1-inbound-replay.yml').read_text()
-          start = "          python3 - <<'PY'\n"
-          end = "          PY\n"
-          assert fixture.count(start) == 1
-          script = fixture.split(start, 1)[1].split(end, 1)[0]
-          assert "test.write_text(r'''import CloudKit" in script
-          exec(compile(textwrap.dedent(script), 'pinned-replay-fixture', 'exec'))
-          test = Path('Tests/BigSyncKitTests/RA1InboundReplayTests.swift')
-          original = test.read_text()
-          lines = []
-          count = 0
-          for line in original.splitlines():
-              if 'XCT' in line:
-                  properties = list(dict.fromkeys(re.findall(r'synchronizer\.\w+', line)))
-                  for expression in properties:
-                      count += 1
-                      name = f'assertionValue{count}'
-                      indent = line[:len(line) - len(line.lstrip())]
-                      lines.append(f'{indent}let {name} = {expression}')
-                      line = line.replace(expression, name)
-              lines.append(line)
-          assert count >= 20, count
-          updated = '\n'.join(lines) + '\n'
-          assert not any('XCT' in line and 'synchronizer.' in line for line in updated.splitlines())
-          assert updated.count('func test') == 4
-          test.write_text(updated)
-          PY
-          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/RA1InboundReplayTests.swift
-          git diff --cached --check
-          test "$(git diff --cached --name-only | sort | tr '\n' ' ')" = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/RA1InboundReplayTests.swift "
-      - name: Focused replay classification and cancellation
-        working-directory: BigSyncKit
-        run: |
-          set -euo pipefail
-          swift test --filter RA1InboundReplayTests 2>&1 | tee /tmp/ra1-focused.log
-          grep -q 'Executed 4 tests, with 0 failures' /tmp/ra1-focused.log
-      - name: Existing real adapter collision and replay
-        working-directory: BigSyncKit
-        run: |
-          set -euo pipefail
-          swift test --filter testNonJournaledTargetChangeRejectsOrdinaryAndForcedImportThenReplays 2>&1 | tee /tmp/ra1-adapter.log
-          grep -q 'Executed 1 test, with 0 failures' /tmp/ra1-adapter.log
-      - name: Full BigSyncKit suite
-        working-directory: BigSyncKit
-        env:
-          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
-        run: |
-          set -euo pipefail
-          swift test 2>&1 | tee /tmp/ra1-full.log
-      - name: Publish clean source-only continuation
-        working-directory: BigSyncKit
+      - name: Archive immutable public source without Git credentials or history
+        shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = 84571b4c2a5262dfa52b66772d0276485d150f20
-          git diff --cached --check
-          test "$(git diff --cached --name-only | sort | tr '\n' ' ')" = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift Tests/BigSyncKitTests/RA1InboundReplayTests.swift "
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Replay inbound target races through fenced ordinary retry'
-          git push origin HEAD:refs/heads/codex/ra1-final-inbound-replay-20260912
-          git show --stat --oneline HEAD | tee /tmp/ra1-published.log
-      - name: Preserve logs and exact source patch
-        if: always()
-        working-directory: BigSyncKit
-        run: |
-          mkdir -p /tmp/ra1-evidence
-          cp /tmp/ra1-*.log /tmp/ra1-evidence/ 2>/dev/null || true
-          git diff 84571b4c2a5262dfa52b66772d0276485d150f20 -- Sources Tests > /tmp/ra1-evidence/source.patch
-          git status --porcelain=v1 > /tmp/ra1-evidence/status.txt
-          git rev-parse HEAD > /tmp/ra1-evidence/source-head.txt
+          mkdir -p /tmp/ra1-public-source
+          git archive --format=tar.gz HEAD > /tmp/ra1-public-source/BigSyncKit-84571b4c.tar.gz
+          git rev-parse HEAD > /tmp/ra1-public-source/source-head.txt
+          sha256sum /tmp/ra1-public-source/BigSyncKit-84571b4c.tar.gz
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: ra1-inbound-replay-evidence
-          path: /tmp/ra1-evidence
+          name: ra1-selected-public-bigsync-source
+          path: /tmp/ra1-public-source
