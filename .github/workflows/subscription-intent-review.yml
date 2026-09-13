@@ -30,6 +30,17 @@ jobs:
           ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
+      - name: Verify exact checkout identity
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          echo "HEAD=$(git rev-parse HEAD)"
+          echo "TEST_BLOB=$(git hash-object Tests/BigSyncKitTests/SubscriptionIntentOrderingTests.swift)"
+          test "$(git hash-object Tests/BigSyncKitTests/SubscriptionIntentOrderingTests.swift)" = "cfd7b1b1e35189e4fd442b8a65bcd3d376bc4339"
+          if grep -n "permits" Tests/BigSyncKitTests/SubscriptionIntentOrderingTests.swift; then
+            echo "unexpected stale permits helper in immutable checkout" >&2
+            exit 1
+          fi
       - name: Focused native test
         working-directory: BigSyncKit
         run: |
