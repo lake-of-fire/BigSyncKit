@@ -62,18 +62,40 @@ text = replace_once(text, '''        let attemptID = synchronizationAttemptID
             throw CancellationError()
         }
         let accountIdentifier = try await accountIdentifierProvider()
-''', '''        let attemptID = synchronizationAttemptID
-        // A pending explicit port can survive process restart or an account
-        // notification, both of which deliberately leave ordinary writer
-        // authority poisoned. Port activation is its own fresh validation
-        // boundary, so capture the raw generation and never clear the fence.
+''', '''        // Explicit account-port activation may legitimately begin while
+        // ordinary writer authority is poisoned (including a fresh process),
+        // but it must not race an unrelated restore or an account-invalidation
+        // callback which still owns application cleanup.
+        refreshBackupRestoreRequirement()
+        guard backupDetectionError == nil,
+              !backupRestoreDetected,
+              pendingAccountScopeInvalidation == nil else {
+            throw CancellationError()
+        }
+        let attemptID = synchronizationAttemptID
         let fenceGeneration =
             accountScopeAuthorityFence.invalidationGenerationSnapshot
         let accountIdentifier = try await accountIdentifierProvider()
 ''')
-text = replace_once(text, '''        guard try accountScopeAuthorityFence
+text = replace_once(text, '''        try checkAccountValidationAttempt(
+            attemptID,
+            fenceGeneration: fenceGeneration
+        )
+
+        guard try accountScopeAuthorityFence
             .withAuthorizedInvalidationGeneration(fenceGeneration, {
-''', '''        guard try accountScopeAuthorityFence
+''', '''        try checkAccountValidationAttempt(
+            attemptID,
+            fenceGeneration: fenceGeneration
+        )
+        refreshBackupRestoreRequirement()
+        guard backupDetectionError == nil,
+              !backupRestoreDetected,
+              pendingAccountScopeInvalidation == nil else {
+            throw CancellationError()
+        }
+
+        guard try accountScopeAuthorityFence
             .withMatchingInvalidationGeneration(fenceGeneration, {
 ''')
 source.write_text(text)
@@ -185,37 +207,54 @@ new_tests = '''    @BigSyncBackgroundActor
     }
 
     @BigSyncBackgroundActor
-    func testExplicitPortCanActivateAfterSynchronousAccountPoison()
+    func testExplicitPortCanActivateAfterSettledSynchronousAccountPoison()
     async throws {
         let transport = AccountFencingTransport()
+        let store = AccountFencingStore()
         let identity = AccountFencingAccountIdentity("account-a")
-        let synchronizer = makeSynchronizer(
+        let identifier = "explicit-port-poison-\\(UUID().uuidString)"
+        let zoneID = makeZoneID()
+        let first = makeSynchronizer(
             transport: transport,
+            store: store,
+            identifier: identifier,
+            recordZoneID: zoneID,
             accountIdentifierProvider: { await identity.current() },
             accountReplacementPolicy: .requireExplicitDatasetPort,
             initialReplicaBindingAdmissionHandler: { _ in }
         )
-        try await synchronizer._test_validateSynchronizationAccount()
+        try await first._test_validateSynchronizationAccount()
         await identity.replace(with: "account-b")
         let requirement: BigSyncCloudAccountPortRequirement
         do {
-            try await synchronizer._test_validateSynchronizationAccount()
+            try await first._test_validateSynchronizationAccount()
             XCTFail("Expected a port requirement")
             return
         } catch BigSyncCloudAccountPortError.required(let value) {
             requirement = value
         }
 
-        synchronizer.accountScopeAuthorityFence.poison(
+        // Reopening models a settled account invalidation with a retained
+        // durable port requirement: writer authority starts closed, while no
+        // invalidation callback remains in flight.
+        let reopened = makeSynchronizer(
+            transport: transport,
+            store: store,
+            identifier: identifier,
+            recordZoneID: zoneID,
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .requireExplicitDatasetPort
+        )
+        reopened.accountScopeAuthorityFence.poison(
             requiresGenerationRotation: false
         )
-        XCTAssertTrue(synchronizer.accountScopeAuthorityFence.rejectsAuthority)
+        XCTAssertTrue(reopened.accountScopeAuthorityFence.rejectsAuthority)
 
-        try await synchronizer.activateCloudAccountPort(requirement)
+        try await reopened.activateCloudAccountPort(requirement)
 
-        XCTAssertNil(try synchronizer.pendingCloudAccountPortRequirement())
-        XCTAssertTrue(synchronizer.accountScopeAuthorityFence.rejectsAuthority)
-        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertNil(try reopened.pendingCloudAccountPortRequirement())
+        XCTAssertTrue(reopened.accountScopeAuthorityFence.rejectsAuthority)
+        XCTAssertNil(try reopened.accountScopeLease())
         XCTAssertEqual(transport.operationCount, 0)
     }
 
