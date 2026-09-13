@@ -1,0 +1,55 @@
+name: RA1 composed BigSync exact suite
+on:
+  push:
+    branches: [codex/ra1-native-suite-closure-20260912]
+    paths: [.github/workflows/ra1-composed-integration-suite.yml]
+permissions:
+  contents: read
+jobs:
+  exact-package:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 6ddbfc9584b4e3d879d2ed8b5d6fea018cf2b609
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record exact source and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git -C BigSyncKit rev-parse HEAD | tee evidence/bigsync-head.txt
+          git -C RealmSwiftGaps rev-parse HEAD > evidence/realm-gaps-head.txt
+          git -C SwiftUtilities rev-parse HEAD > evidence/swift-utilities-head.txt
+          swift --version > evidence/toolchain.txt
+          test "$(cat evidence/bigsync-head.txt)" = "6ddbfc9584b4e3d879d2ed8b5d6fea018cf2b609"
+      - name: Run exact full package suite
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        shell: bash
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee ../evidence/full.log
+          status=${PIPESTATUS[0]}
+          echo "$status" > ../evidence/full-exit-code.txt
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ra1-composed-bigsync-exact-suite
+          path: evidence
