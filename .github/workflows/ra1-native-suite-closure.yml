@@ -6,7 +6,7 @@ on:
       - .github/workflows/ra1-native-suite-closure.yml
       - Scripts/ra1_native_suite_closure_patch.py
 permissions:
-  contents: read
+  contents: write
 jobs:
   native-suite:
     runs-on: macos-15
@@ -20,7 +20,7 @@ jobs:
         with:
           ref: b1cde24b2e22e68a5cd056b865bc53f7fd491e2a
           path: BigSyncKit
-          persist-credentials: false
+          persist-credentials: true
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/RealmSwiftGaps
@@ -87,6 +87,25 @@ jobs:
           swift test --filter testReboundFixtureInitializesItsActualOutboundNamespace > ../evidence/restored-focus.log 2>&1
           git diff --binary > ../evidence/restored.patch
           cmp ../evidence/source.patch ../evidence/restored.patch
+      - name: Publish authenticated clean donor
+        if: success()
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --binary > ../evidence/publish.patch
+          cmp ../evidence/source.patch ../evidence/publish.patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift \
+            Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift \
+            Tests/BigSyncKitTests/BigSyncKitTests.swift \
+            Tests/BigSyncKitTests/OwnedRecordRevisionTests.swift
+          test "$(git diff --cached --name-only | wc -l | tr -d ' ')" = "4"
+          git commit -m "Close RA-1 native suite mutation-drain fixtures"
+          git push origin HEAD:refs/heads/codex/ra1-native-suite-donor-20260912
       - name: Summarize exact executed failures
         if: always()
         shell: bash
@@ -96,8 +115,8 @@ jobs:
           import json, re
           p = Path('evidence/full.log')
           text = p.read_text() if p.exists() else ''
-          result = {'source_base': 'b1cde24b2e22e68a5cd056b865bc53f7fd491e2a', 'failed_cases': sorted(set(re.findall(r"Test Case '(.*?)' failed", text))), 'summaries': re.findall(r'Executed \d+ tests?, with \d+ failures?[^\n]*', text)}
-          Path('evidence/result.json').write_text(json.dumps(result, indent=2) + '\n')
+          result = {'source_base': 'b1cde24b2e22e68a5cd056b865bc53f7fd491e2a', 'failed_cases': sorted(set(re.findall(r"Test Case '(.*?)' failed", text))), 'summaries': re.findall(r'Executed \\d+ tests?, with \\d+ failures?[^\\n]*', text)}
+          Path('evidence/result.json').write_text(json.dumps(result, indent=2) + '\\n')
           print(json.dumps(result, indent=2))
           PY
       - uses: actions/upload-artifact@v4
