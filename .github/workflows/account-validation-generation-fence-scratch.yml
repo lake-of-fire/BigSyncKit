@@ -1,0 +1,297 @@
+name: Account validation generation fence scratch
+
+on:
+  push:
+    branches: [automation/account-validation-generation-fence-20260913]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-qualify:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: BigSyncKit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+
+      - name: Patch current main and qualify account fencing
+        working-directory: BigSyncKit
+        env:
+          TARGET_BRANCH: fix/account-validation-generation-fence-20260913
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          BASE_SHA="$(git rev-parse origin/main)"
+          git checkout --detach "$BASE_SHA"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift")
+          source = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one match, found {count}: {old[:120]!r}")
+              source = source.replace(old, new, 1)
+
+          replace_once(
+          '''    var publicationInspectionGeneration: UInt64? {
+              lock.lock()
+              defer { lock.unlock() }
+              guard !isPoisoned || invalidationGeneration == 0 else { return nil }
+              return invalidationGeneration
+          }
+
+          ''',
+          '''    var publicationInspectionGeneration: UInt64? {
+              lock.lock()
+              defer { lock.unlock() }
+              guard !isPoisoned || invalidationGeneration == 0 else { return nil }
+              return invalidationGeneration
+          }
+
+              /// Monotonic identity for one account-validation authority window.
+              /// Unlike publicationInspectionGeneration this remains readable
+              /// while poisoned so a suspended validation can detect a newer
+              /// synchronous account-change notification before actor cleanup runs.
+              var invalidationGenerationSnapshot: UInt64 {
+                  lock.lock()
+                  defer { lock.unlock() }
+                  return invalidationGeneration
+              }
+
+          '''
+          )
+
+          replace_once(
+          '''    func clear() {
+              lock.lock()
+              isPoisoned = false
+              rotatesGeneration = false
+              lock.unlock()
+          }
+          ''',
+          '''    @discardableResult
+              func clear(ifInvalidationGenerationMatches expected: UInt64) -> Bool {
+                  lock.lock()
+                  defer { lock.unlock() }
+                  guard invalidationGeneration == expected else { return false }
+                  isPoisoned = false
+                  rotatesGeneration = false
+                  return true
+              }
+          '''
+          )
+
+          replace_once(
+          '''    private func checkAccountValidationAttempt(_ attemptID: UUID) throws {
+              try Task.checkCancellation()
+              guard synchronizationAttemptID == attemptID else {
+                  throw CancellationError()
+              }
+          }
+          ''',
+          '''    private func checkAccountValidationAttempt(
+              _ attemptID: UUID,
+              fenceGeneration: UInt64? = nil
+          ) throws {
+              try Task.checkCancellation()
+              guard synchronizationAttemptID == attemptID,
+                    fenceGeneration.map({
+                        accountScopeAuthorityFence.invalidationGenerationSnapshot == $0
+                    }) ?? true else {
+                  throw CancellationError()
+              }
+          }
+          '''
+          )
+
+          start_marker = '''    @BigSyncBackgroundActor
+              private func validateSynchronizationAccount() async throws -> String {
+          '''
+          end_marker = '''    /// Resolves application-specific dataset identity before BigSync claims an
+          '''
+          start = source.index(start_marker)
+          end = source.index(end_marker, start)
+          region = source[start:end]
+
+          old = '''        let validationAttemptID = synchronizationAttemptID
+              let currentAccountIdentifier = try await accountIdentifierProvider()
+              try checkAccountValidationAttempt(validationAttemptID)
+          '''
+          new = '''        let validationAttemptID = synchronizationAttemptID
+              let validationFenceGeneration =
+                  accountScopeAuthorityFence.invalidationGenerationSnapshot
+              let currentAccountIdentifier = try await accountIdentifierProvider()
+              try checkAccountValidationAttempt(
+                  validationAttemptID,
+                  fenceGeneration: validationFenceGeneration
+              )
+          '''
+          if region.count(old) != 1:
+              raise SystemExit("validation start shape changed")
+          region = region.replace(old, new, 1)
+
+          remaining_checks = region.count(
+              "        try checkAccountValidationAttempt(validationAttemptID)\n"
+          )
+          if remaining_checks != 2:
+              raise SystemExit(f"expected two remaining validation checks, found {remaining_checks}")
+          region = region.replace(
+              "        try checkAccountValidationAttempt(validationAttemptID)\n",
+              '''        try checkAccountValidationAttempt(
+                  validationAttemptID,
+                  fenceGeneration: validationFenceGeneration
+              )
+          '''
+          )
+
+          helper_call_count = region.count(
+              "validationAttemptID: validationAttemptID"
+          )
+          if helper_call_count != 4:
+              raise SystemExit(f"expected four validation helper calls, found {helper_call_count}")
+          region = region.replace(
+              "validationAttemptID: validationAttemptID",
+              "validationAttemptID: validationAttemptID,\n"
+              "                        validationFenceGeneration: validationFenceGeneration"
+          )
+
+          establish = '''        try establishAccountScopeLeaseDurably(
+          '''
+          if region.count(establish) != 1:
+              raise SystemExit("account lease publication shape changed")
+          region = region.replace(
+              establish,
+              '''        try checkAccountValidationAttempt(
+                  validationAttemptID,
+                  fenceGeneration: validationFenceGeneration
+              )
+              try establishAccountScopeLeaseDurably(
+          ''',
+              1
+          )
+
+          terminal = '''        accountValidationRequired = false
+              cancelSync = false
+              cancelledDueToUnauthentication = false
+              accountScopeAuthorityFence.clear()
+              return confirmedAccountIdentifier
+          '''
+          terminal_replacement = '''        try checkAccountValidationAttempt(
+                  validationAttemptID,
+                  fenceGeneration: validationFenceGeneration
+              )
+              accountValidationRequired = false
+              guard accountScopeAuthorityFence.clear(
+                  ifInvalidationGenerationMatches: validationFenceGeneration
+              ) else {
+                  accountValidationRequired = true
+                  throw CancellationError()
+              }
+              cancelSync = false
+              cancelledDueToUnauthentication = false
+              return confirmedAccountIdentifier
+          '''
+          if region.count(terminal) != 1:
+              raise SystemExit("validation completion shape changed")
+          region = region.replace(terminal, terminal_replacement, 1)
+          source = source[:start] + region + source[end:]
+
+          replace_once(
+          '''    private func admitInitialReplicaBindingIfNeeded(
+              accountIdentifier: String,
+              accountScopeIdentifier: String,
+              validationAttemptID: UUID
+          ) async throws {
+          ''',
+          '''    private func admitInitialReplicaBindingIfNeeded(
+              accountIdentifier: String,
+              accountScopeIdentifier: String,
+              validationAttemptID: UUID,
+              validationFenceGeneration: UInt64
+          ) async throws {
+          '''
+          )
+
+          replace_once(
+          '''            expectedBinding: expectedBinding,
+                  validationAttemptID: validationAttemptID
+              )
+          }
+
+              private func admitReplicaBinding(
+          ''',
+          '''            expectedBinding: expectedBinding,
+                  validationAttemptID: validationAttemptID,
+                  validationFenceGeneration: validationFenceGeneration
+              )
+          }
+
+              private func admitReplicaBinding(
+          '''
+          )
+
+          replace_once(
+          '''        expectedBinding: BigSyncReplicaBindingSnapshot,
+              validationAttemptID: UUID
+          ) async throws {
+          ''',
+          '''        expectedBinding: BigSyncReplicaBindingSnapshot,
+              validationAttemptID: UUID,
+              validationFenceGeneration: UInt64
+          ) async throws {
+          '''
+          )
+
+          helper_start = source.index("    private func admitReplicaBinding(")
+          helper_end = source.index("    private func durableAccountIdentifier()", helper_start)
+          helper = source[helper_start:helper_end]
+          helper_checks = helper.count("        try checkAccountValidationAttempt(validationAttemptID)\n")
+          if helper_checks != 2:
+              raise SystemExit(f"expected two replica-binding checks, found {helper_checks}")
+          helper = helper.replace(
+              "        try checkAccountValidationAttempt(validationAttemptID)\n",
+              '''        try checkAccountValidationAttempt(
+                  validationAttemptID,
+                  fenceGeneration: validationFenceGeneration
+              )
+          '''
+          )
+          source = source[:helper_start] + helper + source[helper_end:]
+
+          if "accountScopeAuthorityFence.clear()" in source:
+              raise SystemExit("unconditional authority-fence clear survived")
+
+          path.write_text(source)
+          PY
+
+          git diff --check
+          swift test --filter CloudKitSynchronizerAccountFencingTests
+
+          git config user.name "OpenAI Codex"
+          git config user.email "codex@users.noreply.github.com"
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift
+          git commit -m "Fence account validation by authority generation"
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
