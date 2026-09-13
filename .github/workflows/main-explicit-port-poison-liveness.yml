@@ -16,17 +16,34 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
       - name: Apply exact bounded correction
+        working-directory: BigSyncKit
         run: python3 Tools/apply-main-explicit-port-poison-liveness.py
       - name: Diff hygiene
+        working-directory: BigSyncKit
         run: git diff --check
       - name: Focused account fencing tests
+        working-directory: BigSyncKit
         run: swift test --filter CloudKitSynchronizerAccountFencingTests
       - name: Publish source-only topic
+        working-directory: BigSyncKit
         run: |
           set -euo pipefail
           git rm Tools/apply-main-explicit-port-poison-liveness.py .github/workflows/main-explicit-port-poison-liveness.yml
