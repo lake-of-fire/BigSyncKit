@@ -1,0 +1,76 @@
+name: RA-1 explicit port recovery qualification
+
+on:
+  push:
+    branches:
+      - fix/ra1-explicit-port-poisoned-recovery-20260913
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ra1-explicit-port-recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  focused:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: fix/ra1-explicit-port-poisoned-recovery-20260913
+          fetch-depth: 0
+          path: BigSyncKit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+
+      - name: Apply exact regression refinement
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          python3 Tools/apply-ra1-explicit-port-test-refinement.py
+          git rm Tests/BigSyncKitTests/RA1ExplicitPortPoisonedRecoveryTests.swift
+          git diff --check
+          git rev-parse HEAD:Sources > qualification-source-tree.txt
+          git hash-object Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift > qualification-account-tests-blob.txt
+          swift --version > qualification-toolchain.txt
+          xcrun --show-sdk-version >> qualification-toolchain.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > qualification-RealmSwiftGaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > qualification-SwiftUtilities.txt
+
+      - name: Run focused account-fencing suite
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --filter CloudKitSynchronizerAccountFencingTests 2>&1 | tee qualification-focused.log
+
+      - name: Publish tested regression refinement and remove temporary machinery
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
+          git rm -f .github/workflows/ra1-explicit-port-recovery-qualification.yml Tools/apply-ra1-explicit-port-test-refinement.py
+          git commit -m 'RA-1: cover poisoned explicit-port recovery states'
+          git push origin HEAD:fix/ra1-explicit-port-poisoned-recovery-20260913
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ra1-explicit-port-recovery-focused
+          path: BigSyncKit/qualification-*
+          retention-days: 14
