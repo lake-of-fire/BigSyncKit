@@ -1,0 +1,29 @@
+# Subscription regression full-suite failures
+
+exit_status: 1
+
+	 Executed 37 tests, with 1 test skipped and 0 failures (0 unexpected) in 0.409 (0.411) seconds
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:8057: error: -[BigSyncKitTests.BigSyncKitTests testAccountReplacementAfterSubscriptionDeletionRetainsLocalFence] : failed - Expected account replacement after subscription deletion
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:8063: error: -[BigSyncKitTests.BigSyncKitTests testAccountReplacementAfterSubscriptionDeletionRetainsLocalFence] : XCTAssertEqual failed: ("[]") is not equal to ("["BigSyncKit.v2.zone.bf027b704772ea2bced53081ae65d492f25fae5d32874d46460f54cf08f9b32f"]")
+/Users/runner/work/BigSyncKit/BigSyncKit/BigSyncKit/Tests/BigSyncKitTests/BigSyncKitTests.swift:8064: error: -[BigSyncKitTests.BigSyncKitTests testAccountReplacementAfterSubscriptionDeletionRetainsLocalFence] : XCTAssertEqual failed: ("nil") is not equal to ("Optional("BigSyncKit.v2.zone.bf027b704772ea2bced53081ae65d492f25fae5d32874d46460f54cf08f9b32f")")
+Test Case '-[BigSyncKitTests.BigSyncKitTests testAccountReplacementAfterSubscriptionDeletionRetainsLocalFence]' failed (0.469 seconds).
+Test Suite 'BigSyncKitTests' failed at 2026-09-13 21:51:19.291.
+	 Executed 309 tests, with 3 failures (0 unexpected) in 13.533 (13.557) seconds
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.181 (0.182) seconds
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.011 (0.011) seconds
+	 Executed 1 test, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+	 Executed 49 tests, with 0 failures (0 unexpected) in 0.544 (0.547) seconds
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.024 (0.024) seconds
+	 Executed 9 tests, with 0 failures (0 unexpected) in 0.621 (0.622) seconds
+	 Executed 3 tests, with 0 failures (0 unexpected) in 0.132 (0.132) seconds
+	 Executed 13 tests, with 0 failures (0 unexpected) in 0.066 (0.067) seconds
+	 Executed 1 test, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+	 Executed 4 tests, with 0 failures (0 unexpected) in 0.021 (0.021) seconds
+	 Executed 6 tests, with 0 failures (0 unexpected) in 0.036 (0.036) seconds
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.593 (0.594) seconds
+	 Executed 2 tests, with 0 failures (0 unexpected) in 0.040 (0.040) seconds
+	 Executed 11 tests, with 0 failures (0 unexpected) in 0.618 (0.619) seconds
+Test Suite 'BigSyncKitPackageTests.xctest' failed at 2026-09-13 21:51:22.186.
+	 Executed 460 tests, with 1 test skipped and 3 failures (0 unexpected) in 16.827 (16.864) seconds
+Test Suite 'All tests' failed at 2026-09-13 21:51:22.187.
+	 Executed 460 tests, with 1 test skipped and 3 failures (0 unexpected) in 16.827 (16.866) seconds
