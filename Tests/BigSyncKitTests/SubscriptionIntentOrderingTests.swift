@@ -256,9 +256,8 @@ final class SubscriptionIntentOrderingTests: XCTestCase {
         await fulfillment(of: [saveEntered], timeout: 2)
 
         let queuedCompletion = expectation(description: "queued completion")
-        var queuedError: Error?
         synchronizer.subscribeForChangesInDatabase { error in
-            queuedError = error
+            XCTAssertTrue(error is CancellationError)
             queuedCompletion.fulfill()
         }
         synchronizer.cancelSynchronization()
@@ -270,7 +269,6 @@ final class SubscriptionIntentOrderingTests: XCTestCase {
         } catch is CancellationError {
         }
         await fulfillment(of: [queuedCompletion], timeout: 2)
-        XCTAssertTrue(queuedError is CancellationError)
 
         let lookupCount = await services.lookupCount
         let saveCount = await services.saveCount
