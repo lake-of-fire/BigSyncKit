@@ -1,0 +1,56 @@
+name: Qualify RA-1 account authority generation
+
+on:
+  push:
+    branches:
+      - qualify/ra1-account-authority-generation-20260913
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/BigSyncKit
+          ref: 3c4cf55f2cbf831d6b447341e2c1900122955677
+          fetch-depth: 1
+          path: BigSyncKit
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          fetch-depth: 1
+          path: RealmSwiftGaps
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          fetch-depth: 1
+          path: SwiftUtilities
+          persist-credentials: false
+
+      - name: Verify exact immutable inputs
+        run: |
+          set -euo pipefail
+          test "$(git -C BigSyncKit rev-parse HEAD)" = "3c4cf55f2cbf831d6b447341e2c1900122955677"
+          test "$(git -C RealmSwiftGaps rev-parse HEAD)" = "2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2"
+          test "$(git -C SwiftUtilities rev-parse HEAD)" = "f437c7d06fc631cd7a67731279411c417cdf8077"
+          git -C BigSyncKit diff --exit-code
+
+      - name: Focused account authority suite
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --filter CloudKitSynchronizerAccountFencingTests
+
+      - name: Verify checkout remained immutable
+        run: git -C BigSyncKit diff --exit-code
