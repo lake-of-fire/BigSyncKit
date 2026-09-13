@@ -105,4 +105,21 @@ new = '''        let uploads = await io.uploadedValues()
         XCTAssertNil(sync.synchronizationTask)
         XCTAssertEqual(uploads.first, local)'''
 replace_once(path, old, new)
+
+path = 'Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift'
+old = '''            guard handledFailures > 0
+                    || records.count >= requestedBatchSize else { return }
+            await Task.yield()
+'''
+new = '''            // A successful acknowledgement can forward a newer target journal
+            // generation into tracking. A short batch is therefore not proof of
+            // quiescence. Give newly published record work another preparation
+            // turn; deletion-only or differently restricted work yields an empty
+            // record batch and returns immediately to its owning phase.
+            guard handledFailures > 0
+                    || records.count >= requestedBatchSize
+                    || adapter.hasChanges else { return }
+            await Task.yield()
+'''
+replace_once(path, old, new)
 subprocess.run(['git', 'diff', '--check'], check=True)
