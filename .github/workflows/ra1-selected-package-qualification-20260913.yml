@@ -1,0 +1,97 @@
+name: RA1 selected package qualification
+on:
+  push:
+    branches: [codex/ra1-selected-package-qualification-20260913]
+    paths:
+      - .github/workflows/ra1-selected-package-qualification-20260913.yml
+permissions:
+  contents: read
+jobs:
+  exact-selected-package:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 8d3bae50e782e4d16221c9d5e63f1da764979e62
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Capture exact source identity
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../evidence
+          test "$(git rev-parse HEAD)" = "8d3bae50e782e4d16221c9d5e63f1da764979e62"
+          git rev-parse HEAD HEAD^{tree} > ../evidence/source-identity.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > ../evidence/realm-swift-gaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > ../evidence/swift-utilities.txt
+          swift --version > ../evidence/toolchain.txt
+          git status --porcelain=v1 --untracked-files=all > ../evidence/source-status.txt
+          test ! -s ../evidence/source-status.txt
+      - name: Execute new subscription regressions
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -uo pipefail
+          swift test --filter HotfixSubscriptionSafetyTests 2>&1 | tee ../evidence/subscription.log
+          status=${PIPESTATUS[0]}
+          echo "$status" > ../evidence/subscription-exit-code.txt
+          exit "$status"
+      - name: Execute complete package suite
+        id: full
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        shell: bash
+        run: |
+          set -uo pipefail
+          swift test 2>&1 | tee ../evidence/full.log
+          status=${PIPESTATUS[0]}
+          echo "$status" > ../evidence/full-exit-code.txt
+          exit "$status"
+      - name: Summarize evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+          root = Path('evidence')
+          text = (root / 'full.log').read_text(errors='replace') if (root / 'full.log').exists() else ''
+          sub = (root / 'subscription.log').read_text(errors='replace') if (root / 'subscription.log').exists() else ''
+          result = {
+              'selected_source': '8d3bae50e782e4d16221c9d5e63f1da764979e62',
+              'subscription_summaries': re.findall(r'Executed \d+ tests?, with \d+ failures?[^\n]*', sub),
+              'full_summaries': re.findall(r'Executed \d+ tests?, with \d+ failures?[^\n]*', text),
+              'failed_cases': sorted(set(re.findall(r"Test Case '(.*?)' failed", text))),
+          }
+          (root / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Verify source remained exact
+        if: always()
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          git diff --exit-code
+          test "$(git rev-parse HEAD)" = "8d3bae50e782e4d16221c9d5e63f1da764979e62"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ra1-selected-package-qualification-8d3bae50
+          path: evidence
+          retention-days: 7
+          if-no-files-found: error
