@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/BigSyncKit
-          ref: 17323205872fa375bb2fd761045c60a1ae52c403
+          ref: 704f6165e841ff8ab2c683c0dea3de14da710683
           path: BigSyncKit
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -74,13 +74,13 @@ jobs:
           test "$(cat "$RUNNER_TEMP/ra1-selected-bigsync/collection.exit")" = 0
           test "$(cat "$RUNNER_TEMP/ra1-selected-bigsync/subscription.exit")" = 0
           test "$(cat "$RUNNER_TEMP/ra1-selected-bigsync/full.exit")" = 0
-          test "$(git -C BigSyncKit rev-parse HEAD)" = 17323205872fa375bb2fd761045c60a1ae52c403
+          test "$(git -C BigSyncKit rev-parse HEAD)" = 704f6165e841ff8ab2c683c0dea3de14da710683
           git -C BigSyncKit diff --exit-code
           test -z "$(git -C BigSyncKit status --porcelain)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ra1-selected-bigsync-17323205
+          name: ra1-selected-bigsync-704f6165
           path: ${{ runner.temp }}/ra1-selected-bigsync/
           retention-days: 7
           if-no-files-found: error
