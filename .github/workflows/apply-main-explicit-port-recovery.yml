@@ -1,0 +1,124 @@
+name: Apply main explicit-port recovery
+
+on:
+  push:
+    branches:
+      - fix/main-explicit-port-recovery-final-20260913
+    paths:
+      - .github/apply-main-explicit-port-recovery.py
+      - .github/workflows/apply-main-explicit-port-recovery.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: main-explicit-port-recovery-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apply-and-qualify:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Verify exact composition
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base HEAD e4207597ecb534518d62b011e1d8f468ca1bc88a)" = "e4207597ecb534518d62b011e1d8f468ca1bc88a"
+          test "$(git -C ../RealmSwiftGaps rev-parse HEAD)" = "2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2"
+          test "$(git -C ../SwiftUtilities rev-parse HEAD)" = "f437c7d06fc631cd7a67731279411c417cdf8077"
+      - name: Apply exact-preimage patch
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/apply-main-explicit-port-recovery.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift")
+          path.write_text(path.read_text().rstrip() + "\n")
+          PY
+      - name: Verify exact postimage and bounded diff
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          python3 - <<'PY'
+          import subprocess
+          expected = [
+              "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift",
+              "Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift",
+          ]
+          changed = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
+          print("\n".join(changed))
+          if changed != expected:
+              raise SystemExit(f"unexpected changed-file set/order: {changed!r}")
+          expected_blobs = {
+              expected[0]: "bd8832f854156297078fadacd13ce225bbb1aec7",
+              expected[1]: "958df7946cbeb95fe151744bca8fd710435f3274",
+          }
+          for path, expected_blob in expected_blobs.items():
+              actual = subprocess.check_output(["git", "hash-object", path], text=True).strip()
+              if actual != expected_blob:
+                  raise SystemExit(f"unexpected postimage for {path}: {actual} != {expected_blob}")
+          PY
+      - name: Run focused account-fencing suite
+        working-directory: BigSyncKit
+        run: swift test --filter CloudKitSynchronizerAccountFencingTests
+      - name: Run full package suite
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set +e
+          swift test > /tmp/bigsync-full.log 2>&1
+          status=$?
+          tail -180 /tmp/bigsync-full.log || true
+          if [ "$status" -ne 0 ]; then
+            mkdir -p .github/qualification
+            {
+              echo "# Main explicit-port recovery full-suite failures"
+              echo
+              echo "exit_status: $status"
+              echo
+              grep -E "error: -\\[|Test Case .* failed|Test Suite .* failed|Executed .* failures" /tmp/bigsync-full.log || true
+            } > .github/qualification/main-explicit-port-recovery-final.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/qualification/main-explicit-port-recovery-final.txt
+            if ! git diff --cached --quiet; then
+              git commit -m "Record explicit-port recovery qualification failure"
+              git push origin "HEAD:${GITHUB_REF_NAME}"
+            fi
+            exit "$status"
+          fi
+      - name: Publish source-and-test postimage
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/apply-main-explicit-port-recovery.py
+          rm .github/workflows/apply-main-explicit-port-recovery.yml
+          rm -f .github/qualification/main-explicit-port-recovery-final.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix explicit account port recovery on poisoned authority"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
