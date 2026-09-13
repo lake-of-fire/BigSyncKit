@@ -1,24 +1,24 @@
-name: RA-1 W3 baseline contamination bisect
+name: RA-1 W3 DEBUG rebind sentinel probe
 on:
   push:
-    branches: [codex/ra1-final-w3-baseline-suite-20260912]
+    branches: [codex/ra1-final-w3-rebind-probe2-20260913]
 permissions:
   contents: read
 concurrency:
-  group: ra1-final-w3-baseline-suite
+  group: ra1-final-w3-rebind-probe2
   cancel-in-progress: false
 defaults:
   run:
     shell: bash
 jobs:
-  baseline:
+  probe:
     runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/BigSyncKit
-          ref: 84571b4c2a5262dfa52b66772d0276485d150f20
+          ref: b1cde24b2e22e68a5cd056b865bc53f7fd491e2a
           path: BigSyncKit
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -37,16 +37,62 @@ jobs:
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ra1-w3-bisect"
-          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-w3-bisect/identity.txt"
-          swift --version | tee "$RUNNER_TEMP/ra1-w3-bisect/toolchain.txt"
-      - name: AccountAuthority then BigSyncKitTests
+          mkdir -p "$RUNNER_TEMP/ra1-w3-rebind"
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/ra1-w3-rebind/identity.txt"
+          git -C ../RealmSwiftGaps rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-rebind/realm-swift-gaps.txt"
+          git -C ../SwiftUtilities rev-parse HEAD | tee "$RUNNER_TEMP/ra1-w3-rebind/swift-utilities.txt"
+          swift --version | tee "$RUNNER_TEMP/ra1-w3-rebind/toolchain.txt"
+      - name: Patch DEBUG rebind sentinel in workspace
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift')
+          text = path.read_text()
+          needle = '''            durableStateNamespace = Self.makeDurableStateNamespace(
+                identifier: identifier,
+                containerIdentifier: containerIdentifier,
+                databaseScope: database.databaseScope,
+                recordZoneID: adapter.recordZoneID
+            )
+'''
+          replacement = needle + '''            _ = try? BackupDetection.run(
+                store: keyValueStore,
+                namespace: durableStateNamespace,
+                sharedSentinelBaseURL: backupDetectionBaseURL
+            )
+'''
+          count = text.count(needle)
+          if count != 1:
+              raise SystemExit(f'expected one DEBUG rebind namespace assignment, found {count}')
+          path.write_text(text.replace(needle, replacement))
+          PY
+          git diff --check
+          git diff -- Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift | tee "$RUNNER_TEMP/ra1-w3-rebind/source.patch"
+      - name: Legacy BigSyncKitTests
+        continue-on-error: true
+        working-directory: BigSyncKit
+        env:
+          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
+        run: |
+          set -o pipefail
+          swift test --filter 'BigSyncKitTests.BigSyncKitTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-rebind/legacy.log"
+      - name: Owned revision
+        if: always()
         continue-on-error: true
         working-directory: BigSyncKit
         run: |
           set -o pipefail
-          swift test --filter 'BigSyncKitTests\.(AccountAuthorityPersistenceTests|BigSyncKitTests)' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-bisect/account-plus-bigsync.log"
-      - name: BackupDetection then BigSyncKitTests
+          swift test --filter 'OwnedRecordRevisionTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-rebind/owned.log"
+      - name: Replay regression
+        if: always()
+        continue-on-error: true
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          swift test --filter 'RA1InboundReplayTests' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-rebind/replay.log"
+      - name: Full package
         if: always()
         continue-on-error: true
         working-directory: BigSyncKit
@@ -54,27 +100,11 @@ jobs:
           BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
         run: |
           set -o pipefail
-          swift test --filter 'BigSyncKitTests\.(BackupDetectionTests|BigSyncKitTests)' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-bisect/backup-plus-bigsync.log"
-      - name: Account plus Backup plus BigSyncKitTests
-        if: always()
-        continue-on-error: true
-        working-directory: BigSyncKit
-        env:
-          BIGSYNC_RUN_MUTATION_BENCHMARK: '1'
-        run: |
-          set -o pipefail
-          swift test --filter 'BigSyncKitTests\.(AccountAuthorityPersistenceTests|BackupDetectionTests|BigSyncKitTests)' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-bisect/account-backup-bigsync.log"
-      - name: BigSyncKitTests then OwnedRevision
-        if: always()
-        continue-on-error: true
-        working-directory: BigSyncKit
-        run: |
-          set -o pipefail
-          swift test --filter 'BigSyncKitTests\.(BigSyncKitTests|OwnedRecordRevisionTests)' 2>&1 | tee "$RUNNER_TEMP/ra1-w3-bisect/bigsync-plus-owned.log"
+          swift test 2>&1 | tee "$RUNNER_TEMP/ra1-w3-rebind/full.log"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ra1-final-w3-contamination-bisect
-          path: ${{ runner.temp }}/ra1-w3-bisect/
+          name: ra1-final-w3-rebind-probe2
+          path: ${{ runner.temp }}/ra1-w3-rebind/
           retention-days: 7
           if-no-files-found: error
