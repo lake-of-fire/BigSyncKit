@@ -1,0 +1,38 @@
+name: Main explicit-port poison liveness
+
+on:
+  push:
+    branches:
+      - fix/main-explicit-port-poison-liveness-20260913
+    paths:
+      - Tools/apply-main-explicit-port-poison-liveness.py
+      - .github/workflows/main-explicit-port-poison-liveness.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize-and-qualify:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Apply exact bounded correction
+        run: python3 Tools/apply-main-explicit-port-poison-liveness.py
+      - name: Diff hygiene
+        run: git diff --check
+      - name: Focused account fencing tests
+        run: swift test --filter CloudKitSynchronizerAccountFencingTests
+      - name: Publish source-only topic
+        run: |
+          set -euo pipefail
+          git rm Tools/apply-main-explicit-port-poison-liveness.py .github/workflows/main-explicit-port-poison-liveness.yml
+          git add Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Allow explicit port recovery under matching poisoned generation'
+          git push origin HEAD:refs/heads/fix/main-explicit-port-poison-liveness-20260913
