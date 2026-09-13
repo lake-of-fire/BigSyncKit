@@ -1,0 +1,326 @@
+name: Apply authority poison follow-up
+on:
+  push:
+    branches: [fix/authority-poison-run-subscription-fence-20260913]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+      - name: Apply reviewed authority fencing follow-up
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}: {old[:90]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          sync = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift"
+          replace_once(sync,
+          '''    var authorizedInvalidationGenerationSnapshot: UInt64? {
+              lock.lock()
+              defer { lock.unlock() }
+              guard !isPoisoned else { return nil }
+              return invalidationGeneration
+          }
+
+          /// Serializes one non-suspending authority commit against synchronous
+          ''',
+          '''    var authorizedInvalidationGenerationSnapshot: UInt64? {
+              lock.lock()
+              defer { lock.unlock() }
+              guard !isPoisoned else { return nil }
+              return invalidationGeneration
+          }
+
+          /// Permits generation-zero standalone metadata setup before the first
+          /// account lease exists, but never lets a later poisoned generation
+          /// become fresh authority while actor-isolated cancellation catches up.
+          var admissibleOperationGenerationSnapshot: UInt64? {
+              lock.lock()
+              defer { lock.unlock() }
+              guard !isPoisoned || invalidationGeneration == 0 else { return nil }
+              return invalidationGeneration
+          }
+
+          /// Serializes one non-suspending authority commit against synchronous
+          ''')
+
+          replace_once(sync,
+          '''        guard activeRunContext == context,
+                  synchronizationAttemptID == context.attemptID,
+                  synchronizationRunID == context.runID,
+                  !cancelSync else {
+          ''',
+          '''        guard activeRunContext == context,
+                  synchronizationAttemptID == context.attemptID,
+                  synchronizationRunID == context.runID,
+                  !accountScopeAuthorityFence.rejectsAuthority,
+                  !cancelSync else {
+          ''')
+
+          subs = "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Subscriptions.swift"
+          replace_once(subs,
+          '''private struct CloudKitSubscriptionAccountFence: Sendable {
+              let accountIdentifier: String
+              let attemptID: UUID
+              let runContext: CloudKitSynchronizer.RunContext?
+          }
+          ''',
+          '''private struct CloudKitSubscriptionAccountFence: Sendable {
+              let accountIdentifier: String
+              let attemptID: UUID
+              let runContext: CloudKitSynchronizer.RunContext?
+              let authorityGeneration: UInt64
+          }
+          ''')
+
+          replace_once(subs,
+          '''    @BigSyncBackgroundActor
+              private func makeSubscriptionAccountFence(
+          ''',
+          '''    @BigSyncBackgroundActor
+              private func checkSubscriptionOperationAuthority(
+                  attemptID: UUID,
+                  runContext: CloudKitSynchronizer.RunContext?,
+                  authorityGeneration: UInt64
+              ) throws {
+                  try Task.checkCancellation()
+                  guard synchronizationAttemptID == attemptID,
+                        accountScopeAuthorityFence.invalidationGenerationSnapshot
+                          == authorityGeneration else {
+                      throw CancellationError()
+                  }
+                  if let runContext {
+                      try checkRunContext(runContext)
+                  }
+              }
+
+              @BigSyncBackgroundActor
+              private func makeSubscriptionAccountFence(
+          ''')
+
+          replace_once(subs,
+          '''        try Task.checkCancellation()
+                  guard synchronizationAttemptID == attemptID else {
+                      throw CancellationError()
+                  }
+                  if let runContext {
+                      try checkRunContext(runContext)
+                  }
+                  try keyValueStore.bigSyncValidateDurability()
+                  let accountIdentifier = try await accountIdentifierProvider()
+                  try Task.checkCancellation()
+                  guard synchronizationAttemptID == attemptID else {
+                      throw CancellationError()
+                  }
+                  if let runContext {
+                      try checkRunContext(runContext)
+                      guard accountIdentifier == runContext.accountIdentifier else {
+                          throw OneOffRecordZoneResetError.cloudKitAccountChanged
+                      }
+                  }
+                  return CloudKitSubscriptionAccountFence(
+                      accountIdentifier: accountIdentifier,
+                      attemptID: attemptID,
+                      runContext: runContext
+                  )
+          ''',
+          '''        guard let authorityGeneration = accountScopeAuthorityFence
+                      .admissibleOperationGenerationSnapshot else {
+                      throw CancellationError()
+                  }
+                  try checkSubscriptionOperationAuthority(
+                      attemptID: attemptID,
+                      runContext: runContext,
+                      authorityGeneration: authorityGeneration
+                  )
+                  try keyValueStore.bigSyncValidateDurability()
+                  let accountIdentifier = try await accountIdentifierProvider()
+                  try checkSubscriptionOperationAuthority(
+                      attemptID: attemptID,
+                      runContext: runContext,
+                      authorityGeneration: authorityGeneration
+                  )
+                  if let runContext {
+                      guard accountIdentifier == runContext.accountIdentifier else {
+                          throw OneOffRecordZoneResetError.cloudKitAccountChanged
+                      }
+                  }
+                  return CloudKitSubscriptionAccountFence(
+                      accountIdentifier: accountIdentifier,
+                      attemptID: attemptID,
+                      runContext: runContext,
+                      authorityGeneration: authorityGeneration
+                  )
+          ''')
+
+          replace_once(subs,
+          '''        try Task.checkCancellation()
+                  guard synchronizationAttemptID == fence.attemptID else {
+                      throw CancellationError()
+                  }
+                  if let runContext = fence.runContext {
+                      try await revalidateRunContext(runContext)
+                      return
+                  }
+                  let currentAccountIdentifier = try await accountIdentifierProvider()
+                  try Task.checkCancellation()
+                  guard synchronizationAttemptID == fence.attemptID else {
+                      throw CancellationError()
+                  }
+                  guard currentAccountIdentifier == fence.accountIdentifier else {
+          ''',
+          '''        try checkSubscriptionOperationAuthority(
+                      attemptID: fence.attemptID,
+                      runContext: fence.runContext,
+                      authorityGeneration: fence.authorityGeneration
+                  )
+                  if let runContext = fence.runContext {
+                      try await revalidateRunContext(runContext)
+                      try checkSubscriptionOperationAuthority(
+                          attemptID: fence.attemptID,
+                          runContext: runContext,
+                          authorityGeneration: fence.authorityGeneration
+                      )
+                      return
+                  }
+                  let currentAccountIdentifier = try await accountIdentifierProvider()
+                  try checkSubscriptionOperationAuthority(
+                      attemptID: fence.attemptID,
+                      runContext: nil,
+                      authorityGeneration: fence.authorityGeneration
+                  )
+                  guard currentAccountIdentifier == fence.accountIdentifier else {
+          ''')
+
+          p = Path(subs)
+          text = p.read_text()
+          lookup = '''        let existing = try await subscriptionStore.subscription(
+              withID: expectedSubscriptionID
+          )'''
+          fenced_lookup = '''        try checkSubscriptionOperationAuthority(
+              attemptID: accountFence.attemptID,
+              runContext: accountFence.runContext,
+              authorityGeneration: accountFence.authorityGeneration
+          )
+          let existing = try await subscriptionStore.subscription(
+              withID: expectedSubscriptionID
+          )'''
+          count = text.count(lookup)
+          if count != 4:
+              raise SystemExit(f"expected 4 subscription lookup sites, found {count}")
+          text = text.replace(lookup, fenced_lookup)
+          save = '        let saved = try await subscriptionStore.save(subscription: subscription)'
+          fenced_save = '''        try checkSubscriptionOperationAuthority(
+              attemptID: accountFence.attemptID,
+              runContext: accountFence.runContext,
+              authorityGeneration: accountFence.authorityGeneration
+          )
+          let saved = try await subscriptionStore.save(subscription: subscription)'''
+          count = text.count(save)
+          if count != 2:
+              raise SystemExit(f"expected 2 subscription save sites, found {count}")
+          text = text.replace(save, fenced_save)
+          p.write_text(text)
+
+          tests = Path("Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift")
+          text = tests.read_text()
+          if 'testActiveRunRejectsSynchronousAuthorityPoisonBeforeActorCancellation' in text:
+              raise SystemExit('follow-up tests already exist')
+          text += r'''
+
+          extension CloudKitSynchronizerAccountFencingTests {
+              @BigSyncBackgroundActor
+              func testActiveRunRejectsSynchronousAuthorityPoisonBeforeActorCancellation()
+              throws {
+                  let synchronizer = makeSynchronizer(
+                      transport: AccountFencingTransport()
+                  )
+                  synchronizer.accountScopeAuthorityFence.clear()
+                  let context = CloudKitSynchronizer.RunContext(
+                      attemptID: synchronizer.synchronizationAttemptID,
+                      runID: synchronizer.synchronizationRunID,
+                      accountIdentifier: "account-a",
+                      accountScopeIdentifier: CloudKitSynchronizer
+                          .accountScopeIdentifier(for: "account-a")
+                  )
+                  synchronizer.activeRunContext = context
+
+                  synchronizer.accountScopeAuthorityFence.poison()
+
+                  XCTAssertThrowsError(try synchronizer.checkRunContext(context)) {
+                      XCTAssertTrue($0 is CancellationError)
+                  }
+              }
+
+              @BigSyncBackgroundActor
+              func testStandaloneSubscriptionRejectsAuthorityPoisonBeforeServerLookup()
+              async throws {
+                  let transport = AccountFencingTransport()
+                  let authority = AccountAuthorityFenceReference()
+                  let synchronizer = makeSynchronizer(
+                      transport: transport,
+                      accountIdentifierProvider: {
+                          await authority.poison()
+                          return "account-a"
+                      }
+                  )
+                  authority.synchronizer = synchronizer
+
+                  do {
+                      try await synchronizer.subscribeForChangesInDatabase()
+                      XCTFail("Expected stale subscription authority to be rejected")
+                  } catch is CancellationError {
+                  }
+
+                  XCTAssertEqual(transport.subscriptionFetchCount, 0)
+                  XCTAssertEqual(transport.subscriptionSaveCount, 0)
+              }
+
+              @BigSyncBackgroundActor
+              func testStandaloneSubscriptionCannotAdoptAlreadyPoisonedGeneration()
+              async throws {
+                  let transport = AccountFencingTransport()
+                  let synchronizer = makeSynchronizer(transport: transport)
+                  synchronizer.accountScopeAuthorityFence.poison()
+
+                  do {
+                      try await synchronizer.subscribeForChangesInDatabase()
+                      XCTFail("Expected poisoned standalone authority to be rejected")
+                  } catch is CancellationError {
+                  }
+
+                  XCTAssertEqual(transport.subscriptionFetchCount, 0)
+                  XCTAssertEqual(transport.subscriptionSaveCount, 0)
+              }
+          }
+          '''
+          tests.write_text(text)
+          PY
+      - name: Focused account and subscription qualification
+        run: |
+          swift test --filter CloudKitSynchronizerAccountFencingTests
+          swift test --filter SubscriptionIntentOrderingTests
+          swift test --filter HotfixSubscriptionSafetyTests
+      - name: Full package suite
+        run: swift test
+      - name: Commit reviewed source and remove one-shot workflow
+        shell: bash
+        run: |
+          rm .github/workflows/apply-authority-poison-followup.yml
+          git add Sources Tests .github/workflows/apply-authority-poison-followup.yml
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Fence active-run and subscription authority poison'
+          git push origin HEAD:fix/authority-poison-run-subscription-fence-20260913
