@@ -19,9 +19,11 @@ public extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     private func makeSubscriptionAccountFence() async throws
         -> CloudKitSubscriptionAccountFence {
+        try Task.checkCancellation()
         try keyValueStore.bigSyncValidateDurability()
         let runContext = activeRunContext
         let accountIdentifier = try await accountIdentifierProvider()
+        try Task.checkCancellation()
         if let runContext {
             try checkRunContext(runContext)
             guard accountIdentifier == runContext.accountIdentifier else {
@@ -38,11 +40,13 @@ public extension CloudKitSynchronizer {
     private func revalidateSubscriptionAccountFence(
         _ fence: CloudKitSubscriptionAccountFence
     ) async throws {
+        try Task.checkCancellation()
         if let runContext = fence.runContext {
             try await revalidateRunContext(runContext)
             return
         }
         let currentAccountIdentifier = try await accountIdentifierProvider()
+        try Task.checkCancellation()
         guard currentAccountIdentifier == fence.accountIdentifier else {
             throw OneOffRecordZoneResetError.cloudKitAccountChanged
         }
@@ -120,6 +124,7 @@ public extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func subscribeForChangesInDatabase() async throws {
+        try Task.checkCancellation()
         let expectedSubscriptionID = ownedSubscriptionID(kind: "database")
         if let storedSubscriptionID = subscriptionIDForDatabaseSubscription() {
             guard storedSubscriptionID == expectedSubscriptionID else {
@@ -176,6 +181,7 @@ public extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func subscribeForChanges(in zoneID: CKRecordZone.ID) async throws {
+        try Task.checkCancellation()
         let expectedSubscriptionID = ownedSubscriptionID(
             kind: "zone",
             zoneID: zoneID
@@ -358,8 +364,38 @@ public extension CloudKitSynchronizer {
         accountFence: CloudKitSubscriptionAccountFence
     ) async throws {
         try await revalidateSubscriptionAccountFence(accountFence)
-        try await subscriptionStore.deleteSubscription(withID: identifier)
+        do {
+            try await subscriptionStore.deleteSubscription(withID: identifier)
+        } catch {
+            // A prior attempt (or another installation) may already have
+            // deleted this deterministic ID. Its absence is the desired result,
+            // not an error that should pin our cached registration forever.
+            // An unrelated partial failure must not erase local retry state.
+            guard subscriptionDeletionReportsMissingItem(
+                error, identifier: identifier
+            ) else { throw error }
+        }
+        // This also fences an unknownItem result: neither account replacement
+        // nor cancellation may turn an old response into local success.
         try await revalidateSubscriptionAccountFence(accountFence)
         try persistRemovingSubscriptionID(identifier)
+    }
+
+    @BigSyncBackgroundActor
+    private func subscriptionDeletionReportsMissingItem(
+        _ error: Error,
+        identifier: CKSubscription.ID
+    ) -> Bool {
+        guard let cloudKitError = error as? CKError else { return false }
+        if cloudKitError.code == .unknownItem { return true }
+        guard cloudKitError.code == .partialFailure,
+              let failures = cloudKitError.userInfo[
+                CKPartialErrorsByItemIDKey
+              ] as? [AnyHashable: Error],
+              failures.count == 1,
+              let itemError = failures[identifier] as? CKError else {
+            return false
+        }
+        return itemError.code == .unknownItem
     }
 }
