@@ -16,28 +16,37 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           source = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
           text = source.read_text()
-          old = '''                if var group = generationsByRealm[realmIdentity] {
-                              group.generations[recordName] = generation
-                              generationsByRealm[realmIdentity] = group
-                          } else {
-                              generationsByRealm[realmIdentity] = (
-                                  targetReaderRealm,
-                                  [recordName: generation]
-                              )
-                          }
-          '''
-          new = '''                generationsByRealm[
-                              realmIdentity,
-                              default: (targetReaderRealm, [:])
-                          ].generations[recordName] = generation
-          '''
-          count = text.count(old)
-          if count != 2:
-              raise SystemExit(f'expected upload and deletion grouping copies, found {count}')
-          text = text.replace(old, new)
+          pattern = re.compile(
+              r'(?P<i>[ \t]*)if var group = generationsByRealm\[realmIdentity\] \{\n'
+              r'(?P=i)    group\.generations\[recordName\] = generation\n'
+              r'(?P=i)    generationsByRealm\[realmIdentity\] = group\n'
+              r'(?P=i)\} else \{\n'
+              r'(?P=i)    generationsByRealm\[realmIdentity\] = \(\n'
+              r'(?P=i)        targetReaderRealm,\n'
+              r'(?P=i)        \[recordName: generation\]\n'
+              r'(?P=i)    \)\n'
+              r'(?P=i)\}'
+          )
+          matches = list(pattern.finditer(text))
+          if len(matches) != 2:
+              raise SystemExit(
+                  f'expected upload and deletion grouping copies, found {len(matches)}'
+              )
+
+          def replacement(match):
+              i = match.group('i')
+              return (
+                  f'{i}generationsByRealm[\n'
+                  f'{i}    realmIdentity,\n'
+                  f'{i}    default: (targetReaderRealm, [:])\n'
+                  f'{i}].generations[recordName] = generation'
+              )
+
+          text = pattern.sub(replacement, text)
           source.write_text(text)
 
           tests = Path('Tests/BigSyncKitTests/HotfixMutationDrainTailTests.swift')
