@@ -359,4 +359,44 @@ extension WorkerReviewReconciliationTests {
         XCTAssertEqual(local.explicitlyModifiedAt, t3)
         XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
     }
+
+    @BigSyncBackgroundActor
+    func testReviewBulkRemoteImportRetainsEveryCandidate() async throws {
+        let (adapter, realm) = try await fixture()
+        let count = 128
+        let records = (0..<count).map { index in
+            remote(
+                id: "bulk-inbound-\(index)",
+                zone: adapter.recordZoneID,
+                date: Date(timeIntervalSinceReferenceDate: 1_000 + Double(index)),
+                explicit: true
+            )
+        }
+
+        let results = try await adapter.saveChanges(
+            in: records,
+            forceSave: true
+        )
+        try await adapter.persistImportedChanges()
+        realm.refresh()
+
+        XCTAssertEqual(results.count, count)
+        XCTAssertEqual(
+            realm.objects(WorkerReviewReceiver.self).where {
+                $0.id.starts(with: "bulk-inbound-")
+            }.count,
+            count
+        )
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+        for index in 0..<count {
+            XCTAssertEqual(
+                realm.object(
+                    ofType: WorkerReviewReceiver.self,
+                    forPrimaryKey: "bulk-inbound-\(index)"
+                )?.payload,
+                "remote-payload"
+            )
+        }
+    }
+
 }

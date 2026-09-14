@@ -6709,15 +6709,10 @@ public final class RealmSwiftAdapter:
                                         resolvedIdentity
                                     realmIdentity = resolvedIdentity
                                 }
-                                if var group = candidatesByRealm[realmIdentity] {
-                                    group.candidates.append(candidate)
-                                    candidatesByRealm[realmIdentity] = group
-                                } else {
-                                    candidatesByRealm[realmIdentity] = (
-                                        targetWriterRealm,
-                                        [candidate]
-                                    )
-                                }
+                                candidatesByRealm[
+                                    realmIdentity,
+                                    default: (targetWriterRealm, [])
+                                ].candidates.append(candidate)
                             }
 
                             for group in candidatesByRealm.values {
