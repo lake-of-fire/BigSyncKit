@@ -6709,15 +6709,10 @@ public final class RealmSwiftAdapter:
                                         resolvedIdentity
                                     realmIdentity = resolvedIdentity
                                 }
-                                if var group = candidatesByRealm[realmIdentity] {
-                                    group.candidates.append(candidate)
-                                    candidatesByRealm[realmIdentity] = group
-                                } else {
-                                    candidatesByRealm[realmIdentity] = (
-                                        targetWriterRealm,
-                                        [candidate]
-                                    )
-                                }
+                                candidatesByRealm[
+                                    realmIdentity,
+                                    default: (targetWriterRealm, [])
+                                ].candidates.append(candidate)
                             }
 
                             for group in candidatesByRealm.values {
@@ -7591,15 +7586,10 @@ public final class RealmSwiftAdapter:
                     let realmIdentity = BigSyncMutationTrackingRegistry.identity(
                         for: targetReaderRealm.configuration
                     )
-                    if var group = generationsByRealm[realmIdentity] {
-                        group.generations[recordName] = generation
-                        generationsByRealm[realmIdentity] = group
-                    } else {
-                        generationsByRealm[realmIdentity] = (
-                            targetReaderRealm,
-                            [recordName: generation]
-                        )
-                    }
+                    generationsByRealm[
+                        realmIdentity,
+                        default: (targetReaderRealm, [:])
+                    ].generations[recordName] = generation
                 }
                 for group in generationsByRealm.values {
                     let targetReaderRealm = group.realm
@@ -7778,15 +7768,10 @@ public final class RealmSwiftAdapter:
                 let realmIdentity = BigSyncMutationTrackingRegistry.identity(
                     for: targetReaderRealm.configuration
                 )
-                if var group = generationsByRealm[realmIdentity] {
-                    group.generations[recordName] = generation
-                    generationsByRealm[realmIdentity] = group
-                } else {
-                    generationsByRealm[realmIdentity] = (
-                        targetReaderRealm,
-                        [recordName: generation]
-                    )
-                }
+                generationsByRealm[
+                    realmIdentity,
+                    default: (targetReaderRealm, [:])
+                ].generations[recordName] = generation
             }
             for group in generationsByRealm.values {
                 let targetReaderRealm = group.realm

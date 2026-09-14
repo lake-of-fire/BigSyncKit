@@ -222,4 +222,48 @@ final class HotfixMutationDrainTailTests: XCTestCase {
             forPrimaryKey: recordName
         ))
     }
+
+    @BigSyncBackgroundActor
+    func testBulkUploadAndDeletionAcknowledgementsRetireAllMatchingGenerations() async throws {
+        let (adapter, realm) = try await fixture()
+        let count = 128
+
+        try await realm.asyncWrite {
+            for index in 0..<count {
+                let object = HotfixMutationDrainTailObject()
+                object.id = "bulk-\(index)"
+                object.payload = "value-\(index)"
+                realm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        try await adapter.didFinishImport()
+
+        let upload = try await adapter.prepareUploadBatch(limit: count + 1)
+        XCTAssertEqual(upload.records.count, count)
+        try await adapter.acknowledgeUploadedRecords(
+            upload.records,
+            from: upload
+        )
+        realm.refresh()
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+
+        try await realm.asyncWrite {
+            for object in realm.objects(HotfixMutationDrainTailObject.self) {
+                object.isDeleted = true
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        try await adapter.didFinishImport()
+
+        let deletion = try await adapter.prepareDeletionBatch(limit: count + 1)
+        XCTAssertEqual(deletion.recordIDs.count, count)
+        try await adapter.acknowledgeDeletedRecordIDs(
+            deletion.recordIDs,
+            from: deletion
+        )
+        realm.refresh()
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
 }
