@@ -1,0 +1,52 @@
+name: Native grouped-write review
+on:
+  push:
+    branches: [test/hotfix-grouping-native-20260914]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 70043c77293cbcc8b02329ade6ca174e6842885a
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain and selected inputs
+        working-directory: BigSyncKit
+        run: |
+          swift --version | tee qualification-toolchain.txt
+          git rev-parse HEAD HEAD:Sources HEAD:Tests > qualification-inputs.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD >> qualification-inputs.txt
+          git -C ../SwiftUtilities rev-parse HEAD >> qualification-inputs.txt
+          if ! command -v xcsift >/dev/null; then brew install xcsift; fi
+      - name: Grouping and adjacent generation regressions
+        working-directory: BigSyncKit
+        shell: bash
+        run: |
+          set -o pipefail
+          swift test --scratch-path .build-review --filter 'RealmGroupingRegressionTests|HotfixMutationDrainTailTests' 2>&1 | tee qualification-tests.log | xcsift
+      - name: Preserve input cleanliness
+        if: always()
+        working-directory: BigSyncKit
+        run: git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: grouping-native-review
+          path: BigSyncKit/qualification-*
+          retention-days: 7
