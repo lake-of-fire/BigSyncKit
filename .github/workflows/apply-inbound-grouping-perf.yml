@@ -1,0 +1,106 @@
+name: Apply inbound grouping optimization
+on:
+  push:
+    branches: [perf/ack-grouping-in-place-20260914]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/ack-grouping-in-place-20260914
+      - name: Apply inbound grouping and regression coverage
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          source = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+          text = source.read_text()
+          pattern = re.compile(
+              r'(?P<i>[ \t]*)if var group = candidatesByRealm\[realmIdentity\] \{\n'
+              r'(?P=i)    group\.candidates\.append\(candidate\)\n'
+              r'(?P=i)    candidatesByRealm\[realmIdentity\] = group\n'
+              r'(?P=i)\} else \{\n'
+              r'(?P=i)    candidatesByRealm\[realmIdentity\] = \(\n'
+              r'(?P=i)        targetWriterRealm,\n'
+              r'(?P=i)        \[candidate\]\n'
+              r'(?P=i)    \)\n'
+              r'(?P=i)\}'
+          )
+          matches = list(pattern.finditer(text))
+          if len(matches) != 1:
+              raise SystemExit(f'expected one inbound grouping copy, found {len(matches)}')
+
+          def replacement(match):
+              i = match.group('i')
+              return (
+                  f'{i}candidatesByRealm[\n'
+                  f'{i}    realmIdentity,\n'
+                  f'{i}    default: (targetWriterRealm, [])\n'
+                  f'{i}].candidates.append(candidate)'
+              )
+
+          source.write_text(pattern.sub(replacement, text))
+
+          tests = Path('Tests/BigSyncKitTests/WorkerReviewReconciliationTests.swift')
+          test_text = tests.read_text()
+          insertion = r'''
+
+              @BigSyncBackgroundActor
+              func testReviewBulkRemoteImportRetainsEveryCandidate() async throws {
+                  let (adapter, realm) = try await fixture()
+                  let count = 128
+                  let records = (0..<count).map { index in
+                      remote(
+                          id: "bulk-inbound-\(index)",
+                          zone: adapter.recordZoneID,
+                          date: Date(timeIntervalSinceReferenceDate: 1_000 + Double(index)),
+                          explicit: true
+                      )
+                  }
+
+                  let results = try await adapter.saveChanges(
+                      in: records,
+                      forceSave: true
+                  )
+                  try await adapter.persistImportedChanges()
+                  realm.refresh()
+
+                  XCTAssertEqual(results.count, count)
+                  XCTAssertEqual(
+                      realm.objects(WorkerReviewReceiver.self).where {
+                          $0.id.starts(with: "bulk-inbound-")
+                      }.count,
+                      count
+                  )
+                  XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+                  for index in 0..<count {
+                      XCTAssertEqual(
+                          realm.object(
+                              ofType: WorkerReviewReceiver.self,
+                              forPrimaryKey: "bulk-inbound-\(index)"
+                          )?.payload,
+                          "remote-payload"
+                      )
+                  }
+              }
+          '''
+          marker = '\n}\n'
+          pos = test_text.rfind(marker)
+          if pos == -1:
+              raise SystemExit('test class closing brace not found')
+          test_text = test_text[:pos] + insertion + test_text[pos:]
+          tests.write_text(test_text)
+          PY
+
+          git rm .github/workflows/apply-inbound-grouping-perf.yml
+          git add Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift \
+                  Tests/BigSyncKitTests/WorkerReviewReconciliationTests.swift
+          git config user.name 'OpenAI Review Bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Avoid inbound grouping copy-on-write churn'
+          git push origin HEAD:perf/ack-grouping-in-place-20260914
