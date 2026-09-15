@@ -1,0 +1,102 @@
+name: Sync intent native qualification
+on:
+  push:
+    branches: [verify/sync-intent-workspace-20260915]
+    paths: [.github/workflows/sync-intent-qualify.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Publish exact source-only increment
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          export EVIDENCE="$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          import base64, gzip, hashlib, os
+          from pathlib import Path
+          patch = gzip.decompress(base64.b64decode(Path('.github/sync-intent.patch.b64').read_text(), validate=False))
+          assert hashlib.sha256(patch).hexdigest() == '96d316aa55c2484bf1392cb9cef188b410ed8f066b90dada24b4886b743b4518'
+          Path(os.environ['EVIDENCE'], 'source.patch').write_bytes(patch)
+          PY
+          git checkout --detach b6da0f4021d563802c648980ba248c96b24f0670
+          git apply --index --whitespace=error-all "$EVIDENCE/source.patch"
+          test "$(git write-tree)" = 421c268bed730fe78d6e192269b35f9ee598ddca
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git commit -m 'Preserve semantic intent during snapshot import and backup recovery' -m 'Add opt-in server snapshot and validated pending predecessor policies, stop quarantined conflict retries, and cover the real Realm boundaries. No wire-format or target-schema change.'
+          git push origin HEAD:refs/heads/fix/sync-semantic-intent-20260915
+          git rev-parse HEAD HEAD^{tree} HEAD^ > "$EVIDENCE/identity.txt"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Install log formatter and record toolchain
+        run: |
+          brew install xcsift
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          xcsift --version >> "$RUNNER_TEMP/evidence/toolchain.txt"
+      - name: Native regression and full-suite qualification
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/sync-build" --filter SyncSemanticIntentTests 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/sync-build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+      - name: Prove regressions detect removed fixes and restore source
+        working-directory: BigSyncKit
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess
+          source = pathlib.Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+          original = source.read_text()
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP'], 'evidence')
+          scratch = pathlib.Path(os.environ['RUNNER_TEMP'], 'sync-build')
+          mutations = [
+            ('backup', 'let acceptsServerSnapshot = isRestoringBackupServerSnapshot', 'let acceptsServerSnapshot = false', 'testBackupBootstrapDoesNotReauthorRetainedFutureTimestamp'),
+            ('snapshot', '|| object is any BigSyncAuthoritativeServerSnapshotModel', '|| false', 'testOwnedSnapshotAcceptsServerWithoutReauthoringOldCachedClock'),
+          ]
+          try:
+            for name, before, after, test in mutations:
+              assert original.count(before) == 1
+              source.write_text(original.replace(before, after))
+              log = evidence / ('negative-' + name + '.log')
+              command = f'set -o pipefail; swift test --scratch-path "{scratch}" --filter "{test}" 2>&1 | tee "{log}" | xcsift'
+              result = subprocess.run(['bash', '-c', command], timeout=600)
+              text = log.read_text()
+              assert result.returncode != 0 and 'XCTAssert' in text and re.search(r'Executed [1-9][0-9]* test', text), (name, result.returncode)
+          finally:
+            source.write_text(original)
+          subprocess.run(['git', 'diff', '--exit-code'], check=True)
+          PY
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/sync-build" --filter SyncSemanticIntentTests 2>&1 | tee "$RUNNER_TEMP/evidence/restored-focused.log" | xcsift
+      - name: Capture source identity and dependency lock
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved" || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: sync-intent-native-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
