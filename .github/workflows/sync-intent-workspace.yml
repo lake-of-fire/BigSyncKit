@@ -1,0 +1,26 @@
+name: Sync intent workspace
+on:
+  push:
+    branches: [verify/sync-intent-workspace-20260915]
+    paths: [.github/workflows/sync-intent-workspace.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: b6da0f4021d563802c648980ba248c96b24f0670
+          persist-credentials: false
+      - run: |
+          mkdir -p "$RUNNER_TEMP/export"
+          git archive HEAD | gzip > "$RUNNER_TEMP/export/source.tar.gz"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/export/identity.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/export/tree.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bigsynckit-sync-intent-source
+          path: ${{ runner.temp }}/export
+          retention-days: 7
