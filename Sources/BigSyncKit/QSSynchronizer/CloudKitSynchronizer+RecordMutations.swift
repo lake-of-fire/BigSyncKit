@@ -11,6 +11,28 @@ enum BigSyncHandledMutationRetryError: Error, Equatable, Sendable {
     case drainBudgetExceeded
 }
 
+/// A semantic quarantine is unresolved work, not a successfully rebased
+/// conflict. Stop this drain instead of spending its retry budget resending
+/// the same stale change tag. Successful siblings were already acknowledged;
+/// the quarantined record's local generation remains durable.
+public struct BigSyncSemanticUploadConflictError: Error, Sendable {
+    public let recordNames: [String]
+}
+
+func requireResolvedUploadConflictOutcomes(
+    _ results: [InboundLiveResult]
+) throws {
+    let quarantined = results.compactMap { result -> String? in
+        if case .quarantined = result.disposition {
+            return result.event.recordName
+        }
+        return nil
+    }
+    guard quarantined.isEmpty else {
+        throw BigSyncSemanticUploadConflictError(recordNames: quarantined.sorted())
+    }
+}
+
 struct HandledMutationRetryBudget {
     private(set) var attemptsByKey = [PreparedMutationRetryKey: Int]()
     private(set) var totalAttempts = 0
@@ -275,6 +297,7 @@ extension CloudKitSynchronizer {
                     results,
                     records: conflictedRecords
                 )
+                try requireResolvedUploadConflictOutcomes(results)
                 try await revalidateActiveRunContext(for: attemptID)
                 try await adapter.persistImportedChanges()
                 try await revalidateActiveRunContext(for: attemptID)

@@ -3535,7 +3535,8 @@ public final class RealmSwiftAdapter:
         syncedEntityID: String,
         syncedEntityState: SyncedEntityState,
         entityType: String,
-        isNewlyCreatedReceiver: Bool
+        isNewlyCreatedReceiver: Bool,
+        acceptsServerSnapshot: Bool = false
     ) throws -> [PendingRelationshipRequest] {
         let objectProperties = object.objectSchema.properties
         var pendingRelationships = [PendingRelationshipRequest]()
@@ -3571,6 +3572,8 @@ public final class RealmSwiftAdapter:
         }
 
         if isNewlyCreatedReceiver
+            || acceptsServerSnapshot
+            || object is any BigSyncAuthoritativeServerSnapshotModel
             || mergePolicy == .server
             || syncedEntityState == .deletedRemotely
             || syncedEntityState == .recreatingRemotely {
@@ -6265,7 +6268,7 @@ public final class RealmSwiftAdapter:
                 do {
                     try recordValidatingType?
                         .validateInboundSemanticRecord(record)
-                    if let replacementValidatingType {
+                    if replacementValidatingType != nil {
                         guard let objectIdentifier = getObjectIdentifier(
                             recordName: record.recordID.recordName,
                             entityType: record.recordType
@@ -6282,11 +6285,18 @@ public final class RealmSwiftAdapter:
                                 ofType: objectClass,
                                 forPrimaryKey: objectIdentifier
                             )
-                        _ = try replacementValidatingType
-                            .inboundSemanticReplacementDisposition(
-                                record,
-                                existingObject: existingObject
-                            )
+                        let pendingGeneration = realmProvider
+                            .targetReaderRealmPerSchemaName[record.recordType]?
+                            .object(
+                                ofType: BigSyncPendingMutation.self,
+                                forPrimaryKey: record.recordID.recordName
+                            )?.generation
+                        _ = try self.semanticReplacementDisposition(
+                            for: record,
+                            objectClass: objectClass,
+                            existingObject: existingObject,
+                            pendingGeneration: pendingGeneration
+                        )
                     }
                     dispositionsByRecordName[record.recordID.recordName] =
                         .validatedAuthoritativeOwnUpload
@@ -6329,6 +6339,47 @@ public final class RealmSwiftAdapter:
     }
 
     @BigSyncBackgroundActor
+    private func semanticReplacementDisposition(
+        for record: CKRecord,
+        objectClass: Object.Type,
+        existingObject: Object?,
+        pendingGeneration: String?
+    ) throws -> BigSyncInboundSemanticReplacementDisposition {
+        guard let validatingType = objectClass as?
+                BigSyncInboundSemanticReplacementValidating.Type else {
+            return .applyIncomingRecord
+        }
+        do {
+            return try validatingType.inboundSemanticReplacementDisposition(
+                record, existingObject: existingObject
+            )
+        } catch {
+            guard pendingGeneration != nil, let existingObject,
+                  let predecessorType = objectClass as?
+                    BigSyncInboundPendingSemanticReplacementValidating.Type
+            else { throw error }
+            try predecessorType.validateInboundSemanticPredecessorOfPendingMutation(
+                record, existingObject: existingObject
+            )
+            // Only the current server metadata is admitted. The final target
+            // transaction must still match the selected pending generation;
+            // its ordinary journal fence preserves the working value.
+            return .applyIncomingRecord
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private var isRestoringBackupServerSnapshot: Bool {
+        guard let state = realmProvider?.persistenceRealm?.object(
+            ofType: RebuildProvenanceState.self,
+            forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+        ) else { return false }
+        return state.isActive && state.serverBootstrapStarted
+            && state.accountScopeIdentifier == activeAccountScopeIdentifier
+            && changeFeedResetMode(for: state) == .backupRestore
+    }
+
+    @BigSyncBackgroundActor
     public func saveChanges(
         in records: [CKRecord],
         forceSave: Bool
@@ -6337,6 +6388,12 @@ public final class RealmSwiftAdapter:
             throw RealmSwiftAdapterError.setupUnavailable
         }
         guard !records.isEmpty else { return [] }
+
+        // A retained backup value is not fresh user intent. Apply validated
+        // server values without allowing the ordinary timestamp fallback to
+        // recreate the copied outbox we deliberately retired. Genuine
+        // post-restore journals remain protected by the final write fence.
+        let acceptsServerSnapshot = isRestoringBackupServerSnapshot
 
         //        debugPrint("# To save from icloud:", records.map { $0.recordID.recordName })
         var recordsToSave: [(
@@ -6489,14 +6546,15 @@ public final class RealmSwiftAdapter:
                         )
                         let semanticReplacementDisposition:
                             BigSyncInboundSemanticReplacementDisposition
-                        if let replacementValidatingType = objectClass as?
+                        if objectClass is
                             BigSyncInboundSemanticReplacementValidating.Type {
                             do {
                                 semanticReplacementDisposition =
-                                    try replacementValidatingType
-                                    .inboundSemanticReplacementDisposition(
-                                        record,
-                                        existingObject: existingObject
+                                    try self.semanticReplacementDisposition(
+                                        for: record,
+                                        objectClass: objectClass,
+                                        existingObject: existingObject,
+                                        pendingGeneration: expectedMutationGeneration
                                     )
                             } catch {
                                 let quarantine = try inboundSemanticQuarantine(
@@ -6833,7 +6891,8 @@ public final class RealmSwiftAdapter:
                                                     syncedEntityID: candidate.syncedEntityID,
                                                     syncedEntityState: candidate.syncedEntityState,
                                                     entityType: candidate.entityType,
-                                                    isNewlyCreatedReceiver: isNewlyCreatedReceiver
+                                                    isNewlyCreatedReceiver: isNewlyCreatedReceiver,
+                                                    acceptsServerSnapshot: acceptsServerSnapshot
                                                 )
                                             )
                                             appliedRecordNames.insert(
