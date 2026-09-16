@@ -1,0 +1,286 @@
+diff --git a/Tests/BigSyncKitTests/SyncLongLivedReplicaTests.swift b/Tests/BigSyncKitTests/SyncLongLivedReplicaTests.swift
+index 7e0adcc..821963d 100644
+--- a/Tests/BigSyncKitTests/SyncLongLivedReplicaTests.swift
++++ b/Tests/BigSyncKitTests/SyncLongLivedReplicaTests.swift
+@@ -28,11 +28,11 @@ private enum TimelineFailure: Error {
+     case invalidRecord, unexpectedTransportSurface, nonQuiescent
+ }
+ 
+-private final class TimelineDatabaseIdentity: NSObject, CloudKitDatabaseAdapter {
++final class TimelineDatabaseIdentity: NSObject, CloudKitDatabaseAdapter {
+     var databaseScope: CKDatabase.Scope { .private }
+ }
+ 
+-private final class TimelineKeyValueStore: NSObject, KeyValueStore {
++final class TimelineKeyValueStore: NSObject, KeyValueStore {
+     private var values: [String: Any] = [:]
+     func object(forKey key: String) -> Any? { values[key] }
+     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
+@@ -47,7 +47,7 @@ private final class TimelineKeyValueStore: NSObject, KeyValueStore {
+ /// tags/modification dates or claim to test server-side compare-and-swap.
+ /// Secure archives isolate request/response/server values from CKRecord aliases.
+ /// The real adapter, journal, import policy, and upload drain are never replaced.
+-private actor TimelineTransport: CloudKitRecordStore, CloudKitChangeFeed,
++actor TimelineTransport: CloudKitRecordStore, CloudKitChangeFeed,
+     CloudKitSubscriptionStore, CloudKitZoneStore {
+     struct Step: Sendable {
+         var failure: CKError.Code? = nil
+ diff --git a/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift b/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
+index bcf5219..9b63e96 100644
+--- a/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
++++ b/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
+@@ -57,16 +57,17 @@ final class SyncRecordRebaseTests: XCTestCase {
+     private enum Fault: Error { case beforeTrackingCommit }
+ 
+     @BigSyncBackgroundActor
+-    private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
++    private func fixture(directory: URL? = nil) async throws -> (RealmSwiftAdapter, Realm) {
+         let nonce = UUID().uuidString
+         var target = Realm.Configuration()
+-        target.inMemoryIdentifier = "rebase-target-" + nonce
+-        target.objectTypes = [RebaseRow.self, RebaseArticle.self, RebaseControl.self,
++        if let directory { target.fileURL = directory.appendingPathComponent("target.realm") }
++        else { target.inMemoryIdentifier = "rebase-target-" + nonce }
++        target.objectTypes = [RebaseRow.self, RebaseArticle.self, RebaseControl.self, RebaseAtomicRow.self,
+                               BigSyncPendingMutation.self]
+         BigSyncMutationPolicy.enableRecordRebasing(in: &target)
+         BigSyncMutationPolicy.enableRecordRebasing(in: &target)
+-        // Explicit in the red baseline so the old adapter can open the fixture.
+-        let exclusions = [BigSyncRecordBaseline.className()]
++        // The library must exclude its own accounting table automatically.
++        let exclusions: [String] = []
+         BigSyncMutationPolicy(excludedClassNames: exclusions).install(
+             configurations: [target],
+             mutationJournalIdentityProvider: {
+@@ -74,14 +75,16 @@ final class SyncRecordRebaseTests: XCTestCase {
+             }
+         )
+         var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
+-        tracking.inMemoryIdentifier = "rebase-tracking-" + nonce
++        if let directory { tracking.fileURL = directory.appendingPathComponent("tracking.realm") }
++        else { tracking.inMemoryIdentifier = "rebase-tracking-" + nonce }
+         let adapter = RealmSwiftAdapter(
+             persistenceRealmConfiguration: tracking,
+             targetRealmConfigurations: [target], excludedClassNames: exclusions,
+             recordZoneID: .init(zoneName: "rebase"),
+             logger: Logger(label: "SyncRecordRebaseTests"), startSetupTask: false
+         )
+-        try await adapter.resetSyncCaches()
++        if directory != nil { try await adapter.ensureSetup() }
++        else { try await adapter.resetSyncCaches() }
+         adapter.invalidateTokens()
+         adapter.mergePolicy = .custom
+         try await adapter.activateReplicaBinding(
+@@ -382,3 +385,212 @@ final class SyncRecordRebaseTests: XCTestCase {
+         XCTAssertEqual(Array(value.order), ["b", "a"])
+     }
+ }
++
++
++@objc(RebaseAtomicRow)
++private final class RebaseAtomicRow: Object, ChangeMetadataRecordable {
++    @Persisted(primaryKey: true) var id = "bounds"
++    @Persisted var lower = 0
++    @Persisted var upper = 10
++    @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 1)
++    @Persisted var modifiedAt = Date(timeIntervalSinceReferenceDate: 1)
++    @Persisted var explicitlyModifiedAt: Date?
++    @Persisted var isDeleted = false
++}
++
++@BigSyncBackgroundActor
++private final class RebaseWakeups: ModelAdapterDelegate {
++    func needsInitialSetup() async throws {}
++    func hasChangesToUpload() async {}
++}
++
++extension SyncRecordRebaseTests {
++    @BigSyncBackgroundActor
++    func testActualUploadDrainRebasesNormalFetchAndConflictReplyToSameResult() async throws {
++        for fetchBeforeUpload in [false, true] {
++            let (adapter, realm) = try await fixture()
++            let transport = TimelineTransport()
++            let directory = FileManager.default.temporaryDirectory
++                .appendingPathComponent("rebase-drain-" + UUID().uuidString)
++            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++            defer { try? FileManager.default.removeItem(at: directory) }
++            let synchronizer = CloudKitSynchronizer(
++                identifier: UUID().uuidString, containerIdentifier: "iCloud.test.rebase",
++                database: TimelineDatabaseIdentity(), recordZoneID: adapter.recordZoneID,
++                keyValueStore: TimelineKeyValueStore(), accountIdentifierProvider: { "account" },
++                accountStatusProvider: { .available }, changeFeed: transport,
++                subscriptionStore: transport, zoneStore: transport, recordStore: transport,
++                backupDetectionBaseURL: directory, logger: Logger(label: "RebaseDrain")
++            )
++            synchronizer.addModelAdapter(adapter)
++            let wakeups = RebaseWakeups()
++            adapter.modelAdapterDelegate = wakeups
++            try await deliver([row(adapter)], to: adapter)
++            let value = try edit(realm) { $0.localField = "local-v1" }
++            let incoming = row(adapter, remote: "remote-v1", at: 30)
++            if fetchBeforeUpload { try await deliver([incoming], to: adapter) }
++            else {
++                await transport.enqueue(.init(conflicts: [
++                    incoming.recordID.recordName: try TimelineTransport.archive(incoming)
++                ]))
++            }
++            try await adapter.didFinishImport()
++            try await synchronizer.synchronizeAdapter(adapter)
++            try await adapter.didFinishImport()
++            XCTAssertFalse(adapter.hasChanges)
++            XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
++            let saved = try await transport.record(named: incoming.recordID.recordName)
++            XCTAssertEqual(saved?["remoteField"] as? String, "remote-v1")
++            XCTAssertEqual(saved?["localField"] as? String, "local-v1")
++            realm.refresh()
++            XCTAssertEqual(value.remoteField, "remote-v1")
++            XCTAssertEqual(value.localField, "local-v1")
++            let calls = await transport.history()
++            XCTAssertEqual(calls.count, fetchBeforeUpload ? 1 : 2)
++            try await synchronizer.synchronizeAdapter(adapter)
++            let quietCalls = await transport.history()
++            XCTAssertEqual(quietCalls.count, calls.count)
++            adapter.cancelSynchronization()
++            await adapter.waitForCancellation()
++        }
++    }
++
++    @BigSyncBackgroundActor
++    func testRebasedTargetBaselineAndPendingIntentSurviveDiskAdapterRecreation() async throws {
++        let directory = FileManager.default.temporaryDirectory
++            .appendingPathComponent("rebase-disk-" + UUID().uuidString)
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let revision: String
++        let pending: String
++        do {
++            let (adapter, realm) = try await fixture(directory: directory)
++            try await deliver([row(adapter)], to: adapter)
++            _ = try edit(realm) { $0.localField = "local-v1" }
++            try await deliver([row(adapter, remote: "remote-v1", at: 30)], to: adapter)
++            revision = try baseline(realm).revision
++            pending = try generation(realm)
++            adapter.cancelSynchronization()
++            await adapter.waitForCancellation()
++            adapter.invalidateTokens()
++        }
++        let (reopened, realm) = try await fixture(directory: directory)
++        XCTAssertEqual(try baseline(realm).revision, revision)
++        XCTAssertEqual(try generation(realm), pending)
++        try await deliver([row(reopened, remote: "remote-v1", at: 30)], to: reopened)
++        XCTAssertEqual(try generation(realm), pending)
++        let batch = try await reopened.prepareUploadBatch(limit: 10)
++        XCTAssertEqual(batch.records.first?["remoteField"] as? String, "remote-v1")
++        XCTAssertEqual(batch.records.first?["localField"] as? String, "local-v1")
++        reopened.cancelSynchronization()
++        await reopened.waitForCancellation()
++    }
++
++    @BigSyncBackgroundActor
++    func testMissingBaselineBlocksWithoutInventingAnAncestorOrChangingTarget() async throws {
++        let (adapter, realm) = try await fixture()
++        try await deliver([row(adapter)], to: adapter)
++        let value = try edit(realm) { $0.localField = "local-v1" }
++        let pending = try generation(realm)
++        try realm.write { realm.delete(try baseline(realm)) }
++        do {
++            try await deliver([row(adapter, remote: "remote-v1", at: 30)], to: adapter)
++            XCTFail("A missing ancestor is not proof that all local differences were authored")
++        } catch BigSyncRecordRebaseError.missingBaseline(let name) {
++            XCTAssertEqual(name, RebaseRow.className() + ".row")
++        }
++        realm.refresh()
++        XCTAssertEqual(value.remoteField, "remote-v0")
++        XCTAssertEqual(value.localField, "local-v1")
++        XCTAssertEqual(try generation(realm), pending)
++        XCTAssertTrue(realm.objects(BigSyncRecordBaseline.self).isEmpty)
++    }
++
++    @BigSyncBackgroundActor
++    func testForeignNamespaceCannotSupplyMutationAncestor() async throws {
++        let (adapter, realm) = try await fixture()
++        try await deliver([row(adapter)], to: adapter)
++        _ = try edit(realm) { $0.localField = "local-v1" }
++        let oldNamespace = try baseline(realm).namespace
++        try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.test.other", databaseScope: .private)
++        do {
++            try await deliver([row(adapter, remote: "remote-v1", at: 30)], to: adapter)
++            XCTFail("Another container's base must not be reused")
++        } catch BigSyncRecordRebaseError.missingBaseline { }
++        XCTAssertEqual(try baseline(realm).namespace, oldNamespace)
++    }
++
++    @BigSyncBackgroundActor
++    func testMalformedIncomingFieldRollsBackTargetBaselineAndGeneration() async throws {
++        let (adapter, realm) = try await fixture()
++        try await deliver([row(adapter)], to: adapter)
++        let value = try edit(realm) { $0.localField = "local-v1" }
++        let revision = try baseline(realm).revision
++        let pending = try generation(realm)
++        let malformed = row(adapter, remote: "remote-v1", at: 30)
++        malformed["localField"] = ["not a string"] as CKRecordValue
++        do { try await deliver([malformed], to: adapter); XCTFail("Malformed input must throw") }
++        catch { }
++        realm.refresh()
++        XCTAssertEqual(value.remoteField, "remote-v0")
++        XCTAssertEqual(value.localField, "local-v1")
++        XCTAssertEqual(try baseline(realm).revision, revision)
++        XCTAssertEqual(try generation(realm), pending)
++    }
++
++    @BigSyncBackgroundActor
++    func testUndeclaredModelsRemainIndivisibleInsteadOfSplittingHiddenInvariants() async throws {
++        let (adapter, realm) = try await fixture()
++        let initial = record(adapter, type: RebaseAtomicRow.self, id: "bounds")
++        initial["lower"] = 0 as CKRecordValue
++        initial["upper"] = 10 as CKRecordValue
++        try await deliver([initial], to: adapter)
++        let bounds = try XCTUnwrap(realm.object(ofType: RebaseAtomicRow.self, forPrimaryKey: "bounds"))
++        try realm.write {
++            bounds.lower = 8
++            bounds.refreshChangeMetadata(explicitlyModified: true, at: Date(timeIntervalSinceReferenceDate: 20))
++        }
++        let remote = record(adapter, type: RebaseAtomicRow.self, id: "bounds", at: 30)
++        remote["lower"] = 0 as CKRecordValue
++        remote["upper"] = 5 as CKRecordValue
++        try await deliver([remote], to: adapter)
++        realm.refresh()
++        XCTAssertEqual(bounds.lower, 0)
++        XCTAssertEqual(bounds.upper, 5)
++        XCTAssertLessThanOrEqual(bounds.lower, bounds.upper, "An implicit field merge would manufacture invalid 8...5 bounds")
++    }
++
++    @BigSyncBackgroundActor
++    func testEqualClockCollisionSelectsSameValueWithReplicaRolesReversed() async throws {
++        var winners = [String?]()
++        for local in ["alpha", "omega"] {
++            let (adapter, realm) = try await fixture()
++            try await deliver([row(adapter)], to: adapter)
++            let value = try edit(realm, at: 20) { $0.remoteField = local }
++            try await deliver([row(adapter, remote: local == "alpha" ? "omega" : "alpha", at: 20)], to: adapter)
++            realm.refresh()
++            winners.append(value.remoteField)
++        }
++        XCTAssertEqual(winners[0], winners[1])
++    }
++
++    @BigSyncBackgroundActor
++    func testLocalDeletionInvalidatesBaselineInTheSameRollbackBoundary() async throws {
++        let (adapter, realm) = try await fixture()
++        try await deliver([row(adapter)], to: adapter)
++        let value = try XCTUnwrap(realm.object(ofType: RebaseRow.self, forPrimaryKey: "row"))
++        let revision = try baseline(realm).revision
++        XCTAssertThrowsError(try realm.write {
++            value.isDeleted = true
++            value.refreshChangeMetadata(explicitlyModified: true, at: Date(timeIntervalSinceReferenceDate: 20))
++            XCTAssertTrue(realm.objects(BigSyncRecordBaseline.self).isEmpty)
++            throw Fault.beforeTrackingCommit
++        })
++        XCTAssertFalse(value.isDeleted)
++        XCTAssertEqual(try baseline(realm).revision, revision)
++        _ = try edit(realm) { $0.isDeleted = true }
++        XCTAssertTrue(realm.objects(BigSyncRecordBaseline.self).isEmpty)
++        _ = try edit(realm, at: 30) { $0.isDeleted = false }
++        XCTAssertTrue(realm.objects(BigSyncRecordBaseline.self).isEmpty, "Resurrection cannot reuse the deleted lifetime's ancestor")
++    }
++}
