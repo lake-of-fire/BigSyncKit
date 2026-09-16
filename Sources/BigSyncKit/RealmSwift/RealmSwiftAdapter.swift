@@ -9219,7 +9219,27 @@ extension RealmSwiftAdapter {
         let remote = try BigSyncRecordFingerprint.fields(of: remoteObject)
         let local = try BigSyncRecordFingerprint.fields(of: object)
         let stored = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
-        let base = stored?.namespace == context.namespace ? stored?.fieldDigests : nil
+        let base = stored?.namespace == context.namespace && stored?.invalidated == false
+            ? stored?.fieldDigests : nil
+        let lifetimeField: String?
+        if case let .lifetimeBundle(field, independent) = policy {
+            guard let property = object.objectSchema.properties.first(where: { $0.name == field }),
+                  !property.isArray, !property.isSet, !property.isMap,
+                  property.type == .string || property.type == .UUID,
+                  independent.isSubset(of: Set(local.keys)) else {
+                throw BigSyncRecordRebaseError.invalidPolicy
+            }
+            lifetimeField = field
+        } else { lifetimeField = nil }
+        func lifetimeValue(_ object: Object) -> String? {
+            guard let lifetimeField else { return nil }
+            if let uuid = object[lifetimeField] as? UUID { return uuid.uuidString.lowercased() }
+            return object[lifetimeField] as? String
+        }
+        if lifetimeField != nil {
+            try BigSyncLifetimeID.validate(lifetimeValue(object))
+            try BigSyncLifetimeID.validate(lifetimeValue(remoteObject))
+        }
         let incoming: Set<String>
         if pending != nil {
             guard let base else {
@@ -9238,30 +9258,28 @@ extension RealmSwiftAdapter {
                 // that can be combined with an unrelated edit to make a zombie.
                 incoming = preferRemote ? Set(remote.keys) : []
             } else {
-                let lifetime: String?
-                if case let .lifetimeBundle(field, independent) = policy {
-                    guard let property = object.objectSchema.properties.first(where: { $0.name == field }),
-                          !property.isArray, !property.isSet, !property.isMap,
-                          property.type == .string || property.type == .UUID,
-                          independent.isSubset(of: Set(local.keys)) else {
-                        throw BigSyncRecordRebaseError.invalidPolicy
-                    }
-                    lifetime = field
-                } else { lifetime = nil }
-                func lifetimeValue(_ object: Object) -> String? {
-                    guard let lifetime else { return nil }
-                    if let uuid = object[lifetime] as? UUID { return uuid.uuidString.lowercased() }
-                    return object[lifetime] as? String
-                }
                 incoming = try BigSyncRecordRebasePlanner.incomingFields(
                     base: base, local: local, remote: remote, policy: policy,
                     preferRemoteOnConflict: preferRemote,
                     localLifetime: lifetimeValue(object), remoteLifetime: lifetimeValue(remoteObject)
                 )
             }
+        } else if let lifetimeField, let base, existingObject != nil,
+                  local[lifetimeField] != remote[lifetimeField],
+                  try BigSyncLifetimeID.prefersIncoming(
+                    local: lifetimeValue(object), incoming: lifetimeValue(remoteObject)
+                  ) == false {
+            // An acknowledged reset is still newer than a delayed predecessor.
+            // Keep the entire accepted bundle and forward it; a sibling's
+            // acknowledgement status must not select a different reset winner.
+            // Without a same-namespace base (e.g. restored backup), the cached
+            // row has no such authority and follows the ordinary server path.
+            incoming = try BigSyncRecordRebasePlanner.incomingFields(
+                base: base, local: local, remote: remote, policy: policy,
+                preferRemoteOnConflict: true,
+                localLifetime: lifetimeValue(object), remoteLifetime: lifetimeValue(remoteObject)
+            )
         } else {
-            // Without a journal the local row is a replica, not a new author.
-            // Inbound feed order establishes the next accepted server baseline.
             incoming = Set(remote.keys)
         }
         return try applyComparisonFields(incoming, record: record, object: object,
@@ -9286,7 +9304,7 @@ extension RealmSwiftAdapter {
             try applyChange(property: property, record: record, object: object,
                             syncedEntityIdentifier: record.recordID.recordName)
         }
-        if !pending || merged == remote {
+        if merged == remote {
             for property in object.objectSchema.properties
                 where BigSyncRecordFingerprint.metadata.contains(property.name) {
                 try applyChange(property: property, record: record, object: object,
@@ -9301,10 +9319,10 @@ extension RealmSwiftAdapter {
         } else {
             changedBase = BigSyncRecordBaseline.install(
                 recordName: record.recordID.recordName, namespace: context.namespace,
-                fields: remote, in: realm
+                fields: remote, serverChangeTag: record.recordChangeTag, in: realm
             )
         }
-        if pending, changedBase || merged != local {
+        if (pending && (changedBase || merged != local)) || (!pending && merged != remote) {
             // A changed ancestor also invalidates older upload receipts even
             // when conflict selection retained every local payload field.
             (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
@@ -9323,7 +9341,7 @@ extension RealmSwiftAdapter {
         let object = try decodedComparisonObject(record, type: type)
         let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: record.recordID.recordName)
         return .init(context: context,
-                     revision: base?.namespace == context.namespace ? base?.revision : nil,
+                     revision: base?.revision,
                      fields: try BigSyncRecordFingerprint.fields(of: object))
     }
 
@@ -9336,7 +9354,7 @@ extension RealmSwiftAdapter {
             }
         }
         var generations = [String: String]()
-        var groups = [String: (realm: Realm, items: [(name: String, type: Object.Type, proof: BigSyncPreparedRecordBase)])]()
+        var groups = [String: (realm: Realm, items: [(name: String, type: Object.Type, proof: BigSyncPreparedRecordBase, serverChangeTag: String?)])]()
         for item in prepared {
             generations[item.record.recordID.recordName] = item.generation
             guard let proof = item.comparisonBase, proof.context == recordRebaseContext,
@@ -9349,7 +9367,7 @@ extension RealmSwiftAdapter {
                 throw BigSyncRecordRebaseError.inconsistentReceipt(saved.recordID.recordName)
             }
             let key = BigSyncMutationTrackingRegistry.identity(for: realm.configuration)
-            groups[key, default: (realm, [])].items.append((saved.recordID.recordName, type, proof))
+            groups[key, default: (realm, [])].items.append((saved.recordID.recordName, type, proof, saved.recordChangeTag))
         }
         for group in groups.values {
             let realm = group.realm
@@ -9361,7 +9379,7 @@ extension RealmSwiftAdapter {
                         guard !cancelSync, recordRebaseContext == proof.context else { throw CancellationError() }
                         try proof.context.validate(in: realm)
                         let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: item.name)
-                        let revision = base?.namespace == proof.context.namespace ? base?.revision : nil
+                        let revision = base?.revision
                         guard revision == proof.revision,
                               let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: item.name),
                               pendingMutationIsEligibleForActiveTransport(pending),
@@ -9369,7 +9387,7 @@ extension RealmSwiftAdapter {
                               let object = realm.object(ofType: item.type, forPrimaryKey: id),
                               (object as? SoftDeletable)?.isDeleted != true else { continue }
                         BigSyncRecordBaseline.install(recordName: item.name, namespace: proof.context.namespace,
-                                                      fields: proof.fields, in: realm)
+                                                      fields: proof.fields, serverChangeTag: item.serverChangeTag, in: realm)
                     }
                 }
             }

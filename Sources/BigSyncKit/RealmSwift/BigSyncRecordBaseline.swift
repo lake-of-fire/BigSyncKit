@@ -10,6 +10,8 @@ public final class BigSyncRecordBaseline: Object {
     @Persisted(primaryKey: true) public var recordName = ""
     @Persisted public var namespace = ""
     @Persisted public var revision = ""
+    @Persisted public var invalidated = false
+    @Persisted public var serverChangeTag: String?
     @Persisted public var fields: Map<String, Data>
 }
 
@@ -46,6 +48,8 @@ public enum BigSyncRecordRebaseError: Error {
     case invalidPolicy
     case missingBaseline(String)
     case inconsistentReceipt(String)
+    case invalidLifetime
+    case lifetimeOverflow
 }
 
 /// Pure three-way selection. Sets/maps/lists are single fields; this is not a
@@ -89,7 +93,11 @@ enum BigSyncRecordRebasePlanner {
             let bundle = keys.subtracting(independentFields)
             let useRemote: Bool
             if local[lifetimeField] != remote[lifetimeField] {
-                if local[lifetimeField] == base[lifetimeField] {
+                if let ordered = try BigSyncLifetimeID.prefersIncoming(
+                    local: localLifetime, incoming: remoteLifetime
+                ) {
+                    useRemote = ordered
+                } else if local[lifetimeField] == base[lifetimeField] {
                     useRemote = true
                 } else if remote[lifetimeField] == base[lifetimeField] {
                     useRemote = false
@@ -274,13 +282,16 @@ extension BigSyncRecordBaseline {
 
     @discardableResult
     static func install(recordName: String, namespace: String,
-                        fields: [String: Data], in realm: Realm) -> Bool {
+                        fields: [String: Data], serverChangeTag: String? = nil, in realm: Realm) -> Bool {
         precondition(realm.isInWriteTransaction)
         let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
-        if existing?.namespace == namespace, existing?.fieldDigests == fields { return false }
+        if existing?.invalidated == false, existing?.namespace == namespace,
+           existing?.fieldDigests == fields, existing?.serverChangeTag == serverChangeTag { return false }
         let row = existing ?? Self()
         if existing == nil { row.recordName = recordName }
         row.namespace = namespace
+        row.invalidated = false
+        row.serverChangeTag = serverChangeTag
         row.revision = UUID().uuidString
         row.fields.removeAll()
         for (name, digest) in fields { row.fields[name] = digest }
@@ -290,8 +301,17 @@ extension BigSyncRecordBaseline {
 
     static func invalidate(recordName: String, in realm: Realm) {
         precondition(realm.isInWriteTransaction)
-        guard isEnabled(in: realm),
-              let row = realm.object(ofType: Self.self, forPrimaryKey: recordName) else { return }
-        realm.delete(row)
+        guard isEnabled(in: realm) else { return }
+        let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
+        // Keep a revision even when the first upload has not established a base.
+        // Removing the row would turn delete/resurrection back into nil and let
+        // an older nil-based receipt install an ancestor from the previous life.
+        let row = existing ?? Self()
+        if existing == nil { row.recordName = recordName }
+        row.invalidated = true
+        row.serverChangeTag = nil
+        row.revision = UUID().uuidString
+        row.fields.removeAll()
+        realm.add(row, update: .modified)
     }
 }
