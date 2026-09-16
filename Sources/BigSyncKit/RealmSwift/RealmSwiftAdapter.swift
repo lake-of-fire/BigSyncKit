@@ -9788,7 +9788,8 @@ extension RealmSwiftAdapter {
     /// base for either choice; choosing local never fabricates a server base.
     @BigSyncBackgroundActor
     public func resolveRecordConflict(
-        id: String, expectedGeneration: String, choice: BigSyncRecordConflictChoice
+        id: String, expectedGeneration: String, choice: BigSyncRecordConflictChoice,
+        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
         guard let context = recordRebaseContext else { throw CancellationError() }
         for realm in realmProvider?.targetReaderRealms ?? [] {
@@ -9963,7 +9964,10 @@ extension RealmSwiftAdapter {
     /// After additional local editing, make a new review snapshot. This does
     /// not resolve anything: the caller must display/confirm the fresh values.
     @BigSyncBackgroundActor
-    public func refreshRecordConflict(_ conflictID: String) async throws {
+    public func refreshRecordConflict(
+        _ conflictID: String,
+        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+    ) async throws {
         try await ensureSetup()
         guard let context = recordRebaseContext, let provider = realmProvider else {
             throw BigSyncRecordContractError.staleConflict
@@ -10026,7 +10030,9 @@ public extension RealmSwiftAdapter {
     /// Explicit archive cleanup. Unresolved values are never evicted to make
     /// room, and no pending submission or mutation generation is touched.
     @BigSyncBackgroundActor
-    func discardResolvedRecordConflictArchives() async throws {
+    func discardResolvedRecordConflictArchives(
+        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+    ) async throws {
         guard let context = recordRebaseContext else { throw CancellationError() }
         try await retireResolvedRecordConflictQuarantines()
         for realm in realmProvider?.targetReaderRealms ?? [] {

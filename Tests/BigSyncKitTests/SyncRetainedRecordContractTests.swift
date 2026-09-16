@@ -585,4 +585,105 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         XCTAssertTrue(try adapter.unresolvedRecordConflicts().isEmpty)
     }
 
+
+    @BigSyncBackgroundActor
+    private final class RecoveryAuthority {
+        enum Failure: Error { case revoked }
+        var calls = 0
+        let revokeAtTransaction: Bool
+        init(revokeAtTransaction: Bool = true) {
+            self.revokeAtTransaction = revokeAtTransaction
+        }
+        func validate() throws {
+            calls += 1
+            if revokeAtTransaction && calls >= 2 { throw Failure.revoked }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func unbasedRecoveryFixture() async throws -> (RealmSwiftAdapter, Realm, RetainedContractRow, BigSyncRecordConflictSnapshot) {
+        let (adapter, realm) = try await fixture()
+        let object = RetainedContractRow()
+        try realm.write {
+            realm.add(object)
+            object.title = "mine"
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await deliver([record(adapter, title: "theirs")], to: adapter)
+        return (adapter, realm, object, try XCTUnwrap(try adapter.unresolvedRecordConflicts().first))
+    }
+
+    @BigSyncBackgroundActor
+    func testRevokedResolutionAuthorityCannotCommitEitherChoice() async throws {
+        for choice: BigSyncRecordConflictChoice in [.keepLocal, .useIncoming] {
+            let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture()
+            let authority = RecoveryAuthority()
+            let pending = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first).generation
+            do {
+                try await adapter.resolveRecordConflict(id: conflict.id,
+                    expectedGeneration: conflict.generation, choice: choice,
+                    validateAuthority: { try authority.validate() })
+                XCTFail("Authority was revoked after entry and before the target transaction")
+            } catch RecoveryAuthority.Failure.revoked { }
+            XCTAssertEqual(authority.calls, 2)
+            XCTAssertEqual(object.title, "mine")
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+            XCTAssertEqual(try adapter.unresolvedRecordConflicts().map(\.id), [conflict.id])
+            XCTAssertTrue(realm.objects(BigSyncRecordBaseline.self).isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRevokedRefreshAuthorityCannotRetireOrReplaceEvidence() async throws {
+        let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture()
+        try realm.write {
+            object.title = "new typing"
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let pending = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first).generation
+        let authority = RecoveryAuthority()
+        do {
+            try await adapter.refreshRecordConflict(conflict.id,
+                validateAuthority: { try authority.validate() })
+            XCTFail("Refreshing evidence must revalidate authority inside its transaction")
+        } catch RecoveryAuthority.Failure.revoked { }
+        XCTAssertEqual(authority.calls, 2)
+        XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).count, 1)
+        XCTAssertEqual(try adapter.unresolvedRecordConflicts().first?.id, conflict.id)
+        XCTAssertEqual(try adapter.unresolvedRecordConflicts().first?.generation, conflict.generation)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+        XCTAssertEqual(object.title, "new typing")
+    }
+
+    @BigSyncBackgroundActor
+    func testRevokedPruneAuthorityCannotDeleteRetainedArchives() async throws {
+        let (adapter, realm, _, conflict) = try await unbasedRecoveryFixture()
+        try await adapter.resolveRecordConflict(id: conflict.id,
+            expectedGeneration: conflict.generation, choice: .keepLocal)
+        let before = try XCTUnwrap(realm.objects(BigSyncRecordConflict.self).first).localPayload
+        let authority = RecoveryAuthority()
+        do {
+            try await adapter.discardResolvedRecordConflictArchives(
+                validateAuthority: { try authority.validate() })
+            XCTFail("Archive cleanup must revalidate authority inside its transaction")
+        } catch RecoveryAuthority.Failure.revoked { }
+        XCTAssertEqual(authority.calls, 2)
+        XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).count, 1)
+        XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).first?.localPayload, before)
+        XCTAssertFalse(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testCurrentRecoveryAuthorityCanResolveAndDrain() async throws {
+        let (adapter, _, object, conflict) = try await unbasedRecoveryFixture()
+        let authority = RecoveryAuthority(revokeAtTransaction: false)
+        try await adapter.resolveRecordConflict(id: conflict.id,
+            expectedGeneration: conflict.generation, choice: .keepLocal,
+            validateAuthority: { try authority.validate() })
+        XCTAssertEqual(authority.calls, 2)
+        XCTAssertEqual(object.title, "mine")
+        let batch = try await adapter.prepareUploadBatch(limit: 20)
+        try await adapter.acknowledgeUploadedRecords(batch.records, from: batch)
+        try await requireQuiet(adapter)
+    }
 }
