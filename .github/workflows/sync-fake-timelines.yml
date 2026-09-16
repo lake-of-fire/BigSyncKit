@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: b9923810c7f53b69550e686df90152998ec35d55
+          ref: 57d4936e525bfc9e5bb34d5b9869151de09746c8
           path: BigSyncKit
           fetch-depth: 0
           persist-credentials: false
@@ -38,7 +38,7 @@ jobs:
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          git checkout --detach c7c13e295e63e8eeb32ad878f979804c0b4b7ce9
+          git checkout --detach 59d1f70d1d6a435ba7d6e713ff5a76f734cfb3c8
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
           set +e
           swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
@@ -52,7 +52,7 @@ jobs:
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          git checkout --detach b9923810c7f53b69550e686df90152998ec35d55
+          git checkout --detach 57d4936e525bfc9e5bb34d5b9869151de09746c8
           swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/green.log" | xcsift
           for repeat in 1 2 3; do
             swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncLongLivedReplicaTests 2>&1 | tee "$RUNNER_TEMP/evidence/timelines-$repeat.log" | xcsift
