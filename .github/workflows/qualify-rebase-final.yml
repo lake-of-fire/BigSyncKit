@@ -1,0 +1,68 @@
+name: Qualify record rebase
+on:
+  push:
+    branches: [verify/sync-fake-timelines-20260915]
+    paths: [.github/workflows/qualify-rebase-final.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Commit reviewed repair before testing
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cp .github/rebase-qualification-fix.patch "$RUNNER_TEMP/evidence/fix.patch"
+          git checkout --detach 1c5155e824fe54a41a47d4656bb1a7001feaeb56
+          git apply --index --whitespace=error-all "$RUNNER_TEMP/evidence/fix.patch"
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git commit -m 'Preserve managed baseline identity when advancing accepted fields'
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/identity.txt"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record toolchain
+        run: |
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          brew install xcsift
+      - name: Native record rebase regressions
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncRecordRebaseTests 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+      - name: Full native suite
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+      - name: Preserve source identity
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/evidence/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: record-rebase-qualification
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
