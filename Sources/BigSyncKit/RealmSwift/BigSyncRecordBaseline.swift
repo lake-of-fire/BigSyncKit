@@ -12,6 +12,10 @@ public final class BigSyncRecordBaseline: Object {
     @Persisted public var revision = ""
     @Persisted public var isComparisonInvalidated = false
     @Persisted public var serverChangeTag: String?
+    @Persisted public var schemaSignature = ""
+    /// The CAS template belongs to the accepted base, not a separately
+    /// published tracking cache. No user payload or historical versions.
+    @Persisted public var acceptedSystemFields: Data?
     @Persisted public var fields: Map<String, Data>
 }
 
@@ -21,10 +25,9 @@ public extension BigSyncMutationPolicy {
     /// fields or an epoch bundle without implementing reconciliation callbacks.
     static func enableRecordRebasing(in configuration: inout Realm.Configuration) {
         precondition(configuration.objectTypes != nil)
-        if configuration.objectTypes?.contains(where: {
-            $0.className() == BigSyncRecordBaseline.className()
-        }) != true {
-            configuration.objectTypes?.append(BigSyncRecordBaseline.self)
+        for type in BigSyncLocalRecordEvidence.objectTypes where
+            configuration.objectTypes?.contains(where: { $0.className() == type.className() }) != true {
+            configuration.objectTypes?.append(type)
         }
     }
 }
@@ -138,7 +141,7 @@ enum BigSyncRecordFingerprint {
             $0.name != object.objectSchema.primaryKeyProperty?.name
                 && $0.type != .linkingObjects
                 && !skipped.contains($0.name)
-                && !metadata.contains($0.name)
+                && !BigSyncRecordLifecycle.metadataFields(for: object).contains($0.name)
         }
     }
 
@@ -253,6 +256,15 @@ struct BigSyncRecordRebaseContext: Sendable, Equatable {
     let namespace: String
     let account: String
     let binding: String
+    let preservationNamespace: String
+
+    init(namespace: String, account: String, binding: String,
+         preservationNamespace: String? = nil) {
+        self.namespace = namespace
+        self.account = account
+        self.binding = binding
+        self.preservationNamespace = preservationNamespace ?? namespace
+    }
 
     func validate(in realm: Realm) throws {
         guard let identity = BigSyncMutationTracking.currentJournalIdentity(
@@ -269,6 +281,15 @@ struct BigSyncPreparedRecordBase: Sendable {
     let context: BigSyncRecordRebaseContext
     let revision: String?
     let fields: [String: Data]
+    let schemaSignature: String
+
+    init(context: BigSyncRecordRebaseContext, revision: String?, fields: [String: Data],
+         schemaSignature: String = "") {
+        self.context = context
+        self.revision = revision
+        self.fields = fields
+        self.schemaSignature = schemaSignature
+    }
 }
 
 extension BigSyncRecordBaseline {
@@ -289,16 +310,26 @@ extension BigSyncRecordBaseline {
 
     @discardableResult
     static func install(recordName: String, namespace: String,
-                        fields: [String: Data], serverChangeTag: String? = nil, in realm: Realm) -> Bool {
+                        fields: [String: Data], serverChangeTag: String? = nil,
+                        schemaSignature: String = "", systemFields: Data? = nil, in realm: Realm) -> Bool {
         precondition(realm.isInWriteTransaction)
         let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
         if existing?.isComparisonInvalidated == false, existing?.namespace == namespace,
-           existing?.fieldDigests == fields, existing?.serverChangeTag == serverChangeTag { return false }
+           existing?.fieldDigests == fields, existing?.serverChangeTag == serverChangeTag,
+           existing?.schemaSignature == schemaSignature {
+            // Backfill metadata without inventing another semantic revision.
+            if existing?.acceptedSystemFields == nil, let systemFields {
+                existing?.acceptedSystemFields = systemFields
+            }
+            return false
+        }
         let row = existing ?? Self()
         if existing == nil { row.recordName = recordName }
         row.namespace = namespace
+        row.schemaSignature = schemaSignature
         row.isComparisonInvalidated = false
         row.serverChangeTag = serverChangeTag
+        row.acceptedSystemFields = systemFields
         row.revision = UUID().uuidString
         row.fields.removeAll()
         for (name, digest) in fields { row.fields[name] = digest }
@@ -317,6 +348,7 @@ extension BigSyncRecordBaseline {
         if existing == nil { row.recordName = recordName }
         row.isComparisonInvalidated = true
         row.serverChangeTag = nil
+        row.acceptedSystemFields = nil
         row.revision = UUID().uuidString
         row.fields.removeAll()
         realm.add(row, update: .modified)
