@@ -411,7 +411,7 @@ extension SyncRecordRebaseTests {
         realm.refresh()
         let retained = realm.object(ofType: BigSyncRecordBaseline.self,
             forPrimaryKey: RebaseRow.className() + ".row")
-        XCTAssertTrue(retained == nil || retained!.fields.isEmpty,
+        XCTAssertTrue(retained == nil || retained!.fields.count == 0,
             "LIFECYCLE: an old first-upload reply must not restore pre-deletion comparison evidence")
         XCTAssertEqual(try generation(realm), generationBefore)
         XCTAssertEqual(value.remoteField, "new lifetime")

@@ -83,7 +83,7 @@ final class BigSyncLifetimeIDTests: XCTestCase {
         let baseline = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: "row"))
         XCTAssertTrue(baseline.invalidated)
         XCTAssertFalse(baseline.revision.isEmpty)
-        XCTAssertTrue(baseline.fields.isEmpty)
+        XCTAssertEqual(baseline.fields.count, 0)
         let revision = baseline.revision
         try realm.write {
             BigSyncRecordBaseline.install(recordName: "row", namespace: "new-account", fields: ["text": Data([2])], in: realm)
