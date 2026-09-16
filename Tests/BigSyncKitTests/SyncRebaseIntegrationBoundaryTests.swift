@@ -85,7 +85,7 @@ final class SyncRebaseIntegrationBoundaryTests: XCTestCase {
 
     @BigSyncBackgroundActor
     private func deliver(_ record: CKRecord, to adapter: RealmSwiftAdapter) async throws {
-        _ = try await adapter.saveChanges(in: [record])
+        _ = try await adapter.saveChanges(in: [record], forceSave: false)
         try await adapter.persistImportedChanges()
         try await adapter.didFinishImport()
     }
