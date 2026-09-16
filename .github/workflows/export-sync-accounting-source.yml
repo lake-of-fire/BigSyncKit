@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 1c5155e824fe54a41a47d4656bb1a7001feaeb56
+          ref: 3bd36cc37b2c54f291476dbf296ed5de458e9608
           fetch-depth: 1
           persist-credentials: false
       - run: |
