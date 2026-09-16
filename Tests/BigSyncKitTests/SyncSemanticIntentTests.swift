@@ -317,3 +317,71 @@ final class SyncSemanticIntentTests: XCTestCase {
         )])
     }
 }
+
+
+extension SyncSemanticIntentTests {
+    @BigSyncBackgroundActor
+    func testPendingPredecessorAdmissionIsRevokedWhenGenerationIsAcknowledgedBeforeCommit() async throws {
+        let (adapter, realm) = try await fixture()
+        let unbound = record(SyncIntentSnapshot.self, adapter: adapter, payload: "base", at: 1_000)
+        _ = try await adapter.saveChanges(in: [unbound], forceSave: true)
+        let value = try XCTUnwrap(realm.object(ofType: SyncIntentSnapshot.self, forPrimaryKey: "one"))
+        try realm.write {
+            value.catalog = "bound"
+            value.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let sent = try await adapter.prepareUploadBatch(limit: 10)
+        adapter._testBeforeImportedRecordTargetWrite = {
+            try await adapter.acknowledgeUploadedRecords(sent.records, from: sent)
+        }
+        defer { adapter._testBeforeImportedRecordTargetWrite = nil }
+        do {
+            _ = try await adapter.saveChanges(in: [unbound], forceSave: true)
+            XCTFail("A predecessor selected using a pending generation cannot become a rollback after acknowledgement")
+        } catch {
+            XCTAssertTrue(error is RealmSwiftInboundTargetChangedError)
+        }
+        realm.refresh()
+        XCTAssertEqual(value.catalog, "bound")
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testSnapshotStillRejectsMalformedServerRecordWithoutReauthoring() async throws {
+        let (adapter, realm) = try await fixture()
+        let initial = record(SyncIntentSnapshot.self, adapter: adapter, payload: "valid", at: 2_000)
+        _ = try await adapter.saveChanges(in: [initial], forceSave: true)
+        let invalid = record(SyncIntentSnapshot.self, adapter: adapter, payload: "invalid", at: 3_000)
+        invalid["catalog"] = nil
+        let results = try await adapter.saveChanges(in: [invalid], forceSave: false)
+        guard case .quarantined? = results.first?.disposition else {
+            return XCTFail("Snapshot authority must not bypass standalone validation")
+        }
+        realm.refresh()
+        XCTAssertEqual(realm.object(ofType: SyncIntentSnapshot.self, forPrimaryKey: "one")?.payload, "valid")
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testSnapshotPendingPredecessorCannotUseContradictoryCatalogOnOwnUploadRoute() async throws {
+        let (adapter, realm) = try await fixture()
+        let initial = record(SyncIntentSnapshot.self, adapter: adapter, payload: "base", at: 1_000)
+        _ = try await adapter.saveChanges(in: [initial], forceSave: true)
+        let value = try XCTUnwrap(realm.object(ofType: SyncIntentSnapshot.self, forPrimaryKey: "one"))
+        try realm.write {
+            value.catalog = "local"
+            value.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let generation = realm.objects(BigSyncPendingMutation.self).first?.generation
+        let contradictory = record(SyncIntentSnapshot.self, adapter: adapter,
+                                   payload: "old own upload", at: 2_000, catalog: "other")
+        let results = try await adapter.validateAuthoritativeOwnUploadRecords([contradictory])
+        guard case .quarantined? = results.first?.disposition else {
+            return XCTFail("Own-upload routing is not permission to bypass replacement validation")
+        }
+        realm.refresh()
+        XCTAssertEqual(value.catalog, "local")
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, generation)
+    }
+}
