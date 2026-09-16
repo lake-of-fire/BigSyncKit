@@ -1,0 +1,233 @@
+import CryptoKit
+import Foundation
+import RealmSwift
+
+/// Local comparison evidence, never an upload journal or CloudKit model. Keep
+/// this in the target Realm so an import and its new base commit or roll back
+/// together. Only one set of field digests is retained, not payload history.
+public final class BigSyncRecordBaseline: Object {
+    @Persisted(primaryKey: true) public var recordName = ""
+    @Persisted public var namespace = ""
+    @Persisted public var revision = ""
+    @Persisted public var fields: Map<String, Data>
+}
+
+public extension BigSyncMutationPolicy {
+    /// Call before opening every target Realm used by writers or the adapter.
+    /// Adding this local table opts supported records into three-way rebasing.
+    static func enableRecordRebasing(in configuration: inout Realm.Configuration) {
+        precondition(configuration.objectTypes != nil)
+        if configuration.objectTypes?.contains(where: {
+            $0.className() == BigSyncRecordBaseline.className()
+        }) != true {
+            configuration.objectTypes?.append(BigSyncRecordBaseline.self)
+        }
+    }
+}
+
+/// A schema declaration, not an application callback. A lifetime bundle keeps
+/// every field together except explicitly independent fields. Newly added
+/// fields therefore default to the bundle instead of silently escaping it.
+public enum BigSyncRecordRebasePolicy: Sendable, Equatable {
+    case disabled
+    case independentFields
+    case lifetimeBundle(lifetimeField: String, independentFields: Set<String>)
+}
+
+public protocol BigSyncRecordRebasePolicyProviding {
+    static var bigSyncRecordRebasePolicy: BigSyncRecordRebasePolicy { get }
+}
+
+enum BigSyncRecordRebaseError: Error {
+    case unsupportedField(String)
+    case invalidPolicy
+}
+
+/// Pure three-way selection. Sets/maps/lists are single fields; this is not a
+/// collection CRDT. A genuine same-field collision uses the supplied existing
+/// record-clock decision. A lifetime change wins over edits in the old lifetime;
+/// concurrent lifetime changes use their opaque IDs as a shared deterministic
+/// tie-break, independent of unrelated title/difficulty clocks on either row.
+enum BigSyncRecordRebasePlanner {
+    static func incomingFields(
+        base: [String: Data], local: [String: Data], remote: [String: Data],
+        policy: BigSyncRecordRebasePolicy,
+        preferRemoteOnConflict: Bool,
+        localLifetime: String?, remoteLifetime: String?
+    ) throws -> Set<String> {
+        guard Set(base.keys) == Set(local.keys),
+              Set(local.keys) == Set(remote.keys) else {
+            throw BigSyncRecordRebaseError.invalidPolicy
+        }
+        let keys = Set(local.keys)
+        var incoming = Set<String>()
+        for key in keys {
+            if local[key] == base[key]
+                || (remote[key] != base[key] && preferRemoteOnConflict) {
+                incoming.insert(key)
+            }
+        }
+        switch policy {
+        case .disabled:
+            return []
+        case .independentFields:
+            return incoming
+        case let .lifetimeBundle(lifetimeField, independentFields):
+            guard keys.contains(lifetimeField),
+                  independentFields.isSubset(of: keys),
+                  !independentFields.contains(lifetimeField) else {
+                throw BigSyncRecordRebaseError.invalidPolicy
+            }
+            let bundle = keys.subtracting(independentFields)
+            let useRemote: Bool
+            if local[lifetimeField] != remote[lifetimeField] {
+                if local[lifetimeField] == base[lifetimeField] {
+                    useRemote = true
+                } else if remote[lifetimeField] == base[lifetimeField] {
+                    useRemote = false
+                } else {
+                    // Comparing IDs is an arbitration rule, not chronology.
+                    // It must be the same on all members of a lifetime bundle.
+                    useRemote = (remoteLifetime ?? "") > (localLifetime ?? "")
+                }
+            } else if bundle.allSatisfy({ local[$0] == base[$0] }) {
+                useRemote = true
+            } else if bundle.allSatisfy({ remote[$0] == base[$0] }) {
+                useRemote = false
+            } else {
+                useRemote = preferRemoteOnConflict
+            }
+            incoming.subtract(bundle)
+            if useRemote { incoming.formUnion(bundle) }
+            return incoming
+        }
+    }
+}
+
+/// Fingerprints are made from Realm's decoded representation, on its owning
+/// executor. This avoids a second CloudKit decoder and normalizes URL/UUID,
+/// unordered sets/maps, nil/empty collections and millisecond Date precision.
+/// Relationships are deliberately outside this first capability: their deferred
+/// materialization has a separate commit boundary and must not be fingerprinted
+/// as though an unresolved target were an authored clear.
+enum BigSyncRecordFingerprint {
+    static let metadata: Set<String> = [
+        "createdAt", "modifiedAt", "explicitlyModifiedAt",
+    ]
+
+    static func properties(of object: Object) -> [Property] {
+        let skipped = (object as? SyncSkippablePropertiesModel)?
+            .skipSyncingProperties() ?? []
+        return object.objectSchema.properties.filter {
+            $0.name != object.objectSchema.primaryKeyProperty?.name
+                && $0.type != .linkingObjects
+                && !skipped.contains($0.name)
+                && !metadata.contains($0.name)
+        }
+    }
+
+    static func supports(_ object: Object) -> Bool {
+        properties(of: object).allSatisfy {
+            switch $0.type {
+            case .int, .bool, .float, .double, .string, .date, .data, .UUID:
+                true
+            default:
+                false
+            }
+        }
+    }
+
+    static func fields(of object: Object) throws -> [String: Data] {
+        try Dictionary(uniqueKeysWithValues: properties(of: object).map { property in
+            let value = object[property.name]
+            let digest: Data
+            if property.isMap {
+                let entries = try mapEntries(value, type: property.type)
+                digest = frame(entries.sorted { $0.0 < $1.0 }.flatMap {
+                    [Data($0.0.utf8), $0.1]
+                })
+            } else if property.isArray || property.isSet {
+                guard let collection = value as? RLMSwiftCollectionBase else {
+                    throw BigSyncRecordRebaseError.unsupportedField(property.name)
+                }
+                var elements = try (0..<collection._rlmCollection.count).map {
+                    try scalar(collection._rlmCollection[$0], type: property.type)
+                }
+                if property.isSet { elements.sort { $0.lexicographicallyPrecedes($1) } }
+                digest = frame(elements)
+            } else {
+                digest = try scalar(value, type: property.type)
+            }
+            return (property.name, digest)
+        })
+    }
+
+    private static func frame(_ parts: [Data]) -> Data {
+        var hash = SHA256()
+        for part in parts {
+            var length = UInt64(part.count).bigEndian
+            withUnsafeBytes(of: &length) { hash.update(data: Data($0)) }
+            hash.update(data: part)
+        }
+        return Data(hash.finalize())
+    }
+
+    private static func scalar(_ value: Any?, type: PropertyType) throws -> Data {
+        guard let value, !(value is NSNull) else { return frame([Data([0])]) }
+        let bytes: Data
+        switch type {
+        case .int:
+            guard let number = value as? NSNumber else { throw unsupported(type) }
+            bytes = Data(String(number.int64Value).utf8)
+        case .bool:
+            guard let number = value as? NSNumber else { throw unsupported(type) }
+            bytes = Data([number.boolValue ? 1 : 0])
+        case .float, .double:
+            guard let number = value as? NSNumber else { throw unsupported(type) }
+            let numberValue = type == .float ? Double(number.floatValue) : number.doubleValue
+            guard numberValue.isFinite else { throw unsupported(type) }
+            bytes = Data(String((numberValue == 0 ? 0.0 : numberValue).bitPattern).utf8)
+        case .string:
+            if let url = value as? URL { bytes = Data(url.absoluteString.utf8) }
+            else if let text = value as? String { bytes = Data(text.utf8) }
+            else { throw unsupported(type) }
+        case .date:
+            guard let date = value as? Date else { throw unsupported(type) }
+            let milliseconds = (date.timeIntervalSinceReferenceDate * 1_000).rounded()
+            guard milliseconds.isFinite,
+                  let integer = Int64(exactly: milliseconds) else { throw unsupported(type) }
+            bytes = Data(String(integer).utf8)
+        case .data:
+            guard let data = value as? Data else { throw unsupported(type) }
+            bytes = data
+        case .UUID:
+            guard let uuid = value as? UUID else { throw unsupported(type) }
+            bytes = Data(uuid.uuidString.lowercased().utf8)
+        default:
+            throw unsupported(type)
+        }
+        return frame([Data([1]), bytes])
+    }
+
+    private static func unsupported(_ type: PropertyType) -> BigSyncRecordRebaseError {
+        .unsupportedField(String(describing: type))
+    }
+
+    private static func mapEntries(_ value: Any?, type: PropertyType) throws -> [(String, Data)] {
+        func entries<T: RealmCollectionValue>(_ map: Map<String, T>?) throws -> [(String, Data)] {
+            guard let map else { throw unsupported(type) }
+            return try map.map { ($0.key, try scalar($0.value, type: type)) }
+        }
+        switch type {
+        case .int: return try entries(value as? Map<String, Int>)
+        case .bool: return try entries(value as? Map<String, Bool>)
+        case .float: return try entries(value as? Map<String, Float>)
+        case .double: return try entries(value as? Map<String, Double>)
+        case .string: return try entries(value as? Map<String, String>)
+        case .date: return try entries(value as? Map<String, Date>)
+        case .data: return try entries(value as? Map<String, Data>)
+        case .UUID: return try entries(value as? Map<String, UUID>)
+        default: throw unsupported(type)
+        }
+    }
+}
