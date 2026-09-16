@@ -20,17 +20,34 @@ public struct BigSyncSemanticUploadConflictError: Error, Sendable {
 }
 
 func requireResolvedUploadConflictOutcomes(
-    _ results: [InboundLiveResult]
+    _ results: [InboundLiveResult],
+    preservingFailures otherFailures: [CKRecord.ID: NSError] = [:]
 ) throws {
-    let quarantined = results.compactMap { result -> String? in
-        if case .quarantined = result.disposition {
-            return result.event.recordName
-        }
-        return nil
+    let quarantined = results.filter {
+        if case .quarantined = $0.disposition { return true }
+        return false
     }
-    guard quarantined.isEmpty else {
-        throw BigSyncSemanticUploadConflictError(recordNames: quarantined.sorted())
+    guard !quarantined.isEmpty else { return }
+    let semanticError = BigSyncSemanticUploadConflictError(
+        recordNames: quarantined.map { $0.event.recordName }.sorted()
+    )
+    guard !otherFailures.isEmpty else { throw semanticError }
+
+    // Account stops, retry-after deadlines and transport failures are independent
+    // constraints on this same batch. A semantic failure must not hide them from
+    // the synchronizer's lifecycle/retry classifier. Keep per-record evidence;
+    // never replace a successful sibling or turn quarantine into a size retry.
+    var failures = otherFailures
+    for result in quarantined {
+        let event = result.event
+        let recordID = CKRecord.ID(recordName: event.recordName, zoneID: .init(
+            zoneName: event.zoneName, ownerName: event.zoneOwnerName
+        ))
+        failures[recordID] = BigSyncSemanticUploadConflictError(
+            recordNames: [event.recordName]
+        ) as NSError
     }
+    throw CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: failures])
 }
 
 struct HandledMutationRetryBudget {
@@ -297,7 +314,9 @@ extension CloudKitSynchronizer {
                     results,
                     records: conflictedRecords
                 )
-                try requireResolvedUploadConflictOutcomes(results)
+                try requireResolvedUploadConflictOutcomes(
+                    results, preservingFailures: unresolvedFailures
+                )
                 try await revalidateActiveRunContext(for: attemptID)
                 try await adapter.persistImportedChanges()
                 try await revalidateActiveRunContext(for: attemptID)
