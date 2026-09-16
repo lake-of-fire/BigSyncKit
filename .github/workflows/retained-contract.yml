@@ -2,7 +2,7 @@ name: Retained lifecycle contract qualification
 on:
   push:
     branches: [verify/retained-lifecycle-20260916]
-    paths: [.github/workflows/retained-contract.yml]
+    paths: [.github/workflows/retained-contract.yml, .github/retained-fix-*.py]
 permissions:
   contents: write
 jobs:
@@ -44,7 +44,7 @@ jobs:
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ github.workspace }}/.rebase-build
-          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-v2
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-${{ github.run_id }}
           restore-keys: |
             rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
       - name: Verify and commit proposed source
@@ -61,7 +61,7 @@ jobs:
           PY
           git apply --check ../retained.patch
           git apply ../retained.patch
-          python3 ../transport/.github/retained-fix-1.py
+          for fix in $(find ../transport/.github -maxdepth 1 -name 'retained-fix-*.py' | sort -V); do python3 "$fix"; done
           git diff --check
           git config user.name 'Manabi contributors'
           git config user.email 'contributors@manabi.io'
@@ -69,6 +69,7 @@ jobs:
           git commit -m 'Implement explicit retained lifecycle contracts and durable comparison recovery'
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
       - name: Qualify committed source without runtime changes
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           git diff --exit-code
@@ -78,15 +79,15 @@ jobs:
           swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" > "$RUNNER_TEMP/evidence/full.log" 2>&1
           tail -n 25 "$RUNNER_TEMP/evidence/full.log"
           git diff --exit-code
-      - name: Publish qualified source without rewriting other work
+      - name: Publish qualified candidate without changing the product branch
         run: |
-          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git push origin HEAD:refs/heads/qualification/retained-${{ github.run_id }}
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/published-identity.txt"
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: always()
         with:
           path: ${{ github.workspace }}/.rebase-build
-          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-v2
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-${{ github.run_id }}
       - name: Retain exact source and failed-run evidence
         if: always()
         run: |
