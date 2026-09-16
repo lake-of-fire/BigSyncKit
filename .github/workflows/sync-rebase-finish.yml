@@ -1,0 +1,67 @@
+name: Rebase receipt and convergence qualification
+on:
+  push:
+    branches: [verify/sync-fake-timelines-20260915]
+    paths: [.github/workflows/sync-rebase-finish.yml]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 3896cca12c51ade0a2c659fbd1d0c4360f42b9d5
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        id: toolchain
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          brew install xcsift
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-3896cca
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-
+      - name: Observe receipt failures without changing production source
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          set +e
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter SyncRecordReceiptTests 2>&1 | tee "$RUNNER_TEMP/evidence/red-receipts.log" | xcsift
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q 'STALE RECEIPT:' "$RUNNER_TEMP/evidence/red-receipts.log"
+          grep -q 'Executed 6 tests' "$RUNNER_TEMP/evidence/red-receipts.log"
+      - name: Exact identity
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/identity.txt"
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved" || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rebase-receipt-red-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
