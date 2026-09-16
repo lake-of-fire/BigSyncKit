@@ -9421,8 +9421,18 @@ extension RealmSwiftAdapter {
     ) throws -> Bool {
         guard recordRebaseContext == receipt.context,
               BigSyncRecordBaseline.isEnabled(in: realm) else { return false }
-        try receipt.context.validate(in: realm)
-        if !realm.isInWriteTransaction { realm.refresh() }
+        if realm.isInWriteTransaction {
+            try receipt.context.validate(in: realm)
+        } else {
+            // The tracking phase observes the target Realm; it must not call
+            // the public write-transaction-only mutation verification API.
+            realm.refresh()
+            guard let identity = BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm),
+                  !identity.installationIdentifier.isEmpty,
+                  identity.replicaBindingGenerationIdentifier == receipt.context.binding else {
+                throw CancellationError()
+            }
+        }
         guard let current = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: recordName),
               !current.isComparisonInvalidated,
               current.namespace == receipt.context.namespace,
