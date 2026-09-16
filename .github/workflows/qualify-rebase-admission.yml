@@ -1,0 +1,115 @@
+name: Rebase admission qualification
+on:
+  push:
+    branches: [verify/sync-fake-timelines-20260915]
+    paths: [.github/workflows/qualify-rebase-admission.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Commit tests on exact product parent
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cp .github/rebase-admission-tests.swift "$RUNNER_TEMP/tests.swift"
+          cp .github/rebase-admission-policy.swift "$RUNNER_TEMP/policy.swift"
+          git checkout --detach 4d42194f2bc75483415a9f5edc7cb394edfb7afd
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path('Tests/BigSyncKitTests/SyncRecordRebaseTests.swift')
+          s = p.read_text()
+          old = 'private func fixture() async throws -> (RealmSwiftAdapter, Realm) {'
+          assert s.count(old) == 1
+          s = s.replace(old, 'private func fixture(extraTypes: [Object.Type] = []) async throws -> (RealmSwiftAdapter, Realm) {')
+          old = 'BigSyncPendingMutation.self]\n        BigSyncMutationPolicy.enableRecordRebasing'
+          assert s.count(old) == 1
+          s = s.replace(old, 'BigSyncPendingMutation.self] + extraTypes\n        BigSyncMutationPolicy.enableRecordRebasing')
+          p.write_text(s + Path(os.environ['RUNNER_TEMP'], 'tests.swift').read_text())
+          PY
+          git add Tests
+          test "$(git write-tree)" = 0ac9efd6986ece9da74d140e9a70de3d1a34b30d
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git commit -m 'Reproduce silent rebasing opt-in failures and assert missing-base isolation'
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record native toolchain
+        run: |
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          brew install xcsift
+      - name: Observe runtime failures on committed previous implementation
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          set +e
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncRecordRebaseTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q 'ADMISSION:' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'Executed 25 tests' "$RUNNER_TEMP/evidence/red.log"
+          git diff --exit-code
+      - name: Commit bounded policy repair
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+          s = p.read_text()
+          a = s.index('    private func recordRebasePolicy(for object: Object) -> BigSyncRecordRebasePolicy {')
+          b = s.index('\n    /// Decode using the normal transport', a)
+          s = s[:a] + Path(os.environ['RUNNER_TEMP'], 'policy.swift').read_text() + s[b:]
+          s = s.replace('let policy = recordRebasePolicy(for: object)', 'let policy = try recordRebasePolicy(for: object)')
+          s = s.replace('recordRebasePolicy(for: type.init()) != .disabled else { return nil }', 'try recordRebasePolicy(for: type.init()) != .disabled else { return nil }')
+          s = s.replace('independent.isSubset(of: Set(local.keys)) else {', '!independent.contains(field), independent.isSubset(of: Set(local.keys)) else {')
+          p.write_text(s)
+          PY
+          git add Sources
+          test "$(git write-tree)" = deb149605be228c660aa870ab6ad0290158180ef
+          git diff --cached --check
+          git commit -m 'Reject unsupported or inconsistent explicit rebasing policies before mutation'
+      - name: Run focused and full library suites once
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncRecordRebaseTests 2>&1 | tee "$RUNNER_TEMP/evidence/green.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+          git diff --exit-code
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+      - name: Record exact final source and patch
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/identity.txt"
+          git diff 4d42194f2bc75483415a9f5edc7cb394edfb7afd HEAD > "$RUNNER_TEMP/evidence/increment.patch"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/evidence/source.tar.gz"
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rebase-admission-qualification
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
