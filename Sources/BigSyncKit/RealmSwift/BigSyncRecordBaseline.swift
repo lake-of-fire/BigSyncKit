@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Realm
 import RealmSwift
 
 /// Local comparison evidence, never an upload journal or CloudKit model. Keep
