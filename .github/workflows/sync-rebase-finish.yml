@@ -19,16 +19,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/evidence"
-          cp .github/finish-receipt-authority.py "$RUNNER_TEMP/finish-receipt-authority.py"
-          git checkout --detach 3896cca12c51ade0a2c659fbd1d0c4360f42b9d5
-          python3 "$RUNNER_TEMP/finish-receipt-authority.py"
-          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = 9038e1475a48261ec4015adb287e90e401e98615
+          cp .github/finish-receipt-read-fence.py "$RUNNER_TEMP/finish-receipt-read-fence.py"
+          git checkout --detach 78f87d820a4dd52052648faaa32b73f5fec29df9
+          python3 "$RUNNER_TEMP/finish-receipt-read-fence.py"
+          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = 08fe786eb549d8f58c904094aea6bed4252dfa69
           git diff --check
-          git diff > "$RUNNER_TEMP/evidence/receipt-fix.patch"
+          git diff > "$RUNNER_TEMP/evidence/receipt-read-fence.patch"
           git add Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
           git config user.name 'Manabi contributors'
           git config user.email 'contributors@manabi.io'
-          git commit -m 'Keep comparison receipt authority through every acknowledgement phase' -m 'Reject duplicate/type/zone/proof mismatches before state changes. Filter stale comparison receipts out of generation-only acknowledgement, recheck the admitted base at both remaining commits, and retain exact-receipt replay after target-only commit. Tests precede this change.'
+          git commit -m 'Observe receipt identity without calling write-only validation from a read phase'
           git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
           git rev-parse HEAD HEAD^{tree} HEAD^ > "$RUNNER_TEMP/evidence/identity.txt"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -53,7 +53,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.rebase-build
-          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-9038e147
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-08fe786e
           restore-keys: |
             rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-
       - name: Qualify immutable committed receipt and rebase sources
@@ -61,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           git diff --exit-code
-          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRecordReceiptTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests' 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests' 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
           swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
       - name: Exact final identity
         if: always()
@@ -73,6 +73,6 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: rebase-receipt-fixed-evidence
+          name: rebase-receipt-qualified-evidence
           path: ${{ runner.temp }}/evidence
           retention-days: 14
