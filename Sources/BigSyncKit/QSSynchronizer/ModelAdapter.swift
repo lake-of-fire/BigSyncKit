@@ -588,17 +588,20 @@ public struct PreparedRecordUpload: @unchecked Sendable {
     public let generation: String?
 
     let comparisonBase: BigSyncPreparedRecordBase?
+    let requiresAcceptanceCheck: Bool
 
     public init(record: CKRecord, generation: String?) {
         self.record = record
         self.generation = generation
         self.comparisonBase = nil
+        self.requiresAcceptanceCheck = false
     }
 
-    init(record: CKRecord, generation: String?, comparisonBase: BigSyncPreparedRecordBase?) {
+    init(record: CKRecord, generation: String?, comparisonBase: BigSyncPreparedRecordBase?, requiresAcceptanceCheck: Bool = false) {
         self.record = record
         self.generation = generation
         self.comparisonBase = comparisonBase
+        self.requiresAcceptanceCheck = requiresAcceptanceCheck
     }
 }
 

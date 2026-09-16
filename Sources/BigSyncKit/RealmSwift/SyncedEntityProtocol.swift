@@ -86,7 +86,7 @@ public extension ChangeMetadataRecordable {
             usingPrimaryKey: primaryKey
         )
         let recordName = entityType + "." + objectIdentifier
-        if isDeleted {
+        if isDeleted && !BigSyncRecordLifecycle.retainsTombstone(type(of: object)) {
             // Resurrection must not compare against a pre-deletion lifetime.
             BigSyncRecordBaseline.invalidate(recordName: recordName, in: realm)
         }
