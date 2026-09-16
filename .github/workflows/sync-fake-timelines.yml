@@ -12,8 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 6542dc5bba3730a298f795e223e9d1c2d75d9d7b
+          ref: b9923810c7f53b69550e686df90152998ec35d55
           path: BigSyncKit
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -33,10 +34,26 @@ jobs:
           swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
           sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
           brew install xcsift
-      - name: Deterministic scenarios without iCloud, sleeps, or source rewriting
+      - name: Run new regressions at committed before-fix revision
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
+          git checkout --detach c7c13e295e63e8eeb32ad878f979804c0b4b7ce9
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
+          set +e
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q 'Executed 8 tests' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'Local processing hid a sibling CloudKit constraint' "$RUNNER_TEMP/evidence/red.log"
+          git diff --exit-code
+      - name: Run unchanged repaired revision with provider injection
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git checkout --detach b9923810c7f53b69550e686df90152998ec35d55
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/green.log" | xcsift
           for repeat in 1 2 3; do
             swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncLongLivedReplicaTests 2>&1 | tee "$RUNNER_TEMP/evidence/timelines-$repeat.log" | xcsift
           done
