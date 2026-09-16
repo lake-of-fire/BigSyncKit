@@ -1,0 +1,24 @@
+diff --git a/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift b/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
+--- a/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
++++ b/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
+@@ -411,7 +411,7 @@ extension SyncRecordRebaseTests {
+         realm.refresh()
+         let retained = realm.object(ofType: BigSyncRecordBaseline.self,
+             forPrimaryKey: RebaseRow.className() + ".row")
+-        XCTAssertTrue(retained == nil || retained!.fields.isEmpty,
++        XCTAssertTrue(retained == nil || retained!.fields.count == 0,
+             "LIFECYCLE: an old first-upload reply must not restore pre-deletion comparison evidence")
+         XCTAssertEqual(try generation(realm), generationBefore)
+         XCTAssertEqual(value.remoteField, "new lifetime")
+diff --git a/Tests/BigSyncKitTests/BigSyncLifetimeIDTests.swift b/Tests/BigSyncKitTests/BigSyncLifetimeIDTests.swift
+--- a/Tests/BigSyncKitTests/BigSyncLifetimeIDTests.swift
++++ b/Tests/BigSyncKitTests/BigSyncLifetimeIDTests.swift
+@@ -83,7 +83,7 @@ final class BigSyncLifetimeIDTests: XCTestCase {
+         let baseline = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: "row"))
+         XCTAssertTrue(baseline.invalidated)
+         XCTAssertFalse(baseline.revision.isEmpty)
+-        XCTAssertTrue(baseline.fields.isEmpty)
++        XCTAssertEqual(baseline.fields.count, 0)
+         let revision = baseline.revision
+         try realm.write {
+             BigSyncRecordBaseline.install(recordName: "row", namespace: "new-account", fields: ["text": Data([2])], in: realm)
