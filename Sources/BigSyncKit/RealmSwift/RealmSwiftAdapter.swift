@@ -9787,10 +9787,15 @@ extension RealmSwiftAdapter {
     /// journal generation. The observed incoming state becomes the accepted
     /// base for either choice; choosing local never fabricates a server base.
     @BigSyncBackgroundActor
+    /// Application callers supply their captured account-lease validator.
+    /// It is checked at entry and again inside the final target transaction,
+    /// after any Realm write wait. Adapter namespace/generation checks remain
+    /// independent; this callback must not suspend or acquire a session lock.
     public func resolveRecordConflict(
         id: String, expectedGeneration: String, choice: BigSyncRecordConflictChoice,
         validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
+        try validateAuthority()
         guard let context = recordRebaseContext else { throw CancellationError() }
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else {
@@ -9803,6 +9808,7 @@ extension RealmSwiftAdapter {
             let incoming = try BigSyncRecordPayload.decode(selected.incomingPayload,
                                                            assetManager: persistentAssetManager)
             try await realm.asyncWrite {
+                try validateAuthority()
                 try context.validate(in: realm)
                 guard recordRebaseContext == context,
                       let conflict = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: id),
@@ -9968,6 +9974,7 @@ extension RealmSwiftAdapter {
         _ conflictID: String,
         validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
+        try validateAuthority()
         try await ensureSetup()
         guard let context = recordRebaseContext, let provider = realmProvider else {
             throw BigSyncRecordContractError.staleConflict
@@ -9979,6 +9986,7 @@ extension RealmSwiftAdapter {
             let name = snapshot.recordName, typeName = snapshot.entityType
             let record = try BigSyncRecordPayload.decode(snapshot.incomingPayload)
             try await realm.asyncWrite {
+                try validateAuthority()
                 guard recordRebaseContext == context else { throw CancellationError() }
                 try context.validate(in: realm)
                 guard let previous = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: conflictID),
@@ -10033,11 +10041,13 @@ public extension RealmSwiftAdapter {
     func discardResolvedRecordConflictArchives(
         validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
+        try validateAuthority()
         guard let context = recordRebaseContext else { throw CancellationError() }
         try await retireResolvedRecordConflictQuarantines()
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
             try await realm.asyncWrite {
+                try validateAuthority()
                 guard recordRebaseContext == context else { throw CancellationError() }
                 try context.validate(in: realm)
                 realm.delete(realm.objects(BigSyncRecordConflict.self).where {
