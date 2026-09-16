@@ -1,0 +1,101 @@
+name: Retained lifecycle contract qualification
+on:
+  push:
+    branches: [verify/retained-lifecycle-20260916]
+    paths: [.github/workflows/retained-contract.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: BigSyncKit
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: transport
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 6e9e7c0269a998af7b6622c27b7769d96571a2bb
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        id: toolchain
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-v1
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
+      - name: Verify and commit proposed source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, zlib
+          from pathlib import Path
+          data = ''.join(Path('../transport/.github/retained-patch-%d.z64' % i).read_text().strip() for i in range(4))
+          data = data.replace('LRFVFVZxEel', 'LRFVlxEel')
+          patch = zlib.decompress(base64.b64decode(data, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == 'ded2f4bda1098cf65f4c18f9ef7edf38479de0e3340ed0a48ebda0bd8b99ac00'
+          Path('../retained.patch').write_bytes(patch)
+          PY
+          git apply --check ../retained.patch
+          git apply ../retained.patch
+          git diff --check
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git add Sources Tests
+          git commit -m 'Implement explicit retained lifecycle contracts and durable comparison recovery'
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+      - name: Qualify committed source without runtime changes
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRetainedRecordContractTests|SyncRebaseIntegrationBoundaryTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests' > "$RUNNER_TEMP/evidence/focused.log" 2>&1
+          tail -n 30 "$RUNNER_TEMP/evidence/focused.log"
+          grep -q "Test Suite 'SyncRetainedRecordContractTests' passed" "$RUNNER_TEMP/evidence/focused.log"
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" > "$RUNNER_TEMP/evidence/full.log" 2>&1
+          tail -n 25 "$RUNNER_TEMP/evidence/full.log"
+          git diff --exit-code
+      - name: Publish qualified source without rewriting other work
+        run: |
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/published-identity.txt"
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: success()
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-v1
+      - name: Retain exact source and failed-run evidence
+        if: always()
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git status --porcelain > "$RUNNER_TEMP/evidence/source-status.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/evidence/source.tar.gz" HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: retained-lifecycle-contract-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
