@@ -25,12 +25,20 @@ jobs:
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 5ddead37a6152b57df0a00306e0e4a31fe275960
-          git apply --check ../input/.github/patches/record-rebase-import.patch
-          git apply --index ../input/.github/patches/record-rebase-import.patch
+          test "$(git rev-parse HEAD)" = 8ea301afb04428fbf3aafff5963b37d1f2d4df48
+          python3 - <<'PY'
+          import base64, gzip, hashlib, pathlib
+          encoded = pathlib.Path('../input/.github/patches/record-rebase-implementation.patch.gz.b64').read_text().strip()
+          encoded = encoded.replace('H4sIAAAAAAAC/9Vde3PbOJL/158', 'H4sIAAAAAAAC/9Vde3PbOJL/358').replace('eCUPd2DzyG9qqcsf5Bb8LoIz', 'eCUPd2DzyG9qqcsf5Bb8LoNoIz')
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == 'e612aee0d4b9afd41d3729320973895fad8bbf3382c13dd7bb2dcd2823684350'
+          pathlib.Path('../implementation.patch').write_bytes(patch)
+          PY
+          git apply --check ../implementation.patch
+          git apply --index ../implementation.patch
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Import Realm collection primitives in the tests-first comparison baseline'
+          git commit -m 'Rebase pending records against atomic target-Realm comparison evidence'
           git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   native:
@@ -55,7 +63,7 @@ jobs:
           ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
-      - name: Confirm the before-fix behavioral failures
+      - name: Qualify rebase regressions and full library
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
@@ -63,17 +71,14 @@ jobs:
           swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/identity.txt"
           brew install xcsift
-          set +e
-          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncRecordRebaseTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
-          status=${PIPESTATUS[0]}
-          set -e
-          test "$status" -ne 0
-          grep -q 'Executed 12 tests' "$RUNNER_TEMP/evidence/red.log"
-          grep -q 'REBASING:' "$RUNNER_TEMP/evidence/red.log"
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncRecordRebaseTests 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+          grep -q 'Executed 12 tests' "$RUNNER_TEMP/evidence/focused.log"
+          swift test --scratch-path "$RUNNER_TEMP/build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
           git diff --exit-code
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: record-rebase-red-evidence
+          name: record-rebase-green-evidence
           path: ${{ runner.temp }}/evidence
           retention-days: 14
