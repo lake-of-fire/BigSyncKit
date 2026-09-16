@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 92f1052038dc6553d9a1680d467c985e97346842
+          ref: 6542dc5bba3730a298f795e223e9d1c2d75d9d7b
           path: BigSyncKit
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -37,7 +37,9 @@ jobs:
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncLongLivedReplicaTests 2>&1 | tee "$RUNNER_TEMP/evidence/timelines.log" | xcsift
+          for repeat in 1 2 3; do
+            swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncLongLivedReplicaTests 2>&1 | tee "$RUNNER_TEMP/evidence/timelines-$repeat.log" | xcsift
+          done
       - name: Full native library suite
         working-directory: BigSyncKit
         run: |
