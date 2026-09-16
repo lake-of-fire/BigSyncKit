@@ -6517,7 +6517,11 @@ public final class RealmSwiftAdapter:
                 try Task.checkCancellation()
 
                 if let syncedEntity {
-                    if syncedEntity.entityState != .deletedLocally
+                    // Forwarding is bookkeeping, not a lifecycle decision.
+                    // Declared lifetime models must reach the same final target-
+                    // transaction comparison before and after deletion forwarding.
+                    let reconsidersDeletion = try shouldRebaseTrackedDeletion(syncedEntity)
+                    if (syncedEntity.entityState != .deletedLocally || reconsidersDeletion)
                         && syncedEntity.entityType != "CKShare" {
                         if syncedEntity.entityState == .deletedRemotely {
                             // Claim this identity durably before the next
@@ -9174,6 +9178,25 @@ extension RealmSwiftAdapter {
             namespace: parts.map { "\($0.utf8.count):\($0)" }.joined(),
             account: account, binding: binding
         )
+    }
+
+    @BigSyncBackgroundActor
+    private func shouldRebaseTrackedDeletion(_ entity: SyncedEntity) throws -> Bool {
+        guard entity.entityState == .deletedLocally,
+              recordRebaseContext != nil,
+              let realm = realmProvider?.targetReaderRealmPerSchemaName[entity.entityType],
+              BigSyncRecordBaseline.isEnabled(in: realm),
+              let mutation = realm.object(ofType: BigSyncPendingMutation.self,
+                                          forPrimaryKey: entity.identifier),
+              pendingMutationIsEligibleForActiveTransport(mutation),
+              let type = realmObjectClass(name: entity.entityType),
+              let identifier = getObjectIdentifier(for: entity),
+              let object = realm.object(ofType: type, forPrimaryKey: identifier),
+              case .lifetimeBundle = try recordRebasePolicy(for: object) else { return false }
+        // Admission does not choose the winner. applyRecordRebase re-resolves
+        // current values, binding and generation inside the target transaction.
+        // Non-lifetime and disabled models keep the established deletion fence.
+        return true
     }
 
     private func recordRebasePolicy(for object: Object) throws -> BigSyncRecordRebasePolicy {
