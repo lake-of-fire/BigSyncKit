@@ -1,0 +1,105 @@
+name: Forwarded lifecycle durability qualification
+on:
+  push:
+    branches: [verify/forwarded-lifecycle-20260916]
+    paths: [.github/workflows/forwarded-durability.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: BigSyncKit
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: transport
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: e7cc1c801298026b3c9588ea8b88ecf0b3b35a1c
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-forwarded-durable-v1
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
+      - name: Commit additional regression tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = e7cc1c801298026b3c9588ea8b88ecf0b3b35a1c
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Tests/BigSyncKitTests/SyncRebaseIntegrationBoundaryTests.swift')
+          text = path.read_text()
+          pos = text.rfind('\n}')
+          assert pos > 0 and text[pos:].strip() == '}'
+          extra = Path('../transport/.github/forwarded-lifecycle-durability.swift').read_text()
+          assert 'func testFileBackedTrackingReopenStillAdmitsOrderedSuccessor' not in text
+          path.write_text(text[:pos] + '\n' + extra + text[pos:])
+          PY
+          git diff --check
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git add Tests/BigSyncKitTests/SyncRebaseIntegrationBoundaryTests.swift
+          git commit -m 'test: qualify persisted deletion reopening and quiescent successor drains'
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+      - name: Run exact committed tests
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRebaseIntegrationBoundaryTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests' > "$RUNNER_TEMP/evidence/focused.log" 2>&1
+          tail -n 18 "$RUNNER_TEMP/evidence/focused.log"
+          grep -q 'Executed 57 tests, with 0 failures' "$RUNNER_TEMP/evidence/focused.log"
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" > "$RUNNER_TEMP/evidence/full.log" 2>&1
+          tail -n 20 "$RUNNER_TEMP/evidence/full.log"
+          grep -q 'Executed 566 tests, with 1 test skipped and 0 failures' "$RUNNER_TEMP/evidence/full.log"
+          git diff --exit-code
+      - name: Publish qualified tests only
+        run: |
+          set -euo pipefail
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/published-identity.txt"
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: success()
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-forwarded-durable-v1
+      - name: Preserve exact evidence
+        if: always()
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git status --porcelain > "$RUNNER_TEMP/evidence/source-status.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/evidence/qualified-source.tar.gz" HEAD
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: forwarded-lifecycle-durability-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
