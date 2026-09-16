@@ -1,0 +1,200 @@
+name: Pending deletion successor qualification
+on:
+  push:
+    branches: [verify/rebase-integration-review-20260916]
+    paths: [.github/workflows/rebase-pending-deletion-successor.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 782a9bd4626ffe63d0c4a2c8770bd19e8f55f152
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Commit desired-outcome regression and control before repair
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import indent, dedent
+          path = Path('Tests/BigSyncKitTests/SyncRebaseIntegrationBoundaryTests.swift')
+          text = path.read_text()
+          anchor = '    @BigSyncBackgroundActor\n    func testUnknownInitialAncestorStillCannotBeInventedForDifferentPendingValues()'
+          assert text.count(anchor) == 1
+          extra = dedent('''\
+          @BigSyncBackgroundActor
+          func testPendingOldDeletionCannotBlockAnOrderedSuccessor() async throws {
+              let (adapter, realm) = try await fixture()
+              let old = try BigSyncLifetimeID.next(after: nil, nonce: higherNonce)
+              let next = try BigSyncLifetimeID.next(after: old, nonce: lowerNonce)
+              try await deliver(record(adapter, epoch: old, count: 7), to: adapter)
+              let value = try object(in: realm)
+              try realm.write {
+                  value.isDeleted = true
+                  value.refreshChangeMetadata(explicitlyModified: true,
+                                              at: Date(timeIntervalSinceReferenceDate: 900))
+              }
+              let oldDeletion = try pending(in: realm).generation
+              try await deliver(record(adapter, epoch: next, count: 0, time: 20), to: adapter)
+              realm.refresh()
+              XCTAssertFalse(value.isDeleted)
+              XCTAssertEqual(value.epoch, next)
+              XCTAssertEqual(value.count, 0)
+              XCTAssertNotEqual(try pending(in: realm).generation, oldDeletion,
+                                "An old deletion receipt must not acknowledge the replacement lifetime")
+              let proof = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self,
+                  forPrimaryKey: RebaseIntegrationBoundaryRow.className() + ".article"))
+              XCTAssertFalse(proof.isComparisonInvalidated)
+          }
+
+          @BigSyncBackgroundActor
+          func testPendingNewerDeletionStillRejectsAnOlderLiveLifetime() async throws {
+              let (adapter, realm) = try await fixture()
+              let old = try BigSyncLifetimeID.next(after: nil, nonce: higherNonce)
+              let next = try BigSyncLifetimeID.next(after: old, nonce: lowerNonce)
+              try await deliver(record(adapter, epoch: old, count: 7), to: adapter)
+              let value = try object(in: realm)
+              try realm.write {
+                  value.epoch = next
+                  value.count = 0
+                  value.isDeleted = true
+                  value.refreshChangeMetadata(explicitlyModified: true,
+                                              at: Date(timeIntervalSinceReferenceDate: 20))
+              }
+              let deletion = try pending(in: realm).generation
+              try await deliver(record(adapter, epoch: old, count: 7, time: 900), to: adapter)
+              realm.refresh()
+              XCTAssertTrue(value.isDeleted)
+              XCTAssertEqual(value.epoch, next)
+              XCTAssertEqual(value.count, 0)
+              XCTAssertEqual(try pending(in: realm).generation, deletion)
+          }
+
+          ''')
+          path.write_text(text.replace(anchor, indent(extra, '    ') + anchor))
+          PY
+          git diff --check
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git add Tests/BigSyncKitTests/SyncRebaseIntegrationBoundaryTests.swift
+          git commit -m 'Reproduce pending deletion blocking a newer ordered lifetime'
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
+      - name: Toolchain
+        id: toolchain
+        run: |
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          brew install xcsift
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: cache
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-pending-successor-v1
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-
+      - name: Observe the committed red test without changing production source
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          set +e
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter SyncRebaseIntegrationBoundaryTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          result=${PIPESTATUS[0]}
+          set -e
+          echo "$result" > "$RUNNER_TEMP/evidence/red-exit.txt"
+          test "$result" -ne 0
+          grep -q 'Executed 6 tests' "$RUNNER_TEMP/evidence/red.log"
+          grep -q "testPendingOldDeletionCannotBlockAnOrderedSuccessor.*failed" "$RUNNER_TEMP/evidence/red.log"
+          grep -q "testPendingNewerDeletionStillRejectsAnOlderLiveLifetime.*passed" "$RUNNER_TEMP/evidence/red.log"
+          git diff --exit-code
+      - name: Commit the whole-lifetime successor admission repair
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import indent, dedent
+          path = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+          text = path.read_text()
+          old = '\n'.join([
+              '        // A local delete deliberately retires its field base. Preserve',
+              '        // the existing generation-fenced deletion path instead of',
+              '        // rejecting an inbound page because that base is now absent.',
+              '        if pending != nil, (object as? SoftDeletable)?.isDeleted == true {',
+              '            return false',
+              '        }'
+          ])
+          new = dedent('''\
+          // A local delete retires its field base, but cannot override a
+          // declared newer lifetime. No ancestor is invented: this is whole-
+          // record lifecycle selection, never independent-field inference.
+          if pending != nil, (object as? SoftDeletable)?.isDeleted == true {
+              if lifetimeField != nil,
+                 try BigSyncLifetimeID.prefersIncoming(
+                     local: lifetimeValue(object), incoming: lifetimeValue(remoteObject)
+                 ) == true {
+                  return try applyComparisonFields(Set(remote.keys), record: record,
+                      object: object, isNew: existingObject == nil,
+                      objectIdentifier: objectIdentifier, local: local, remote: remote,
+                      pending: true, context: context, in: realm)
+              }
+              // Same/older/unversioned lifetimes retain the existing exact-
+              // generation deletion fence without rejecting the inbound page.
+              return false
+          }''')
+          assert text.count(old) == 1
+          path.write_text(text.replace(old, indent(new, '        ')))
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/evidence/production-repair.patch"
+          git add Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+          git commit -m 'Admit an ordered successor over a pending predecessor deletion atomically'
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+      - name: Qualify focused and full suites on the immutable committed repair
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRebaseIntegrationBoundaryTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests' 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+          git diff --exit-code
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Preserve exact source evidence
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/evidence/qualified-source.tar.gz" HEAD
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pending-deletion-successor-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
