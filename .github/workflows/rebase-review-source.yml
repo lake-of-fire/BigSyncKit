@@ -1,0 +1,27 @@
+name: Rebase review source
+on:
+  push:
+    branches: [verify/rebase-integration-review-20260916]
+    paths: [.github/workflows/rebase-review-source.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ce554bfc09a097013e90c607fd65ae8ffc716f96
+          persist-credentials: false
+      - run: |
+          mkdir evidence
+          git archive --format=tar.gz --output=evidence/BigSyncKit-ce554bfc.tar.gz HEAD
+          git rev-parse HEAD HEAD^{tree} > evidence/source-identity.txt
+          sha256sum evidence/BigSyncKit-ce554bfc.tar.gz > evidence/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: public-bigsync-rebase-review-source
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: error
