@@ -1,0 +1,162 @@
+name: Rebase boundary red-green qualification
+on:
+  push:
+    branches: [verify/rebase-integration-review-20260916]
+    paths: [.github/workflows/rebase-boundary-red-green.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 2ea225848c698825579b3516287fc5cd38579d7c
+          path: BigSyncKit
+          fetch-depth: 0
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Correct test API and commit tests before any production repair
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Tests/BigSyncKitTests/SyncRebaseIntegrationBoundaryTests.swift')
+          text = path.read_text()
+          old = 'adapter.saveChanges(in: [record])'
+          assert text.count(old) == 1
+          path.write_text(text.replace(old, 'adapter.saveChanges(in: [record], forceSave: false)'))
+          PY
+          git diff --check
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git add Tests/BigSyncKitTests/SyncRebaseIntegrationBoundaryTests.swift
+          git commit -m 'Correct explicit forceSave argument in boundary regression fixture'
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
+      - name: Toolchain
+        id: toolchain
+        run: |
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          brew install xcsift
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: cache
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-boundary-v2
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-
+      - name: Observe assertion-level failures against unchanged production
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          set +e
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter SyncRebaseIntegrationBoundaryTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          result=${PIPESTATUS[0]}
+          set -e
+          echo "$result" > "$RUNNER_TEMP/evidence/red-exit.txt"
+          test "$result" -ne 0
+          grep -q 'Executed 4 tests' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'testUnknownInitialAncestorStillCannotBeInventedForDifferentPendingValues.*passed' "$RUNNER_TEMP/evidence/red.log"
+          git diff --exit-code
+      - name: Commit bounded lifecycle repair after the reproductions
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift')
+          text = path.read_text()
+          old = '''        let incoming: Set<String>
+                  if pending != nil {
+                      guard let base else {'''
+          # Keep exact indentation independent of YAML's block indentation.
+          old = '\n'.join(line[10:] if line.startswith('          ') else line for line in old.split('\n'))
+          old = '        let incoming: Set<String>\n        if pending != nil {\n            guard let base else {'
+          new = '''        // A local delete intentionally retires its field comparison base.
+                  // It remains a deletion intent, not an unequal edit with an unknown
+                  // ancestor. Keep the existing generation-fenced deletion path rather
+                  // than making unrelated inbound pages fail on missingBaseline.
+                  if pending != nil, (object as? SoftDeletable)?.isDeleted == true {
+                      return false
+                  }
+                  let incoming: Set<String>
+                  if pending != nil {
+                      guard let base else {'''
+          lines = new.split('\n')
+          new = lines[0] + '\n' + '\n'.join(line[10:] for line in lines[1:])
+          assert text.count(old) == 1
+          text = text.replace(old, new)
+          old = '''                // Deletion is a whole-record lifecycle decision, not a field
+                          // that can be combined with an unrelated edit to make a zombie.
+                          incoming = preferRemote ? Set(remote.keys) : []'''
+          lines = old.split('\n')
+          old = lines[0] + '\n' + '\n'.join(line[10:] for line in lines[1:])
+          new = '''                // A value-bearing tombstone includes a lifetime, unlike a
+                          // CloudKit deleted-record ID. Honor that lifetime before unrelated
+                          // title/metadata clocks, while selecting the whole record together.
+                          let deletionPrefersRemote: Bool
+                          if lifetimeField != nil,
+                             lifetimeValue(object) != lifetimeValue(remoteObject),
+                             let ordered = try BigSyncLifetimeID.prefersIncoming(
+                                 local: lifetimeValue(object), incoming: lifetimeValue(remoteObject)
+                             ) {
+                              deletionPrefersRemote = ordered
+                          } else {
+                              deletionPrefersRemote = preferRemote
+                          }
+                          incoming = deletionPrefersRemote ? Set(remote.keys) : []'''
+          lines = new.split('\n')
+          new = lines[0] + '\n' + '\n'.join(line[10:] for line in lines[1:])
+          assert text.count(old) == 1
+          path.write_text(text.replace(old, new))
+          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/evidence/production-repair.patch"
+          git add Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+          git commit -m 'Preserve pending deletion intent and order value-bearing tombstones by lifetime'
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/green-identity.txt"
+      - name: Qualify immutable committed repair
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRebaseIntegrationBoundaryTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests' 2>&1 | tee "$RUNNER_TEMP/evidence/green-focused.log" | xcsift
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" 2>&1 | tee "$RUNNER_TEMP/evidence/green-full.log" | xcsift
+          git diff --exit-code
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Preserve final source identity
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rebase-boundary-red-green-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
