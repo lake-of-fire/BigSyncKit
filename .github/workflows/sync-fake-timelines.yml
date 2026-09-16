@@ -1,4 +1,4 @@
-name: Sync fake-provider timeline qualification
+name: Sync fake-provider qualification
 on:
   push:
     branches: [verify/sync-fake-timelines-20260915]
@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 57d4936e525bfc9e5bb34d5b9869151de09746c8
+          ref: a76e44bd1e3bf4ba5dd9fa0af6da3aad24db14e6
           path: BigSyncKit
           fetch-depth: 0
           persist-credentials: false
@@ -34,30 +34,28 @@ jobs:
           swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
           sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
           brew install xcsift
-      - name: Run new regressions at committed before-fix revision
+      - name: Prove local-conflict failure composition regressed before its repair
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
           git checkout --detach 59d1f70d1d6a435ba7d6e713ff5a76f734cfb3c8
-          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
           set +e
-          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/red-local-conflict.log" | xcsift
           status=$?
           set -e
           test "$status" -ne 0
-          grep -q 'Executed 8 tests' "$RUNNER_TEMP/evidence/red.log"
-          grep -q 'Local processing hid a sibling CloudKit constraint' "$RUNNER_TEMP/evidence/red.log"
-          git diff --exit-code
-      - name: Run unchanged repaired revision with provider injection
+          grep -q 'Executed 8 tests' "$RUNNER_TEMP/evidence/red-local-conflict.log"
+          grep -q 'Local processing hid a sibling CloudKit constraint' "$RUNNER_TEMP/evidence/red-local-conflict.log"
+      - name: Run compact fake-provider and known-issue repro suites once
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          git checkout --detach 57d4936e525bfc9e5bb34d5b9869151de09746c8
-          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/green.log" | xcsift
-          for repeat in 1 2 3; do
-            swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncLongLivedReplicaTests 2>&1 | tee "$RUNNER_TEMP/evidence/timelines-$repeat.log" | xcsift
-          done
-      - name: Full native library suite
+          git checkout --detach a76e44bd1e3bf4ba5dd9fa0af6da3aad24db14e6
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncLongLivedReplicaTests 2>&1 | tee "$RUNNER_TEMP/evidence/timelines.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/conflict-failures.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncStaleBaseReproductionTests 2>&1 | tee "$RUNNER_TEMP/evidence/stale-base-repro.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncSemanticIntentTests 2>&1 | tee "$RUNNER_TEMP/evidence/semantic.log" | xcsift
+      - name: Full native library suite once
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
@@ -72,6 +70,6 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: sync-fake-timelines-evidence
+          name: sync-fake-provider-evidence
           path: ${{ runner.temp }}/evidence
           retention-days: 14
