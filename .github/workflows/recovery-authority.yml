@@ -1,0 +1,113 @@
+name: Recovery authority native qualification
+on:
+  push:
+    branches: [verify/recovery-authority-20260916]
+    paths: [.github/workflows/recovery-authority.yml, .github/recovery-authority-patch.py]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: BigSyncKit
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: transport
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 41f5d8d0f4fe647622646e1999649d98d39c24e0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        id: toolchain
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-authority-${{ github.run_id }}
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
+      - name: Commit tests and the inert validation seam
+        run: |
+          set -euo pipefail
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          python3 ../transport/.github/recovery-authority-patch.py tests
+          git diff --check
+          git add Sources Tests
+          git commit -m 'Add recovery-authority boundary regressions before enforcement'
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
+      - name: Require the intended native behavior failures
+        run: |
+          set -euo pipefail
+          set +e
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRetainedRecordContractTests.*testRevoked' > "$RUNNER_TEMP/evidence/red.log" 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          log = (Path(os.environ['RUNNER_TEMP']) / 'evidence/red.log').read_text()
+          assert re.search(r'Executed 3 tests, with [1-9]\d* failures', log), log[-5000:]
+          for name in ['testRevokedResolutionAuthorityCannotCommitEitherChoice', 'testRevokedRefreshAuthorityCannotRetireOrReplaceEvidence', 'testRevokedPruneAuthorityCannotDeleteRetainedArchives']:
+              assert re.search(name + r'.*failed', log), name
+          PY
+      - name: Commit final transaction authority checks
+        run: |
+          set -euo pipefail
+          python3 ../transport/.github/recovery-authority-patch.py fix
+          git diff --check
+          git add Sources Tests
+          git commit -m 'Revalidate caller authority inside recovery target transactions'
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+      - name: Qualify committed source
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRetainedRecordContractTests|SyncRebaseIntegrationBoundaryTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests' > "$RUNNER_TEMP/evidence/focused.log" 2>&1
+          grep -q "Test Suite 'SyncRetainedRecordContractTests' passed" "$RUNNER_TEMP/evidence/focused.log"
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" > "$RUNNER_TEMP/evidence/full.log" 2>&1
+          git diff --exit-code
+      - name: Publish source-only qualified candidate
+        run: |
+          git push origin HEAD:refs/heads/qualification/recovery-authority-${{ github.run_id }}
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/published-identity.txt"
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always()
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-authority-${{ github.run_id }}
+      - name: Retain exact source and all outcomes
+        if: always()
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git status --porcelain > "$RUNNER_TEMP/evidence/source-status.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/evidence/source.tar.gz" HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: recovery-authority-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
