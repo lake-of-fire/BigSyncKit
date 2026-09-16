@@ -1,0 +1,99 @@
+name: Sync intent reassessment qualification
+on:
+  push:
+    branches: [verify/sync-intent-reassessment-20260915]
+    paths: [.github/workflows/sync-intent-reassessment.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Materialize exact test increment
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          export EVIDENCE="$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          import base64, gzip, hashlib, os
+          from pathlib import Path
+          text = Path('.github/sync-intent-reassessment.b64').read_text().strip()
+          patch = gzip.decompress(base64.b64decode(text, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '1ef83a33b20e5c73bbec95715896627d59fc90ebbd15a9ffeb984b1d96196b08'
+          Path(os.environ['EVIDENCE'], 'increment.patch').write_bytes(patch)
+          PY
+          git checkout --detach bebbcefba72adfd1856cb0b09375a189360bdbda
+          git apply --index --include='Tests/*' "$EVIDENCE/increment.patch"
+          test "$(git write-tree)" = 50a421ef18454c674470ca9ca47521bef0937e2d
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git commit -m 'Reproduce mixed semantic and transport failures; extend native snapshot-race coverage'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record toolchain and install formatter
+        run: |
+          brew install xcsift
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+      - name: Observe expected failures on unchanged production source
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          set +e
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter testSemanticQuarantine 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -Eq 'Executed 6 tests, with 5 failures' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'Quarantine hid the sibling CloudKit failure' "$RUNNER_TEMP/evidence/red.log"
+      - name: Apply bounded production fix
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git apply --index --include='Sources/*' "$RUNNER_TEMP/evidence/increment.patch"
+          test "$(git write-tree)" = 6b9070cbb6f6c0cacb4c732d9260b3f484c4a131
+          git diff --cached --check
+          git commit -m 'Preserve account and backoff errors beside quarantined upload conflicts' -m 'Successful siblings retain their acknowledgements. Semantic failures remain per-record evidence and cannot conceal CloudKit account or retry constraints, or become a size-limit retry.'
+      - name: Native focused and full suites
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter testSemanticQuarantine 2>&1 | tee "$RUNNER_TEMP/evidence/green.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncSemanticIntentTests 2>&1 | tee "$RUNNER_TEMP/evidence/semantic.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+      - name: Push source-only incremental commits to existing PR branch
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^{tree})" = 6b9070cbb6f6c0cacb4c732d9260b3f484c4a131
+          git diff --exit-code
+          git rev-parse HEAD HEAD^{tree} HEAD^ HEAD^^ > "$RUNNER_TEMP/evidence/identity.txt"
+          git push origin HEAD:refs/heads/fix/sync-semantic-intent-20260915
+      - name: Record final identity
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved" || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: sync-intent-reassessment-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
