@@ -64,3 +64,19 @@ extension DefaultCloudKitDatabaseAdapter: CloudKitRecordStore {
         }
     }
 }
+
+/// Optional injected lookup for resolving uncertain submission acceptance.
+/// Mutation-only test stores may safely retry the exact durable candidate.
+@available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
+public protocol CloudKitRecordFetching: Sendable {
+    func fetchRecords(with recordIDs: [CKRecord.ID]) async throws -> [CKRecord.ID: Result<CKRecord, Error>]
+}
+
+@available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
+extension DefaultCloudKitDatabaseAdapter: CloudKitRecordFetching {
+    public func fetchRecords(with recordIDs: [CKRecord.ID]) async throws -> [CKRecord.ID: Result<CKRecord, Error>] {
+        try await database.configuredWith(configuration: recordMutationConfiguration()) { database in
+            try await database.records(for: recordIDs)
+        }
+    }
+}
