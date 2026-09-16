@@ -9309,6 +9309,12 @@ extension RealmSwiftAdapter {
             try BigSyncLifetimeID.validate(lifetimeValue(object))
             try BigSyncLifetimeID.validate(lifetimeValue(remoteObject))
         }
+        // A local delete deliberately retires its field base. Preserve
+        // the existing generation-fenced deletion path instead of
+        // rejecting an inbound page because that base is now absent.
+        if pending != nil, (object as? SoftDeletable)?.isDeleted == true {
+            return false
+        }
         let incoming: Set<String>
         if pending != nil {
             guard let base else {
@@ -9323,9 +9329,20 @@ extension RealmSwiftAdapter {
                                                           localFields: local, remoteFields: remote)
             if (object as? SoftDeletable)?.isDeleted == true
                 || (remoteObject as? SoftDeletable)?.isDeleted == true {
-                // Deletion is a whole-record lifecycle decision, not a field
-                // that can be combined with an unrelated edit to make a zombie.
-                incoming = preferRemote ? Set(remote.keys) : []
+                // A value-bearing tombstone carries a lifetime; a CloudKit
+                // deleted-record ID does not. Honor that lifetime before
+                // unrelated metadata clocks, selecting the record together.
+                let deletionPrefersRemote: Bool
+                if lifetimeField != nil,
+                   lifetimeValue(object) != lifetimeValue(remoteObject),
+                   let ordered = try BigSyncLifetimeID.prefersIncoming(
+                       local: lifetimeValue(object), incoming: lifetimeValue(remoteObject)
+                   ) {
+                    deletionPrefersRemote = ordered
+                } else {
+                    deletionPrefersRemote = preferRemote
+                }
+                incoming = deletionPrefersRemote ? Set(remote.keys) : []
             } else {
                 incoming = try BigSyncRecordRebasePlanner.incomingFields(
                     base: base, local: local, remote: remote, policy: policy,
