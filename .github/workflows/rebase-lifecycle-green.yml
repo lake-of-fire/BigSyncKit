@@ -1,0 +1,75 @@
+name: Rebase lifecycle qualification
+on:
+  push:
+    branches: [verify/sync-fake-timelines-20260915]
+    paths: [.github/workflows/rebase-lifecycle-green.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Commit hash-verified repair before native execution
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          export EVIDENCE="$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          import base64, gzip, hashlib, os
+          from pathlib import Path
+          patch = gzip.decompress(base64.b64decode(Path('.github/rebase-lifecycle-repair.b64').read_text().strip(), validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '063992c07f2f67a761693622ccac765776517f79e5eebba6ff84c696d68a7f42'
+          Path(os.environ['EVIDENCE'], 'repair.patch').write_bytes(patch)
+          PY
+          git checkout --detach afb81bc752ce8c5f68c33949764f5b11a8bcbf0c
+          git apply --index --whitespace=error-all "$RUNNER_TEMP/evidence/repair.patch"
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git commit -m 'Fence late receipts across deletion and preserve ordered lifetime bundles' -m 'Keep target/base updates atomic. Fence identical-payload server versions, retain invalidation revisions across first-upload ABA, and arbitrate reset bundles independently of unrelated record timestamps. Add bounded native regression coverage.'
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/identity.txt"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          brew install xcsift
+      - name: Rebase and lifetime regressions
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter 'SyncRecordRebaseTests|BigSyncLifetimeIDTests' 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+      - name: Full native suite once
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+      - name: Preserve exact product source
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/evidence/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rebase-lifecycle-qualification
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
