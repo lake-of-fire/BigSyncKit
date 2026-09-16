@@ -21,6 +21,20 @@ public enum BigSyncLifetimeID {
         _ = try components(identifier)
     }
 
+    /// Validates a prepared command's one-generation transition without making
+    /// application callers parse this library's wire representation. This proves
+    /// only structural succession: the caller must still validate the captured
+    /// predecessor, account/binding and live/deleted state in its transaction.
+    /// Siblings, replays and skipped generations are not immediate successors.
+    public static func isImmediateSuccessor(
+        _ successor: String, of predecessor: String?
+    ) throws -> Bool {
+        let previous = try components(predecessor)
+        let candidate = try components(successor)
+        guard previous.generation < UInt64.max else { return false }
+        return candidate.generation == previous.generation + 1
+    }
+
     /// nil means both inputs are unversioned: the caller uses its legacy
     /// base-aware policy, never pretending random UUID order is causality.
     static func prefersIncoming(local: String?, incoming: String?) throws -> Bool? {
