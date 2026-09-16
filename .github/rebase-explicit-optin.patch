@@ -1,0 +1,102 @@
+diff --git a/Sources/BigSyncKit/RealmSwift/BigSyncRecordBaseline.swift b/Sources/BigSyncKit/RealmSwift/BigSyncRecordBaseline.swift
+index d7cc669..46263af 100644
+--- a/Sources/BigSyncKit/RealmSwift/BigSyncRecordBaseline.swift
++++ b/Sources/BigSyncKit/RealmSwift/BigSyncRecordBaseline.swift
+@@ -10,7 +10,7 @@ public final class BigSyncRecordBaseline: Object {
+     @Persisted(primaryKey: true) public var recordName = ""
+     @Persisted public var namespace = ""
+     @Persisted public var revision = ""
+-    @Persisted public var invalidated = false
++    @Persisted public var isComparisonInvalidated = false
+     @Persisted public var serverChangeTag: String?
+     @Persisted public var fields: Map<String, Data>
+ }
+@@ -277,7 +277,14 @@ extension BigSyncRecordBaseline {
+     }
+ 
+     static func isEnabled(in realm: Realm) -> Bool {
+-        realm.schema.objectSchema.contains { $0.className == className() }
++        isEnabled(in: realm.configuration)
++            && realm.schema.objectSchema.contains { $0.className == className() }
++    }
++
++    static func isEnabled(in configuration: Realm.Configuration) -> Bool {
++        // Merely linking BigSyncKit can make the table visible to Realm's
++        // automatic schema discovery. That is not consent to change merging.
++        configuration.objectTypes?.contains { $0.className() == className() } == true
+     }
+ 
+     @discardableResult
+@@ -285,12 +292,12 @@ extension BigSyncRecordBaseline {
+                         fields: [String: Data], serverChangeTag: String? = nil, in realm: Realm) -> Bool {
+         precondition(realm.isInWriteTransaction)
+         let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
+-        if existing?.invalidated == false, existing?.namespace == namespace,
++        if existing?.isComparisonInvalidated == false, existing?.namespace == namespace,
+            existing?.fieldDigests == fields, existing?.serverChangeTag == serverChangeTag { return false }
+         let row = existing ?? Self()
+         if existing == nil { row.recordName = recordName }
+         row.namespace = namespace
+-        row.invalidated = false
++        row.isComparisonInvalidated = false
+         row.serverChangeTag = serverChangeTag
+         row.revision = UUID().uuidString
+         row.fields.removeAll()
+@@ -308,7 +315,7 @@ extension BigSyncRecordBaseline {
+         // an older nil-based receipt install an ancestor from the previous life.
+         let row = existing ?? Self()
+         if existing == nil { row.recordName = recordName }
+-        row.invalidated = true
++        row.isComparisonInvalidated = true
+         row.serverChangeTag = nil
+         row.revision = UUID().uuidString
+         row.fields.removeAll()
+diff --git a/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift b/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+index 01c9e47..b5bb5e2 100644
+--- a/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
++++ b/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+@@ -9219,7 +9219,7 @@ extension RealmSwiftAdapter {
+         let remote = try BigSyncRecordFingerprint.fields(of: remoteObject)
+         let local = try BigSyncRecordFingerprint.fields(of: object)
+         let stored = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
+-        let base = stored?.namespace == context.namespace && stored?.invalidated == false
++        let base = stored?.namespace == context.namespace && stored?.isComparisonInvalidated == false
+             ? stored?.fieldDigests : nil
+         let lifetimeField: String?
+         if case let .lifetimeBundle(field, independent) = policy {
+diff --git a/Tests/BigSyncKitTests/BigSyncLifetimeIDTests.swift b/Tests/BigSyncKitTests/BigSyncLifetimeIDTests.swift
+index 4e0d2df..b16aa58 100644
+--- a/Tests/BigSyncKitTests/BigSyncLifetimeIDTests.swift
++++ b/Tests/BigSyncKitTests/BigSyncLifetimeIDTests.swift
+@@ -74,6 +74,14 @@ final class BigSyncLifetimeIDTests: XCTestCase {
+         XCTAssertEqual(baseline.fieldDigests, fields)
+     }
+ 
++    func testAutomaticSchemaDiscoveryDoesNotEnableRebasing() {
++        var config = Realm.Configuration()
++        config.objectTypes = nil
++        XCTAssertFalse(BigSyncRecordBaseline.isEnabled(in: config))
++        config.objectTypes = [BigSyncRecordBaseline.self]
++        XCTAssertTrue(BigSyncRecordBaseline.isEnabled(in: config))
++    }
++
+     func testInvalidationBeforeFirstAcceptanceHasDurableNonNilRevision() throws {
+         var config = Realm.Configuration()
+         config.inMemoryIdentifier = UUID().uuidString
+@@ -81,14 +89,14 @@ final class BigSyncLifetimeIDTests: XCTestCase {
+         let realm = try Realm(configuration: config)
+         try realm.write { BigSyncRecordBaseline.invalidate(recordName: "row", in: realm) }
+         let baseline = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: "row"))
+-        XCTAssertTrue(baseline.invalidated)
++        XCTAssertTrue(baseline.isComparisonInvalidated)
+         XCTAssertFalse(baseline.revision.isEmpty)
+         XCTAssertEqual(baseline.fields.count, 0)
+         let revision = baseline.revision
+         try realm.write {
+             BigSyncRecordBaseline.install(recordName: "row", namespace: "new-account", fields: ["text": Data([2])], in: realm)
+         }
+-        XCTAssertFalse(baseline.invalidated)
++        XCTAssertFalse(baseline.isComparisonInvalidated)
+         XCTAssertNotEqual(baseline.revision, revision)
+         XCTAssertEqual(baseline.namespace, "new-account")
+     }
