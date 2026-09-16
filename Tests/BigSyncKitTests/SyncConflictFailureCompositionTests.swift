@@ -9,7 +9,7 @@ private enum ConflictProcessingPhase { case apply, persist, cancellation }
 
 /// A protocol fake for local import failures. It is intentionally not Realm:
 /// deterministic storage faults belong at the existing adapter boundary.
-private final class ConflictFailureAdapter: NSObject, ModelAdapter, @unchecked Sendable {
+private final class ConflictFailureAdapter: NSObject, ModelAdapter, ChangeFeedResetMigrating, @unchecked Sendable {
     let recordZoneID = CKRecordZone.ID(zoneName: "local-conflict-failure")
     weak var modelAdapterDelegate: ModelAdapterDelegate?
     var mergePolicy: MergePolicy = .custom
@@ -21,6 +21,15 @@ private final class ConflictFailureAdapter: NSObject, ModelAdapter, @unchecked S
     let localFailure = NSError(domain: "TestLocalImportFailure", code: 17)
 
     init(_ phase: ConflictProcessingPhase) { self.phase = phase }
+    // Satisfy the same topology admission as production, but reject any reset:
+    // these tests schedule only conflict processing, not bootstrap/migration.
+    func isChangeFeedServerBootstrapActive() async -> Bool { false }
+    func prepareChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws { throw UnexpectedReset() }
+    func beginChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws { throw UnexpectedReset() }
+    func changeFeedResetCompletionIsDurable(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws -> Bool { throw UnexpectedReset() }
+    func reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws { throw UnexpectedReset() }
+    func finishChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws { throw UnexpectedReset() }
+    private struct UnexpectedReset: Error {}
     func cleanUp() async throws {}
     func resetSyncCaches() async throws {}
     func hasChanges(record: CKRecord, object: Object) -> Bool { true }
