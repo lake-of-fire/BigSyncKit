@@ -306,7 +306,7 @@ extension CloudKitSynchronizer {
             if !savedRecords.isEmpty {
                 try await adapter.didUpload(
                     savedRecords: savedRecords,
-                    matchingGenerations: generations
+                    matchingPreparedUploads: prepared
                 )
                 try await revalidateActiveRunContext(for: attemptID)
             }

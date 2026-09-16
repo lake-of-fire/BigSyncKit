@@ -6,7 +6,9 @@ import XCTest
 @testable import BigSyncKit
 
 @objc(RebaseRow)
-private final class RebaseRow: Object, ChangeMetadataRecordable {
+private final class RebaseRow: Object, ChangeMetadataRecordable,
+    BigSyncRecordRebasePolicyProviding {
+    static var bigSyncRecordRebasePolicy: BigSyncRecordRebasePolicy { .independentFields }
     @Persisted(primaryKey: true) var id = "row"
     @Persisted var remoteField: String?
     @Persisted var localField = "local-v0"

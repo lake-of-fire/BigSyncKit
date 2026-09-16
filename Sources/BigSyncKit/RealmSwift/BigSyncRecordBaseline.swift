@@ -15,7 +15,8 @@ public final class BigSyncRecordBaseline: Object {
 
 public extension BigSyncMutationPolicy {
     /// Call before opening every target Realm used by writers or the adapter.
-    /// Adding this local table opts supported records into three-way rebasing.
+    /// Undeclared records remain indivisible; models may declare independent
+    /// fields or an epoch bundle without implementing reconciliation callbacks.
     static func enableRecordRebasing(in configuration: inout Realm.Configuration) {
         precondition(configuration.objectTypes != nil)
         if configuration.objectTypes?.contains(where: {
@@ -31,6 +32,7 @@ public extension BigSyncMutationPolicy {
 /// fields therefore default to the bundle instead of silently escaping it.
 public enum BigSyncRecordRebasePolicy: Sendable, Equatable {
     case disabled
+    case atomicRecord
     case independentFields
     case lifetimeBundle(lifetimeField: String, independentFields: Set<String>)
 }
@@ -39,9 +41,11 @@ public protocol BigSyncRecordRebasePolicyProviding {
     static var bigSyncRecordRebasePolicy: BigSyncRecordRebasePolicy { get }
 }
 
-enum BigSyncRecordRebaseError: Error {
+public enum BigSyncRecordRebaseError: Error {
     case unsupportedField(String)
     case invalidPolicy
+    case missingBaseline(String)
+    case inconsistentReceipt(String)
 }
 
 /// Pure three-way selection. Sets/maps/lists are single fields; this is not a
@@ -71,6 +75,9 @@ enum BigSyncRecordRebasePlanner {
         switch policy {
         case .disabled:
             return []
+        case .atomicRecord:
+            return local == base || (remote != base && preferRemoteOnConflict)
+                ? keys : []
         case .independentFields:
             return incoming
         case let .lifetimeBundle(lifetimeField, independentFields):
@@ -230,5 +237,61 @@ enum BigSyncRecordFingerprint {
         case .UUID: return try entries(value as? Map<String, UUID>)
         default: throw unsupported(type)
         }
+    }
+}
+
+
+struct BigSyncRecordRebaseContext: Sendable, Equatable {
+    let namespace: String
+    let account: String
+    let binding: String
+
+    func validate(in realm: Realm) throws {
+        guard let identity = BigSyncMutationTracking.currentJournalIdentity(
+            verifyingPendingMutationsFor: [Object](), in: realm
+        ), identity.replicaBindingGenerationIdentifier == binding else {
+            throw CancellationError()
+        }
+    }
+}
+
+/// Immutable preparation-time evidence. A late receipt may advance this base
+/// under a newer local edit, but never over a base installed by a newer import.
+struct BigSyncPreparedRecordBase: Sendable {
+    let context: BigSyncRecordRebaseContext
+    let revision: String?
+    let fields: [String: Data]
+}
+
+extension BigSyncRecordBaseline {
+    var fieldDigests: [String: Data] {
+        Dictionary(uniqueKeysWithValues: fields.map { ($0.key, $0.value) })
+    }
+
+    static func isEnabled(in realm: Realm) -> Bool {
+        realm.schema.objectSchema.contains { $0.className == className() }
+    }
+
+    @discardableResult
+    static func install(recordName: String, namespace: String,
+                        fields: [String: Data], in realm: Realm) -> Bool {
+        precondition(realm.isInWriteTransaction)
+        let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
+        if existing?.namespace == namespace, existing?.fieldDigests == fields { return false }
+        let row = existing ?? Self()
+        row.recordName = recordName
+        row.namespace = namespace
+        row.revision = UUID().uuidString
+        row.fields.removeAll()
+        for (name, digest) in fields { row.fields[name] = digest }
+        realm.add(row, update: .modified)
+        return true
+    }
+
+    static func invalidate(recordName: String, in realm: Realm) {
+        precondition(realm.isInWriteTransaction)
+        guard isEnabled(in: realm),
+              let row = realm.object(ofType: Self.self, forPrimaryKey: recordName) else { return }
+        realm.delete(row)
     }
 }
