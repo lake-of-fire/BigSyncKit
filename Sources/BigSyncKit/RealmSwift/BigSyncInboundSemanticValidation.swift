@@ -62,6 +62,25 @@ public extension BigSyncInboundSemanticReplacementValidating {
     }
 }
 
+/// Opt-in for models whose unjournaled local value is a replicated snapshot,
+/// not independent local authoring authority. Standalone/replacement validation
+/// still runs, and an exact pending local generation still wins the write fence.
+/// This does not restrict forwarding an unchanged source during account recovery.
+public protocol BigSyncAuthoritativeServerSnapshotModel {}
+
+/// Narrow model-owned exception to replacement validation. A valid received
+/// record may be a predecessor of a pending local semantic extension rather
+/// than an attempted rollback of accepted state (for example unbound -> bound).
+/// Implementations must validate immutable identity and the exact permitted
+/// predecessor relationship; the presence of a journal is not permission to
+/// bypass validation. The adapter never applies these fields over that journal.
+public protocol BigSyncInboundPendingSemanticReplacementValidating {
+    static func validateInboundSemanticPredecessorOfPendingMutation(
+        _ record: CKRecord,
+        existingObject: Object
+    ) throws
+}
+
 /// Admission fence for CloudKit record deletions whose absence would violate
 /// a model's semantic authority. CloudKit deletion callbacks carry only a
 /// record identifier, so authorization must be provable from that identifier

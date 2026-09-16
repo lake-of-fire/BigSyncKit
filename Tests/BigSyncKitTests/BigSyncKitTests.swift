@@ -564,6 +564,7 @@ private final class FakeModelAdapter:
     var cleanUpHandler: (@Sendable () async throws -> Void)?
     var resetSyncCachesHandler: (@Sendable () async throws -> Void)?
     var saveChangesHandler: (@Sendable () async throws -> Void)?
+    var quarantinedRecordNames = Set<String>()
     var recordsToUploadHandler: (@Sendable () async throws -> Void)?
     var terminalPendingChanges = false
     var semanticBlockers = [CloudKitSynchronizer.DomainBlocker]()
@@ -613,7 +614,8 @@ private final class FakeModelAdapter:
                     entityType: $0.element.recordType,
                     recordID: $0.element.recordID
                 ),
-                disposition: .applied
+                disposition: quarantinedRecordNames.contains($0.element.recordID.recordName)
+                    ? .quarantined(lineageID: "test-semantic-quarantine") : .applied
             )
         }
     }
@@ -16366,5 +16368,99 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNotNil(fixture.targetRealm.object(
             ofType: BigSyncPendingMutation.self, forPrimaryKey: unresolvedName
         ))
+    }
+}
+
+
+extension BigSyncKitTests {
+    @BigSyncBackgroundActor
+    private func assertSemanticQuarantinePreservesSiblingFailure(
+        _ code: CKError.Code?, retryAfter: TimeInterval? = nil
+    ) async throws {
+        let database = FakeCloudKitDatabase()
+        let zone = CKRecordZone.ID(zoneName: "mixed-semantic-errors")
+        let conflict = makeRecord(type: "Bookmark", id: "quarantined", zoneID: zone)
+        let sibling = makeRecord(type: "Bookmark", id: "failed", zoneID: zone)
+        let success = makeRecord(type: "Bookmark", id: "saved", zoneID: zone)
+        let server = makeRecord(type: "Bookmark", id: "quarantined", zoneID: zone)
+        database.partialSaveErrorsByRecordID[conflict.recordID] = CKError(
+            .serverRecordChanged,
+            userInfo: [CKRecordChangedErrorServerRecordKey: server]
+        ) as NSError
+        var batch = [conflict, success]
+        if let code {
+            var info: [String: Any] = [:]
+            if let retryAfter { info[CKErrorRetryAfterKey] = retryAfter }
+            database.partialSaveErrorsByRecordID[sibling.recordID] =
+                CKError(code, userInfo: info) as NSError
+            batch.append(sibling)
+        }
+        let adapter = FakeModelAdapter(
+            zoneID: zone, priorities: [], uploadedByEntity: ["Bookmark": batch]
+        )
+        adapter.quarantinedRecordNames.insert(conflict.recordID.recordName)
+        adapter.repeatsPreparedUploads = true
+        let synchronizer = makeSynchronizer(database: database)
+        synchronizer.addModelAdapter(adapter)
+        do {
+            try await synchronizer.synchronizeAdapter(adapter)
+            XCTFail("A semantic quarantine is not a successful rebase")
+        } catch {
+            if let code {
+                guard let cloudError = error as? CKError, cloudError.code == .partialFailure,
+                      let failures = cloudError.userInfo[CKPartialErrorsByItemIDKey]
+                        as? [CKRecord.ID: NSError] else {
+                    return XCTFail("Quarantine hid the sibling CloudKit failure: \(error)")
+                }
+                XCTAssertEqual((failures[sibling.recordID] as? CKError)?.code, code)
+                XCTAssertNotNil(failures[conflict.recordID])
+                XCTAssertNil(failures[success.recordID])
+                let constraints = CloudKitRetryConstraints(error)
+                XCTAssertEqual(constraints.serverMinimum, retryAfter)
+                XCTAssertEqual(constraints.blocksAccountOperations,
+                    code == .notAuthenticated || code == .accountTemporarilyUnavailable)
+                XCTAssertFalse(constraints.containsOnlySizeLimitFailures,
+                               "A quarantine is not a reducible size failure")
+                XCTAssertFalse(synchronizer.shouldRetryUpload(for: error as NSError))
+            } else {
+                XCTAssertEqual((error as? BigSyncSemanticUploadConflictError)?.recordNames,
+                               [conflict.recordID.recordName])
+            }
+        }
+        XCTAssertEqual(database.modifyRecordsOperationCount, 1,
+                       "Neither a quarantine nor an account/backoff stop permits immediate retries")
+        XCTAssertTrue(adapter.events.contains("didUpload:Bookmark.saved"))
+        XCTAssertFalse(adapter.events.contains("didUpload:Bookmark.quarantined"))
+        XCTAssertFalse(adapter.events.contains("didUpload:Bookmark.failed"))
+    }
+
+    @BigSyncBackgroundActor
+    func testSemanticQuarantinePreservesNotAuthenticatedSibling() async throws {
+        try await assertSemanticQuarantinePreservesSiblingFailure(.notAuthenticated)
+    }
+
+    @BigSyncBackgroundActor
+    func testSemanticQuarantinePreservesTemporaryAccountFailureSibling() async throws {
+        try await assertSemanticQuarantinePreservesSiblingFailure(.accountTemporarilyUnavailable)
+    }
+
+    @BigSyncBackgroundActor
+    func testSemanticQuarantinePreservesRateLimitAndRetryDeadline() async throws {
+        try await assertSemanticQuarantinePreservesSiblingFailure(.requestRateLimited, retryAfter: 91)
+    }
+
+    @BigSyncBackgroundActor
+    func testSemanticQuarantinePreservesNetworkFailureSibling() async throws {
+        try await assertSemanticQuarantinePreservesSiblingFailure(.networkFailure)
+    }
+
+    @BigSyncBackgroundActor
+    func testSemanticQuarantineDoesNotBecomeASizeRetry() async throws {
+        try await assertSemanticQuarantinePreservesSiblingFailure(.limitExceeded)
+    }
+
+    @BigSyncBackgroundActor
+    func testSemanticQuarantineAloneStopsAfterAcknowledgingSuccessfulSibling() async throws {
+        try await assertSemanticQuarantinePreservesSiblingFailure(nil)
     }
 }

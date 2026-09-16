@@ -11,6 +11,61 @@ enum BigSyncHandledMutationRetryError: Error, Equatable, Sendable {
     case drainBudgetExceeded
 }
 
+/// A semantic quarantine is unresolved work, not a successfully rebased
+/// conflict. Stop this drain instead of spending its retry budget resending
+/// the same stale change tag. Successful siblings were already acknowledged;
+/// the quarantined record's local generation remains durable.
+public struct BigSyncSemanticUploadConflictError: Error, Sendable {
+    public let recordNames: [String]
+}
+
+func requireResolvedUploadConflictOutcomes(
+    _ results: [InboundLiveResult],
+    preservingFailures otherFailures: [CKRecord.ID: NSError] = [:]
+) throws {
+    let quarantined = results.filter {
+        if case .quarantined = $0.disposition { return true }
+        return false
+    }
+    guard !quarantined.isEmpty else { return }
+    let semanticError = BigSyncSemanticUploadConflictError(
+        recordNames: quarantined.map { $0.event.recordName }.sorted()
+    )
+    guard !otherFailures.isEmpty else { throw semanticError }
+
+    // Account stops, retry-after deadlines and transport failures are independent
+    // constraints on this same batch. A semantic failure must not hide them from
+    // the synchronizer's lifecycle/retry classifier. Keep per-record evidence;
+    // never replace a successful sibling or turn quarantine into a size retry.
+    var failures = otherFailures
+    for result in quarantined {
+        let event = result.event
+        let recordID = CKRecord.ID(recordName: event.recordName, zoneID: .init(
+            zoneName: event.zoneName, ownerName: event.zoneOwnerName
+        ))
+        failures[recordID] = BigSyncSemanticUploadConflictError(
+            recordNames: [event.recordName]
+        ) as NSError
+    }
+    throw CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: failures])
+}
+
+/// Local reconciliation failures do not cancel independent transport constraints
+/// already reported for sibling records. Preserve both without labelling an
+/// acknowledged success as a CloudKit failure. Cancellation remains terminal.
+func preservingSiblingMutationFailures(
+    _ error: Error,
+    failedRecordIDs: [CKRecord.ID],
+    otherFailures: [CKRecord.ID: NSError]
+) -> Error {
+    guard !(error is CancellationError), !otherFailures.isEmpty else { return error }
+    var failures = otherFailures
+    for recordID in failedRecordIDs where failures[recordID] == nil {
+        failures[recordID] = error as NSError
+    }
+    return CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: failures])
+}
+
 struct HandledMutationRetryBudget {
     private(set) var attemptsByKey = [PreparedMutationRetryKey: Int]()
     private(set) var totalAttempts = 0
@@ -267,16 +322,40 @@ extension CloudKitSynchronizer {
                     .sorted {
                         $0.recordID.recordName < $1.recordID.recordName
                     }
-                let results = try await adapter.saveChanges(
-                    in: conflictedRecords,
-                    forceSave: true
-                )
-                try ChangeRequestProcessor.validateInboundLiveResults(
-                    results,
-                    records: conflictedRecords
+                let results: [InboundLiveResult]
+                do {
+                    results = try await adapter.saveChanges(
+                        in: conflictedRecords,
+                        forceSave: true
+                    )
+                    try ChangeRequestProcessor.validateInboundLiveResults(
+                        results,
+                        records: conflictedRecords
+                    )
+                } catch {
+                    try Task.checkCancellation()
+                    try checkSynchronizationAttempt(attemptID)
+                    if let context = activeRunContext { try checkRunContext(context) }
+                    throw preservingSiblingMutationFailures(
+                        error, failedRecordIDs: conflictedRecords.map(\.recordID),
+                        otherFailures: unresolvedFailures
+                    )
+                }
+                try requireResolvedUploadConflictOutcomes(
+                    results, preservingFailures: unresolvedFailures
                 )
                 try await revalidateActiveRunContext(for: attemptID)
-                try await adapter.persistImportedChanges()
+                do {
+                    try await adapter.persistImportedChanges()
+                } catch {
+                    try Task.checkCancellation()
+                    try checkSynchronizationAttempt(attemptID)
+                    if let context = activeRunContext { try checkRunContext(context) }
+                    throw preservingSiblingMutationFailures(
+                        error, failedRecordIDs: conflictedRecords.map(\.recordID),
+                        otherFailures: unresolvedFailures
+                    )
+                }
                 try await revalidateActiveRunContext(for: attemptID)
             }
 
