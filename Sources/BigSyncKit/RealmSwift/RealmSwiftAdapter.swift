@@ -9135,16 +9135,44 @@ extension RealmSwiftAdapter {
         )
     }
 
-    private func recordRebasePolicy(for object: Object) -> BigSyncRecordRebasePolicy {
-        guard BigSyncRecordFingerprint.supports(object) else { return .disabled }
-        if let type = type(of: object) as? BigSyncRecordRebasePolicyProviding.Type {
-            let policy = type.bigSyncRecordRebasePolicy
-            // Semantic validators may opt in only as a complete bundle. There
-            // is no permission to assemble a new unvalidated semantic payload.
+    private func recordRebasePolicy(for object: Object) throws -> BigSyncRecordRebasePolicy {
+        let declaration = type(of: object) as? BigSyncRecordRebasePolicyProviding.Type
+        let declared = declaration?.bigSyncRecordRebasePolicy
+        if declared == .disabled { return .disabled }
+        guard BigSyncRecordFingerprint.supports(object) else {
+            // Undeclared legacy models retain their original behavior. An
+            // explicit declaration must not look enabled while silently using
+            // whole-record replacement for an unsupported relationship/type.
+            if declared != nil {
+                let field = BigSyncRecordFingerprint.properties(of: object).first {
+                    switch $0.type {
+                    case .int, .bool, .float, .double, .string, .date, .data, .UUID: false
+                    default: true
+                    }
+                }
+                throw BigSyncRecordRebaseError.unsupportedField(field?.name ?? object.objectSchema.className)
+            }
+            return .disabled
+        }
+        if let policy = declared {
+            // Semantic payloads cannot be assembled property-by-property.
+            // Reject invalid declarations before the first baseline is stored,
+            // not only after a pending local mutation happens to exercise it.
             if object is BigSyncInboundSemanticRecordValidating
                 || object is BigSyncInboundSemanticReplacementValidating {
-                if case let .lifetimeBundle(_, fields) = policy, fields.isEmpty { return policy }
-                return .disabled
+                guard case let .lifetimeBundle(_, fields) = policy, fields.isEmpty else {
+                    throw BigSyncRecordRebaseError.invalidPolicy
+                }
+            }
+            if case let .lifetimeBundle(field, independent) = policy {
+                let properties = BigSyncRecordFingerprint.properties(of: object)
+                guard let property = properties.first(where: { $0.name == field }),
+                      !property.isArray, !property.isSet, !property.isMap,
+                      property.type == .string || property.type == .UUID,
+                      !independent.contains(field),
+                      independent.isSubset(of: Set(properties.map(\.name))) else {
+                    throw BigSyncRecordRebaseError.invalidPolicy
+                }
             }
             return policy
         }
@@ -9197,7 +9225,7 @@ extension RealmSwiftAdapter {
     ) throws -> Bool {
         guard BigSyncRecordBaseline.isEnabled(in: realm) else { return false }
         let object = existingObject ?? objectType.init()
-        let policy = recordRebasePolicy(for: object)
+        let policy = try recordRebasePolicy(for: object)
         guard policy != .disabled else { return false }
         try context.validate(in: realm)
         let name = record.recordID.recordName
@@ -9226,7 +9254,7 @@ extension RealmSwiftAdapter {
             guard let property = object.objectSchema.properties.first(where: { $0.name == field }),
                   !property.isArray, !property.isSet, !property.isMap,
                   property.type == .string || property.type == .UUID,
-                  independent.isSubset(of: Set(local.keys)) else {
+                  !independent.contains(field), independent.isSubset(of: Set(local.keys)) else {
                 throw BigSyncRecordRebaseError.invalidPolicy
             }
             lifetimeField = field
@@ -9337,7 +9365,7 @@ extension RealmSwiftAdapter {
               let realm = realmProvider?.targetReaderRealmPerSchemaName[entityType],
               BigSyncRecordBaseline.isEnabled(in: realm),
               let type = realmObjectClass(name: entityType),
-              recordRebasePolicy(for: type.init()) != .disabled else { return nil }
+              try recordRebasePolicy(for: type.init()) != .disabled else { return nil }
         let object = try decodedComparisonObject(record, type: type)
         let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: record.recordID.recordName)
         return .init(context: context,
