@@ -1,0 +1,128 @@
+name: Forwarded lifecycle admission qualification
+on:
+  push:
+    branches: [verify/forwarded-lifecycle-20260916]
+    paths: [.github/workflows/forwarded-lifecycle.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: BigSyncKit
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: transport
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 9c96fc1ed00f837631c86b12a8cc8f754e1f3025
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-forwarded-v1
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
+      - name: Commit regression before repair
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9c96fc1ed00f837631c86b12a8cc8f754e1f3025
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Tests/BigSyncKitTests/SyncRebaseIntegrationBoundaryTests.swift')
+          text = path.read_text()
+          assert text.rstrip().endswith('}')
+          pos = text.rfind('\n}')
+          extra = Path('../transport/.github/forwarded-lifecycle-tests.swift').read_text()
+          assert 'func testForwardedPredecessorDeletion' not in text
+          path.write_text(text[:pos] + '\n' + extra + text[pos:])
+          PY
+          git diff --check
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git add Tests/BigSyncKitTests/SyncRebaseIntegrationBoundaryTests.swift
+          git commit -m 'test: cover forwarded deletion admission and stale deletion receipts'
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
+      - name: Observe the scheduling regression on unchanged committed source
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          set +e
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter SyncRebaseIntegrationBoundaryTests > "$RUNNER_TEMP/evidence/red.log" 2>&1
+          result=$?
+          set -e
+          echo "$result" > "$RUNNER_TEMP/evidence/red-exit.txt"
+          tail -n 35 "$RUNNER_TEMP/evidence/red.log"
+          test "$result" -ne 0
+          grep -q 'Executed 9 tests' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'testForwardedPredecessorDeletionAdmitsSuccessorAndRejectsLateDeleteReceipt.*failed' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'testForwardedSameLifetimeDeletionPreservesItsGeneration.*passed' "$RUNNER_TEMP/evidence/red.log"
+          git diff --exit-code
+      - name: Commit production admission repair
+        run: |
+          set -euo pipefail
+          git apply --check ../transport/.github/forwarded-lifecycle-fix.patch
+          git apply ../transport/.github/forwarded-lifecycle-fix.patch
+          git diff --check
+          git add Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+          git commit -m 'fix: admit lifetime comparison after deletion journal forwarding'
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+      - name: Qualify unchanged production source
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRebaseIntegrationBoundaryTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests' > "$RUNNER_TEMP/evidence/focused.log" 2>&1
+          tail -n 15 "$RUNNER_TEMP/evidence/focused.log"
+          grep -q 'Executed 55 tests, with 0 failures' "$RUNNER_TEMP/evidence/focused.log"
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" > "$RUNNER_TEMP/evidence/full.log" 2>&1
+          tail -n 20 "$RUNNER_TEMP/evidence/full.log"
+          git diff --exit-code
+      - name: Publish source-only commits without overwriting concurrent work
+        run: |
+          set -euo pipefail
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/published-identity.txt"
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: success()
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-forwarded-v1
+      - name: Preserve source and evidence
+        if: always()
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git status --porcelain > "$RUNNER_TEMP/evidence/source-status.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/evidence/qualified-source.tar.gz" HEAD
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: forwarded-lifecycle-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
