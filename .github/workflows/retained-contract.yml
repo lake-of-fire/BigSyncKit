@@ -44,7 +44,7 @@ jobs:
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ github.workspace }}/.rebase-build
-          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-v1
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-v2
           restore-keys: |
             rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
       - name: Verify and commit proposed source
@@ -61,6 +61,7 @@ jobs:
           PY
           git apply --check ../retained.patch
           git apply ../retained.patch
+          python3 ../transport/.github/retained-fix-1.py
           git diff --check
           git config user.name 'Manabi contributors'
           git config user.email 'contributors@manabi.io'
@@ -82,10 +83,10 @@ jobs:
           git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/published-identity.txt"
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: success()
+        if: always()
         with:
           path: ${{ github.workspace }}/.rebase-build
-          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-v1
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-retained-v2
       - name: Retain exact source and failed-run evidence
         if: always()
         run: |
