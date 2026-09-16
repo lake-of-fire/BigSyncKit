@@ -25,7 +25,7 @@ private final class SyncTimelineSnapshot: Object, ChangeMetadataRecordable,
 }
 
 private enum TimelineFailure: Error {
-    case invalidRecord, unexpectedTransportSurface, missingResult, nonQuiescent
+    case invalidRecord, unexpectedTransportSurface, nonQuiescent
 }
 
 private final class TimelineDatabaseIdentity: NSObject, CloudKitDatabaseAdapter {
@@ -139,6 +139,15 @@ private actor TimelineTransport: CloudKitRecordStore, CloudKitChangeFeed,
     func deleteRecordZone(withID: CKRecordZone.ID) async throws { throw TimelineFailure.unexpectedTransportSurface }
 }
 
+/// Explicit test scheduling owns drains; journal wakeups are observed rather
+/// than starting a second synchronization behind the deterministic driver.
+@BigSyncBackgroundActor
+private final class TimelineWakeups: ModelAdapterDelegate {
+    private(set) var count = 0
+    func needsInitialSetup() async throws {}
+    func hasChangesToUpload() async { count += 1 }
+}
+
 @BigSyncBackgroundActor
 private final class TimelineReplica {
     let adapter: RealmSwiftAdapter
@@ -146,6 +155,7 @@ private final class TimelineReplica {
     let targetConfiguration: Realm.Configuration
     let trackingConfiguration: Realm.Configuration
     let binding: String
+    private let wakeups = TimelineWakeups()
     var realm: Realm { adapter.realmProvider!.targetReaderRealms!.first! }
     var recordName: String { SyncTimelineSnapshot.className() + ".document" }
 
@@ -188,6 +198,7 @@ private final class TimelineReplica {
             logger: Logger(label: "TimelineSynchronizer")
         )
         synchronizer.addModelAdapter(adapter)
+        adapter.modelAdapterDelegate = wakeups
     }
     func write(_ text: String, day: Double, deleted: Bool = false) throws {
         let realm = realm
@@ -207,9 +218,6 @@ private final class TimelineReplica {
     func generation() -> String? {
         realm.refresh()
         return realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName)?.generation
-    }
-    func pending() -> BigSyncPendingMutation? {
-        realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName)
     }
     func importRecord(_ record: CKRecord) async throws -> [InboundLiveResult] {
         try await adapter.saveChanges(in: [record], forceSave: false)
@@ -292,7 +300,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         XCTAssertNil(reopened.generation())
         let calls = await server.history()
         XCTAssertEqual(calls.count, 2)
-        XCTAssertEqual(calls[0].texts, calls[1].texts)
+        XCTAssertEqual(try XCTUnwrap(calls.first).texts, try XCTUnwrap(calls.dropFirst().first).texts)
         await reopened.stop()
     }
 
@@ -329,9 +337,9 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         XCTAssertNil(owner.generation())
         let calls = await server.history()
         XCTAssertEqual(calls.count, 2)
-        XCTAssertEqual(calls[0].savedNames, [owner.recordName])
-        XCTAssertEqual(calls[1].deletedNames, [owner.recordName])
-        XCTAssertTrue(calls[1].savedNames.isEmpty)
+        XCTAssertEqual(try XCTUnwrap(calls.first).savedNames, [owner.recordName])
+        XCTAssertEqual(try XCTUnwrap(calls.dropFirst().first).deletedNames, [owner.recordName])
+        XCTAssertTrue(try XCTUnwrap(calls.dropFirst().first).savedNames.isEmpty)
         await owner.stop()
     }
 
@@ -355,8 +363,8 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         XCTAssertNil(owner.generation())
         let calls = await server.history()
         XCTAssertEqual(calls.count, 3)
-        XCTAssertEqual(calls[1].deletedNames, [owner.recordName])
-        XCTAssertEqual(calls[2].texts[owner.recordName], "new lifetime")
+        XCTAssertEqual(try XCTUnwrap(calls.dropFirst().first).deletedNames, [owner.recordName])
+        XCTAssertEqual(try XCTUnwrap(calls.dropFirst(2).first).texts[owner.recordName], "new lifetime")
         await owner.stop()
     }
 
@@ -394,7 +402,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         let serverBase = try XCTUnwrap(receivedBase)
         serverBase["text"] = "remote predecessor" as CKRecordValue
         serverBase["modifiedAt"] = TimelineReplica.date(90) as CKRecordValue
-        serverBase["explicitlyModifiedAt"] = serverBase["modifiedlyModifiedAt"]
+        serverBase["explicitlyModifiedAt"] = serverBase["modifiedAt"]
         let expected = (1...7).map { "work-\($0)" }.joined(separator: "\n")
         try owner.write(expected, day: 7)
         await server.enqueue(.init(conflicts: [owner.recordName: try TimelineTransport.archive(serverBase)]))
