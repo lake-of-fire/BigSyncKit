@@ -50,6 +50,22 @@ func requireResolvedUploadConflictOutcomes(
     throw CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: failures])
 }
 
+/// Local reconciliation failures do not cancel independent transport constraints
+/// already reported for sibling records. Preserve both without labelling an
+/// acknowledged success as a CloudKit failure. Cancellation remains terminal.
+func preservingSiblingMutationFailures(
+    _ error: Error,
+    failedRecordIDs: [CKRecord.ID],
+    otherFailures: [CKRecord.ID: NSError]
+) -> Error {
+    guard !(error is CancellationError), !otherFailures.isEmpty else { return error }
+    var failures = otherFailures
+    for recordID in failedRecordIDs where failures[recordID] == nil {
+        failures[recordID] = error as NSError
+    }
+    return CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: failures])
+}
+
 struct HandledMutationRetryBudget {
     private(set) var attemptsByKey = [PreparedMutationRetryKey: Int]()
     private(set) var totalAttempts = 0
@@ -306,19 +322,40 @@ extension CloudKitSynchronizer {
                     .sorted {
                         $0.recordID.recordName < $1.recordID.recordName
                     }
-                let results = try await adapter.saveChanges(
-                    in: conflictedRecords,
-                    forceSave: true
-                )
-                try ChangeRequestProcessor.validateInboundLiveResults(
-                    results,
-                    records: conflictedRecords
-                )
+                let results: [InboundLiveResult]
+                do {
+                    results = try await adapter.saveChanges(
+                        in: conflictedRecords,
+                        forceSave: true
+                    )
+                    try ChangeRequestProcessor.validateInboundLiveResults(
+                        results,
+                        records: conflictedRecords
+                    )
+                } catch {
+                    try Task.checkCancellation()
+                    try checkSynchronizationAttempt(attemptID)
+                    if let context = activeRunContext { try checkRunContext(context) }
+                    throw preservingSiblingMutationFailures(
+                        error, failedRecordIDs: conflictedRecords.map(\.recordID),
+                        otherFailures: unresolvedFailures
+                    )
+                }
                 try requireResolvedUploadConflictOutcomes(
                     results, preservingFailures: unresolvedFailures
                 )
                 try await revalidateActiveRunContext(for: attemptID)
-                try await adapter.persistImportedChanges()
+                do {
+                    try await adapter.persistImportedChanges()
+                } catch {
+                    try Task.checkCancellation()
+                    try checkSynchronizationAttempt(attemptID)
+                    if let context = activeRunContext { try checkRunContext(context) }
+                    throw preservingSiblingMutationFailures(
+                        error, failedRecordIDs: conflictedRecords.map(\.recordID),
+                        otherFailures: unresolvedFailures
+                    )
+                }
                 try await revalidateActiveRunContext(for: attemptID)
             }
 
