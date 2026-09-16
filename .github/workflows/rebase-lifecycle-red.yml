@@ -1,0 +1,67 @@
+name: Rebase lifecycle tests first
+on:
+  push:
+    branches: [verify/sync-fake-timelines-20260915]
+    paths: [.github/workflows/rebase-lifecycle-red.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Publish tests before implementing their fixes
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cp .github/rebase-lifecycle-tests.patch "$RUNNER_TEMP/evidence/tests.patch"
+          git checkout --detach ad1433991df43da6be508933087cbbd5ee062df1
+          git apply --index --whitespace=error-all "$RUNNER_TEMP/evidence/tests.patch"
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git commit -m 'Reproduce late first-receipt ABA and acknowledged-versus-pending epoch divergence'
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/identity.txt"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          brew install xcsift
+      - name: Observe desired-outcome assertion failures on unchanged product logic
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          set +e
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncRecordRebaseTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q 'LIFECYCLE:' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'LIFETIME:' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'Executed ' "$RUNNER_TEMP/evidence/red.log"
+      - name: Source identity
+        if: always()
+        working-directory: BigSyncKit
+        run: git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rebase-lifecycle-red-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
