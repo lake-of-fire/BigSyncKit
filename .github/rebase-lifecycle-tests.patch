@@ -1,0 +1,148 @@
+diff --git a/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift b/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
+index bcf5219..709973a 100644
+--- a/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
++++ b/Tests/BigSyncKitTests/SyncRecordRebaseTests.swift
+@@ -382,3 +382,143 @@ final class SyncRecordRebaseTests: XCTestCase {
+         XCTAssertEqual(Array(value.order), ["b", "a"])
+     }
+ }
++
++
++extension SyncRecordRebaseTests {
++    @BigSyncBackgroundActor
++    func testLateFirstUploadReceiptCannotInstallPreDeletionAncestor() async throws {
++        let (adapter, realm) = try await fixture()
++        let value = RebaseRow()
++        value.remoteField = "before deletion"
++        try realm.write {
++            realm.add(value)
++            value.refreshChangeMetadata(explicitlyModified: true)
++        }
++        try await adapter.didFinishImport()
++        let old = try await adapter.prepareUploadBatch(limit: 10)
++        try realm.write {
++            value.isDeleted = true
++            value.refreshChangeMetadata(explicitlyModified: true)
++        }
++        try realm.write {
++            value.isDeleted = false
++            value.remoteField = "new lifetime"
++            value.refreshChangeMetadata(explicitlyModified: true)
++        }
++        try await adapter.didFinishImport()
++        let generationBefore = try generation(realm)
++        try await adapter.acknowledgeUploadedRecords(old.records, from: old)
++        realm.refresh()
++        let retained = realm.object(ofType: BigSyncRecordBaseline.self,
++            forPrimaryKey: RebaseRow.className() + ".row")
++        XCTAssertTrue(retained == nil || retained!.fields.isEmpty,
++            "LIFECYCLE: an old first-upload reply must not restore pre-deletion comparison evidence")
++        XCTAssertEqual(try generation(realm), generationBefore)
++        XCTAssertEqual(value.remoteField, "new lifetime")
++    }
++
++    @BigSyncBackgroundActor
++    func testLateReceiptCannotOverwriteNewerImportedComparisonBase() async throws {
++        let (adapter, realm) = try await fixture()
++        try await deliver([row(adapter)], to: adapter)
++        let value = try edit(realm) { $0.localField = "sent" }
++        try await adapter.didFinishImport()
++        let old = try await adapter.prepareUploadBatch(limit: 10)
++        try await deliver([row(adapter, remote: "received", at: 30)], to: adapter)
++        let revision = try baseline(realm).revision
++        let latestGeneration = try generation(realm)
++        try await adapter.acknowledgeUploadedRecords(old.records, from: old)
++        XCTAssertEqual(try baseline(realm).revision, revision)
++        XCTAssertEqual(try generation(realm), latestGeneration)
++        XCTAssertEqual(value.remoteField, "received")
++        XCTAssertEqual(value.localField, "sent")
++    }
++
++    @BigSyncBackgroundActor
++    func testComparisonBaseRollsBackWithItsTargetTransaction() async throws {
++        let (adapter, realm) = try await fixture()
++        try await deliver([row(adapter)], to: adapter)
++        let old = try baseline(realm)
++        let revision = old.revision, fields = old.fieldDigests, namespace = old.namespace
++        do {
++            try realm.write {
++                BigSyncRecordBaseline.install(recordName: old.recordName, namespace: namespace,
++                    fields: ["different": Data([1])], in: realm)
++                throw Fault.beforeTrackingCommit
++            }
++        } catch Fault.beforeTrackingCommit {}
++        XCTAssertEqual(try baseline(realm).revision, revision)
++        XCTAssertEqual(try baseline(realm).fieldDigests, fields)
++    }
++
++    @BigSyncBackgroundActor
++    func testAcknowledgedArticleAndPendingControlCannotSplitLifetimeWinner() async throws {
++        let (adapter, realm) = try await fixture()
++        try await deliver(epochRecords(adapter), to: adapter)
++        let article = try XCTUnwrap(realm.object(ofType: RebaseArticle.self, forPrimaryKey: "article"))
++        let control = try XCTUnwrap(realm.object(ofType: RebaseControl.self, forPrimaryKey: "control"))
++        let newer = "bsk1:0000000000000002:00000000-0000-0000-0000-000000000001"
++        let older = "bsk1:0000000000000001:ffffffff-ffff-ffff-ffff-ffffffffffff"
++        try realm.write {
++            article.epoch = newer; article.count = 2; article.duration = 20
++            article.refreshChangeMetadata(explicitlyModified: true, at: Date(timeIntervalSinceReferenceDate: 20))
++            control.epoch = newer
++            control.refreshChangeMetadata(explicitlyModified: true, at: Date(timeIntervalSinceReferenceDate: 20))
++        }
++        try await adapter.didFinishImport()
++        let prepared = try await adapter.prepareUploadBatch(limit: 10)
++        let articleReceipt = prepared.records.filter { $0.recordType == RebaseArticle.className() }
++        XCTAssertEqual(articleReceipt.count, 1)
++        try await adapter.acknowledgeUploadedRecords(articleReceipt, from: prepared)
++        try await deliver(epochRecords(adapter, epoch: older, count: 1, at: 90), to: adapter)
++        realm.refresh()
++        XCTAssertEqual(article.epoch, newer, "LIFETIME: no journal does not make an older accepted reset newer")
++        XCTAssertEqual(control.epoch, newer)
++        XCTAssertEqual(article.count, 2)
++        XCTAssertEqual(article.duration, 20)
++    }
++
++    @BigSyncBackgroundActor
++    func testDelayedOlderResetCannotRegressAcceptedLifetimeWithoutPendingWork() async throws {
++        let (adapter, realm) = try await fixture()
++        let newer = "bsk1:0000000000000002:00000000-0000-0000-0000-000000000001"
++        let older = "bsk1:0000000000000001:ffffffff-ffff-ffff-ffff-ffffffffffff"
++        try await deliver(epochRecords(adapter, epoch: newer, count: 2, at: 20), to: adapter)
++        try await deliver(epochRecords(adapter, epoch: older, count: 1, at: 90), to: adapter)
++        realm.refresh()
++        XCTAssertEqual(realm.object(ofType: RebaseArticle.self, forPrimaryKey: "article")?.epoch,
++            newer, "LIFETIME: replay must not reverse a later reset")
++        XCTAssertEqual(realm.object(ofType: RebaseControl.self, forPrimaryKey: "control")?.epoch, newer)
++        XCTAssertEqual(realm.object(ofType: RebaseArticle.self, forPrimaryKey: "article")?.count, 2)
++    }
++
++    @BigSyncBackgroundActor
++    func testIncomingOrderedResetWinsOverOldLifetimeEditsWithoutTimestampAuthority() async throws {
++        let (adapter, realm) = try await fixture()
++        let newer = "bsk1:0000000000000001:00000000-0000-0000-0000-000000000001"
++        try await deliver(epochRecords(adapter), to: adapter)
++        let article = try XCTUnwrap(realm.object(ofType: RebaseArticle.self, forPrimaryKey: "article"))
++        try realm.write {
++            article.title = "keep this title"
++            article.count = 999
++            article.refreshChangeMetadata(explicitlyModified: true, at: Date(timeIntervalSinceReferenceDate: 900))
++        }
++        try await deliver(epochRecords(adapter, epoch: newer, count: 0, at: 20), to: adapter)
++        realm.refresh()
++        XCTAssertEqual(article.epoch, newer)
++        XCTAssertEqual(article.count, 0)
++        XCTAssertEqual(article.title, "keep this title")
++    }
++
++    @BigSyncBackgroundActor
++    func testVersionedLifetimeRejectsMalformedReservedIdentifier() async throws {
++        let (adapter, realm) = try await fixture()
++        try await deliver(epochRecords(adapter), to: adapter)
++        do {
++            try await deliver(epochRecords(adapter, epoch: "bsk1:malformed", at: 30), to: adapter)
++            XCTFail("LIFETIME: reserved malformed versions must not enter comparison accounting")
++        } catch is BigSyncRecordRebaseError {}
++        realm.refresh()
++        XCTAssertEqual(realm.object(ofType: RebaseArticle.self, forPrimaryKey: "article")?.epoch, "E0")
++    }
++}
