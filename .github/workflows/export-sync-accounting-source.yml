@@ -1,0 +1,26 @@
+name: Export sync accounting review source
+on:
+  push:
+    branches: [verify/sync-fake-timelines-20260915]
+    paths: [.github/workflows/export-sync-accounting-source.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 35d0b0ed058e863e5193cfc9978f31fbeec5cd1f
+          fetch-depth: 0
+          persist-credentials: false
+      - run: |
+          mkdir -p "$RUNNER_TEMP/source"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/source/identity.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/source/source.tar.gz"
+          git diff b6da0f4021d563802c648980ba248c96b24f0670 HEAD > "$RUNNER_TEMP/source/pr44.patch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sync-accounting-review-source
+          path: ${{ runner.temp }}/source
+          retention-days: 7
