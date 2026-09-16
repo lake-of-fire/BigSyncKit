@@ -163,6 +163,54 @@ final class SyncRebaseIntegrationBoundaryTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPendingOldDeletionCannotBlockAnOrderedSuccessor() async throws {
+        let (adapter, realm) = try await fixture()
+        let old = try BigSyncLifetimeID.next(after: nil, nonce: higherNonce)
+        let next = try BigSyncLifetimeID.next(after: old, nonce: lowerNonce)
+        try await deliver(record(adapter, epoch: old, count: 7), to: adapter)
+        let value = try object(in: realm)
+        try realm.write {
+            value.isDeleted = true
+            value.refreshChangeMetadata(explicitlyModified: true,
+                                        at: Date(timeIntervalSinceReferenceDate: 900))
+        }
+        let oldDeletion = try pending(in: realm).generation
+        try await deliver(record(adapter, epoch: next, count: 0, time: 20), to: adapter)
+        realm.refresh()
+        XCTAssertFalse(value.isDeleted)
+        XCTAssertEqual(value.epoch, next)
+        XCTAssertEqual(value.count, 0)
+        XCTAssertNotEqual(try pending(in: realm).generation, oldDeletion,
+                          "An old deletion receipt must not acknowledge the replacement lifetime")
+        let proof = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: RebaseIntegrationBoundaryRow.className() + ".article"))
+        XCTAssertFalse(proof.isComparisonInvalidated)
+    }
+
+    @BigSyncBackgroundActor
+    func testPendingNewerDeletionStillRejectsAnOlderLiveLifetime() async throws {
+        let (adapter, realm) = try await fixture()
+        let old = try BigSyncLifetimeID.next(after: nil, nonce: higherNonce)
+        let next = try BigSyncLifetimeID.next(after: old, nonce: lowerNonce)
+        try await deliver(record(adapter, epoch: old, count: 7), to: adapter)
+        let value = try object(in: realm)
+        try realm.write {
+            value.epoch = next
+            value.count = 0
+            value.isDeleted = true
+            value.refreshChangeMetadata(explicitlyModified: true,
+                                        at: Date(timeIntervalSinceReferenceDate: 20))
+        }
+        let deletion = try pending(in: realm).generation
+        try await deliver(record(adapter, epoch: old, count: 7, time: 900), to: adapter)
+        realm.refresh()
+        XCTAssertTrue(value.isDeleted)
+        XCTAssertEqual(value.epoch, next)
+        XCTAssertEqual(value.count, 0)
+        XCTAssertEqual(try pending(in: realm).generation, deletion)
+    }
+
+    @BigSyncBackgroundActor
     func testUnknownInitialAncestorStillCannotBeInventedForDifferentPendingValues() async throws {
         let (adapter, realm) = try await fixture()
         let value = RebaseIntegrationBoundaryRow()
