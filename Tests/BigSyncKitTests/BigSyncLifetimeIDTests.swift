@@ -74,6 +74,14 @@ final class BigSyncLifetimeIDTests: XCTestCase {
         XCTAssertEqual(baseline.fieldDigests, fields)
     }
 
+    func testAutomaticSchemaDiscoveryDoesNotEnableRebasing() {
+        var config = Realm.Configuration()
+        config.objectTypes = nil
+        XCTAssertFalse(BigSyncRecordBaseline.isEnabled(in: config))
+        config.objectTypes = [BigSyncRecordBaseline.self]
+        XCTAssertTrue(BigSyncRecordBaseline.isEnabled(in: config))
+    }
+
     func testInvalidationBeforeFirstAcceptanceHasDurableNonNilRevision() throws {
         var config = Realm.Configuration()
         config.inMemoryIdentifier = UUID().uuidString
@@ -81,14 +89,14 @@ final class BigSyncLifetimeIDTests: XCTestCase {
         let realm = try Realm(configuration: config)
         try realm.write { BigSyncRecordBaseline.invalidate(recordName: "row", in: realm) }
         let baseline = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: "row"))
-        XCTAssertTrue(baseline.invalidated)
+        XCTAssertTrue(baseline.isComparisonInvalidated)
         XCTAssertFalse(baseline.revision.isEmpty)
         XCTAssertEqual(baseline.fields.count, 0)
         let revision = baseline.revision
         try realm.write {
             BigSyncRecordBaseline.install(recordName: "row", namespace: "new-account", fields: ["text": Data([2])], in: realm)
         }
-        XCTAssertFalse(baseline.invalidated)
+        XCTAssertFalse(baseline.isComparisonInvalidated)
         XCTAssertNotEqual(baseline.revision, revision)
         XCTAssertEqual(baseline.namespace, "new-account")
     }

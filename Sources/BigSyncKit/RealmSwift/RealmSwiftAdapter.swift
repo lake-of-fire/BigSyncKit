@@ -9219,7 +9219,7 @@ extension RealmSwiftAdapter {
         let remote = try BigSyncRecordFingerprint.fields(of: remoteObject)
         let local = try BigSyncRecordFingerprint.fields(of: object)
         let stored = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
-        let base = stored?.namespace == context.namespace && stored?.invalidated == false
+        let base = stored?.namespace == context.namespace && stored?.isComparisonInvalidated == false
             ? stored?.fieldDigests : nil
         let lifetimeField: String?
         if case let .lifetimeBundle(field, independent) = policy {

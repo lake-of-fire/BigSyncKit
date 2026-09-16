@@ -10,7 +10,7 @@ public final class BigSyncRecordBaseline: Object {
     @Persisted(primaryKey: true) public var recordName = ""
     @Persisted public var namespace = ""
     @Persisted public var revision = ""
-    @Persisted public var invalidated = false
+    @Persisted public var isComparisonInvalidated = false
     @Persisted public var serverChangeTag: String?
     @Persisted public var fields: Map<String, Data>
 }
@@ -277,7 +277,14 @@ extension BigSyncRecordBaseline {
     }
 
     static func isEnabled(in realm: Realm) -> Bool {
-        realm.schema.objectSchema.contains { $0.className == className() }
+        isEnabled(in: realm.configuration)
+            && realm.schema.objectSchema.contains { $0.className == className() }
+    }
+
+    static func isEnabled(in configuration: Realm.Configuration) -> Bool {
+        // Merely linking BigSyncKit can make the table visible to Realm's
+        // automatic schema discovery. That is not consent to change merging.
+        configuration.objectTypes?.contains { $0.className() == className() } == true
     }
 
     @discardableResult
@@ -285,12 +292,12 @@ extension BigSyncRecordBaseline {
                         fields: [String: Data], serverChangeTag: String? = nil, in realm: Realm) -> Bool {
         precondition(realm.isInWriteTransaction)
         let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
-        if existing?.invalidated == false, existing?.namespace == namespace,
+        if existing?.isComparisonInvalidated == false, existing?.namespace == namespace,
            existing?.fieldDigests == fields, existing?.serverChangeTag == serverChangeTag { return false }
         let row = existing ?? Self()
         if existing == nil { row.recordName = recordName }
         row.namespace = namespace
-        row.invalidated = false
+        row.isComparisonInvalidated = false
         row.serverChangeTag = serverChangeTag
         row.revision = UUID().uuidString
         row.fields.removeAll()
@@ -308,7 +315,7 @@ extension BigSyncRecordBaseline {
         // an older nil-based receipt install an ancestor from the previous life.
         let row = existing ?? Self()
         if existing == nil { row.recordName = recordName }
-        row.invalidated = true
+        row.isComparisonInvalidated = true
         row.serverChangeTag = nil
         row.revision = UUID().uuidString
         row.fields.removeAll()
