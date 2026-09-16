@@ -1,0 +1,64 @@
+name: Rebase integration boundary qualification
+on:
+  push:
+    branches: [verify/rebase-integration-review-20260916]
+    paths: [.github/workflows/rebase-integration-native.yml]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 2ea225848c698825579b3516287fc5cd38579d7c
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        id: toolchain
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          brew install xcsift
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-boundary-red-2ea22584
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.resolved') }}-
+      - name: Execute committed desired-outcome boundary tests before repair
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter SyncRebaseIntegrationBoundaryTests 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+      - name: Preserve exact source evidence
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rebase-integration-boundary-red
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
