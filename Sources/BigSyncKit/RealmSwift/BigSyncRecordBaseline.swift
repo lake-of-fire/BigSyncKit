@@ -279,7 +279,7 @@ extension BigSyncRecordBaseline {
         let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
         if existing?.namespace == namespace, existing?.fieldDigests == fields { return false }
         let row = existing ?? Self()
-        row.recordName = recordName
+        if existing == nil { row.recordName = recordName }
         row.namespace = namespace
         row.revision = UUID().uuidString
         row.fields.removeAll()
