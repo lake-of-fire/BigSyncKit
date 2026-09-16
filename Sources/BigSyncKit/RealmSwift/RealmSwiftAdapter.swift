@@ -9309,10 +9309,21 @@ extension RealmSwiftAdapter {
             try BigSyncLifetimeID.validate(lifetimeValue(object))
             try BigSyncLifetimeID.validate(lifetimeValue(remoteObject))
         }
-        // A local delete deliberately retires its field base. Preserve
-        // the existing generation-fenced deletion path instead of
-        // rejecting an inbound page because that base is now absent.
+        // A local delete retires its field base, but cannot override a
+        // declared newer lifetime. No ancestor is invented: this is whole-
+        // record lifecycle selection, never independent-field inference.
         if pending != nil, (object as? SoftDeletable)?.isDeleted == true {
+            if lifetimeField != nil,
+               try BigSyncLifetimeID.prefersIncoming(
+                   local: lifetimeValue(object), incoming: lifetimeValue(remoteObject)
+               ) == true {
+                return try applyComparisonFields(Set(remote.keys), record: record,
+                    object: object, isNew: existingObject == nil,
+                    objectIdentifier: objectIdentifier, local: local, remote: remote,
+                    pending: true, context: context, in: realm)
+            }
+            // Same/older/unversioned lifetimes retain the existing exact-
+            // generation deletion fence without rejecting the inbound page.
             return false
         }
         let incoming: Set<String>
