@@ -1,0 +1,88 @@
+name: Rebase lifecycle red green
+on:
+  push:
+    branches: [verify/sync-fake-timelines-20260915]
+    paths: [.github/workflows/rebase-lifecycle-red-green.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: BigSyncKit
+          fetch-depth: 0
+      - name: Commit test API correction on the unrepaired production tree
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cp .github/rebase-map-test-api.patch "$RUNNER_TEMP/evidence/test-api.patch"
+          git checkout --detach afb81bc752ce8c5f68c33949764f5b11a8bcbf0c
+          git apply --index --include='Tests/BigSyncKitTests/SyncRecordRebaseTests.swift' "$RUNNER_TEMP/evidence/test-api.patch"
+          git config user.name 'Manabi contributors'
+          git config user.email 'contributors@manabi.io'
+          git commit -m 'Use the Realm Map count API in unchanged-logic desired-outcome tests'
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-identity.txt"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          brew install xcsift
+      - name: Require real assertion failures rather than compilation failures
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          set +e
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncRecordRebaseTests 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q 'LIFECYCLE:' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'LIFETIME:' "$RUNNER_TEMP/evidence/red.log"
+          grep -q 'Executed 19 tests' "$RUNNER_TEMP/evidence/red.log"
+      - name: Publish API-correct tests with reviewed production repair
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          git checkout --detach 42f30af3b1ada5492668bd9ccc216dabfb3c9896
+          git apply --index "$RUNNER_TEMP/evidence/test-api.patch"
+          git commit -m 'Use supported Realm Map assertions in rebase lifecycle tests'
+          git push origin HEAD:refs/heads/fix/record-rebase-accounting-20260916
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/identity.txt"
+      - name: All rebase and lifetime cases on repaired committed source
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter 'SyncRecordRebaseTests|BigSyncLifetimeIDTests' 2>&1 | tee "$RUNNER_TEMP/evidence/green.log" | xcsift
+      - name: Full native suite once
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$RUNNER_TEMP/build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+      - name: Exact source and clean-tree proof
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git diff --exit-code > "$RUNNER_TEMP/evidence/source-clean.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/evidence/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rebase-lifecycle-red-green
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
