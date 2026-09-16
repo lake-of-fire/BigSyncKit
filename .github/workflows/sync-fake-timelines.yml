@@ -12,9 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: a76e44bd1e3bf4ba5dd9fa0af6da3aad24db14e6
+          ref: 35d0b0ed058e863e5193cfc9978f31fbeec5cd1f
           path: BigSyncKit
-          fetch-depth: 0
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -34,26 +33,14 @@ jobs:
           swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
           sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
           brew install xcsift
-      - name: Prove local-conflict failure composition regressed before its repair
-        working-directory: BigSyncKit
-        run: |
-          set -euo pipefail
-          git checkout --detach 59d1f70d1d6a435ba7d6e713ff5a76f734cfb3c8
-          set +e
-          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/red-local-conflict.log" | xcsift
-          status=$?
-          set -e
-          test "$status" -ne 0
-          grep -q 'Executed 8 tests' "$RUNNER_TEMP/evidence/red-local-conflict.log"
-          grep -q 'Local processing hid a sibling CloudKit constraint' "$RUNNER_TEMP/evidence/red-local-conflict.log"
       - name: Run compact fake-provider and known-issue repro suites once
         working-directory: BigSyncKit
         run: |
           set -euo pipefail
-          git checkout --detach a76e44bd1e3bf4ba5dd9fa0af6da3aad24db14e6
           swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncLongLivedReplicaTests 2>&1 | tee "$RUNNER_TEMP/evidence/timelines.log" | xcsift
           swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncConflictFailureCompositionTests 2>&1 | tee "$RUNNER_TEMP/evidence/conflict-failures.log" | xcsift
           swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncStaleBaseReproductionTests 2>&1 | tee "$RUNNER_TEMP/evidence/stale-base-repro.log" | xcsift
+          swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncEpochBundleReproductionTests 2>&1 | tee "$RUNNER_TEMP/evidence/epoch-bundle-repro.log" | xcsift
           swift test --scratch-path "$RUNNER_TEMP/build" --filter SyncSemanticIntentTests 2>&1 | tee "$RUNNER_TEMP/evidence/semantic.log" | xcsift
       - name: Full native library suite once
         working-directory: BigSyncKit
