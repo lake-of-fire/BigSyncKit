@@ -1,0 +1,73 @@
+name: Final sync composition library qualification
+on:
+  push:
+    branches: [verify/final-sync-composition-20260916]
+    paths: [.github/workflows/final-sync-composition.yml]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+        working-directory: BigSyncKit
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 4079fd48d0f582ad449785f7a825c221a1d0aa53
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record immutable source and toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          test "$(git rev-parse HEAD)" = 4079fd48d0f582ad449785f7a825c221a1d0aa53
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-final-${{ github.run_id }}
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
+      - name: Execute exact focused and full library suites
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'SyncRetainedRecordContractTests|SyncRebaseIntegrationBoundaryTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRecordRebaseTests|BigSyncLifetimeIDTests|BigSyncLifetimeSuccessorTests' > "$RUNNER_TEMP/evidence/focused.log" 2>&1
+          grep -q 'Executed 91 tests, with 0 failures' "$RUNNER_TEMP/evidence/focused.log"
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" > "$RUNNER_TEMP/evidence/full.log" 2>&1
+          grep -q 'Executed 600 tests, with 1 test skipped and 0 failures' "$RUNNER_TEMP/evidence/full.log"
+          git diff --exit-code
+      - name: Preserve source and outcome
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git status --porcelain --untracked-files=no > "$RUNNER_TEMP/evidence/source-status.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/evidence/source.tar.gz" HEAD
+          cp Package.resolved "$RUNNER_TEMP/evidence/Package.resolved"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: final-sync-library-evidence
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
