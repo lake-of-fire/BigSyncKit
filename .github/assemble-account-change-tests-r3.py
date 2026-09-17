@@ -24,7 +24,7 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 source_path, source = load(
     "Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift",
-    "baf8c0e1a1f31962b04df444a2d19d4ca3b4f42f",
+    "8f626bd9047967cd0edf0d520a981275bff8c685",
 )
 source = replace_once(
     source,
