@@ -1,0 +1,170 @@
+name: Retained prerelease review red-green
+on:
+  push:
+    branches: [verify/retained-prerelease-review-20260917]
+    paths: [.github/workflows/retained-prerelease-review.yml]
+permissions:
+  contents: write
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+        working-directory: BigSyncKit
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: qualification
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 63c0849bf77cb7dcb803848edbdb6163241f4f0a
+          fetch-depth: 0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 02faace3e1c821bf4d4c3f3e3d7770b5d4acea21
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Import exact review commits without transport ancestry
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          data = (Path(os.environ['GITHUB_WORKSPACE']) / 'qualification/.github/retained-review.bundle.b64').read_bytes()
+          (Path(os.environ['RUNNER_TEMP']) / 'review.bundle').write_bytes(base64.b64decode(data, validate=False))
+          PY
+          git bundle verify "$RUNNER_TEMP/review.bundle"
+          git fetch "$RUNNER_TEMP/review.bundle" HEAD
+          git checkout --detach 77612369e3e6b4a1dece9278257ec54f51433a09
+          test "$(git rev-parse HEAD^{tree})" = 6cb49e13be60a1ef036742820667ec2b3ae303a8
+          test "$(git rev-parse HEAD^)" = 63c0849bf77cb7dcb803848edbdb6163241f4f0a
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/red-source.txt"
+          git -C ../RealmSwiftGaps rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/RealmSwiftGaps.txt"
+          git -C ../SwiftUtilities rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/SwiftUtilities.txt"
+      - name: Record toolchain and install formatter
+        id: toolchain
+        run: |
+          set -euo pipefail
+          command -v xcsift >/dev/null || brew install xcsift
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          uname -m >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import os, re, subprocess
+          version = subprocess.check_output(['swift', '--version'], text=True)
+          match = re.search(r'Swift version (\d+)\.(\d+)', version)
+          assert match, version
+          modern = tuple(map(int, match.groups())) >= (6, 3)
+          scratch = os.environ['GITHUB_WORKSPACE'] + ('/.review-clean-' + os.environ['GITHUB_RUN_ID'] if modern else '/.rebase-build')
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write('REVIEW_SCRATCH=' + scratch + '\n')
+              out.write('REVIEW_DISABLE_PREBUILTS=' + ('1' if modern else '0') + '\n')
+          PY
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-review-${{ github.run_id }}
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
+            rebase-${{ runner.os }}-${{ runner.arch }}-
+      - name: Require behavioral red on unchanged production source
+        run: |
+          set -euo pipefail
+          flags=(--scratch-path "$REVIEW_SCRATCH")
+          if [[ "$REVIEW_DISABLE_PREBUILTS" == 1 ]]; then flags+=(--disable-experimental-prebuilts); fi
+          set +e
+          swift test "${flags[@]}" --filter 'testMissingComparisonEvidenceCannot|testRevokedPruneCannotRetireCrashPrefixQuarantine|testRecoveryAuthorityRevokedAfterTargetCommitPreservesQuarantineForRetry' 2>&1 | tee "$RUNNER_TEMP/evidence/red.log" | xcsift
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${statuses[0]}" -ne 0
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'evidence/red.log').read_text()
+          names = ['testMissingComparisonEvidenceCannotRollBackAcknowledgedReopen', 'testMissingComparisonEvidenceCannotResurrectNewerClear', 'testRevokedPruneCannotRetireCrashPrefixQuarantine', 'testRecoveryAuthorityRevokedAfterTargetCommitPreservesQuarantineForRetry']
+          for name in names:
+              assert re.search(r"Test Case '[^'\n]*" + name + r"[^'\n]*' failed", text), name
+          assert re.search(r"Test Suite 'Selected tests' failed at [^\n]+\n\s*Executed 4 tests, with [1-9]\d* failures", text), 'No completed four-test behavioral failure'
+          PY
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Qualify exact repaired product
+        run: |
+          set -euo pipefail
+          git checkout --detach e4ad9384e958af6ab224ae29619a9f2a54f3a3c2
+          test "$(git rev-parse HEAD^)" = 77612369e3e6b4a1dece9278257ec54f51433a09
+          test "$(git rev-parse HEAD^{tree})" = de092e11588aaafeac5ee1549fd2f45badf6af99
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+          flags=(--scratch-path "$REVIEW_SCRATCH")
+          if [[ "$REVIEW_DISABLE_PREBUILTS" == 1 ]]; then flags+=(--disable-experimental-prebuilts); fi
+          swift test "${flags[@]}" --filter 'BigSyncLifetimeIDTests|BigSyncLifetimeSuccessorTests|SyncRebaseIntegrationBoundaryTests|SyncRecordRebaseTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRetainedRecordContractTests|HotfixMutationDrainTailTests' 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+          swift test "${flags[@]}" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          cmp "$RUNNER_TEMP/evidence/source-identity.txt" "$RUNNER_TEMP/evidence/final-identity.txt"
+      - name: Require completed suites and regression execution
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          required = {'BigSyncLifetimeIDTests': 9, 'BigSyncLifetimeSuccessorTests': 7, 'SyncRebaseIntegrationBoundaryTests': 11, 'SyncRecordRebaseTests': 25, 'SyncRecordReceiptTests': 6, 'SyncRecordReceiptValidationTests': 6, 'SyncRetainedRecordContractTests': 32, 'HotfixMutationDrainTailTests': 4}
+          new = ['testMissingComparisonEvidenceCannotRollBackAcknowledgedReopen', 'testMissingComparisonEvidenceCannotResurrectNewerClear', 'testMissingComparisonEvidenceStillAcceptsGenuineSuccessor', 'testRevokedPruneCannotRetireCrashPrefixQuarantine', 'testRecoveryAuthorityRevokedAfterTargetCommitPreservesQuarantineForRetry']
+          result = {}
+          for mode, aggregate in [('focused', 'Selected tests'), ('full', 'All tests')]:
+              text = (root / (mode + '.log')).read_text()
+              assert not re.search(r"Test (?:Case|Suite) '[^'\n]+' failed", text)
+              starts = re.findall(r"^Test Suite '([^'\n]+)' started at .+$", text, re.M)
+              matches = re.findall(r"^Test Suite '([^'\n]+)' passed at [^\n]+\n\s*Executed (\d+) tests?, with (?:(\d+) tests? skipped and )?(\d+) failures? \((\d+) unexpected\) in ([\d.]+)", text, re.M)
+              rows = {name: dict(executed=int(n), skipped=int(s or 0), failures=int(f), unexpected=int(u), seconds=float(t)) for name,n,s,f,u,t in matches}
+              assert len(starts) == len(set(starts)) == len(rows) == len(matches)
+              assert set(starts) == set(rows)
+              assert aggregate in rows and rows[aggregate]['executed'] >= sum(required.values())
+              for name, row in rows.items():
+                  assert row['failures'] == row['unexpected'] == 0 and row['skipped'] <= row['executed'], (mode,name,row)
+              for name, count in required.items():
+                  assert rows[name]['executed'] >= count and rows[name]['skipped'] == 0, (mode,name,rows.get(name))
+              for name in new + ['testRevokedResolutionAuthorityCannotCommitEitherChoice', 'testRevokedRefreshAuthorityCannotRetireOrReplaceEvidence', 'testRevokedPruneAuthorityCannotDeleteRetainedArchives']:
+                  assert re.search(r"Test Case '[^'\n]*" + name + r"[^'\n]*' passed", text), (mode,name)
+              result[mode] = rows
+          (root / 'verified-results.json').write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({mode: rows['All tests' if mode == 'full' else 'Selected tests'] for mode,rows in result.items()}, indent=2))
+          PY
+      - name: Publish tested candidate without changing product PR
+        run: |
+          set -euo pipefail
+          candidate=integration/retained-review-qualified-20260917
+          test -z "$(git ls-remote --heads origin "refs/heads/$candidate")"
+          git push origin "HEAD:refs/heads/$candidate"
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/published-candidate.txt"
+      - name: Retain exact identities and source
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git status --porcelain --untracked-files=all > "$RUNNER_TEMP/evidence/source-status.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/evidence/source.tar.gz" HEAD
+          git bundle create "$RUNNER_TEMP/evidence/source.bundle" HEAD
+          cd "$RUNNER_TEMP/evidence"
+          shasum -a 256 * > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: retained-prerelease-review-red-green
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
