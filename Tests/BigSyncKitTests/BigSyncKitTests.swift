@@ -1442,6 +1442,32 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testDownloadOnlyTerminalDrainForwardsEveryAdapterWithoutUploading() async {
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(database: database)
+        let firstAdapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "download-only-terminal-first"),
+            priorities: []
+        )
+        let secondAdapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "download-only-terminal-second"),
+            priorities: []
+        )
+        synchronizer.addModelAdapter(firstAdapter)
+        synchronizer.addModelAdapter(secondAdapter)
+        synchronizer.syncMode = .downloadOnly
+        synchronizer.syncing = true
+        synchronizer.synchronizationDrainIsActive = true
+
+        await synchronizer.changesFinishedSynchronizing()
+
+        XCTAssertEqual(firstAdapter.didFinishImportCount, 2)
+        XCTAssertEqual(secondAdapter.didFinishImportCount, 2)
+        XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+        XCTAssertFalse(synchronizer.syncing)
+    }
+
+    @BigSyncBackgroundActor
     func testDeletedZoneProviderFailureIsPropagatedBeforeTokenCommit() async {
         let database = FakeCloudKitDatabase()
         database.databaseDeletedZoneIDs = [
@@ -4696,6 +4722,174 @@ final class BigSyncKitTests: XCTestCase {
         )
         XCTAssertEqual(tracking.entityState, .deletedRemotely)
         XCTAssertNil(tracking.pendingGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledOpaqueAcknowledgementsStopBeforeBatchValidation()
+    async throws {
+        let firstFixture = try await makeRealmAdapterFixture()
+        let secondFixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "cancelled-opaque-acknowledgement",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await firstFixture.targetRealm.asyncWrite {
+            firstFixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await firstFixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: firstFixture.targetRealm
+        )
+        let uploadBatch = try await firstFixture.adapter.prepareUploadBatch(limit: 1)
+        let uploadAcknowledgement = Task { @BigSyncBackgroundActor in
+            try await secondFixture.adapter.acknowledgeUploadedRecords(
+                uploadBatch.records,
+                from: uploadBatch
+            )
+        }
+        uploadAcknowledgement.cancel()
+        do {
+            try await uploadAcknowledgement.value
+            XCTFail("Expected cancellation before upload batch validation")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let uploaded = try XCTUnwrap(uploadBatch.records.first)
+        try await firstFixture.adapter.acknowledgeUploadedRecords(
+            [uploaded],
+            from: uploadBatch
+        )
+        try await firstFixture.targetRealm.asyncWrite {
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await firstFixture.adapter._test_forwardPendingMutations(
+            in: firstFixture.targetRealm
+        )
+        let deletionBatch = try await firstFixture.adapter.prepareDeletionBatch(limit: 1)
+        let deletionAcknowledgement = Task { @BigSyncBackgroundActor in
+            try await secondFixture.adapter.acknowledgeDeletedRecordIDs(
+                deletionBatch.recordIDs,
+                from: deletionBatch
+            )
+        }
+        deletionAcknowledgement.cancel()
+        do {
+            try await deletionAcknowledgement.value
+            XCTFail("Expected cancellation before deletion batch validation")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledAcknowledgementsPreserveExactPreparedGenerationsForRetry()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(
+            id: "cancelled-generation-acknowledgement",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: Date()
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await fixture.adapter._test_enqueueCreatedAndModifiedAndProcess(
+            in: fixture.targetRealm
+        )
+        let uploadBatch = try await fixture.adapter.prepareUploadBatch(limit: 1)
+        let uploaded = try XCTUnwrap(uploadBatch.records.first)
+        let recordName = uploaded.recordID.recordName
+        let uploadGeneration = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration
+        )
+
+        let uploadAcknowledgement = Task { @BigSyncBackgroundActor in
+            try await fixture.adapter.acknowledgeUploadedRecords(
+                [uploaded],
+                from: uploadBatch
+            )
+        }
+        uploadAcknowledgement.cancel()
+        do {
+            try await uploadAcknowledgement.value
+            XCTFail("Expected cancelled upload acknowledgement")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration,
+            uploadGeneration
+        )
+        try await fixture.adapter.acknowledgeUploadedRecords(
+            [uploaded],
+            from: uploadBatch
+        )
+
+        try await fixture.targetRealm.asyncWrite {
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await fixture.adapter._test_forwardPendingMutations(
+            in: fixture.targetRealm
+        )
+        let deletionBatch = try await fixture.adapter.prepareDeletionBatch(limit: 1)
+        let deletedRecordID = try XCTUnwrap(deletionBatch.recordIDs.first)
+        let deletionGeneration = try XCTUnwrap(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration
+        )
+
+        let deletionAcknowledgement = Task { @BigSyncBackgroundActor in
+            try await fixture.adapter.acknowledgeDeletedRecordIDs(
+                [deletedRecordID],
+                from: deletionBatch
+            )
+        }
+        deletionAcknowledgement.cancel()
+        do {
+            try await deletionAcknowledgement.value
+            XCTFail("Expected cancelled deletion acknowledgement")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration,
+            deletionGeneration
+        )
+        try await fixture.adapter.acknowledgeDeletedRecordIDs(
+            [deletedRecordID],
+            from: deletionBatch
+        )
+        XCTAssertEqual(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.entityState,
+            .deletedRemotely
+        )
+        XCTAssertNil(
+            fixture.persistenceRealm.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: recordName
+            )?.pendingGeneration
+        )
     }
 
     @BigSyncBackgroundActor
