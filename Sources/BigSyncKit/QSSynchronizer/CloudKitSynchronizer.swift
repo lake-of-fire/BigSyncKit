@@ -1359,6 +1359,12 @@ public class CloudKitSynchronizer: NSObject {
             self?.accountScopeAuthorityFence.poison()
             Task { @BigSyncBackgroundActor [weak self] in
                 guard let self else { return }
+#if DEBUG
+                // Tests need the completion of this actor task, not an
+                // intermediate attempt-ID rotation, as their synchronization
+                // boundary. Keep the seam out of release builds.
+                defer { _testAccountChangeObserverDidFinishHandler?() }
+#endif
                 // Revoke run ownership before application invalidation can
                 // suspend and allow actor reentrancy.
                 accountValidationRequired = true
@@ -1406,6 +1412,9 @@ public class CloudKitSynchronizer: NSObject {
     }
 
 #if DEBUG
+    @BigSyncBackgroundActor
+    internal var _testAccountChangeObserverDidFinishHandler: (() -> Void)?
+
     @BigSyncBackgroundActor
     internal var processKillCheckpointHandler:
         BigSyncBackgroundWorkerConfiguration.ProcessKillCheckpointHandler?

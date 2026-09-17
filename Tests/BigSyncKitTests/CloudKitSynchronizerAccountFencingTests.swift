@@ -1050,6 +1050,12 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         let establishedLease = try XCTUnwrap(
             synchronizer.accountScopeLease()
         )
+        let observerFinished = expectation(
+            description: "account-change observer finished"
+        )
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            observerFinished.fulfill()
+        }
 
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
         // Delivery revokes authority synchronously, before the actor task can
@@ -1063,10 +1069,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
                 .unavailable
             )
         }
-        for _ in 0..<100 {
-            if !(await recorder.reasons).isEmpty { break }
-            await Task.yield()
-        }
+        await fulfillment(of: [observerFinished], timeout: 2)
 
         let reasons = await recorder.reasons
         XCTAssertEqual(reasons, [.accountChanged])
@@ -1092,13 +1095,15 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         synchronizer.accountScopeInvalidationHandler = { _ in
             try await invalidation.run()
         }
+        let observerFinished = expectation(
+            description: "failed account-change observer finished"
+        )
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            observerFinished.fulfill()
+        }
 
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
-        for _ in 0..<100 {
-            if await invalidation.attempts > 0 { break }
-            await Task.yield()
-        }
-        for _ in 0..<10 { await Task.yield() }
+        await fulfillment(of: [observerFinished], timeout: 2)
 
         let attemptsAfterFailure = await invalidation.attempts
         XCTAssertEqual(attemptsAfterFailure, 1)
@@ -1190,11 +1195,15 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             first.invalidationGeneration
         )
 
+        let observerFinished = expectation(
+            description: "account-change observer finished"
+        )
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            observerFinished.fulfill()
+        }
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
         XCTAssertNil(try synchronizer.accountScopeLease())
-        for _ in 0..<100 where !synchronizer.accountValidationRequired {
-            await Task.yield()
-        }
+        await fulfillment(of: [observerFinished], timeout: 2)
         XCTAssertTrue(synchronizer.accountValidationRequired)
         XCTAssertNil(try synchronizer.accountScopeLease())
         XCTAssertThrowsError(

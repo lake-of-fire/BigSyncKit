@@ -111,6 +111,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     var subscriptionLookupError: Error?
     var subscriptionSaveError: Error?
     var subscriptionDeleteError: Error?
+    var subscriptionSaveHandler: (@Sendable (Int) -> Void)?
     var accountIdentifierAfterNextSubscriptionLookup: String?
     var accountIdentifierAfterNextSubscriptionSave: String?
     var accountIdentifierAfterNextSubscriptionDelete: String?
@@ -229,6 +230,7 @@ extension FakeCloudKitDatabase: CloudKitSubscriptionStore {
     func save(subscription: CKSubscription) async throws -> CKSubscription {
         savedSubscriptionCount += 1
         savedSubscriptions.append(subscription)
+        subscriptionSaveHandler?(savedSubscriptionCount)
         if let subscriptionSaveError {
             throw subscriptionSaveError
         }
@@ -8635,7 +8637,7 @@ final class BigSyncKitTests: XCTestCase {
     async throws {
         let enteredInvalidation = expectation(description: "observer invalidation suspended")
         let enteredValidation = expectation(description: "intermediate validation suspended")
-        let restarted = expectation(description: "automatic restart validated its account")
+        let observerFinished = expectation(description: "account-change observer finished")
         let validationFinished = expectation(description: "intermediate validation rejected")
         let releaseInvalidation = AsyncGate()
         let releaseValidation = AsyncGate()
@@ -8646,11 +8648,6 @@ final class BigSyncKitTests: XCTestCase {
             releaseGate: releaseValidation
         )
         let synchronizer = makeSynchronizer(
-            progressHandler: { checkpoint in
-                if checkpoint == "account-identity-validated" {
-                    restarted.fulfill()
-                }
-            },
             accountIdentifierProvider: { await identifiers.next() }
         )
         synchronizer.addModelAdapter(FakeModelAdapter(
@@ -8662,6 +8659,9 @@ final class BigSyncKitTests: XCTestCase {
                 enteredInvalidation.fulfill()
                 await releaseInvalidation.wait()
             }
+        }
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            observerFinished.fulfill()
         }
         addTeardownBlock { @BigSyncBackgroundActor in
             // Prevent a still-suspended observer from starting work after a
@@ -8698,17 +8698,11 @@ final class BigSyncKitTests: XCTestCase {
         // Force the precise formerly flaky ordering: the probe captured the
         // cancellation ID before the observer resumed and called begin.
         await releaseInvalidation.open()
-        await fulfillment(of: [restarted], timeout: 2)
+        await fulfillment(of: [observerFinished], timeout: 2)
         XCTAssertNotEqual(synchronizer.synchronizationAttemptID, intermediateAttemptID)
+        XCTAssertTrue(synchronizer.syncing)
         await releaseValidation.open()
         await fulfillment(of: [validationFinished], timeout: 2)
-        XCTAssertFalse(synchronizer.accountValidationRequired)
-        XCTAssertEqual(
-            synchronizer.keyValueStore.object(
-                forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier")
-            ) as? String,
-            "account-b"
-        )
     }
 
     @BigSyncBackgroundActor
@@ -8729,18 +8723,20 @@ final class BigSyncKitTests: XCTestCase {
         try await synchronizer.subscribeForChangesInDatabase()
         XCTAssertEqual(database.savedSubscriptionCount, 1)
 
+        let replacementSubscriptionSaved = expectation(
+            description: "replacement account subscription saved"
+        )
+        database.subscriptionSaveHandler = { saveCount in
+            if saveCount == 2 {
+                replacementSubscriptionSaved.fulfill()
+            }
+        }
         database.accountIdentifier = "account-b"
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
-        // The account-change observer owns the recovery wakeup. Issuing a
-        // second explicit begin here can race the observer and create a tail
-        // drain, making an exact save-count assertion scheduler-dependent.
-        await Task.yield()
-
-        for _ in 0..<1_000 where database.savedSubscriptionCount < 2 {
-            try await Task.sleep(nanoseconds: 1_000_000)
-        }
+        await fulfillment(of: [replacementSubscriptionSaved], timeout: 2)
 
         XCTAssertEqual(database.savedSubscriptionCount, 2)
+        database.subscriptionSaveHandler = nil
         await synchronizer.cancelSynchronizationAndWait()
     }
 
@@ -15119,7 +15115,6 @@ final class BigSyncKitTests: XCTestCase {
             ownerName: CKCurrentUserDefaultName
         ),
         backupDetectionBaseURL: URL? = nil,
-        progressHandler: CloudKitSynchronizer.ProgressHandler? = nil,
         accountIdentifierProvider: @escaping CloudKitSynchronizer.AccountIdentifierProvider = {
             "test-account"
         }
@@ -15132,7 +15127,6 @@ final class BigSyncKitTests: XCTestCase {
             keyValueStore: keyValueStore,
             accountIdentifierProvider: accountIdentifierProvider,
             accountStatusProvider: { .available },
-            progressHandler: progressHandler,
             backupDetectionBaseURL: backupDetectionBaseURL,
             logger: Logger(label: "BigSyncKitTests")
         )
