@@ -1,0 +1,118 @@
+name: Invalidation failure-ordering qualification
+on:
+  push:
+    branches: [automation/account-invalidation-failure-ordering-20260917]
+    paths: [.github/workflows/invalidation-failure-ordering.yml]
+permissions:
+  contents: read
+concurrency:
+  group: invalidation-failure-ordering-20260917
+  cancel-in-progress: false
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      candidate: ${{ steps.assemble.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: fdb0e1313e2839db92126ae3e3ec76333195a045
+          path: BigSyncKit
+      - name: Publish isolated tests-only candidate
+        id: assemble
+        working-directory: BigSyncKit
+        run: python3 ../tooling/.github/qualify-invalidation-failures.py assemble
+  native:
+    needs: assemble
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.assemble.outputs.candidate }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record toolchain and dependencies
+        run: |
+          mkdir -p qualification-failures
+          swift --version > qualification-failures/toolchain.txt
+          sw_vers >> qualification-failures/toolchain.txt
+          xcrun --show-sdk-version >> qualification-failures/toolchain.txt
+          git -C RealmSwiftGaps rev-parse HEAD > qualification-failures/RealmSwiftGaps.txt
+          git -C SwiftUtilities rev-parse HEAD > qualification-failures/SwiftUtilities.txt
+      - name: Focused tests, three negative controls, full suite, and stress
+        working-directory: BigSyncKit
+        env:
+          CANDIDATE: ${{ needs.assemble.outputs.candidate }}
+        run: python3 ../tooling/.github/qualify-invalidation-failures.py qualify "$CANDIDATE"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: invalidation-failure-ordering-native
+          path: qualification-failures/
+          retention-days: 14
+  release:
+    needs: assemble
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.assemble.outputs.candidate }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Build immutable Release source
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p ../qualification-release
+          git rev-parse HEAD HEAD^{tree} HEAD:Sources > ../qualification-release/initial-identity.txt
+          swift --version > ../qualification-release/toolchain.txt
+          swift build -c release > ../qualification-release/build.log 2>&1
+          git diff --exit-code
+          git rev-parse HEAD HEAD^{tree} HEAD:Sources > ../qualification-release/final-identity.txt
+          cmp ../qualification-release/initial-identity.txt ../qualification-release/final-identity.txt
+          git status --porcelain > ../qualification-release/source-status.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: invalidation-failure-ordering-release
+          path: qualification-release/
+          retention-days: 14
