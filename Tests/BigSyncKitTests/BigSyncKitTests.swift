@@ -512,18 +512,18 @@ private actor GatedAccountIdentifierSequence {
     private var identifiers: [String]
     private var callCount = 0
     private let gatedCall: Int
-    private let enteredGate: AsyncGate
+    private let enteredConfirmation: XCTestExpectation
     private let releaseGate: AsyncGate
 
     init(
         _ identifiers: [String],
         gatedCall: Int,
-        enteredGate: AsyncGate,
+        enteredConfirmation: XCTestExpectation,
         releaseGate: AsyncGate
     ) {
         self.identifiers = identifiers
         self.gatedCall = gatedCall
-        self.enteredGate = enteredGate
+        self.enteredConfirmation = enteredConfirmation
         self.releaseGate = releaseGate
     }
 
@@ -536,7 +536,7 @@ private actor GatedAccountIdentifierSequence {
             identifier = identifiers[0]
         }
         if callCount == gatedCall {
-            await enteredGate.open()
+            enteredConfirmation.fulfill()
             await releaseGate.wait()
         }
         return identifier
@@ -8539,9 +8539,9 @@ final class BigSyncKitTests: XCTestCase {
 
         try await synchronizer._test_validateSynchronizationAccount()
         database.accountIdentifier = "account-b"
-        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
-        await Task.yield()
-
+        // Exercise account replacement directly. Posting a notification here
+        // would also start an automatic drain competing with this validation.
+        // The subscription test below covers the observer-owned restart.
         try await synchronizer._test_validateSynchronizationAccount()
 
         // Account validation must not erase tracking outside the provenance
@@ -8560,63 +8560,154 @@ final class BigSyncKitTests: XCTestCase {
     func testAccountChangeDuringReplacementConfirmationLeavesValidationRequired()
     async throws {
         let database = FakeCloudKitDatabase()
-        let enteredConfirmation = AsyncGate()
+        let enteredConfirmation = expectation(description: "replacement confirmation entered")
+        let invalidatedAccount = expectation(description: "account-change invalidation entered")
+        let validationFinished = expectation(description: "superseded validation finished")
         let releaseConfirmation = AsyncGate()
         let identifiers = GatedAccountIdentifierSequence(
             ["account-a", "account-b", "account-b", "account-c"],
             gatedCall: 3,
-            enteredGate: enteredConfirmation,
+            enteredConfirmation: enteredConfirmation,
             releaseGate: releaseConfirmation
         )
         let synchronizer = makeSynchronizer(
             database: database,
             accountIdentifierProvider: { await identifiers.next() }
         )
-        let adapter = FakeModelAdapter(
-            zoneID: CKRecordZone.ID(
-                zoneName: "account-reset-race",
-                ownerName: CKCurrentUserDefaultName
-            ),
-            priorities: []
-        )
-        synchronizer.addModelAdapter(adapter)
-        try await synchronizer._test_validateSynchronizationAccount()
-
-        let replacementAttemptID = synchronizer.synchronizationAttemptID
-        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
-        while synchronizer.synchronizationAttemptID == replacementAttemptID {
-            await Task.yield()
+        // This unit test owns validation explicitly. With an adapter attached,
+        // the notification observer also starts a drain: its cancel and begin
+        // each rotate the attempt ID, so observing one rotation is not a
+        // completion barrier. Test that restart separately below.
+        XCTAssertTrue(synchronizer.modelAdapters.isEmpty)
+        synchronizer.accountScopeInvalidationHandler = { reason in
+            if reason == .accountChanged {
+                invalidatedAccount.fulfill()
+            }
         }
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertFalse(synchronizer.accountValidationRequired)
 
         let validation = Task { @BigSyncBackgroundActor in
-            try await synchronizer._test_validateSynchronizationAccount()
+            defer { validationFinished.fulfill() }
+            do {
+                try await synchronizer._test_validateSynchronizationAccount()
+                XCTFail("Expected the superseded validation to be cancelled")
+            } catch is CancellationError {
+                XCTAssertFalse(Task.isCancelled, "Authority supersession must reject an uncancelled task")
+            } catch {
+                XCTFail("Unexpected validation error: \(error)")
+            }
         }
-        while !(await enteredConfirmation.hasOpened()) {
-            await Task.yield()
+        addTeardownBlock {
+            validation.cancel()
+            await releaseConfirmation.open()
         }
+        await fulfillment(of: [enteredConfirmation], timeout: 2)
 
-        let confirmationAttemptID = synchronizer.synchronizationAttemptID
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
-        while synchronizer.synchronizationAttemptID == confirmationAttemptID {
-            await Task.yield()
-        }
+        await fulfillment(of: [invalidatedAccount], timeout: 2)
         await releaseConfirmation.open()
+        await fulfillment(of: [validationFinished], timeout: 2)
 
-        do {
-            try await validation.value
-            XCTFail("Expected the superseded validation to be cancelled")
-        } catch is CancellationError {
-        }
-
-        try await synchronizer._test_validateSynchronizationAccount()
-        XCTAssertFalse(adapter.events.contains("resetSyncCaches"))
+        // A stale confirmation must neither publish account-b nor clear the
+        // requirement for a fresh validation of the newly reported account.
+        XCTAssertTrue(synchronizer.accountValidationRequired)
         XCTAssertEqual(
             synchronizer.keyValueStore.object(
-                forKey: synchronizer.durableStateKey(
-                    "CloudKitAccountIdentifier"
-                )
+                forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier")
+            ) as? String,
+            "account-a"
+        )
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertFalse(synchronizer.accountValidationRequired)
+        XCTAssertEqual(
+            synchronizer.keyValueStore.object(
+                forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier")
             ) as? String,
             "account-c"
+        )
+        XCTAssertEqual(database.subscriptionFetchCount, 0)
+        XCTAssertEqual(database.databaseChangeFetchCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountChangeRestartRejectsIntermediateValidationAttempt()
+    async throws {
+        let enteredInvalidation = expectation(description: "observer invalidation suspended")
+        let enteredValidation = expectation(description: "intermediate validation suspended")
+        let restarted = expectation(description: "automatic restart validated its account")
+        let validationFinished = expectation(description: "intermediate validation rejected")
+        let releaseInvalidation = AsyncGate()
+        let releaseValidation = AsyncGate()
+        let identifiers = GatedAccountIdentifierSequence(
+            ["account-a", "account-b", "account-b"],
+            gatedCall: 2,
+            enteredConfirmation: enteredValidation,
+            releaseGate: releaseValidation
+        )
+        let synchronizer = makeSynchronizer(
+            progressHandler: { checkpoint in
+                if checkpoint == "account-identity-validated" {
+                    restarted.fulfill()
+                }
+            },
+            accountIdentifierProvider: { await identifiers.next() }
+        )
+        synchronizer.addModelAdapter(FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "account-change-restart-race"),
+            priorities: []
+        ))
+        synchronizer.accountScopeInvalidationHandler = { reason in
+            if reason == .accountChanged {
+                enteredInvalidation.fulfill()
+                await releaseInvalidation.wait()
+            }
+        }
+        addTeardownBlock { @BigSyncBackgroundActor in
+            // Prevent a still-suspended observer from starting work after a
+            // timeout, then release every gate and retire any active drain.
+            synchronizer.cancelSynchronization()
+            synchronizer.modelAdapterDictionary.removeAll()
+            await releaseInvalidation.open()
+            await releaseValidation.open()
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+        try await synchronizer._test_validateSynchronizationAccount()
+        let originalAttemptID = synchronizer.synchronizationAttemptID
+
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        await fulfillment(of: [enteredInvalidation], timeout: 2)
+        let intermediateAttemptID = synchronizer.synchronizationAttemptID
+        XCTAssertNotEqual(intermediateAttemptID, originalAttemptID)
+        XCTAssertFalse(synchronizer.syncing)
+
+        let validation = Task { @BigSyncBackgroundActor in
+            defer { validationFinished.fulfill() }
+            do {
+                try await synchronizer._test_validateSynchronizationAccount()
+                XCTFail("An intermediate attempt must not survive the observer restart")
+            } catch is CancellationError {
+                XCTAssertFalse(Task.isCancelled, "Authority supersession must reject an uncancelled task")
+            } catch {
+                XCTFail("Unexpected validation error: \(error)")
+            }
+        }
+        addTeardownBlock { validation.cancel() }
+        await fulfillment(of: [enteredValidation], timeout: 2)
+
+        // Force the precise formerly flaky ordering: the probe captured the
+        // cancellation ID before the observer resumed and called begin.
+        await releaseInvalidation.open()
+        await fulfillment(of: [restarted], timeout: 2)
+        XCTAssertNotEqual(synchronizer.synchronizationAttemptID, intermediateAttemptID)
+        await releaseValidation.open()
+        await fulfillment(of: [validationFinished], timeout: 2)
+        XCTAssertFalse(synchronizer.accountValidationRequired)
+        XCTAssertEqual(
+            synchronizer.keyValueStore.object(
+                forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier")
+            ) as? String,
+            "account-b"
         )
     }
 
@@ -15028,6 +15119,7 @@ final class BigSyncKitTests: XCTestCase {
             ownerName: CKCurrentUserDefaultName
         ),
         backupDetectionBaseURL: URL? = nil,
+        progressHandler: CloudKitSynchronizer.ProgressHandler? = nil,
         accountIdentifierProvider: @escaping CloudKitSynchronizer.AccountIdentifierProvider = {
             "test-account"
         }
@@ -15040,6 +15132,7 @@ final class BigSyncKitTests: XCTestCase {
             keyValueStore: keyValueStore,
             accountIdentifierProvider: accountIdentifierProvider,
             accountStatusProvider: { .available },
+            progressHandler: progressHandler,
             backupDetectionBaseURL: backupDetectionBaseURL,
             logger: Logger(label: "BigSyncKitTests")
         )
