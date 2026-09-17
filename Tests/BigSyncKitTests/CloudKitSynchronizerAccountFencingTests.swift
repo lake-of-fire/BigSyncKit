@@ -2637,3 +2637,183 @@ extension CloudKitSynchronizerAccountFencingTests {
         )
     }
 }
+
+
+@BigSyncBackgroundActor
+private final class AccountChangeObserverInterleaving {
+    let entered: [XCTestExpectation]
+    let finished: [XCTestExpectation]
+    let gates = [ClosureRestorationGate(), ClosureRestorationGate()]
+    private var nextIndex = 0
+    private var exitedInvalidation = Set<Int>()
+    private(set) var completions = [Int]()
+
+    init(entered: [XCTestExpectation], finished: [XCTestExpectation]) {
+        self.entered = entered
+        self.finished = finished
+    }
+
+    func invalidate() async {
+        let index = nextIndex
+        nextIndex += 1
+        guard gates.indices.contains(index) else {
+            XCTFail("Unexpected additional account-change invalidation")
+            return
+        }
+        entered[index].fulfill()
+        await gates[index].wait()
+        exitedInvalidation.insert(index)
+    }
+
+    func complete(_ index: Int) {
+        XCTAssertTrue(
+            exitedInvalidation.contains(index),
+            "Observer completion must belong to its own invalidation task"
+        )
+        completions.append(index)
+        finished[index].fulfill()
+    }
+}
+
+extension CloudKitSynchronizerAccountFencingTests {
+    @BigSyncBackgroundActor
+    func testAccountChangeObserverCompletionKeepsRegistrationOrder()
+    async throws {
+        try await assertOverlappingAccountChangeCompletions(order: [0, 1])
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountChangeObserverCompletionAllowsReverseFinishOrder()
+    async throws {
+        try await assertOverlappingAccountChangeCompletions(order: [1, 0])
+    }
+
+    @BigSyncBackgroundActor
+    private func assertOverlappingAccountChangeCompletions(order: [Int])
+    async throws {
+        let interleaving = AccountChangeObserverInterleaving(
+            entered: [
+                expectation(description: "first observer invalidation entered"),
+                expectation(description: "second observer invalidation entered"),
+            ],
+            finished: [
+                expectation(description: "first observer task finished"),
+                expectation(description: "second observer task finished"),
+            ]
+        )
+        let synchronizer = makeSynchronizer(transport: AccountFencingTransport())
+        // No adapter: only the two observer tasks own work in this test.
+        XCTAssertTrue(synchronizer.modelAdapters.isEmpty)
+        try await synchronizer._test_validateSynchronizationAccount()
+        synchronizer.accountScopeInvalidationHandler = { reason in
+            XCTAssertEqual(reason, .accountChanged)
+            await interleaving.invalidate()
+        }
+        addTeardownBlock { @BigSyncBackgroundActor in
+            synchronizer._testAccountChangeObserverDidFinishHandler = nil
+            synchronizer.accountScopeInvalidationHandler = nil
+            for gate in interleaving.gates { await gate.open() }
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+
+        for index in 0..<2 {
+            synchronizer._testAccountChangeObserverDidFinishHandler = {
+                interleaving.complete(index)
+            }
+            NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+            await fulfillment(of: [interleaving.entered[index]], timeout: 2)
+        }
+
+        // Both tasks are now suspended. Finishing either must not consume
+        // the other task's completion registration, regardless of order.
+        for (position, index) in order.enumerated() {
+            await interleaving.gates[index].open()
+            await fulfillment(of: [interleaving.finished[index]], timeout: 2)
+            XCTAssertEqual(interleaving.completions, Array(order.prefix(position + 1)))
+        }
+        XCTAssertNil(synchronizer._testAccountChangeObserverDidFinishHandler)
+        XCTAssertTrue(synchronizer.accountValidationRequired)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertNotNil(try synchronizer.accountScopeLease())
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountChangeNotificationCompletesLocalDatasetRebootstrap()
+    async throws {
+        let transport = AccountFencingTransport()
+        let store = AccountFencingStore()
+        let identity = AccountFencingAccountIdentity("account-a")
+        let admissions = InitialBindingAdmissionRecorder()
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(
+            transport: transport,
+            store: store,
+            recordZoneID: zoneID,
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .localDatasetRebootstrap,
+            initialReplicaBindingAdmissionHandler: {
+                await admissions.record($0)
+            }
+        )
+        let adapter = AccountFencingModelAdapter(zoneID: zoneID)
+        synchronizer.addModelAdapter(adapter)
+        try await synchronizer._test_validateSynchronizationAccount()
+        let oldLease = try XCTUnwrap(synchronizer.accountScopeLease())
+        try await synchronizer.subscribeForChangesInDatabase()
+        XCTAssertEqual(transport.subscriptionSaveCount, 1)
+
+        let destinationScope = CloudKitSynchronizer
+            .accountScopeIdentifier(for: "account-b")
+        let completed = expectation(description: "notification-owned recovery completed")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .SynchronizerDidSynchronize,
+            object: synchronizer,
+            queue: nil
+        ) { _ in completed.fulfill() }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        synchronizer.synchronizationCompletionHandler = { result in
+            XCTAssertEqual(result.completionScope, .fullSynchronization)
+            XCTAssertEqual(result.publicationState, .complete)
+            XCTAssertEqual(result.receipt?.accountScopeIdentifier, destinationScope)
+        }
+        addTeardownBlock { @BigSyncBackgroundActor in
+            synchronizer.synchronizationCompletionHandler = nil
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+
+        await identity.replace(with: "account-b")
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        // No explicit synchronize/begin call may rescue a broken observer.
+        await fulfillment(of: [completed], timeout: 5)
+        XCTAssertFalse(synchronizer.syncing)
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
+        XCTAssertFalse(synchronizer.accountValidationRequired)
+        let lease = try XCTUnwrap(synchronizer.accountScopeLease())
+        XCTAssertEqual(lease.accountScopeIdentifier, destinationScope)
+        XCTAssertGreaterThan(lease.invalidationGeneration, oldLease.invalidationGeneration)
+        XCTAssertThrowsError(try synchronizer.validateAccountScopeLease(oldLease))
+        XCTAssertEqual(
+            store.value(forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier"))
+                as? String,
+            "account-b"
+        )
+        let binding = try XCTUnwrap(BigSyncReplicaBindingStateStore.load(
+            store: store,
+            key: synchronizer.durableStateKey("ReplicaBinding.v1")
+        ))
+        XCTAssertEqual(binding.activeAccountScopeIdentifier, destinationScope)
+        XCTAssertEqual(binding.datasetOwnerAccountScopeIdentifier, destinationScope)
+        XCTAssertNil(binding.pendingPort)
+        let admissionContexts = await admissions.contexts
+        XCTAssertEqual(admissionContexts.count, 2)
+        XCTAssertEqual(adapter.preparedResetModes, [.localDatasetRebootstrap])
+        let envelope = try XCTUnwrap(store.valuesWithPrefix(
+            synchronizer.durableStateKey("ChangeFeedMigration.v3")
+        ).values.first as? [String: Any])
+        XCTAssertEqual(envelope["mode"] as? String, "localDatasetRebootstrap")
+        XCTAssertEqual(envelope["phase"] as? String, "completed")
+        XCTAssertEqual(transport.subscriptionSaveCount, 2)
+        XCTAssertNotNil(synchronizer.databaseSubscriptionID)
+    }
+}

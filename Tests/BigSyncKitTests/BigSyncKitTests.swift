@@ -8631,6 +8631,65 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testReplacementConfirmationRejectsSynchronousPoisonWithoutAttemptRotation()
+    async throws {
+        let entered = expectation(description: "replacement confirmation suspended")
+        let finished = expectation(description: "poisoned validation finished")
+        let release = AsyncGate()
+        let identifiers = GatedAccountIdentifierSequence(
+            ["account-a", "account-b", "account-b", "account-c"],
+            gatedCall: 3,
+            enteredConfirmation: entered,
+            releaseGate: release
+        )
+        let synchronizer = makeSynchronizer(
+            accountIdentifierProvider: { await identifiers.next() }
+        )
+        try await synchronizer._test_validateSynchronizationAccount()
+        let attemptID = synchronizer.synchronizationAttemptID
+        let validation = Task { @BigSyncBackgroundActor in
+            defer { finished.fulfill() }
+            do {
+                try await synchronizer._test_validateSynchronizationAccount()
+                XCTFail("Synchronous poison must reject the suspended confirmation")
+            } catch is CancellationError {
+                XCTAssertFalse(Task.isCancelled)
+            } catch {
+                XCTFail("Unexpected validation error: \(error)")
+            }
+        }
+        addTeardownBlock {
+            validation.cancel()
+            await release.open()
+            await validation.value
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        // Exercise the synchronous half of notification delivery in isolation.
+        // No cancel/begin call rotates the attempt ID and masks the fence check.
+        synchronizer.accountScopeAuthorityFence.poison()
+        XCTAssertEqual(synchronizer.synchronizationAttemptID, attemptID)
+        await release.open()
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertEqual(synchronizer.synchronizationAttemptID, attemptID)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertEqual(
+            synchronizer.keyValueStore.object(
+                forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier")
+            ) as? String,
+            "account-a",
+            "A stale confirmation must not publish its durable account marker"
+        )
+        try await synchronizer._test_validateSynchronizationAccount()
+        XCTAssertFalse(synchronizer.accountValidationRequired)
+        XCTAssertEqual(
+            synchronizer.keyValueStore.object(
+                forKey: synchronizer.durableStateKey("CloudKitAccountIdentifier")
+            ) as? String,
+            "account-c"
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testAccountChangeRestartRejectsIntermediateValidationAttempt()
     async throws {
         let enteredInvalidation = expectation(description: "observer invalidation suspended")
