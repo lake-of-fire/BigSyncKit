@@ -242,6 +242,89 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         try await requireQuiet(adapter)
     }
 
+    // Missing comparison evidence is not permission to reverse the reset's
+    // own order. These simulate absent, invalidated and unusable local evidence
+    // without inventing a server baseline or changing a user mutation journal.
+    @BigSyncBackgroundActor
+    private func makeComparisonEvidenceUnusable(_ mode: Int, in realm: Realm) throws {
+        let baseline = try XCTUnwrap(realm.objects(BigSyncRecordBaseline.self).first)
+        try realm.write {
+            switch mode {
+            case 0: realm.delete(baseline)
+            case 1: baseline.isComparisonInvalidated = true
+            case 2: baseline.namespace = "previous-transport-namespace"
+            default: baseline.schemaSignature = "previous-contract-signature"
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingComparisonEvidenceCannotRollBackAcknowledgedReopen() async throws {
+        for mode in 0..<4 {
+            let (adapter, realm) = try await fixture()
+            let clear = try BigSyncLifetimeID.next(after: "E0", nonce: nonce)
+            let live = try BigSyncLifetimeID.next(after: clear, nonce: nonce)
+            _ = try await deliver([record(adapter, epoch: live, count: 3, created: 99)], to: adapter)
+            XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+            try makeComparisonEvidenceUnusable(mode, in: realm)
+            _ = try await deliver([record(adapter, epoch: clear, title: "incoming title",
+                deleted: true, time: 9_999)], to: adapter)
+            let object = try value(realm)
+            XCTAssertEqual(object.epoch, live, "evidence mode \(mode)")
+            XCTAssertFalse(object.isDeleted)
+            XCTAssertEqual(object.count, 3)
+            XCTAssertEqual(object.createdAt, Date(timeIntervalSinceReferenceDate: 99))
+            XCTAssertEqual(object.title, "incoming title")
+            XCTAssertFalse(realm.objects(BigSyncPendingMutation.self).isEmpty)
+            let save = try await adapter.prepareUploadBatch(limit: 10)
+            XCTAssertEqual(save.records.count, 1)
+            XCTAssertEqual(save.records.first?["epoch"] as? String, live)
+            try await adapter.acknowledgeUploadedRecords(save.records, from: save)
+            let revision = realm.objects(BigSyncRecordBaseline.self).first?.revision
+            try await requireQuiet(adapter)
+            XCTAssertEqual(realm.objects(BigSyncRecordBaseline.self).first?.revision, revision)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingComparisonEvidenceCannotResurrectNewerClear() async throws {
+        for mode in 0..<4 {
+            let (adapter, realm) = try await fixture()
+            let live = try BigSyncLifetimeID.next(after: "E0", nonce: nonce)
+            let clear = try BigSyncLifetimeID.next(after: live, nonce: nonce)
+            _ = try await deliver([record(adapter, epoch: clear, deleted: true, created: 99)], to: adapter)
+            XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+            try makeComparisonEvidenceUnusable(mode, in: realm)
+            _ = try await deliver([record(adapter, epoch: live, count: 7, time: 9_999)], to: adapter)
+            let object = try value(realm)
+            XCTAssertEqual(object.epoch, clear, "evidence mode \(mode)")
+            XCTAssertTrue(object.isDeleted)
+            XCTAssertEqual(object.count, 0)
+            XCTAssertEqual(object.createdAt, Date(timeIntervalSinceReferenceDate: 99))
+            let deletes = try await adapter.prepareDeletionBatch(limit: 10)
+            XCTAssertTrue(deletes.recordIDs.isEmpty)
+            let save = try await adapter.prepareUploadBatch(limit: 10)
+            XCTAssertEqual(save.records.count, 1)
+            XCTAssertEqual(save.records.first?["epoch"] as? String, clear)
+            try await adapter.acknowledgeUploadedRecords(save.records, from: save)
+            try await requireQuiet(adapter)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingComparisonEvidenceStillAcceptsGenuineSuccessor() async throws {
+        let (adapter, realm) = try await fixture()
+        let live = try BigSyncLifetimeID.next(after: "E0", nonce: nonce)
+        let clear = try BigSyncLifetimeID.next(after: live, nonce: nonce)
+        _ = try await deliver([record(adapter, epoch: live, count: 7)], to: adapter)
+        try makeComparisonEvidenceUnusable(0, in: realm)
+        _ = try await deliver([record(adapter, epoch: clear, deleted: true)], to: adapter)
+        XCTAssertEqual(try value(realm).epoch, clear)
+        XCTAssertTrue(try value(realm).isDeleted)
+        XCTAssertEqual(try value(realm).count, 0)
+        try await requireQuiet(adapter)
+    }
+
     @BigSyncBackgroundActor
     func testPhysicalDeletionIsQuarantinedWithoutInventingLifecycle() async throws {
         let (adapter, realm) = try await fixture()
@@ -591,12 +674,14 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         enum Failure: Error { case revoked }
         var calls = 0
         let revokeAtTransaction: Bool
-        init(revokeAtTransaction: Bool = true) {
+        let revokeOnValidation: Int
+        init(revokeAtTransaction: Bool = true, revokeOnValidation: Int = 2) {
             self.revokeAtTransaction = revokeAtTransaction
+            self.revokeOnValidation = revokeOnValidation
         }
         func validate() throws {
             calls += 1
-            if revokeAtTransaction && calls >= 2 { throw Failure.revoked }
+            if revokeAtTransaction && calls >= revokeOnValidation { throw Failure.revoked }
         }
     }
 
@@ -680,9 +765,61 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         try await adapter.resolveRecordConflict(id: conflict.id,
             expectedGeneration: conflict.generation, choice: .keepLocal,
             validateAuthority: { try authority.validate() })
-        XCTAssertEqual(authority.calls, 2)
+        XCTAssertGreaterThanOrEqual(authority.calls, 2)
         XCTAssertEqual(object.title, "mine")
         let batch = try await adapter.prepareUploadBatch(limit: 20)
+        try await adapter.acknowledgeUploadedRecords(batch.records, from: batch)
+        try await requireQuiet(adapter)
+    }
+
+    @BigSyncBackgroundActor
+    func testRevokedPruneCannotRetireCrashPrefixQuarantine() async throws {
+        let (adapter, realm, _, conflict) = try await unbasedRecoveryFixture()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let original = try XCTUnwrap(tracking.objects(BigSyncInboundSemanticQuarantine.self).first)
+        let residual = BigSyncInboundSemanticQuarantine(value: original)
+        let lineage = residual.lineageID
+        try await adapter.resolveRecordConflict(id: conflict.id,
+            expectedGeneration: conflict.generation, choice: .keepLocal)
+        // Reproduce the durable target / unretired tracking crash prefix.
+        // This is persisted model state, not a patched implementation.
+        try tracking.write { tracking.add(residual, update: .modified) }
+        let pending = realm.objects(BigSyncPendingMutation.self).first?.generation
+        let authority = RecoveryAuthority()
+        do {
+            try await adapter.discardResolvedRecordConflictArchives(
+                validateAuthority: { try authority.validate() })
+            XCTFail("Revoked archive cleanup must not consume quarantine evidence")
+        } catch RecoveryAuthority.Failure.revoked { }
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
+        XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).count, 1)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+        // A fresh authorized retry must converge, not merely block forever.
+        try await adapter.discardResolvedRecordConflictArchives()
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
+        XCTAssertTrue(realm.objects(BigSyncRecordConflict.self).isEmpty)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+    }
+
+    @BigSyncBackgroundActor
+    func testRecoveryAuthorityRevokedAfterTargetCommitPreservesQuarantineForRetry() async throws {
+        let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let lineage = try XCTUnwrap(tracking.objects(BigSyncInboundSemanticQuarantine.self).first).lineageID
+        let authority = RecoveryAuthority(revokeOnValidation: 3)
+        do {
+            try await adapter.resolveRecordConflict(id: conflict.id,
+                expectedGeneration: conflict.generation, choice: .keepLocal,
+                validateAuthority: { try authority.validate() })
+            XCTFail("A later tracking write must not reuse the target write's authority check")
+        } catch RecoveryAuthority.Failure.revoked { }
+        XCTAssertEqual(object.title, "mine")
+        XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).first?.isResolved, true)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
+        XCTAssertFalse(realm.objects(BigSyncPendingMutation.self).isEmpty)
+        try await adapter.discardResolvedRecordConflictArchives()
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
+        let batch = try await adapter.prepareUploadBatch(limit: 10)
         try await adapter.acknowledgeUploadedRecords(batch.records, from: batch)
         try await requireQuiet(adapter)
     }
