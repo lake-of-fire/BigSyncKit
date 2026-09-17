@@ -503,7 +503,7 @@ public enum BigSyncMutationTracking {
         BigSyncMutationTrackingRegistry.register(
             configurations: configurations,
             excluding: Set(
-                excludedClassNames + [BigSyncPendingMutation.className()]
+                excludedClassNames + BigSyncLocalRecordEvidence.classNames
             ),
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName,

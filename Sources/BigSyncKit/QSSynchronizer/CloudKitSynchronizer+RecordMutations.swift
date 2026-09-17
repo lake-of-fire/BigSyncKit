@@ -203,6 +203,58 @@ extension CloudKitSynchronizer {
             try checkSynchronizationAttempt(attemptID)
             guard !prepared.isEmpty else { return }
 
+            let uncertain = prepared.filter(\.requiresAcceptanceCheck)
+            if !uncertain.isEmpty, let lookup = recordStore as? any CloudKitRecordFetching {
+                let fetched = try await lookup.fetchRecords(with: uncertain.map { $0.record.recordID })
+                try await revalidateActiveRunContext(for: attemptID)
+                var observations = [CKRecord]()
+                var lookupFailures = [CKRecord.ID: NSError]()
+                for candidate in uncertain {
+                    let id = candidate.record.recordID
+                    guard let result = fetched[id] else {
+                        lookupFailures[id] = CocoaError(.coderValueNotFound) as NSError
+                        continue
+                    }
+                    switch result {
+                    case let .success(record):
+                        guard record.recordID == id, record.recordType == candidate.record.recordType else {
+                            throw BigSyncRecordRebaseError.inconsistentReceipt(id.recordName)
+                        }
+                        observations.append(record)
+                    case let .failure(error):
+                        let ns = error as NSError
+                        if ns.domain != CKErrorDomain || ns.code != CKError.unknownItem.rawValue {
+                            lookupFailures[id] = ns
+                        }
+                        // Not found does not prove the earlier request never
+                        // ran; retry the same candidate with its save fence.
+                    }
+                }
+                if !observations.isEmpty {
+                    for candidate in uncertain where observations.contains(where: {
+                        $0.recordID == candidate.record.recordID
+                    }) {
+                        try retryBudget.register(.init(recordID: candidate.record.recordID,
+                            generation: candidate.generation),
+                            maximumPerGeneration: Self.maximumHandledRecordRetries,
+                            maximumPerDrain: Self.maximumHandledRetriesPerDrain)
+                    }
+                    let outcomes: [InboundLiveResult]
+                    do { outcomes = try await adapter.saveChanges(in: observations, forceSave: true) }
+                    catch { throw preservingSiblingMutationFailures(error,
+                        failedRecordIDs: observations.map(\.recordID), otherFailures: lookupFailures) }
+                    try await adapter.persistImportedChanges()
+                    try await adapter.didFinishImport()
+                    try await revalidateActiveRunContext(for: attemptID)
+                    try requireResolvedUploadConflictOutcomes(outcomes, preservingFailures: lookupFailures)
+                    guard lookupFailures.isEmpty else { throw partialMutationError(lookupFailures) }
+                    // The observed accepted base retires/supersedes the old
+                    // candidate. Reprepare rather than send a stale batch.
+                    continue
+                }
+                guard lookupFailures.isEmpty else { throw partialMutationError(lookupFailures) }
+            }
+
             let records = prepared.map(\.record)
             let generations = prepared.reduce(into: [String: String]()) {
                 guard let generation = $1.generation else { return }
@@ -306,7 +358,7 @@ extension CloudKitSynchronizer {
             if !savedRecords.isEmpty {
                 try await adapter.didUpload(
                     savedRecords: savedRecords,
-                    matchingGenerations: generations
+                    matchingPreparedUploads: prepared
                 )
                 try await revalidateActiveRunContext(for: attemptID)
             }
