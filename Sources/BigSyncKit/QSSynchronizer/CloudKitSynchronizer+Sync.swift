@@ -166,6 +166,17 @@ extension CloudKitSynchronizer {
                         )
                     try await revalidateRunContext(terminalContext)
                 }
+                // Domain reconciliation is allowed to commit authoritative
+                // local writes. Forward those durable target-journal
+                // generations before deciding whether this drain is terminal.
+                // In download-only mode this does not grant upload authority;
+                // it merely ensures the next explicit full drain starts from
+                // the newest generation instead of uploading a stale tracked
+                // generation first.
+                for adapter in modelAdapters {
+                    try await adapter.didFinishImport()
+                    try await revalidateRunContext(terminalContext)
+                }
             } catch is CancellationError {
                 settleCancellationIfCurrentAttempt(attemptID)
                 return

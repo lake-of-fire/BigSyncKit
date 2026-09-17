@@ -33,6 +33,7 @@
 		5A6D8A0DC6ABB060CABE7AD7 /* CloudKitSynchronizer+Subscriptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */; };
 		5B015B50039D59D5DC1FA875 /* BigSyncPendingMutationInventory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CBB9A19795DE1D073B8C0A6 /* BigSyncPendingMutationInventory.swift */; };
 		5DA94DE008BDD629A4FEBE98 /* CloudKitSynchronizerAccountFencingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B357AAD7AFFD76A14129C866 /* CloudKitSynchronizerAccountFencingTests.swift */; };
+		5F79ABCD91CA4507A39207C2 /* RealmGroupingRegressionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76C887F0237E01726EB5205A /* RealmGroupingRegressionTests.swift */; };
 		66E970ECB20D9971EEF458CB /* SwiftUtilities.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = 375A2DE5459AEC32DBEA009C /* SwiftUtilities.framework */; };
 		67C0BC55F7C2A611E3B6B953 /* BigSyncInboundSemanticValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF52105CAF371F030BE82483 /* BigSyncInboundSemanticValidation.swift */; };
 		6F46C9C9A74FA828EF4E2530 /* Algorithms.framework in Dependencies */ = {isa = PBXBuildFile; fileRef = 94DDE581A883BAE50A2BCF02 /* Algorithms.framework */; };
@@ -210,6 +211,7 @@
 		6332363B0D794F74C2755D68 /* CloudKitSynchronizer+Subscriptions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudKitSynchronizer+Subscriptions.swift"; sourceTree = "<group>"; };
 		718D6595C6AF721A7726556D /* CloudKitRetryConstraints.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitRetryConstraints.swift; sourceTree = "<group>"; };
 		73F4DCFDFCE608B084E2B80B /* PendingRelationship.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingRelationship.swift; sourceTree = "<group>"; };
+		76C887F0237E01726EB5205A /* RealmGroupingRegressionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealmGroupingRegressionTests.swift; sourceTree = "<group>"; };
 		79E19DFA5F1138D940DB2677 /* SyncStatusViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncStatusViewModelTests.swift; sourceTree = "<group>"; };
 		7A23A3D639AD4B86CE5DCB0A /* CloudKitChangeFeed.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudKitChangeFeed.swift; sourceTree = "<group>"; };
 		7C37477315EBF4679DF4C72A /* BigSyncPendingMutation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncPendingMutation.swift; sourceTree = "<group>"; };
@@ -311,6 +313,7 @@
 				211B694B645BEDBC9B56108A /* HotfixMutationDrainTailTests.swift */,
 				29A56E9AF9697066D1A63F04 /* HotfixSubscriptionSafetyTests.swift */,
 				573C544F6B0039442FD4222A /* ModelAdapterDeletionConflictSafetyTests.swift */,
+				76C887F0237E01726EB5205A /* RealmGroupingRegressionTests.swift */,
 				DDF63D7D40AFAB9CC47DF69D /* SubscriptionCacheRevalidationTests.swift */,
 				044264DBF99F9FB33B18A8A2 /* SubscriptionCancellationOwnershipTests.swift */,
 				10DBD385B5CEF95DE2B08D5F /* SubscriptionIntentOrderingTests.swift */,
@@ -669,6 +672,7 @@
 				925FD12FF5B9A924B3A897A4 /* HotfixMutationDrainTailTests.swift in Sources */,
 				50DE267C20AD8CD833C6AA58 /* HotfixSubscriptionSafetyTests.swift in Sources */,
 				2283F6BCF197679484C48935 /* ModelAdapterDeletionConflictSafetyTests.swift in Sources */,
+				5F79ABCD91CA4507A39207C2 /* RealmGroupingRegressionTests.swift in Sources */,
 				769EAF06C122B8337C56E4D0 /* SubscriptionCacheRevalidationTests.swift in Sources */,
 				E64DD8439EA06488F62BDD30 /* SubscriptionCancellationOwnershipTests.swift in Sources */,
 				A8BD21855AFE1EC7B7F724BF /* SubscriptionIntentOrderingTests.swift in Sources */,
