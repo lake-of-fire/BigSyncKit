@@ -1,0 +1,109 @@
+name: Account-change cancellation test qualification
+
+on:
+  push:
+    branches: [automation/account-change-test-qualification-20260917]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: account-change-test-qualification-20260917
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      commit: ${{ steps.publish.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: bb8492c313d40b0962a640c76214bf21db2bd768
+          path: BigSyncKit
+      - name: Assemble checksum-verified test-only candidate
+        run: python3 tooling/.github/assemble-account-change-tests.py BigSyncKit
+      - name: Publish clean candidate without tooling ancestry
+        id: publish
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = bb8492c313d40b0962a640c76214bf21db2bd768
+          git diff --check
+          test "$(git diff --name-only)" = Tests/BigSyncKitTests/BigSyncKitTests.swift
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c fix/account-change-validation-tests-20260917
+          git add Tests/BigSyncKitTests/BigSyncKitTests.swift
+          git commit -m 'test: isolate account validation from notification restart races'
+          test "$(git rev-parse HEAD:Sources)" = "$(git rev-parse HEAD^:Sources)"
+          git push origin HEAD:refs/heads/fix/account-change-validation-tests-20260917
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git show --stat --oneline HEAD
+
+  native:
+    needs: assemble
+    runs-on: macos-15
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.assemble.outputs.commit }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record immutable source and native toolchain
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p ../qualification
+          git diff --exit-code
+          git rev-parse HEAD HEAD^{tree} HEAD:Sources HEAD:Tests > ../qualification/source-identity.txt
+          git log -1 --format=fuller > ../qualification/commit.txt
+          swift --version > ../qualification/toolchain.txt
+          sw_vers >> ../qualification/toolchain.txt
+          xcrun --show-sdk-version >> ../qualification/toolchain.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > ../qualification/RealmSwiftGaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > ../qualification/SwiftUtilities.txt
+      - name: Focused regressions, full suite, and 50 repeated gated rounds
+        working-directory: BigSyncKit
+        run: python3 ../tooling/.github/qualify-account-change-tests.py
+      - name: Verify immutable candidate after qualification
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git diff --exit-code
+          git status --porcelain > ../qualification/source-status.txt
+          cmp ../qualification/source-identity.txt ../qualification/final-identity.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: account-change-tests-native
+          path: qualification/
+          retention-days: 14
