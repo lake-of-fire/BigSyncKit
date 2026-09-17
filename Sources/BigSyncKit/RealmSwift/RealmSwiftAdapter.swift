@@ -7694,6 +7694,11 @@ public final class RealmSwiftAdapter:
         _ savedRecords: [CKRecord],
         from batch: RealmSwiftPreparedUploadBatch
     ) async throws {
+        // Give a caller which cancelled the acknowledgement immediately after
+        // spawning it a deterministic boundary before any journal-consuming
+        // Realm transaction can begin.
+        await Task.yield()
+        try Task.checkCancellation()
         guard batch.issuerID == acknowledgementIssuerID else {
             throw RealmSwiftAdapterAcknowledgementError.batchBelongsToAnotherAdapter
         }
@@ -7917,6 +7922,10 @@ public final class RealmSwiftAdapter:
         _ recordIDs: [CKRecord.ID],
         from batch: RealmSwiftPreparedDeletionBatch
     ) async throws {
+        // Deletion acknowledgements consume tombstones, so cancellation must
+        // be observed before entering the first persistence transaction.
+        await Task.yield()
+        try Task.checkCancellation()
         guard batch.issuerID == acknowledgementIssuerID else {
             throw RealmSwiftAdapterAcknowledgementError.batchBelongsToAnotherAdapter
         }
