@@ -1,0 +1,70 @@
+name: Account-change parallel XCTest evidence
+
+on:
+  push:
+    branches: [automation/account-change-parallel-evidence-20260917]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: account-change-parallel-evidence-20260917
+  cancel-in-progress: false
+
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: b07889f9d913cf69f1c7887eb41fb108edbc5421
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record immutable candidate and toolchain
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p ../qualification-parallel
+          git diff --exit-code
+          test "$(git rev-parse HEAD)" = b07889f9d913cf69f1c7887eb41fb108edbc5421
+          git rev-parse HEAD HEAD^{tree} HEAD:Sources HEAD:Tests > ../qualification-parallel/source-identity.txt
+          swift --version > ../qualification-parallel/toolchain.txt
+          sw_vers >> ../qualification-parallel/toolchain.txt
+          xcrun --show-sdk-version >> ../qualification-parallel/toolchain.txt
+      - name: Build tests and prove the key regression once serially
+        working-directory: BigSyncKit
+        run: swift test --filter testAccountChangeRestartRejectsIntermediateValidationAttempt
+      - name: Run 20 corrected parallel stress rounds
+        working-directory: BigSyncKit
+        run: python3 ../tooling/.github/qualify-account-change-parallel.py
+      - name: Verify immutable candidate
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          git diff --exit-code
+          git status --porcelain > ../qualification-parallel/source-status.txt
+          cmp ../qualification-parallel/source-identity.txt ../qualification-parallel/final-identity.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: account-change-parallel-evidence
+          path: qualification-parallel/
+          retention-days: 14
