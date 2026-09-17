@@ -8563,7 +8563,7 @@ final class BigSyncKitTests: XCTestCase {
     async throws {
         let database = FakeCloudKitDatabase()
         let enteredConfirmation = expectation(description: "replacement confirmation entered")
-        let invalidatedAccount = expectation(description: "account-change invalidation entered")
+        let observerFinished = expectation(description: "account-change observer finished")
         let validationFinished = expectation(description: "superseded validation finished")
         let releaseConfirmation = AsyncGate()
         let identifiers = GatedAccountIdentifierSequence(
@@ -8581,10 +8581,8 @@ final class BigSyncKitTests: XCTestCase {
         // each rotate the attempt ID, so observing one rotation is not a
         // completion barrier. Test that restart separately below.
         XCTAssertTrue(synchronizer.modelAdapters.isEmpty)
-        synchronizer.accountScopeInvalidationHandler = { reason in
-            if reason == .accountChanged {
-                invalidatedAccount.fulfill()
-            }
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            observerFinished.fulfill()
         }
         try await synchronizer._test_validateSynchronizationAccount()
         XCTAssertFalse(synchronizer.accountValidationRequired)
@@ -8607,7 +8605,7 @@ final class BigSyncKitTests: XCTestCase {
         await fulfillment(of: [enteredConfirmation], timeout: 2)
 
         NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
-        await fulfillment(of: [invalidatedAccount], timeout: 2)
+        await fulfillment(of: [observerFinished], timeout: 2)
         await releaseConfirmation.open()
         await fulfillment(of: [validationFinished], timeout: 2)
 

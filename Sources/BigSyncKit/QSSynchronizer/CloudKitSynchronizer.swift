@@ -1362,8 +1362,10 @@ public class CloudKitSynchronizer: NSObject {
 #if DEBUG
                 // Tests need the completion of this actor task, not an
                 // intermediate attempt-ID rotation, as their synchronization
-                // boundary. Keep the seam out of release builds.
-                defer { _testAccountChangeObserverDidFinishHandler?() }
+                // boundary. Keep the seam out of release builds and consume it
+                // once so a later account-change cannot over-fulfill the same
+                // XCTest expectation.
+                defer { _testFinishAccountChangeObserverTask() }
 #endif
                 // Revoke run ownership before application invalidation can
                 // suspend and allow actor reentrancy.
@@ -1414,6 +1416,13 @@ public class CloudKitSynchronizer: NSObject {
 #if DEBUG
     @BigSyncBackgroundActor
     internal var _testAccountChangeObserverDidFinishHandler: (() -> Void)?
+
+    @BigSyncBackgroundActor
+    private func _testFinishAccountChangeObserverTask() {
+        let handler = _testAccountChangeObserverDidFinishHandler
+        _testAccountChangeObserverDidFinishHandler = nil
+        handler?()
+    }
 
     @BigSyncBackgroundActor
     internal var processKillCheckpointHandler:
