@@ -313,8 +313,13 @@ struct BigSyncRecordEvidenceStore {
         let local = try BigSyncRecordPayload.encode(localRecord)
         let remote = try BigSyncRecordPayload.encode(record)
         let localFields = try BigSyncRecordFingerprint.fields(of: object)
+        // A late acknowledgement can advance accepted evidence without
+        // advancing the newer local generation. Refresh must produce a new
+        // immutable review identity rather than returning a permanently stale
+        // archive whose comparison revision can never pass resolution.
         var identity = ["bigsync-conflict-v1", context.namespace, record.recordID.recordName,
-                        signature, generation, record.recordChangeTag ?? "", reason]
+                        signature, generation, record.recordChangeTag ?? "", reason,
+                        "comparison-revision", revision ?? ""]
         identity += localFields.keys.sorted().map { $0 + ":" + localFields[$0]!.base64EncodedString() }
         // A changed, tag-less injected/server representation must not overwrite
         // an earlier preserved candidate with the same local generation.
