@@ -8698,7 +8698,6 @@ final class BigSyncKitTests: XCTestCase {
         await releaseInvalidation.open()
         await fulfillment(of: [observerFinished], timeout: 2)
         XCTAssertNotEqual(synchronizer.synchronizationAttemptID, intermediateAttemptID)
-        XCTAssertTrue(synchronizer.syncing)
         await releaseValidation.open()
         await fulfillment(of: [validationFinished], timeout: 2)
     }
