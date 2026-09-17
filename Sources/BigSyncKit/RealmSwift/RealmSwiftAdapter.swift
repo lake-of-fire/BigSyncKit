@@ -9860,7 +9860,7 @@ extension RealmSwiftAdapter {
             // A crash here keeps the target decision durable. The next normal
             // import/own echo retires page quarantine; no cursor is fabricated.
             try await forwardPendingMutations(pendingMutationSnapshots(for: [name], in: realm), in: realm)
-            try await retireResolvedRecordConflictQuarantines()
+            try await retireResolvedRecordConflictQuarantines(validateAuthority: validateAuthority)
             return
         }
         throw BigSyncRecordContractError.staleConflict
@@ -9949,7 +9949,9 @@ extension RealmSwiftAdapter {
     /// quarantine. Replay finishes this tracking phase after a crash without
     /// claiming another inbound page or advancing any cursor.
     @BigSyncBackgroundActor
-    private func retireResolvedRecordConflictQuarantines() async throws {
+    private func retireResolvedRecordConflictQuarantines(
+        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+    ) async throws {
         guard let context = recordRebaseContext, let provider = realmProvider,
               let tracking = provider.persistenceRealm else { return }
         var resolvedScopes = Set<String>()
@@ -9962,6 +9964,11 @@ extension RealmSwiftAdapter {
         }
         guard !resolvedScopes.isEmpty else { return }
         try await tracking.asyncWrite {
+            // Retiring quarantine/page evidence is a separate mutation from
+            // the durable target decision. Its transaction wait can outlive
+            // the UI account lease even when adapter namespace strings have
+            // not yet changed. Reuse the caller's final-write authority here.
+            try validateAuthority()
             guard recordRebaseContext == context else { throw CancellationError() }
             let quarantines = activeInboundSemanticQuarantines(accountScopeIdentifier: context.account, in: tracking).filter { row in
                 guard let scope = row.semanticScopeIdentifier else { return false }
@@ -10052,7 +10059,7 @@ public extension RealmSwiftAdapter {
     ) async throws {
         try validateAuthority()
         guard let context = recordRebaseContext else { throw CancellationError() }
-        try await retireResolvedRecordConflictQuarantines()
+        try await retireResolvedRecordConflictQuarantines(validateAuthority: validateAuthority)
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
             try await realm.asyncWrite {

@@ -42,10 +42,21 @@ enum BigSyncRecordReconciliationPlanner {
             return .commit(.init(incomingFields: keys, acceptsIncomingBaseline: true))
         }
         if !pending {
-            if existing, let base, ordered == false {
-                let selected = try fields(base: base, local: local, remote: remote,
-                    policy: policy, contract: contract, preferRemote: true,
-                    localLifetime: localLifetime, remoteLifetime: remoteLifetime)
+            if existing, ordered == false,
+               case let .lifetimeBundle(_, independent) = policy {
+                let selected: Set<String>
+                if let base {
+                    selected = try fields(base: base, local: local, remote: remote,
+                        policy: policy, contract: contract, preferRemote: true,
+                        localLifetime: localLifetime, remoteLifetime: remoteLifetime)
+                } else {
+                    // The reset ID proves lifetime order even when comparison
+                    // evidence is unavailable. Keep the complete newer bundle;
+                    // with no pending local intent, independent metadata still
+                    // follows the observed server. Never invent a base from the
+                    // local working object to make this decision.
+                    selected = independent
+                }
                 return .commit(.init(incomingFields: selected, acceptsIncomingBaseline: true))
             }
             return .commit(.init(incomingFields: keys, acceptsIncomingBaseline: true))
