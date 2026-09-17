@@ -31,7 +31,7 @@ jobs:
                       // Every posted observer has a captured exit callback. Join the
                       // controlled fake work even on a failed setup expectation.
                       for exit in schedule.postedObservers { await exit.wait() }
-                      await synchronizer.cancelSynchronizationAndWait()'''.replace('\n          ', '\n')
+                      await synchronizer.cancelSynchronizationAndWait()'''
           new = '''            synchronizer.accountScopeInvalidationHandler = nil
                       await schedule.releaseFirst.open()
                       // A posted observer may not have started when setup times out.
@@ -39,7 +39,7 @@ jobs:
                       // exited; clearing the registration first could strand cleanup.
                       for exit in schedule.postedObservers { await exit.wait() }
                       synchronizer._testAccountChangeObserverDidFinishHandler = nil
-                      await synchronizer.cancelSynchronizationAndWait()'''.replace('\n          ', '\n')
+                      await synchronizer.cancelSynchronizationAndWait()'''
           assert s.count(old) == 1
           p.write_text(s.replace(old, new))
           PY
