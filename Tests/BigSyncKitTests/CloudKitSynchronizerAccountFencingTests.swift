@@ -2926,11 +2926,12 @@ extension CloudKitSynchronizerAccountFencingTests {
         addTeardownBlock { @BigSyncBackgroundActor in
             synchronizer.modelAdapterDictionary.removeAll()
             synchronizer.accountScopeInvalidationHandler = nil
-            synchronizer._testAccountChangeObserverDidFinishHandler = nil
             await schedule.releaseFirst.open()
-            // Every posted observer has a captured exit callback. Join the
-            // controlled fake work even on a failed setup expectation.
+            // A posted observer may not have started when setup times out.
+            // Keep its completion registration until it has captured it and
+            // exited; clearing the registration first could strand cleanup.
             for exit in schedule.postedObservers { await exit.wait() }
+            synchronizer._testAccountChangeObserverDidFinishHandler = nil
             await synchronizer.cancelSynchronizationAndWait()
         }
 
