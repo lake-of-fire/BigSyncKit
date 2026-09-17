@@ -1,0 +1,116 @@
+name: Account-change deep reassessment
+on:
+  push:
+    branches: [automation/account-change-deep-reassessment-20260917]
+    paths:
+      - .github/workflows/account-change-deep-reassessment.yml
+permissions:
+  contents: read
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      red: ${{ steps.assemble.outputs.red }}
+      green: ${{ steps.assemble.outputs.green }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: b07889f9d913cf69f1c7887eb41fb108edbc5421
+          path: BigSyncKit
+      - name: Publish clean test-first and fix commits
+        id: assemble
+        working-directory: BigSyncKit
+        run: python3 ../tooling/.github/reassess-account-change.py assemble
+  native:
+    needs: assemble
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.assemble.outputs.green }}
+          fetch-depth: 3
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record toolchain and dependencies
+        run: |
+          mkdir -p qualification-deep-native
+          swift --version > qualification-deep-native/toolchain.txt
+          sw_vers >> qualification-deep-native/toolchain.txt
+          xcrun --show-sdk-version >> qualification-deep-native/toolchain.txt
+          git -C RealmSwiftGaps rev-parse HEAD > qualification-deep-native/RealmSwiftGaps.txt
+          git -C SwiftUtilities rev-parse HEAD > qualification-deep-native/SwiftUtilities.txt
+      - name: Prove red, green, mutation sensitivity, full suite, and stress
+        working-directory: BigSyncKit
+        env:
+          RED: ${{ needs.assemble.outputs.red }}
+          GREEN: ${{ needs.assemble.outputs.green }}
+        run: python3 ../tooling/.github/reassess-account-change.py qualify "$RED" "$GREEN"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: account-change-deep-native
+          path: qualification-deep-native/
+          retention-days: 14
+  release:
+    needs: assemble
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.assemble.outputs.green }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Build exact release source
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p ../qualification-deep-release
+          git rev-parse HEAD HEAD^{tree} HEAD:Sources > ../qualification-deep-release/source-identity.txt
+          swift --version > ../qualification-deep-release/toolchain.txt
+          swift build -c release > ../qualification-deep-release/build.log 2>&1
+          git diff --exit-code
+          git rev-parse HEAD HEAD^{tree} HEAD:Sources > ../qualification-deep-release/final-identity.txt
+          cmp ../qualification-deep-release/source-identity.txt ../qualification-deep-release/final-identity.txt
+          git status --porcelain > ../qualification-deep-release/source-status.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: account-change-deep-release
+          path: qualification-deep-release/
+          retention-days: 14
