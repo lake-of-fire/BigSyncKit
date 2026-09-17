@@ -1035,7 +1035,11 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             accountIdentifierProvider: { "account-a" }
         )
         let recorder = AccountScopeInvalidationRecorder()
-        synchronizer.accountScopeInvalidationHandler = { reason in
+        synchronizer.accountScopeInvalidationHandler = { [weak synchronizer] reason in
+            guard let synchronizer else {
+                XCTFail("Synchronizer was released during account invalidation")
+                return
+            }
             let lease: BigSyncAccountScopeLease?
             do {
                 lease = try synchronizer.accountScopeLease()
