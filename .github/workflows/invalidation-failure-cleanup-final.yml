@@ -1,0 +1,141 @@
+name: Final invalidation failure-ordering qualification
+on:
+  push:
+    branches: [automation/account-invalidation-failure-ordering-20260917]
+    paths: [.github/workflows/invalidation-failure-cleanup-final.yml]
+permissions:
+  contents: read
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      candidate: ${{ steps.refine.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 5254ddf2a5f9107e2a5f4802a1203ed1528ed215
+      - name: Refine cleanup without changing production sources
+        id: refine
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift')
+          s = p.read_text()
+          old = '''            synchronizer.accountScopeInvalidationHandler = nil
+                      synchronizer._testAccountChangeObserverDidFinishHandler = nil
+                      await schedule.releaseFirst.open()
+                      // Every posted observer has a captured exit callback. Join the
+                      // controlled fake work even on a failed setup expectation.
+                      for exit in schedule.postedObservers { await exit.wait() }
+                      await synchronizer.cancelSynchronizationAndWait()'''.replace('\n          ', '\n')
+          new = '''            synchronizer.accountScopeInvalidationHandler = nil
+                      await schedule.releaseFirst.open()
+                      // A posted observer may not have started when setup times out.
+                      // Keep its completion registration until it has captured it and
+                      // exited; clearing the registration first could strand cleanup.
+                      for exit in schedule.postedObservers { await exit.wait() }
+                      synchronizer._testAccountChangeObserverDidFinishHandler = nil
+                      await synchronizer.cancelSynchronizationAndWait()'''.replace('\n          ', '\n')
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+          PY
+          git diff --check
+          test "$(git diff --name-only)" = Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Tests
+          git commit -m 'test: preserve queued observer completion registrations during cleanup'
+          test "$(git rev-parse HEAD:Sources)" = "$(git rev-parse HEAD^:Sources)"
+          test "$(git ls-remote origin refs/heads/test/account-invalidation-failure-ordering-20260917 | cut -f1)" = 5254ddf2a5f9107e2a5f4802a1203ed1528ed215
+          git push origin HEAD:refs/heads/test/account-invalidation-failure-ordering-20260917
+          echo "candidate=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  native:
+    needs: assemble
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.assemble.outputs.candidate }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record toolchain and dependencies
+        run: |
+          mkdir -p qualification-failures
+          swift --version > qualification-failures/toolchain.txt
+          sw_vers >> qualification-failures/toolchain.txt
+          xcrun --show-sdk-version >> qualification-failures/toolchain.txt
+          git -C RealmSwiftGaps rev-parse HEAD > qualification-failures/RealmSwiftGaps.txt
+          git -C SwiftUtilities rev-parse HEAD > qualification-failures/SwiftUtilities.txt
+      - name: Focused tests, three negative controls, full suite, and stress
+        working-directory: BigSyncKit
+        env:
+          CANDIDATE: ${{ needs.assemble.outputs.candidate }}
+        run: python3 ../tooling/.github/qualify-invalidation-failures.py qualify "$CANDIDATE"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: final-invalidation-failure-ordering-native
+          path: qualification-failures/
+          retention-days: 14
+  release:
+    needs: assemble
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.assemble.outputs.candidate }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Build immutable Release source
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          mkdir -p ../qualification-release
+          git rev-parse HEAD HEAD^{tree} HEAD:Sources > ../qualification-release/initial-identity.txt
+          swift --version > ../qualification-release/toolchain.txt
+          swift build -c release > ../qualification-release/build.log 2>&1
+          git diff --exit-code
+          git rev-parse HEAD HEAD^{tree} HEAD:Sources > ../qualification-release/final-identity.txt
+          cmp ../qualification-release/initial-identity.txt ../qualification-release/final-identity.txt
+          git status --porcelain > ../qualification-release/source-status.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: final-invalidation-failure-ordering-release
+          path: qualification-release/
+          retention-days: 14
