@@ -823,4 +823,162 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         try await adapter.acknowledgeUploadedRecords(batch.records, from: batch)
         try await requireQuiet(adapter)
     }
+
+    @BigSyncBackgroundActor
+    func testConflictRefreshTracksAcceptedRevisionAfterLateUploadAcknowledgement() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = RetainedContractRow()
+        try realm.write {
+            realm.add(object)
+            object.title = "first submitted version"
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let firstUpload = try await adapter.prepareUploadBatch(limit: 10)
+        let sent = try XCTUnwrap(firstUpload.records.first)
+        // A server response owns its asset bytes independently of temporary
+        // upload files retired by an intervening import.
+        let saved = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(sent))
+        try realm.write {
+            object.title = "later local edit"
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await deliver([record(adapter, title: "independent remote creation")], to: adapter)
+        let old = try XCTUnwrap(try adapter.unresolvedRecordConflicts().first)
+        XCTAssertNil(realm.objects(BigSyncRecordBaseline.self).first)
+        let generation = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first).generation
+
+        // The earlier V1 save is now acknowledged, without acknowledging V2.
+        try await adapter.acknowledgeUploadedRecords([saved], from: firstUpload)
+        let accepted = try XCTUnwrap(realm.objects(BigSyncRecordBaseline.self).first)
+        let acceptedRevision = accepted.revision
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, generation)
+        XCTAssertEqual(object.title, "later local edit")
+        do {
+            try await adapter.resolveRecordConflict(id: old.id,
+                expectedGeneration: old.generation, choice: .keepLocal)
+            XCTFail("The old displayed comparison revision must remain stale")
+        } catch BigSyncRecordContractError.staleConflict { }
+
+        try await adapter.refreshRecordConflict(old.id)
+        let refreshed = try XCTUnwrap(try adapter.unresolvedRecordConflicts().first)
+        XCTAssertNotEqual(refreshed.id, old.id, "Changed accepted evidence requires a fresh immutable review identity")
+        XCTAssertEqual(refreshed.generation, generation, "An acknowledgement need not change newer local intent")
+        XCTAssertEqual(realm.object(ofType: BigSyncRecordConflict.self,
+            forPrimaryKey: refreshed.id)?.comparisonRevision, acceptedRevision)
+        // A second refresh with unchanged evidence must not grow the archive.
+        let count = realm.objects(BigSyncRecordConflict.self).count
+        try await adapter.refreshRecordConflict(refreshed.id)
+        XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).count, count)
+        do {
+            try await adapter.resolveRecordConflict(id: refreshed.id,
+                expectedGeneration: refreshed.generation, choice: .keepLocal)
+        } catch {
+            XCTFail("Fresh review must resolve after the accepted baseline changes: \(error)")
+            return
+        }
+        XCTAssertEqual(object.title, "later local edit")
+        let final = try await adapter.prepareUploadBatch(limit: 10)
+        try await adapter.acknowledgeUploadedRecords(final.records, from: final)
+        try await requireQuiet(adapter)
+    }
+
+    @BigSyncBackgroundActor
+    private final class ResolutionDuringPruning {
+        let realm: Realm
+        let resolved: BigSyncRecordConflict
+        let accepted: BigSyncRecordBaseline
+        let pending: BigSyncPendingMutation
+        var didCommitResolution = false
+        var calls = 0
+        init(realm: Realm, resolved: BigSyncRecordConflict,
+             accepted: BigSyncRecordBaseline, pending: BigSyncPendingMutation) {
+            self.realm = realm
+            self.resolved = resolved
+            self.accepted = accepted
+            self.pending = pending
+        }
+        func validate() throws {
+            calls += 1
+            guard calls == 2 else { return }
+            // The pruning operation has already selected resolved A and is
+            // entering the tracking write on a different Realm. Commit B's
+            // complete target resolution now. These rows were recorded from
+            // an actual keep-local resolution, not hand-invented evidence.
+            // This phase can commit during pruning's asynchronous wait.
+            try realm.write {
+                realm.add(resolved, update: .modified)
+                realm.add(accepted, update: .modified)
+                realm.add(pending, update: .modified)
+            }
+            didCommitResolution = true
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testArchivePruningCannotConsumeResolutionOutsideItsRetiredSnapshot() async throws {
+        let (adapter, realm, _, firstConflict) = try await unbasedRecoveryFixture()
+        try await adapter.resolveRecordConflict(id: firstConflict.id,
+            expectedGeneration: firstConflict.generation, choice: .keepLocal)
+        let second = RetainedContractRow()
+        second.id = "second-article"
+        let remote = CKRecord(recordType: RetainedContractRow.className(),
+            recordID: .init(recordName: RetainedContractRow.className() + "." + second.id,
+                            zoneID: adapter.recordZoneID))
+        let payload = record(adapter, title: "second incoming")
+        for key in payload.allKeys() { remote[key] = payload[key] }
+        try realm.write {
+            realm.add(second)
+            second.title = "second local"
+            second.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await deliver([remote], to: adapter)
+        let secondConflict = try XCTUnwrap(try adapter.unresolvedRecordConflicts().first)
+        XCTAssertNotEqual(firstConflict.id, secondConflict.id)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let scope = "record-conflict:" + secondConflict.id
+        let quarantine = BigSyncInboundSemanticQuarantine(value: try XCTUnwrap(
+            tracking.objects(BigSyncInboundSemanticQuarantine.self)
+                .filter("semanticScopeIdentifier == %@", scope).first))
+        let lineage = quarantine.lineageID
+        let beforeConflict = BigSyncRecordConflict(value: try XCTUnwrap(realm.object(
+            ofType: BigSyncRecordConflict.self, forPrimaryKey: secondConflict.id)))
+        let beforePending = BigSyncPendingMutation(value: try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: secondConflict.recordName)))
+        // Record the real target state produced by resolving B. Restore the
+        // preceding snapshot, then replay that committed state at the event
+        // boundary. The only injected component is event ordering.
+        try await adapter.resolveRecordConflict(id: secondConflict.id,
+            expectedGeneration: secondConflict.generation, choice: .keepLocal)
+        let resolved = BigSyncRecordConflict(value: try XCTUnwrap(realm.object(
+            ofType: BigSyncRecordConflict.self, forPrimaryKey: secondConflict.id)))
+        let accepted = BigSyncRecordBaseline(value: try XCTUnwrap(realm.object(
+            ofType: BigSyncRecordBaseline.self, forPrimaryKey: secondConflict.recordName)))
+        let pending = BigSyncPendingMutation(value: try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: secondConflict.recordName)))
+        let generation = pending.generation
+        try realm.write {
+            realm.delete(try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self,
+                                                  forPrimaryKey: secondConflict.recordName)))
+            realm.add(beforeConflict, update: .modified)
+            realm.add(beforePending, update: .modified)
+        }
+        try tracking.write { tracking.add(quarantine, update: .modified) }
+        let event = ResolutionDuringPruning(realm: realm, resolved: resolved,
+                                           accepted: accepted, pending: pending)
+        try await adapter.discardResolvedRecordConflictArchives(validateAuthority: { try event.validate() })
+        XCTAssertTrue(event.didCommitResolution)
+        XCTAssertNil(realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: firstConflict.id))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
+        XCTAssertNotNil(realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: secondConflict.id),
+                        "The resolution is still the only durable authority for retiring its quarantine")
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: secondConflict.recordName)?.generation, generation)
+        try await adapter.discardResolvedRecordConflictArchives()
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage),
+                     "An authorized retry must retire B before discarding its resolution evidence")
+        XCTAssertNil(realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: secondConflict.id))
+        XCTAssertEqual(second.title, "second local")
+    }
+
 }
