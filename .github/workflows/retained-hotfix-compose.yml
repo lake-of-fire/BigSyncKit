@@ -1,0 +1,137 @@
+name: Retained sync hotfix composition qualification
+on:
+  push:
+    branches: [verify/retained-hotfix-composition-20260917]
+    paths: [.github/workflows/retained-hotfix-compose.yml]
+permissions:
+  contents: write
+concurrency:
+  group: retained-hotfix-composition-20260917
+  cancel-in-progress: false
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: BigSyncKit
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 4079fd48d0f582ad449785f7a825c221a1d0aa53
+          fetch-depth: 0
+          path: BigSyncKit
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 02faace3e1c821bf4d4c3f3e3d7770b5d4acea21
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Compose immutable product parents
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          test "$(git rev-parse HEAD)" = 4079fd48d0f582ad449785f7a825c221a1d0aa53
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git config user.name 'Retained sync qualification'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin bb8492c313d40b0962a640c76214bf21db2bd768
+          git merge --no-ff --no-edit bb8492c313d40b0962a640c76214bf21db2bd768 \
+            -m 'Integrate concurrent hotfix journal drain and cancellation boundaries'
+          test "$(git rev-parse HEAD^1)" = 4079fd48d0f582ad449785f7a825c221a1d0aa53
+          test "$(git rev-parse HEAD^2)" = bb8492c313d40b0962a640c76214bf21db2bd768
+          git diff HEAD^1 HEAD > "$RUNNER_TEMP/evidence/composition.patch"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/source-identity.txt"
+          git -C ../RealmSwiftGaps rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/RealmSwiftGaps-identity.txt"
+          git -C ../SwiftUtilities rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/SwiftUtilities-identity.txt"
+      - name: Toolchain and log formatter
+        id: toolchain
+        run: |
+          set -euo pipefail
+          command -v xcsift >/dev/null || brew install xcsift
+          swift --version > "$RUNNER_TEMP/evidence/toolchain.txt"
+          sw_vers >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          uname -m >> "$RUNNER_TEMP/evidence/toolchain.txt"
+          echo "id=$(shasum -a 256 "$RUNNER_TEMP/evidence/toolchain.txt" | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-compose-${{ github.run_id }}
+          restore-keys: |
+            rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-
+            rebase-${{ runner.os }}-${{ runner.arch }}-
+      - name: Native focused and full qualification
+        run: |
+          set -euo pipefail
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" --filter 'BigSyncLifetimeIDTests|BigSyncLifetimeSuccessorTests|SyncRebaseIntegrationBoundaryTests|SyncRecordRebaseTests|SyncRecordReceiptTests|SyncRecordReceiptValidationTests|SyncRetainedRecordContractTests|HotfixMutationDrainTailTests' 2>&1 | tee "$RUNNER_TEMP/evidence/focused.log" | xcsift
+          swift test --scratch-path "$GITHUB_WORKSPACE/.rebase-build" 2>&1 | tee "$RUNNER_TEMP/evidence/full.log" | xcsift
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          cmp "$RUNNER_TEMP/evidence/source-identity.txt" "$RUNNER_TEMP/evidence/final-identity.txt"
+      - name: Require complete native execution and authority regressions
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          minimums = {'BigSyncLifetimeIDTests': 9, 'BigSyncLifetimeSuccessorTests': 7,
+              'SyncRebaseIntegrationBoundaryTests': 11, 'SyncRecordRebaseTests': 25,
+              'SyncRecordReceiptTests': 6, 'SyncRecordReceiptValidationTests': 6,
+              'SyncRetainedRecordContractTests': 27, 'HotfixMutationDrainTailTests': 1}
+          results = {}
+          for mode, aggregate in [('focused', 'Selected tests'), ('full', 'All tests')]:
+              text = (root / (mode + '.log')).read_text()
+              assert not re.search(r"Test (?:Case|Suite) '[^'\n]+' failed", text), mode
+              starts = re.findall(r"^Test Suite '([^'\n]+)' started at .+$", text, re.M)
+              matches = re.findall(r"^Test Suite '([^'\n]+)' passed at [^\n]+\n\s*Executed (\d+) tests?, with (?:(\d+) tests? skipped and )?(\d+) failures? \((\d+) unexpected\) in ([\d.]+)", text, re.M)
+              rows = {name: dict(executed=int(n), skipped=int(s or 0), failures=int(f), unexpected=int(u), seconds=float(t)) for name, n, s, f, u, t in matches}
+              assert len(starts) == len(set(starts)) == len(rows) == len(matches), (mode, starts, rows)
+              assert set(starts) == set(rows), (mode, starts, rows)
+              assert aggregate in rows and rows[aggregate]['executed'] >= sum(minimums.values()), (mode, rows)
+              for name, row in rows.items():
+                  assert row['failures'] == row['unexpected'] == 0 and row['skipped'] <= row['executed'], (mode, name, row)
+              for name, minimum in minimums.items():
+                  assert name in rows and rows[name]['executed'] >= minimum and rows[name]['skipped'] == 0, (mode, name, rows.get(name))
+              for name in ['testRevokedResolutionAuthorityCannotCommitEitherChoice', 'testRevokedRefreshAuthorityCannotRetireOrReplaceEvidence', 'testRevokedPruneAuthorityCannotDeleteRetainedArchives']:
+                  assert re.search(r"Test Case '[^'\n]*" + name + r"[^'\n]*' passed", text), (mode, name)
+              results[mode] = rows
+          (root / 'verified-results.json').write_text(json.dumps(results, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({k: v['All tests' if k == 'full' else 'Selected tests'] for k, v in results.items()}, indent=2))
+          PY
+      - name: Publish qualified candidate only
+        run: |
+          set -euo pipefail
+          # Never mutate the product PR branch or a release branch in CI.
+          candidate=integration/retained-hotfix-qualified-20260917
+          test -z "$(git ls-remote --heads origin "refs/heads/$candidate")"
+          git push origin "HEAD:refs/heads/$candidate"
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/published-candidate.txt"
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always()
+        with:
+          path: ${{ github.workspace }}/.rebase-build
+          key: rebase-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.id }}-${{ hashFiles('BigSyncKit/Package.swift', 'BigSyncKit/Package.resolved') }}-compose-${{ github.run_id }}
+      - name: Retain exact source and logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/evidence/final-identity.txt"
+          git status --porcelain --untracked-files=all > "$RUNNER_TEMP/evidence/source-status.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/evidence/source.tar.gz" HEAD
+          git bundle create "$RUNNER_TEMP/evidence/source.bundle" HEAD
+          cd "$RUNNER_TEMP/evidence"
+          shasum -a 256 * > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: retained-hotfix-composition
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
+          if-no-files-found: error
