@@ -2817,3 +2817,228 @@ extension CloudKitSynchronizerAccountFencingTests {
         XCTAssertNotNil(synchronizer.databaseSubscriptionID)
     }
 }
+
+
+/// A test-owned completion that can be joined during cleanup even when its
+/// XCTest expectation has already been waited on. It tracks observer exits,
+/// not the synchronizer's logical cancellation barrier.
+@BigSyncBackgroundActor
+private final class AccountChangeObserverExit {
+    private var finished = false
+    private var waiters = [CheckedContinuation<Void, Never>]()
+
+    func finish() {
+        precondition(!finished, "An observer task must finish exactly once")
+        finished = true
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
+
+    func wait() async {
+        if finished { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+@BigSyncBackgroundActor
+private final class AccountInvalidationFailureSchedule {
+    let firstEntered: XCTestExpectation
+    let releaseFirst = ClosureRestorationGate()
+    let firstFails: Bool
+    private(set) var reasons = [BigSyncAccountScopeInvalidationReason]()
+    var postedObservers = [AccountChangeObserverExit]()
+
+    init(firstEntered: XCTestExpectation, firstFails: Bool) {
+        self.firstEntered = firstEntered
+        self.firstFails = firstFails
+    }
+
+    func invalidate(_ reason: BigSyncAccountScopeInvalidationReason) async throws {
+        reasons.append(reason)
+        switch reasons.count {
+        case 1:
+            firstEntered.fulfill()
+            await releaseFirst.wait()
+            if firstFails { throw AccountScopeInvalidationTestError.rejected }
+        case 2:
+            if !firstFails { throw AccountScopeInvalidationTestError.rejected }
+        case 3:
+            // The failed latest invalidation, and only that invalidation,
+            // should be retried by the later explicit synchronization.
+            XCTAssertFalse(firstFails, "A stale failure must not restore already-completed invalidation debt")
+        default:
+            XCTFail("Unexpected extra account invalidation")
+            throw AccountScopeInvalidationTestError.rejected
+        }
+    }
+}
+
+extension CloudKitSynchronizerAccountFencingTests {
+    @BigSyncBackgroundActor
+    func testOlderSuccessfulInvalidationPreservesNewerFailedInvalidation()
+    async throws {
+        try await assertOutOfOrderInvalidationRetry(firstFails: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testOlderFailedInvalidationDoesNotRestoreNewerCompletedInvalidation()
+    async throws {
+        try await assertOutOfOrderInvalidationRetry(firstFails: true)
+    }
+
+    @BigSyncBackgroundActor
+    private func accountChangeExpectationCompleted(
+        _ expectation: XCTestExpectation,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> Bool {
+        let result = await XCTWaiter.fulfillment(of: [expectation], timeout: 2)
+        XCTAssertEqual(result, .completed, expectation.expectationDescription, file: file, line: line)
+        return result == .completed
+    }
+
+    @BigSyncBackgroundActor
+    private func assertOutOfOrderInvalidationRetry(firstFails: Bool) async throws {
+        let schedule = AccountInvalidationFailureSchedule(
+            firstEntered: expectation(description: "older invalidation suspended"),
+            firstFails: firstFails
+        )
+        let firstFinished = expectation(description: "older observer exited")
+        let secondFinished = expectation(description: "newer observer exited")
+        let transport = AccountFencingTransport()
+        let identity = AccountFencingAccountIdentity("account-a")
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(
+            transport: transport,
+            recordZoneID: zoneID,
+            accountIdentifierProvider: { await identity.current() }
+        )
+        // Do not attach an adapter until both observer tasks have exited.
+        // Otherwise an automatic drain could retry the debt before the test
+        // checks that the older completion did not erase it.
+        try await synchronizer._test_validateSynchronizationAccount()
+        let oldLease = try XCTUnwrap(synchronizer.accountScopeLease())
+        let initialIdentityRequests = await identity.requests()
+        synchronizer.accountScopeInvalidationHandler = { reason in
+            try await schedule.invalidate(reason)
+        }
+        addTeardownBlock { @BigSyncBackgroundActor in
+            synchronizer.modelAdapterDictionary.removeAll()
+            synchronizer.accountScopeInvalidationHandler = nil
+            await schedule.releaseFirst.open()
+            // A posted observer may not have started when setup times out.
+            // Keep its completion registration until it has captured it and
+            // exited; clearing the registration first could strand cleanup.
+            for exit in schedule.postedObservers { await exit.wait() }
+            synchronizer._testAccountChangeObserverDidFinishHandler = nil
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+
+        let firstExit = AccountChangeObserverExit()
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            firstExit.finish()
+            firstFinished.fulfill()
+        }
+        schedule.postedObservers.append(firstExit)
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        guard await accountChangeExpectationCompleted(schedule.firstEntered) else { return }
+
+        let secondExit = AccountChangeObserverExit()
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            secondExit.finish()
+            secondFinished.fulfill()
+        }
+        schedule.postedObservers.append(secondExit)
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        guard await accountChangeExpectationCompleted(secondFinished) else { return }
+        XCTAssertEqual(schedule.reasons, [.accountChanged, .accountChanged])
+
+        await schedule.releaseFirst.open()
+        guard await accountChangeExpectationCompleted(firstFinished) else { return }
+        let identityRequestsBeforeRetry = await identity.requests()
+        XCTAssertEqual(identityRequestsBeforeRetry, initialIdentityRequests)
+        XCTAssertEqual(transport.operationCount, 0)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertTrue(synchronizer.accountValidationRequired)
+
+        synchronizer.addModelAdapter(AccountFencingModelAdapter(zoneID: zoneID))
+        let result = try await synchronizer.synchronize()
+        XCTAssertEqual(result.publicationState, .complete)
+        XCTAssertNotNil(result.receipt)
+        XCTAssertEqual(
+            schedule.reasons,
+            Array(repeating: .accountChanged, count: firstFails ? 2 : 3),
+            firstFails
+                ? "An older failure must not resurrect completed invalidation debt"
+                : "An older success must not erase the newer failed invalidation"
+        )
+        let newLease = try XCTUnwrap(synchronizer.accountScopeLease())
+        XCTAssertEqual(newLease.accountScopeIdentifier, oldLease.accountScopeIdentifier)
+        XCTAssertGreaterThan(newLease.invalidationGeneration, oldLease.invalidationGeneration)
+        XCTAssertThrowsError(try synchronizer.validateAccountScopeLease(oldLease))
+    }
+
+    @BigSyncBackgroundActor
+    func testUndurableAccountInvalidationDefersDomainCallbackUntilRetry()
+    async throws {
+        let transport = AccountFencingTransport()
+        let store = AccountFencingStore()
+        let identity = AccountFencingAccountIdentity("account-a")
+        let zoneID = makeZoneID()
+        let synchronizer = makeSynchronizer(
+            transport: transport,
+            store: store,
+            recordZoneID: zoneID,
+            accountIdentifierProvider: { await identity.current() }
+        )
+        synchronizer.addModelAdapter(AccountFencingModelAdapter(zoneID: zoneID))
+        try await synchronizer._test_validateSynchronizationAccount()
+        let oldLease = try XCTUnwrap(synchronizer.accountScopeLease())
+        let identityRequestsBeforeNotification = await identity.requests()
+        let recorder = AccountScopeInvalidationRecorder()
+        let leaseKey = synchronizer.durableStateKey("AccountScopeLease.v1")
+        synchronizer.accountScopeInvalidationHandler = { reason in
+            let persisted = store.value(forKey: leaseKey)
+                as? [String: Any]
+            XCTAssertEqual(persisted?["isValid"] as? Bool, false)
+            await recorder.record(reason)
+        }
+        let observerFinished = expectation(description: "undurable invalidation observer exited")
+        let exit = AccountChangeObserverExit()
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            exit.finish()
+            observerFinished.fulfill()
+        }
+        addTeardownBlock { @BigSyncBackgroundActor in
+            synchronizer.accountScopeInvalidationHandler = nil
+            store.undurableKeySubstring = nil
+            await exit.wait()
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+
+        // Fail the lease write, not the preceding durable read. The fake
+        // flush failure must stop the domain callback and automatic restart.
+        store.undurableKeySubstring = "AccountScopeLease.v1"
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        guard await accountChangeExpectationCompleted(observerFinished) else { return }
+        let reasonsBeforeRetry = await recorder.reasons
+        XCTAssertTrue(reasonsBeforeRetry.isEmpty, "Domain invalidation must wait for durable lease revocation")
+        let identityRequestsAfterFailure = await identity.requests()
+        XCTAssertEqual(identityRequestsAfterFailure, identityRequestsBeforeNotification)
+        XCTAssertEqual(transport.operationCount, 0)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertTrue(synchronizer.accountValidationRequired)
+
+        store.undurableKeySubstring = nil
+        let result = try await synchronizer.synchronize()
+        XCTAssertEqual(result.publicationState, .complete)
+        XCTAssertNotNil(result.receipt)
+        let reasonsAfterRetry = await recorder.reasons
+        XCTAssertEqual(reasonsAfterRetry, [.accountChanged])
+        let newLease = try XCTUnwrap(synchronizer.accountScopeLease())
+        XCTAssertGreaterThan(newLease.invalidationGeneration, oldLease.invalidationGeneration)
+        XCTAssertThrowsError(try synchronizer.validateAccountScopeLease(oldLease))
+        XCTAssertGreaterThan(transport.operationCount, 0)
+    }
+}

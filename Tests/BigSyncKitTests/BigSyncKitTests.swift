@@ -8601,6 +8601,7 @@ final class BigSyncKitTests: XCTestCase {
         addTeardownBlock {
             validation.cancel()
             await releaseConfirmation.open()
+            await validation.value
         }
         await fulfillment(of: [enteredConfirmation], timeout: 2)
 
@@ -8749,7 +8750,14 @@ final class BigSyncKitTests: XCTestCase {
                 XCTFail("Unexpected validation error: \(error)")
             }
         }
-        addTeardownBlock { validation.cancel() }
+        addTeardownBlock {
+            validation.cancel()
+            // Teardown blocks run in reverse order. Release this task's gate
+            // here before joining it, rather than relying on the earlier
+            // observer cleanup block to release the gate later.
+            await releaseValidation.open()
+            await validation.value
+        }
         await fulfillment(of: [enteredValidation], timeout: 2)
 
         // Force the precise formerly flaky ordering: the probe captured the
