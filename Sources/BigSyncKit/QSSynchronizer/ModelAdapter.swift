@@ -365,6 +365,13 @@ public protocol ModelAdapter: AnyObject, Sendable {
         matchingGenerations: [String: String]
     ) async throws
 
+    /// Carries optional adapter-owned comparison evidence through the receipt.
+    /// Existing adapters default to their generation-only acknowledgement.
+    @BigSyncBackgroundActor
+    func didUpload(
+        savedRecords: [CKRecord], matchingPreparedUploads: [PreparedRecordUpload]
+    ) async throws
+
     /// Prepares deletions with their exact durable mutation generations.
     @BigSyncBackgroundActor
     func preparedRecordDeletions(
@@ -580,9 +587,21 @@ public struct PreparedRecordUpload: @unchecked Sendable {
     public let record: CKRecord
     public let generation: String?
 
+    let comparisonBase: BigSyncPreparedRecordBase?
+    let requiresAcceptanceCheck: Bool
+
     public init(record: CKRecord, generation: String?) {
         self.record = record
         self.generation = generation
+        self.comparisonBase = nil
+        self.requiresAcceptanceCheck = false
+    }
+
+    init(record: CKRecord, generation: String?, comparisonBase: BigSyncPreparedRecordBase?, requiresAcceptanceCheck: Bool = false) {
+        self.record = record
+        self.generation = generation
+        self.comparisonBase = comparisonBase
+        self.requiresAcceptanceCheck = requiresAcceptanceCheck
     }
 }
 
@@ -601,4 +620,16 @@ public struct PreparedRecordDeletion: Sendable {
 internal protocol TerminalSynchronizationStateModelAdapter: ModelAdapter {
     @BigSyncBackgroundActor
     func hasPendingChangesAtTerminalBoundary() throws -> Bool
+}
+
+
+public extension ModelAdapter {
+    @BigSyncBackgroundActor
+    func didUpload(savedRecords: [CKRecord], matchingPreparedUploads: [PreparedRecordUpload]) async throws {
+        var generations = [String: String]()
+        for item in matchingPreparedUploads {
+            generations[item.record.recordID.recordName] = item.generation
+        }
+        try await didUpload(savedRecords: savedRecords, matchingGenerations: generations)
+    }
 }

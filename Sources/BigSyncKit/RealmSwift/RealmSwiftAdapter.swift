@@ -148,8 +148,17 @@ enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
 /// opaque so acknowledgements cannot accidentally sample newer local edits.
 struct RealmSwiftPreparedUploadBatch: @unchecked Sendable {
     let records: [CKRecord]
+    fileprivate let prepared: [PreparedRecordUpload]
     fileprivate let matchingGenerations: [String: String]
     fileprivate let issuerID: UUID
+}
+
+/// A comparison receipt admitted by the target transaction. Carry its exact
+/// revision into both remaining acknowledgement phases; a rejected comparison
+/// must never fall through to generation-only acknowledgement.
+private struct RealmSwiftAcceptedComparisonReceipt: Sendable {
+    let context: BigSyncRecordRebaseContext
+    let revision: String
 }
 
 /// Record identifiers prepared for one deletion attempt. The mutation
@@ -595,7 +604,7 @@ public final class RealmSwiftAdapter:
         }
         self.persistenceRealmConfiguration = persistenceRealmConfiguration
         self.targetRealmConfigurations = targetRealmConfigurations
-        let internalClassNames = [BigSyncPendingMutation.className()]
+        let internalClassNames = BigSyncLocalRecordEvidence.classNames
         self.excludedClassNames = Array(Set(excludedClassNames + internalClassNames))
         self.accountScopePropertyByClassName =
             accountScopePropertyByClassName
@@ -2323,8 +2332,8 @@ public final class RealmSwiftAdapter:
         default:
             return false
         }
-        return (realm.object(ofType: objectType, forPrimaryKey: primaryKeyValue)
-            as? SoftDeletable)?.isDeleted == true
+        guard let object = realm.object(ofType: objectType, forPrimaryKey: primaryKeyValue) else { return false }
+        return BigSyncRecordLifecycle.isPhysicalDeletion(object)
     }
 
     /// Immediately updates.
@@ -2877,7 +2886,11 @@ public final class RealmSwiftAdapter:
         let syncedEntity = Self.getSyncedEntity(objectIdentifier: identifier, realm: persistenceRealm)
         //        debugPrint("# updateTracking", identifier, "ins", inserted, "mod", modified, "syncedentity exists?", syncedEntity != nil)
 
-        if deleted {
+        let physicalDeletion = deleted && !(modelTypes[entityName].map {
+            BigSyncRecordLifecycle.retainsTombstone($0)
+        } ?? false)
+        let modified = modified || (deleted && !physicalDeletion)
+        if physicalDeletion {
             isNewChange = true
 
             if let syncedEntity = syncedEntity {
@@ -5048,7 +5061,7 @@ public final class RealmSwiftAdapter:
                         accountScopeIdentifier:
                             accountScopePropertyByClassName[schema.className]
                                 .flatMap { object[$0] as? String },
-                        isDeleted: (object as? SoftDeletable)?.isDeleted == true
+                        isDeleted: BigSyncRecordLifecycle.isPhysicalDeletion(object)
                     ))
                 }
             }
@@ -5093,7 +5106,7 @@ public final class RealmSwiftAdapter:
                         ), let liveObject = targetRealm.object(
                             ofType: objectType,
                             forPrimaryKey: objectIdentifier
-                        ), ((liveObject as? SoftDeletable)?.isDeleted == true)
+                        ), BigSyncRecordLifecycle.isPhysicalDeletion(liveObject)
                             == candidate.isDeleted else {
                             continue
                         }
@@ -5193,7 +5206,7 @@ public final class RealmSwiftAdapter:
                 ), let liveObject = targetRealm.object(
                     ofType: objectType,
                     forPrimaryKey: objectIdentifier
-                ), ((liveObject as? SoftDeletable)?.isDeleted == true)
+                ), BigSyncRecordLifecycle.isPhysicalDeletion(liveObject)
                     == candidate.isDeleted else {
                     continue
                 }
@@ -5509,7 +5522,7 @@ public final class RealmSwiftAdapter:
             guard isOwnedEntityType(entityType) else { continue }
             if pendingEntities.where({
                 $0.state.in(pendingStates) && $0.entityType == entityType
-            }).first != nil {
+            }).contains(where: { !recordIsBlocked($0.identifier, entityType: $0.entityType) }) {
                 return entityType
             }
         }
@@ -5544,13 +5557,13 @@ public final class RealmSwiftAdapter:
         // missing-target path in recordToUpload can mark a tracking row as
         // deleted; iterating a live Results while that write occurs can leave
         // Realm's fast enumerator pointing at invalidated storage.
-        let candidateIdentifiers = results.map(\.identifier)
+        let candidateIdentifiers = Array(results.map(\.identifier))
         var resultArray = [PreparedRecordUpload]()
         var includedEntityIDs = Set<String>()
 
         func appendUploadRecords(
             matching include: (String) -> Bool
-        ) throws {
+        ) async throws {
             for identifier in candidateIdentifiers {
                 guard include(identifier) else { continue }
                 if resultArray.count >= limit {
@@ -5562,11 +5575,11 @@ public final class RealmSwiftAdapter:
                 ) else {
                     continue
                 }
-                try appendUploadRecords(startingAt: candidate)
+                try await appendUploadRecords(startingAt: candidate)
             }
         }
 
-        func appendUploadRecords(startingAt syncedEntity: SyncedEntity) throws {
+        func appendUploadRecords(startingAt syncedEntity: SyncedEntity) async throws {
             if let restrictedEntityType, syncedEntity.entityType != restrictedEntityType {
                 return
             }
@@ -5591,6 +5604,7 @@ public final class RealmSwiftAdapter:
                 return
             }
             let entityIdentifier = syncedEntity.identifier
+            guard !recordIsBlocked(entityIdentifier, entityType: syncedEntity.entityType) else { return }
             let generation = syncedEntity.pendingGeneration
             if let generation,
                !preparedGenerationIsEligibleForActiveTransport(
@@ -5610,10 +5624,8 @@ public final class RealmSwiftAdapter:
                 isDummyRecord: isDummyRecord
             ) else { return }
             resultArray.append(
-                PreparedRecordUpload(
-                    record: record,
-                    generation: generation
-                )
+                try await prepareContractUpload(record: record, generation: generation,
+                    comparisonBase: preparedComparisonBase(for: record, entityType: syncedEntity.entityType))
             )
             includedEntityIDs.insert(entityIdentifier)
         }
@@ -5621,15 +5633,15 @@ public final class RealmSwiftAdapter:
 #if DEBUG
         // Ensure dummy records are uploaded first.
         if dummyRecordIdentifiers.isEmpty {
-            try appendUploadRecords { _ in true }
+            try await appendUploadRecords { _ in true }
         } else {
-            try appendUploadRecords { dummyRecordIdentifiers.contains($0) }
+            try await appendUploadRecords { dummyRecordIdentifiers.contains($0) }
             if resultArray.count < limit {
-                try appendUploadRecords { !dummyRecordIdentifiers.contains($0) }
+                try await appendUploadRecords { !dummyRecordIdentifiers.contains($0) }
             }
         }
 #else
-        try appendUploadRecords { _ in true }
+        try await appendUploadRecords { _ in true }
 #endif
 
         return resultArray
@@ -5675,6 +5687,9 @@ public final class RealmSwiftAdapter:
 
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
         guard let object else {
+            if BigSyncRecordLifecycle.retainsTombstone(objectClass) {
+                throw BigSyncRecordContractError.missingRetainedTarget(syncedEntity.identifier)
+            }
             // Object does not exist, but tracking syncedEntity thinks it does.
             // We mark it as deleted so the iCloud record will get deleted too
             try persistenceRealm.write {
@@ -5692,6 +5707,30 @@ public final class RealmSwiftAdapter:
             object,
             entityType: syncedEntity.entityType
         ) else { return nil }
+
+        if let contract = try BigSyncCompiledRecordContract.compile(object) {
+            try requireRecordEvidenceSchema(in: object.realm!, entityType: object.objectSchema.className)
+            guard recordRebaseContext != nil else {
+                throw BigSyncRecordContractError.invalidDeclaration(object.objectSchema.className)
+            }
+            let template: CKRecord
+            if targetZoneID == nil,
+               let base = object.realm?.object(ofType: BigSyncRecordBaseline.self,
+                    forPrimaryKey: syncedEntity.identifier),
+               base.namespace == recordRebaseContext?.namespace, !base.isComparisonInvalidated,
+               base.schemaSignature == contract.signature, let systemFields = base.acceptedSystemFields {
+                template = try BigSyncRecordPayload.record(systemFields: systemFields)
+                guard template.recordID == record.recordID,
+                      template.recordType == record.recordType,
+                      template.recordChangeTag == base.serverChangeTag else {
+                    throw BigSyncRecordRebaseError.inconsistentReceipt(syncedEntity.identifier)
+                }
+            } else {
+                template = record
+            }
+            return try BigSyncRecordPayload.record(from: object, recordID: record.recordID,
+                template: template, assetManager: forceDataTypeInsteadOfAsset ? nil : persistentAssetManager)
+        }
 
         let skippedKeys: Set<String>
         if let skippable = object as? SyncSkippablePropertiesModel {
@@ -6168,6 +6207,7 @@ public final class RealmSwiftAdapter:
                        syncable.needsSyncToAppServer {
                         continue
                     }
+                    guard !BigSyncRecordLifecycle.retainsTombstone(objectClass) else { continue }
                     targetRealm.delete(object)
                     committedRecordNames.insert(deletion.recordName)
                 }
@@ -6394,6 +6434,7 @@ public final class RealmSwiftAdapter:
         // recreate the copied outbox we deliberately retired. Genuine
         // post-restore journals remain protected by the final write fence.
         let acceptsServerSnapshot = isRestoringBackupServerSnapshot
+        let comparisonContext = recordRebaseContext
 
         //        debugPrint("# To save from icloud:", records.map { $0.recordID.recordName })
         var recordsToSave: [(
@@ -6451,6 +6492,13 @@ public final class RealmSwiftAdapter:
                         record.recordType
                     )
                 }
+                if objectClass is BigSyncRecordContractProviding.Type {
+                    guard recordRebaseContext != nil,
+                          let target = realmProvider.targetReaderRealmPerSchemaName[record.recordType] else {
+                        throw BigSyncRecordContractError.invalidDeclaration(record.recordType)
+                    }
+                    try requireRecordEvidenceSchema(in: target, entityType: record.recordType)
+                }
                 let semanticScopeIdentifier = (objectClass as?
                     BigSyncInboundSemanticRecordValidating.Type)?
                     .inboundSemanticQuarantineScopeIdentifier(record)
@@ -6504,7 +6552,11 @@ public final class RealmSwiftAdapter:
                 try Task.checkCancellation()
 
                 if let syncedEntity {
-                    if syncedEntity.entityState != .deletedLocally
+                    // Forwarding is bookkeeping, not a lifecycle decision.
+                    // Declared lifetime models must reach the same final target-
+                    // transaction comparison before and after deletion forwarding.
+                    let reconsidersDeletion = try shouldRebaseTrackedDeletion(syncedEntity)
+                    if (syncedEntity.entityState != .deletedLocally || reconsidersDeletion)
                         && syncedEntity.entityType != "CKShare" {
                         if syncedEntity.entityState == .deletedRemotely {
                             // Claim this identity durably before the next
@@ -6806,6 +6858,31 @@ public final class RealmSwiftAdapter:
                                         let currentExplicitlyModifiedAt =
                                             (object as? ChangeMetadataRecordable)?
                                                 .explicitlyModifiedAt
+                                        // Recompute against the current target and its atomic
+                                        // comparison base, not a selection-time field snapshot.
+                                        // Unsupported/custom semantic paths keep their old fence.
+                                        if let comparisonContext,
+                                           candidate.semanticReplacementDisposition == .applyIncomingRecord {
+                                            let result = try self.applyRecordRebase(
+                                                record: candidate.record, objectType: candidate.objectType,
+                                                objectIdentifier: candidate.objectIdentifier,
+                                                existingObject: object, context: comparisonContext,
+                                                in: targetWriterRealm)
+                                            switch result {
+                                            case .notAdopted: break
+                                            case .committed:
+                                                appliedRecordNames.insert(candidate.syncedEntityID)
+                                                continue
+                                            case .preservedDeletion:
+                                                preservedDispositionsByRecordName[candidate.syncedEntityID] =
+                                                    .preservedPendingLocal(generation: currentMutationGeneration ?? "")
+                                                continue
+                                            case let .unresolved(id):
+                                                preservedDispositionsByRecordName[candidate.syncedEntityID] =
+                                                    .quarantined(lineageID: id)
+                                                continue
+                                            }
+                                        }
                                         guard currentMutationGeneration
                                                 == candidate.expectedMutationGeneration,
                                               currentModifiedAt == candidate.expectedModifiedAt,
@@ -7079,16 +7156,44 @@ public final class RealmSwiftAdapter:
                 relationshipCount: count
             )
         }
+        if comparisonContext != nil {
+            var namesByRealm = [String: (realm: Realm, names: Set<String>)]()
+            for record in records {
+                guard let realm = realmProvider.targetReaderRealmPerSchemaName[record.recordType],
+                      BigSyncRecordBaseline.isEnabled(in: realm) else { continue }
+                let key = BigSyncMutationTrackingRegistry.identity(for: realm.configuration)
+                namesByRealm[key, default: (realm, [])].names.insert(record.recordID.recordName)
+            }
+            for group in namesByRealm.values {
+                await group.realm.asyncRefresh()
+                try await forwardPendingMutations(pendingMutationSnapshots(for: group.names, in: group.realm), in: group.realm)
+            }
+        }
+        var comparisonQuarantines = [BigSyncInboundSemanticQuarantine]()
+        if let comparisonContext {
+            for record in records {
+                guard case let .quarantined(conflictID) = dispositionsByRecordName[record.recordID.recordName],
+                      let target = realmProvider.targetReaderRealmPerSchemaName[record.recordType],
+                      target.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }),
+                      let conflict = target.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: conflictID),
+                      conflict.namespace == comparisonContext.namespace, !conflict.isResolved else { continue }
+                let quarantine = try inboundSemanticQuarantine(for: record,
+                    error: BigSyncRecordConflictValidationFailure(),
+                    semanticScopeIdentifier: "record-conflict:" + conflictID,
+                    importRunIdentifier: importRunIdentifier)
+                comparisonQuarantines.append(quarantine)
+                dispositionsByRecordName[record.recordID.recordName] = .quarantined(lineageID: quarantine.lineageID)
+            }
+        }
+        if !comparisonQuarantines.isEmpty {
+            try await persistenceRealm.asyncWrite {
+                for quarantine in comparisonQuarantines { persistenceRealm.add(quarantine, update: .modified) }
+            }
+        }
         return records.enumerated().map { ordinal, record in
             InboundLiveResult(
-                event: InboundEventIdentity(
-                    ordinal: ordinal,
-                    entityType: record.recordType,
-                    recordID: record.recordID
-                ),
-                disposition: dispositionsByRecordName[
-                    record.recordID.recordName
-                ] ?? .unchanged
+                event: InboundEventIdentity(ordinal: ordinal, entityType: record.recordType, recordID: record.recordID),
+                disposition: dispositionsByRecordName[record.recordID.recordName] ?? .unchanged
             )
         }
     }
@@ -7214,6 +7319,16 @@ public final class RealmSwiftAdapter:
                     continue
                 }
             }
+            if BigSyncRecordLifecycle.retainsTombstone(objectClass) {
+                let quarantine = inboundSemanticDeletionQuarantine(for: recordID,
+                    entityType: entityType,
+                    error: BigSyncRecordContractError.unexpectedPhysicalDeletion(recordID.recordName),
+                    semanticScopeIdentifier: "retained-physical-deletion:" + recordID.recordName,
+                    importRunIdentifier: importRunIdentifier)
+                semanticQuarantines.append(quarantine)
+                dispositionsByRecordName[recordID.recordName] = .quarantined(lineageID: quarantine.lineageID)
+                continue
+            }
             if let validatingType = objectClass as?
                     BigSyncInboundSemanticDeletionValidating.Type {
                 let semanticScopeIdentifier = validatingType
@@ -7337,6 +7452,9 @@ public final class RealmSwiftAdapter:
                             object.isDeleted = true
                         }
                     }
+                    BigSyncRecordBaseline.invalidate(
+                        recordName: deletion.recordName, in: targetRealm
+                    )
                     committedRemoteDeletions.append(deletion)
                     dispositionsByRecordName[deletion.recordName] =
                         .appliedTombstone
@@ -7561,6 +7679,7 @@ public final class RealmSwiftAdapter:
         )
         return RealmSwiftPreparedUploadBatch(
             records: prepared.map(\.record),
+            prepared: prepared,
             matchingGenerations: prepared.reduce(into: [:]) { generations, item in
                 guard let generation = item.generation else { return }
                 generations[item.record.recordID.recordName] = generation
@@ -7589,7 +7708,7 @@ public final class RealmSwiftAdapter:
         }
         try await didUpload(
             savedRecords: savedRecords,
-            matchingGenerations: batch.matchingGenerations
+            matchingPreparedUploads: batch.prepared
         )
     }
 
@@ -7597,6 +7716,30 @@ public final class RealmSwiftAdapter:
     public func didUpload(
         savedRecords: [CKRecord],
         matchingGenerations: [String: String]
+    ) async throws {
+        // Comparison-enabled records must retain their preparation evidence all
+        // the way through acknowledgement. A legacy call cannot manufacture it
+        // from current values (which may already contain a newer local edit).
+        for record in savedRecords {
+            if let realm = realmProvider?.targetReaderRealmPerSchemaName[record.recordType],
+               BigSyncRecordBaseline.isEnabled(in: realm),
+               recordRebaseContext != nil,
+               let type = realmObjectClass(name: record.recordType),
+               try recordRebasePolicy(for: type.init()) != .disabled {
+                throw BigSyncRecordRebaseError.inconsistentReceipt(record.recordID.recordName)
+            }
+        }
+        try await acknowledgeUploadReceipts(
+            savedRecords: savedRecords, matchingGenerations: matchingGenerations,
+            comparisonReceipts: [:]
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func acknowledgeUploadReceipts(
+        savedRecords: [CKRecord],
+        matchingGenerations: [String: String],
+        comparisonReceipts: [String: RealmSwiftAcceptedComparisonReceipt]
     ) async throws {
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else { return }
@@ -7623,6 +7766,11 @@ public final class RealmSwiftAdapter:
                            entityType: syncedEntity.entityType,
                            generation: uploadedGeneration
                        ) else { continue }
+                    if let receipt = comparisonReceipts[record.recordID.recordName] {
+                        guard let target = realmProvider.targetReaderRealmPerSchemaName[syncedEntity.entityType],
+                              try comparisonReceiptIsCurrent(receipt,
+                                recordName: record.recordID.recordName, in: target) else { continue }
+                    }
                     try Task.checkCancellation()
                     try save(record: record, for: syncedEntity)
                     syncedEntity.state = SyncedEntityState.synced.rawValue
@@ -7669,6 +7817,10 @@ public final class RealmSwiftAdapter:
                             pendingMutationIsEligibleForActiveTransport(
                                 mutation
                             ) else { continue }
+                            if let receipt = comparisonReceipts[recordName] {
+                                guard try comparisonReceiptIsCurrent(receipt,
+                                    recordName: recordName, in: targetReaderRealm) else { continue }
+                            }
                             targetReaderRealm.delete(mutation)
                         }
                     }
@@ -7714,6 +7866,10 @@ public final class RealmSwiftAdapter:
         }
 
         for syncedEntity in deletedEntities {
+            if let type = realmObjectClass(name: syncedEntity.entityType),
+               BigSyncRecordLifecycle.retainsTombstone(type) {
+                throw BigSyncRecordContractError.missingRetainedTarget(syncedEntity.identifier)
+            }
             guard !cancelSync else { throw CancellationError() }
             guard isOwnedEntityType(syncedEntity.entityType) else { continue }
             guard syncedEntityIsEligibleForActiveAccount(
@@ -7886,6 +8042,7 @@ public final class RealmSwiftAdapter:
 
         //        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
         try await updateCreatedAndModified()
+        try await retireResolvedRecordConflictQuarantines()
         // didFinishImport is reached only after the operation that consumed
         // prepared CKAssets is terminal. Realm data, not these files, owns any
         // still-pending generation, so future retries can safely rematerialize
@@ -7907,6 +8064,17 @@ public final class RealmSwiftAdapter:
             throw RealmSwiftAdapterError.setupUnavailable
         }
 
+        if let context = recordRebaseContext {
+            var conflicts = Set<String>()
+            for realm in targetReaderRealms {
+                realm.refresh()
+                guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
+                conflicts.formUnion(realm.objects(BigSyncRecordConflict.self).where {
+                    $0.namespace == context.namespace && !$0.isResolved
+                }.map(\.recordName))
+            }
+            if !conflicts.isEmpty { throw BigSyncUnresolvedRecordConflicts(recordNames: conflicts.sorted()) }
+        }
         for targetReaderRealm in targetReaderRealms where
             targetReaderRealm.schema.objectSchema.contains(where: {
                 $0.className == BigSyncPendingMutation.className()
@@ -9082,5 +9250,834 @@ final class ZSTDCompressor {
         }
 
         return Data(bytes: dstBuffer, count: actualSize)
+    }
+}
+
+
+// MARK: Atomic comparison-base accounting
+
+extension RealmSwiftAdapter {
+    @BigSyncBackgroundActor
+    private var recordRebaseContext: BigSyncRecordRebaseContext? {
+        guard mergePolicy == .custom, delegate == nil, recordProcessingDelegate == nil,
+              let account = activeAccountScopeIdentifier,
+              let binding = activeReplicaBindingGenerationIdentifier,
+              !activeContainerIdentifier.isEmpty else { return nil }
+        let parts = [account, activeContainerIdentifier, String(activeDatabaseScopeRawValue),
+                     recordZoneID.ownerName, recordZoneID.zoneName, binding]
+        return .init(
+            namespace: parts.map { "\($0.utf8.count):\($0)" }.joined(),
+            account: account, binding: binding,
+            preservationNamespace: parts.dropLast().map { "\($0.utf8.count):\($0)" }.joined()
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func shouldRebaseTrackedDeletion(_ entity: SyncedEntity) throws -> Bool {
+        guard entity.entityState == .deletedLocally,
+              recordRebaseContext != nil,
+              let realm = realmProvider?.targetReaderRealmPerSchemaName[entity.entityType],
+              BigSyncRecordBaseline.isEnabled(in: realm),
+              let mutation = realm.object(ofType: BigSyncPendingMutation.self,
+                                          forPrimaryKey: entity.identifier),
+              pendingMutationIsEligibleForActiveTransport(mutation),
+              let type = realmObjectClass(name: entity.entityType),
+              let identifier = getObjectIdentifier(for: entity),
+              let object = realm.object(ofType: type, forPrimaryKey: identifier),
+              case .lifetimeBundle = try recordRebasePolicy(for: object) else { return false }
+        // Admission does not choose the winner. applyRecordRebase re-resolves
+        // current values, binding and generation inside the target transaction.
+        // Non-lifetime and disabled models keep the established deletion fence.
+        return true
+    }
+
+    private func recordRebasePolicy(for object: Object) throws -> BigSyncRecordRebasePolicy {
+        let declaration = type(of: object) as? BigSyncRecordRebasePolicyProviding.Type
+        let declared = declaration?.bigSyncRecordRebasePolicy
+        _ = try BigSyncCompiledRecordContract.compile(object)
+        if declared == .disabled { return .disabled }
+        guard BigSyncRecordFingerprint.supports(object) else {
+            // Undeclared legacy models retain their original behavior. An
+            // explicit declaration must not look enabled while silently using
+            // whole-record replacement for an unsupported relationship/type.
+            if declared != nil {
+                let field = BigSyncRecordFingerprint.properties(of: object).first {
+                    switch $0.type {
+                    case .int, .bool, .float, .double, .string, .date, .data, .UUID: false
+                    default: true
+                    }
+                }
+                throw BigSyncRecordRebaseError.unsupportedField(field?.name ?? object.objectSchema.className)
+            }
+            return .disabled
+        }
+        if let policy = declared {
+            // Semantic payloads cannot be assembled property-by-property.
+            // Reject invalid declarations before the first baseline is stored,
+            // not only after a pending local mutation happens to exercise it.
+            if object is BigSyncInboundSemanticRecordValidating
+                || object is BigSyncInboundSemanticReplacementValidating {
+                guard case let .lifetimeBundle(_, fields) = policy, fields.isEmpty else {
+                    throw BigSyncRecordRebaseError.invalidPolicy
+                }
+            }
+            if case let .lifetimeBundle(field, independent) = policy {
+                let properties = BigSyncRecordFingerprint.properties(of: object)
+                guard let property = properties.first(where: { $0.name == field }),
+                      !property.isArray, !property.isSet, !property.isMap,
+                      property.type == .string || property.type == .UUID,
+                      !independent.contains(field),
+                      independent.isSubset(of: Set(properties.map(\.name))) else {
+                    throw BigSyncRecordRebaseError.invalidPolicy
+                }
+            }
+            return policy
+        }
+        if object is BigSyncAuthoritativeServerSnapshotModel
+            || object is BigSyncInboundSemanticRecordValidating
+            || object is BigSyncInboundSemanticReplacementValidating {
+            return .disabled
+        }
+        // Schema availability is not adoption. An ordinary model must declare
+        // even atomic comparison deliberately; unrelated models keep their path.
+        return .disabled
+    }
+
+    /// Decode using the normal transport decoder into an unmanaged receiver.
+    /// Object relationships are excluded by capability admission above.
+    private func decodedComparisonObject(_ record: CKRecord, type: Object.Type) throws -> Object {
+        let object = type.init()
+        for property in object.objectSchema.properties {
+            if property.name == object.objectSchema.primaryKeyProperty?.name
+                || property.type == .linkingObjects
+                || shouldIgnore(key: property.name) { continue }
+            let skipped = (object as? SyncSkippablePropertiesModel)?.skipSyncingProperties() ?? []
+            guard !skipped.contains(property.name) else { continue }
+            try applyChange(property: property, record: record, object: object,
+                            syncedEntityIdentifier: record.recordID.recordName)
+        }
+        return object
+    }
+
+    private func prefersIncomingComparison(
+        local: Object, remote: Object, localFields: [String: Data], remoteFields: [String: Data]
+    ) -> Bool {
+        for key in ["explicitlyModifiedAt", "modifiedAt"] {
+            let lhs = ((local[key] as? Date) ?? .distantPast).timeIntervalSinceReferenceDate
+            let rhs = ((remote[key] as? Date) ?? .distantPast).timeIntervalSinceReferenceDate
+            if (lhs * 1_000).rounded() != (rhs * 1_000).rounded() { return rhs > lhs }
+        }
+        // Equal record clocks must not mean "whoever arrived last".
+        for key in localFields.keys.sorted() {
+            if let lhs = localFields[key], let rhs = remoteFields[key], lhs != rhs {
+                return lhs.lexicographicallyPrecedes(rhs)
+            }
+        }
+        return true
+    }
+
+    private enum RecordApplication {
+        case notAdopted
+        case committed
+        case preservedDeletion
+        case unresolved(String)
+    }
+
+    @RealmBackgroundActor
+    private func applyRecordRebase(
+        record: CKRecord, objectType: Object.Type, objectIdentifier: any Sendable,
+        existingObject: Object?, context: BigSyncRecordRebaseContext, in realm: Realm
+    ) throws -> RecordApplication {
+        guard BigSyncRecordBaseline.isEnabled(in: realm) else { return .notAdopted }
+        let object = existingObject ?? objectType.init()
+        let policy = try recordRebasePolicy(for: object)
+        guard policy != .disabled else { return .notAdopted }
+        let contract = try BigSyncCompiledRecordContract.compile(object)
+        if contract != nil { try requireRecordEvidenceSchema(in: realm, entityType: objectType.className()) }
+        try context.validate(in: realm)
+        let name = record.recordID.recordName
+        let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
+        if let pending {
+            guard pending.replicaBindingGenerationIdentifier == context.binding,
+                  pending.accountScopeIdentifier == nil || pending.accountScopeIdentifier == context.account else {
+                throw CancellationError()
+            }
+        }
+        var preservesValidatedPredecessor = false
+        if let validator = objectType as? BigSyncInboundSemanticReplacementValidating.Type {
+            do {
+                guard try validator.inboundSemanticReplacementDisposition(
+                    record, existingObject: existingObject
+                ) == .applyIncomingRecord else { return .notAdopted }
+            } catch {
+                guard pending != nil, let existingObject,
+                      let predecessor = objectType as? BigSyncInboundPendingSemanticReplacementValidating.Type else {
+                    throw error
+                }
+                try predecessor.validateInboundSemanticPredecessorOfPendingMutation(
+                    record, existingObject: existingObject)
+                preservesValidatedPredecessor = true
+            }
+        }
+        let remoteObject = try decodedComparisonObject(record, type: objectType)
+        let remote = try BigSyncRecordFingerprint.fields(of: remoteObject)
+        let local = try BigSyncRecordFingerprint.fields(of: object)
+        let stored = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
+        var base = stored?.namespace == context.namespace && stored?.isComparisonInvalidated == false
+            && stored?.schemaSignature == (contract?.signature ?? "") ? stored?.fieldDigests : nil
+        if let contract, let submitted = matchingSubmission(recordName: name, context: context, in: realm),
+           submitted.schemaSignature == contract.signature,
+           submitted.comparisonRevision == stored?.revision,
+           Dictionary(uniqueKeysWithValues: submitted.fields.map { ($0.key, $0.value) }) == remote {
+            // This is an observed server representation of the exact unresolved
+            // candidate, not an assumption that transmission succeeded.
+            base = remote
+        }
+        func lifetime(_ value: Object) -> String? {
+            guard case let .lifetimeBundle(field, _) = policy else { return nil }
+            if let uuid = value[field] as? UUID { return uuid.uuidString.lowercased() }
+            return value[field] as? String
+        }
+        if case .lifetimeBundle = policy {
+            try BigSyncLifetimeID.validate(lifetime(object))
+            try BigSyncLifetimeID.validate(lifetime(remoteObject))
+        }
+        if preservesValidatedPredecessor {
+            // This validated exception admits the observed server baseline,
+            // never property-level replacement of a pending bound catalog.
+            // Retiring its uncertain candidate also prevents a fetch/reprepare
+            // loop that could otherwise starve unrelated upload work.
+            _ = try applyComparisonFields([], record: record, object: object,
+                isNew: false, objectIdentifier: objectIdentifier, local: local,
+                remote: remote, pending: true, context: context, in: realm)
+            if let submitted = matchingSubmission(recordName: name, context: context, in: realm) {
+                realm.delete(submitted)
+            }
+            return .committed
+        }
+        let decision = try BigSyncRecordReconciliationPlanner.plan(
+            base: base, local: local, remote: remote, policy: policy,
+            contract: contract?.declaration, pending: pending != nil,
+            existing: existingObject != nil,
+            localDeleted: (object as? SoftDeletable)?.isDeleted == true,
+            remoteDeleted: (remoteObject as? SoftDeletable)?.isDeleted == true,
+            localLifetime: lifetime(object), remoteLifetime: lifetime(remoteObject),
+            preferRemote: prefersIncomingComparison(local: object, remote: remoteObject,
+                                                     localFields: local, remoteFields: remote))
+        switch decision {
+        case .preservePhysicalDeletion:
+            return .preservedDeletion
+        case .needsResolution:
+            guard let contract, let pending else { throw BigSyncRecordRebaseError.missingBaseline(name) }
+            if !contract.declaration.preserveConflictingFields.isEmpty,
+               (object as? SoftDeletable)?.isDeleted != true,
+               (remoteObject as? SoftDeletable)?.isDeleted != true {
+                try BigSyncRecordEvidenceStore(context: context, realm: realm).preserveNoteCopy(
+                    losingObject: object, record: record, fieldNames: contract.declaration.preserveConflictingFields)
+                _ = try applyComparisonFields(Set(remote.keys), record: record, object: object,
+                    isNew: existingObject == nil, objectIdentifier: objectIdentifier,
+                    local: local, remote: remote, pending: true, context: context, in: realm)
+                if let submission = matchingSubmission(recordName: name, context: context, in: realm) { realm.delete(submission) }
+                return .committed
+            }
+            let conflict = try preserveUnbasedConflict(record: record, object: object,
+                generation: pending.generation, revision: stored?.revision,
+                signature: contract.signature, context: context, in: realm)
+            return .unresolved(conflict)
+        case let .commit(transition):
+            if let contract, let base {
+                try preserveConflictingTextIfNeeded(object: object, remoteObject: remoteObject,
+                    record: record, base: base, local: local, remote: remote,
+                    selected: transition.incomingFields, contract: contract, context: context, in: realm)
+            }
+            _ = try applyComparisonFields(transition.incomingFields, record: record, object: object,
+                isNew: existingObject == nil, objectIdentifier: objectIdentifier,
+                local: local, remote: remote, pending: pending != nil, context: context, in: realm)
+            if let submission = matchingSubmission(recordName: name, context: context, in: realm) {
+                realm.delete(submission)
+            }
+            return .committed
+        }
+    }
+
+    // Caller owns this Realm's executor and final write transaction. Inbound
+    // import and explicit conflict resolution use different existing actors;
+    // no managed object crosses that boundary through this synchronous helper.
+    private func applyComparisonFields(
+        _ incoming: Set<String>, record: CKRecord, object: Object, isNew: Bool,
+        objectIdentifier: any Sendable, local: [String: Data], remote: [String: Data],
+        pending: Bool, context: BigSyncRecordRebaseContext, in realm: Realm
+    ) throws -> Bool {
+        precondition(realm.isInWriteTransaction)
+        var merged = local
+        for key in incoming { merged[key] = remote[key] }
+        if isNew {
+            object.setValue(objectIdentifier, forKey: object.objectSchema.primaryKeyProperty!.name)
+            realm.add(object)
+        }
+        for property in BigSyncRecordFingerprint.properties(of: object)
+            where incoming.contains(property.name) {
+            try applyChange(property: property, record: record, object: object,
+                            syncedEntityIdentifier: record.recordID.recordName)
+        }
+        if merged == remote {
+            for property in object.objectSchema.properties
+                where BigSyncRecordLifecycle.metadataFields(for: object).contains(property.name) {
+                try applyChange(property: property, record: record, object: object,
+                                syncedEntityIdentifier: record.recordID.recordName)
+            }
+        }
+        let changedBase: Bool
+        if BigSyncRecordLifecycle.isPhysicalDeletion(object) {
+            changedBase = realm.object(ofType: BigSyncRecordBaseline.self,
+                                      forPrimaryKey: record.recordID.recordName) != nil
+            BigSyncRecordBaseline.invalidate(recordName: record.recordID.recordName, in: realm)
+        } else {
+            changedBase = BigSyncRecordBaseline.install(
+                recordName: record.recordID.recordName, namespace: context.namespace,
+                fields: remote, serverChangeTag: record.recordChangeTag,
+                schemaSignature: try BigSyncCompiledRecordContract.compile(object)?.signature ?? "",
+                systemFields: try BigSyncRecordPayload.systemFields(of: record), in: realm
+            )
+        }
+        if (pending && (changedBase || merged != local)) || (!pending && merged != remote) {
+            // A changed ancestor also invalidates older upload receipts even
+            // when conflict selection retained every local payload field.
+            (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
+        }
+        try context.validate(in: realm)
+        return true
+    }
+
+    @BigSyncBackgroundActor
+    private func preparedComparisonBase(for record: CKRecord, entityType: String) throws -> BigSyncPreparedRecordBase? {
+        guard let context = recordRebaseContext,
+              let realm = realmProvider?.targetReaderRealmPerSchemaName[entityType],
+              BigSyncRecordBaseline.isEnabled(in: realm),
+              let type = realmObjectClass(name: entityType),
+              try recordRebasePolicy(for: type.init()) != .disabled else { return nil }
+        let object = try decodedComparisonObject(record, type: type)
+        let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: record.recordID.recordName)
+        return .init(context: context,
+                     revision: base?.revision,
+                     fields: try BigSyncRecordFingerprint.fields(of: object),
+                     schemaSignature: try BigSyncCompiledRecordContract.compile(object)?.signature ?? "")
+    }
+
+    @BigSyncBackgroundActor
+    private func comparisonReceiptIsCurrent(
+        _ receipt: RealmSwiftAcceptedComparisonReceipt,
+        recordName: String, in realm: Realm
+    ) throws -> Bool {
+        guard recordRebaseContext == receipt.context,
+              BigSyncRecordBaseline.isEnabled(in: realm) else { return false }
+        if realm.isInWriteTransaction {
+            try receipt.context.validate(in: realm)
+        } else {
+            // The tracking phase observes the target Realm; it must not call
+            // the public write-transaction-only mutation verification API.
+            realm.refresh()
+            guard let identity = BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm),
+                  !identity.installationIdentifier.isEmpty,
+                  identity.replicaBindingGenerationIdentifier == receipt.context.binding else {
+                throw CancellationError()
+            }
+        }
+        guard let current = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: recordName),
+              !current.isComparisonInvalidated,
+              current.namespace == receipt.context.namespace,
+              current.revision == receipt.revision else { return false }
+        if let typeName = recordName.split(separator: ".", maxSplits: 1).first.map(String.init),
+           let type = realmObjectClass(name: typeName),
+           let compiled = try BigSyncCompiledRecordContract.compile(type.init()),
+           compiled.signature != current.schemaSignature { return false }
+        return true
+    }
+
+    @BigSyncBackgroundActor
+    public func didUpload(savedRecords: [CKRecord], matchingPreparedUploads prepared: [PreparedRecordUpload]) async throws {
+        // Validate the complete response before any target/tracking mutation.
+        // Name alone is not identity: zone and record type must also match.
+        var preparedByID = [CKRecord.ID: PreparedRecordUpload]()
+        for item in prepared {
+            guard item.record.recordID.zoneID == recordZoneID,
+                  preparedByID.updateValue(item, forKey: item.record.recordID) == nil else {
+                throw BigSyncRecordRebaseError.inconsistentReceipt(item.record.recordID.recordName)
+            }
+        }
+        var seen = Set<CKRecord.ID>()
+        var generations = [String: String]()
+        var admittedRecords = [CKRecord]()
+        var accepted = [String: RealmSwiftAcceptedComparisonReceipt]()
+        typealias ReceiptItem = (saved: CKRecord, type: Object.Type, proof: BigSyncPreparedRecordBase)
+        var groups = [String: (realm: Realm, items: [ReceiptItem])]()
+        for saved in savedRecords {
+            guard seen.insert(saved.recordID).inserted,
+                  let item = preparedByID[saved.recordID],
+                  item.record.recordType == saved.recordType else {
+                throw BigSyncRecordRebaseError.inconsistentReceipt(saved.recordID.recordName)
+            }
+            guard let proof = item.comparisonBase else {
+                // Only genuinely non-comparison records use the old path.
+                // A missing proof on an enabled model is not opt-out consent.
+                if let realm = realmProvider?.targetReaderRealmPerSchemaName[saved.recordType],
+                   BigSyncRecordBaseline.isEnabled(in: realm), recordRebaseContext != nil,
+                   let type = realmObjectClass(name: saved.recordType),
+                   try recordRebasePolicy(for: type.init()) != .disabled {
+                    throw BigSyncRecordRebaseError.inconsistentReceipt(saved.recordID.recordName)
+                }
+                generations[saved.recordID.recordName] = item.generation
+                admittedRecords.append(saved)
+                continue
+            }
+            // A superseded binding's receipt has no authority in this adapter.
+            // In particular it must not be passed to the legacy fallback.
+            guard proof.context == recordRebaseContext else { continue }
+            guard let realm = realmProvider?.targetReaderRealmPerSchemaName[saved.recordType],
+                  let type = realmObjectClass(name: saved.recordType),
+                  BigSyncRecordBaseline.isEnabled(in: realm) else {
+                throw BigSyncRecordRebaseError.inconsistentReceipt(saved.recordID.recordName)
+            }
+            let decoded = try decodedComparisonObject(saved, type: type)
+            let savedFields = try BigSyncRecordFingerprint.fields(of: decoded)
+            guard savedFields == proof.fields,
+                  (try BigSyncCompiledRecordContract.compile(decoded)?.signature ?? "") == proof.schemaSignature else {
+                throw BigSyncRecordRebaseError.inconsistentReceipt(saved.recordID.recordName)
+            }
+            let key = BigSyncMutationTrackingRegistry.identity(for: realm.configuration)
+            groups[key, default: (realm, [])].items.append((saved, type, proof))
+        }
+        for key in groups.keys.sorted() {
+            guard let group = groups[key] else { continue }
+            let realm = group.realm
+            for chunk in group.items.chunks(ofCount: 500) {
+                try await realm.asyncWrite {
+                    for item in chunk {
+                        try Task.checkCancellation()
+                        let proof = item.proof, saved = item.saved
+                        let name = saved.recordID.recordName
+                        guard !cancelSync, recordRebaseContext == proof.context else { throw CancellationError() }
+                        try proof.context.validate(in: realm)
+                        let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
+                        // Resume the exact accepted receipt if the target base
+                        // committed before tracking acknowledgement. Tag and
+                        // payload must both match; a newer base is not a match.
+                        let alreadyInstalled = base?.isComparisonInvalidated == false
+                            && base?.namespace == proof.context.namespace
+                            && base?.fieldDigests == proof.fields
+                            && base?.schemaSignature == proof.schemaSignature
+                            && base?.serverChangeTag == saved.recordChangeTag
+                        guard base?.revision == proof.revision || alreadyInstalled,
+                              let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name),
+                              pendingMutationIsEligibleForActiveTransport(pending),
+                              let id = getObjectIdentifier(recordName: name, entityType: item.type.className()),
+                              let object = realm.object(ofType: item.type, forPrimaryKey: id),
+                              !BigSyncRecordLifecycle.isPhysicalDeletion(object) else { continue }
+                        BigSyncRecordBaseline.install(recordName: name, namespace: proof.context.namespace,
+                            fields: proof.fields, serverChangeTag: saved.recordChangeTag,
+                            schemaSignature: proof.schemaSignature,
+                            systemFields: try BigSyncRecordPayload.systemFields(of: saved), in: realm)
+                        guard let current = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name) else {
+                            throw BigSyncRecordRebaseError.inconsistentReceipt(name)
+                        }
+                        if let submitted = matchingSubmission(recordName: name, context: proof.context, in: realm),
+                           submitted.generation == preparedByID[saved.recordID]?.generation,
+                           submitted.schemaSignature == proof.schemaSignature,
+                           submitted.fields.reduce(into: [String: Data](), { $0[$1.key] = $1.value }) == proof.fields {
+                            realm.delete(submitted)
+                        }
+                        accepted[name] = .init(context: proof.context, revision: current.revision)
+                        generations[name] = preparedByID[saved.recordID]?.generation
+                        admittedRecords.append(saved)
+                    }
+                }
+            }
+        }
+        // Do not pass rejected records with a merely matching generation. Both
+        // subsequent commit phases recheck the admitted comparison revision.
+        try await acknowledgeUploadReceipts(
+            savedRecords: admittedRecords, matchingGenerations: generations,
+            comparisonReceipts: accepted
+        )
+    }
+}
+
+// MARK: Bounded submitted-value evidence and explicit conflict resolution
+extension RealmSwiftAdapter {
+    private func matchingSubmission(recordName: String, context: BigSyncRecordRebaseContext,
+                                    in realm: Realm) -> BigSyncRecordSubmission? {
+        BigSyncRecordEvidenceStore(context: context, realm: realm).submission(recordName: recordName)
+    }
+
+    private func preserveUnbasedConflict(
+        record: CKRecord, object: Object, generation: String, revision: String?,
+        signature: String, context: BigSyncRecordRebaseContext, in realm: Realm
+    ) throws -> String {
+        try BigSyncRecordEvidenceStore(context: context, realm: realm).preserveConflict(
+            record: record, object: object, generation: generation,
+            revision: revision, signature: signature,
+            incomingFields: BigSyncRecordFingerprint.fields(of: decodedComparisonObject(record, type: type(of: object))))
+    }
+
+    private func preserveConflictingTextIfNeeded(
+        object: Object, remoteObject: Object, record: CKRecord,
+        base: [String: Data], local: [String: Data], remote: [String: Data],
+        selected: Set<String>, contract: BigSyncCompiledRecordContract,
+        context: BigSyncRecordRebaseContext, in realm: Realm
+    ) throws {
+        let fields = contract.declaration.preserveConflictingFields.filter {
+            local[$0] != base[$0] && remote[$0] != base[$0] && local[$0] != remote[$0]
+        }
+        guard !fields.isEmpty else { return }
+        let store = BigSyncRecordEvidenceStore(context: context, realm: realm)
+        let locallyLosing = Set(fields.filter { selected.contains($0) })
+        let remotelyLosing = Set(fields).subtracting(locallyLosing)
+        if !locallyLosing.isEmpty {
+            try store.preserveNoteCopy(losingObject: object, record: record, fieldNames: locallyLosing)
+        }
+        if !remotelyLosing.isEmpty {
+            try store.preserveNoteCopy(losingObject: remoteObject, record: record, fieldNames: remotelyLosing)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func recordIsBlocked(_ recordName: String, entityType: String) -> Bool {
+        guard let context = recordRebaseContext,
+              let realm = realmProvider?.targetReaderRealmPerSchemaName[entityType] else { return false }
+        return BigSyncRecordEvidenceStore(context: context, realm: realm).isBlocked(recordName: recordName)
+    }
+
+    private func conflictLifetimes(local: CKRecord, incoming: CKRecord,
+        policy: BigSyncRecordRebasePolicy?) -> (local: String?, incoming: String?) {
+        guard case let .lifetimeBundle(field, _) = policy else { return (nil, nil) }
+        return (local[field] as? String, incoming[field] as? String)
+    }
+
+    private func requiredLifecycleChoice(lifetimes: (local: String?, incoming: String?)) throws
+        -> BigSyncRecordConflictChoice? {
+        guard lifetimes.local != lifetimes.incoming,
+              let incoming = try BigSyncLifetimeID.prefersIncoming(local: lifetimes.local,
+                  incoming: lifetimes.incoming) else { return nil }
+        return incoming ? .useIncoming : .keepLocal
+    }
+
+    @BigSyncBackgroundActor
+    public func unresolvedRecordConflicts() throws -> [BigSyncRecordConflictSnapshot] {
+        guard let context = recordRebaseContext else { return [] }
+        var result = [BigSyncRecordConflictSnapshot]()
+        var seen = Set<String>()
+        for realm in realmProvider?.targetReaderRealms ?? [] {
+            guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else {
+                continue
+            }
+            realm.refresh()
+            for row in realm.objects(BigSyncRecordConflict.self).where({
+                $0.namespace == context.namespace && !$0.isResolved
+            }) where seen.insert(row.id).inserted {
+                let local = try BigSyncRecordPayload.decode(row.localPayload)
+                let incoming = try BigSyncRecordPayload.decode(row.incomingPayload)
+                let type = realmObjectClass(name: row.entityType)
+                let policy = type.flatMap { $0 as? BigSyncRecordContractProviding.Type }?.bigSyncRecordContract.policy
+                let lifetimes = conflictLifetimes(local: local, incoming: incoming, policy: policy)
+                result.append(.init(id: row.id, recordName: row.recordName, entityType: row.entityType,
+                    reason: row.reason, generation: row.generation, createdAt: row.createdAt,
+                    localText: local["text"] as? String, incomingText: incoming["text"] as? String,
+                    localTitle: local["title"] as? String, incomingTitle: incoming["title"] as? String,
+                    localLifetime: lifetimes.local, incomingLifetime: lifetimes.incoming,
+                    localIsDeleted: BigSyncCloudKitBooleanCodec.decode(local["isDeleted"]) == true,
+                    incomingIsDeleted: BigSyncCloudKitBooleanCodec.decode(incoming["isDeleted"]) == true,
+                    requiredChoice: try requiredLifecycleChoice(lifetimes: lifetimes)))
+            }
+        }
+        return result.sorted { $0.id < $1.id }
+    }
+
+    /// An explicit user decision, bound to the archived conflict and current
+    /// journal generation. The observed incoming state becomes the accepted
+    /// base for either choice; choosing local never fabricates a server base.
+    @BigSyncBackgroundActor
+    /// Application callers supply their captured account-lease validator.
+    /// It is checked at entry and again inside the final target transaction,
+    /// after any Realm write wait. Adapter namespace/generation checks remain
+    /// independent; this callback must not suspend or acquire a session lock.
+    public func resolveRecordConflict(
+        id: String, expectedGeneration: String, choice: BigSyncRecordConflictChoice,
+        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+    ) async throws {
+        try validateAuthority()
+        guard let context = recordRebaseContext else { throw CancellationError() }
+        for realm in realmProvider?.targetReaderRealms ?? [] {
+            guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else {
+                continue
+            }
+            realm.refresh()
+            guard let selected = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: id),
+                  selected.namespace == context.namespace, !selected.isResolved else { continue }
+            let name = selected.recordName, typeName = selected.entityType
+            let incoming = try BigSyncRecordPayload.decode(selected.incomingPayload,
+                                                           assetManager: persistentAssetManager)
+            try await realm.asyncWrite {
+                try validateAuthority()
+                try context.validate(in: realm)
+                guard recordRebaseContext == context,
+                      let conflict = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: id),
+                      !conflict.isResolved, conflict.namespace == context.namespace,
+                      conflict.generation == expectedGeneration,
+                      let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name),
+                      pending.generation == expectedGeneration, pendingMutationIsEligibleForActiveTransport(pending),
+                      let type = realmObjectClass(name: typeName),
+                      let objectID = getObjectIdentifier(recordName: name, entityType: typeName),
+                      let object = realm.object(ofType: type, forPrimaryKey: objectID),
+                      let contract = try BigSyncCompiledRecordContract.compile(object),
+                      contract.signature == conflict.schemaSignature,
+                      incoming.recordID.zoneID == recordZoneID,
+                      incoming.recordID.recordName == name, incoming.recordType == typeName,
+                      realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)?.revision
+                        == conflict.comparisonRevision else {
+                    throw BigSyncRecordContractError.staleConflict
+                }
+                try (type as? BigSyncInboundSemanticRecordValidating.Type)?.validateInboundSemanticRecord(incoming)
+                try (type as? BigSyncInboundSemanticReplacementValidating.Type)?
+                    .validateInboundSemanticReplacement(incoming, existingObject: object)
+                let currentRecord = try BigSyncRecordPayload.record(from: object, recordID: incoming.recordID)
+                let lifetimes = conflictLifetimes(local: currentRecord, incoming: incoming,
+                    policy: contract.declaration.policy)
+                if let required = try requiredLifecycleChoice(lifetimes: lifetimes), required != choice {
+                    throw BigSyncRecordContractError.staleConflict
+                }
+                let local = try BigSyncRecordFingerprint.fields(of: object)
+                let remote = try BigSyncRecordFingerprint.fields(of: decodedComparisonObject(incoming, type: type))
+                _ = try applyComparisonFields(choice == .useIncoming ? Set(remote.keys) : [],
+                    record: incoming, object: object, isNew: false, objectIdentifier: objectID,
+                    local: local, remote: remote, pending: true, context: context, in: realm)
+                for sibling in realm.objects(BigSyncRecordConflict.self).where({
+                    $0.namespace == context.namespace && $0.recordName == name && !$0.isResolved
+                }) { sibling.isResolved = true }
+                if let submission = matchingSubmission(recordName: name, context: context, in: realm) {
+                    realm.delete(submission)
+                }
+            }
+            // A crash here keeps the target decision durable. The next normal
+            // import/own echo retires page quarantine; no cursor is fabricated.
+            try await forwardPendingMutations(pendingMutationSnapshots(for: [name], in: realm), in: realm)
+            try await retireResolvedRecordConflictQuarantines(validateAuthority: validateAuthority)
+            return
+        }
+        throw BigSyncRecordContractError.staleConflict
+    }
+}
+
+extension RealmSwiftAdapter {
+    /// Preparation persists the candidate before the caller can submit it.
+    /// Repeated preparation replays that exact candidate, even after V2 typing.
+    /// Only an observed accepted base or an explicit conflict decision retires it.
+    @BigSyncBackgroundActor
+    private func prepareContractUpload(
+        record: CKRecord, generation: String?, comparisonBase: BigSyncPreparedRecordBase?
+    ) async throws -> PreparedRecordUpload {
+        guard let proof = comparisonBase, !proof.schemaSignature.isEmpty else {
+            return .init(record: record, generation: generation, comparisonBase: comparisonBase)
+        }
+        guard let generation,
+              let realm = realmProvider?.targetReaderRealmPerSchemaName[record.recordType],
+              let type = realmObjectClass(name: record.recordType),
+              let objectID = getObjectIdentifier(recordName: record.recordID.recordName, entityType: record.recordType) else {
+            throw BigSyncRecordRebaseError.inconsistentReceipt(record.recordID.recordName)
+        }
+        try requireRecordEvidenceSchema(in: realm, entityType: record.recordType)
+        var result: PreparedRecordUpload?
+        try await realm.asyncWrite {
+            guard recordRebaseContext == proof.context else { throw CancellationError() }
+            try proof.context.validate(in: realm)
+            let name = record.recordID.recordName
+            guard let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name),
+                  pendingMutationIsEligibleForActiveTransport(pending),
+                  pending.generation == generation,
+                  let object = realm.object(ofType: type, forPrimaryKey: objectID),
+                  !BigSyncRecordLifecycle.isPhysicalDeletion(object),
+                  try BigSyncRecordFingerprint.fields(of: object) == proof.fields else {
+                throw RealmSwiftInboundTargetChangedError(recordName: name)
+            }
+            let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
+            guard base?.revision == proof.revision else {
+                throw RealmSwiftInboundTargetChangedError(recordName: name)
+            }
+            let store = BigSyncRecordEvidenceStore(context: proof.context, realm: realm)
+            if let submitted = store.submission(recordName: name) {
+                guard submitted.schemaSignature == proof.schemaSignature else {
+                    throw BigSyncRecordContractError.invalidDeclaration(record.recordType)
+                }
+                if submitted.comparisonRevision == base?.revision {
+                    let candidate = try BigSyncRecordPayload.decode(submitted.payload, assetManager: persistentAssetManager)
+                    guard candidate.recordID == record.recordID, candidate.recordType == record.recordType else {
+                        throw BigSyncRecordRebaseError.inconsistentReceipt(name)
+                    }
+                    let fields = submitted.fields.reduce(into: [String: Data]()) { $0[$1.key] = $1.value }
+                    guard try BigSyncRecordFingerprint.fields(of: decodedComparisonObject(candidate, type: type)) == fields else {
+                        throw BigSyncRecordRebaseError.inconsistentReceipt(name)
+                    }
+                    result = .init(record: candidate, generation: submitted.generation,
+                        comparisonBase: .init(context: proof.context, revision: submitted.comparisonRevision,
+                                              fields: fields, schemaSignature: submitted.schemaSignature),
+                        requiresAcceptanceCheck: true)
+                    return
+                }
+                // An accepted newer observation has superseded this proof. A
+                // missing/invalidated base is not permission to discard it.
+                guard let base, !base.isComparisonInvalidated,
+                      base.namespace == proof.context.namespace,
+                      base.schemaSignature == proof.schemaSignature else {
+                    throw BigSyncRecordRebaseError.inconsistentReceipt(name)
+                }
+                realm.delete(submitted)
+            }
+            try store.stage(record: record, generation: generation, proof: proof)
+            result = .init(record: record, generation: generation, comparisonBase: proof)
+        }
+        guard let result else { throw BigSyncRecordRebaseError.inconsistentReceipt(record.recordID.recordName) }
+        return result
+    }
+
+    private func requireRecordEvidenceSchema(in realm: Realm, entityType: String) throws {
+        let present = Set(realm.schema.objectSchema.map(\.className))
+        guard BigSyncLocalRecordEvidence.objectTypes.allSatisfy({ present.contains($0.className()) }) else {
+            throw BigSyncRecordContractError.missingEvidenceSchema(entityType)
+        }
+    }
+
+    /// A durable target resolution is the authority for retiring its own
+    /// quarantine. Replay finishes this tracking phase after a crash without
+    /// claiming another inbound page or advancing any cursor.
+    @BigSyncBackgroundActor
+    @discardableResult
+    private func retireResolvedRecordConflictQuarantines(
+        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+    ) async throws -> Set<String> {
+        guard let context = recordRebaseContext, let provider = realmProvider,
+              let tracking = provider.persistenceRealm else { return [] }
+        var resolvedConflictIDs = Set<String>()
+        for realm in provider.targetReaderRealms ?? [] {
+            realm.refresh()
+            guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
+            for row in realm.objects(BigSyncRecordConflict.self).where({
+                $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
+            }) { resolvedConflictIDs.insert(row.id) }
+        }
+        guard !resolvedConflictIDs.isEmpty else { return [] }
+        let resolvedScopes = Set(resolvedConflictIDs.map { "record-conflict:" + $0 })
+        try await tracking.asyncWrite {
+            // Retiring quarantine/page evidence is a separate mutation from
+            // the durable target decision. Its transaction wait can outlive
+            // the UI account lease even when adapter namespace strings have
+            // not yet changed. Reuse the caller's final-write authority here.
+            try validateAuthority()
+            guard recordRebaseContext == context else { throw CancellationError() }
+            let quarantines = activeInboundSemanticQuarantines(accountScopeIdentifier: context.account, in: tracking).filter { row in
+                guard let scope = row.semanticScopeIdentifier else { return false }
+                return resolvedScopes.contains(scope)
+                    && row.accountScopeIdentifier == context.account
+                    && row.containerIdentifier == self.activeContainerIdentifier
+                    && row.databaseScopeRawValue == self.activeDatabaseScopeRawValue
+                    && row.zoneOwnerName == self.recordZoneID.ownerName && row.zoneName == self.recordZoneID.zoneName
+            }
+            let receiptIDs = try Self.retireQuarantines(quarantines.map(\.lineageID), in: tracking)
+            Self.removeUnreferencedPageReceipts(receiptIDs, in: tracking)
+        }
+        // Only this snapshot has completed the tracking phase. A resolution
+        // committed during the wait must retain its archive for a later pass.
+        return resolvedConflictIDs
+    }
+
+    /// After additional local editing, make a new review snapshot. This does
+    /// not resolve anything: the caller must display/confirm the fresh values.
+    @BigSyncBackgroundActor
+    public func refreshRecordConflict(
+        _ conflictID: String,
+        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+    ) async throws {
+        try validateAuthority()
+        try await ensureSetup()
+        guard let context = recordRebaseContext, let provider = realmProvider else {
+            throw BigSyncRecordContractError.staleConflict
+        }
+        for realm in provider.targetReaderRealms ?? [] {
+            guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }),
+                  let snapshot = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: conflictID),
+                  snapshot.namespace == context.namespace, !snapshot.isResolved else { continue }
+            let name = snapshot.recordName, typeName = snapshot.entityType
+            let record = try BigSyncRecordPayload.decode(snapshot.incomingPayload)
+            try await realm.asyncWrite {
+                try validateAuthority()
+                guard recordRebaseContext == context else { throw CancellationError() }
+                try context.validate(in: realm)
+                guard let previous = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: conflictID),
+                      !previous.isResolved, previous.namespace == context.namespace,
+                      let type = realmObjectClass(name: typeName),
+                      let id = getObjectIdentifier(recordName: name, entityType: typeName),
+                      let object = realm.object(ofType: type, forPrimaryKey: id),
+                      let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name),
+                      pendingMutationIsEligibleForActiveTransport(pending),
+                      let contract = try BigSyncCompiledRecordContract.compile(object) else {
+                    throw BigSyncRecordContractError.staleConflict
+                }
+                let nextID = try preserveUnbasedConflict(record: record, object: object,
+                    generation: pending.generation,
+                    revision: realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)?.revision,
+                    signature: contract.signature, context: context, in: realm)
+                if nextID != conflictID { previous.isResolved = true }
+            }
+            // Old quarantine remains until an explicit record decision; no
+            // successful publication may be inferred from refreshing a view.
+            return
+        }
+        throw BigSyncRecordContractError.staleConflict
+    }
+}
+
+public extension RealmSwiftAdapter {
+    @BigSyncBackgroundActor
+    func exportPreservedRecordConflicts() throws -> Data {
+        guard let context = recordRebaseContext else { throw CancellationError() }
+        var snapshots = [[String: Any]]()
+        var identities = Set<String>()
+        for realm in realmProvider?.targetReaderRealms ?? [] {
+            guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
+            realm.refresh()
+            for row in realm.objects(BigSyncRecordConflict.self).where({ $0.namespace == context.namespace && !$0.isPreservationReceipt }) {
+                guard identities.insert(row.id).inserted else { continue }
+                snapshots.append(["id": row.id, "recordName": row.recordName,
+                    "entityType": row.entityType, "generation": row.generation,
+                    "schemaSignature": row.schemaSignature, "reason": row.reason,
+                    "createdAt": row.createdAt, "resolved": row.isResolved,
+                    "localPayload": row.localPayload, "incomingPayload": row.incomingPayload])
+            }
+        }
+        return try PropertyListSerialization.data(fromPropertyList:
+            ["format": "BigSyncPreservedConflicts-v1", "records": snapshots], format: .binary, options: 0)
+    }
+
+    /// Explicit archive cleanup. Unresolved values are never evicted to make
+    /// room, and no pending submission or mutation generation is touched.
+    @BigSyncBackgroundActor
+    func discardResolvedRecordConflictArchives(
+        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+    ) async throws {
+        try validateAuthority()
+        guard let context = recordRebaseContext else { throw CancellationError() }
+        let retiredConflictIDs = try await retireResolvedRecordConflictQuarantines(
+            validateAuthority: validateAuthority)
+        guard !retiredConflictIDs.isEmpty else { return }
+        for realm in realmProvider?.targetReaderRealms ?? [] {
+            guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
+            try await realm.asyncWrite {
+                try validateAuthority()
+                guard recordRebaseContext == context else { throw CancellationError() }
+                try context.validate(in: realm)
+                realm.delete(realm.objects(BigSyncRecordConflict.self)
+                    .filter("id IN %@", Array(retiredConflictIDs)).where {
+                        $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
+                    })
+            }
+        }
     }
 }
