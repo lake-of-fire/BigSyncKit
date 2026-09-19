@@ -9949,20 +9949,22 @@ extension RealmSwiftAdapter {
     /// quarantine. Replay finishes this tracking phase after a crash without
     /// claiming another inbound page or advancing any cursor.
     @BigSyncBackgroundActor
+    @discardableResult
     private func retireResolvedRecordConflictQuarantines(
         validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
-    ) async throws {
+    ) async throws -> Set<String> {
         guard let context = recordRebaseContext, let provider = realmProvider,
-              let tracking = provider.persistenceRealm else { return }
-        var resolvedScopes = Set<String>()
+              let tracking = provider.persistenceRealm else { return [] }
+        var resolvedConflictIDs = Set<String>()
         for realm in provider.targetReaderRealms ?? [] {
             realm.refresh()
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
             for row in realm.objects(BigSyncRecordConflict.self).where({
                 $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
-            }) { resolvedScopes.insert("record-conflict:" + row.id) }
+            }) { resolvedConflictIDs.insert(row.id) }
         }
-        guard !resolvedScopes.isEmpty else { return }
+        guard !resolvedConflictIDs.isEmpty else { return [] }
+        let resolvedScopes = Set(resolvedConflictIDs.map { "record-conflict:" + $0 })
         try await tracking.asyncWrite {
             // Retiring quarantine/page evidence is a separate mutation from
             // the durable target decision. Its transaction wait can outlive
@@ -9981,6 +9983,9 @@ extension RealmSwiftAdapter {
             let receiptIDs = try Self.retireQuarantines(quarantines.map(\.lineageID), in: tracking)
             Self.removeUnreferencedPageReceipts(receiptIDs, in: tracking)
         }
+        // Only this snapshot has completed the tracking phase. A resolution
+        // committed during the wait must retain its archive for a later pass.
+        return resolvedConflictIDs
     }
 
     /// After additional local editing, make a new review snapshot. This does
@@ -10059,16 +10064,19 @@ public extension RealmSwiftAdapter {
     ) async throws {
         try validateAuthority()
         guard let context = recordRebaseContext else { throw CancellationError() }
-        try await retireResolvedRecordConflictQuarantines(validateAuthority: validateAuthority)
+        let retiredConflictIDs = try await retireResolvedRecordConflictQuarantines(
+            validateAuthority: validateAuthority)
+        guard !retiredConflictIDs.isEmpty else { return }
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
             try await realm.asyncWrite {
                 try validateAuthority()
                 guard recordRebaseContext == context else { throw CancellationError() }
                 try context.validate(in: realm)
-                realm.delete(realm.objects(BigSyncRecordConflict.self).where {
-                    $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
-                })
+                realm.delete(realm.objects(BigSyncRecordConflict.self)
+                    .filter("id IN %@", Array(retiredConflictIDs)).where {
+                        $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
+                    })
             }
         }
     }
