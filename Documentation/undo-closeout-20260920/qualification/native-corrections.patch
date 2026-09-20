@@ -1,0 +1,56 @@
+--- a/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
++++ b/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+@@ -9803,8 +9803,8 @@
+                             && base?.fieldDigests == proof.fields
+                             && base?.schemaSignature == proof.schemaSignature
+                             && base?.serverChangeTag == saved.recordChangeTag
+-                            && proof.submissionIdentity != nil
+-                            && base?.revision == proof.submissionIdentity
++                            && (!(item.type is BigSyncRecordContractProviding.Type)
++                                || (proof.submissionIdentity != nil && base?.revision == proof.submissionIdentity))
+                         guard base?.revision == proof.revision || alreadyInstalled,
+                               let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name),
+                               pendingMutationIsEligibleForActiveTransport(pending),
+--- a/Tests/BigSyncKitTests/SyncUndoCloseoutW1DisappearanceTests.swift
++++ b/Tests/BigSyncKitTests/SyncUndoCloseoutW1DisappearanceTests.swift
+@@ -7,14 +7,15 @@
+ 
+ extension SyncUndoCloseoutW1Tests {
+     /// Native CKRecord archive fixture. This is not signed CloudKit evidence.
+-    /// Assert the SDK supplies its setter before KVC to avoid an ObjC exception
+-    /// being mistaken for the intended adapter behavioral counterexample.
++    /// Use the SDK's system-field setter, not CKRecord.setValue(forKey:),
++    /// which writes user fields and rejects the reserved recordChangeTag key.
++    /// The round-trip assertion verifies the resulting real system archive.
+     func tagged(_ record: CKRecord, _ tag: String) throws -> CKRecord {
+         guard record.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
+             throw NSError(domain: "W1NativeFixture", code: 1,
+                 userInfo: [NSLocalizedDescriptionKey: "This CloudKit SDK cannot construct the tagged record fixture"])
+         }
+-        record.setValue(tag, forKey: "recordChangeTag")
++        _ = record.perform(NSSelectorFromString("setRecordChangeTag:"), with: tag as NSString)
+         XCTAssertEqual(record.recordChangeTag, tag)
+         let decoded = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(record))
+         XCTAssertEqual(decoded.recordChangeTag, tag)
+--- a/Tests/BigSyncKitTests/SyncUndoCloseoutW1RepresentationTests.swift
++++ b/Tests/BigSyncKitTests/SyncUndoCloseoutW1RepresentationTests.swift
+@@ -135,14 +135,16 @@
+         XCTAssertEqual(realm.objects(W1ContractNote.self).count, 2)
+         let receipt = try XCTUnwrap(realm.objects(BigSyncRecordConflict.self).first)
+         XCTAssertTrue(receipt.isResolved && receipt.isPreservationReceipt)
+-        // The already accepted original has no pending upload. Keep the known
+-        // incoming server record in the inventory alongside the new note copy.
++        // Seed the server inventory with the accepted original, then apply
++        // successful saves by full ID (the journal may also save the original).
+         try await adapter.didFinishImport()
+         let copies = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+         try await adapter.didUpload(savedRecords: copies.map(\.record), matchingPreparedUploads: copies)
+         try await adapter.cleanUp()
+         try await quiet(adapter, realm: realm)
+-        let audit = try await adapter.auditSynchronizationState(serverRecords: [incoming] + copies.map(\.record))
++        var inventory = [incoming.recordID: incoming]
++        for item in copies { inventory[item.record.recordID] = item.record }
++        let audit = try await adapter.auditSynchronizationState(serverRecords: Array(inventory.values))
+         XCTAssertEqual(audit.resolvedPreservationReceiptCount, 1)
+         XCTAssertEqual(audit.unresolvedSubmissionCount, 0)
+         XCTAssertTrue(audit.isClean, audit.issues.joined(separator: ","))
