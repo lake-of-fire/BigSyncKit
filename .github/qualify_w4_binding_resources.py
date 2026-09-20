@@ -67,8 +67,14 @@ def main():
     result_path.write_text(json.dumps(report, indent=2) + "\n")
     if not report["discovery_passed"]:
         print("W4 native discovery failed; this is not a behavioral regression result.", flush=True)
-        print(listing[:16000], flush=True)
-        print(listing[-16000:], flush=True)
+        print(listing[:8000], flush=True)
+        error_lines = listing.splitlines()
+        for index, line in enumerate(error_lines):
+            if " error:" in line or line.strip() == "error: fatalError":
+                start = max(0, index - 8)
+                end = min(len(error_lines), index + 12)
+                print("\n".join(error_lines[start:end]), flush=True)
+        print(listing[-8000:], flush=True)
         return 1
     code, execution = capture("execution", ["swift", "test", "--skip-build", "--filter",
                                              "|".join(EXPECTED)])
