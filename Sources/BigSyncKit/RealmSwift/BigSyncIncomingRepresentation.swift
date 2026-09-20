@@ -1,3 +1,4 @@
+import CloudKit
 import Foundation
 import RealmSwift
 
@@ -122,6 +123,19 @@ public struct BigSyncIncomingRepresentationPolicy: Sendable, Equatable {
             guard valid else {
                 throw BigSyncRecordContractError.invalidDeclaration(
                     object.objectSchema.className + "." + property.name)
+            }
+        }
+    }
+
+    /// Coverage and presence are distinct checks. Validate presence before
+    /// lifecycle/immutable skips too, without decoding or manufacturing values.
+    func validatePresence(in record: CKRecord, for object: Object) throws {
+        try validate(for: object)
+        for property in Self.transportedProperties(of: object)
+            where record[property.name] == nil {
+            if case .required = omission(for: property) {
+                throw BigSyncIncomingRepresentationError.missingRequiredField(
+                    recordType: object.objectSchema.className, field: property.name)
             }
         }
     }

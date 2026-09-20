@@ -282,13 +282,18 @@ struct BigSyncPreparedRecordBase: Sendable {
     let revision: String?
     let fields: [String: Data]
     let schemaSignature: String
+    /// Identity of the one durable candidate, not of its payload alone. The
+    /// accepted baseline uses this as its revision for idempotent target-first
+    /// acknowledgement recovery. No receipt history or new Realm field.
+    let submissionIdentity: String?
 
     init(context: BigSyncRecordRebaseContext, revision: String?, fields: [String: Data],
-         schemaSignature: String = "") {
+         schemaSignature: String = "", submissionIdentity: String? = nil) {
         self.context = context
         self.revision = revision
         self.fields = fields
         self.schemaSignature = schemaSignature
+        self.submissionIdentity = submissionIdentity
     }
 }
 
@@ -311,12 +316,14 @@ extension BigSyncRecordBaseline {
     @discardableResult
     static func install(recordName: String, namespace: String,
                         fields: [String: Data], serverChangeTag: String? = nil,
-                        schemaSignature: String = "", systemFields: Data? = nil, in realm: Realm) -> Bool {
+                        schemaSignature: String = "", systemFields: Data? = nil,
+                        acceptedRevision: String? = nil, in realm: Realm) -> Bool {
         precondition(realm.isInWriteTransaction)
         let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
         if existing?.isComparisonInvalidated == false, existing?.namespace == namespace,
            existing?.fieldDigests == fields, existing?.serverChangeTag == serverChangeTag,
-           existing?.schemaSignature == schemaSignature {
+           existing?.schemaSignature == schemaSignature,
+           acceptedRevision == nil || existing?.revision == acceptedRevision {
             // Backfill metadata without inventing another semantic revision.
             if existing?.acceptedSystemFields == nil, let systemFields {
                 existing?.acceptedSystemFields = systemFields
@@ -330,7 +337,7 @@ extension BigSyncRecordBaseline {
         row.isComparisonInvalidated = false
         row.serverChangeTag = serverChangeTag
         row.acceptedSystemFields = systemFields
-        row.revision = UUID().uuidString
+        row.revision = acceptedRevision ?? UUID().uuidString
         row.fields.removeAll()
         for (name, digest) in fields { row.fields[name] = digest }
         realm.add(row, update: .modified)

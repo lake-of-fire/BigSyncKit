@@ -33,18 +33,33 @@ jobs:
           ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
+      - name: Apply exact review candidate (temporary qualification checkpoint)
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = d3ace2cd74f4068f18122c580b6fa09cde072d33
+          git apply --check Documentation/undo-closeout-20260920/qualification/RealmSwiftAdapter.patch
+          git apply Documentation/undo-closeout-20260920/qualification/RealmSwiftAdapter.patch
+          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = d10af4388f8e2990e8d631e3102c10f883514bbf
+      - name: Install structured build output
+        run: brew install xcsift
       - name: Record exact source and toolchain
         working-directory: BigSyncKit
         run: |
           mkdir -p qualification-w1
-          git diff --exit-code
+          git diff --abbrev=7 -- Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift | cmp - Documentation/undo-closeout-20260920/qualification/RealmSwiftAdapter.patch
           git rev-parse HEAD > qualification-w1/commit.txt
-          git rev-parse HEAD:Sources > qualification-w1/source-tree.txt
+          git rev-parse HEAD:Sources > qualification-w1/input-source-tree.txt
+          git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift > qualification-w1/applied-adapter-blob.txt
+          shasum -a 256 Documentation/undo-closeout-20260920/qualification/RealmSwiftAdapter.patch > qualification-w1/candidate-patch.sha256
+          tar -czf qualification-w1/applied-source.tar.gz Sources Tests Package.swift
           git -C ../RealmSwiftGaps rev-parse HEAD > qualification-w1/RealmSwiftGaps.txt
           git -C ../SwiftUtilities rev-parse HEAD > qualification-w1/SwiftUtilities.txt
           swift --version > qualification-w1/toolchain.txt
           sw_vers >> qualification-w1/toolchain.txt
-          xcodebuild -version >> qualification-w1/toolchain.txt
+          xcsift --version >> qualification-w1/toolchain.txt
+          set -o pipefail
+          xcodebuild -version 2>&1 | tee -a qualification-w1/toolchain.txt | xcsift -f json > qualification-w1/xcode-version.json
           # Public BigSyncKit source only; no application checkout or data.
           git archive --format=tar.gz -o qualification-w1/source.tar.gz HEAD
       - name: Discover and execute native Realm tests
@@ -55,12 +70,16 @@ jobs:
           if swift test --help | grep -q -- '--disable-experimental-prebuilts'; then
             extra+=(--disable-experimental-prebuilts)
           fi
-          swift test --scratch-path .build-w1 "${extra[@]}" list 2>&1 | tee qualification-w1/discovery.log
-          swift test --scratch-path .build-w1 "${extra[@]}" --xunit-output qualification-w1/full.xml 2>&1 | tee qualification-w1/full.log
-          if grep -q 'SyncUndoCloseoutW1' qualification-w1/discovery.log; then
-            swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --filter SyncUndoCloseoutW1 --xunit-output qualification-w1/focused.xml 2>&1 | tee qualification-w1/focused.log
-          fi
-          git diff --exit-code
+          swift test --scratch-path .build-w1 "${extra[@]}" list 2>&1 | tee qualification-w1/discovery.log | xcsift -f json --exit-on-failure
+          grep -F 'SyncUndoCloseoutW1Tests/testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline' qualification-w1/discovery.log
+          grep -F 'SyncUndoCloseoutW1Tests/testTerminalLocalDeleteRetiresItsSupersededStagedSave' qualification-w1/discovery.log
+          full_status=0
+          swift test --scratch-path .build-w1 "${extra[@]}" --xunit-output qualification-w1/full.xml 2>&1 | tee qualification-w1/full.log | xcsift -f json --exit-on-failure || full_status=$?
+          focused_status=0
+          swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --filter SyncUndoCloseoutW1 --xunit-output qualification-w1/focused.xml 2>&1 | tee qualification-w1/focused.log | xcsift -f json --exit-on-failure || focused_status=$?
+          printf 'full=%s\nfocused=%s\n' "$full_status" "$focused_status" > qualification-w1/status.txt
+          git diff --abbrev=7 -- Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift | cmp - Documentation/undo-closeout-20260920/qualification/RealmSwiftAdapter.patch
+          test "$full_status" -eq 0 && test "$focused_status" -eq 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

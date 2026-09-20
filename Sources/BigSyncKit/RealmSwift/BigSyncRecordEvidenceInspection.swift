@@ -2,9 +2,8 @@ import CloudKit
 import Foundation
 import RealmSwift
 
-/// A read-only view shared by terminal receipt admission, publication recovery
-/// and the external inventory audit. A journal-empty state is not necessarily
-/// terminal: an uncertain submission still needs an acceptance decision.
+/// Shared read-only inspection for terminal admission, publication recovery and
+/// external inventory audits. An empty journal is not evidence of no debt.
 struct BigSyncRecordEvidenceInspection: Sendable {
     var unresolvedSubmissionCount = 0
     var acceptedBaselineCount = 0
@@ -16,10 +15,16 @@ struct BigSyncRecordEvidenceInspection: Sendable {
     var isConsistent: Bool { issues.isEmpty }
 }
 
+public struct BigSyncComparisonEvidenceError: Error, LocalizedError, Sendable {
+    public let issues: [String]
+    public var errorDescription: String? {
+        "Synchronization comparison evidence is inconsistent: " + issues.joined(separator: ", ")
+    }
+}
+
 extension RealmSwiftAdapter {
-    /// This deliberately accepts an explicit context. Read-only publication
-    /// restoration uses it before operational setup/account activation, and
-    /// must not open an account-wide or other-binding evidence namespace.
+    /// An explicit context also permits restoration inspection before adapter
+    /// activation. Do not infer a namespace from all rows in a shared Realm.
     @BigSyncBackgroundActor
     func inspectRecordEvidence(
         in realm: Realm, context: BigSyncRecordRebaseContext
@@ -32,14 +37,12 @@ extension RealmSwiftAdapter {
                 && schemaNames.contains($0.key)
                 && $0.value is BigSyncRecordContractProviding.Type
         }
-        guard !registeredContracts.isEmpty else { return result }
         guard schemaNames.contains(BigSyncRecordSubmission.className()),
               schemaNames.contains(BigSyncPendingMutation.className()),
               schemaNames.contains(BigSyncRecordConflict.className()) else {
-            result.issues.append("comparison-evidence-schema-missing")
+            if !registeredContracts.isEmpty { result.issues.append("comparison-evidence-schema-missing") }
             return result
         }
-
         func ownedType(for name: String) -> (String, Object.Type)? {
             guard let separator = name.firstIndex(of: ".") else { return nil }
             let entityType = String(name[..<separator])
@@ -66,12 +69,11 @@ extension RealmSwiftAdapter {
             if baseline.isComparisonInvalidated {
                 result.invalidatedBaselineCount += 1
                 if baseline.revision.isEmpty || !baseline.fields.isEmpty
-                    || baseline.acceptedSystemFields != nil || baseline.serverChangeTag != nil
-                    || baseline.acceptedSubmissionIdentity != nil {
+                    || baseline.acceptedSystemFields != nil || baseline.serverChangeTag != nil {
                     result.issues.append("invalidated-comparison-evidence-inconsistent:\(name)")
                 }
-                // The revision fence outlives a physically removed note. It is
-                // neither a missing object nor an unresolved server submission.
+                // A fence may outlive a physically deleted note. It is not
+                // missing-object debt and never grants mutation authority.
                 continue
             }
             result.acceptedBaselineCount += 1
@@ -100,8 +102,6 @@ extension RealmSwiftAdapter {
                     continue
                 }
                 let mutation = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
-                // An owned V2 is allowed to differ from the accepted V1. It is
-                // the existing journal, not the baseline, that explains V2.
                 if mutation.map({ eligible($0, entityType: entityType) }) != true,
                    try BigSyncRecordFingerprint.fields(of: object) != baseline.fieldDigests {
                     result.issues.append("accepted-comparison-unexplained-local-value:\(name)")
@@ -113,25 +113,32 @@ extension RealmSwiftAdapter {
         for submission in realm.objects(BigSyncRecordSubmission.self)
             where submission.namespace == context.namespace {
             let name = submission.recordName
-            guard let (entityType, type) = ownedType(for: name) else { continue }
             result.unresolvedSubmissionCount += 1
+            guard let (entityType, type) = ownedType(for: name) else {
+                result.issues.append("active-submission-unknown-contract:\(name)")
+                continue
+            }
             let mutation = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
             if mutation.map({ eligible($0, entityType: entityType) }) != true {
                 result.issues.append("orphaned-active-submission:\(name)")
             }
             do {
                 _ = try validatedSubmissionRecord(submission,
-                    recordID: .init(recordName: name, zoneID: recordZoneID),
-                    type: type, context: context)
+                    recordID: .init(recordName: name, zoneID: recordZoneID), type: type, context: context)
+                let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
+                if submission.comparisonRevision != base?.revision,
+                   !(base?.isComparisonInvalidated == true
+                     && target(name, type: type, entityType: entityType).map(BigSyncRecordLifecycle.isPhysicalDeletion) == true
+                     && mutation.map({ eligible($0, entityType: entityType) }) == true) {
+                    result.issues.append("active-submission-comparison-superseded:\(name)")
+                }
             } catch {
                 result.issues.append("active-submission-representation-inconsistent:\(name)")
             }
-            // No generation-equality requirement: a staged V1 can legitimately
-            // coexist with the journal's V2 until V1's uncertainty is resolved.
+            // Staged V1 and journal V2 are legitimate until V1 is resolved.
         }
         result.resolvedPreservationReceiptCount = realm.objects(BigSyncRecordConflict.self)
-            .filter { $0.namespace == context.preservationNamespace
-                && $0.isResolved && $0.isPreservationReceipt
+            .filter { $0.namespace == context.namespace && $0.isResolved && $0.isPreservationReceipt
                 && registeredContracts[$0.entityType] != nil }.count
         return result
     }
