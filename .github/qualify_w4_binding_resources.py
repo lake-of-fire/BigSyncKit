@@ -86,6 +86,8 @@ def main():
     report["execution_passed"] = code == 0 and passed_cases == expected
     result_path.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2), flush=True)
+    if not report["execution_passed"]:
+        print(execution[-12000:], flush=True)
     return 0 if report["execution_passed"] else 1
 
 
