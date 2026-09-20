@@ -46,11 +46,12 @@ final class BigSyncLegacyTrackingEvidenceTests: XCTestCase {
                 identifier: syncedRecord.recordID.recordName,
                 state: SyncedEntityState.synced.rawValue
             )
+            let data = NSMutableData()
+            let archiver = NSKeyedArchiver(forWritingWith: data)
+            syncedRecord.encodeSystemFields(with: archiver)
+            archiver.finishEncoding()
             synced.encodedRecord = try ZSTDCompressor.shared.compress(
-                data: QSCoder.shared.encode(
-                    syncedRecord,
-                    onlySystemFields: true
-                )
+                data: data as Data
             )
             realm.add(synced)
             let pending = SyncedEntity(
