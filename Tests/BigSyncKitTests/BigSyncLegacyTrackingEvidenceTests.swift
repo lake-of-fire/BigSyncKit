@@ -78,7 +78,7 @@ final class BigSyncLegacyTrackingEvidenceTests: XCTestCase {
                     recordName: syncedRecord.recordID.recordName,
                     entityType: syncedRecord.recordType,
                     recordChangeTag: nil,
-                    deviceIdentifier: "released-device-a"
+                    deviceIdentifier: nil
                 )
             ]
         )
