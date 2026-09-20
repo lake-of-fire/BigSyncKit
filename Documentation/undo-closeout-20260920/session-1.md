@@ -1,31 +1,99 @@
-# MR-UNDO-CLOSEOUT-20260920 · W1 · Native qualification checkpoint
+# MR-UNDO-CLOSEOUT-20260920 — W1
 
-Base: `4baa7a4903c9f9372903fedf36a95afcb49ced71` (`main`). This source change follows `3f9c2abfbc6a78acaad68fc6d0d05764cfefad91`, which fixed the native deletion-restart crash by eagerly materializing Realm IDs before suspension. The current commit adds a live-object invalidated-evidence audit regression and preserves the production attempt fence when testing a stale deletion reply after adapter restart.
+Status: **W1 BigSync source complete and native-qualified; Common companion source complete with composed native qualification owned by W4.** No target branch is merged by this work.
 
-## Packaging status
+## Exact revisions
 
-The actual adapter edit is still in `qualification/RealmSwiftAdapter.patch` plus `qualification/native-corrections.patch`. Read-only macOS CI verifies original adapter blob `d3ace2cd74f4068f18122c580b6fa09cde072d33` and applied adapter blob `480c4135a76d9b54d51adecdf8f6f6abd363b92c`. The final production tree must contain the actual modified adapter, without this temporary apply step. This is therefore **not yet an integration-ready dependency**, even if the applied-source tests pass. No CI write credentials or private application source/data are used.
+- BigSyncKit target/base: `4baa7a4903c9f9372903fedf36a95afcb49ced71` (`main`).
+- BigSyncKit directly buildable source/test head: `3120e2caf68ffef4f3b16302046d706fc7172603`.
+- ManabiCommon target/base: `cd5fd21484e35a29c28e664ba5b020087ca194e4` (`v3-hotfix`).
+- ManabiCommon W1 source/test head: `4588444426b13b7f7850eebfd40c87285aa700d1` on PR #88.
+- Rechecked Reader root: `6896027d165f087d70e19bccec9e7a487657d04c`; it still pins BigSyncKit `4baa7a4903c9f9372903fedf36a95afcb49ced71` and Common `cd5fd21484e35a29c28e664ba5b020087ca194e4`. Core advanced compatibly to `cc82afda1e2f2678022e268a253f27dc1e92f09d`; W1 did not edit root/Core gitlinks.
 
-## Observed native results
+The completion-note commit is documentation-only after the source/test heads above.
 
-- Baseline `a7b6401de5310d778e0b30bbaced0dd77d1bf239`, run `35491425445`: 619 XCTest tests, one skipped, zero failures.
-- Counterexample `eb4f9fe74e3ce08cab744208cbfc753a706d4ec0`, run `35491847410`: 622 tests, one skipped; six failed assertions across `testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline`, `testRetainedClearIsAcceptedByTheTerminalAudit`, and `testTerminalLocalDeleteRetiresItsSupersededStagedSave`. Build/discovery succeeded. No device incident is claimed.
-- `6a103615c4df826ef481f0b0415b463f4ca7a986`, run `35519804746`: native backtrace resolved the restart crash through `RLMFastEnumerate` / `LazyMapSequence.Iterator.next` in `preparedRecordDeletions`; an apparent key snapshot was still lazy across a tracking write.
-- `3f9c2abfbc6a78acaad68fc6d0d05764cfefad91`, run `35520354025`: full 646 tests, one skipped, one failure; focused 27 tests, one failure. The crash regression passes, including a separate one-test native rerun. The sole remaining failure is the fixture expecting no throw from a stale delete preparation after adapter restart; production correctly throws `CancellationError`. This commit accepts that rejection while still checking the recreated baseline, empty journal/submission debt and a quiet second drain.
-- The additional `testInvalidatedFenceCannotCertifyUnjournaledLiveObject` checks actual target/tracking Realm audit, terminal and publication rejection, restart, and repair by a real server observation. Its native result is pending for this commit. Frontend parsing is supplementary, not native qualification.
+## Implemented BigSync lifecycle
 
-## Actual interfaces
+Physical disappearance now has one durable target disposition shared by admitted inbound deletion, prepared missing-server repair, prepared deletion acknowledgment, restart recovery and tracking publication.
 
-`ModelAdapter.requeueMissingServerRecords(_:matchingPreparedUploads:)` and `ModelAdapter.didDelete(recordIDs:matchingPreparedDeletions:)` carry actual preparation-time comparison/submission evidence. W4 must forward the original opaque preparations from Core's CloudKitE2ETransport, not reconstruct them from public fields or generation maps. Generic adapter defaults remain compatible; Realm's adopted contracts reject generation-only shortcuts.
+- A target transaction invalidates only the still-applicable accepted comparison and retires exactly the captured staged candidate.
+- The invalidated baseline retains a nonempty revision fence even when no accepted server representation remains, so old nil-based receipts cannot acquire a recreated lifetime.
+- V1 disappearance can repair its still-current accepted ancestor while a newer V2 journal/value remains pending; a newer accepted baseline or namespace rejects the stale failure.
+- Tracking publication re-reads the target fence and live journal after its queued tracking write begins. A target-first crash therefore resumes the durable disposition instead of trusting stale encoded tracking system fields.
+- Local deletion superseding a staged save retires the old submission. Late save/delete acknowledgments cannot consume a recreated lifetime's mutation or install its baseline.
+- An uncertain first-save `unknownItem` remains uncertainty: its exact archived conditional candidate is preserved.
+- Retained Article/control records never enter physical note recreation. Their clears remain versioned saves.
 
-`BigSyncIncomingRepresentationPolicy`, `BigSyncIncomingFieldOmission`, `BigSyncIncomingDefaultValue`, and `BigSyncRecordContract.incomingRepresentation` define omission semantics in comparison signature version 2. A normalized decoded object supplies selected values; the actual managed fingerprint must match the plan before the target Realm commits. Baselines remain incoming representations. Unrelated legacy omission behavior and source-shard predecessor semantics are unchanged.
+No second outbox, field clocks, timestamp re-authoring, universal submission purge or retained-record hard deletion was introduced. Existing record-level journaling and generation-matched transport remain authoritative.
 
-Audit adds `comparisonEvidenceVersion` (new 1; old decoded artifact 0), `unresolvedSubmissionCount`, `acceptedBaselineCount`, `invalidatedBaselineCount`, `resolvedPreservationReceiptCount`, and `retainedTombstoneCount`. The signed gate must require version 1, zero unresolved submissions and `isClean`. Intentional fences on absent physical notes are not debt, but an unjournaled live object behind a fence cannot establish terminal success. No persisted Realm evidence fields were added.
+## Incoming representation contract
 
-## Ownership and dependencies
+Published APIs:
 
-Common PR #88 head `b102905b1f459b0db7734ac31e0632020cdd76b4`, based on `cd5fd21484e35a29c28e664ba5b020087ca194e4`, already contains the Article/control/note policy companion and six real-model `ReaderIncomingRepresentationW1Tests`. Those have not been natively executed. W4 owns shared test membership, Core forwarding, root composition, released-input qualification and isolated signed macOS CloudKit acceptance.
+- `BigSyncIncomingRepresentationPolicy`
+- `BigSyncIncomingFieldOmission`
+- `BigSyncIncomingDefaultValue`
+- `BigSyncRecordContract.incomingRepresentation`
 
-Live Reader re-read at `6896027d165f087d70e19bccec9e7a487657d04c` with Core `cc82afda1e2f2678022e268a253f27dc1e92f09d`; preserve its newer timing-test fixes. BigSync/Common product pins remain unchanged. Public native dependencies are RealmSwiftGaps `2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2` and SwiftUtilities `f437c7d06fc631cd7a67731279411c417cdf8077`.
+Contract signature version 2 includes policy identity/version/default meaning. Adopted records validate required field presence before merge, decode one normalized representation, apply selected values from that representation, and fingerprint the actual managed object in the same Realm transaction before committing accepted evidence or journal/preservation changes. A mismatch rolls the transaction back.
 
-No target branch, root gitlink or another worker's branch was changed. No production CloudKit data, release, signed acceptance or Common native pass is claimed.
+Legacy models that have not adopted `BigSyncRecordContractProviding` retain their existing omission behavior.
+
+Common PR #88 declares the actual Reader policies: released aggregate Article scalar defaults and nil legacy epoch, complete current control identity/integrity, and complete note text with optional context clearing. Its eight real-model regressions cover successor-lifetime omission with nonempty counters/sets/maps, pending title/image independence, explicit defaults, legacy nil epoch, required control fields, all four note types, managed-result rollback, contract boundaries, retained Article/control Clear across restart, and rejection of physical disappearance.
+
+## Synchronization audit
+
+`BigSyncSynchronizationAudit` is lifecycle/evidence-aware. Retained clears are validated as saved server representations rather than physical tombstone debt. Active-namespace submissions and accepted/invalidated comparison evidence are inspected in addition to journals/tracking/relationships/quarantine.
+
+Additive telemetry for W4:
+
+- `comparisonEvidenceVersion` — current evidence-aware artifact is `1`; older decoded artifacts report `0`.
+- `unresolvedSubmissionCount`
+- `acceptedBaselineCount`
+- `invalidatedBaselineCount`
+- `resolvedPreservationReceiptCount`
+- `retainedTombstoneCount`
+
+For release acceptance, W4 should require `comparisonEvidenceVersion == 1`, `unresolvedSubmissionCount == 0`, and `isClean`. An intentional invalidated physical-note revision fence and resolved preservation receipt are classified as durable evidence, not automatically as debt.
+
+## Transport handoff to W4
+
+The prepared-evidence overloads are the integration boundary:
+
+- `ModelAdapter.requeueMissingServerRecords(_:matchingPreparedUploads:)`
+- `ModelAdapter.didDelete(recordIDs:matchingPreparedDeletions:)`
+
+Core's `CloudKitE2ETransport` must forward the actual prepared uploads/deletions through these overloads; it must not reconstruct their evidence from public record names or generation strings. Generic/legacy adapters retain compatible generation-only defaults.
+
+W2's generic mutable-predecessor extension point and exact pending-generation protection are unchanged.
+
+## Native qualification
+
+GitHub Actions run `35530038608` qualified the **directly committed source**, not an applied patch:
+
+- commit: `3120e2caf68ffef4f3b16302046d706fc7172603`
+- source tree: `af5bfe9a13c7d44e299da4b4d5b9bfdb1413b898`
+- `RealmSwiftAdapter.swift` blob: `480c4135a76d9b54d51adecdf8f6f6abd363b92c`
+- disappearance tests blob: `72bbc542d32e08b345626f041002fd327338c1bd`
+- representation tests blob: `6e43979542b414c200fdedf65d281e9f3aac1ea5`
+- full XCTest: **647 executed, 1 skipped, 0 failures**
+- focused `SyncUndoCloseoutW1`: **28 executed, 0 failures**
+- macOS 15.7.9, Xcode 16.4 (16F6), Apple Swift 6.1.2
+- RealmSwiftGaps `2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2`
+- SwiftUtilities `f437c7d06fc631cd7a67731279411c417cdf8077`
+
+The focused suites cover remote deletion before upload; missing-server-before-feed equivalence; staged candidate retirement; delayed V1 with V2; stale failure after newer baseline; late acknowledgments after recreation; target/tracking crash recovery; local delete superseding staged save; uncertain first-save absence; retained negative control; full record/binding fences; normalized omissions/defaults/collections; required fields; actual-result rollback; namespace scoping; submission/evidence audit; and actual transport forwarding.
+
+Common has no standalone compatible native runner in this branch: its Swift package intentionally resolves BigSyncKit through the sibling local path, and W4 owns the final package/root composition. The two additional retained-model regressions were Swift-frontend parsed locally; their native discovery/execution remains an explicit W4 integration gate. No private Reader/Common source was copied into BigSyncKit's public vendor CI.
+
+## Remaining external/integration qualification
+
+W4 still owns:
+
+- selecting BigSyncKit W1 and Common W1 real heads together with W2/W3/W4 heads;
+- Core `CloudKitE2ETransport` prepared-evidence forwarding and audit telemetry exposure;
+- root/Tuist/test membership and actual Common/Core discovery;
+- genuine supported released-data upgrade qualification;
+- isolated signed macOS CloudKit/two-client release evidence.
+
+No simulator result, synthetic source fixture, personal production Realm or unsigned vendor run is represented as signed release evidence.
