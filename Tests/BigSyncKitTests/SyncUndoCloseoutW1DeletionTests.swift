@@ -53,7 +53,13 @@ extension SyncUndoCloseoutW1Tests {
         // Once V2 is accepted, even the previously legitimate delete evidence
         // cannot invalidate its new baseline or schedule another deletion.
         let acceptedRevision = reopened.objects(BigSyncRecordBaseline.self).first?.revision
-        try await restarted.didDelete(recordIDs: [incoming.recordID], matchingPreparedDeletions: deletion)
+        do {
+            try await restarted.didDelete(recordIDs: [incoming.recordID], matchingPreparedDeletions: deletion)
+        } catch is CancellationError {
+            // A restarted adapter may reject the old transport attempt before
+            // reaching comparison-revision validation. Both fences must leave
+            // the accepted recreated value and its journal untouched.
+        }
         XCTAssertEqual(reopened.objects(BigSyncRecordBaseline.self).first?.revision, acceptedRevision)
         try await quiet(restarted, realm: reopened)
     }

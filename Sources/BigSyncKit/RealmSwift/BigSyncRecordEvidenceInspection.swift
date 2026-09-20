@@ -74,6 +74,15 @@ extension RealmSwiftAdapter {
                 }
                 // A fence may outlive a physically deleted note. It is not
                 // missing-object debt and never grants mutation authority.
+                // A live recreation, however, still needs its journal until
+                // a server observation has installed an accepted comparison.
+                if let object = target(name, type: type, entityType: entityType),
+                   !BigSyncRecordLifecycle.isPhysicalDeletion(object) {
+                    let mutation = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
+                    if mutation.map({ eligible($0, entityType: entityType) }) != true {
+                        result.issues.append("invalidated-comparison-unexplained-live-target:\(name)")
+                    }
+                }
                 continue
             }
             result.acceptedBaselineCount += 1
