@@ -92,8 +92,10 @@ public enum BigSyncLegacyTrackingEvidence {
                 guard !entity.identifier.isEmpty,
                       !entity.entityType.isEmpty,
                       let encoded = entity.encodedRecord,
-                      let record = QSCoder.shared.object(from: encoded)
-                        as? CKRecord,
+                      let decompressed = ZSTDCompressor.shared
+                        .decompress(data: encoded),
+                      let record: CKRecord = QSCoder.shared
+                        .decode(from: decompressed),
                       record.recordID.recordName == entity.identifier,
                       record.recordType == entity.entityType else {
                     continue
@@ -103,9 +105,10 @@ public enum BigSyncLegacyTrackingEvidence {
                         recordName: entity.identifier,
                         entityType: entity.entityType,
                         recordChangeTag: record.recordChangeTag,
-                        deviceIdentifier: record[
-                            CloudKitSynchronizer.deviceUUIDKey
-                        ] as? String
+                        // Released tracking stores only CKRecord system
+                        // fields. Device authorship is proven separately from
+                        // the current-account v2 server record.
+                        deviceIdentifier: nil
                     )
                 )
             }
