@@ -1,0 +1,69 @@
+name: MR-UNDO-CLOSEOUT-20260920 W1 native qualification
+on:
+  push:
+    branches: [codex/undo-closeout-w1-sync-20260920]
+    paths:
+      - .github/workflows/undo-closeout-w1.yml
+      - Documentation/undo-closeout-20260920/session-1.md
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: undo-closeout-w1-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Record exact source and toolchain
+        working-directory: BigSyncKit
+        run: |
+          mkdir -p qualification-w1
+          git diff --exit-code
+          git rev-parse HEAD > qualification-w1/commit.txt
+          git rev-parse HEAD:Sources > qualification-w1/source-tree.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > qualification-w1/RealmSwiftGaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > qualification-w1/SwiftUtilities.txt
+          swift --version > qualification-w1/toolchain.txt
+          sw_vers >> qualification-w1/toolchain.txt
+          xcodebuild -version >> qualification-w1/toolchain.txt
+          # Public BigSyncKit source only; no application checkout or data.
+          git archive --format=tar.gz -o qualification-w1/source.tar.gz HEAD
+      - name: Discover and execute native Realm tests
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          extra=()
+          if swift test --help | grep -q -- '--disable-experimental-prebuilts'; then
+            extra+=(--disable-experimental-prebuilts)
+          fi
+          swift test --scratch-path .build-w1 "${extra[@]}" list 2>&1 | tee qualification-w1/discovery.log
+          swift test --scratch-path .build-w1 "${extra[@]}" --xunit-output qualification-w1/full.xml 2>&1 | tee qualification-w1/full.log
+          if grep -q 'SyncUndoCloseoutW1' qualification-w1/discovery.log; then
+            swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --filter SyncUndoCloseoutW1 --xunit-output qualification-w1/focused.xml 2>&1 | tee qualification-w1/focused.log
+          fi
+          git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: undo-closeout-w1-native
+          path: BigSyncKit/qualification-w1
+          retention-days: 14
