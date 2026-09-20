@@ -74,6 +74,8 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
             // download-only drain's immutable completion scope.
             fixture.synchronizer.syncMode = .sync
             XCTAssertFalse(try fixture.worker.requestFollowUpSynchronization(after: context))
+            let readiness = try await fixture.worker.domainTransitionReadiness(after: context)
+            XCTAssertEqual(readiness, .downloadOnly)
             XCTAssertFalse(fixture.synchronizer.synchronizationRequestedWhileRunning)
             return []
         }
@@ -138,6 +140,109 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testTransitionReadinessRechecksPendingWorkAndSemanticBlockers() async throws {
+        let fixture = try makeFixture()
+        var inspected = false
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            inspected = true
+            let ready = try await fixture.worker.domainTransitionReadiness(after: context)
+            XCTAssertEqual(ready, .ready)
+            fixture.adapter.pending = true
+            let pending = try await fixture.worker.domainTransitionReadiness(after: context)
+            XCTAssertEqual(pending, .pendingWork)
+            fixture.adapter.blockers = [.init(code: "test-semantic-recovery")]
+            let pendingAndBlocked = try await fixture.worker.domainTransitionReadiness(after: context)
+            XCTAssertEqual(pendingAndBlocked, .pendingWork)
+            fixture.adapter.pending = false
+            let blocked = try await fixture.worker.domainTransitionReadiness(after: context)
+            XCTAssertEqual(blocked, .blocked)
+            XCTAssertFalse(fixture.synchronizer.synchronizationRequestedWhileRunning,
+                           "Read-only inspection must not create a retry loop for semantic debt")
+            fixture.adapter.blockers = []
+            let recovered = try await fixture.worker.domainTransitionReadiness(after: context)
+            XCTAssertEqual(recovered, .ready)
+            return []
+        }
+        let result = try await fixture.synchronizer.synchronize()
+        XCTAssertTrue(inspected)
+        XCTAssertNotNil(result.receipt)
+        XCTAssertEqual(fixture.transport.recordMutationCount, 0)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testTransitionReadinessRejectsEarlierPassWithoutBlockingFreshWork() async throws {
+        let fixture = try makeFixture()
+        var previous: CloudKitSynchronizer.PrepublicationBoundaryContext?
+        var passes = 0
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            passes += 1
+            if let previous {
+                do {
+                    _ = try await fixture.worker.domainTransitionReadiness(after: previous)
+                    XCTFail("An earlier pass cannot authorize a transition")
+                } catch is CancellationError {}
+            } else {
+                previous = context
+                _ = try fixture.worker.requestFollowUpSynchronization(after: context)
+            }
+            let ready = try await fixture.worker.domainTransitionReadiness(after: context)
+            XCTAssertEqual(ready, .ready)
+            return []
+        }
+        _ = try await fixture.synchronizer.synchronize()
+        XCTAssertEqual(passes, 2)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testTransitionReadinessRejectsWorkerReplacementDuringInspection() async throws {
+        let fixture = try makeFixture()
+        let replacement = try makeFixture(account: "new-account")
+        var inspected = false
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            fixture.adapter.onInspection = {
+                fixture.worker._test_installSynchronizer(
+                    replacement.synchronizer, performsAccountAvailabilityPreflight: false
+                )
+            }
+            defer { fixture.adapter.onInspection = nil }
+            do {
+                _ = try await fixture.worker.domainTransitionReadiness(after: context)
+                XCTFail("A readiness result must still belong to the current worker")
+            } catch is CancellationError { inspected = true }
+            return []
+        }
+        _ = try await fixture.synchronizer.synchronize()
+        XCTAssertTrue(inspected)
+        XCTAssertFalse(replacement.synchronizer.synchronizationRequestedWhileRunning)
+        await fixture.stop()
+        await replacement.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledReadinessInspectionCannotAcquireCurrentPass() async throws {
+        let fixture = try makeFixture()
+        var rejected = false
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            let inspection = Task { @BigSyncBackgroundActor in
+                try await fixture.worker.domainTransitionReadiness(after: context)
+            }
+            inspection.cancel()
+            do {
+                _ = try await inspection.value
+                XCTFail("Cancellation must reject before readiness is returned")
+            } catch is CancellationError { rejected = true }
+            let fresh = try await fixture.worker.domainTransitionReadiness(after: context)
+            XCTAssertEqual(fresh, .ready)
+            return []
+        }
+        _ = try await fixture.synchronizer.synchronize()
+        XCTAssertTrue(rejected)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
     private func makeFixture(account: String = "follow-up-account") throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("bigsync-domain-follow-up-\(UUID().uuidString)", isDirectory: true)
@@ -155,11 +260,12 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
             accountReplacementPolicy: .localDatasetRebootstrap,
             logger: Logger(label: "DomainPrepublicationFollowUpTests")
         )
-        synchronizer.addModelAdapter(DomainFollowUpAdapter(zoneID: zone))
+        let adapter = DomainFollowUpAdapter(zoneID: zone)
+        synchronizer.addModelAdapter(adapter)
         let worker = BigSyncBackgroundActor()
         worker._test_installSynchronizer(synchronizer, performsAccountAvailabilityPreflight: false)
         let fixture = Fixture(directory: directory, worker: worker,
-                              synchronizer: synchronizer, transport: transport)
+                              synchronizer: synchronizer, transport: transport, adapter: adapter)
         addTeardownBlock { @BigSyncBackgroundActor in
             await fixture.stop()
             fixture.removeFiles()
@@ -173,10 +279,12 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
         let worker: BigSyncBackgroundActor
         let synchronizer: CloudKitSynchronizer
         let transport: DomainFollowUpTransport
+        let adapter: DomainFollowUpAdapter
 
         func stop() async {
             synchronizer.domainPrepublicationHandler = nil
             synchronizer.synchronizationWillConsumeServerChangesHandler = nil
+            adapter.onInspection = nil
             await synchronizer.cancelSynchronizationAndWait()
         }
 
@@ -224,6 +332,9 @@ private final class DomainFollowUpAdapter: NSObject, ModelAdapter, ChangeFeedRes
     weak var modelAdapterDelegate: ModelAdapterDelegate?
     var mergePolicy: MergePolicy = .server
     private var rebuilding = false
+    @BigSyncBackgroundActor var pending = false
+    @BigSyncBackgroundActor var blockers = [CloudKitSynchronizer.DomainBlocker]()
+    @BigSyncBackgroundActor var onInspection: (() -> Void)?
     init(zoneID: CKRecordZone.ID) { recordZoneID = zoneID }
     var hasChanges: Bool { false }
     func cleanUp() async throws {}
@@ -267,5 +378,10 @@ private final class DomainFollowUpAdapter: NSObject, ModelAdapter, ChangeFeedRes
     func didFinishImport() async throws {}
     func cancelSynchronization() {}
     func unsetCancellation() async throws {}
-    @BigSyncBackgroundActor func hasPendingChangesAtTerminalBoundary() throws -> Bool { false }
+    @BigSyncBackgroundActor func hasPendingChangesAtTerminalBoundary() throws -> Bool { pending }
+    @BigSyncBackgroundActor
+    func semanticPublicationBlockers() async throws -> [CloudKitSynchronizer.DomainBlocker] {
+        onInspection?()
+        return blockers
+    }
 }
