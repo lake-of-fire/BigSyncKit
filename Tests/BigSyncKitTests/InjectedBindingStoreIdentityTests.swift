@@ -39,6 +39,7 @@ final class InjectedBindingStoreIdentityTests: XCTestCase {
         try withResources { identity, store, root in
             let binding = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
             let reopened = FileKeyValueStore(fileURL: root.appendingPathComponent("bigsync-state.plist"), writesAtomically: true)
+            try reopened.prepareForUse()
             XCTAssertEqual(identity.currentMutationJournalIdentity(store: reopened)?.replicaBindingGenerationIdentifier, binding)
             XCTAssertEqual(try identity.prepareReplicaBindingGenerationIdentifier(store: reopened), binding)
         }
@@ -48,7 +49,7 @@ final class InjectedBindingStoreIdentityTests: XCTestCase {
         try withResources { identity, store, _ in
             _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
             let key = identity.durableStateNamespace + ".ReplicaBinding.v1"
-            try store.bigSyncDurableSet(["version": 999], forKey: key)
+            try store.bigSyncSetDurably(value: ["version": 999], forKey: key)
             XCTAssertNil(identity.currentMutationJournalIdentity(store: store))
             XCTAssertThrowsError(try identity.prepareReplicaBindingGenerationIdentifier(store: store))
             XCTAssertNil(identity.currentMutationJournalIdentity())
