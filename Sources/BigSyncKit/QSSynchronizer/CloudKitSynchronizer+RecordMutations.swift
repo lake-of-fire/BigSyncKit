@@ -365,7 +365,7 @@ extension CloudKitSynchronizer {
             if !missingRecordIDs.isEmpty {
                 try await adapter.requeueMissingServerRecords(
                     Array(missingRecordIDs),
-                    matchingPreparedGenerations: generations
+                    matchingPreparedUploads: prepared
                 )
                 try await revalidateActiveRunContext(for: attemptID)
             }
@@ -559,7 +559,7 @@ extension CloudKitSynchronizer {
             if !acknowledged.isEmpty {
                 try await adapter.didDelete(
                     recordIDs: acknowledged,
-                    matchingGenerations: generations
+                    matchingPreparedDeletions: prepared
                 )
                 try await revalidateActiveRunContext(for: attemptID)
             }
