@@ -73,7 +73,7 @@ extension RealmSwiftAdapter {
             BigSyncRecordBaseline.invalidate(recordName: name, in: realm)
         }
         guard let fence = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name),
-              fence.isComparisonInvalidated, fence.fields.isEmpty,
+              fence.isComparisonInvalidated, fence.fields.count == 0,
               fence.serverChangeTag == nil, fence.acceptedSystemFields == nil else {
             throw BigSyncRecordRebaseError.inconsistentReceipt(name)
         }
@@ -330,7 +330,7 @@ extension RealmSwiftAdapter {
             guard submitted == nil, let base, base.namespace == cut.context.namespace,
                   base.schemaSignature == contract.signature,
                   base.isComparisonInvalidated, !base.revision.isEmpty,
-                  base.fields.isEmpty, base.serverChangeTag == nil, base.acceptedSystemFields == nil,
+                  base.fields.count == 0, base.serverChangeTag == nil, base.acceptedSystemFields == nil,
                   object == nil || object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == true else {
                 throw BigSyncRecordRebaseError.inconsistentReceipt(name)
             }

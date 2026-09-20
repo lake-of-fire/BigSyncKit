@@ -117,7 +117,7 @@ extension RealmSwiftAdapter {
         }
 
         let trackedEntities = persistenceRealm.objects(SyncedEntity.self).filter {
-            ownedTypeNames.contains($0.entityType) && syncedEntityIsEligibleForActiveAccount($0)
+            ownedTypeNames.contains($0.entityType) && self.syncedEntityIsEligibleForActiveAccount($0)
         }
         var trackedEntitiesByName = [String: [SyncedEntity]]()
         for trackedEntity in trackedEntities {

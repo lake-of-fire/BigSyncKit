@@ -68,7 +68,7 @@ extension RealmSwiftAdapter {
             guard let (entityType, type) = ownedType(for: name) else { continue }
             if baseline.isComparisonInvalidated {
                 result.invalidatedBaselineCount += 1
-                if baseline.revision.isEmpty || !baseline.fields.isEmpty
+                if baseline.revision.isEmpty || baseline.fields.count != 0
                     || baseline.acceptedSystemFields != nil || baseline.serverChangeTag != nil {
                     result.issues.append("invalidated-comparison-evidence-inconsistent:\(name)")
                 }

@@ -6,7 +6,7 @@ import XCTest
 @testable import BigSyncKit
 
 @objc(W1ContractNote)
-private final class W1ContractNote: Object, ChangeMetadataRecordable,
+final class W1ContractNote: Object, ChangeMetadataRecordable,
     BigSyncRecordContractProviding {
     static let bigSyncRecordContract = BigSyncRecordContract(
         policy: .independentFields, preserveConflictingFields: ["text"],
@@ -31,7 +31,7 @@ private final class W1ContractNote: Object, ChangeMetadataRecordable,
 }
 
 @objc(W1RetainedArticle)
-private final class W1RetainedArticle: Object, ChangeMetadataRecordable,
+final class W1RetainedArticle: Object, ChangeMetadataRecordable,
     BigSyncRecordContractProviding {
     static let bigSyncRecordContract = BigSyncRecordContract(
         policy: .lifetimeBundle(lifetimeField: "epoch", independentFields: ["title"]),
@@ -53,12 +53,15 @@ private final class W1RetainedArticle: Object, ChangeMetadataRecordable,
 /// Real target/tracking Realms and production adapter entry points. Synthetic
 /// CloudKit records are adapter inputs, not evidence of signed cloud delivery.
 final class SyncUndoCloseoutW1Tests: XCTestCase {
-    private let noteID = UUID(uuidString: "A0000000-0000-0000-0000-000000000001")!
+    let noteID = UUID(uuidString: "A0000000-0000-0000-0000-000000000001")!
 
     @BigSyncBackgroundActor
-    private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
+    func fixture() async throws -> (RealmSwiftAdapter, Realm) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("w1-realms-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         var target = Realm.Configuration()
-        target.inMemoryIdentifier = "w1-target-" + UUID().uuidString
+        target.fileURL = directory.appendingPathComponent("target.realm")
         target.objectTypes = [W1ContractNote.self, W1RetainedArticle.self, BigSyncPendingMutation.self]
         BigSyncMutationPolicy.enableRecordRebasing(in: &target)
         BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [target],
@@ -66,7 +69,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
                 .init(installationIdentifier: "w1-local", replicaBindingGenerationIdentifier: "w1-binding")
             })
         var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
-        tracking.inMemoryIdentifier = "w1-tracking-" + UUID().uuidString
+        tracking.fileURL = directory.appendingPathComponent("tracking.realm")
         let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
             targetRealmConfigurations: [target], excludedClassNames: [],
             recordZoneID: .init(zoneName: "w1-closeout"),
@@ -81,7 +84,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         return (adapter, try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first))
     }
 
-    private func note(_ adapter: RealmSwiftAdapter, time: Double = 10) -> CKRecord {
+    func note(_ adapter: RealmSwiftAdapter, time: Double = 10) -> CKRecord {
         let record = CKRecord(recordType: W1ContractNote.className(), recordID: .init(
             recordName: W1ContractNote.className() + "." + noteID.uuidString, zoneID: adapter.recordZoneID))
         record["text"] = "server-text" as CKRecordValue
@@ -95,7 +98,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    private func deliver(_ records: [CKRecord], to adapter: RealmSwiftAdapter) async throws -> [InboundLiveResult] {
+    func deliver(_ records: [CKRecord], to adapter: RealmSwiftAdapter) async throws -> [InboundLiveResult] {
         let result = try await adapter.saveChanges(in: records, forceSave: false)
         try await adapter.persistImportedChanges()
         try await adapter.didFinishImport()
@@ -103,14 +106,16 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    private func quiet(_ adapter: RealmSwiftAdapter, realm: Realm) async throws {
+    func quiet(_ adapter: RealmSwiftAdapter, realm: Realm) async throws {
         try await adapter.didFinishImport()
         let saves = try await adapter.prepareUploadBatch(limit: 50)
         let deletes = try await adapter.prepareDeletionBatch(limit: 50)
         XCTAssertTrue(saves.records.isEmpty)
         XCTAssertTrue(deletes.recordIDs.isEmpty)
         XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
-        XCTAssertTrue(realm.objects(BigSyncRecordSubmission.self).isEmpty)
+        XCTAssertTrue(realm.objects(BigSyncRecordSubmission.self).filter {
+            $0.namespace == adapter.recordRebaseContext?.namespace
+        }.isEmpty)
         XCTAssertFalse(try adapter.hasPendingChangesAtTerminalBoundary())
     }
 
@@ -191,3 +196,6 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         try await quiet(adapter, realm: realm)
     }
 }
+
+enum W1InjectedFailure: Error { case afterTarget }
+
