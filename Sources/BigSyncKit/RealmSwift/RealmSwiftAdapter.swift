@@ -5708,6 +5708,11 @@ public final class RealmSwiftAdapter:
             entityType: syncedEntity.entityType
         ) else { return nil }
 
+        if let validator = object as? BigSyncOutboundSemanticObjectValidating,
+           let targetRealm = object.realm {
+            try validator.validateOutboundSemanticObject(in: targetRealm)
+        }
+
         if let contract = try BigSyncCompiledRecordContract.compile(object) {
             try requireRecordEvidenceSchema(in: object.realm!, entityType: object.objectSchema.className)
             guard recordRebaseContext != nil else {
@@ -6341,6 +6346,7 @@ public final class RealmSwiftAdapter:
                     dispositionsByRecordName[record.recordID.recordName] =
                         .validatedAuthoritativeOwnUpload
                 } catch {
+                    try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
                     let quarantine = try inboundSemanticQuarantine(
                         for: record,
                         error: error,
@@ -6378,8 +6384,7 @@ public final class RealmSwiftAdapter:
         }
     }
 
-    @BigSyncBackgroundActor
-    private func semanticReplacementDisposition(
+    private nonisolated func semanticReplacementDisposition(
         for record: CKRecord,
         objectClass: Object.Type,
         existingObject: Object?,
@@ -6394,6 +6399,7 @@ public final class RealmSwiftAdapter:
                 record, existingObject: existingObject
             )
         } catch {
+            try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
             guard pendingGeneration != nil, let existingObject,
                   let predecessorType = objectClass as?
                     BigSyncInboundPendingSemanticReplacementValidating.Type
@@ -6509,6 +6515,7 @@ public final class RealmSwiftAdapter:
                             record
                         )
                     } catch {
+                        try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
                         let quarantine = try inboundSemanticQuarantine(
                             for: record,
                             error: error,
@@ -6609,6 +6616,7 @@ public final class RealmSwiftAdapter:
                                         pendingGeneration: expectedMutationGeneration
                                     )
                             } catch {
+                                try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
                                 let quarantine = try inboundSemanticQuarantine(
                                     for: record,
                                     error: error,
@@ -6858,11 +6866,30 @@ public final class RealmSwiftAdapter:
                                         let currentExplicitlyModifiedAt =
                                             (object as? ChangeMetadataRecordable)?
                                                 .explicitlyModifiedAt
+                                        // Whole-record ordering must be recomputed inside
+                                        // the physical write, including a newer local edit
+                                        // committed after selection. No field merge or clock
+                                        // is involved in these model-owned dispositions.
+                                        let replacementDisposition: BigSyncInboundSemanticReplacementDisposition
+                                        if candidate.semanticReplacementDisposition == .preferIncomingRecord
+                                            || candidate.semanticReplacementDisposition == .preferExistingObject {
+                                            replacementDisposition = try self.semanticReplacementDisposition(
+                                                for: candidate.record,
+                                                objectClass: candidate.objectType,
+                                                existingObject: object,
+                                                pendingGeneration: currentMutationGeneration)
+                                        } else {
+                                            // Existing immutable/predecessor admission remains
+                                            // bound to the selected journal generation below.
+                                            replacementDisposition = candidate.semanticReplacementDisposition
+                                        }
+                                        let selectsWholeRecord = replacementDisposition == .preferIncomingRecord
+                                            || replacementDisposition == .preferExistingObject
                                         // Recompute against the current target and its atomic
                                         // comparison base, not a selection-time field snapshot.
                                         // Unsupported/custom semantic paths keep their old fence.
                                         if let comparisonContext,
-                                           candidate.semanticReplacementDisposition == .applyIncomingRecord {
+                                           replacementDisposition == .applyIncomingRecord {
                                             let result = try self.applyRecordRebase(
                                                 record: candidate.record, objectType: candidate.objectType,
                                                 objectIdentifier: candidate.objectIdentifier,
@@ -6883,11 +6910,11 @@ public final class RealmSwiftAdapter:
                                                 continue
                                             }
                                         }
-                                        guard currentMutationGeneration
-                                                == candidate.expectedMutationGeneration,
-                                              currentModifiedAt == candidate.expectedModifiedAt,
-                                              currentExplicitlyModifiedAt
-                                                == candidate.expectedExplicitlyModifiedAt else {
+                                        guard selectsWholeRecord || (
+                                              currentMutationGeneration == candidate.expectedMutationGeneration
+                                              && currentModifiedAt == candidate.expectedModifiedAt
+                                              && currentExplicitlyModifiedAt == candidate.expectedExplicitlyModifiedAt
+                                        ) else {
                                             if let currentMutationGeneration {
                                                 preservedDispositionsByRecordName[
                                                     candidate.syncedEntityID
@@ -6909,7 +6936,24 @@ public final class RealmSwiftAdapter:
                                             )
                                             continue
                                         }
-                                        if currentMutationGeneration != nil {
+                                        if replacementDisposition == .preferExistingObject {
+                                            guard let metadata = object as? ChangeMetadataRecordable else {
+                                                throw BigSyncSemanticAdmissionUnavailable(entityType: candidate.entityType)
+                                            }
+                                            if currentMutationGeneration == nil {
+                                                metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
+                                            }
+                                            guard let generation = targetWriterRealm.object(
+                                                ofType: BigSyncPendingMutation.self,
+                                                forPrimaryKey: candidate.syncedEntityID)?.generation else {
+                                                throw BigSyncSemanticAdmissionUnavailable(entityType: candidate.entityType)
+                                            }
+                                            preservedDispositionsByRecordName[candidate.syncedEntityID] =
+                                                .preservedPendingLocal(generation: generation)
+                                            continue
+                                        }
+                                        if currentMutationGeneration != nil,
+                                           replacementDisposition != .preferIncomingRecord {
                                             // The durable local journal is the
                                             // authority for user intent. Keep
                                             // the target values untouched while
@@ -6924,9 +6968,7 @@ public final class RealmSwiftAdapter:
                                             )
                                             continue
                                         }
-                                        if candidate
-                                            .semanticReplacementDisposition
-                                            == .preserveExistingObject {
+                                        if replacementDisposition == .preserveExistingObject {
                                             // Immutable semantic records may
                                             // accept newer CloudKit system
                                             // fields without allowing audit or
@@ -6970,8 +7012,22 @@ public final class RealmSwiftAdapter:
                                                     entityType: candidate.entityType,
                                                     isNewlyCreatedReceiver: isNewlyCreatedReceiver,
                                                     acceptsServerSnapshot: acceptsServerSnapshot
+                                                        || replacementDisposition == .preferIncomingRecord
                                                 )
                                             )
+                                            if replacementDisposition == .preferIncomingRecord,
+                                               let currentMutationGeneration {
+                                                guard let metadata = object as? ChangeMetadataRecordable else {
+                                                    throw BigSyncSemanticAdmissionUnavailable(entityType: candidate.entityType)
+                                                }
+                                                metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
+                                                guard let generation = targetWriterRealm.object(
+                                                    ofType: BigSyncPendingMutation.self,
+                                                    forPrimaryKey: candidate.syncedEntityID)?.generation,
+                                                    generation != currentMutationGeneration else {
+                                                    throw BigSyncSemanticAdmissionUnavailable(entityType: candidate.entityType)
+                                                }
+                                            }
                                             appliedRecordNames.insert(
                                                 candidate.syncedEntityID
                                             )
@@ -7342,6 +7398,7 @@ public final class RealmSwiftAdapter:
                         existingObject: localObject
                     )
                 } catch {
+                    try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
                     let quarantine = inboundSemanticDeletionQuarantine(
                         for: recordID,
                         entityType: entityType,

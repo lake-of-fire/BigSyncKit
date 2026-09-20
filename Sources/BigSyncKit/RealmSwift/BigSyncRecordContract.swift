@@ -75,8 +75,10 @@ public enum BigSyncRecordContractError: Error, Equatable {
 /// Queue transitions cannot change a model's deletion representation.
 enum BigSyncRecordLifecycle {
     static func retainsTombstone(_ type: Object.Type) -> Bool {
-        (type as? BigSyncRecordContractProviding.Type)?
-            .bigSyncRecordContract.deletion == .retained
+        if (type as? BigSyncRecordContractProviding.Type)?
+            .bigSyncRecordContract.deletion == .retained { return true }
+        guard type is BigSyncRetainsSyncedTombstone.Type else { return false }
+        return (type.init() as? BigSyncRetainsSyncedTombstone)?.retainsSyncedTombstone == true
     }
 
     static func isPhysicalDeletion(_ object: Object) -> Bool {
