@@ -31,7 +31,7 @@ final class BigSyncLegacyTrackingEvidenceTests: XCTestCase {
                 zoneID: zoneID
             )
         )
-        syncedRecord[CloudKitSynchronizer.deviceUUIDKey] =
+        syncedRecord[BigSyncLegacyTrackingEvidence.legacyDeviceMetadataKey] =
             "released-device-a" as CKRecordValue
         let pendingRecord = CKRecord(
             recordType: "Bookmark",
