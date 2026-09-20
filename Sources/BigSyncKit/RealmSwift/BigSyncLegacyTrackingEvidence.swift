@@ -25,6 +25,8 @@ public struct BigSyncLegacyTrackedRecordEvidence: Sendable, Equatable {
 }
 
 public enum BigSyncLegacyTrackingEvidence {
+    public static let legacyDeviceMetadataKey =
+        "QSCloudKitDeviceUUIDKey"
     public static func trackingRealmURL(
         appGroup: String,
         zoneID: CKRecordZone.ID
