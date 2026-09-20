@@ -68,6 +68,8 @@ jobs:
           git archive --format=tar.gz -o qualification-w1/source.tar.gz HEAD
       - name: Discover and execute native Realm tests
         working-directory: BigSyncKit
+        env:
+          SWIFT_BACKTRACE: enable=yes
         run: |
           set -euo pipefail
           extra=()
@@ -83,6 +85,15 @@ jobs:
           swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --filter SyncUndoCloseoutW1 --xunit-output qualification-w1/focused.xml 2>&1 | tee qualification-w1/focused.log | xcsift -f json --exit-on-failure || focused_status=$?
           printf 'full=%s\nfocused=%s\n' "$full_status" "$focused_status" > qualification-w1/status.txt
           test "$full_status" -eq 0 && test "$focused_status" -eq 0
+      - name: Diagnose native delete-restart crash
+        if: failure()
+        continue-on-error: true
+        working-directory: BigSyncKit
+        run: |
+          set -o pipefail
+          bundle="$(find "$PWD/.build-w1" -name BigSyncKitPackageTests.xctest -type d -print -quit)"
+          test -n "$bundle"
+          xcrun lldb --batch -o run -o 'thread backtrace all' -- "$(xcrun -f xctest)" -XCTest 'BigSyncKitTests.SyncUndoCloseoutW1Tests/testDeleteTargetFirstCrashFinishesTrackingWithoutAnotherServerDelete' "$bundle" 2>&1 | tee qualification-w1/delete-restart-backtrace.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
