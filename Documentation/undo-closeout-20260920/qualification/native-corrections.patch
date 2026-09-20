@@ -1,5 +1,13 @@
 --- a/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
 +++ b/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+@@ -7926,6 +7926,6 @@
+         // Evidence recovery can complete a tracking disposition. Snapshot
+         // keys, not a live Realm query being mutated by that queued write.
+-        let identifiers = deletedEntities.map(\.identifier)
++        let identifiers = Array(deletedEntities.map(\.identifier))
+         for identifier in identifiers {
+             guard let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self,
+                 forPrimaryKey: identifier), syncedEntity.entityState == .deletedLocally else { continue }
 @@ -9803,8 +9803,8 @@
                              && base?.fieldDigests == proof.fields
                              && base?.schemaSignature == proof.schemaSignature

@@ -43,7 +43,7 @@ jobs:
           test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = d10af4388f8e2990e8d631e3102c10f883514bbf
           git apply --check Documentation/undo-closeout-20260920/qualification/native-corrections.patch
           git apply Documentation/undo-closeout-20260920/qualification/native-corrections.patch
-          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = 2c046ae7913cd783ab55d273f18c982cbff1cb27
+          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = 480c4135a76d9b54d51adecdf8f6f6abd363b92c
           test "$(git hash-object Tests/BigSyncKitTests/SyncUndoCloseoutW1DisappearanceTests.swift)" = 72bbc542d32e08b345626f041002fd327338c1bd
           test "$(git hash-object Tests/BigSyncKitTests/SyncUndoCloseoutW1RepresentationTests.swift)" = 6e43979542b414c200fdedf65d281e9f3aac1ea5
       - name: Install structured build output
@@ -69,7 +69,7 @@ jobs:
       - name: Discover and execute native Realm tests
         working-directory: BigSyncKit
         env:
-          SWIFT_BACKTRACE: enable=yes
+          SWIFT_BACKTRACE: enable=yes,interactive=no
         run: |
           set -euo pipefail
           extra=()
@@ -93,7 +93,7 @@ jobs:
           set -o pipefail
           bundle="$(find "$PWD/.build-w1" -name BigSyncKitPackageTests.xctest -type d -print -quit)"
           test -n "$bundle"
-          xcrun lldb --batch -o run -o 'thread backtrace all' -- "$(xcrun -f xctest)" -XCTest 'BigSyncKitTests.SyncUndoCloseoutW1Tests/testDeleteTargetFirstCrashFinishesTrackingWithoutAnotherServerDelete' "$bundle" 2>&1 | tee qualification-w1/delete-restart-backtrace.log
+          xcrun lldb --batch -o run -k 'thread backtrace all' -- "$(xcrun -f xctest)" -XCTest 'BigSyncKitTests.SyncUndoCloseoutW1Tests/testDeleteTargetFirstCrashFinishesTrackingWithoutAnotherServerDelete' "$bundle" 2>&1 | tee qualification-w1/delete-restart-backtrace.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
