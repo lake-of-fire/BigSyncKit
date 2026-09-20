@@ -5,6 +5,9 @@ on:
     paths:
       - .github/workflows/undo-closeout-w1.yml
       - Documentation/undo-closeout-20260920/session-1.md
+      - Sources/BigSyncKit/**
+      - Tests/BigSyncKitTests/**
+      - Package.swift
   workflow_dispatch:
 permissions:
   contents: read
@@ -33,19 +36,6 @@ jobs:
           ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
-      - name: Apply exact review candidate (temporary qualification checkpoint)
-        working-directory: BigSyncKit
-        run: |
-          set -euo pipefail
-          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = d3ace2cd74f4068f18122c580b6fa09cde072d33
-          git apply --check Documentation/undo-closeout-20260920/qualification/RealmSwiftAdapter.patch
-          git apply Documentation/undo-closeout-20260920/qualification/RealmSwiftAdapter.patch
-          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = d10af4388f8e2990e8d631e3102c10f883514bbf
-          git apply --check Documentation/undo-closeout-20260920/qualification/native-corrections.patch
-          git apply Documentation/undo-closeout-20260920/qualification/native-corrections.patch
-          test "$(git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift)" = 480c4135a76d9b54d51adecdf8f6f6abd363b92c
-          test "$(git hash-object Tests/BigSyncKitTests/SyncUndoCloseoutW1DisappearanceTests.swift)" = 72bbc542d32e08b345626f041002fd327338c1bd
-          test "$(git hash-object Tests/BigSyncKitTests/SyncUndoCloseoutW1RepresentationTests.swift)" = 6e43979542b414c200fdedf65d281e9f3aac1ea5
       - name: Install structured build output
         run: brew install xcsift
       - name: Record exact source and toolchain
@@ -53,11 +43,12 @@ jobs:
         run: |
           mkdir -p qualification-w1
           git rev-parse HEAD > qualification-w1/commit.txt
-          git rev-parse HEAD:Sources > qualification-w1/input-source-tree.txt
-          git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift > qualification-w1/applied-adapter-blob.txt
-          shasum -a 256 Documentation/undo-closeout-20260920/qualification/*.patch > qualification-w1/candidate-patches.sha256
-          git diff --binary > qualification-w1/applied-candidate.patch
-          tar -czf qualification-w1/applied-source.tar.gz Sources Tests Package.swift
+          git diff --exit-code
+          git rev-parse HEAD:Sources > qualification-w1/source-tree.txt
+          git hash-object Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift > qualification-w1/adapter-blob.txt
+          git hash-object Tests/BigSyncKitTests/SyncUndoCloseoutW1DisappearanceTests.swift > qualification-w1/disappearance-tests-blob.txt
+          git hash-object Tests/BigSyncKitTests/SyncUndoCloseoutW1RepresentationTests.swift > qualification-w1/representation-tests-blob.txt
+          tar -czf qualification-w1/direct-source.tar.gz Sources Tests Package.swift
           git -C ../RealmSwiftGaps rev-parse HEAD > qualification-w1/RealmSwiftGaps.txt
           git -C ../SwiftUtilities rev-parse HEAD > qualification-w1/SwiftUtilities.txt
           swift --version > qualification-w1/toolchain.txt
@@ -85,6 +76,7 @@ jobs:
           swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --filter SyncUndoCloseoutW1 --xunit-output qualification-w1/focused.xml 2>&1 | tee qualification-w1/focused.log | xcsift -f json --exit-on-failure || focused_status=$?
           printf 'full=%s\nfocused=%s\n' "$full_status" "$focused_status" > qualification-w1/status.txt
           test "$full_status" -eq 0 && test "$focused_status" -eq 0
+          git diff --exit-code
       - name: Diagnose native delete-restart crash
         if: failure()
         continue-on-error: true

@@ -135,14 +135,16 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(realm.objects(W1ContractNote.self).count, 2)
         let receipt = try XCTUnwrap(realm.objects(BigSyncRecordConflict.self).first)
         XCTAssertTrue(receipt.isResolved && receipt.isPreservationReceipt)
-        // The already accepted original has no pending upload. Keep the known
-        // incoming server record in the inventory alongside the new note copy.
+        // Seed the server inventory with the accepted original, then apply
+        // successful saves by full ID (the journal may also save the original).
         try await adapter.didFinishImport()
         let copies = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
         try await adapter.didUpload(savedRecords: copies.map(\.record), matchingPreparedUploads: copies)
         try await adapter.cleanUp()
         try await quiet(adapter, realm: realm)
-        let audit = try await adapter.auditSynchronizationState(serverRecords: [incoming] + copies.map(\.record))
+        var inventory = [incoming.recordID: incoming]
+        for item in copies { inventory[item.record.recordID] = item.record }
+        let audit = try await adapter.auditSynchronizationState(serverRecords: Array(inventory.values))
         XCTAssertEqual(audit.resolvedPreservationReceiptCount, 1)
         XCTAssertEqual(audit.unresolvedSubmissionCount, 0)
         XCTAssertTrue(audit.isClean, audit.issues.joined(separator: ","))

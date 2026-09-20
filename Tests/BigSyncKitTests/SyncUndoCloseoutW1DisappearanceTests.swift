@@ -7,14 +7,15 @@ import XCTest
 
 extension SyncUndoCloseoutW1Tests {
     /// Native CKRecord archive fixture. This is not signed CloudKit evidence.
-    /// Assert the SDK supplies its setter before KVC to avoid an ObjC exception
-    /// being mistaken for the intended adapter behavioral counterexample.
+    /// Use the SDK's system-field setter, not CKRecord.setValue(forKey:),
+    /// which writes user fields and rejects the reserved recordChangeTag key.
+    /// The round-trip assertion verifies the resulting real system archive.
     func tagged(_ record: CKRecord, _ tag: String) throws -> CKRecord {
         guard record.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
             throw NSError(domain: "W1NativeFixture", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "This CloudKit SDK cannot construct the tagged record fixture"])
         }
-        record.setValue(tag, forKey: "recordChangeTag")
+        _ = record.perform(NSSelectorFromString("setRecordChangeTag:"), with: tag as NSString)
         XCTAssertEqual(record.recordChangeTag, tag)
         let decoded = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(record))
         XCTAssertEqual(decoded.recordChangeTag, tag)
