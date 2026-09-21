@@ -35,6 +35,15 @@ public enum BigSyncInboundSemanticReplacementDisposition: Sendable, Equatable {
     /// Keep the existing target object byte-for-byte while still accepting
     /// the received CKRecord as current tracking/system-field evidence.
     case preserveExistingObject
+
+    /// Select the complete incoming value independently of timestamp order.
+    /// Replacing pending work mints a new journal generation so an old upload
+    /// acknowledgement cannot clear the selected value.
+    case preferIncomingRecord
+
+    /// Select the complete existing value and retain or enqueue its upload
+    /// without manufacturing a new modification timestamp.
+    case preferExistingObject
 }
 
 public protocol BigSyncInboundSemanticReplacementValidating {
@@ -59,6 +68,33 @@ public extension BigSyncInboundSemanticReplacementValidating {
             existingObject: existingObject
         )
         return .applyIncomingRecord
+    }
+}
+
+/// Missing local authority is retryable, not proof of corrupt remote data.
+public struct BigSyncSemanticAdmissionUnavailable: Error, Equatable, Sendable {
+    public let entityType: String
+    public init(entityType: String) { self.entityType = entityType }
+}
+
+/// Validate the actual managed value before preparing an upload.
+public protocol BigSyncOutboundSemanticObjectValidating {
+    func validateOutboundSemanticObject(in realm: Realm) throws
+}
+
+/// Structural selectors must retain their identity through acknowledgement,
+/// cleanup and destination reseeding. This is a type-wide lifecycle contract;
+/// the value must be constant for every instance, including a default instance.
+public protocol BigSyncRetainsSyncedTombstone {
+    var retainsSyncedTombstone: Bool { get }
+}
+
+enum BigSyncInboundValidationErrors {
+    static func rethrowNonSemantic(_ error: any Error) throws {
+        try Task.checkCancellation()
+        if error is CancellationError || error is BigSyncSemanticAdmissionUnavailable {
+            throw error
+        }
     }
 }
 
