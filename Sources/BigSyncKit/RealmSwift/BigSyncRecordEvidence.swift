@@ -16,6 +16,18 @@ public final class BigSyncRecordSubmission: Object {
     @Persisted public var comparisonRevision: String?
     @Persisted public var fields: Map<String, Data>
     @Persisted public var payload = Data()
+
+    /// Include the exact persisted archive (record type, full ID/zone and CAS
+    /// tag), comparison revision, generation and digests. Equal user values in
+    /// a recreated lifetime are not the same submitted candidate.
+    var candidateIdentity: String {
+        let payloadDigest = Data(SHA256.hash(data: payload)).base64EncodedString()
+        let fieldParts = fields.keys.sorted().flatMap { [$0, fields[$0]!.base64EncodedString()] }
+        return "submission-v1:" + BigSyncRecordPayload.identity([
+            namespace, recordName, schemaSignature, generation,
+            comparisonRevision.map { "some:" + $0 } ?? "none", payloadDigest,
+        ] + fieldParts)
+    }
 }
 
 /// Explicit, local-only preservation of incomparable values. Retention is

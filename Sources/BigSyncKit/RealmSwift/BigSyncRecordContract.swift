@@ -20,6 +20,7 @@ public struct BigSyncRecordContract: Sendable, Equatable {
     public let atomicFieldGroups: [Set<String>]
     public let expectedFields: Set<String>?
     public let preserveConflictingFields: Set<String>
+    public let incomingRepresentation: BigSyncIncomingRepresentationPolicy
 
     public init(
         policy: BigSyncRecordRebasePolicy,
@@ -27,7 +28,8 @@ public struct BigSyncRecordContract: Sendable, Equatable {
         semanticMetadataFields: Set<String> = [],
         atomicFieldGroups: [Set<String>] = [],
         expectedFields: Set<String>? = nil,
-        preserveConflictingFields: Set<String> = []
+        preserveConflictingFields: Set<String> = [],
+        incomingRepresentation: BigSyncIncomingRepresentationPolicy = .strict
     ) {
         self.policy = policy
         self.deletion = deletion
@@ -35,6 +37,7 @@ public struct BigSyncRecordContract: Sendable, Equatable {
         self.atomicFieldGroups = atomicFieldGroups
         self.expectedFields = expectedFields
         self.preserveConflictingFields = preserveConflictingFields
+        self.incomingRepresentation = incomingRepresentation
     }
 }
 
@@ -113,6 +116,7 @@ struct BigSyncCompiledRecordContract: Sendable {
         if let expected = contract.expectedFields, fields != expected {
             throw BigSyncRecordContractError.unclassifiedFields(name)
         }
+        try contract.incomingRepresentation.validate(for: object)
         var grouped = Set<String>()
         for group in contract.atomicFieldGroups {
             guard !group.isEmpty, group.isSubset(of: fields), grouped.isDisjoint(with: group) else {
@@ -137,7 +141,8 @@ struct BigSyncCompiledRecordContract: Sendable {
                 throw BigSyncRecordContractError.invalidDeclaration(name)
             }
         }
-        var parts = ["bigsync-record-contract-v1", name, contract.deletion.rawValue]
+        var parts = ["bigsync-record-contract-v2", name, contract.deletion.rawValue]
+        parts += contract.incomingRepresentation.signatureParts
         switch contract.policy {
         case .disabled: parts.append("disabled")
         case .atomicRecord: parts.append("atomic")

@@ -386,12 +386,30 @@ public protocol ModelAdapter: AnyObject, Sendable {
         matchingGenerations: [String: String]
     ) async throws
 
+    /// The complete prepared deletion also fences comparison/submission
+    /// evidence. A delayed delete receipt may retire its superseded save while
+    /// leaving a newer recreation's journal and value untouched.
+    @BigSyncBackgroundActor
+    func didDelete(
+        recordIDs: [CKRecord.ID], matchingPreparedDeletions: [PreparedRecordDeletion]
+    ) async throws
+
     /// Requeues an upload rejected as missing on the server without
     /// overwriting a newer mutation that arrived after preparation.
     @BigSyncBackgroundActor
     func requeueMissingServerRecords(
         _ recordIDs: [CKRecord.ID],
         matchingPreparedGenerations: [String: String]
+    ) async throws
+
+    /// Preparation-aware retry. Adapters with adopted comparison contracts
+    /// validate the exact candidate and accepted comparison revision before
+    /// retiring obsolete evidence. A failed V1 may repair that still-current
+    /// base without acknowledging or discarding a newer V2 journal mutation.
+    @BigSyncBackgroundActor
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedUploads: [PreparedRecordUpload]
     ) async throws
 
     /// Rebases only the cached CloudKit system fields for local deletions that
@@ -579,6 +597,27 @@ public extension ModelAdapter {
     }
 }
 
+public extension ModelAdapter {
+    @BigSyncBackgroundActor
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedUploads prepared: [PreparedRecordUpload]
+    ) async throws {
+        var generations = [String: String]()
+        var identities = Set<CKRecord.ID>()
+        for item in prepared {
+            guard identities.insert(item.record.recordID).inserted else {
+                throw BigSyncRecordRebaseError.inconsistentReceipt(item.record.recordID.recordName)
+            }
+            generations[item.record.recordID.recordName] = item.generation
+        }
+        guard recordIDs.allSatisfy({ identities.contains($0) }) else {
+            throw RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared
+        }
+        try await requeueMissingServerRecords(recordIDs, matchingPreparedGenerations: generations)
+    }
+}
+
 public enum ModelAdapterDeletionConflictError: Error, Equatable {
     case tombstonePreservingRebaseNotImplemented
 }
@@ -608,10 +647,19 @@ public struct PreparedRecordUpload: @unchecked Sendable {
 public struct PreparedRecordDeletion: Sendable {
     public let recordID: CKRecord.ID
     public let generation: String?
+    let evidence: BigSyncPreparedDeletionEvidence?
 
     public init(recordID: CKRecord.ID, generation: String?) {
         self.recordID = recordID
         self.generation = generation
+        self.evidence = nil
+    }
+
+    init(recordID: CKRecord.ID, generation: String,
+         evidence: BigSyncPreparedDeletionEvidence) {
+        self.recordID = recordID
+        self.generation = generation
+        self.evidence = evidence
     }
 }
 
@@ -631,5 +679,24 @@ public extension ModelAdapter {
             generations[item.record.recordID.recordName] = item.generation
         }
         try await didUpload(savedRecords: savedRecords, matchingGenerations: generations)
+    }
+}
+
+public extension ModelAdapter {
+    @BigSyncBackgroundActor
+    func didDelete(recordIDs: [CKRecord.ID], matchingPreparedDeletions: [PreparedRecordDeletion]) async throws {
+        var byID = [CKRecord.ID: PreparedRecordDeletion]()
+        for item in matchingPreparedDeletions {
+            guard byID.updateValue(item, forKey: item.recordID) == nil else {
+                throw RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared
+            }
+        }
+        guard Set(recordIDs).count == recordIDs.count,
+              recordIDs.allSatisfy({ byID[$0] != nil }) else {
+            throw RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared
+        }
+        var generations = [String: String]()
+        for recordID in recordIDs { generations[recordID.recordName] = byID[recordID]?.generation }
+        try await didDelete(recordIDs: recordIDs, matchingGenerations: generations)
     }
 }
