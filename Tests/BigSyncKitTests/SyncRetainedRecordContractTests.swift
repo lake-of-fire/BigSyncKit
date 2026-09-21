@@ -536,8 +536,20 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         let first = try await adapter.prepareUploadBatch(limit: 10)
         let unbound = try BigSyncRecordPayload.encode(try XCTUnwrap(first.records.first))
         try realm.write { control.digest = "bound"; control.refreshChangeMetadata(explicitlyModified: true) }
-        _ = try await deliver([BigSyncRecordPayload.decode(unbound)], to: adapter)
+        let boundGeneration = try XCTUnwrap(
+            realm.objects(BigSyncPendingMutation.self).first?.generation
+        )
+        let accepted = try await deliver([BigSyncRecordPayload.decode(unbound)], to: adapter)
+        XCTAssertEqual(
+            accepted.map(\.disposition),
+            [.preservedPendingLocal(generation: boundGeneration)]
+        )
         XCTAssertEqual(control.digest, "bound")
+        XCTAssertEqual(
+            realm.objects(BigSyncPendingMutation.self).first?.generation,
+            boundGeneration,
+            "Accepting server baseline evidence must not relabel the pending semantic extension"
+        )
         XCTAssertTrue(realm.objects(BigSyncRecordSubmission.self).isEmpty)
         let bound = try await adapter.prepareUploadBatch(limit: 10)
         XCTAssertEqual(bound.records.first?["digest"] as? String, "bound")
