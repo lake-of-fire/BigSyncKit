@@ -9622,7 +9622,9 @@ extension RealmSwiftAdapter {
             // loop that could otherwise starve unrelated upload work.
             _ = try applyComparisonFields([], record: record, decoded: remoteObject, object: object,
                 isNew: false, objectIdentifier: objectIdentifier, local: local,
-                remote: remote, pending: true, context: context, in: realm)
+                remote: remote, pending: true,
+                preservesPendingMutationGeneration: true,
+                context: context, in: realm)
             if let submitted = matchingSubmission(recordName: name, context: context, in: realm) {
                 realm.delete(submitted)
             }
@@ -9679,7 +9681,9 @@ extension RealmSwiftAdapter {
     private func applyComparisonFields(
         _ incoming: Set<String>, record: CKRecord, decoded: Object, object: Object, isNew: Bool,
         objectIdentifier: any Sendable, local: [String: Data], remote: [String: Data],
-        pending: Bool, context: BigSyncRecordRebaseContext, in realm: Realm
+        pending: Bool,
+        preservesPendingMutationGeneration: Bool = false,
+        context: BigSyncRecordRebaseContext, in realm: Realm
     ) throws -> Bool {
         precondition(realm.isInWriteTransaction)
         var merged = local
@@ -9733,7 +9737,13 @@ extension RealmSwiftAdapter {
                 systemFields: try BigSyncRecordPayload.systemFields(of: record), in: realm
             )
         }
-        if (pending && (changedBase || merged != local)) || (!pending && merged != remote) {
+        // A validated semantic predecessor already belongs to the exact
+        // pending extension generation. Its newly accepted comparison
+        // revision fences older prepared receipts, so relabeling the sole
+        // journal here would lose exact-generation ownership.
+        if (pending && (changedBase || merged != local)
+                && !preservesPendingMutationGeneration)
+            || (!pending && merged != remote) {
             // A changed ancestor also invalidates older upload receipts even
             // when conflict selection retained every local payload field.
             (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
