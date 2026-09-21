@@ -2,7 +2,9 @@ name: Hotfix findings union qualification
 
 on:
   push:
-    branches: [fix/hotfix-findings-union-20260912]
+    branches:
+      - fix/hotfix-findings-union-20260912
+      - codex/undo-closeout-w4-binding-resources-20260920
   workflow_dispatch:
 
 permissions:
@@ -56,6 +58,11 @@ jobs:
           xcrun --show-sdk-version >> qualification-toolchain.txt
           git -C ../RealmSwiftGaps rev-parse HEAD > qualification-RealmSwiftGaps.txt
           git -C ../SwiftUtilities rev-parse HEAD > qualification-SwiftUtilities.txt
+
+      - name: Discover and execute the four W4 binding-store regressions
+        if: github.ref == 'refs/heads/codex/undo-closeout-w4-binding-resources-20260920'
+        working-directory: BigSyncKit
+        run: python3 .github/qualify_w4_binding_resources.py
 
       - name: Native package qualification
         working-directory: BigSyncKit

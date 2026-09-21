@@ -37,7 +37,11 @@ public enum BigSyncLifetimeID {
 
     /// nil means both inputs are unversioned: the caller uses its legacy
     /// base-aware policy, never pretending random UUID order is causality.
-    static func prefersIncoming(local: String?, incoming: String?) throws -> Bool? {
+    ///
+    /// Public so a bounded domain intake can use exactly the same ordering as
+    /// record reconciliation. Ordering alone does not authorize repair: callers
+    /// must prove intake provenance, immutable scope and the current lease.
+    public static func prefersIncoming(local: String?, incoming: String?) throws -> Bool? {
         let left = try components(local), right = try components(incoming)
         guard left.generation != 0 || right.generation != 0 else { return nil }
         if left.generation != right.generation { return right.generation > left.generation }
