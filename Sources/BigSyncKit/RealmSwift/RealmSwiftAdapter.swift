@@ -6949,6 +6949,10 @@ public final class RealmSwiftAdapter:
                                             case .committed:
                                                 appliedRecordNames.insert(candidate.syncedEntityID)
                                                 continue
+                                            case let .preservedPendingLocal(generation):
+                                                preservedDispositionsByRecordName[candidate.syncedEntityID] =
+                                                    .preservedPendingLocal(generation: generation)
+                                                continue
                                             case .preservedDeletion:
                                                 preservedDispositionsByRecordName[candidate.syncedEntityID] =
                                                     .preservedPendingLocal(generation: currentMutationGeneration ?? "")
@@ -9552,6 +9556,7 @@ extension RealmSwiftAdapter {
     private enum RecordApplication {
         case notAdopted
         case committed
+        case preservedPendingLocal(generation: String)
         case preservedDeletion
         case unresolved(String)
     }
@@ -9616,6 +9621,11 @@ extension RealmSwiftAdapter {
             try BigSyncLifetimeID.validate(lifetime(remoteObject))
         }
         if preservesValidatedPredecessor {
+            guard let pending else {
+                throw BigSyncSemanticAdmissionUnavailable(
+                    entityType: objectType.className()
+                )
+            }
             // This validated exception admits the observed server baseline,
             // never property-level replacement of a pending bound catalog.
             // Retiring its uncertain candidate also prevents a fetch/reprepare
@@ -9628,7 +9638,7 @@ extension RealmSwiftAdapter {
             if let submitted = matchingSubmission(recordName: name, context: context, in: realm) {
                 realm.delete(submitted)
             }
-            return .committed
+            return .preservedPendingLocal(generation: pending.generation)
         }
         let decision = try BigSyncRecordReconciliationPlanner.plan(
             base: base, local: local, remote: remote, policy: policy,

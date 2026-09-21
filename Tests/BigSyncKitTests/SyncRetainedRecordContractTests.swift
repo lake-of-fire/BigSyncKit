@@ -539,7 +539,11 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         let boundGeneration = try XCTUnwrap(
             realm.objects(BigSyncPendingMutation.self).first?.generation
         )
-        _ = try await deliver([BigSyncRecordPayload.decode(unbound)], to: adapter)
+        let accepted = try await deliver([BigSyncRecordPayload.decode(unbound)], to: adapter)
+        XCTAssertEqual(
+            accepted.map(\.disposition),
+            [.preservedPendingLocal(generation: boundGeneration)]
+        )
         XCTAssertEqual(control.digest, "bound")
         XCTAssertEqual(
             realm.objects(BigSyncPendingMutation.self).first?.generation,
