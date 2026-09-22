@@ -9917,6 +9917,93 @@ extension RealmSwiftAdapter {
             savedRecords: admittedRecords, matchingGenerations: generations,
             comparisonReceipts: accepted
         )
+        // A retained record's physical-disappearance quarantine is resolved
+        // by an accepted upload of that same retained tombstone. This is a
+        // record-scoped receipt, not a general quarantine cleanup: require
+        // the tracking acknowledgement to be terminal and retire only the
+        // matching retained-deletion lineage.
+        try await retireAcceptedRetainedDeletionQuarantines(
+            savedRecords: admittedRecords
+        )
+    }
+}
+
+extension RealmSwiftAdapter {
+    /// A retained record cannot be physically deleted by an inbound deletion.
+    /// If the exact retained tombstone is subsequently accepted by CloudKit,
+    /// that successful upload restores the server representation and resolves
+    /// only the quarantine for that record. Other semantic quarantines remain
+    /// unresolved until their own accepted disposition or committed feed
+    /// evidence proves them.
+    @BigSyncBackgroundActor
+    private func retireAcceptedRetainedDeletionQuarantines(
+        savedRecords: [CKRecord]
+    ) async throws {
+        guard !savedRecords.isEmpty,
+              let context = recordRebaseContext,
+              let provider = realmProvider,
+              let tracking = provider.persistenceRealm else { return }
+
+        let savedByName = Dictionary(
+            uniqueKeysWithValues: savedRecords.map {
+                ($0.recordID.recordName, $0)
+            }
+        )
+        let candidates = Array(activeInboundSemanticQuarantines(
+            accountScopeIdentifier: context.account,
+            in: tracking
+        ).filter { [self] quarantine in
+            guard quarantine.eventKind == "deletion",
+                  quarantine.validationCode
+                    == "retained-record-physically-deleted",
+                  quarantine.semanticScopeIdentifier
+                    == "retained-physical-deletion:" + quarantine.recordName,
+                  let saved = savedByName[quarantine.recordName],
+                  saved.recordType == quarantine.entityType,
+                  let type = self.realmObjectClass(name: quarantine.entityType),
+                  BigSyncRecordLifecycle.retainsTombstone(type),
+                  let target = provider
+                    .targetReaderRealmPerSchemaName[quarantine.entityType],
+                  let objectID = self.getObjectIdentifier(
+                    recordName: quarantine.recordName,
+                    entityType: quarantine.entityType
+                  ),
+                  let object = target.object(
+                    ofType: type,
+                    forPrimaryKey: objectID
+                  ),
+                  let tombstone = object as? SoftDeletable,
+                  tombstone.isDeleted else { return false }
+
+            // The tracking receipt must be terminal for the exact submitted
+            // record. A newer pending generation means this acknowledgement
+            // did not consume the prepared upload and cannot resolve evidence.
+            guard let entity = tracking.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: quarantine.recordName
+            ), entity.entityType == quarantine.entityType,
+                  entity.entityState == .synced,
+                  entity.pendingGeneration == nil,
+                  let cached = self.getRecord(for: entity),
+                  cached.recordID.recordName == saved.recordID.recordName,
+                  cached.recordID.zoneID == saved.recordID.zoneID,
+                  cached.recordChangeTag == saved.recordChangeTag else {
+                return false
+            }
+            return true
+        })
+        guard !candidates.isEmpty else { return }
+
+        try await tracking.asyncWrite {
+            try Task.checkCancellation()
+            guard !cancelSync, recordRebaseContext == context,
+                  activeAccountScopeIdentifier == context.account else {
+                throw CancellationError()
+            }
+            let lineageIDs = candidates.map(\.lineageID)
+            let receiptIDs = try Self.retireQuarantines(lineageIDs, in: tracking)
+            Self.removeUnreferencedPageReceipts(receiptIDs, in: tracking)
+        }
     }
 }
 
