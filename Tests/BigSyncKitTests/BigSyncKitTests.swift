@@ -16597,18 +16597,21 @@ final class BigSyncKitTests: XCTestCase {
         )
         let timestamp = Date(timeIntervalSinceReferenceDate: 5_000)
         try await fixture.targetRealm.asyncWrite {
-            let prepared = BigSyncMutationTracking.prepareWrite(
+            let expired = BigSyncMutationTracking.withPreparedWrite(
                 of: BigSyncTrackedObject.self, in: fixture.targetRealm
-            )
-            fixture.targetRealm.add([first, second])
-            first.refreshChangeMetadata(
-                explicitlyModified: true, at: timestamp,
-                preparedWrite: prepared
-            )
-            second.refreshChangeMetadata(
-                explicitlyModified: true, at: timestamp,
-                preparedWrite: prepared
-            )
+            ) { prepared in
+                fixture.targetRealm.add([first, second])
+                first.refreshChangeMetadata(
+                    explicitlyModified: true, at: timestamp,
+                    preparedWrite: prepared
+                )
+                second.refreshChangeMetadata(
+                    explicitlyModified: true, at: timestamp,
+                    preparedWrite: prepared
+                )
+                return prepared
+            }
+            XCTAssertFalse(expired.lifetime.isActive)
         }
         let firstName = BigSyncTrackedObject.className() + "." + first.id
         let secondName = BigSyncTrackedObject.className() + "." + second.id
@@ -16623,15 +16626,16 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(second.explicitlyModifiedAt, timestamp)
 
         try await fixture.targetRealm.asyncWrite {
-            let prepared = BigSyncMutationTracking.prepareWrite(
+            BigSyncMutationTracking.withPreparedWrite(
                 of: BigSyncTrackedObject.self, in: fixture.targetRealm
-            )
-            first.ordinaryScalarInteger = 1
-            first.refreshChangeMetadata(
-                explicitlyModified: true,
-                at: timestamp.addingTimeInterval(1),
-                preparedWrite: prepared
-            )
+            ) { prepared in
+                first.ordinaryScalarInteger = 1
+                first.refreshChangeMetadata(
+                    explicitlyModified: true,
+                    at: timestamp.addingTimeInterval(1),
+                    preparedWrite: prepared
+                )
+            }
         }
         XCTAssertNotEqual(fixture.targetRealm.object(
             ofType: BigSyncPendingMutation.self, forPrimaryKey: firstName

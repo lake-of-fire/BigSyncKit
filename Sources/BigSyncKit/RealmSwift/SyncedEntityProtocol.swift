@@ -70,9 +70,10 @@ public extension ChangeMetadataRecordable {
         }
 
         if let preparedWrite {
-            precondition(preparedWrite.realm == realm
+            precondition(preparedWrite.lifetime.isActive
+                         && preparedWrite.realm == realm
                          && preparedWrite.className == entityType,
-                         "Prepared BigSync write belongs to another Realm or class")
+                         "Prepared BigSync write is expired or belongs to another Realm or class")
         }
         let mutationContext = preparedWrite?.context
             ?? BigSyncMutationTrackingRegistry.mutationContext(

@@ -477,6 +477,10 @@ enum BigSyncMutationTrackingRegistry {
 /// policy defensively during initialization, but adapter setup may intentionally
 /// happen later than application startup.
 public enum BigSyncMutationTracking {
+    final class PreparedWriteLifetime {
+        var isActive = true
+    }
+
     /// Reuses the registered policy for several records of one class in one
     /// synchronous Realm write. Each record still receives its own generation
     /// and durable journal row; only the configuration/schema copy is shared.
@@ -484,22 +488,29 @@ public enum BigSyncMutationTracking {
         let realm: Realm
         let className: String
         let context: BigSyncMutationTrackingRegistry.MutationContext
+        let lifetime: PreparedWriteLifetime
     }
 
-    public static func prepareWrite(
+    /// The prepared policy cannot be reused by a later transaction, even if a
+    /// caller retains the value passed to the synchronous body.
+    public static func withPreparedWrite<Result>(
         of objectType: Object.Type,
-        in realm: Realm
-    ) -> PreparedWrite {
+        in realm: Realm,
+        _ body: (PreparedWrite) throws -> Result
+    ) rethrows -> Result {
         precondition(realm.isInWriteTransaction)
         let className = objectType.className()
-        return PreparedWrite(
+        let lifetime = PreparedWriteLifetime()
+        defer { lifetime.isActive = false }
+        return try body(PreparedWrite(
             realm: realm,
             className: className,
             context: BigSyncMutationTrackingRegistry.mutationContext(
                 className: className,
                 in: realm
-            )
-        )
+            ),
+            lifetime: lifetime
+        ))
     }
 
     public static func install(
