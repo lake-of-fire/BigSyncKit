@@ -488,6 +488,7 @@ public enum BigSyncMutationTracking {
         let realm: Realm
         let className: String
         let context: BigSyncMutationTrackingRegistry.MutationContext
+        let containsMutationJournal: Bool
         let lifetime: PreparedWriteLifetime
     }
 
@@ -509,6 +510,9 @@ public enum BigSyncMutationTracking {
                 className: className,
                 in: realm
             ),
+            containsMutationJournal: realm.schema.objectSchema.contains {
+                $0.className == BigSyncPendingMutation.className()
+            },
             lifetime: lifetime
         ))
     }

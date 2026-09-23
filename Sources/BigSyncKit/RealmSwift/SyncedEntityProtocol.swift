@@ -92,9 +92,11 @@ public extension ChangeMetadataRecordable {
             break
         }
 
-        guard realm.schema.objectSchema.contains(where: {
-            $0.className == BigSyncPendingMutation.className()
-        }) else {
+        let containsMutationJournal = preparedWrite?.containsMutationJournal
+            ?? realm.schema.objectSchema.contains(where: {
+                $0.className == BigSyncPendingMutation.className()
+            })
+        guard containsMutationJournal else {
             assertionFailure(
                 "Realm containing \(entityType) is missing BigSyncPendingMutation"
             )
