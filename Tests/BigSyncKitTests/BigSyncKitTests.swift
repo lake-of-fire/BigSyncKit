@@ -4254,6 +4254,68 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCurrentJournalIdentityRejectsSameRecordNameFromForeignRealm()
+    async throws {
+        let binding = String(repeating: "c", count: 64)
+        let identity = BigSyncMutationJournalIdentity(
+            installationIdentifier: "realm-identity-verification",
+            replicaBindingGenerationIdentifier: binding
+        )
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "journal-target-\(UUID().uuidString)"
+        configuration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration],
+            mutationJournalIdentityProvider: { identity }
+        )
+        let realm = try await Realm(
+            configuration: configuration,
+            actor: BigSyncBackgroundActor.shared
+        )
+
+        var foreignConfiguration = configuration
+        foreignConfiguration.inMemoryIdentifier =
+            "journal-foreign-\(UUID().uuidString)"
+        let foreignRealm = try await Realm(
+            configuration: foreignConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let recordName = "same-primary-key"
+        let foreign = BigSyncTrackedObject(
+            id: recordName,
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try foreignRealm.write { foreignRealm.add(foreign) }
+
+        let owned = BigSyncTrackedObject(
+            id: recordName,
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try realm.write {
+            realm.add(owned)
+            owned.refreshChangeMetadata(explicitlyModified: true)
+            XCTAssertEqual(
+                BigSyncMutationTracking.currentJournalIdentity(
+                    verifyingPendingMutationsFor: [owned], in: realm
+                ),
+                identity
+            )
+            XCTAssertNil(
+                BigSyncMutationTracking.currentJournalIdentity(
+                    verifyingPendingMutationsFor: [foreign], in: realm
+                )
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testBoundUploadAcknowledgesPreparedGenerationAndForwardsNewerEdit()
     async throws {
         let fixture = try await makeRealmAdapterFixture()

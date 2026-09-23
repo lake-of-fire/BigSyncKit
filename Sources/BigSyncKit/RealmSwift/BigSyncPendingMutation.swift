@@ -535,16 +535,26 @@ public enum BigSyncMutationTracking {
                 != true else {
             return nil
         }
+        var targetRealmIdentity: String?
         for object in objects {
             guard let objectRealm = object.realm,
                   !object.isInvalidated,
-                  BigSyncMutationTrackingRegistry.identity(
-                    for: objectRealm.configuration
-                  ) == BigSyncMutationTrackingRegistry.identity(
-                    for: realm.configuration
-                  ),
                   let primaryKey = object.objectSchema.primaryKeyProperty?.name
             else { return nil }
+            if objectRealm != realm {
+                // `configuration` copies Realm's schema. An equal Realm handle
+                // needs no copy; for a different handle, compare the configured
+                // backing identity exactly as before and compute this target's
+                // identity only once for the entire verification batch.
+                if targetRealmIdentity == nil {
+                    targetRealmIdentity = BigSyncMutationTrackingRegistry
+                        .identity(for: realm.configuration)
+                }
+                guard let targetRealmIdentity,
+                      BigSyncMutationTrackingRegistry.identity(
+                    for: objectRealm.configuration
+                ) == targetRealmIdentity else { return nil }
+            }
             let entityType = object.objectSchema.className
             let objectIdentifier = RealmSwiftAdapter
                 .getTargetObjectStringIdentifier(
