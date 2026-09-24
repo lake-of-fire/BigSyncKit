@@ -2739,6 +2739,34 @@ extension CloudKitSynchronizerAccountFencingTests {
     }
 
     @BigSyncBackgroundActor
+    func testCancellationRetainsValidatedLeaseForSubsequentLocalWrite()
+    async throws {
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport()
+        )
+
+        try await synchronizer._test_validateSynchronizationAccount()
+        let beforeCancellation = try XCTUnwrap(
+            synchronizer.accountScopeLease()
+        )
+
+        // Cancellation retires only the active CloudKit attempt. A same-
+        // account local domain writer still needs the durable lease while
+        // offline or between sync runs; replacing the account is the event
+        // that must invalidate it.
+        await synchronizer.cancelSynchronizationAndWait()
+
+        XCTAssertFalse(synchronizer.accountValidationRequired)
+        let afterCancellation = try XCTUnwrap(
+            synchronizer.accountScopeLease()
+        )
+        XCTAssertEqual(afterCancellation, beforeCancellation)
+        XCTAssertNoThrow(
+            try synchronizer.validateAccountScopeLease(beforeCancellation)
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testAccountChangeNotificationCompletesLocalDatasetRebootstrap()
     async throws {
         let transport = AccountFencingTransport()
