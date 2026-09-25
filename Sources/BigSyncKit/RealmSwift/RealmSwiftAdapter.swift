@@ -3602,12 +3602,21 @@ public final class RealmSwiftAdapter:
             //#if DEBUG
             //            logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict), local object: \(object.debugDescription) – remote object: \(record.debugDescription)")
             //#endif
+            let incomingRepresentation = (type(of: object) as?
+                BigSyncRecordContractProviding.Type)?.bigSyncRecordContract
+                .incomingRepresentation
             for property in objectProperties where !skippedKeys.contains(property.name) {
                 try Task.checkCancellation()
                 if shouldIgnore(key: property.name) {
                     continue
                 }
-                if property.type == .linkingObjects {
+                if property.name == object.objectSchema.primaryKeyProperty?.name
+                    || property.type == .linkingObjects {
+                    continue
+                }
+                if record[property.name] == nil,
+                   let incomingRepresentation,
+                   try incomingRepresentation.applyOmission(to: object, property: property) {
                     continue
                 }
                 try applyChange(
@@ -7068,6 +7077,41 @@ public final class RealmSwiftAdapter:
                                                         || replacementDisposition == .preferIncomingRecord
                                                 )
                                             )
+                                            if replacementDisposition == .preferIncomingRecord,
+                                               let comparisonContext,
+                                               BigSyncRecordBaseline.isEnabled(in: targetWriterRealm),
+                                               candidate.objectType is BigSyncRecordContractProviding.Type {
+                                                // Semantic replacement accepts the entire server
+                                                // representation, including omitted-field defaults.
+                                                // Keep its accepted base in the same target write as
+                                                // the managed value and the pending-generation fence.
+                                                let decoded = try self.decodedComparisonObject(
+                                                    candidate.record, type: candidate.objectType
+                                                )
+                                                let remoteFields = try BigSyncRecordFingerprint.fields(of: decoded)
+                                                guard try BigSyncRecordFingerprint.fields(of: object) == remoteFields else {
+                                                    throw BigSyncIncomingRepresentationError.actualValueMismatch(
+                                                        recordName: candidate.record.recordID.recordName
+                                                    )
+                                                }
+                                                if BigSyncRecordLifecycle.isPhysicalDeletion(object) {
+                                                    BigSyncRecordBaseline.invalidate(
+                                                        recordName: candidate.record.recordID.recordName,
+                                                        in: targetWriterRealm
+                                                    )
+                                                } else {
+                                                    _ = BigSyncRecordBaseline.install(
+                                                        recordName: candidate.record.recordID.recordName,
+                                                        namespace: comparisonContext.namespace,
+                                                        fields: remoteFields,
+                                                        serverChangeTag: candidate.record.recordChangeTag,
+                                                        schemaSignature: try BigSyncCompiledRecordContract.compile(object)?.signature ?? "",
+                                                        systemFields: try BigSyncRecordPayload.systemFields(of: candidate.record),
+                                                        in: targetWriterRealm
+                                                    )
+                                                }
+                                                try comparisonContext.validate(in: targetWriterRealm)
+                                            }
                                             if replacementDisposition == .preferIncomingRecord,
                                                let currentMutationGeneration {
                                                 guard let metadata = object as? ChangeMetadataRecordable else {
