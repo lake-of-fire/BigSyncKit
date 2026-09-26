@@ -84,6 +84,29 @@ extension SyncUndoCloseoutW1Tests {
     }
 
     @BigSyncBackgroundActor
+    func assertTargetCommittedBeforeTracking(
+        _ adapter: RealmSwiftAdapter, realm: Realm, record: CKRecord,
+        expectedText: String, generation: String, previousRevision: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        realm.refresh()
+        let object = try XCTUnwrap(realm.object(ofType: W1ContractNote.self, forPrimaryKey: noteID), file: file, line: line)
+        XCTAssertEqual(object.text, expectedText, file: file, line: line)
+        XCTAssertFalse(object.isDeleted, file: file, line: line)
+        let base = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: record.recordID.recordName), file: file, line: line)
+        XCTAssertTrue(base.isComparisonInvalidated, file: file, line: line)
+        XCTAssertNotEqual(base.revision, previousRevision, file: file, line: line)
+        XCTAssertEqual(base.namespace, adapter.recordRebaseContext?.namespace, file: file, line: line)
+        XCTAssertNil(base.serverChangeTag, file: file, line: line)
+        XCTAssertNil(base.acceptedSystemFields, file: file, line: line)
+        XCTAssertEqual(base.fields.count, 0, file: file, line: line)
+        XCTAssertTrue(realm.objects(BigSyncRecordSubmission.self).isEmpty, file: file, line: line)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: record.recordID.recordName)?.generation, generation, file: file, line: line)
+    }
+
+    @BigSyncBackgroundActor
     @discardableResult
     func drain(_ adapter: RealmSwiftAdapter, realm: Realm, expectsFreshTemplate: Bool = false) async throws -> [CKRecord] {
         try await adapter.didFinishImport()
@@ -235,6 +258,50 @@ extension SyncUndoCloseoutW1Tests {
     }
 
     @BigSyncBackgroundActor
+    func testInboundDeletionTargetFirstCrashRecoversWithoutConsumingLocalEdit() async throws {
+        let (adapter, realm, object, incoming) = try await acceptedNote()
+        let generation = try await edit(object, text: "inbound survives restart", time: 30,
+                                        realm: realm, adapter: adapter)
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        let previousRevision = try XCTUnwrap(realm.objects(BigSyncRecordBaseline.self).first?.revision)
+        let candidateIdentity = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let staleEntity = try XCTUnwrap(tracking.objects(SyncedEntity.self).first)
+        XCTAssertEqual(adapter.getRecord(for: staleEntity)?.recordChangeTag, "accepted-A")
+
+        adapter._testAfterDisappearanceTargetWrite = { throw W1InjectedFailure.afterTarget }
+        do {
+            _ = try await adapter.deleteRecords(with: [incoming.recordID])
+            XCTFail("Expected interruption after the inbound target commit")
+        } catch W1InjectedFailure.afterTarget { }
+        adapter._testAfterDisappearanceTargetWrite = nil
+
+        // The target transaction is durable even though the old tracking
+        // cache was not published. Neither the local edit nor its authoring
+        // time may be replaced by the incoming physical deletion.
+        try assertTargetCommittedBeforeTracking(adapter, realm: realm, record: incoming,
+            expectedText: "inbound survives restart", generation: generation,
+            previousRevision: previousRevision)
+        XCTAssertEqual(object.modifiedAt, Date(timeIntervalSinceReferenceDate: 30))
+        XCTAssertEqual(object.explicitlyModifiedAt, Date(timeIntervalSinceReferenceDate: 30))
+        XCTAssertEqual(adapter.getRecord(for: staleEntity)?.recordChangeTag, "accepted-A")
+        XCTAssertFalse(realm.objects(BigSyncRecordSubmission.self).contains {
+            $0.candidateIdentity == candidateIdentity
+        })
+
+        let (restarted, reopened) = try await restart(adapter)
+        try assertTargetCommittedBeforeTracking(restarted, realm: reopened, record: incoming,
+            expectedText: "inbound survives restart", generation: generation,
+            previousRevision: previousRevision)
+        try await restarted.didUpload(savedRecords: prepared.map(\.record), matchingPreparedUploads: prepared)
+        XCTAssertEqual(reopened.objects(BigSyncPendingMutation.self).first?.generation, generation)
+        let uploaded = try await drain(restarted, realm: reopened, expectsFreshTemplate: true)
+        XCTAssertEqual(uploaded.first?["text"] as? String, "inbound survives restart")
+        let (again, sameRealm) = try await restart(restarted)
+        try await quiet(again, realm: sameRealm)
+    }
+
+    @BigSyncBackgroundActor
     func testUncertainFirstSaveUnknownItemPreservesTheExactCandidateAcrossRestart() async throws {
         let (adapter, realm) = try await fixture()
         let object = W1ContractNote()
@@ -330,4 +397,3 @@ extension SyncUndoCloseoutW1Tests {
         try await quiet(adapter, realm: realm)
     }
 }
-
