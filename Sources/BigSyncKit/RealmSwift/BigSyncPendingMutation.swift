@@ -477,6 +477,46 @@ enum BigSyncMutationTrackingRegistry {
 /// policy defensively during initialization, but adapter setup may intentionally
 /// happen later than application startup.
 public enum BigSyncMutationTracking {
+    final class PreparedWriteLifetime {
+        var isActive = true
+    }
+
+    /// Reuses the registered policy for several records of one class in one
+    /// synchronous Realm write. Each record still receives its own generation
+    /// and durable journal row; only the configuration/schema copy is shared.
+    public struct PreparedWrite {
+        let realm: Realm
+        let className: String
+        let context: BigSyncMutationTrackingRegistry.MutationContext
+        let containsMutationJournal: Bool
+        let lifetime: PreparedWriteLifetime
+    }
+
+    /// The prepared policy cannot be reused by a later transaction, even if a
+    /// caller retains the value passed to the synchronous body.
+    public static func withPreparedWrite<Result>(
+        of objectType: Object.Type,
+        in realm: Realm,
+        _ body: (PreparedWrite) throws -> Result
+    ) rethrows -> Result {
+        precondition(realm.isInWriteTransaction)
+        let className = objectType.className()
+        let lifetime = PreparedWriteLifetime()
+        defer { lifetime.isActive = false }
+        return try body(PreparedWrite(
+            realm: realm,
+            className: className,
+            context: BigSyncMutationTrackingRegistry.mutationContext(
+                className: className,
+                in: realm
+            ),
+            containsMutationJournal: realm.schema.objectSchema.contains {
+                $0.className == BigSyncPendingMutation.className()
+            },
+            lifetime: lifetime
+        ))
+    }
+
     public static func install(
         configurations: [Realm.Configuration],
         excludedClassNames: [String],
@@ -535,16 +575,26 @@ public enum BigSyncMutationTracking {
                 != true else {
             return nil
         }
+        var targetRealmIdentity: String?
         for object in objects {
             guard let objectRealm = object.realm,
                   !object.isInvalidated,
-                  BigSyncMutationTrackingRegistry.identity(
-                    for: objectRealm.configuration
-                  ) == BigSyncMutationTrackingRegistry.identity(
-                    for: realm.configuration
-                  ),
                   let primaryKey = object.objectSchema.primaryKeyProperty?.name
             else { return nil }
+            if objectRealm != realm {
+                // `configuration` copies Realm's schema. An equal Realm handle
+                // needs no copy; for a different handle, compare the configured
+                // backing identity exactly as before and compute this target's
+                // identity only once for the entire verification batch.
+                if targetRealmIdentity == nil {
+                    targetRealmIdentity = BigSyncMutationTrackingRegistry
+                        .identity(for: realm.configuration)
+                }
+                guard let targetRealmIdentity,
+                      BigSyncMutationTrackingRegistry.identity(
+                    for: objectRealm.configuration
+                ) == targetRealmIdentity else { return nil }
+            }
             let entityType = object.objectSchema.className
             let objectIdentifier = RealmSwiftAdapter
                 .getTargetObjectStringIdentifier(

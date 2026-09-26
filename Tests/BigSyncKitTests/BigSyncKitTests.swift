@@ -4254,6 +4254,68 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCurrentJournalIdentityRejectsSameRecordNameFromForeignRealm()
+    async throws {
+        let binding = String(repeating: "c", count: 64)
+        let identity = BigSyncMutationJournalIdentity(
+            installationIdentifier: "realm-identity-verification",
+            replicaBindingGenerationIdentifier: binding
+        )
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "journal-target-\(UUID().uuidString)"
+        configuration.objectTypes = [
+            BigSyncTrackedObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        BigSyncMutationPolicy(excludedClassNames: []).install(
+            configurations: [configuration],
+            mutationJournalIdentityProvider: { identity }
+        )
+        let realm = try await Realm(
+            configuration: configuration,
+            actor: BigSyncBackgroundActor.shared
+        )
+
+        var foreignConfiguration = configuration
+        foreignConfiguration.inMemoryIdentifier =
+            "journal-foreign-\(UUID().uuidString)"
+        let foreignRealm = try await Realm(
+            configuration: foreignConfiguration,
+            actor: BigSyncBackgroundActor.shared
+        )
+        let recordName = "same-primary-key"
+        let foreign = BigSyncTrackedObject(
+            id: recordName,
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try foreignRealm.write { foreignRealm.add(foreign) }
+
+        let owned = BigSyncTrackedObject(
+            id: recordName,
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try realm.write {
+            realm.add(owned)
+            owned.refreshChangeMetadata(explicitlyModified: true)
+            XCTAssertEqual(
+                BigSyncMutationTracking.currentJournalIdentity(
+                    verifyingPendingMutationsFor: [owned], in: realm
+                ),
+                identity
+            )
+            XCTAssertNil(
+                BigSyncMutationTracking.currentJournalIdentity(
+                    verifyingPendingMutationsFor: [foreign], in: realm
+                )
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testBoundUploadAcknowledgesPreparedGenerationAndForwardsNewerEdit()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
@@ -16519,6 +16581,68 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertNotNil(fixture.targetRealm.object(
             ofType: BigSyncPendingMutation.self, forPrimaryKey: unresolvedName
         ))
+    }
+
+    @BigSyncBackgroundActor
+    func testPreparedSameTransactionWritesKeepIndependentJournalGenerations()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let first = BigSyncTrackedObject(
+            id: "prepared-first", createdAt: Date(),
+            modifiedAt: Date(), explicitlyModifiedAt: nil
+        )
+        let second = BigSyncTrackedObject(
+            id: "prepared-second", createdAt: Date(),
+            modifiedAt: Date(), explicitlyModifiedAt: nil
+        )
+        let timestamp = Date(timeIntervalSinceReferenceDate: 5_000)
+        try await fixture.targetRealm.asyncWrite {
+            let expired = BigSyncMutationTracking.withPreparedWrite(
+                of: BigSyncTrackedObject.self, in: fixture.targetRealm
+            ) { prepared in
+                fixture.targetRealm.add([first, second])
+                first.refreshChangeMetadata(
+                    explicitlyModified: true, at: timestamp,
+                    preparedWrite: prepared
+                )
+                second.refreshChangeMetadata(
+                    explicitlyModified: true, at: timestamp,
+                    preparedWrite: prepared
+                )
+                return prepared
+            }
+            XCTAssertFalse(expired.lifetime.isActive)
+        }
+        let firstName = BigSyncTrackedObject.className() + "." + first.id
+        let secondName = BigSyncTrackedObject.className() + "." + second.id
+        let firstGeneration = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: firstName
+        )?.generation)
+        let secondGeneration = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: secondName
+        )?.generation)
+        XCTAssertNotEqual(firstGeneration, secondGeneration)
+        XCTAssertEqual(first.explicitlyModifiedAt, timestamp)
+        XCTAssertEqual(second.explicitlyModifiedAt, timestamp)
+
+        try await fixture.targetRealm.asyncWrite {
+            BigSyncMutationTracking.withPreparedWrite(
+                of: BigSyncTrackedObject.self, in: fixture.targetRealm
+            ) { prepared in
+                first.ordinaryScalarInteger = 1
+                first.refreshChangeMetadata(
+                    explicitlyModified: true,
+                    at: timestamp.addingTimeInterval(1),
+                    preparedWrite: prepared
+                )
+            }
+        }
+        XCTAssertNotEqual(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: firstName
+        )?.generation, firstGeneration)
+        XCTAssertEqual(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: secondName
+        )?.generation, secondGeneration)
     }
 }
 

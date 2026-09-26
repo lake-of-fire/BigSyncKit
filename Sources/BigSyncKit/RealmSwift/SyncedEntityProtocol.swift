@@ -27,6 +27,20 @@ public extension ChangeMetadataRecordable {
         }
     }
 
+    /// A same-transaction batch keeps the ordinary record-level journal path
+    /// while avoiding a Realm configuration copy for every affected record.
+    func refreshChangeMetadata(
+        explicitlyModified: Bool,
+        at timestamp: Date,
+        preparedWrite: BigSyncMutationTracking.PreparedWrite
+    ) {
+        modifiedAt = timestamp
+        if explicitlyModified {
+            explicitlyModifiedAt = timestamp
+            recordBigSyncMutation(at: timestamp, preparedWrite: preparedWrite)
+        }
+    }
+
     /// BigSync has already selected the complete existing value as the winner.
     /// Queue that value for retransmission without manufacturing a later user
     /// edit clock. Custom delegates that mutate the object continue to use the
@@ -35,7 +49,10 @@ public extension ChangeMetadataRecordable {
         recordBigSyncMutation(at: timestamp)
     }
 
-    private func recordBigSyncMutation(at timestamp: Date) {
+    private func recordBigSyncMutation(
+        at timestamp: Date,
+        preparedWrite: BigSyncMutationTracking.PreparedWrite? = nil
+    ) {
         guard let object = self as? Object else {
             assertionFailure("BigSync mutations require a Realm Object")
             return
@@ -52,10 +69,17 @@ public extension ChangeMetadataRecordable {
             return
         }
 
-        let mutationContext = BigSyncMutationTrackingRegistry.mutationContext(
-            className: entityType,
-            in: realm
-        )
+        if let preparedWrite {
+            precondition(preparedWrite.lifetime.isActive
+                         && preparedWrite.realm == realm
+                         && preparedWrite.className == entityType,
+                         "Prepared BigSync write is expired or belongs to another Realm or class")
+        }
+        let mutationContext = preparedWrite?.context
+            ?? BigSyncMutationTrackingRegistry.mutationContext(
+                className: entityType,
+                in: realm
+            )
         switch mutationContext.trackingStatus {
         case .unregistered:
             assertionFailure(
@@ -68,9 +92,11 @@ public extension ChangeMetadataRecordable {
             break
         }
 
-        guard realm.schema.objectSchema.contains(where: {
-            $0.className == BigSyncPendingMutation.className()
-        }) else {
+        let containsMutationJournal = preparedWrite?.containsMutationJournal
+            ?? realm.schema.objectSchema.contains(where: {
+                $0.className == BigSyncPendingMutation.className()
+            })
+        guard containsMutationJournal else {
             assertionFailure(
                 "Realm containing \(entityType) is missing BigSyncPendingMutation"
             )
