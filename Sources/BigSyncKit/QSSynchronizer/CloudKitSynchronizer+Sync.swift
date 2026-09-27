@@ -43,6 +43,7 @@ extension CloudKitSynchronizer {
         do {
             reportProgress("terminal-tail-start")
             try await revalidateActiveRunContext(for: attemptID)
+            reportProgress("terminal-tail-account-revalidated")
         } catch is CancellationError {
             settleCancellationIfCurrentAttempt(attemptID)
             return
@@ -75,6 +76,7 @@ extension CloudKitSynchronizer {
                 return
             }
         }
+        reportProgress("terminal-tail-adapters-cleaned")
 
         do {
             // The final import can legitimately forward zero new journal rows
@@ -92,9 +94,11 @@ extension CloudKitSynchronizer {
             await failSynchronization(error: error)
             return
         }
+        reportProgress("terminal-tail-pending-checked")
         
 //        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
         if !isDownloadOnly, synchronizationRequestedWhileRunning {
+            reportProgress("terminal-tail-restarting")
             restartSynchronizationForTerminalWork()
             return
         }
@@ -185,6 +189,7 @@ extension CloudKitSynchronizer {
                 return
             }
         }
+        reportProgress("terminal-tail-prepublication-completed")
 
         do {
             for adapter in modelAdapters {
@@ -240,6 +245,7 @@ extension CloudKitSynchronizer {
             return
         }
         if !isDownloadOnly, synchronizationRequestedWhileRunning {
+            reportProgress("terminal-tail-restarting")
             restartSynchronizationForTerminalWork()
             return
         }
