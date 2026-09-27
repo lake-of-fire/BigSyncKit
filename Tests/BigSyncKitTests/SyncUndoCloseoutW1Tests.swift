@@ -120,6 +120,92 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testTerminalBoundaryIgnoresBusyIdleRealmAndFindsNewGeneration()
+    async throws {
+        let (adapter, realm) = try await fixture()
+        let context = try XCTUnwrap(adapter.recordRebaseContext)
+        // Exercise the same indexed journal and comparison-evidence queries
+        // used by the production terminal cut. Older-binding rows remain
+        // durable, but cannot authorize this transport's upload.
+        try realm.write {
+            for index in 0..<1_024 {
+                realm.add(BigSyncPendingMutation(
+                    recordName: "W1ContractNote.stale-\(index)",
+                    entityType: W1ContractNote.className(),
+                    objectIdentifier: "stale-\(index)",
+                    replicaBindingGenerationIdentifier: "older-binding"
+                ))
+                let receipt = BigSyncRecordConflict()
+                receipt.id = "resolved-\(index)"
+                receipt.recordName = "W1ContractNote.resolved-\(index)"
+                receipt.entityType = W1ContractNote.className()
+                receipt.namespace = context.namespace
+                receipt.isResolved = true
+                receipt.isPreservationReceipt = true
+                realm.add(receipt)
+            }
+        }
+
+        let idleStart = Date()
+        for _ in 0..<3 {
+            XCTAssertFalse(try adapter.hasPendingChangesAtTerminalBoundary())
+        }
+        print("terminal-busy-idle-three-cuts-seconds=\(Date().timeIntervalSince(idleStart))")
+
+        let authored = W1ContractNote()
+        authored.id = noteID
+        try realm.write {
+            realm.add(authored)
+            authored.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let pending = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: W1ContractNote.className() + "." + noteID.uuidString
+        ))
+        XCTAssertEqual(pending.replicaBindingGenerationIdentifier,
+                       context.binding)
+        XCTAssertTrue(try adapter.hasPendingChangesAtTerminalBoundary())
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count,
+                       1_025)
+    }
+
+    @BigSyncBackgroundActor
+    func testTrackingPendingQueryIgnoresLargeSyncedPopulation() async throws {
+        let (adapter, _) = try await fixture()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        try tracking.write {
+            for index in 0..<4_096 {
+                tracking.add(SyncedEntity(
+                    entityType: W1ContractNote.className(),
+                    identifier: "W1ContractNote.synced-\(index)",
+                    state: SyncedEntityState.synced.rawValue
+                ))
+            }
+        }
+        let idleStart = Date()
+        for _ in 0..<3 {
+            adapter.updateHasChanges(realm: tracking)
+            XCTAssertFalse(adapter.hasChanges)
+            XCTAssertEqual(adapter.hasChangesCount, 0)
+        }
+        print("tracking-busy-idle-three-checks-seconds=\(Date().timeIntervalSince(idleStart))")
+
+        let changed = SyncedEntity(
+            entityType: W1ContractNote.className(),
+            identifier: "W1ContractNote.changed",
+            state: SyncedEntityState.changed.rawValue
+        )
+        changed.setPendingMutation(
+            generation: "fresh-generation",
+            replicaBindingGenerationIdentifier: "w1-binding"
+        )
+        try tracking.write { tracking.add(changed) }
+        adapter.updateHasChanges(realm: tracking)
+        XCTAssertTrue(adapter.hasChanges)
+        XCTAssertEqual(adapter.hasChangesCount, 1)
+    }
+
+    @BigSyncBackgroundActor
     func testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline() async throws {
         let (adapter, realm) = try await fixture()
         _ = try await deliver([note(adapter)], to: adapter)
