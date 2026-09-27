@@ -1086,6 +1086,30 @@ private actor ReevaluationTerminalRecorder {
     func results() -> [CloudKitSynchronizer.SynchronizationResult] { values }
 }
 
+@BigSyncBackgroundActor
+private final class ReevaluationProgressRecorder {
+    private(set) var checkpoints = [String]()
+
+    func append(_ checkpoint: String) {
+        checkpoints.append(checkpoint)
+    }
+}
+
+private actor ReevaluationTerminalPhaseHold {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func isWaiting() -> Bool { continuation != nil }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private actor ReevaluationHeldCompletion {
     private var continuation: CheckedContinuation<Void, Never>?
     private var values = [CloudKitSynchronizer.SynchronizationResult]()
@@ -14955,6 +14979,99 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testTerminalTailTraceSeparatesAccountCleanupAndRestartFromReceipt() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let progress = ReevaluationProgressRecorder()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            progressHandler: { progress.append($0) }
+        )
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "terminal-trace-restart"),
+            priorities: []
+        )
+        adapter.didFinishImportHandler = { [weak adapter] in
+            if adapter?.didFinishImportCount == 1 {
+                await adapter?.modelAdapterDelegate?.hasChangesToUpload()
+            }
+        }
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.beginSynchronization()
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNotNil(synchronizer.activeRunContext)
+
+        await synchronizer.changesFinishedSynchronizing()
+        let firstPass = progress.checkpoints
+        let expected = [
+            "terminal-tail-start",
+            "terminal-tail-account-revalidated",
+            "terminal-tail-adapters-cleaned",
+            "terminal-tail-pending-checked",
+            "terminal-tail-restarting",
+        ]
+        XCTAssertEqual(firstPass.filter { $0.hasPrefix("terminal-tail-") }, expected)
+        XCTAssertFalse(firstPass.contains("terminal-receipt"))
+        XCTAssertTrue(synchronizer.syncing)
+
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        await synchronizer.changesFinishedSynchronizing()
+        let secondPass = Array(progress.checkpoints.dropFirst(firstPass.count))
+        XCTAssertTrue(secondPass.contains("terminal-tail-prepublication-completed"))
+        XCTAssertTrue(secondPass.contains("terminal-receipt"))
+        XCTAssertFalse(synchronizer.syncing)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalTailTraceLocatesHeldAdapterCleanupBeforeReceipt() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let progress = ReevaluationProgressRecorder()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            progressHandler: { progress.append($0) }
+        )
+        let hold = ReevaluationTerminalPhaseHold()
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "terminal-trace-held-cleanup"),
+            priorities: []
+        )
+        adapter.cleanUpHandler = { await hold.wait() }
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.beginSynchronization()
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNotNil(synchronizer.activeRunContext)
+
+        let terminal = Task { @BigSyncBackgroundActor in
+            await synchronizer.changesFinishedSynchronizing()
+        }
+        for _ in 0..<1_000 {
+            if await hold.isWaiting() { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let cleanupIsHeld = await hold.isWaiting()
+        XCTAssertTrue(cleanupIsHeld)
+        XCTAssertEqual(
+            progress.checkpoints.filter { $0.hasPrefix("terminal-tail-") },
+            ["terminal-tail-start", "terminal-tail-account-revalidated"]
+        )
+        XCTAssertFalse(progress.checkpoints.contains("terminal-receipt"))
+
+        await hold.release()
+        await terminal.value
+        XCTAssertTrue(progress.checkpoints.contains("terminal-tail-adapters-cleaned"))
+        XCTAssertTrue(progress.checkpoints.contains("terminal-receipt"))
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     func testReevaluationBlockedOutcomeCarriesIdentityWithoutReceipt() async throws {
         let database = FakeCloudKitDatabase()
         database.completesFetchDatabaseChanges = false
@@ -15243,7 +15360,8 @@ final class BigSyncKitTests: XCTestCase {
         backupDetectionBaseURL: URL? = nil,
         accountIdentifierProvider: @escaping CloudKitSynchronizer.AccountIdentifierProvider = {
             "test-account"
-        }
+        },
+        progressHandler: CloudKitSynchronizer.ProgressHandler? = nil
     ) -> CloudKitSynchronizer {
         let synchronizer = CloudKitSynchronizer(
             identifier: identifier,
@@ -15253,6 +15371,7 @@ final class BigSyncKitTests: XCTestCase {
             keyValueStore: keyValueStore,
             accountIdentifierProvider: accountIdentifierProvider,
             accountStatusProvider: { .available },
+            progressHandler: progressHandler,
             backupDetectionBaseURL: backupDetectionBaseURL,
             logger: Logger(label: "BigSyncKitTests")
         )
