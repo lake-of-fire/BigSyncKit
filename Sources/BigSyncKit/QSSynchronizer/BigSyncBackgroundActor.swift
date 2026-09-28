@@ -696,6 +696,11 @@ public actor BigSyncBackgroundActor {
         }
         synchronizationTask.cancel()
         deadlineTask.cancel()
+        // Race settlement and caller delivery are distinct boundaries. If the
+        // caller was cancelled after the race won but before this request
+        // returned, cancellation still owns delivery and must not be reported
+        // as a completed request or lifecycle timeout.
+        if Task.isCancelled { return .cancelled }
         return outcome
     }
 
