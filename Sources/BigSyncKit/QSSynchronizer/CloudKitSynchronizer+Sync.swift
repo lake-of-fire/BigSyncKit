@@ -162,13 +162,17 @@ extension CloudKitSynchronizer {
                         }
                     )
                 ))
+                reportProgress("terminal-tail-domain-handler-completed")
                 try await revalidateRunContext(terminalContext)
+                reportProgress("terminal-tail-domain-context-revalidated")
                 for delivery in inboundIdentityDeliveries {
+                    reportProgress("terminal-tail-inbound-ack-started")
                     try await delivery.adapter
                         .acknowledgeCommittedInboundIdentityBatch(
                             deliveryID: delivery.batch.deliveryID
                         )
                     try await revalidateRunContext(terminalContext)
+                    reportProgress("terminal-tail-inbound-ack-completed")
                 }
                 // Domain reconciliation is allowed to commit authoritative
                 // local writes. Forward those durable target-journal
@@ -178,8 +182,11 @@ extension CloudKitSynchronizer {
                 // the newest generation instead of uploading a stale tracked
                 // generation first.
                 for adapter in modelAdapters {
+                    reportProgress("terminal-tail-import-forwarding-started")
                     try await adapter.didFinishImport()
+                    reportProgress("terminal-tail-import-forwarding-completed")
                     try await revalidateRunContext(terminalContext)
+                    reportProgress("terminal-tail-import-forwarding-revalidated")
                 }
             } catch is CancellationError {
                 settleCancellationIfCurrentAttempt(attemptID)
@@ -224,6 +231,7 @@ extension CloudKitSynchronizer {
             try await revalidateRunContext(terminalContext)
             if !isDownloadOnly,
                try adaptersHavePendingChangesAtTerminalBoundary() {
+                reportProgress("terminal-tail-pending-target")
                 synchronizationRequestedWhileRunning = true
             }
             if try currentConsumedServerBoundaryIdentifier(
@@ -235,6 +243,7 @@ extension CloudKitSynchronizer {
                     // Do not publish a result for the stale domain boundary.
                     throw SyncError.inboundBoundaryChanged
                 }
+                reportProgress("terminal-tail-inbound-boundary-changed")
                 synchronizationRequestedWhileRunning = true
             }
         } catch is CancellationError {
