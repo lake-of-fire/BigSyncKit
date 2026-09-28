@@ -7,7 +7,20 @@ import Logging
 private enum BigSyncDeadlineOutcome: Sendable {
     case completed(CloudKitSynchronizer.SynchronizationResult?)
     case timedOut
+    case cancelled
 }
+
+#if DEBUG
+/// DEBUG qualification surface for callers that must distinguish an actual
+/// deadline from a completed request that legitimately produced no receipt.
+/// This does not expose or transfer synchronization authority.
+@_spi(CloudKitE2E)
+public enum BigSyncCloudKitE2EDeadlineOutcome: Sendable {
+    case completed(CloudKitSynchronizer.SynchronizationResult?)
+    case timedOut
+    case cancelled
+}
+#endif
 
 private actor BigSyncDeadlineRace {
     private var outcome: BigSyncDeadlineOutcome?
@@ -614,9 +627,50 @@ public actor BigSyncBackgroundActor {
     public func synchronizeCloudKit(
         deadlineNanoseconds: UInt64
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
+        switch await synchronizationDeadlineOutcome(
+            deadlineNanoseconds: deadlineNanoseconds
+        ) {
+        case .completed(let result):
+            return result
+        case .timedOut:
+            logger?.warning(
+                "QSCloudKitSynchronizer >> Lifecycle synchronization deadline elapsed"
+            )
+            return nil
+        case .cancelled:
+            return nil
+        }
+    }
+
+#if DEBUG
+    /// Exact request-scoped result for the disposable E2E harness. Callers can
+    /// distinguish a deadline from a quick completed-nil result without
+    /// globally cancelling whichever worker happens to be current later.
+    @_spi(CloudKitE2E)
+    @BigSyncBackgroundActor
+    public func cloudKitE2ESynchronizeCloudKit(
+        deadlineNanoseconds: UInt64
+    ) async -> BigSyncCloudKitE2EDeadlineOutcome {
+        switch await synchronizationDeadlineOutcome(
+            deadlineNanoseconds: deadlineNanoseconds
+        ) {
+        case .completed(let result):
+            return .completed(result)
+        case .timedOut:
+            return .timedOut
+        case .cancelled:
+            return .cancelled
+        }
+    }
+#endif
+
+    @BigSyncBackgroundActor
+    private func synchronizationDeadlineOutcome(
+        deadlineNanoseconds: UInt64
+    ) async -> BigSyncDeadlineOutcome {
         // Do not manufacture an unstructured request for an already-cancelled
         // lifecycle caller; cancellation is not inherited by a new Task.
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else { return .cancelled }
 
         let race = BigSyncDeadlineRace()
         let synchronizationTask = Task { @BigSyncBackgroundActor [weak self] in
@@ -636,19 +690,18 @@ public actor BigSyncBackgroundActor {
             await race.value()
         } onCancel: {
             synchronizationTask.cancel()
-            Task { await race.resolve(.timedOut) }
+            // This task settles only the local race actor. It does not cancel,
+            // replace, or otherwise mutate a shared synchronizer.
+            Task { await race.resolve(.cancelled) }
         }
         synchronizationTask.cancel()
         deadlineTask.cancel()
-        switch outcome {
-        case .completed(let result):
-            return result
-        case .timedOut:
-            logger?.warning(
-                "QSCloudKitSynchronizer >> Lifecycle synchronization deadline elapsed"
-            )
-            return nil
-        }
+        // Race settlement and caller delivery are distinct boundaries. If the
+        // caller was cancelled after the race won but before this request
+        // returned, cancellation still owns delivery and must not be reported
+        // as a completed request or lifecycle timeout.
+        if Task.isCancelled { return .cancelled }
+        return outcome
     }
 
     @BigSyncBackgroundActor
