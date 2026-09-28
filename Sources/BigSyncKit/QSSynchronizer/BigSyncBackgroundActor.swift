@@ -652,6 +652,10 @@ public actor BigSyncBackgroundActor {
         }
         await publicationRestorationTask?.value
         publicationRestorationTask = nil
+        guard !Task.isCancelled,
+              realmSynchronizer === expectedSynchronizer else {
+            return nil
+        }
         let containerIdentifier = expectedSynchronizer.containerIdentifier
 
         // Explicit lifecycle requests share the same cheap durable gate used
@@ -664,9 +668,14 @@ public actor BigSyncBackgroundActor {
         }
 
         if performsAccountAvailabilityPreflight {
-            switch await accountAvailabilityGate.availability(
+            let availability = await accountAvailabilityGate.availability(
                 for: containerIdentifier
-            ) {
+            )
+            guard !Task.isCancelled,
+                  realmSynchronizer === expectedSynchronizer else {
+                return nil
+            }
+            switch availability {
             case .available:
                 accountAvailabilityRetryTask?.cancel()
                 accountAvailabilityRetryTask = nil
@@ -727,7 +736,8 @@ public actor BigSyncBackgroundActor {
     private func scheduleAccountAvailabilityRetry(
         expectedSynchronizer: CloudKitSynchronizer
     ) {
-        guard realmSynchronizer === expectedSynchronizer else { return }
+        guard !Task.isCancelled,
+              realmSynchronizer === expectedSynchronizer else { return }
         accountAvailabilityRetryTask?.cancel()
         accountAvailabilityRetryTask = Task(priority: .utility) {
             @BigSyncBackgroundActor [weak self, weak expectedSynchronizer] in
