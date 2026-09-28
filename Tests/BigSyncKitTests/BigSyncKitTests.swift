@@ -1093,18 +1093,25 @@ private final class ReevaluationProgressRecorder {
     func append(_ checkpoint: String) {
         checkpoints.append(checkpoint)
     }
+
+    func contains(_ checkpoint: String) -> Bool {
+        checkpoints.contains(checkpoint)
+    }
 }
 
 private actor ReevaluationTerminalPhaseHold {
     private var continuation: CheckedContinuation<Void, Never>?
+    private var wasReleased = false
 
     func wait() async {
+        guard !wasReleased else { return }
         await withCheckedContinuation { continuation = $0 }
     }
 
     func isWaiting() -> Bool { continuation != nil }
 
     func release() {
+        wasReleased = true
         continuation?.resume()
         continuation = nil
     }
@@ -12170,6 +12177,62 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testFileBackedObservedJournalAndImportForwardingRetainGeneration()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture(fileBacked: true)
+        let object = BigSyncTrackedObject(
+            id: "file-backed-terminal-forwarding",
+            createdAt: Date(),
+            modifiedAt: Date(),
+            explicitlyModifiedAt: nil
+        )
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let generation = try XCTUnwrap(
+            fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordName
+            )?.generation
+        )
+
+        let enteredForwarding = AsyncGate()
+        let releaseForwarding = AsyncGate()
+        fixture.adapter._testBeforePendingMutationTrackingWrite = {
+            guard !(await enteredForwarding.hasOpened()) else { return }
+            await enteredForwarding.open()
+            await releaseForwarding.wait()
+        }
+        fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
+        fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
+        await enteredForwarding.wait()
+
+        let progress = ReevaluationProgressRecorder()
+        let terminal = Task { @BigSyncBackgroundActor in
+            try await fixture.adapter.didFinishImport(progress: { progress.append($0) })
+        }
+        await releaseForwarding.open()
+        try await terminal.value
+        XCTAssertTrue(progress.checkpoints.contains("adapter-import-setup-completed"))
+        XCTAssertTrue(progress.checkpoints.contains("adapter-import-journal-snapshot-completed"))
+        XCTAssertTrue(progress.checkpoints.contains("adapter-import-forwarding-completed"))
+        XCTAssertTrue(progress.checkpoints.contains("adapter-import-status-completed"))
+        fixture.adapter._testBeforePendingMutationTrackingWrite = nil
+        fixture.persistenceRealm.refresh()
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(tracking.pendingGeneration, generation)
+        XCTAssertEqual(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordName
+        )?.generation, generation)
+    }
+
+    @BigSyncBackgroundActor
     func testJournalForwardingRechecksGenerationAfterPageSuspension()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
@@ -15072,6 +15135,60 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testTerminalTailTraceLocatesHeldImportForwardingBeforeReceipt() async throws {
+        let database = FakeCloudKitDatabase()
+        database.completesFetchDatabaseChanges = false
+        let progress = ReevaluationProgressRecorder()
+        let synchronizer = makeSynchronizer(
+            database: database,
+            progressHandler: { progress.append($0) }
+        )
+        let hold = ReevaluationTerminalPhaseHold()
+        let adapter = FakeModelAdapter(
+            zoneID: CKRecordZone.ID(zoneName: "terminal-trace-held-forwarding"),
+            priorities: []
+        )
+        adapter.didFinishImportHandler = {
+            if await progress.contains(
+                "terminal-tail-domain-context-revalidated"
+            ) {
+                await hold.wait()
+            }
+        }
+        synchronizer.addModelAdapter(adapter)
+        synchronizer.domainPrepublicationHandler = { _ in [] }
+        synchronizer.beginSynchronization()
+        for _ in 0..<1_000 where synchronizer.activeRunContext == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNotNil(synchronizer.activeRunContext)
+
+        let terminal = Task { @BigSyncBackgroundActor in
+            await synchronizer.changesFinishedSynchronizing()
+        }
+        for _ in 0..<1_000 {
+            if await hold.isWaiting() { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let forwardingIsHeld = await hold.isWaiting()
+        XCTAssertTrue(forwardingIsHeld)
+        let heldTrace = progress.checkpoints
+        XCTAssertTrue(heldTrace.contains("terminal-tail-domain-handler-completed"))
+        XCTAssertTrue(heldTrace.contains("terminal-tail-domain-context-revalidated"))
+        XCTAssertTrue(heldTrace.contains("terminal-tail-import-forwarding-started"))
+        XCTAssertFalse(heldTrace.contains("terminal-tail-import-forwarding-completed"))
+        XCTAssertFalse(heldTrace.contains("terminal-receipt"))
+
+        await hold.release()
+        await terminal.value
+        let completedTrace = progress.checkpoints
+        XCTAssertTrue(completedTrace.contains("terminal-tail-import-forwarding-completed"))
+        XCTAssertTrue(completedTrace.contains("terminal-tail-import-forwarding-revalidated"))
+        XCTAssertTrue(completedTrace.contains("terminal-receipt"))
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     func testReevaluationBlockedOutcomeCarriesIdentityWithoutReceipt() async throws {
         let database = FakeCloudKitDatabase()
         database.completesFetchDatabaseChanges = false
@@ -15772,7 +15889,8 @@ final class BigSyncKitTests: XCTestCase {
     private func makeRealmAdapterFixture(
         accountScopePropertyByClassName: [String: String] = [:],
         priorityEntityTypeNames: [String] = [],
-        committedInboundIdentityDeliveryEnabled: Bool = false
+        committedInboundIdentityDeliveryEnabled: Bool = false,
+        fileBacked: Bool = false
     ) async throws -> (
         adapter: RealmSwiftAdapter,
         persistenceRealm: Realm,
@@ -15780,10 +15898,22 @@ final class BigSyncKitTests: XCTestCase {
     ) {
         let identifier = UUID().uuidString
         var persistenceConfiguration = RealmSwiftAdapter.defaultPersistenceConfiguration()
-        persistenceConfiguration.inMemoryIdentifier = "persistence-\(identifier)"
-
         var targetConfiguration = Realm.Configuration()
-        targetConfiguration.inMemoryIdentifier = "target-\(identifier)"
+        if fileBacked {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("BigSyncKitTests-file-backed-\(identifier)",
+                                    isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true
+            )
+            persistenceConfiguration.fileURL = directory
+                .appendingPathComponent("tracking.realm")
+            targetConfiguration.fileURL = directory
+                .appendingPathComponent("target.realm")
+        } else {
+            persistenceConfiguration.inMemoryIdentifier = "persistence-\(identifier)"
+            targetConfiguration.inMemoryIdentifier = "target-\(identifier)"
+        }
         targetConfiguration.objectTypes = [
             BigSyncTrackedObject.self,
             BigSyncIntegerKeyedObject.self,
