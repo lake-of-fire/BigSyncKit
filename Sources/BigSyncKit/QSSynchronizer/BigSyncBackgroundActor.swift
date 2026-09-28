@@ -584,6 +584,10 @@ public actor BigSyncBackgroundActor {
     @discardableResult
     public func synchronizeCloudKit()
         async -> CloudKitSynchronizer.SynchronizationResult? {
+        // A cancelled caller owns no admission and must not retire valid
+        // startup/retry work belonging to another request.
+        guard !Task.isCancelled else { return nil }
+
         // An explicit request supersedes the delayed startup request. Leaving
         // both alive performs a second full drain ten seconds after every
         // configuration, or queues it behind a long initial reupload.
@@ -610,6 +614,10 @@ public actor BigSyncBackgroundActor {
     public func synchronizeCloudKit(
         deadlineNanoseconds: UInt64
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
+        // Do not manufacture an unstructured request for an already-cancelled
+        // lifecycle caller; cancellation is not inherited by a new Task.
+        guard !Task.isCancelled else { return nil }
+
         let race = BigSyncDeadlineRace()
         let synchronizationTask = Task { @BigSyncBackgroundActor [weak self] in
             let result = await self?.synchronizeCloudKit()
@@ -647,7 +655,8 @@ public actor BigSyncBackgroundActor {
     private func synchronizeCloudKit(
         expectedSynchronizer: CloudKitSynchronizer
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
-        guard realmSynchronizer === expectedSynchronizer else {
+        guard !Task.isCancelled,
+              realmSynchronizer === expectedSynchronizer else {
             return nil
         }
         await publicationRestorationTask?.value
@@ -905,6 +914,13 @@ public actor BigSyncBackgroundActor {
             performsAccountAvailabilityPreflight
         synchronizer.synchronizationCompletionHandler =
             synchronizationCompletionHandler
+    }
+
+    /// Holds the worker's existing restoration barrier without changing
+    /// production configuration or introducing a second admission path.
+    @BigSyncBackgroundActor
+    func _test_installPublicationRestoration(_ task: Task<Void, Never>) {
+        publicationRestorationTask = task
     }
 
     @BigSyncBackgroundActor
