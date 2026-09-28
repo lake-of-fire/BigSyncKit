@@ -2,7 +2,7 @@ import CloudKit
 import Foundation
 import Logging
 import XCTest
-@testable import BigSyncKit
+@_spi(CloudKitE2E) @testable import BigSyncKit
 
 final class BigSyncWorkerRequestCancellationTests: XCTestCase {
     @BigSyncBackgroundActor
@@ -23,6 +23,65 @@ final class BigSyncWorkerRequestCancellationTests: XCTestCase {
     @BigSyncBackgroundActor
     func testAlreadyCancelledDeadlineRequestPreservesLiveRetry() async {
         await assertCancelledRequestPreservesRetry(withDeadline: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testE2EDeadlineOutcomeReportsAlreadyCancelledCaller() async {
+        let fixture = makeFixture()
+        let request = Task { @BigSyncBackgroundActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await fixture.worker.cloudKitE2ESynchronizeCloudKit(
+                deadlineNanoseconds: 5_000_000_000
+            )
+        }
+        let outcome = await request.value
+        guard case .cancelled = outcome else {
+            return XCTFail("Expected request-scoped cancellation, got \(outcome)")
+        }
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testE2EDeadlineOutcomeDistinguishesCompletedNilFromTimeout() async {
+        let fixture = makeFixture()
+        let outcome = await fixture.worker.cloudKitE2ESynchronizeCloudKit(
+            deadlineNanoseconds: 5_000_000_000
+        )
+        guard case .completed(let result) = outcome else {
+            return XCTFail("Expected completed result, got \(outcome)")
+        }
+        XCTAssertNil(result)
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 1)
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testE2EDeadlineTimeoutDoesNotCancelSharedRestorationTask() async {
+        let fixture = makeFixture()
+        let release = WorkerRestorationRelease()
+        let restoration = installRestoration(on: fixture.worker, release: release)
+
+        let outcome = await fixture.worker.cloudKitE2ESynchronizeCloudKit(
+            deadlineNanoseconds: 1_000_000
+        )
+        guard case .timedOut = outcome else {
+            await release.open()
+            await restoration.value
+            return XCTFail("Expected deadline outcome, got \(outcome)")
+        }
+        XCTAssertFalse(
+            restoration.isCancelled,
+            "Request timeout must not cancel shared restoration authority"
+        )
+        await release.open()
+        await restoration.value
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
     }
 
     @BigSyncBackgroundActor
