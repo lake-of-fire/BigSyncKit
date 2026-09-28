@@ -1718,7 +1718,14 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(result.completionScope, .downloadOnly)
         XCTAssertNil(result.receipt)
         XCTAssertEqual(database.modifyRecordsOperationCount, 0)
-        XCTAssertFalse(sync.syncing)
+        // A separate journal wakeup may start a successor after this request
+        // completes. It must not leave the returned download-only run active.
+        if sync.syncing {
+            XCTAssertNotEqual(
+                sync.activeRunContext?.runID,
+                result.terminalBoundary?.runID
+            )
+        }
         realm.refresh()
         XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
         sync.domainPrepublicationHandler = nil
