@@ -429,6 +429,12 @@ public protocol ModelAdapter: AnyObject, Sendable {
     
     /// Tells the model adapter that the current import operation finished.
     func didFinishImport() async throws
+
+    /// Emits checkpoints around terminal import work. Adapters without
+    /// detailed checkpoints retain their normal import behavior.
+    func didFinishImport(
+        progress: @escaping @BigSyncBackgroundActor @Sendable (String) -> Void
+    ) async throws
     
     /// Record zone ID managed by this adapter
     var recordZoneID: CKRecordZone.ID { get }
@@ -500,6 +506,12 @@ public protocol ModelAdapter: AnyObject, Sendable {
 }
 
 public extension ModelAdapter {
+    func didFinishImport(
+        progress: @escaping @BigSyncBackgroundActor @Sendable (String) -> Void
+    ) async throws {
+        try await didFinishImport()
+    }
+
     func commitInboundPage(_ page: InboundPageCommit) async throws {
         try await saveToken(page.nextCursor)
     }

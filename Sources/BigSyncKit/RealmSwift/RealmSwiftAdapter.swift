@@ -2374,13 +2374,19 @@ public final class RealmSwiftAdapter:
 
     /// Immediately updates.
     @BigSyncBackgroundActor
-    private func updateCreatedAndModified(notifyDelegate: Bool = true) async throws {
+    private func updateCreatedAndModified(
+        notifyDelegate: Bool = true,
+        progress: (@BigSyncBackgroundActor @Sendable (String) -> Void)? = nil
+    ) async throws {
         guard let targetReaderRealms = realmProvider?.targetReaderRealms else { return }
-        for targetReaderRealm in targetReaderRealms {
+        for (index, targetReaderRealm) in targetReaderRealms.enumerated() {
+            progress?("adapter-import-target-\(index)-started")
             try await forwardPendingMutations(
                 in: targetReaderRealm,
-                notifyDelegate: notifyDelegate
+                notifyDelegate: notifyDelegate,
+                progress: progress
             )
+            progress?("adapter-import-target-\(index)-completed")
         }
     }
 
@@ -2388,20 +2394,24 @@ public final class RealmSwiftAdapter:
     @discardableResult
     private func forwardPendingMutations(
         in targetReaderRealm: Realm,
-        notifyDelegate: Bool = true
+        notifyDelegate: Bool = true,
+        progress: (@BigSyncBackgroundActor @Sendable (String) -> Void)? = nil
     ) async throws -> Int {
         // Freeze the journal boundary so paging does not change which generations
         // this drain promises to forward, while avoiding one O(N) snapshot array.
+        progress?("adapter-import-journal-snapshot-started")
         let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
             .sorted(byKeyPath: "recordName")
             .freeze()
+        let mutationCount = mutations.count
+        progress?("adapter-import-journal-snapshot-completed")
         let pageSize = 1_000
         var forwardedCount = 0
         var offset = 0
-        while offset < mutations.count {
+        while offset < mutationCount {
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
-            let end = min(offset + pageSize, mutations.count)
+            let end = min(offset + pageSize, mutationCount)
             var pending = [BigSyncPendingMutationSnapshot]()
             pending.reserveCapacity(end - offset)
             for index in offset..<end {
@@ -2412,22 +2422,26 @@ public final class RealmSwiftAdapter:
                     )
                 )
             }
+            progress?("adapter-import-journal-page-tracking-started")
             forwardedCount += try await forwardPendingMutations(
                 pending,
                 in: targetReaderRealm,
                 notifyDelegate: false,
                 updateStatus: false
             )
+            progress?("adapter-import-journal-page-tracking-completed")
             offset = end
             await Task.yield()
         }
 
         if forwardedCount > 0,
            let persistenceRealm = realmProvider?.persistenceRealm {
+            progress?("adapter-import-delegate-started")
             updateHasChanges(realm: persistenceRealm)
             if notifyDelegate {
                 await modelAdapterDelegate?.hasChangesToUpload()
             }
+            progress?("adapter-import-delegate-completed")
         }
         return forwardedCount
     }
@@ -8232,25 +8246,42 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     public func didFinishImport() async throws {
+        try await didFinishImport(progress: { _ in })
+    }
+
+    @BigSyncBackgroundActor
+    public func didFinishImport(
+        progress: @escaping @BigSyncBackgroundActor @Sendable (String) -> Void
+    ) async throws {
         // Failure cleanup can arrive before migration has installed recovery
         // provenance. Keep the target journal untouched at this boundary;
         // normal setup/forwarding resumes through unsetCancellation only
         // after the owning run completes preparation successfully.
         guard !isPreparingFencedMigration else { return }
+        progress("adapter-import-setup-started")
         try await ensureSetup()
+        progress("adapter-import-setup-completed")
         guard let realmProvider, let persistenceRealm = realmProvider.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
 
         //        logger.info("QSCloudKitSynchronizer >> Clearing temporary CKAsset files")
-        try await updateCreatedAndModified()
+        progress("adapter-import-forwarding-started")
+        try await updateCreatedAndModified(progress: progress)
+        progress("adapter-import-forwarding-completed")
+        progress("adapter-import-quarantine-started")
         try await retireResolvedRecordConflictQuarantines()
+        progress("adapter-import-quarantine-completed")
         // didFinishImport is reached only after the operation that consumed
         // prepared CKAssets is terminal. Realm data, not these files, owns any
         // still-pending generation, so future retries can safely rematerialize
         // their current values without retaining superseded offline versions.
+        progress("adapter-import-assets-started")
         persistentAssetManager.clearAssetFiles()
+        progress("adapter-import-assets-completed")
+        progress("adapter-import-status-started")
         updateHasChanges(realm: persistenceRealm)
+        progress("adapter-import-status-completed")
     }
 
     @BigSyncBackgroundActor

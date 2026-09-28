@@ -12209,11 +12209,16 @@ final class BigSyncKitTests: XCTestCase {
         fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
         await enteredForwarding.wait()
 
+        let progress = ReevaluationProgressRecorder()
         let terminal = Task { @BigSyncBackgroundActor in
-            try await fixture.adapter.didFinishImport()
+            try await fixture.adapter.didFinishImport(progress: { progress.append($0) })
         }
         await releaseForwarding.open()
         try await terminal.value
+        XCTAssertTrue(progress.checkpoints.contains("adapter-import-setup-completed"))
+        XCTAssertTrue(progress.checkpoints.contains("adapter-import-journal-snapshot-completed"))
+        XCTAssertTrue(progress.checkpoints.contains("adapter-import-forwarding-completed"))
+        XCTAssertTrue(progress.checkpoints.contains("adapter-import-status-completed"))
         fixture.adapter._testBeforePendingMutationTrackingWrite = nil
         fixture.persistenceRealm.refresh()
         let tracking = try XCTUnwrap(fixture.persistenceRealm.object(

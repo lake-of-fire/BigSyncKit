@@ -183,7 +183,9 @@ extension CloudKitSynchronizer {
                 // generation first.
                 for adapter in modelAdapters {
                     reportProgress("terminal-tail-import-forwarding-started")
-                    try await adapter.didFinishImport()
+                    try await adapter.didFinishImport { checkpoint in
+                        self.reportProgress("terminal-tail-\(checkpoint)")
+                    }
                     reportProgress("terminal-tail-import-forwarding-completed")
                     try await revalidateRunContext(terminalContext)
                     reportProgress("terminal-tail-import-forwarding-revalidated")
