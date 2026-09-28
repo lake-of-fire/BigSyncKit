@@ -41,6 +41,22 @@ class W1ExecutionTests(unittest.TestCase):
     def test_linux_named_passes_are_accepted(self):
         self.assertTrue(self.check(log=execution(apple=False))["passed"])
 
+    def test_apple_start_without_timestamp_is_accepted(self):
+        # Exact record shape observed in the macOS/Xcode 16.4 run artifact.
+        # Test cases say "started." while test suites include a timestamp.
+        log = execution().replace("started at 2026-09-28 12:00:00.000", "started.")
+        result = self.check(log=log)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["passed_cases"], list(verifier.REQUIRED))
+
+    def test_timestamp_free_start_does_not_weaken_terminal_or_order_requirements(self):
+        log = execution().replace("started at 2026-09-28 12:00:00.000", "started.")
+        lines = log.splitlines(keepends=True)
+        for changed in (lines[1:], lines[:-1], lines + lines,
+                        [lines[1], lines[0]] + lines[2:]):
+            with self.subTest(events=changed[:2]):
+                self.assertFalse(self.check(log="".join(changed))["passed"])
+
     def test_discovery_does_not_claim_execution(self):
         result = verifier.validate(discovery(), [0, 0, 0])
         self.assertTrue(result["passed"])

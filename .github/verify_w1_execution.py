@@ -44,7 +44,7 @@ DISCOVERY = re.compile(rf"BigSyncKitTests\.({IDENTIFIER})/({IDENTIFIER})")
 APPLE_NAME = re.compile(rf"-\[(?:BigSyncKitTests\.)?({IDENTIFIER}) ({IDENTIFIER})\]")
 SWIFT_NAME = re.compile(rf"(?:BigSyncKitTests\.)?({IDENTIFIER})\.({IDENTIFIER})")
 EVENT = re.compile(
-    r"Test Case '([^']+)' (started at .+|(?:passed|failed|skipped) \([0-9.]+ seconds\)\.?)"
+    r"Test Case '([^']+)' (started(?: at .+|\.)|(?:passed|failed|skipped) \([0-9.]+ seconds\)\.?)"
 )
 
 
@@ -72,7 +72,7 @@ def validate(
             name = APPLE_NAME.fullmatch(event[1]) or SWIFT_NAME.fullmatch(event[1])
             if not name:
                 continue
-            records["/".join(name.groups())].append(event[2].split(" ", 1)[0])
+            records["/".join(name.groups())].append(event[2].split(" ", 1)[0].removesuffix("."))
         for name in REQUIRED:
             if records[name] != ["started", "passed"]:
                 errors.append(f"{name}: expected one start followed by one pass; got {records[name]}")
