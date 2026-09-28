@@ -6286,18 +6286,14 @@ public final class RealmSwiftAdapter:
                 }
             }
 
-            let retiredIdentifiers = Set(entitiesToDelete.map(\.identifier))
-            let obsoleteRelationships = Array(
-                persistenceRealm.objects(PendingRelationship.self)
-            ).filter { relationship in
-                guard let ownerIdentifier = relationship.forSyncedEntity?
-                    .identifier else {
-                    return true
-                }
-                return retiredIdentifiers.contains(ownerIdentifier)
-            }
-            persistenceRealm.delete(obsoleteRelationships)
+            // Realm clears links to deleted owners inside this transaction.
+            // This also collects relationships that were already orphaned,
+            // without materializing every pending relationship in memory.
             persistenceRealm.delete(entitiesToDelete)
+            let orphanedRelationships = persistenceRealm
+                .objects(PendingRelationship.self)
+                .filter("forSyncedEntity == nil")
+            persistenceRealm.delete(orphanedRelationships)
         }
     }
 

@@ -12027,10 +12027,22 @@ final class BigSyncKitTests: XCTestCase {
             alreadyOrphaned.targetIdentifier =
                 BigSyncRelationshipChild.className() + ".also-missing"
             fixture.persistenceRealm.add(alreadyOrphaned)
+
+            let survivingOwner = SyncedEntity(
+                entityType: BigSyncRelationshipParent.className(),
+                identifier: "surviving-parent", state: SyncedEntityState.synced.rawValue
+            )
+            let survivingRelationship = PendingRelationship()
+            survivingRelationship.relationshipName = "children"
+            survivingRelationship.targetIdentifier =
+                BigSyncRelationshipChild.className() + ".still-missing"
+            survivingRelationship.forSyncedEntity = survivingOwner
+            fixture.persistenceRealm.add(survivingOwner)
+            fixture.persistenceRealm.add(survivingRelationship)
         }
         XCTAssertEqual(
             fixture.persistenceRealm.objects(PendingRelationship.self).count,
-            2
+            3
         )
 
         _ = try await fixture.adapter.deleteRecords(with: [record.recordID])
@@ -12049,8 +12061,12 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: record.recordID.recordName
             )
         )
-        XCTAssertTrue(
-            fixture.persistenceRealm.objects(PendingRelationship.self).isEmpty
+        let remainingRelationships = fixture.persistenceRealm
+            .objects(PendingRelationship.self)
+        XCTAssertEqual(remainingRelationships.count, 1)
+        XCTAssertEqual(
+            remainingRelationships.first?.forSyncedEntity?.identifier,
+            "surviving-parent"
         )
     }
 

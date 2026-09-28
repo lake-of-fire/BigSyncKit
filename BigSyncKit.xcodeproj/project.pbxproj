@@ -68,6 +68,7 @@
 		90E99801CAF3EC8227C36131 /* RealmSwift.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 334E77EAA11F1D8A3C955A4A /* RealmSwift.framework */; };
 		925FD12FF5B9A924B3A897A4 /* HotfixMutationDrainTailTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 211B694B645BEDBC9B56108A /* HotfixMutationDrainTailTests.swift */; };
 		97AA7C192DA5ABD85BE065B7 /* BigSyncLegacyTrackingEvidence.swift in Sources */ = {isa = PBXBuildFile; fileRef = F94ABB7198B34AFAABA9C13C /* BigSyncLegacyTrackingEvidence.swift */; };
+		999DDBD7512DA58EAF12D1FC /* IncomingRepresentationSemanticRecordTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A917452F7936D7D954FB5125 /* IncomingRepresentationSemanticRecordTests.swift */; };
 		9A1BF58FA7646A413503C6AC /* QSCloudKitSynchronizer+RealmSwift.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58CDB4D39314DDAFE352E728 /* QSCloudKitSynchronizer+RealmSwift.swift */; };
 		9A20104DB64B73EAB08F674B /* RealmDatabase_RealmCoreResources.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 81AE000449FA79F1262C25F3 /* RealmDatabase_RealmCoreResources.bundle */; };
 		9B4D4052744B0934AC8AD62F /* SyncRetainedRecordContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BE747FFB25C6693850239E1 /* SyncRetainedRecordContractTests.swift */; };
@@ -288,6 +289,7 @@
 		9EBCC0560D957A2DE22C48E2 /* InjectedBindingStoreIdentityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InjectedBindingStoreIdentityTests.swift; sourceTree = "<group>"; };
 		A449FA4DC3573137B2E9902C /* BigSyncRecordBaseline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigSyncRecordBaseline.swift; sourceTree = "<group>"; };
 		A8A3550B283BE2BFFFA7F437 /* HotfixCollectionSafetyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotfixCollectionSafetyTests.swift; sourceTree = "<group>"; };
+		A917452F7936D7D954FB5125 /* IncomingRepresentationSemanticRecordTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IncomingRepresentationSemanticRecordTests.swift; sourceTree = "<group>"; };
 		ABEE9A26F724BE99A3697C23 /* PrimaryKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrimaryKey.swift; sourceTree = "<group>"; };
 		ADA2B08225F32371A9576AAA /* ReviewDisjointFieldRegressionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewDisjointFieldRegressionTests.swift; sourceTree = "<group>"; };
 		AE750B9FB808E3C4EA4F3D4E /* CloudKitSynchronizer+RecordMutations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudKitSynchronizer+RecordMutations.swift"; sourceTree = "<group>"; };
@@ -392,6 +394,7 @@
 				A8A3550B283BE2BFFFA7F437 /* HotfixCollectionSafetyTests.swift */,
 				211B694B645BEDBC9B56108A /* HotfixMutationDrainTailTests.swift */,
 				29A56E9AF9697066D1A63F04 /* HotfixSubscriptionSafetyTests.swift */,
+				A917452F7936D7D954FB5125 /* IncomingRepresentationSemanticRecordTests.swift */,
 				9EBCC0560D957A2DE22C48E2 /* InjectedBindingStoreIdentityTests.swift */,
 				573C544F6B0039442FD4222A /* ModelAdapterDeletionConflictSafetyTests.swift */,
 				3EA9DD2B0DCEADD082EA24A2 /* OrderedSemanticRecordTests.swift */,
@@ -802,6 +805,7 @@
 				DF89D7B7B2053E4AFF94AE59 /* HotfixCollectionSafetyTests.swift in Sources */,
 				925FD12FF5B9A924B3A897A4 /* HotfixMutationDrainTailTests.swift in Sources */,
 				50DE267C20AD8CD833C6AA58 /* HotfixSubscriptionSafetyTests.swift in Sources */,
+				999DDBD7512DA58EAF12D1FC /* IncomingRepresentationSemanticRecordTests.swift in Sources */,
 				E01FC8DA622C27523FDDFDBA /* InjectedBindingStoreIdentityTests.swift in Sources */,
 				2283F6BCF197679484C48935 /* ModelAdapterDeletionConflictSafetyTests.swift in Sources */,
 				2BBF46BAD84A4F5A32F65D2A /* OrderedSemanticRecordTests.swift in Sources */,
