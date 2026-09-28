@@ -2304,6 +2304,45 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCancelledWorkerPreflightDoesNotScheduleRetry() async throws {
+        let entered = expectation(description: "account preflight entered")
+        let release = ClosureRestorationGate()
+        let availabilityGate = CloudKitAccountAvailabilityGate(
+            statusProvider: { _ in
+                entered.fulfill()
+                await release.wait()
+                return .failed
+            },
+            deadlineNanoseconds: 60_000_000_000
+        )
+        let worker = BigSyncBackgroundActor(
+            accountAvailabilityGate: availabilityGate
+        )
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport()
+        )
+        worker._test_installSynchronizer(
+            synchronizer,
+            performsAccountAvailabilityPreflight: true
+        )
+        addTeardownBlock { @BigSyncBackgroundActor in
+            await release.open()
+            await worker.cancelSynchronization()
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+
+        let request = Task { @BigSyncBackgroundActor in
+            await worker.synchronizeCloudKit()
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        request.cancel()
+        _ = await request.value
+
+        XCTAssertFalse(worker._test_hasScheduledAccountAvailabilityRetry)
+        XCTAssertEqual(synchronizer.modelAdapters.count, 0)
+    }
+
+    @BigSyncBackgroundActor
     private func makeSynchronizer(
         transport: AccountFencingTransport,
         store: KeyValueStore = AccountFencingStore(),

@@ -65,6 +65,9 @@ struct CloudKitAccountAvailabilityGate: Sendable {
     }
 
     func availability(for containerIdentifier: String) async -> CloudKitAccountAvailability {
+        // Unstructured provider/deadline tasks do not inherit cancellation.
+        // Do not submit account work for a caller cancelled before admission.
+        guard !Task.isCancelled else { return .failed }
         let race = CloudKitAccountAvailabilityRace()
         let providerTask = Task {
             let value = await statusProvider(containerIdentifier)
