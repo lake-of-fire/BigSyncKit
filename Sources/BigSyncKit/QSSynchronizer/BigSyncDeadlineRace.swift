@@ -27,6 +27,17 @@ actor BigSyncDeadlineRace<Value: Sendable> {
         deadline = sum.overflow ? UInt64.max : sum.partialValue
     }
 
+    /// Preserve a cutoff captured by a caller before logging, actor hops or
+    /// earlier attempts. This is DispatchTime uptime within the same process;
+    /// never pass wall-clock nanoseconds or persist/reuse it after relaunch.
+    init(
+        untilUptimeNanoseconds deadline: UInt64,
+        now: @escaping Now = { DispatchTime.now().uptimeNanoseconds }
+    ) {
+        self.now = now
+        self.deadline = deadline
+    }
+
     /// Safe on the worker actor before any admission side effect. This only
     /// inspects immutable timing inputs, never actor-owned result state.
     nonisolated var remainingNanoseconds: UInt64 {

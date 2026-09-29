@@ -118,6 +118,61 @@ final class BigSyncWorkerRequestCancellationTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testExpiredCallerCutoffPreservesStartupWithoutPreflight() async {
+        let fixture = makeFixture()
+        fixture.worker._test_scheduleDormantInitialSynchronization()
+        // An absolute cutoff in the past is NOT a new positive duration.
+        let outcome = await fixture.worker.cloudKitE2ESynchronizeCloudKit(untilUptimeNanoseconds: 1)
+        guard case .timedOut = outcome else { return XCTFail("Expired caller budget was renewed") }
+        XCTAssertTrue(fixture.worker._test_hasScheduledInitialSynchronization)
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testExpiredCallerCutoffPreservesScheduledRetry() async {
+        let fixture = makeFixture()
+        _ = await fixture.worker.synchronizeCloudKit()
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        let before = await fixture.availability.count
+        let outcome = await fixture.worker.cloudKitE2ESynchronizeCloudKit(untilUptimeNanoseconds: 1)
+        guard case .timedOut = outcome else { return XCTFail("Expected expired caller cutoff") }
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        let after = await fixture.availability.count
+        XCTAssertEqual(after, before)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledAbsoluteCutoffCallerDoesNotBecomeTimeout() async {
+        let fixture = makeFixture()
+        fixture.worker._test_scheduleDormantInitialSynchronization()
+        let request = Task { @BigSyncBackgroundActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await fixture.worker.cloudKitE2ESynchronizeCloudKit(untilUptimeNanoseconds: 0)
+        }
+        let outcome = await request.value
+        guard case .cancelled = outcome else { return XCTFail("Cancellation became timeout") }
+        XCTAssertTrue(fixture.worker._test_hasScheduledInitialSynchronization)
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testLiveAbsoluteCutoffCanReturnCompletedNil() async {
+        let fixture = makeFixture()
+        let outcome = await fixture.worker.cloudKitE2ESynchronizeCloudKit(untilUptimeNanoseconds: UInt64.max)
+        guard case .completed(let result) = outcome else { return XCTFail("Valid cutoff lost completed-nil") }
+        XCTAssertNil(result)
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 1)
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
     func testLiveExplicitRequestStillSupersedesScheduledStartup() async {
         let fixture = makeFixture()
         fixture.worker._test_scheduleDormantInitialSynchronization()
@@ -567,6 +622,92 @@ final class BigSyncDeadlineRaceTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(winners, 1)
         guard case .completed(let value) = await race.value() else { return XCTFail("No completed result") }
         XCTAssertTrue((0..<32).contains(value))
+    }
+
+    func testAbsoluteCutoffDoesNotRenewAfterCallerDelay() async {
+        let clock = DeadlineTestClock(500)
+        let race = Race(untilUptimeNanoseconds: 150, now: { clock.read() })
+        XCTAssertEqual(race.remainingNanoseconds, 0)
+        await race.resolve(.completed(7))
+        guard case .timedOut = await race.value() else { return XCTFail("Past cutoff became new duration") }
+    }
+
+    func testAbsoluteCutoffSleepsOnlyUnspentCallerBudget() async {
+        let clock = DeadlineTestClock(140)
+        let race = Race(untilUptimeNanoseconds: 150, now: { clock.read() })
+        XCTAssertEqual(race.remainingNanoseconds, 10)
+        await race.waitUntilDeadline { remaining in
+            XCTAssertEqual(remaining, 10)
+            clock.set(150)
+        }
+        guard case .timedOut = await race.value() else { return XCTFail("Caller deadline was extended") }
+    }
+
+    func testOriginalCutoffIsSharedAcrossSeparatelyConstructedAttempts() async {
+        let clock = DeadlineTestClock(100)
+        let first = BigSyncDeadlineRace<Int?>(untilUptimeNanoseconds: 150, now: { clock.read() })
+        clock.set(120)
+        await first.resolve(.completed(nil))
+        guard case .completed(nil) = await first.value() else { return XCTFail("First result was not accepted") }
+        // Logging/preparation between attempts consumes, rather than renews,
+        // the caller's budget even though a new race object is constructed.
+        clock.set(151)
+        let second = Race(untilUptimeNanoseconds: 150, now: { clock.read() })
+        await second.resolve(.completed(8))
+        guard case .timedOut = await second.value() else { return XCTFail("Second attempt reset the cutoff") }
+    }
+
+    func testAbsoluteOnTimeResultSurvivesLaterDelivery() async {
+        let clock = DeadlineTestClock(149)
+        let race = Race(untilUptimeNanoseconds: 150, now: { clock.read() })
+        await race.resolve(.completed(9))
+        clock.set(900)
+        await race.resolve(.timedOut)
+        guard case .completed(9) = await race.value() else { return XCTFail("Accepted result was revoked") }
+    }
+
+    func testAbsoluteExpiredCutoffKeepsCancellationDistinct() async {
+        let clock = DeadlineTestClock(500)
+        let race = Race(untilUptimeNanoseconds: 150, now: { clock.read() })
+        await race.resolve(.cancelled)
+        await race.resolve(.completed(8))
+        guard case .cancelled = await race.value() else { return XCTFail("Cancellation was relabeled") }
+    }
+
+    func testZeroAbsoluteCutoffDoesNotMeanUnlimited() async {
+        let clock = DeadlineTestClock(0)
+        let race = Race(untilUptimeNanoseconds: 0, now: { clock.read() })
+        XCTAssertEqual(race.remainingNanoseconds, 0)
+        await race.resolve(.completed(8))
+        guard case .timedOut = await race.value() else { return XCTFail("Zero cutoff admitted work") }
+    }
+
+    func testAbsoluteCutoffDoesNotAddUptimeOrOverflow() async {
+        let clock = DeadlineTestClock(UInt64.max - 20)
+        let race = Race(untilUptimeNanoseconds: UInt64.max - 5, now: { clock.read() })
+        XCTAssertEqual(race.remainingNanoseconds, 15)
+        clock.set(UInt64.max - 5)
+        await race.resolve(.completed(8))
+        guard case .timedOut = await race.value() else { return XCTFail("Cutoff arithmetic added time") }
+    }
+
+    func testRelativeHandoffRenewsBudgetButAbsoluteHandoffDoesNot() async {
+        let clock = DeadlineTestClock(100)
+        let callerCutoff: UInt64 = 150
+        let cachedRemaining = callerCutoff - clock.read()
+        // Reproduce the inspected Core call sequence: remaining time is
+        // calculated before logging and the worker-actor scheduling gap.
+        clock.set(160)
+        let durationHandoff = Race(durationNanoseconds: cachedRemaining, now: { clock.read() })
+        let cutoffHandoff = Race(untilUptimeNanoseconds: callerCutoff, now: { clock.read() })
+        await durationHandoff.resolve(.completed(1))
+        await cutoffHandoff.resolve(.completed(1))
+        guard case .completed(1) = await durationHandoff.value() else {
+            return XCTFail("Duration compatibility semantics unexpectedly changed")
+        }
+        guard case .timedOut = await cutoffHandoff.value() else {
+            return XCTFail("Absolute handoff still renewed the caller's budget")
+        }
     }
 
     func testProductionTimerResumesRegisteredWaiter() async {
