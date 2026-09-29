@@ -18,14 +18,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 3c0ccf00d734cae997bd34654a4f2efd01397531
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: 475973026ca1e953d016ff78e65c0be5bb4885d5
+          path: SwiftUtilities
           persist-credentials: false
       - name: Record exact source and toolchain
         run: |
           set -euo pipefail
-          git rev-parse HEAD
+          git -C BigSyncKit rev-parse HEAD
+          test "$(git -C RealmSwiftGaps rev-parse HEAD)" = "3c0ccf00d734cae997bd34654a4f2efd01397531"
+          test "$(git -C SwiftUtilities rev-parse HEAD)" = "475973026ca1e953d016ff78e65c0be5bb4885d5"
           swift --version
-          grep -F '.package(url: "https://github.com/realm/realm-swift.git", from: "20.0.5")' Package.swift
+          grep -F '.package(url: "https://github.com/realm/realm-swift.git", from: "20.0.5")' BigSyncKit/Package.swift
       - name: Debug tests
-        run: swift test -c debug
+        run: swift test --package-path BigSyncKit -c debug
       - name: Release tests
-        run: swift test -c release
+        run: swift test --package-path BigSyncKit -c release
