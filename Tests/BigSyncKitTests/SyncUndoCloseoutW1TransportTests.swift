@@ -42,7 +42,7 @@ extension SyncUndoCloseoutW1Tests {
     func testFetchedDeletionPageReplaysAfterTargetFirstInterruptionAndUploadsV2Recreation()
     async throws {
         let (adapter, realm, object, incoming) = try await acceptedNote()
-        let transport = W1ScriptedTransport()
+        let transport = W1ScriptedTransport(servesZonePages: true)
         let firstSynchronizer = synchronizer(adapter, transport: transport)
         let wakeups = W1ExplicitWakeups()
         adapter.modelAdapterDelegate = wakeups
