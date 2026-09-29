@@ -5218,6 +5218,143 @@ public final class RealmSwiftAdapter:
                 }
             }
 
+            if (mode == .initialImport || mode == .serverReconciliation),
+               let comparisonContext = recordRebaseContext {
+                // Contract preparation requires target-owned intent, including
+                // the bounded legacy discovery that predates journaling. Commit
+                // it before publishing tracking, so interruption resumes through
+                // ordinary forwarding rather than a tracking-only generation.
+                var journalRecordNames = [String]()
+                let changedAt = Date()
+                try await targetRealm.asyncWrite {
+                    try requireCurrentTransport(
+                        namespace,
+                        cancellationGeneration: expectedCancellationGeneration
+                    )
+                    guard recordRebaseContext == comparisonContext else {
+                        throw CancellationError()
+                    }
+                    try comparisonContext.validate(in: targetRealm)
+                    guard let activeState = persistenceRealm.object(
+                        ofType: RebuildProvenanceState.self,
+                        forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+                    ), activeState.isActive,
+                       activeState.serverBootstrapStarted,
+                       activeState.accountScopeIdentifier == accountScopeIdentifier,
+                       activeState.epoch == epoch,
+                       changeFeedResetMode(for: activeState) == mode else {
+                        throw CancellationError()
+                    }
+                    for candidate in targetCandidates {
+                        guard persistenceRealm.object(
+                            ofType: SyncedEntity.self,
+                            forPrimaryKey: candidate.identifier
+                        ) == nil,
+                        let objectType = realmObjectClass(name: candidate.entityType),
+                        objectType is BigSyncRecordContractProviding.Type,
+                        let objectIdentifier = getObjectIdentifier(
+                            stringObjectId: candidate.objectIdentifier,
+                            entityType: candidate.entityType
+                        ), let object = targetRealm.object(
+                            ofType: objectType,
+                            forPrimaryKey: objectIdentifier
+                        ), BigSyncRecordLifecycle.isPhysicalDeletion(object) == candidate.isDeleted,
+                        objectIsEligibleForActiveAccount(object, entityType: candidate.entityType) else {
+                            continue
+                        }
+                        try requireRecordEvidenceSchema(in: targetRealm, entityType: candidate.entityType)
+                        guard targetRealm.schema.objectSchema.contains(where: {
+                            $0.className == BigSyncPendingMutation.className()
+                        }) else {
+                            throw BigSyncRecordContractError.missingEvidenceSchema(candidate.entityType)
+                        }
+                        if let eligibility = objectType as? CloudKitInitialSyncEligibilityModel.Type,
+                           !eligibility.initialCloudKitSyncEligibilityPredicate.evaluate(with: object) {
+                            continue
+                        }
+                        if let mutation = targetRealm.object(
+                            ofType: BigSyncPendingMutation.self,
+                            forPrimaryKey: candidate.identifier
+                        ) {
+                            // A newer eligible local edit already owns this
+                            // intent. Never renew or rebind its generation.
+                            if pendingMutationIsEligibleForActiveTransport(mutation) {
+                                guard mutation.entityType == candidate.entityType,
+                                      mutation.objectIdentifier == candidate.objectIdentifier,
+                                      !mutation.generation.isEmpty else {
+                                    throw BigSyncRecordRebaseError.inconsistentReceipt(candidate.identifier)
+                                }
+                                journalRecordNames.append(candidate.identifier)
+                            }
+                            continue
+                        }
+                        let provenance = persistenceRealm.object(
+                            ofType: RebuildProvenance.self,
+                            forPrimaryKey: candidate.identifier
+                        ).flatMap { row -> RebuildProvenance? in
+                            row.accountScopeIdentifier == accountScopeIdentifier && row.epoch == epoch
+                                ? row : nil
+                        }
+                        if let provenance, provenance.entityType != candidate.entityType {
+                            continue
+                        }
+                        if let generation = provenance?.priorPendingGeneration {
+                            guard !generation.isEmpty,
+                                  let provenance,
+                                  [SyncedEntityState.new.rawValue,
+                                   SyncedEntityState.changed.rawValue,
+                                   SyncedEntityState.deletedLocally.rawValue].contains(provenance.priorState),
+                                  provenance.priorPendingReplicaBindingGenerationIdentifier
+                                    == activeReplicaBindingGenerationIdentifier else {
+                                continue
+                            }
+                            // This exact tracking generation already owned the
+                            // local intent; recovery moves it to the sole durable
+                            // target journal without minting a successor edit.
+                            if candidate.isDeleted {
+                                BigSyncRecordBaseline.invalidate(recordName: candidate.identifier, in: targetRealm)
+                            }
+                            targetRealm.add(BigSyncPendingMutation(
+                                recordName: candidate.identifier,
+                                entityType: candidate.entityType,
+                                objectIdentifier: candidate.objectIdentifier,
+                                accountScopeIdentifier: candidate.accountScopeIdentifier,
+                                replicaBindingGenerationIdentifier:
+                                    provenance.priorPendingReplicaBindingGenerationIdentifier,
+                                generation: generation,
+                                changedAt: changedAt
+                            ))
+                        } else {
+                            guard mode == .initialImport,
+                                  provenance?.hadValidServerRecord != true,
+                                  !candidate.isDeleted else { continue }
+                            guard let metadata = object as? ChangeMetadataRecordable else {
+                                throw RealmSwiftAdapterError.missingChangeMetadataConformance(
+                                    entityType: candidate.entityType
+                                )
+                            }
+                            metadata.journalCurrentValuePreservingChangeMetadata(at: changedAt)
+                        }
+                        guard let mutation = targetRealm.object(
+                            ofType: BigSyncPendingMutation.self,
+                            forPrimaryKey: candidate.identifier
+                        ), mutation.entityType == candidate.entityType,
+                           mutation.objectIdentifier == candidate.objectIdentifier,
+                           !mutation.generation.isEmpty,
+                           pendingMutationIsEligibleForActiveTransport(mutation) else {
+                            throw BigSyncRecordRebaseError.inconsistentReceipt(candidate.identifier)
+                        }
+                        journalRecordNames.append(candidate.identifier)
+                    }
+                    try comparisonContext.validate(in: targetRealm)
+                }
+                try await forwardPendingMutations(
+                    pendingMutationSnapshots(for: journalRecordNames, in: targetRealm),
+                    in: targetRealm,
+                    notifyDelegate: false
+                )
+            }
+
             candidates.append(contentsOf: targetCandidates.map { candidate in
                 let pendingMutation = targetRealm.object(
                     ofType: BigSyncPendingMutation.self,
@@ -5315,6 +5452,21 @@ public final class RealmSwiftAdapter:
                 ).flatMap { provenance -> RebuildProvenance? in
                     provenance.accountScopeIdentifier == accountScopeIdentifier
                         && provenance.epoch == epoch ? provenance : nil
+                }
+                if (mode == .initialImport || mode == .serverReconciliation),
+                   objectType is BigSyncRecordContractProviding.Type {
+                    // Eligible contract intent was forwarded from its durable
+                    // target journal above. Rejected/stale provenance must not
+                    // fall through to another tracking-only upload generation.
+                    if provenance?.entityType == candidate.entityType,
+                       provenance?.hadValidServerRecord == true {
+                        persistenceRealm.add(SyncedEntity(
+                            entityType: candidate.entityType,
+                            identifier: candidate.identifier,
+                            state: SyncedEntityState.awaitingServerEvidence.rawValue
+                        ), update: .modified)
+                    }
+                    continue
                 }
                 if mode != .backupRestore,
                    let generation = provenance?.priorPendingGeneration {
