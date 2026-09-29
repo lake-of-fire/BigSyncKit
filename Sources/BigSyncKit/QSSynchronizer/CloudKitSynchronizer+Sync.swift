@@ -168,13 +168,12 @@ extension CloudKitSynchronizer {
             await failSynchronization(error: error)
             return
         }
-        if disposition == .restartRequired {
+        switch disposition {
+        case .restartRequired:
             reportProgress("terminal-tail-restarting")
             restartSynchronizationForTerminalWork()
             return
-        }
-
-        if disposition == .downloadOnly {
+        case .downloadOnly:
             // Journal forwarding and domain reconciliation may create local
             // work, but this mode promises not to upload it. Finish the inbound
             // request once without completing migration, minting a receipt or
@@ -193,15 +192,12 @@ extension CloudKitSynchronizer {
             reportProgress("download-only-completed")
             await publishSynchronizationResult(result, context: terminalContext)
             return
-        }
-
-        // A semantic blocker is publishable only after the same exact
-        // journal and cursor predicates required by a success receipt are
-        // stable. Domain reconciliation may both create upload work and
-        // report a blocker; drain that work first so `.blocked` describes the
-        // terminal transport boundary rather than an obsolete intermediate
-        // one.
-        if disposition == .blocked {
+        case .blocked:
+            // A semantic blocker is publishable only after the same exact
+            // journal and cursor predicates required by a success receipt are
+            // stable. Domain reconciliation may both create upload work and
+            // report a blocker; drain that work first so `.blocked` describes
+            // the terminal transport boundary rather than an intermediate one.
             let result: SynchronizationResult
             do {
                 result = try prepareBlockedTerminalPublication(
@@ -218,6 +214,8 @@ extension CloudKitSynchronizer {
             }
             await publishSynchronizationResult(result, context: terminalContext)
             return
+        case .fullDrain:
+            break
         }
 
         // Only now authorize and publish the receipt. A notification observer
