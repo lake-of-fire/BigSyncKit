@@ -36,7 +36,7 @@ methods = (root / f'{mode}-discovery.txt').read_text().splitlines()
 xml = ET.parse(root / f'{mode}.xml').getroot()
 cases = list(xml.iter('testcase'))
 actual = [f'{c.attrib["classname"]}/{c.attrib["name"]}' for c in cases]
-assert len(methods) == len(set(methods)) == 16, 'Wrong deadline inventory'
+assert len(methods) == len(set(methods)) == 24, 'Wrong deadline inventory'
 assert all(m.startswith('BigSyncKitTests.BigSyncDeadlineRaceTests/') for m in methods)
 assert Counter(methods) == Counter(actual), 'Executed identities differ from discovery'
 assert not any(list(xml.iter(t)) for t in ('failure', 'error', 'skipped'))

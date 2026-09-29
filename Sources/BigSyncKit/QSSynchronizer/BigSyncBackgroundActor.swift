@@ -4,8 +4,9 @@ import RealmSwift
 import Combine
 import Logging
 
-private typealias BigSyncDeadlineOutcome =
-    BigSyncDeadlineRace<CloudKitSynchronizer.SynchronizationResult?>.Outcome
+private typealias BigSyncSynchronizationDeadline =
+    BigSyncDeadlineRace<CloudKitSynchronizer.SynchronizationResult?>
+private typealias BigSyncDeadlineOutcome = BigSyncSynchronizationDeadline.Outcome
 
 #if DEBUG
 /// DEBUG qualification surface for callers that must distinguish an actual
@@ -600,9 +601,9 @@ public actor BigSyncBackgroundActor {
     public func synchronizeCloudKit(
         deadlineNanoseconds: UInt64
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
-        switch await synchronizationDeadlineOutcome(
-            deadlineNanoseconds: deadlineNanoseconds
-        ) {
+        switch await synchronizationDeadlineOutcome(BigSyncSynchronizationDeadline(
+            durationNanoseconds: deadlineNanoseconds
+        )) {
         case .completed(let result):
             return result
         case .timedOut:
@@ -616,17 +617,37 @@ public actor BigSyncBackgroundActor {
     }
 
 #if DEBUG
-    /// Exact request-scoped result for the disposable E2E harness. Callers can
-    /// distinguish a deadline from a quick completed-nil result without
-    /// globally cancelling whichever worker happens to be current later.
+    /// Duration compatibility entry: its budget starts on this worker actor.
+    /// A caller with an existing cutoff must use the uptime overload below.
     @_spi(CloudKitE2E)
     @BigSyncBackgroundActor
     public func cloudKitE2ESynchronizeCloudKit(
         deadlineNanoseconds: UInt64
     ) async -> BigSyncCloudKitE2EDeadlineOutcome {
-        switch await synchronizationDeadlineOutcome(
-            deadlineNanoseconds: deadlineNanoseconds
-        ) {
+        await cloudKitE2EDeadlineOutcome(BigSyncSynchronizationDeadline(
+            durationNanoseconds: deadlineNanoseconds
+        ))
+    }
+
+    /// Consume the caller's original DispatchTime uptime cutoff without
+    /// renewing time spent logging, waiting for this actor, or making retries.
+    /// The cutoff belongs to this process/clock, not a durable sync authority.
+    /// Expired admission preserves other requests' startup and retry work.
+    @_spi(CloudKitE2E)
+    @BigSyncBackgroundActor
+    public func cloudKitE2ESynchronizeCloudKit(
+        untilUptimeNanoseconds deadline: UInt64
+    ) async -> BigSyncCloudKitE2EDeadlineOutcome {
+        await cloudKitE2EDeadlineOutcome(BigSyncSynchronizationDeadline(
+            untilUptimeNanoseconds: deadline
+        ))
+    }
+
+    @BigSyncBackgroundActor
+    private func cloudKitE2EDeadlineOutcome(
+        _ race: BigSyncSynchronizationDeadline
+    ) async -> BigSyncCloudKitE2EDeadlineOutcome {
+        switch await synchronizationDeadlineOutcome(race) {
         case .completed(let result):
             return .completed(result)
         case .timedOut:
@@ -639,17 +660,12 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     private func synchronizationDeadlineOutcome(
-        deadlineNanoseconds: UInt64
+        _ race: BigSyncSynchronizationDeadline
     ) async -> BigSyncDeadlineOutcome {
-        // Do not manufacture an unstructured request for an already-cancelled
-        // lifecycle caller; cancellation is not inherited by a new Task.
+        // Constructing the immutable clock owner grants no admission. Do not
+        // schedule any request for an already-cancelled lifecycle caller.
         guard !Task.isCancelled else { return .cancelled }
 
-        // Capture once, before either task is scheduled. A zero/expired
-        // request must not retire valid startup or retry work during admission.
-        let race = BigSyncDeadlineRace<CloudKitSynchronizer.SynchronizationResult?>(
-            durationNanoseconds: deadlineNanoseconds
-        )
         guard race.remainingNanoseconds > 0 else {
             return Task.isCancelled ? .cancelled : .timedOut
         }
