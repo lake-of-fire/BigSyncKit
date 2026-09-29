@@ -2,10 +2,12 @@
 
 ## Scope
 
-This is a follow-up to merged BigSyncKit #68 on `main` at
-`c5bb26d50afe8830119729facf58894b50ad3f0f`. Core #182 now consumes its typed
-DEBUG outcome; Reader #196 is the separate integration stack. No Reader pin or
-release flag is changed by this package patch.
+The original worker-deadline repair in BigSyncKit #70 merged at
+`9cee5e112a6c3ca5cf530b3bce3d467f818b77f3` while this caller-cutoff follow-up
+was in progress. That merge contains `ba283ff8` and does not contain the new
+absolute-cutoff overload. This separate successor retains the exact merged tree
+plus the five-file cutoff delta. Core #182 has also merged; Reader #196 remains
+a separate optional integration stack. No Reader pin or release flag changes.
 
 The existing public optional-result signature and DEBUG completed/timed-out/
 cancelled cases remain unchanged. Zero-budget and expired results now fail
@@ -83,7 +85,7 @@ let outcome = await BigSyncBackgroundActor.shared
 Keep the existing configured budget and the same cutoff across both attempts.
 Do not compute `now + remaining` again after logging or the actor hop. Do not
 restore Core's old detached race or delayed global cancellation. This consumer
-must select a compatible #70 revision before compiling. Its current coordinator
+must select a compatible caller-cutoff successor before compiling. Its current coordinator
 blob is `ea2a74f4cc3f9448f1f8194d2260e22e3d7f9cc6`; recheck newer work first.
 Until the consumer adopts this entry, its pre-worker timing gap remains open.
 Reader #187's frozen composition and Reader #196's conflicting pins/manifest
