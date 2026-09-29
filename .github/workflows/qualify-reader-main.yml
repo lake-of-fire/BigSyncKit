@@ -42,5 +42,5 @@ jobs:
           grep -F '.package(url: "https://github.com/realm/realm-swift.git", from: "20.0.5")' BigSyncKit/Package.swift
       - name: Debug tests
         run: swift test --package-path BigSyncKit -c debug
-      - name: Release tests
-        run: swift test --package-path BigSyncKit -c release
+      - name: Release production build
+        run: swift build --package-path BigSyncKit -c release
