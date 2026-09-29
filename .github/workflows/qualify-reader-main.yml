@@ -1,0 +1,31 @@
+name: Qualify canonical BigSync for Reader main
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/qualify-reader-main.yml'
+      - 'Package.swift'
+      - 'Package.resolved'
+      - 'Sources/**'
+      - 'Tests/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record exact source and toolchain
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          swift --version
+          grep -F '.package(url: "https://github.com/realm/realm-swift.git", from: "20.0.5")' Package.swift
+      - name: Debug tests
+        run: swift test -c debug
+      - name: Release tests
+        run: swift test -c release
