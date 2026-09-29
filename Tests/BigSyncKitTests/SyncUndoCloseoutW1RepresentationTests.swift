@@ -301,6 +301,8 @@ final class W1ExplicitWakeups: ModelAdapterDelegate {
 
 actor W1ScriptedTransport: CloudKitRecordStore, CloudKitRecordFetching,
     CloudKitChangeFeed, CloudKitSubscriptionStore, CloudKitZoneStore {
+    static let seedZoneCursor = Data("w1-before-deletion".utf8)
+    static let deletionZoneCursor = Data("w1-after-deletion".utf8)
     struct Call: Sendable {
         let texts: [String]
         let tags: [String?]
@@ -310,6 +312,8 @@ actor W1ScriptedTransport: CloudKitRecordStore, CloudKitRecordFetching,
     var calls = [Call]()
     var lookupCount = 0
     var storage = [CKRecord.ID: Data]()
+    var deletedRecordIDForPage: CKRecord.ID?
+    var fetchedZoneCursorBytes = [Data?]()
 
     init(missingFirstSave: Bool = false,
          afterFirstSave: (@Sendable () async throws -> Void)? = nil) {
@@ -318,6 +322,10 @@ actor W1ScriptedTransport: CloudKitRecordStore, CloudKitRecordFetching,
     }
     func history() -> [Call] { calls }
     func lookups() -> Int { lookupCount }
+    func serveDeletionPage(for recordID: CKRecord.ID) {
+        deletedRecordIDForPage = recordID
+    }
+    func zoneCursorHistory() -> [Data?] { fetchedZoneCursorBytes }
     func inventory() throws -> [CKRecord] {
         try storage.values.map { try BigSyncRecordPayload.decode($0) }
     }
@@ -357,9 +365,20 @@ actor W1ScriptedTransport: CloudKitRecordStore, CloudKitRecordFetching,
     func databaseChanges(since: DatabaseChangeCursor?, resultsLimit: Int?) async throws -> CloudKitDatabaseChangePage {
         throw NSError(domain: "W1UnexpectedTransportSurface", code: 2)
     }
-    func recordZoneChanges(in: CKRecordZone.ID, since: RecordZoneChangeCursor?,
+    func recordZoneChanges(in zoneID: CKRecordZone.ID, since cursor: RecordZoneChangeCursor?,
         desiredKeys: [CKRecord.FieldKey]?, resultsLimit: Int?
     ) async throws -> CloudKitRecordZoneChangePage {
+        fetchedZoneCursorBytes.append(cursor?.serializedData)
+        if cursor == nil, deletedRecordIDForPage == nil {
+            return .init(cursor: .init(serializedData: Self.seedZoneCursor),
+                records: [], deletedRecordIDs: [], moreComing: false)
+        }
+        if cursor?.serializedData == Self.seedZoneCursor,
+           let deletedRecordIDForPage,
+           deletedRecordIDForPage.zoneID == zoneID {
+            return .init(cursor: .init(serializedData: Self.deletionZoneCursor),
+                records: [], deletedRecordIDs: [deletedRecordIDForPage], moreComing: false)
+        }
         throw NSError(domain: "W1UnexpectedTransportSurface", code: 3)
     }
     func subscription(withID: CKSubscription.ID) async throws -> CKSubscription? { nil }
@@ -371,4 +390,3 @@ actor W1ScriptedTransport: CloudKitRecordStore, CloudKitRecordFetching,
         throw NSError(domain: "W1UnexpectedTransportSurface", code: 4)
     }
 }
-
