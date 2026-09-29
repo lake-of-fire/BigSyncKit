@@ -243,6 +243,91 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPendingWorkDiscoveredAfterReconciliationDrainsBeforeBlockedPublication() async throws {
+        let fixture = try makeFixture()
+        let blocker = CloudKitSynchronizer.DomainBlocker(code: "reconciliation-debt")
+        var runs = [UUID]()
+        fixture.adapter.onImport = { fixture.adapter.pending = false }
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            runs.append(context.runID)
+            if runs.count == 1 {
+                // The semantic inspection follows journal forwarding. This
+                // generation must still force a fresh drain before .blocked.
+                fixture.adapter.onInspection = {
+                    fixture.adapter.pending = true
+                    fixture.adapter.onInspection = nil
+                }
+            }
+            return [blocker]
+        }
+        let result = try await fixture.synchronizer.synchronize()
+        XCTAssertEqual(runs.count, 2)
+        XCTAssertNotEqual(runs.first, runs.last)
+        XCTAssertEqual(result.terminalBoundary?.runID, runs.last)
+        XCTAssertEqual(result.publicationState, .blocked([blocker]))
+        XCTAssertNil(result.receipt)
+        XCTAssertFalse(fixture.adapter.pending)
+        XCTAssertEqual(fixture.transport.recordMutationCount, 0)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testDownloadOnlyAcknowledgesCapturedDeliveryBeforeForwardingAndPreservesNewerBatch() async throws {
+        let fixture = try makeFixture()
+        fixture.synchronizer.syncMode = .downloadOnly
+        let oldIdentity = CommittedInboundIdentity(
+            entityType: "DomainFollowUpObject", recordName: "old", disposition: .upsert
+        )
+        let newerIdentity = CommittedInboundIdentity(
+            entityType: "DomainFollowUpObject", recordName: "new", disposition: .delete
+        )
+        fixture.adapter.committedBatch = .init(deliveryID: "old-delivery", identities: [oldIdentity])
+        var events = [String]()
+        let blocker = CloudKitSynchronizer.DomainBlocker(code: "download-reconciliation-debt")
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            XCTAssertEqual(context.committedInboundIdentities, [oldIdentity])
+            events.append("reconcile")
+            fixture.adapter.committedBatch = .init(deliveryID: "new-delivery", identities: [newerIdentity])
+            fixture.adapter.pending = true
+            fixture.adapter.onAcknowledgement = { events.append("ack:" + $0) }
+            fixture.adapter.onImport = { events.append("forward") }
+            fixture.adapter.onInspection = { events.append("inspect") }
+            return [blocker]
+        }
+        let result = try await fixture.synchronizer.synchronize()
+        XCTAssertEqual(events, ["reconcile", "ack:old-delivery", "forward", "inspect"])
+        XCTAssertEqual(fixture.adapter.committedBatch?.deliveryID, "new-delivery")
+        XCTAssertTrue(fixture.adapter.pending)
+        XCTAssertEqual(result.completionScope, .downloadOnly)
+        XCTAssertEqual(result.publicationState, .blocked([blocker]))
+        XCTAssertNil(result.receipt)
+        XCTAssertEqual(fixture.transport.recordMutationCount, 0)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testDownloadOnlyRejectsCursorChangedAfterDomainReconciliation() async throws {
+        let fixture = try makeFixture()
+        fixture.synchronizer.syncMode = .downloadOnly
+        fixture.adapter.boundaryIdentifier = "captured-boundary"
+        var completions = 0
+        fixture.synchronizer.synchronizationCompletionHandler = { _ in completions += 1 }
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            XCTAssertEqual(context.consumedServerBoundaryIdentifier, "captured-boundary")
+            fixture.adapter.boundaryIdentifier = "newer-boundary"
+            return []
+        }
+        do {
+            _ = try await fixture.synchronizer.synchronize()
+            XCTFail("A changed inbound cursor cannot publish the captured boundary")
+        } catch CloudKitSynchronizer.SyncError.inboundBoundaryChanged {}
+        XCTAssertEqual(completions, 0)
+        XCTAssertNil(fixture.synchronizer.activeReceiptAuthorizationID)
+        XCTAssertEqual(fixture.transport.recordMutationCount, 0)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
     private func makeFixture(account: String = "follow-up-account") throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("bigsync-domain-follow-up-\(UUID().uuidString)", isDirectory: true)
@@ -285,6 +370,9 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
             synchronizer.domainPrepublicationHandler = nil
             synchronizer.synchronizationWillConsumeServerChangesHandler = nil
             adapter.onInspection = nil
+            adapter.onImport = nil
+            adapter.onAcknowledgement = nil
+            synchronizer.synchronizationCompletionHandler = nil
             await synchronizer.cancelSynchronizationAndWait()
         }
 
@@ -335,6 +423,10 @@ private final class DomainFollowUpAdapter: NSObject, ModelAdapter, ChangeFeedRes
     @BigSyncBackgroundActor var pending = false
     @BigSyncBackgroundActor var blockers = [CloudKitSynchronizer.DomainBlocker]()
     @BigSyncBackgroundActor var onInspection: (() -> Void)?
+    @BigSyncBackgroundActor var onImport: (() -> Void)?
+    @BigSyncBackgroundActor var onAcknowledgement: ((String) -> Void)?
+    @BigSyncBackgroundActor var committedBatch: CommittedInboundIdentityBatch?
+    @BigSyncBackgroundActor var boundaryIdentifier: String?
     init(zoneID: CKRecordZone.ID) { recordZoneID = zoneID }
     var hasChanges: Bool { false }
     func cleanUp() async throws {}
@@ -373,9 +465,16 @@ private final class DomainFollowUpAdapter: NSObject, ModelAdapter, ChangeFeedRes
     func saveToken(_ token: RecordZoneChangeCursor?) async throws {}
     @BigSyncBackgroundActor
     func consumedServerBoundaryIdentifier(accountScopeIdentifier: String, replicaBindingGenerationIdentifier: String?,
-                                          containerIdentifier: String, databaseScope: CKDatabase.Scope) throws -> String? { nil }
+                                          containerIdentifier: String, databaseScope: CKDatabase.Scope) throws -> String? { boundaryIdentifier }
     @BigSyncBackgroundActor func changeFeedEpoch() throws -> Int? { nil }
-    func didFinishImport() async throws {}
+    @BigSyncBackgroundActor func didFinishImport() async throws { onImport?() }
+    @BigSyncBackgroundActor
+    func pendingCommittedInboundIdentityBatch() throws -> CommittedInboundIdentityBatch? { committedBatch }
+    @BigSyncBackgroundActor
+    func acknowledgeCommittedInboundIdentityBatch(deliveryID: String) async throws {
+        onAcknowledgement?(deliveryID)
+        if committedBatch?.deliveryID == deliveryID { committedBatch = nil }
+    }
     func cancelSynchronization() {}
     func unsetCancellation() async throws {}
     @BigSyncBackgroundActor func hasPendingChangesAtTerminalBoundary() throws -> Bool { pending }

@@ -3616,31 +3616,13 @@ public final class RealmSwiftAdapter:
             //#if DEBUG
             //            logger.info("QSCloudKitSynchronizer >> Applying changes (no conflict), local object: \(object.debugDescription) – remote object: \(record.debugDescription)")
             //#endif
-            let incomingRepresentation = (type(of: object) as?
-                BigSyncRecordContractProviding.Type)?.bigSyncRecordContract
-                .incomingRepresentation
-            for property in objectProperties where !skippedKeys.contains(property.name) {
-                try Task.checkCancellation()
-                if shouldIgnore(key: property.name) {
-                    continue
-                }
-                if property.name == object.objectSchema.primaryKeyProperty?.name
-                    || property.type == .linkingObjects {
-                    continue
-                }
-                if record[property.name] == nil,
-                   let incomingRepresentation,
-                   try incomingRepresentation.applyOmission(to: object, property: property) {
-                    continue
-                }
-                try applyChange(
-                    property: property,
-                    record: record,
-                    object: object,
-                    syncedEntityIdentifier: syncedEntityID,
-                    pendingRelationships: &pendingRelationships
-                )
-            }
+            try applyTransportedFields(
+                in: record,
+                to: object,
+                traversal: .incoming(skippedKeys: skippedKeys),
+                syncedEntityIdentifier: syncedEntityID,
+                pendingRelationships: &pendingRelationships
+            )
         }
 
         if isNewlyCreatedReceiver
@@ -3766,6 +3748,76 @@ public final class RealmSwiftAdapter:
             }
         }
         return pendingRelationships
+    }
+
+    /// Incoming apply snapshots skip fields before conflict selection and
+    /// checks cancellation before inspecting each unskipped field. Comparison
+    /// decoding samples model-owned skips after transport exclusions, as it did
+    /// before sharing this traversal (skips may depend on decoded values).
+    private enum TransportedFieldTraversal {
+        case incoming(skippedKeys: Set<String>)
+        case comparison
+    }
+
+    /// Shares transport exclusions and released omission rules only. Conflict
+    /// admission, capability checks and accepted-baseline transactions remain
+    /// with the callers; every present/nil-or-empty field uses the same codec.
+    private func applyTransportedFields(
+        in record: CKRecord,
+        to object: Object,
+        traversal: TransportedFieldTraversal,
+        syncedEntityIdentifier: String,
+        pendingRelationships: inout [PendingRelationshipRequest]
+    ) throws {
+        let incomingRepresentation: BigSyncIncomingRepresentationPolicy?
+        switch traversal {
+        case .incoming:
+            incomingRepresentation = (type(of: object) as?
+                BigSyncRecordContractProviding.Type)?.bigSyncRecordContract
+                .incomingRepresentation
+        case .comparison:
+            incomingRepresentation = nil
+        }
+        for property in object.objectSchema.properties {
+            if case let .incoming(skippedKeys) = traversal {
+                guard !skippedKeys.contains(property.name) else { continue }
+                try Task.checkCancellation()
+            }
+            if shouldIgnore(key: property.name) {
+                continue
+            }
+            if property.name == object.objectSchema.primaryKeyProperty?.name
+                || property.type == .linkingObjects {
+                continue
+            }
+            if case .comparison = traversal {
+                let skipped = (object as? SyncSkippablePropertiesModel)?
+                    .skipSyncingProperties() ?? []
+                guard !skipped.contains(property.name) else { continue }
+            }
+            if record[property.name] == nil {
+                let representation: BigSyncIncomingRepresentationPolicy?
+                switch traversal {
+                case .incoming:
+                    representation = incomingRepresentation
+                case .comparison:
+                    representation = (type(of: object) as?
+                        BigSyncRecordContractProviding.Type)?.bigSyncRecordContract
+                        .incomingRepresentation
+                }
+                if let representation,
+                   try representation.applyOmission(to: object, property: property) {
+                    continue
+                }
+            }
+            try applyChange(
+                property: property,
+                record: record,
+                object: object,
+                syncedEntityIdentifier: syncedEntityIdentifier,
+                pendingRelationships: &pendingRelationships
+            )
+        }
     }
 
     func applyChange(
@@ -9593,21 +9645,14 @@ extension RealmSwiftAdapter {
     /// Object relationships are excluded by capability admission above.
     func decodedComparisonObject(_ record: CKRecord, type: Object.Type) throws -> Object {
         let object = type.init()
-        for property in object.objectSchema.properties {
-            if property.name == object.objectSchema.primaryKeyProperty?.name
-                || property.type == .linkingObjects
-                || shouldIgnore(key: property.name) { continue }
-            let skipped = (object as? SyncSkippablePropertiesModel)?.skipSyncingProperties() ?? []
-            guard !skipped.contains(property.name) else { continue }
-            if record[property.name] == nil,
-               let declaration = type as? BigSyncRecordContractProviding.Type,
-               try declaration.bigSyncRecordContract.incomingRepresentation
-                    .applyOmission(to: object, property: property) {
-                continue
-            }
-            try applyChange(property: property, record: record, object: object,
-                            syncedEntityIdentifier: record.recordID.recordName)
-        }
+        var pendingRelationships = [PendingRelationshipRequest]()
+        try applyTransportedFields(
+            in: record,
+            to: object,
+            traversal: .comparison,
+            syncedEntityIdentifier: record.recordID.recordName,
+            pendingRelationships: &pendingRelationships
+        )
         return object
     }
 
