@@ -307,6 +307,7 @@ actor W1ScriptedTransport: CloudKitRecordStore, CloudKitRecordFetching,
         let texts: [String]
         let tags: [String?]
     }
+    let servesZonePages: Bool
     var missingFirstSave: Bool
     var afterFirstSave: (@Sendable () async throws -> Void)?
     var calls = [Call]()
@@ -315,9 +316,10 @@ actor W1ScriptedTransport: CloudKitRecordStore, CloudKitRecordFetching,
     var deletedRecordIDForPage: CKRecord.ID?
     var fetchedZoneCursorBytes = [Data?]()
 
-    init(missingFirstSave: Bool = false,
+    init(missingFirstSave: Bool = false, servesZonePages: Bool = false,
          afterFirstSave: (@Sendable () async throws -> Void)? = nil) {
         self.missingFirstSave = missingFirstSave
+        self.servesZonePages = servesZonePages
         self.afterFirstSave = afterFirstSave
     }
     func history() -> [Call] { calls }
@@ -368,6 +370,9 @@ actor W1ScriptedTransport: CloudKitRecordStore, CloudKitRecordFetching,
     func recordZoneChanges(in zoneID: CKRecordZone.ID, since cursor: RecordZoneChangeCursor?,
         desiredKeys: [CKRecord.FieldKey]?, resultsLimit: Int?
     ) async throws -> CloudKitRecordZoneChangePage {
+        guard servesZonePages else {
+            throw NSError(domain: "W1UnexpectedTransportSurface", code: 3)
+        }
         fetchedZoneCursorBytes.append(cursor?.serializedData)
         if cursor == nil, deletedRecordIDForPage == nil {
             return .init(cursor: .init(serializedData: Self.seedZoneCursor),
