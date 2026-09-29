@@ -1,8 +1,12 @@
-import CloudKit
 import Foundation
-import Logging
 import XCTest
 @_spi(CloudKitE2E) @testable import BigSyncKit
+
+// Only the dedicated dependency-free deadline runner sets this flag. Normal
+// Apple package and assembled Reader tests always compile the real worker tests.
+#if !BIGSYNC_WORKER_DEADLINE_PORTABLE
+import CloudKit
+import Logging
 
 final class BigSyncWorkerRequestCancellationTests: XCTestCase {
     @BigSyncBackgroundActor
@@ -85,6 +89,35 @@ final class BigSyncWorkerRequestCancellationTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testZeroE2EDeadlineDoesNotRetireStartupOrEnterPreflight() async {
+        let fixture = makeFixture()
+        fixture.worker._test_scheduleDormantInitialSynchronization()
+        let outcome = await fixture.worker.cloudKitE2ESynchronizeCloudKit(deadlineNanoseconds: 0)
+        guard case .timedOut = outcome else {
+            return XCTFail("Zero budget must time out without admission, got \(outcome)")
+        }
+        XCTAssertTrue(fixture.worker._test_hasScheduledInitialSynchronization)
+        XCTAssertFalse(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testZeroPublicDeadlinePreservesLiveRetry() async {
+        let fixture = makeFixture()
+        _ = await fixture.worker.synchronizeCloudKit()
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        let before = await fixture.availability.count
+        let result = await fixture.worker.synchronizeCloudKit(deadlineNanoseconds: 0)
+        XCTAssertNil(result)
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        let after = await fixture.availability.count
+        XCTAssertEqual(after, before)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
     func testLiveExplicitRequestStillSupersedesScheduledStartup() async {
         let fixture = makeFixture()
         fixture.worker._test_scheduleDormantInitialSynchronization()
@@ -123,6 +156,44 @@ final class BigSyncWorkerRequestCancellationTests: XCTestCase {
         XCTAssertEqual(fixture.transport.operationCount, 0)
         XCTAssertEqual(fixture.synchronizer.accountValidationRequired, originalValidation)
         XCTAssertEqual(fixture.synchronizer.cancelledDueToUnauthentication, originalUnauthentication)
+        XCTAssertTrue(fixture.worker._test_hasPublicationRestorationTask,
+                      "A cancelled waiter must not clear shared restoration state")
+        _ = await fixture.worker.synchronizeCloudKit()
+        XCTAssertFalse(fixture.worker._test_hasPublicationRestorationTask,
+                       "The next live waiter may retire the completed barrier")
+    }
+
+    @BigSyncBackgroundActor
+    func testOldRestorationWaiterDoesNotClearReplacementBarrier() async {
+        let original = makeFixture()
+        let replacement = makeFixture()
+        let oldRelease = WorkerRestorationRelease()
+        let oldRestoration = installRestoration(on: original.worker, release: oldRelease)
+        let entered = expectation(description: "original request entered restoration")
+        let request = Task { @BigSyncBackgroundActor in
+            entered.fulfill()
+            return await original.worker.synchronizeCloudKit()
+        }
+        await fulfillment(of: [entered], timeout: 2)
+
+        // Replacement is test-controlled; production configuration is one-shot.
+        original.worker._test_installSynchronizer(replacement.synchronizer)
+        let newRelease = WorkerRestorationRelease()
+        let newRestoration = installRestoration(on: original.worker, release: newRelease)
+        await oldRelease.open()
+        let result = await request.value
+        await oldRestoration.value
+
+        XCTAssertNil(result)
+        XCTAssertTrue(original.worker._test_hasPublicationRestorationTask,
+                      "An obsolete waiter cleared the replacement's barrier")
+        XCTAssertFalse(newRestoration.isCancelled)
+        let count = await original.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(original.transport.operationCount, 0)
+        XCTAssertEqual(replacement.transport.operationCount, 0)
+        await newRelease.open()
+        await newRestoration.value
     }
 
     @BigSyncBackgroundActor
@@ -331,4 +402,188 @@ private final class WorkerUnexpectedTransport: NSObject, CloudKitDatabaseAdapter
         in zoneID: CKRecordZone.ID, since cursor: RecordZoneChangeCursor?,
         desiredKeys: [CKRecord.FieldKey]?, resultsLimit: Int?
     ) async throws -> CloudKitRecordZoneChangePage { throw reject() }
+}
+
+#endif // !BIGSYNC_WORKER_DEADLINE_PORTABLE
+
+/// Exercises the same deadline owner used by the real worker, without CloudKit.
+/// These tests also run in the already-registered native test source file.
+final class BigSyncDeadlineRaceTests: XCTestCase, @unchecked Sendable {
+    private typealias Race = BigSyncDeadlineRace<Int>
+    private enum Failure: Error { case stopTimer }
+
+    func testCompletionAfterDeadlineCannotBeatUnscheduledTimer() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        clock.set(151)
+        await race.resolve(.completed(7)) // No timer task has executed.
+        guard case .timedOut = await race.value() else {
+            return XCTFail("Late completion won before the timer was scheduled")
+        }
+    }
+
+    func testCompletionAtDeadlineIsExpired() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        clock.set(150)
+        await race.resolve(.completed(7))
+        guard case .timedOut = await race.value() else { return XCTFail("Boundary was renewed") }
+    }
+
+    func testOnTimeSettlementSurvivesDelayedWaiter() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        clock.set(149)
+        await race.resolve(.completed(7))
+        clock.set(900)
+        await race.resolve(.timedOut)
+        guard case .completed(7) = await race.value() else {
+            return XCTFail("Already accepted result was revoked by delayed delivery")
+        }
+    }
+
+    func testDelayedTimerSleepsOnlyRemainingBudget() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        clock.set(140) // Timer only starts now.
+        await race.waitUntilDeadline { remaining in
+            XCTAssertEqual(remaining, 10)
+            clock.set(150)
+        }
+        guard case .timedOut = await race.value() else { return XCTFail("Timer did not expire") }
+    }
+
+    func testTimerStartingAfterExpiryDoesNotSleepAgain() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        clock.set(200)
+        await race.waitUntilDeadline { _ in XCTFail("Expired timer restarted its budget") }
+        guard case .timedOut = await race.value() else { return XCTFail("Expired timer did not settle") }
+    }
+
+    func testEarlyWakeRecomputesRemainingBudget() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        clock.set(125)
+        await race.waitUntilDeadline { remaining in
+            if clock.read() == 125 {
+                XCTAssertEqual(remaining, 25)
+                clock.set(140)
+            } else {
+                XCTAssertEqual(remaining, 10)
+                clock.set(150)
+            }
+        }
+        guard case .timedOut = await race.value() else { return XCTFail("Early wake extended budget") }
+    }
+
+    func testEarlyTimeoutSignalDoesNotDefeatOnTimeCompletion() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        let accepted = await race.resolve(.timedOut)
+        XCTAssertFalse(accepted)
+        await race.resolve(.completed(9))
+        guard case .completed(9) = await race.value() else { return XCTFail("Early timer won") }
+    }
+
+    func testZeroBudgetCannotAcceptQuickCompletedNil() async {
+        let clock = DeadlineTestClock(100)
+        let race = BigSyncDeadlineRace<Int?>(durationNanoseconds: 0, now: { clock.read() })
+        XCTAssertEqual(race.remainingNanoseconds, 0)
+        await race.resolve(.completed(nil))
+        guard case .timedOut = await race.value() else { return XCTFail("Zero budget admitted completion") }
+    }
+
+    func testOnTimeCompletedNilRemainsDistinctFromTimeout() async {
+        let clock = DeadlineTestClock(100)
+        let race = BigSyncDeadlineRace<Int?>(durationNanoseconds: 50, now: { clock.read() })
+        await race.resolve(.completed(nil))
+        guard case .completed(let value) = await race.value() else { return XCTFail("Nil became timeout") }
+        XCTAssertNil(value)
+    }
+
+    func testCancelledTimerDoesNotManufactureTimeout() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        let timer = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await race.waitUntilDeadline { _ in XCTFail("Cancelled timer slept") }
+        }
+        await timer.value
+        let accepted = await race.resolve(.completed(11))
+        XCTAssertTrue(accepted)
+        guard case .completed(11) = await race.value() else { return XCTFail("Timer cancellation expired request") }
+    }
+
+    func testFailedSleepDoesNotManufactureTimeout() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        await race.waitUntilDeadline { _ in throw Failure.stopTimer }
+        let accepted = await race.resolve(.completed(12))
+        XCTAssertTrue(accepted)
+        guard case .completed(12) = await race.value() else { return XCTFail("Failed sleep became timeout") }
+    }
+
+    func testCancellationSettlementRemainsDistinctAfterExpiry() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        clock.set(200)
+        await race.resolve(.cancelled)
+        await race.resolve(.completed(1))
+        guard case .cancelled = await race.value() else { return XCTFail("Cancellation became timeout") }
+    }
+
+    func testExpiredRequestCannotChangeSuccessorOutcome() async {
+        let clock = DeadlineTestClock(100)
+        let old = Race(durationNanoseconds: 10, now: { clock.read() })
+        let successor = Race(durationNanoseconds: 100, now: { clock.read() })
+        clock.set(111)
+        await old.resolve(.completed(1))
+        await successor.resolve(.completed(2))
+        await old.resolve(.cancelled)
+        guard case .timedOut = await old.value() else { return XCTFail("Old request revived") }
+        guard case .completed(2) = await successor.value() else { return XCTFail("Successor was affected") }
+    }
+
+    func testOverflowSaturatesInsteadOfExpiringImmediately() async {
+        let clock = DeadlineTestClock(UInt64.max - 20)
+        let race = Race(durationNanoseconds: 100, now: { clock.read() })
+        XCTAssertEqual(race.remainingNanoseconds, 20)
+        clock.set(UInt64.max - 1)
+        XCTAssertEqual(race.remainingNanoseconds, 1)
+        await race.resolve(.completed(7))
+        guard case .completed(7) = await race.value() else { return XCTFail("Overflow wrapped deadline") }
+    }
+
+    func testConcurrentSettlementHasExactlyOneWinner() async {
+        let clock = DeadlineTestClock(100)
+        let race = Race(durationNanoseconds: 50, now: { clock.read() })
+        let winners = await withTaskGroup(of: Bool.self) { group in
+            for value in 0..<32 { group.addTask { await race.resolve(.completed(value)) } }
+            var count = 0
+            for await accepted in group where accepted { count += 1 }
+            return count
+        }
+        XCTAssertEqual(winners, 1)
+        guard case .completed(let value) = await race.value() else { return XCTFail("No completed result") }
+        XCTAssertTrue((0..<32).contains(value))
+    }
+
+    func testProductionTimerResumesRegisteredWaiter() async {
+        let race = Race(durationNanoseconds: 1_000_000)
+        let timer = Task { await race.waitUntilDeadline() }
+        guard case .timedOut = await race.value() else {
+            timer.cancel()
+            return XCTFail("Real timer did not settle the waiter")
+        }
+        await timer.value
+    }
+}
+
+private final class DeadlineTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant: UInt64
+    init(_ instant: UInt64) { self.instant = instant }
+    func read() -> UInt64 { lock.withLock { instant } }
+    func set(_ instant: UInt64) { lock.withLock { self.instant = instant } }
 }

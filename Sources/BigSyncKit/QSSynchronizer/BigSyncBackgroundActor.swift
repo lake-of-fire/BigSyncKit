@@ -4,11 +4,8 @@ import RealmSwift
 import Combine
 import Logging
 
-private enum BigSyncDeadlineOutcome: Sendable {
-    case completed(CloudKitSynchronizer.SynchronizationResult?)
-    case timedOut
-    case cancelled
-}
+private typealias BigSyncDeadlineOutcome =
+    BigSyncDeadlineRace<CloudKitSynchronizer.SynchronizationResult?>.Outcome
 
 #if DEBUG
 /// DEBUG qualification surface for callers that must distinguish an actual
@@ -21,30 +18,6 @@ public enum BigSyncCloudKitE2EDeadlineOutcome: Sendable {
     case cancelled
 }
 #endif
-
-private actor BigSyncDeadlineRace {
-    private var outcome: BigSyncDeadlineOutcome?
-    private var continuation:
-        CheckedContinuation<BigSyncDeadlineOutcome, Never>?
-
-    func resolve(_ outcome: BigSyncDeadlineOutcome) {
-        guard self.outcome == nil else { return }
-        self.outcome = outcome
-        continuation?.resume(returning: outcome)
-        continuation = nil
-    }
-
-    func value() async -> BigSyncDeadlineOutcome {
-        if let outcome { return outcome }
-        return await withCheckedContinuation { continuation in
-            if let outcome {
-                continuation.resume(returning: outcome)
-            } else {
-                self.continuation = continuation
-            }
-        }
-    }
-}
 
 public struct BigSyncBackgroundWorkerConfiguration {
 #if DEBUG
@@ -617,11 +590,11 @@ public actor BigSyncBackgroundActor {
         return await synchronizeCloudKit(expectedSynchronizer: realmSynchronizer)
     }
 
-    /// Returns at the deadline even when an underlying CloudKit await does not
-    /// cooperate with Swift task cancellation. The losing request task is
-    /// canceled and fenced; an already-running shared synchronization may still
-    /// finish for other waiters, but it cannot hold a lifecycle completion
-    /// handler hostage.
+    /// Bounds result acceptance from worker-actor entry even when an underlying
+    /// CloudKit await does not cooperate with task cancellation. Scheduling may
+    /// delay delivery but cannot renew the deadline. The losing request is
+    /// cancelled and fenced; shared synchronization may finish for other waiters.
+    /// This is not a rollback of CloudKit work already accepted by the server.
     @BigSyncBackgroundActor
     @discardableResult
     public func synchronizeCloudKit(
@@ -672,18 +645,28 @@ public actor BigSyncBackgroundActor {
         // lifecycle caller; cancellation is not inherited by a new Task.
         guard !Task.isCancelled else { return .cancelled }
 
-        let race = BigSyncDeadlineRace()
+        // Capture once, before either task is scheduled. A zero/expired
+        // request must not retire valid startup or retry work during admission.
+        let race = BigSyncDeadlineRace<CloudKitSynchronizer.SynchronizationResult?>(
+            durationNanoseconds: deadlineNanoseconds
+        )
+        guard race.remainingNanoseconds > 0 else {
+            return Task.isCancelled ? .cancelled : .timedOut
+        }
         let synchronizationTask = Task { @BigSyncBackgroundActor [weak self] in
+            guard !Task.isCancelled else {
+                await race.resolve(.cancelled)
+                return
+            }
+            guard race.remainingNanoseconds > 0 else {
+                await race.resolve(.timedOut)
+                return
+            }
             let result = await self?.synchronizeCloudKit()
             await race.resolve(.completed(result))
         }
-        let deadlineTask = Task.detached { [race, deadlineNanoseconds] in
-            do {
-                try await Task.sleep(nanoseconds: deadlineNanoseconds)
-            } catch {
-                return
-            }
-            await race.resolve(.timedOut)
+        let deadlineTask = Task.detached { [race] in
+            await race.waitUntilDeadline()
         }
 
         let outcome = await withTaskCancellationHandler {
@@ -713,11 +696,11 @@ public actor BigSyncBackgroundActor {
             return nil
         }
         await publicationRestorationTask?.value
-        publicationRestorationTask = nil
         guard !Task.isCancelled,
               realmSynchronizer === expectedSynchronizer else {
             return nil
         }
+        publicationRestorationTask = nil
         let containerIdentifier = expectedSynchronizer.containerIdentifier
 
         // Explicit lifecycle requests share the same cheap durable gate used
@@ -945,6 +928,11 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     var _test_hasScheduledInitialSynchronization: Bool {
         initialSynchronizationTask != nil
+    }
+
+    @BigSyncBackgroundActor
+    var _test_hasPublicationRestorationTask: Bool {
+        publicationRestorationTask != nil
     }
 
     @BigSyncBackgroundActor
