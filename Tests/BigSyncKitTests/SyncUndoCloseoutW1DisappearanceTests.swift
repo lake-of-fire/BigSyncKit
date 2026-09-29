@@ -101,7 +101,9 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertNil(base.serverChangeTag, file: file, line: line)
         XCTAssertNil(base.acceptedSystemFields, file: file, line: line)
         XCTAssertEqual(base.fields.count, 0, file: file, line: line)
-        XCTAssertTrue(realm.objects(BigSyncRecordSubmission.self).isEmpty, file: file, line: line)
+        XCTAssertTrue(realm.objects(BigSyncRecordSubmission.self).filter {
+            $0.namespace == adapter.recordRebaseContext?.namespace
+        }.isEmpty, file: file, line: line)
         XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
             forPrimaryKey: record.recordID.recordName)?.generation, generation, file: file, line: line)
     }
@@ -264,7 +266,20 @@ extension SyncUndoCloseoutW1Tests {
                                         realm: realm, adapter: adapter)
         let prepared = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
         let previousRevision = try XCTUnwrap(realm.objects(BigSyncRecordBaseline.self).first?.revision)
-        let candidateIdentity = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity)
+        let candidate = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first)
+        let candidateIdentity = candidate.candidateIdentity
+        // A second namespace's evidence is not owned by this inbound deletion.
+        let foreign = BigSyncRecordSubmission()
+        foreign.namespace = "different-account-binding-zone"
+        foreign.id = BigSyncRecordPayload.identity([foreign.namespace, candidate.recordName])
+        foreign.recordName = candidate.recordName
+        foreign.schemaSignature = candidate.schemaSignature
+        foreign.generation = candidate.generation
+        foreign.comparisonRevision = candidate.comparisonRevision
+        foreign.payload = candidate.payload
+        for entry in candidate.fields { foreign.fields[entry.key] = entry.value }
+        try realm.write { realm.add(foreign) }
+        let foreignID = foreign.id, foreignIdentity = foreign.candidateIdentity
         let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
         let staleEntity = try XCTUnwrap(tracking.objects(SyncedEntity.self).first)
         XCTAssertEqual(adapter.getRecord(for: staleEntity)?.recordChangeTag, "accepted-A")
@@ -288,17 +303,33 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertFalse(realm.objects(BigSyncRecordSubmission.self).contains {
             $0.candidateIdentity == candidateIdentity
         })
+        XCTAssertEqual(foreign.candidateIdentity, foreignIdentity)
+        let committedRevision = try XCTUnwrap(realm.objects(BigSyncRecordBaseline.self).first?.revision)
 
         let (restarted, reopened) = try await restart(adapter)
         try assertTargetCommittedBeforeTracking(restarted, realm: reopened, record: incoming,
             expectedText: "inbound survives restart", generation: generation,
             previousRevision: previousRevision)
         try await restarted.didUpload(savedRecords: prepared.map(\.record), matchingPreparedUploads: prepared)
-        XCTAssertEqual(reopened.objects(BigSyncPendingMutation.self).first?.generation, generation)
+        try assertTargetCommittedBeforeTracking(restarted, realm: reopened, record: incoming,
+            expectedText: "inbound survives restart", generation: generation,
+            previousRevision: previousRevision)
+        XCTAssertEqual(reopened.objects(BigSyncRecordBaseline.self).first?.revision, committedRevision)
+        let recovered = try XCTUnwrap(reopened.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
+        XCTAssertEqual(recovered.modifiedAt, Date(timeIntervalSinceReferenceDate: 30))
+        XCTAssertEqual(recovered.explicitlyModifiedAt, Date(timeIntervalSinceReferenceDate: 30))
+        XCTAssertEqual(reopened.object(ofType: BigSyncRecordSubmission.self,
+            forPrimaryKey: foreignID)?.candidateIdentity, foreignIdentity)
         let uploaded = try await drain(restarted, realm: reopened, expectsFreshTemplate: true)
         XCTAssertEqual(uploaded.first?["text"] as? String, "inbound survives restart")
+        let recoveredTracking = try XCTUnwrap(restarted.realmProvider?.persistenceRealm?
+            .object(ofType: SyncedEntity.self, forPrimaryKey: incoming.recordID.recordName))
+        XCTAssertEqual(recoveredTracking.entityState, .synced)
+        XCTAssertNil(recoveredTracking.pendingGeneration)
         let (again, sameRealm) = try await restart(restarted)
         try await quiet(again, realm: sameRealm)
+        XCTAssertEqual(sameRealm.object(ofType: BigSyncRecordSubmission.self,
+            forPrimaryKey: foreignID)?.candidateIdentity, foreignIdentity)
     }
 
     @BigSyncBackgroundActor
