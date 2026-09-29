@@ -56,14 +56,16 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     let noteID = UUID(uuidString: "A0000000-0000-0000-0000-000000000001")!
 
     @BigSyncBackgroundActor
-    func fixture() async throws -> (RealmSwiftAdapter, Realm) {
+    func fixture(enableRecordRebasing: Bool = true) async throws -> (RealmSwiftAdapter, Realm) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("w1-realms-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         var target = Realm.Configuration()
         target.fileURL = directory.appendingPathComponent("target.realm")
         target.objectTypes = [W1ContractNote.self, W1RetainedArticle.self, BigSyncPendingMutation.self]
-        BigSyncMutationPolicy.enableRecordRebasing(in: &target)
+        if enableRecordRebasing {
+            BigSyncMutationPolicy.enableRecordRebasing(in: &target)
+        }
         BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [target],
             mutationJournalIdentityProvider: {
                 .init(installationIdentifier: "w1-local", replicaBindingGenerationIdentifier: "w1-binding")
@@ -372,8 +374,9 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     @BigSyncBackgroundActor
     func initialImportNote(priorPending: Bool,
         mode: ChangeFeedResetMode = .initialImport,
-        priorBinding: String = "w1-binding") async throws -> (RealmSwiftAdapter, Realm) {
-        let (adapter, realm) = try await fixture()
+        priorBinding: String = "w1-binding",
+        enableRecordRebasing: Bool = true) async throws -> (RealmSwiftAdapter, Realm) {
+        let (adapter, realm) = try await fixture(enableRecordRebasing: enableRecordRebasing)
         let object = W1ContractNote()
         object.id = noteID
         object.text = "legacy-local-note"
@@ -451,6 +454,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         XCTAssertTrue(realm.objects(BigSyncRecordSubmission.self).isEmpty)
         XCTAssertEqual(realm.objects(BigSyncRecordBaseline.self).first?.fieldDigests, fields)
         XCTAssertEqual(adapter.realmProvider?.persistenceRealm?.objects(SyncedEntity.self).first?.entityState, .synced)
+        try await quiet(adapter, realm: realm)
     }
 
     @BigSyncBackgroundActor
@@ -486,6 +490,24 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     @BigSyncBackgroundActor
     func testServerReconciliationRestoresExactPriorTrackingJournal() async throws {
         try await assertInitialImportNoteDrains(priorPending: true, mode: .serverReconciliation)
+    }
+
+    @BigSyncBackgroundActor
+    func testInitialImportPreservesLegacyTrackingWhenRebasingIsNotEnabled() async throws {
+        for priorPending in [false, true] {
+            let (adapter, realm) = try await initialImportNote(priorPending: priorPending,
+                enableRecordRebasing: false)
+            XCTAssertFalse(BigSyncRecordBaseline.isEnabled(in: realm))
+            try await adapter.reconcileAfterChangeFeedServerBootstrap(accountScopeIdentifier: "w1-account",
+                epoch: 1, mode: .initialImport)
+            XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+            let entity = try XCTUnwrap(adapter.realmProvider?.persistenceRealm?.objects(SyncedEntity.self).first)
+            XCTAssertEqual(entity.entityState, .new)
+            XCTAssertEqual(entity.pendingReplicaBindingGenerationIdentifier, "w1-binding")
+            XCTAssertFalse(try XCTUnwrap(entity.pendingGeneration).isEmpty)
+            if priorPending { XCTAssertEqual(entity.pendingGeneration, "legacy-tracking-only") }
+            XCTAssertEqual(realm.object(ofType: W1ContractNote.self, forPrimaryKey: noteID)?.text, "legacy-local-note")
+        }
     }
 
     @BigSyncBackgroundActor
@@ -569,6 +591,9 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
             XCTAssertEqual(prepared.count, 1)
             XCTAssertEqual(prepared.first?.generation, generation)
             XCTAssertEqual(prepared.first?.record["text"] as? String, "legacy-local-note")
+            let saved = try tagged(XCTUnwrap(prepared.first).record, "restarted-initial-import-accepted")
+            try await restarted.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+            try await quiet(restarted, realm: reopened)
         }
     }
 

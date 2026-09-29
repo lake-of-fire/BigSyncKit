@@ -5219,13 +5219,13 @@ public final class RealmSwiftAdapter:
             }
 
             if (mode == .initialImport || mode == .serverReconciliation),
+               BigSyncRecordBaseline.isEnabled(in: targetRealm),
                let comparisonContext = recordRebaseContext {
                 // Contract preparation requires target-owned intent, including
                 // the bounded legacy discovery that predates journaling. Commit
                 // it before publishing tracking, so interruption resumes through
                 // ordinary forwarding rather than a tracking-only generation.
                 var journalRecordNames = [String]()
-                let changedAt = Date()
                 try await targetRealm.asyncWrite {
                     try requireCurrentTransport(
                         namespace,
@@ -5245,6 +5245,7 @@ public final class RealmSwiftAdapter:
                        changeFeedResetMode(for: activeState) == mode else {
                         throw CancellationError()
                     }
+                    let changedAt = Date()
                     for candidate in targetCandidates {
                         guard persistenceRealm.object(
                             ofType: SyncedEntity.self,
@@ -5454,6 +5455,8 @@ public final class RealmSwiftAdapter:
                         && provenance.epoch == epoch ? provenance : nil
                 }
                 if (mode == .initialImport || mode == .serverReconciliation),
+                   BigSyncRecordBaseline.isEnabled(in: targetRealm),
+                   recordRebaseContext != nil,
                    objectType is BigSyncRecordContractProviding.Type {
                     // Eligible contract intent was forwarded from its durable
                     // target journal above. Rejected/stale provenance must not
