@@ -856,20 +856,27 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     private func scheduleAccountAvailabilityRetry(
-        expectedSynchronizer: CloudKitSynchronizer
+        expectedSynchronizer: CloudKitSynchronizer,
+        sleep: @escaping @Sendable (UInt64) async throws -> Void = {
+            try await Task.sleep(nanoseconds: $0)
+        }
     ) {
         guard !Task.isCancelled,
               realmSynchronizer === expectedSynchronizer else { return }
         accountAvailabilityRetryTask?.cancel()
         accountAvailabilityRetryTask = Task(priority: .utility) {
             @BigSyncBackgroundActor [weak self, weak expectedSynchronizer] in
-            guard let self, let expectedSynchronizer else { return }
             do {
-                try await Task.sleep(nanoseconds: 30_000_000_000)
+                try await sleep(30_000_000_000)
             } catch {
                 return
             }
-            guard realmSynchronizer === expectedSynchronizer else { return }
+            // A cancelled timer may already be queued to resume on this
+            // actor. It must not clear a newer retry's handle. Promote weak
+            // ownership only after sleeping so idle retries retain no worker.
+            guard !Task.isCancelled,
+                  let self, let expectedSynchronizer,
+                  realmSynchronizer === expectedSynchronizer else { return }
             accountAvailabilityRetryTask = nil
             _ = await synchronizeCloudKit(
                 expectedSynchronizer: expectedSynchronizer
@@ -1039,6 +1046,19 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     func _test_installPublicationRestoration(_ task: Task<Void, Never>) {
         publicationRestorationTask = task
+    }
+
+    /// Hold only the existing retry sleep; production callers always use
+    /// Task.sleep and the unchanged thirty-second account-status delay.
+    @BigSyncBackgroundActor
+    func _test_scheduleAccountAvailabilityRetry(
+        sleep: @escaping @Sendable (UInt64) async throws -> Void
+    ) -> Task<Void, Never>? {
+        guard let synchronizer = realmSynchronizer else { return nil }
+        scheduleAccountAvailabilityRetry(
+            expectedSynchronizer: synchronizer, sleep: sleep
+        )
+        return accountAvailabilityRetryTask
     }
 
     @BigSyncBackgroundActor
