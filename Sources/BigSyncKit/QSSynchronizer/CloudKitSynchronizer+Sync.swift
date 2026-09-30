@@ -801,6 +801,10 @@ extension CloudKitSynchronizer {
 /// server-directed delay can create a retry storm. Optional jitter is added
 /// *after* that minimum so clients do not synchronize their wakeups while
 /// still respecting CloudKit's backpressure.
+enum BigSyncRetrySleepError: Error {
+    case invalidDelay
+}
+
 enum BigSyncRetrySleep {
     /// Keep each integer conversion comfortably below UInt64.max. Large
     /// server-directed delays remain large: they are slept in consecutive
@@ -828,7 +832,7 @@ enum BigSyncRetrySleep {
 
     static func sleep(for delaySeconds: TimeInterval) async throws {
         guard !delaySeconds.isNaN, delaySeconds >= 0 else {
-            throw CocoaError(.validationMissingMandatoryProperty)
+            throw BigSyncRetrySleepError.invalidDelay
         }
         var remaining = delaySeconds
         while remaining > 0 {
@@ -836,7 +840,7 @@ enum BigSyncRetrySleep {
             guard let nanoseconds = nextChunkNanoseconds(
                 remainingSeconds: remaining
             ) else {
-                throw CocoaError(.validationMissingMandatoryProperty)
+                throw BigSyncRetrySleepError.invalidDelay
             }
             try await Task.sleep(nanoseconds: nanoseconds)
             if remaining.isFinite {
