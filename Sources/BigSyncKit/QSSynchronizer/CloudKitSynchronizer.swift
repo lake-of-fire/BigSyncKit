@@ -3135,9 +3135,7 @@ public class CloudKitSynchronizer: NSObject {
         }
         retrySleepUntil = state.notBefore
         do {
-            try await Task.sleep(
-                nanoseconds: UInt64(delay * 1_000_000_000)
-            )
+            try await BigSyncRetrySleep.sleep(for: delay)
             try await revalidateRunContext(context)
             retrySleepUntil = nil
             clearPersistedTransientRetryState()
