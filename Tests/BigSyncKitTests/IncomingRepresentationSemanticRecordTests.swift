@@ -2,6 +2,7 @@ import CloudKit
 import Foundation
 import Logging
 import RealmSwift
+import RealmSwiftGaps
 import XCTest
 @testable import BigSyncKit
 
@@ -157,6 +158,56 @@ final class IncomingRepresentationSemanticRecordTests: XCTestCase {
         _ = try await adapter.saveChanges(in: [record], forceSave: false)
         try await adapter.persistImportedChanges()
         try await adapter.didFinishImport()
+    }
+
+    @BigSyncBackgroundActor
+    func testOrdinaryApplyAndComparisonShareReleasedOmissionsAndPresentFieldCodec() async throws {
+        let fixture = try await fixture()
+        defer { fixture.adapter.invalidateTokens() }
+        let omitted = record(fixture)
+        // Transport must never overwrite the receiver's already-admitted PK.
+        omitted["id"] = "untrusted-wire-id" as CKRecordValue
+        try await assertOrdinaryAndComparisonParity(adapter: fixture.adapter, record: omitted,
+                                                    expectedCount: 0, expectedEnabled: false,
+                                                    expectedOptionalText: nil)
+        let present = record(fixture, time: 20)
+        present["count"] = 12 as CKRecordValue
+        present["enabled"] = true as CKRecordValue
+        present["optionalText"] = "remote-text" as CKRecordValue
+        try await assertOrdinaryAndComparisonParity(adapter: fixture.adapter, record: present,
+                                                    expectedCount: 12, expectedEnabled: true,
+                                                    expectedOptionalText: "remote-text")
+        XCTAssertTrue(fixture.realm.objects(BigSyncPendingMutation.self).isEmpty)
+        XCTAssertTrue(fixture.realm.objects(BigSyncRecordBaseline.self).isEmpty,
+                      "Decoding alone does not accept a transactional baseline")
+    }
+
+    @RealmBackgroundActor
+    private func assertOrdinaryAndComparisonParity(
+        adapter: RealmSwiftAdapter, record: CKRecord,
+        expectedCount: Int, expectedEnabled: Bool, expectedOptionalText: String?
+    ) throws {
+        let receiver = IncomingRepresentationSemanticRecord()
+        receiver.id = "admitted-id"
+        receiver.count = 99
+        receiver.enabled = true
+        receiver.optionalText = "stale-local-text"
+        let relationships = try adapter.applyChanges(
+            in: record, to: receiver, syncedEntityID: record.recordID.recordName,
+            syncedEntityState: .synced, entityType: IncomingRepresentationSemanticRecord.className(),
+            isNewlyCreatedReceiver: false, acceptsServerSnapshot: true
+        )
+        let comparison = try XCTUnwrap(adapter.decodedComparisonObject(
+            record, type: IncomingRepresentationSemanticRecord.self
+        ) as? IncomingRepresentationSemanticRecord)
+        XCTAssertEqual(receiver.id, "admitted-id")
+        XCTAssertEqual(comparison.id, "")
+        XCTAssertEqual(receiver.count, expectedCount)
+        XCTAssertEqual(receiver.enabled, expectedEnabled)
+        XCTAssertEqual(receiver.optionalText, expectedOptionalText)
+        XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: receiver),
+                       try BigSyncRecordFingerprint.fields(of: comparison))
+        XCTAssertTrue(relationships.isEmpty)
     }
 
     @BigSyncBackgroundActor

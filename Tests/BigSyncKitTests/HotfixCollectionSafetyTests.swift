@@ -136,6 +136,84 @@ final class HotfixCollectionSafetyTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testSharedTraversalSkipsUnsupportedFieldsAndBacklinksAndRetainsDeferredClears() async throws {
+        let fixture = try await fixture()
+        defer { fixture.adapter.invalidateTokens() }
+        try await assertTransportExclusionsAndDeferredClears(adapter: fixture.adapter)
+    }
+
+    @RealmBackgroundActor
+    private func assertTransportExclusionsAndDeferredClears(adapter: RealmSwiftAdapter) throws {
+        func record(for type: Object.Type) -> CKRecord {
+            let record = CKRecord(recordType: type.className(), recordID: .init(
+                recordName: type.className() + ".traversal", zoneID: adapter.recordZoneID
+            ))
+            let date = Date(timeIntervalSinceReferenceDate: 20_000)
+            record["createdAt"] = date as CKRecordValue
+            record["modifiedAt"] = date as CKRecordValue
+            record["explicitlyModifiedAt"] = date as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            record["id"] = "untrusted-wire-id" as CKRecordValue
+            return record
+        }
+        let skipped = HotfixCollectionReviewUnsupported()
+        skipped.id = "admitted-id"
+        let skippedRecord = record(for: HotfixCollectionReviewUnsupported.self)
+        skippedRecord["selectedProperty"] = "unkeyedTarget" as CKRecordValue
+        for field in HotfixCollectionReviewUnsupported.candidateProperties {
+            skippedRecord[field] = "malformed-but-skipped" as CKRecordValue
+        }
+        let skippedRequests = try adapter.applyChanges(
+            in: skippedRecord, to: skipped, syncedEntityID: skippedRecord.recordID.recordName,
+            syncedEntityState: .synced, entityType: skippedRecord.recordType,
+            isNewlyCreatedReceiver: false, acceptsServerSnapshot: true
+        )
+        let comparison = try XCTUnwrap(adapter.decodedComparisonObject(
+            skippedRecord, type: HotfixCollectionReviewUnsupported.self
+        ) as? HotfixCollectionReviewUnsupported)
+        XCTAssertEqual(skipped.id, "admitted-id")
+        XCTAssertEqual(comparison.id, "")
+        XCTAssertEqual(skipped.selectedProperty, "")
+        XCTAssertEqual(comparison.selectedProperty, "")
+        XCTAssertTrue(skipped.nullableStrings.isEmpty)
+        XCTAssertTrue(comparison.nullableStrings.isEmpty)
+        XCTAssertNil(skipped.unkeyedTarget)
+        XCTAssertNil(comparison.unkeyedTarget)
+        XCTAssertTrue(skippedRequests.isEmpty)
+
+        let child = HotfixCollectionReviewChild()
+        let childRecord = record(for: HotfixCollectionReviewChild.self)
+        childRecord["parents"] = "malformed-backlink" as CKRecordValue
+        let backlinkRequests = try adapter.applyChanges(
+            in: childRecord, to: child, syncedEntityID: childRecord.recordID.recordName,
+            syncedEntityState: .synced, entityType: childRecord.recordType,
+            isNewlyCreatedReceiver: true
+        )
+        _ = try adapter.decodedComparisonObject(childRecord, type: HotfixCollectionReviewChild.self)
+        XCTAssertTrue(backlinkRequests.isEmpty)
+
+        // Relationship-capable incoming apply still returns deferred intents;
+        // it is deliberately outside scalar comparison capability admission.
+        let parent = HotfixCollectionReviewSupported()
+        parent.names.append("stale")
+        parent.children.append(child)
+        parent.relatedChildren.insert(child)
+        let parentRecord = record(for: HotfixCollectionReviewSupported.self)
+        let requests = try adapter.applyChanges(
+            in: parentRecord, to: parent, syncedEntityID: parentRecord.recordID.recordName,
+            syncedEntityState: .synced, entityType: parentRecord.recordType,
+            isNewlyCreatedReceiver: false, acceptsServerSnapshot: true
+        )
+        XCTAssertTrue(parent.names.isEmpty)
+        XCTAssertEqual(Set(requests.map(\.name)), ["children", "relatedChildren"])
+        XCTAssertTrue(requests.allSatisfy {
+            $0.targetIdentifiers.isEmpty && $0.syncedEntityID == parentRecord.recordID.recordName
+        })
+        XCTAssertEqual(parent.children.count, 1, "Materialization follows the existing deferred-relationship boundary")
+        XCTAssertEqual(parent.relatedChildren.count, 1)
+    }
+
+    @BigSyncBackgroundActor
     func testAbsentObjectMapRejectsNewReceiverWithoutDeferredToOneIntent()
         async throws {
         let fixture = try await fixture()

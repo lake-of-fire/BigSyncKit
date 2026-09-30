@@ -1169,7 +1169,10 @@ final class BigSyncKitTests: XCTestCase {
         try fixture.adapter.prepareForFencedMigrationAfterCancellation()
         // Exercise the real failure handler's explicit flush, not just the
         // debounced observer. Preparation itself has not committed provenance.
-        await synchronizer.failSynchronization(error: TestSynchronizationError.initialSetupFailed)
+        await synchronizer.failSynchronization(
+            error: TestSynchronizationError.initialSetupFailed,
+            for: synchronizer.synchronizationAttemptID
+        )
         fixture.persistenceRealm.refresh()
         fixture.targetRealm.refresh()
         XCTAssertNil(fixture.persistenceRealm.object(
@@ -1617,7 +1620,7 @@ final class BigSyncKitTests: XCTestCase {
         sync.synchronizationDrainIsActive = true
         sync.activeRunContext = reviewContext(sync)
         let started = Date()
-        await sync.failSynchronization(error: error)
+        await sync.failSynchronization(error: error, for: sync.synchronizationAttemptID)
         XCTAssertGreaterThanOrEqual(sync.retrySleepUntil ?? .distantPast,
                                     started.addingTimeInterval(60))
         await sync.cancelSynchronizationAndWait()
@@ -1640,7 +1643,7 @@ final class BigSyncKitTests: XCTestCase {
             ]])
             XCTAssertFalse(sync.shouldRetryUpload(for: error as NSError))
             let started = Date()
-            await sync.failSynchronization(error: error)
+            await sync.failSynchronization(error: error, for: sync.synchronizationAttemptID)
             XCTAssertTrue(store.propertyListEntries.keys.contains { $0.contains("ChangeFeedMigration") })
             if sibling == .requestRateLimited {
                 XCTAssertGreaterThanOrEqual(sync.retrySleepUntil ?? .distantPast,
@@ -6487,7 +6490,8 @@ final class BigSyncKitTests: XCTestCase {
         let failedAttemptID = synchronizer.synchronizationAttemptID
 
         await synchronizer.failSynchronization(
-            error: TestSynchronizationError.terminalForwardingFailed
+            error: TestSynchronizationError.terminalForwardingFailed,
+            for: failedAttemptID
         )
 
         XCTAssertNotEqual(synchronizer.synchronizationAttemptID, failedAttemptID)
@@ -6519,7 +6523,8 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         await synchronizer.failSynchronization(
-            error: BigSyncCloudAccountPortError.required(requirement)
+            error: BigSyncCloudAccountPortError.required(requirement),
+            for: failedAttemptID
         )
 
         XCTAssertEqual(synchronizer.synchronizationAttemptID, failedAttemptID)
@@ -6655,7 +6660,8 @@ final class BigSyncKitTests: XCTestCase {
             error: CKError(
                 .requestRateLimited,
                 userInfo: [CKErrorRetryAfterKey: 1.0]
-            )
+            ),
+            for: synchronizer.synchronizationAttemptID
         )
 
         XCTAssertGreaterThanOrEqual(

@@ -1181,6 +1181,8 @@ public class CloudKitSynchronizer: NSObject {
     private var synchronizationWaiters = [
         UUID: CheckedContinuation<SynchronizationResult, Error>
     ]()
+    private var synchronizationFailureHandlers = [UUID: BigSyncSynchronizationFailureHandler]()
+    private var lastSynchronizationProgressStage: String?
     private var activeRunCallbackCount = 0
 #if DEBUG
     /// Test-only compatibility seam for older focused fixtures that construct
@@ -1430,6 +1432,9 @@ public class CloudKitSynchronizer: NSObject {
 
     @BigSyncBackgroundActor
     internal func reportProgress(_ checkpoint: String) {
+        if !synchronizationFailureHandlers.isEmpty {
+            lastSynchronizationProgressStage = checkpoint
+        }
         progressHandler(checkpoint)
     }
 
@@ -1811,6 +1816,7 @@ public class CloudKitSynchronizer: NSObject {
         activeRunContext = nil
         activeReceiptAuthorizationID = nil
         reservedReceiptAuthorizationID = nil
+        lastSynchronizationProgressStage = nil
 
         synchronizationTask?.cancel()
         // Synchronization is deferrable user-data work, but it must still make
@@ -1956,7 +1962,7 @@ public class CloudKitSynchronizer: NSObject {
                 await performSynchronization()
             } catch {
                 guard synchronizationAttemptID == attemptID else { return }
-                await failSynchronization(error: error)
+                await failSynchronization(error: error, for: attemptID)
             }
         }
     }
@@ -1965,8 +1971,19 @@ public class CloudKitSynchronizer: NSObject {
     /// only after the full fetch/import/upload drain has finished.
     @BigSyncBackgroundActor
     public func synchronize() async throws -> SynchronizationResult {
+        try await synchronize(failureHandler: nil)
+    }
+
+    @BigSyncBackgroundActor
+    internal func synchronize(
+        failureHandler: BigSyncSynchronizationFailureHandler?
+    ) async throws -> SynchronizationResult {
         guard !portActivationRequiresWorkerRestart else {
-            throw BigSyncCloudAccountPortError.workerRestartRequired
+            let error = BigSyncCloudAccountPortError.workerRestartRequired
+            failureHandler?(failureDiagnostic(
+                error: error, category: .failed, requestIdentifier: UUID()
+            ))
+            throw error
         }
         precondition(
             modelAdapterDictionary.count == 1,
@@ -1980,6 +1997,7 @@ public class CloudKitSynchronizer: NSObject {
                     return
                 }
                 synchronizationWaiters[requestID] = continuation
+                synchronizationFailureHandlers[requestID] = failureHandler
                 beginSynchronization()
             }
         } onCancel: {
@@ -1997,12 +2015,29 @@ public class CloudKitSynchronizer: NSObject {
     internal func settleCancellationIfCurrentAttempt(_ attemptID: UUID) {
         guard synchronizationAttemptID == attemptID,
               synchronizationDrainIsActive else { return }
-        cancelSynchronization()
+        cancelSynchronization(category: .attemptCancellation)
     }
 
     private func cancelSynchronizationRequest(_ requestID: UUID) {
-        synchronizationWaiters.removeValue(forKey: requestID)?
-            .resume(throwing: CancellationError())
+        guard let waiter = synchronizationWaiters.removeValue(forKey: requestID) else { return }
+        let handler = synchronizationFailureHandlers.removeValue(forKey: requestID)
+        handler?(failureDiagnostic(
+            error: CancellationError(), category: .requestCancellation, requestIdentifier: requestID
+        ))
+        waiter.resume(throwing: CancellationError())
+    }
+
+    private func failureDiagnostic(
+        error: Error, category: BigSyncSynchronizationFailure.Category,
+        requestIdentifier: UUID, attemptIdentifier: UUID? = nil,
+        runIdentifier: UUID? = nil
+    ) -> BigSyncSynchronizationFailure {
+        BigSyncSynchronizationFailure(
+            category: category, requestIdentifier: requestIdentifier,
+            attemptIdentifier: attemptIdentifier ?? synchronizationAttemptID,
+            runIdentifier: runIdentifier ?? activeRunContext?.runID,
+            lastProgressStage: lastSynchronizationProgressStage, error: error
+        )
     }
 
     /// Checks that an asynchronous callback still belongs to the active sync.
@@ -2324,7 +2359,7 @@ public class CloudKitSynchronizer: NSObject {
             return
         } catch {
             guard synchronizationAttemptID == context.attemptID else { return }
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: context.attemptID)
             return
         }
         let needsFollowUp = synchronizationRequestedWhileRunning
@@ -2343,16 +2378,30 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     internal func finishSynchronizationDrain(
-        with result: Result<SynchronizationResult, Error>
+        with result: Result<SynchronizationResult, Error>,
+        failureCategory: BigSyncSynchronizationFailure.Category = .failed,
+        failureAttemptIdentifier: UUID? = nil,
+        failureRunIdentifier: UUID? = nil
     ) {
         synchronizationDrainIsActive = false
         synchronizationDrainMode = nil
         synchronizationRequestedWhileRunning = false
-        let waiters = synchronizationWaiters.values
+        let waiters = synchronizationWaiters
+        let failureHandlers = synchronizationFailureHandlers
         synchronizationWaiters.removeAll(keepingCapacity: false)
-        for waiter in waiters {
+        synchronizationFailureHandlers.removeAll(keepingCapacity: false)
+        for (requestIdentifier, waiter) in waiters {
+            if case .failure(let error) = result {
+                failureHandlers[requestIdentifier]?(failureDiagnostic(
+                    error: error, category: failureCategory,
+                    requestIdentifier: requestIdentifier,
+                    attemptIdentifier: failureAttemptIdentifier,
+                    runIdentifier: failureRunIdentifier
+                ))
+            }
             waiter.resume(with: result)
         }
+        lastSynchronizationProgressStage = nil
     }
 
     @BigSyncBackgroundActor
@@ -3470,8 +3519,14 @@ public class CloudKitSynchronizer: NSObject {
     /// Cancel synchronization. It will cause a current synchronization to end with a `cancelled` error.
     @BigSyncBackgroundActor
     @objc public func cancelSynchronization() {
-        //        guard syncing, !cancelSync else { return }
+        cancelSynchronization(category: .explicitSynchronizationCancellation)
+    }
+
+    @BigSyncBackgroundActor
+    private func cancelSynchronization(category: BigSyncSynchronizationFailure.Category) {
+        // Capture the origin before revoking attempt/run ownership.
         let cancelledAttemptID = synchronizationAttemptID
+        let cancelledRunID = activeRunContext?.runID
         synchronizationAttemptID = UUID()
         cancelAttemptCallbacks(for: cancelledAttemptID)
         activeRunContext = nil
@@ -3493,7 +3548,10 @@ public class CloudKitSynchronizer: NSObject {
             adapter.cancelSynchronization()
         }
         finishSynchronizationDrain(
-            with: .failure(CancellationError())
+            with: .failure(CancellationError()),
+            failureCategory: category,
+            failureAttemptIdentifier: cancelledAttemptID,
+            failureRunIdentifier: cancelledRunID
         )
     }
 

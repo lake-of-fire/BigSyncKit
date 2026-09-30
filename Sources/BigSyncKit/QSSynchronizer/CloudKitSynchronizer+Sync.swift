@@ -48,33 +48,19 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
 //        logger.info("QSCloudKitSynchronizer >> Finishing synchronization batch...")
         
-        resetActiveTokens()
-        
-        uploadRetries = 0
-        
-        for adapter in modelAdapters {
-            do {
-                try await adapter.didFinishImport()
-                try await revalidateActiveRunContext(for: attemptID)
-                try await adapter.cleanUp()
-                try await revalidateActiveRunContext(for: attemptID)
-                // Cleanup can overlap a newly committed local mutation. Forward
-                // journals again so that mutation requests a new
-                // drain before a terminal receipt is issued.
-                try await adapter.didFinishImport()
-                try await revalidateActiveRunContext(for: attemptID)
-            } catch is CancellationError {
-                settleCancellationIfCurrentAttempt(attemptID)
-                return
-            } catch {
-                await failSynchronization(error: error)
-                return
-            }
+        do {
+            try await cleanUpAndForwardTerminalImports(for: attemptID)
+        } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
+            return
+        } catch {
+            await failSynchronization(error: error, for: attemptID)
+            return
         }
         reportProgress("terminal-tail-adapters-cleaned")
 
@@ -91,7 +77,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         reportProgress("terminal-tail-pending-checked")
@@ -113,7 +99,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         let consumedServerBoundaryIdentifier: String?
@@ -124,106 +110,44 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         guard let terminalContext = activeRunContext else {
-            await failSynchronization(error: CancellationError())
+            await failSynchronization(error: CancellationError(), for: attemptID)
             return
         }
-        var publicationBlockers = [DomainBlocker]()
-        var domainPublicationScopeIdentifier: String?
-        var inboundIdentityDeliveries = [
-            (adapter: ModelAdapter, batch: CommittedInboundIdentityBatch)
-        ]()
-        if let domainPrepublicationHandler {
-            do {
-                for adapter in modelAdapters {
-                    if let batch = try adapter
-                        .pendingCommittedInboundIdentityBatch() {
-                        inboundIdentityDeliveries.append((adapter, batch))
-                    }
-                }
-                publicationBlockers.append(contentsOf:
-                    try await domainPrepublicationHandler(
-                    PrepublicationBoundaryContext(
-                        context: terminalContext,
-                        consumedServerBoundaryIdentifier:
-                            consumedServerBoundaryIdentifier,
-                        didImportChanges:
-                            synchronizationDrainDidImportChanges,
-                        committedInboundIdentities: Array(Set(
-                            inboundIdentityDeliveries.flatMap {
-                                $0.batch.identities
-                            }
-                        )).sorted {
-                            ($0.entityType, $0.recordName)
-                                < ($1.entityType, $1.recordName)
-                        }
-                    )
-                ))
-                reportProgress("terminal-tail-domain-handler-completed")
-                try await revalidateRunContext(terminalContext)
-                reportProgress("terminal-tail-domain-context-revalidated")
-                for delivery in inboundIdentityDeliveries {
-                    reportProgress("terminal-tail-inbound-ack-started")
-                    try await delivery.adapter
-                        .acknowledgeCommittedInboundIdentityBatch(
-                            deliveryID: delivery.batch.deliveryID
-                        )
-                    try await revalidateRunContext(terminalContext)
-                    reportProgress("terminal-tail-inbound-ack-completed")
-                }
-                // Domain reconciliation is allowed to commit authoritative
-                // local writes. Forward those durable target-journal
-                // generations before deciding whether this drain is terminal.
-                // In download-only mode this does not grant upload authority;
-                // it merely ensures the next explicit full drain starts from
-                // the newest generation instead of uploading a stale tracked
-                // generation first.
-                for adapter in modelAdapters {
-                    reportProgress("terminal-tail-import-forwarding-started")
-                    try await adapter.didFinishImport { checkpoint in
-                        self.reportProgress("terminal-tail-\(checkpoint)")
-                    }
-                    reportProgress("terminal-tail-import-forwarding-completed")
-                    try await revalidateRunContext(terminalContext)
-                    reportProgress("terminal-tail-import-forwarding-revalidated")
-                }
-            } catch is CancellationError {
-                settleCancellationIfCurrentAttempt(attemptID)
-                return
-            } catch {
-                await failSynchronization(error: error)
-                return
-            }
-        }
-        reportProgress("terminal-tail-prepublication-completed")
-
+        let reconciliationBlockers: [DomainBlocker]
         do {
-            for adapter in modelAdapters {
-                publicationBlockers.append(contentsOf:
-                    try await adapter.semanticPublicationBlockers()
-                )
-            }
-            try await revalidateRunContext(terminalContext)
-            if !isDownloadOnly, publicationBlockers.isEmpty,
-               let provider = domainPublicationScopeIdentifierProvider {
-                let scope = try await provider()
-                guard scope?.isEmpty != true else {
-                    throw DurableKeyValueStoreError.mutationNotDurable
-                }
-                domainPublicationScopeIdentifier = scope
-                try await revalidateRunContext(terminalContext)
-            }
+            reconciliationBlockers = try await reconcileDomainBeforeTerminalPublication(
+                context: terminalContext,
+                consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
+            )
         } catch is CancellationError {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
+            return
+        }
+        reportProgress("terminal-tail-prepublication-completed")
+
+        let publication: TerminalDomainPublication
+        do {
+            publication = try await inspectTerminalDomainPublication(
+                context: terminalContext,
+                isDownloadOnly: isDownloadOnly,
+                reconciliationBlockers: reconciliationBlockers
+            )
+        } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
+            return
+        } catch {
+            await failSynchronization(error: error, for: attemptID)
             return
         }
 
+        let disposition: TerminalPublicationDisposition
         do {
             // Account validation is the last suspension before the local
             // cutoff. Every eligible generation visible to the following
@@ -231,157 +155,85 @@ extension CloudKitSynchronizer {
             // writes remain journaled for the next drain; the receipt is not
             // an assertion that all writers have stopped.
             try await revalidateRunContext(terminalContext)
-            if !isDownloadOnly,
-               try adaptersHavePendingChangesAtTerminalBoundary() {
-                reportProgress("terminal-tail-pending-target")
-                synchronizationRequestedWhileRunning = true
-            }
-            if try currentConsumedServerBoundaryIdentifier(
-                for: terminalContext
-            ) != consumedServerBoundaryIdentifier {
-                if isDownloadOnly {
-                    // Outbound wakeups are intentionally ignored in this
-                    // mode; a changed inbound cursor is not such a wakeup.
-                    // Do not publish a result for the stale domain boundary.
-                    throw SyncError.inboundBoundaryChanged
-                }
-                reportProgress("terminal-tail-inbound-boundary-changed")
-                synchronizationRequestedWhileRunning = true
-            }
+            disposition = try checkTerminalPublicationCutoff(
+                context: terminalContext,
+                isDownloadOnly: isDownloadOnly,
+                publication: publication,
+                consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
+            )
         } catch is CancellationError {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
-        if !isDownloadOnly, synchronizationRequestedWhileRunning {
+        switch disposition {
+        case .restartRequired:
             reportProgress("terminal-tail-restarting")
             restartSynchronizationForTerminalWork()
             return
-        }
-
-        if isDownloadOnly {
+        case .downloadOnly:
             // Journal forwarding and domain reconciliation may create local
             // work, but this mode promises not to upload it. Finish the inbound
             // request once without completing migration, minting a receipt or
             // persisting full-drain publication evidence.
-            activeReceiptAuthorizationID = nil
+            let result: SynchronizationResult
             do {
-                try checkRunContext(terminalContext)
-                try keyValueStore.bigSyncValidateDurability()
+                result = try prepareDownloadOnlyPublication(
+                    context: terminalContext,
+                    consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier,
+                    publication: publication
+                )
             } catch {
-                await failSynchronization(error: error)
+                await failSynchronization(error: error, for: attemptID)
                 return
             }
-            let result = SynchronizationResult(
-                didImportChanges: synchronizationDrainDidImportChanges,
-                publicationState: publicationBlockers.isEmpty
-                    ? .complete : .blocked(publicationBlockers),
-                terminalBoundary: .init(
-                    accountScopeIdentifier: terminalContext.accountScopeIdentifier,
-                    replicaBindingGenerationIdentifier:
-                        terminalContext.replicaBindingGenerationIdentifier,
-                    runID: terminalContext.runID,
-                    consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
-                ),
-                completionScope: .downloadOnly
-            )
             reportProgress("download-only-completed")
             await publishSynchronizationResult(result, context: terminalContext)
             return
-        }
-
-        // A semantic blocker is publishable only after the same exact
-        // journal and cursor predicates required by a success receipt are
-        // stable. Domain reconciliation may both create upload work and
-        // report a blocker; drain that work first so `.blocked` describes the
-        // terminal transport boundary rather than an obsolete intermediate
-        // one.
-        if !publicationBlockers.isEmpty {
+        case .blocked:
+            // A semantic blocker is publishable only after the same exact
+            // journal and cursor predicates required by a success receipt are
+            // stable. Domain reconciliation may both create upload work and
+            // report a blocker; drain that work first so `.blocked` describes
+            // the terminal transport boundary rather than an intermediate one.
+            let result: SynchronizationResult
             do {
-                try recordSyncHealth(
-                    .semanticBlocked,
-                    context: terminalContext
+                result = try prepareBlockedTerminalPublication(
+                    context: terminalContext,
+                    consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier,
+                    publication: publication
                 )
-                try keyValueStore.bigSyncValidateDurability()
             } catch is CancellationError {
                 settleCancellationIfCurrentAttempt(attemptID)
                 return
             } catch {
-                await failSynchronization(error: error)
+                await failSynchronization(error: error, for: attemptID)
                 return
             }
-            activeReceiptAuthorizationID = nil
-            await publishSynchronizationResult(
-                SynchronizationResult(
-                    didImportChanges: synchronizationDrainDidImportChanges,
-                    publicationState: .blocked(publicationBlockers),
-                    terminalBoundary: .init(
-                        accountScopeIdentifier: terminalContext.accountScopeIdentifier,
-                        replicaBindingGenerationIdentifier:
-                            terminalContext.replicaBindingGenerationIdentifier,
-                        runID: terminalContext.runID,
-                        consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
-                    )
-                ),
-                context: terminalContext
-            )
+            await publishSynchronizationResult(result, context: terminalContext)
             return
+        case .fullDrain:
+            break
         }
 
         // Only now authorize and publish the receipt. A notification observer
         // may request a fresh synchronization, so snapshot the result before
         // releasing run ownership.
-        let authorizationID = UUID()
-        activeReceiptAuthorizationID = authorizationID
-        let receipt = SynchronizationReceipt(
-            context: terminalContext,
-            issuerID: synchronizationReceiptIssuerID,
-            authorizationID: authorizationID,
-            consumedServerBoundaryIdentifier:
-                consumedServerBoundaryIdentifier
-        )
-        let result = SynchronizationResult(
-            didImportChanges: synchronizationDrainDidImportChanges,
-            receipt: receipt
-        )
-        consecutiveTransientCloudKitFailures = 0
-        clearPersistedTransientRetryState()
-        if let domainPublicationScopeIdentifier,
-           let consumedServerBoundaryIdentifier,
-           let adapter = modelAdapters.first {
-            do {
-                guard let changeFeedEpoch = try adapter.changeFeedEpoch()
-                else {
-                    throw DurableKeyValueStoreError.mutationNotDurable
-                }
-                try persistDurablePublicationEvidence(
-                    domainScopeIdentifier:
-                        domainPublicationScopeIdentifier,
-                    context: terminalContext,
-                    consumedServerBoundaryIdentifier:
-                        consumedServerBoundaryIdentifier,
-                    changeFeedEpoch: changeFeedEpoch
-                )
-            } catch is CancellationError {
-                settleCancellationIfCurrentAttempt(attemptID)
-                return
-            } catch {
-                await failSynchronization(error: error)
-                return
-            }
-        }
-        if let context = activeRunContext {
-            do {
-                try recordSyncHealth(.succeeded, context: context)
-            } catch is CancellationError {
-                settleCancellationIfCurrentAttempt(attemptID)
-                return
-            } catch {
-                await failSynchronization(error: error)
-                return
-            }
+        let result: SynchronizationResult
+        do {
+            result = try prepareFullTerminalPublication(
+                context: terminalContext,
+                consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier,
+                publication: publication
+            )
+        } catch is CancellationError {
+            settleCancellationIfCurrentAttempt(attemptID)
+            return
+        } catch {
+            await failSynchronization(error: error, for: attemptID)
+            return
         }
         do {
             // Cursor/account/retry setters retain a mutation failure in the
@@ -390,7 +242,7 @@ extension CloudKitSynchronizer {
             // local-state commit failed.
             try keyValueStore.bigSyncValidateDurability()
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
 #if DEBUG
@@ -402,12 +254,254 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
 #endif
         reportProgress("terminal-receipt")
         await publishSynchronizationResult(result, context: terminalContext)
+    }
+
+    /// The synchronous cutoff selects exactly one terminal path. This value
+    /// belongs to the current attempt; it does not replace drain wakeup state.
+    private enum TerminalPublicationDisposition {
+        case restartRequired, downloadOnly, blocked, fullDrain
+    }
+
+    /// Domain inspection is a candidate for publication, not receipt authority.
+    private struct TerminalDomainPublication {
+        let blockers: [DomainBlocker]
+        let domainScopeIdentifier: String?
+    }
+
+    @BigSyncBackgroundActor
+    private func cleanUpAndForwardTerminalImports(for attemptID: UUID) async throws {
+        resetActiveTokens()
+
+        uploadRetries = 0
+
+        for adapter in modelAdapters {
+            try await adapter.didFinishImport()
+            try await revalidateActiveRunContext(for: attemptID)
+            try await adapter.cleanUp()
+            try await revalidateActiveRunContext(for: attemptID)
+            // Cleanup can overlap a newly committed local mutation. Forward
+            // journals again so that mutation requests a new drain before a
+            // terminal receipt is issued.
+            try await adapter.didFinishImport()
+            try await revalidateActiveRunContext(for: attemptID)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func reconcileDomainBeforeTerminalPublication(
+        context terminalContext: RunContext,
+        consumedServerBoundaryIdentifier: String?
+    ) async throws -> [DomainBlocker] {
+        var publicationBlockers = [DomainBlocker]()
+        var inboundIdentityDeliveries = [
+            (adapter: ModelAdapter, batch: CommittedInboundIdentityBatch)
+        ]()
+        if let domainPrepublicationHandler {
+            for adapter in modelAdapters {
+                if let batch = try adapter
+                    .pendingCommittedInboundIdentityBatch() {
+                    inboundIdentityDeliveries.append((adapter, batch))
+                }
+            }
+            publicationBlockers.append(contentsOf:
+                try await domainPrepublicationHandler(
+                PrepublicationBoundaryContext(
+                    context: terminalContext,
+                    consumedServerBoundaryIdentifier:
+                        consumedServerBoundaryIdentifier,
+                    didImportChanges:
+                        synchronizationDrainDidImportChanges,
+                    committedInboundIdentities: Array(Set(
+                        inboundIdentityDeliveries.flatMap {
+                            $0.batch.identities
+                        }
+                    )).sorted {
+                        ($0.entityType, $0.recordName)
+                            < ($1.entityType, $1.recordName)
+                    }
+                )
+            ))
+            reportProgress("terminal-tail-domain-handler-completed")
+            try await revalidateRunContext(terminalContext)
+            reportProgress("terminal-tail-domain-context-revalidated")
+            for delivery in inboundIdentityDeliveries {
+                reportProgress("terminal-tail-inbound-ack-started")
+                try await delivery.adapter
+                    .acknowledgeCommittedInboundIdentityBatch(
+                        deliveryID: delivery.batch.deliveryID
+                    )
+                try await revalidateRunContext(terminalContext)
+                reportProgress("terminal-tail-inbound-ack-completed")
+            }
+            // Domain reconciliation is allowed to commit authoritative
+            // local writes. Forward those durable target-journal
+            // generations before deciding whether this drain is terminal.
+            // In download-only mode this does not grant upload authority;
+            // it merely ensures the next explicit full drain starts from
+            // the newest generation instead of uploading a stale tracked
+            // generation first.
+            for adapter in modelAdapters {
+                reportProgress("terminal-tail-import-forwarding-started")
+                try await adapter.didFinishImport { checkpoint in
+                    self.reportProgress("terminal-tail-\(checkpoint)")
+                }
+                reportProgress("terminal-tail-import-forwarding-completed")
+                try await revalidateRunContext(terminalContext)
+                reportProgress("terminal-tail-import-forwarding-revalidated")
+            }
+        }
+        return publicationBlockers
+    }
+
+    @BigSyncBackgroundActor
+    private func inspectTerminalDomainPublication(
+        context terminalContext: RunContext,
+        isDownloadOnly: Bool,
+        reconciliationBlockers: [DomainBlocker]
+    ) async throws -> TerminalDomainPublication {
+        var publicationBlockers = reconciliationBlockers
+        var domainPublicationScopeIdentifier: String?
+        for adapter in modelAdapters {
+            publicationBlockers.append(contentsOf:
+                try await adapter.semanticPublicationBlockers()
+            )
+        }
+        try await revalidateRunContext(terminalContext)
+        if !isDownloadOnly, publicationBlockers.isEmpty,
+           let provider = domainPublicationScopeIdentifierProvider {
+            let scope = try await provider()
+            guard scope?.isEmpty != true else {
+                throw DurableKeyValueStoreError.mutationNotDurable
+            }
+            domainPublicationScopeIdentifier = scope
+            try await revalidateRunContext(terminalContext)
+        }
+        return TerminalDomainPublication(
+            blockers: publicationBlockers,
+            domainScopeIdentifier: domainPublicationScopeIdentifier
+        )
+    }
+
+    /// No suspension is allowed between the last account validation and these
+    /// journal/cursor predicates or the ensuing durable publication writes.
+    @BigSyncBackgroundActor
+    private func checkTerminalPublicationCutoff(
+        context terminalContext: RunContext,
+        isDownloadOnly: Bool,
+        publication: TerminalDomainPublication,
+        consumedServerBoundaryIdentifier: String?
+    ) throws -> TerminalPublicationDisposition {
+        if !isDownloadOnly,
+           try adaptersHavePendingChangesAtTerminalBoundary() {
+            reportProgress("terminal-tail-pending-target")
+            synchronizationRequestedWhileRunning = true
+        }
+        if try currentConsumedServerBoundaryIdentifier(
+            for: terminalContext
+        ) != consumedServerBoundaryIdentifier {
+            if isDownloadOnly {
+                // Outbound wakeups are intentionally ignored in this
+                // mode; a changed inbound cursor is not such a wakeup.
+                // Do not publish a result for the stale domain boundary.
+                throw SyncError.inboundBoundaryChanged
+            }
+            reportProgress("terminal-tail-inbound-boundary-changed")
+            synchronizationRequestedWhileRunning = true
+        }
+        if isDownloadOnly { return .downloadOnly }
+        if synchronizationRequestedWhileRunning { return .restartRequired }
+        return publication.blockers.isEmpty ? .fullDrain : .blocked
+    }
+
+    @BigSyncBackgroundActor
+    private func prepareDownloadOnlyPublication(
+        context terminalContext: RunContext,
+        consumedServerBoundaryIdentifier: String?,
+        publication: TerminalDomainPublication
+    ) throws -> SynchronizationResult {
+        activeReceiptAuthorizationID = nil
+        try checkRunContext(terminalContext)
+        try keyValueStore.bigSyncValidateDurability()
+        return SynchronizationResult(
+            didImportChanges: synchronizationDrainDidImportChanges,
+            publicationState: publication.blockers.isEmpty
+                ? .complete : .blocked(publication.blockers),
+            terminalBoundary: .init(
+                accountScopeIdentifier: terminalContext.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier:
+                    terminalContext.replicaBindingGenerationIdentifier,
+                runID: terminalContext.runID,
+                consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
+            ),
+            completionScope: .downloadOnly
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func prepareBlockedTerminalPublication(
+        context terminalContext: RunContext,
+        consumedServerBoundaryIdentifier: String?,
+        publication: TerminalDomainPublication
+    ) throws -> SynchronizationResult {
+        try recordSyncHealth(.semanticBlocked, context: terminalContext)
+        try keyValueStore.bigSyncValidateDurability()
+        activeReceiptAuthorizationID = nil
+        return SynchronizationResult(
+            didImportChanges: synchronizationDrainDidImportChanges,
+            publicationState: .blocked(publication.blockers),
+            terminalBoundary: .init(
+                accountScopeIdentifier: terminalContext.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier:
+                    terminalContext.replicaBindingGenerationIdentifier,
+                runID: terminalContext.runID,
+                consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
+            )
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func prepareFullTerminalPublication(
+        context terminalContext: RunContext,
+        consumedServerBoundaryIdentifier: String?,
+        publication: TerminalDomainPublication
+    ) throws -> SynchronizationResult {
+        let authorizationID = UUID()
+        activeReceiptAuthorizationID = authorizationID
+        let receipt = SynchronizationReceipt(
+            context: terminalContext,
+            issuerID: synchronizationReceiptIssuerID,
+            authorizationID: authorizationID,
+            consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier
+        )
+        let result = SynchronizationResult(
+            didImportChanges: synchronizationDrainDidImportChanges,
+            receipt: receipt
+        )
+        consecutiveTransientCloudKitFailures = 0
+        clearPersistedTransientRetryState()
+        if let domainPublicationScopeIdentifier = publication.domainScopeIdentifier,
+           let consumedServerBoundaryIdentifier,
+           let adapter = modelAdapters.first {
+            guard let changeFeedEpoch = try adapter.changeFeedEpoch() else {
+                throw DurableKeyValueStoreError.mutationNotDurable
+            }
+            try persistDurablePublicationEvidence(
+                domainScopeIdentifier: domainPublicationScopeIdentifier,
+                context: terminalContext,
+                consumedServerBoundaryIdentifier: consumedServerBoundaryIdentifier,
+                changeFeedEpoch: changeFeedEpoch
+            )
+        }
+        if let context = activeRunContext {
+            try recordSyncHealth(.succeeded, context: context)
+        }
+        return result
     }
 
     @BigSyncBackgroundActor
@@ -452,9 +546,12 @@ extension CloudKitSynchronizer {
         beginSynchronization()
     }
 
-//    @BigSyncBackgroundActor
-    func failSynchronization(error: Error) async {
-        let attemptID = synchronizationAttemptID
+    /// A suspended callback must fail only the attempt that originally owned it.
+    /// Check before resetting tokens, forwarding imports, or releasing waiters:
+    /// a replacement can be admitted while it still waits for this callback.
+    @BigSyncBackgroundActor
+    func failSynchronization(error: Error, for attemptID: UUID) async {
+        guard synchronizationAttemptID == attemptID else { return }
         if error is CancellationError {
             settleCancellationIfCurrentAttempt(attemptID)
             return
@@ -536,6 +633,7 @@ extension CloudKitSynchronizer {
                         settleCancellationIfCurrentAttempt(attemptID)
                         return
                     } catch {
+                        guard synchronizationAttemptID == attemptID else { return }
                         logger.error("QSCloudKitSynchronizer >> Could not durably prepare token recovery: \(error)")
                     }
                 }
@@ -602,6 +700,7 @@ extension CloudKitSynchronizer {
                     }
                     shouldRetry = true
                 } catch {
+                    guard synchronizationAttemptID == attemptID else { return }
                     logger.error(
                         "QSCloudKitSynchronizer >> Failed to clear corrupt adapter cursor: \(error)"
                     )
@@ -982,7 +1081,7 @@ extension CloudKitSynchronizer {
         let attemptID = synchronizationAttemptID
         guard !cancelSync else {
             guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled, for: attemptID)
             return
         }
 
@@ -1022,7 +1121,7 @@ extension CloudKitSynchronizer {
             }
         } catch {
             guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
         }
     }
 
@@ -1384,7 +1483,7 @@ extension CloudKitSynchronizer {
         let attemptID = synchronizationAttemptID
         guard !cancelSync else {
             guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled, for: attemptID)
             return
         }
         
@@ -1407,7 +1506,7 @@ extension CloudKitSynchronizer {
         //        debugPrint("# uploadChanges()")
         guard !cancelSync else {
             guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled, for: attemptID)
             return
         }
         try Task.checkCancellation()
@@ -1426,7 +1525,7 @@ extension CloudKitSynchronizer {
                     defaultZoneID: recordZoneID,
                     context: context
                    ) {
-                    await failSynchronization(error: lifecycleError)
+                    await failSynchronization(error: lifecycleError, for: attemptID)
                     return
                 }
                 if isZoneNotFoundOrDeletedError(error) {
@@ -1443,7 +1542,7 @@ extension CloudKitSynchronizer {
                     logger.info("QSCloudKitSynchronizer >> Retrying upload due to error \(error.description.prefix(200)), beginning with fetching changes...")
                     await fetchChanges()
                 } else {
-                    await failSynchronization(error: error)
+                    await failSynchronization(error: error, for: attemptID)
                 }
             } else {
                 // The database token is a commit barrier for the zone changes it
