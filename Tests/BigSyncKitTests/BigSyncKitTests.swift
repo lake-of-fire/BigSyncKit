@@ -6551,6 +6551,135 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    func testRetrySleepChunksHugeFiniteServerDelayWithoutOverflow() {
+        let directConversionLimit = Double(UInt64.max) / 1_000_000_000
+        let hugeDelay = max(
+            directConversionLimit * 2,
+            Double.greatestFiniteMagnitude
+        )
+
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: hugeDelay
+            ),
+            3_600_000_000_000
+        )
+    }
+
+    func testRetrySleepChunksInfiniteDelayConservatively() {
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: .infinity
+            ),
+            3_600_000_000_000
+        )
+    }
+
+    func testRetrySleepPreservesOrdinaryAndFractionalMinimums() {
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: 1
+            ),
+            1_000_000_000
+        )
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: 0.000_000_000_1
+            ),
+            1,
+            "Fractional nanoseconds must round upward, never shorten the retry minimum"
+        )
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: BigSyncRetrySleep.maximumChunkSeconds
+            ),
+            3_600_000_000_000
+        )
+    }
+
+    func testRetrySleepRejectsNonpositiveOrNaNChunks() {
+        XCTAssertNil(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: 0
+            )
+        )
+        XCTAssertNil(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: -1
+            )
+        )
+        XCTAssertNil(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: .nan
+            )
+        )
+    }
+
+    func testHugeRetrySleepSuspendsAndRemainsCancellable() async {
+        let task = Task {
+            try await BigSyncRetrySleep.sleep(
+                for: Double.greatestFiniteMagnitude
+            )
+        }
+        await Task.yield()
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Cancelling a huge retry sleep must terminate it")
+        } catch is CancellationError {
+            // Expected: huge finite delays are chunked, not overflow-converted.
+        } catch {
+            XCTFail("Unexpected retry sleep error: \(error)")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testHugePersistedRetryDeadlineIsCancellableWithoutOverflow() async {
+        let store = DictionaryKeyValueStore()
+        let database = FakeCloudKitDatabase()
+        let sync = CloudKitSynchronizer(
+            identifier: "huge-retry-" + UUID().uuidString,
+            containerIdentifier: "iCloud.test",
+            database: database,
+            recordZoneID: CloudKitSynchronizer.defaultCustomZoneID,
+            keyValueStore: store,
+            accountIdentifierProvider: { database.accountIdentifier },
+            logger: Logger(label: "BigSyncKitTests")
+        )
+        let context = CloudKitSynchronizer.RunContext(
+            attemptID: sync.synchronizationAttemptID,
+            runID: sync.synchronizationRunID,
+            accountIdentifier: "test-account",
+            accountScopeIdentifier: "test-account-scope"
+        )
+        sync.activeRunContext = context
+        sync.persistTransientRetryState(
+            context: context,
+            notBefore: Date().addingTimeInterval(
+                Double.greatestFiniteMagnitude
+            ),
+            consecutiveFailures: 1
+        )
+
+        let task = Task { @BigSyncBackgroundActor in
+            try await sync.waitForPersistedTransientRetryIfNeeded(
+                context: context
+            )
+        }
+        await Task.yield()
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Cancelling a restored huge retry sleep must terminate it")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Unexpected restored retry error: \(error)")
+        }
+    }
+
     func testCloudKitRetryBackoffGrowsAndCapsWithoutServerDirection() {
         XCTAssertEqual(
             CloudKitRetryBackoff.delay(
