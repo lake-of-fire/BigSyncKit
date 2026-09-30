@@ -6615,6 +6615,71 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    func testHugeRetrySleepSuspendsAndRemainsCancellable() async {
+        let task = Task {
+            try await BigSyncRetrySleep.sleep(
+                for: Double.greatestFiniteMagnitude
+            )
+        }
+        await Task.yield()
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Cancelling a huge retry sleep must terminate it")
+        } catch is CancellationError {
+            // Expected: huge finite delays are chunked, not overflow-converted.
+        } catch {
+            XCTFail("Unexpected retry sleep error: \(error)")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testHugePersistedRetryDeadlineIsCancellableWithoutOverflow() async {
+        let store = DictionaryKeyValueStore()
+        let database = FakeCloudKitDatabase()
+        let sync = CloudKitSynchronizer(
+            identifier: "huge-retry-" + UUID().uuidString,
+            containerIdentifier: "iCloud.test",
+            database: database,
+            recordZoneID: CloudKitSynchronizer.defaultCustomZoneID,
+            keyValueStore: store,
+            accountIdentifierProvider: { database.accountIdentifier },
+            logger: Logger(label: "BigSyncKitTests")
+        )
+        let context = CloudKitSynchronizer.RunContext(
+            attemptID: sync.synchronizationAttemptID,
+            runID: sync.synchronizationRunID,
+            accountIdentifier: "test-account",
+            accountScopeIdentifier: "test-account-scope"
+        )
+        sync.activeRunContext = context
+        sync.persistTransientRetryState(
+            context: context,
+            notBefore: Date().addingTimeInterval(
+                Double.greatestFiniteMagnitude
+            ),
+            consecutiveFailures: 1
+        )
+
+        let task = Task { @BigSyncBackgroundActor in
+            try await sync.waitForPersistedTransientRetryIfNeeded(
+                context: context
+            )
+        }
+        await Task.yield()
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Cancelling a restored huge retry sleep must terminate it")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Unexpected restored retry error: \(error)")
+        }
+    }
+
     func testCloudKitRetryBackoffGrowsAndCapsWithoutServerDirection() {
         XCTAssertEqual(
             CloudKitRetryBackoff.delay(
