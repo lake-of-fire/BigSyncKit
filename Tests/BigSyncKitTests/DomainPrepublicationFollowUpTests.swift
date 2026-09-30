@@ -243,6 +243,227 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPendingWorkDiscoveredAfterReconciliationDrainsBeforeBlockedPublication() async throws {
+        let fixture = try makeFixture()
+        let blocker = CloudKitSynchronizer.DomainBlocker(code: "reconciliation-debt")
+        var runs = [UUID]()
+        fixture.adapter.onImport = { fixture.adapter.pending = false }
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            runs.append(context.runID)
+            if runs.count == 1 {
+                // The semantic inspection follows journal forwarding. This
+                // generation must still force a fresh drain before .blocked.
+                fixture.adapter.onInspection = {
+                    fixture.adapter.pending = true
+                    fixture.adapter.onInspection = nil
+                }
+            }
+            return [blocker]
+        }
+        let result = try await fixture.synchronizer.synchronize()
+        XCTAssertEqual(runs.count, 2)
+        XCTAssertNotEqual(runs.first, runs.last)
+        XCTAssertEqual(result.terminalBoundary?.runID, runs.last)
+        XCTAssertEqual(result.publicationState, .blocked([blocker]))
+        XCTAssertNil(result.receipt)
+        XCTAssertFalse(fixture.adapter.pending)
+        XCTAssertEqual(fixture.transport.recordMutationCount, 0)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testDownloadOnlyAcknowledgesCapturedDeliveryBeforeForwardingAndPreservesNewerBatch() async throws {
+        let fixture = try makeFixture()
+        fixture.synchronizer.syncMode = .downloadOnly
+        let oldIdentity = CommittedInboundIdentity(
+            entityType: "DomainFollowUpObject", recordName: "old", disposition: .upsert
+        )
+        let newerIdentity = CommittedInboundIdentity(
+            entityType: "DomainFollowUpObject", recordName: "new", disposition: .delete
+        )
+        fixture.adapter.committedBatch = .init(deliveryID: "old-delivery", identities: [oldIdentity])
+        var events = [String]()
+        let blocker = CloudKitSynchronizer.DomainBlocker(code: "download-reconciliation-debt")
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            XCTAssertEqual(context.committedInboundIdentities, [oldIdentity])
+            events.append("reconcile")
+            fixture.adapter.committedBatch = .init(deliveryID: "new-delivery", identities: [newerIdentity])
+            fixture.adapter.pending = true
+            fixture.adapter.onAcknowledgement = { events.append("ack:" + $0) }
+            fixture.adapter.onImport = { events.append("forward") }
+            fixture.adapter.onInspection = { events.append("inspect") }
+            return [blocker]
+        }
+        let result = try await fixture.synchronizer.synchronize()
+        XCTAssertEqual(events, ["reconcile", "ack:old-delivery", "forward", "inspect"])
+        XCTAssertEqual(fixture.adapter.committedBatch?.deliveryID, "new-delivery")
+        XCTAssertTrue(fixture.adapter.pending)
+        XCTAssertEqual(result.completionScope, .downloadOnly)
+        XCTAssertEqual(result.publicationState, .blocked([blocker]))
+        XCTAssertNil(result.receipt)
+        XCTAssertEqual(fixture.transport.recordMutationCount, 0)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testDownloadOnlyRejectsCursorChangedAfterDomainReconciliation() async throws {
+        let fixture = try makeFixture()
+        fixture.synchronizer.syncMode = .downloadOnly
+        fixture.adapter.boundaryIdentifier = "captured-boundary"
+        var completions = 0
+        fixture.synchronizer.synchronizationCompletionHandler = { _ in completions += 1 }
+        fixture.synchronizer.domainPrepublicationHandler = { context in
+            XCTAssertEqual(context.consumedServerBoundaryIdentifier, "captured-boundary")
+            fixture.adapter.boundaryIdentifier = "newer-boundary"
+            return []
+        }
+        do {
+            _ = try await fixture.synchronizer.synchronize()
+            XCTFail("A changed inbound cursor cannot publish the captured boundary")
+        } catch CloudKitSynchronizer.SyncError.inboundBoundaryChanged {}
+        XCTAssertEqual(completions, 0)
+        XCTAssertNil(fixture.synchronizer.activeReceiptAuthorizationID)
+        XCTAssertEqual(fixture.transport.recordMutationCount, 0)
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testRetiredTerminalErrorCannotFailReplacementDrainOrItsWaiters() async throws {
+        let fixture = try makeFixture()
+        let synchronizer = fixture.synchronizer
+        let enteredRetiredCallback = expectation(description: "Retired terminal callback entered")
+        let releaseRetiredCallback = DomainFollowUpGate()
+        let enteredReplacementConsume = expectation(description: "Replacement consume boundary entered")
+        let releaseReplacementConsume = DomainFollowUpGate()
+        let enteredReplacementCallback = expectation(description: "Replacement terminal callback entered")
+        let releaseReplacementCallback = DomainFollowUpGate()
+        var consumedRuns = [UUID]()
+        var terminalRuns = [UUID]()
+        var publishedRuns = [UUID]()
+        synchronizer.synchronizationWillConsumeServerChangesHandler = { context in
+            consumedRuns.append(context.runID)
+            if consumedRuns.count == 2 {
+                enteredReplacementConsume.fulfill()
+                await releaseReplacementConsume.wait()
+            }
+        }
+        synchronizer.synchronizationCompletionHandler = {
+            if let runID = $0.terminalBoundary?.runID {
+                publishedRuns.append(runID)
+            }
+        }
+        synchronizer.domainPrepublicationHandler = { context in
+            terminalRuns.append(context.runID)
+            if terminalRuns.count == 1 {
+                enteredRetiredCallback.fulfill()
+                // Deliberately ignore cooperative cancellation, as a domain
+                // dependency may deliver an ordinary error after retirement.
+                await releaseRetiredCallback.wait()
+                throw DomainFollowUpError.retiredTerminalCallback
+            }
+            if terminalRuns.count == 2 {
+                enteredReplacementCallback.fulfill()
+                await releaseReplacementCallback.wait()
+            }
+            return []
+        }
+        // Release held boundaries before the fixture's cancellation teardown,
+        // including when an assertion or request unexpectedly fails.
+        addTeardownBlock { @BigSyncBackgroundActor in
+            releaseRetiredCallback.open()
+            releaseReplacementConsume.open()
+            releaseReplacementCallback.open()
+        }
+        let retiredRequest = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        await fulfillment(of: [enteredRetiredCallback], timeout: 5)
+        guard terminalRuns.count == 1 else { return }
+        let retiredAttemptID = synchronizer.synchronizationAttemptID
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 1)
+
+        synchronizer.cancelSynchronization()
+        do {
+            _ = try await retiredRequest.value
+            XCTFail("Cancellation must release the retired request's waiter")
+        } catch is CancellationError {}
+        let cancelledAttemptID = synchronizer.synchronizationAttemptID
+        let replacementRequest = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        // Observe admission, not an elapsed-time guess. The held callback
+        // prevents B's orchestration from crossing its callback barrier.
+        guard await waitForCondition(description: "Replacement request admitted", {
+            synchronizer.synchronizationAttemptID != cancelledAttemptID
+        }) else { return }
+        let replacementAttemptID = synchronizer.synchronizationAttemptID
+        XCTAssertNotEqual(replacementAttemptID, retiredAttemptID)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertNil(synchronizer.activeRunContext)
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 1)
+
+        let joinedReplacementRequest = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        guard await waitForCondition(description: "Replacement waiter joined", {
+            synchronizer.synchronizationRequestedWhileRunning
+        }) else { return }
+        XCTAssertTrue(publishedRuns.isEmpty)
+        releaseRetiredCallback.open()
+        await fulfillment(of: [enteredReplacementConsume], timeout: 5)
+        guard consumedRuns.count == 2 else { return }
+        XCTAssertEqual(synchronizer.synchronizationAttemptID, replacementAttemptID)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertTrue(publishedRuns.isEmpty)
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 0)
+        // Joining an active request asks the shared drain for another pass.
+        // Both replacement waiters must survive that ordinary tail pass too.
+        releaseReplacementConsume.open()
+        await fulfillment(of: [enteredReplacementCallback], timeout: 5)
+        guard terminalRuns.count == 2 else { return }
+
+        XCTAssertEqual(consumedRuns.count, 3)
+        XCTAssertEqual(terminalRuns.last, consumedRuns.last)
+        XCTAssertEqual(terminalRuns.count, 2)
+        XCTAssertNotEqual(terminalRuns.first, terminalRuns.last)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertTrue(publishedRuns.isEmpty)
+        let replacementRunID = try XCTUnwrap(terminalRuns.last)
+        releaseReplacementCallback.open()
+        let replacementResult = try await replacementRequest.value
+        let joinedResult = try await joinedReplacementRequest.value
+        XCTAssertEqual(replacementResult.receipt?.runID, replacementRunID)
+        XCTAssertEqual(joinedResult.receipt?.runID, replacementRunID)
+        XCTAssertEqual(replacementResult.publicationState, .complete)
+        XCTAssertEqual(joinedResult.publicationState, .complete)
+        XCTAssertFalse(publishedRuns.contains(try XCTUnwrap(terminalRuns.first)))
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    private func waitForCondition(
+        description: String,
+        _ condition: @escaping @BigSyncBackgroundActor () -> Bool
+    ) async -> Bool {
+        let reachedCondition = expectation(description: description)
+        let observer = Task { @BigSyncBackgroundActor in
+            while !Task.isCancelled {
+                if condition() {
+                    reachedCondition.fulfill()
+                    return
+                }
+                await Task.yield()
+            }
+        }
+        await fulfillment(of: [reachedCondition], timeout: 5)
+        observer.cancel()
+        return condition()
+    }
+
+    @BigSyncBackgroundActor
     private func makeFixture(account: String = "follow-up-account") throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("bigsync-domain-follow-up-\(UUID().uuidString)", isDirectory: true)
@@ -285,6 +506,9 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
             synchronizer.domainPrepublicationHandler = nil
             synchronizer.synchronizationWillConsumeServerChangesHandler = nil
             adapter.onInspection = nil
+            adapter.onImport = nil
+            adapter.onAcknowledgement = nil
+            synchronizer.synchronizationCompletionHandler = nil
             await synchronizer.cancelSynchronizationAndWait()
         }
 
@@ -335,6 +559,10 @@ private final class DomainFollowUpAdapter: NSObject, ModelAdapter, ChangeFeedRes
     @BigSyncBackgroundActor var pending = false
     @BigSyncBackgroundActor var blockers = [CloudKitSynchronizer.DomainBlocker]()
     @BigSyncBackgroundActor var onInspection: (() -> Void)?
+    @BigSyncBackgroundActor var onImport: (() -> Void)?
+    @BigSyncBackgroundActor var onAcknowledgement: ((String) -> Void)?
+    @BigSyncBackgroundActor var committedBatch: CommittedInboundIdentityBatch?
+    @BigSyncBackgroundActor var boundaryIdentifier: String?
     init(zoneID: CKRecordZone.ID) { recordZoneID = zoneID }
     var hasChanges: Bool { false }
     func cleanUp() async throws {}
@@ -373,9 +601,16 @@ private final class DomainFollowUpAdapter: NSObject, ModelAdapter, ChangeFeedRes
     func saveToken(_ token: RecordZoneChangeCursor?) async throws {}
     @BigSyncBackgroundActor
     func consumedServerBoundaryIdentifier(accountScopeIdentifier: String, replicaBindingGenerationIdentifier: String?,
-                                          containerIdentifier: String, databaseScope: CKDatabase.Scope) throws -> String? { nil }
+                                          containerIdentifier: String, databaseScope: CKDatabase.Scope) throws -> String? { boundaryIdentifier }
     @BigSyncBackgroundActor func changeFeedEpoch() throws -> Int? { nil }
-    func didFinishImport() async throws {}
+    @BigSyncBackgroundActor func didFinishImport() async throws { onImport?() }
+    @BigSyncBackgroundActor
+    func pendingCommittedInboundIdentityBatch() throws -> CommittedInboundIdentityBatch? { committedBatch }
+    @BigSyncBackgroundActor
+    func acknowledgeCommittedInboundIdentityBatch(deliveryID: String) async throws {
+        onAcknowledgement?(deliveryID)
+        if committedBatch?.deliveryID == deliveryID { committedBatch = nil }
+    }
     func cancelSynchronization() {}
     func unsetCancellation() async throws {}
     @BigSyncBackgroundActor func hasPendingChangesAtTerminalBoundary() throws -> Bool { pending }
@@ -383,5 +618,27 @@ private final class DomainFollowUpAdapter: NSObject, ModelAdapter, ChangeFeedRes
     func semanticPublicationBlockers() async throws -> [CloudKitSynchronizer.DomainBlocker] {
         onInspection?()
         return blockers
+    }
+}
+
+private enum DomainFollowUpError: Error {
+    case retiredTerminalCallback
+}
+
+@BigSyncBackgroundActor
+private final class DomainFollowUpGate {
+    private var isOpen = false
+    private var waiters = [CheckedContinuation<Void, Never>]()
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let continuations = waiters
+        waiters.removeAll()
+        continuations.forEach { $0.resume() }
     }
 }
