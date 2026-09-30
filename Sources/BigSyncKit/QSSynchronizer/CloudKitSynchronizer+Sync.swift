@@ -776,7 +776,7 @@ extension CloudKitSynchronizer {
             guard let self else { return }
             if retryDelay > 0 {
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+                    try await BigSyncRetrySleep.sleep(for: retryDelay)
                 } catch {
                     return
                 }
@@ -801,6 +801,52 @@ extension CloudKitSynchronizer {
 /// server-directed delay can create a retry storm. Optional jitter is added
 /// *after* that minimum so clients do not synchronize their wakeups while
 /// still respecting CloudKit's backpressure.
+enum BigSyncRetrySleep {
+    /// Keep each integer conversion comfortably below UInt64.max. Large
+    /// server-directed delays remain large: they are slept in consecutive
+    /// chunks rather than clamped to an earlier retry deadline.
+    static let maximumChunkSeconds: TimeInterval = 60 * 60
+
+    static func nextChunkNanoseconds(
+        remainingSeconds: TimeInterval
+    ) -> UInt64? {
+        guard !remainingSeconds.isNaN, remainingSeconds > 0 else {
+            return nil
+        }
+        let chunkSeconds = remainingSeconds.isFinite
+            ? min(remainingSeconds, maximumChunkSeconds)
+            : maximumChunkSeconds
+        // Round upward so fractional nanoseconds can never shorten the
+        // server-requested minimum.
+        let nanoseconds = (chunkSeconds * 1_000_000_000).rounded(.up)
+        guard nanoseconds.isFinite, nanoseconds > 0,
+              nanoseconds <= Double(UInt64.max) else {
+            return nil
+        }
+        return UInt64(nanoseconds)
+    }
+
+    static func sleep(for delaySeconds: TimeInterval) async throws {
+        guard !delaySeconds.isNaN, delaySeconds >= 0 else {
+            throw CocoaError(.validationMissingMandatoryProperty)
+        }
+        var remaining = delaySeconds
+        while remaining > 0 {
+            try Task.checkCancellation()
+            guard let nanoseconds = nextChunkNanoseconds(
+                remainingSeconds: remaining
+            ) else {
+                throw CocoaError(.validationMissingMandatoryProperty)
+            }
+            try await Task.sleep(nanoseconds: nanoseconds)
+            if remaining.isFinite {
+                let consumed = Double(nanoseconds) / 1_000_000_000
+                remaining = max(0, remaining - consumed)
+            }
+        }
+    }
+}
+
 enum CloudKitRetryBackoff {
     static let initialFallbackDelay: TimeInterval = 5
     static let maximumFallbackDelay: TimeInterval = 300
