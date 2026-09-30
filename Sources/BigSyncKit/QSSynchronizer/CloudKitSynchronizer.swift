@@ -1956,7 +1956,7 @@ public class CloudKitSynchronizer: NSObject {
                 await performSynchronization()
             } catch {
                 guard synchronizationAttemptID == attemptID else { return }
-                await failSynchronization(error: error)
+                await failSynchronization(error: error, for: attemptID)
             }
         }
     }
@@ -2324,7 +2324,7 @@ public class CloudKitSynchronizer: NSObject {
             return
         } catch {
             guard synchronizationAttemptID == context.attemptID else { return }
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: context.attemptID)
             return
         }
         let needsFollowUp = synchronizationRequestedWhileRunning

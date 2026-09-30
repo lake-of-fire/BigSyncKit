@@ -328,6 +328,142 @@ final class DomainPrepublicationFollowUpTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testRetiredTerminalErrorCannotFailReplacementDrainOrItsWaiters() async throws {
+        let fixture = try makeFixture()
+        let synchronizer = fixture.synchronizer
+        let enteredRetiredCallback = expectation(description: "Retired terminal callback entered")
+        let releaseRetiredCallback = DomainFollowUpGate()
+        let enteredReplacementConsume = expectation(description: "Replacement consume boundary entered")
+        let releaseReplacementConsume = DomainFollowUpGate()
+        let enteredReplacementCallback = expectation(description: "Replacement terminal callback entered")
+        let releaseReplacementCallback = DomainFollowUpGate()
+        var consumedRuns = [UUID]()
+        var terminalRuns = [UUID]()
+        var publishedRuns = [UUID]()
+        synchronizer.synchronizationWillConsumeServerChangesHandler = { context in
+            consumedRuns.append(context.runID)
+            if consumedRuns.count == 2 {
+                enteredReplacementConsume.fulfill()
+                await releaseReplacementConsume.wait()
+            }
+        }
+        synchronizer.synchronizationCompletionHandler = {
+            if let runID = $0.terminalBoundary?.runID {
+                publishedRuns.append(runID)
+            }
+        }
+        synchronizer.domainPrepublicationHandler = { context in
+            terminalRuns.append(context.runID)
+            if terminalRuns.count == 1 {
+                enteredRetiredCallback.fulfill()
+                // Deliberately ignore cooperative cancellation, as a domain
+                // dependency may deliver an ordinary error after retirement.
+                await releaseRetiredCallback.wait()
+                throw DomainFollowUpError.retiredTerminalCallback
+            }
+            if terminalRuns.count == 2 {
+                enteredReplacementCallback.fulfill()
+                await releaseReplacementCallback.wait()
+            }
+            return []
+        }
+        // Release held boundaries before the fixture's cancellation teardown,
+        // including when an assertion or request unexpectedly fails.
+        addTeardownBlock { @BigSyncBackgroundActor in
+            releaseRetiredCallback.open()
+            releaseReplacementConsume.open()
+            releaseReplacementCallback.open()
+        }
+        let retiredRequest = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        await fulfillment(of: [enteredRetiredCallback], timeout: 5)
+        guard terminalRuns.count == 1 else { return }
+        let retiredAttemptID = synchronizer.synchronizationAttemptID
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 1)
+
+        synchronizer.cancelSynchronization()
+        do {
+            _ = try await retiredRequest.value
+            XCTFail("Cancellation must release the retired request's waiter")
+        } catch is CancellationError {}
+        let cancelledAttemptID = synchronizer.synchronizationAttemptID
+        let replacementRequest = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        // Observe admission, not an elapsed-time guess. The held callback
+        // prevents B's orchestration from crossing its callback barrier.
+        guard await waitForCondition(description: "Replacement request admitted", {
+            synchronizer.synchronizationAttemptID != cancelledAttemptID
+        }) else { return }
+        let replacementAttemptID = synchronizer.synchronizationAttemptID
+        XCTAssertNotEqual(replacementAttemptID, retiredAttemptID)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertNil(synchronizer.activeRunContext)
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 1)
+
+        let joinedReplacementRequest = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize()
+        }
+        guard await waitForCondition(description: "Replacement waiter joined", {
+            synchronizer.synchronizationRequestedWhileRunning
+        }) else { return }
+        XCTAssertTrue(publishedRuns.isEmpty)
+        releaseRetiredCallback.open()
+        await fulfillment(of: [enteredReplacementConsume], timeout: 5)
+        guard consumedRuns.count == 2 else { return }
+        XCTAssertEqual(synchronizer.synchronizationAttemptID, replacementAttemptID)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertTrue(publishedRuns.isEmpty)
+        XCTAssertEqual(synchronizer._testActiveRunCallbackCount, 0)
+        // Joining an active request asks the shared drain for another pass.
+        // Both replacement waiters must survive that ordinary tail pass too.
+        releaseReplacementConsume.open()
+        await fulfillment(of: [enteredReplacementCallback], timeout: 5)
+        guard terminalRuns.count == 2 else { return }
+
+        XCTAssertEqual(consumedRuns.count, 3)
+        XCTAssertEqual(terminalRuns.last, consumedRuns.last)
+        XCTAssertEqual(terminalRuns.count, 2)
+        XCTAssertNotEqual(terminalRuns.first, terminalRuns.last)
+        XCTAssertTrue(synchronizer.synchronizationDrainIsActive)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertTrue(publishedRuns.isEmpty)
+        let replacementRunID = try XCTUnwrap(terminalRuns.last)
+        releaseReplacementCallback.open()
+        let replacementResult = try await replacementRequest.value
+        let joinedResult = try await joinedReplacementRequest.value
+        XCTAssertEqual(replacementResult.receipt?.runID, replacementRunID)
+        XCTAssertEqual(joinedResult.receipt?.runID, replacementRunID)
+        XCTAssertEqual(replacementResult.publicationState, .complete)
+        XCTAssertEqual(joinedResult.publicationState, .complete)
+        XCTAssertFalse(publishedRuns.contains(try XCTUnwrap(terminalRuns.first)))
+        await fixture.stop()
+    }
+
+    @BigSyncBackgroundActor
+    private func waitForCondition(
+        description: String,
+        _ condition: @escaping @BigSyncBackgroundActor () -> Bool
+    ) async -> Bool {
+        let reachedCondition = expectation(description: description)
+        let observer = Task { @BigSyncBackgroundActor in
+            while !Task.isCancelled {
+                if condition() {
+                    reachedCondition.fulfill()
+                    return
+                }
+                await Task.yield()
+            }
+        }
+        await fulfillment(of: [reachedCondition], timeout: 5)
+        observer.cancel()
+        return condition()
+    }
+
+    @BigSyncBackgroundActor
     private func makeFixture(account: String = "follow-up-account") throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("bigsync-domain-follow-up-\(UUID().uuidString)", isDirectory: true)
@@ -482,5 +618,27 @@ private final class DomainFollowUpAdapter: NSObject, ModelAdapter, ChangeFeedRes
     func semanticPublicationBlockers() async throws -> [CloudKitSynchronizer.DomainBlocker] {
         onInspection?()
         return blockers
+    }
+}
+
+private enum DomainFollowUpError: Error {
+    case retiredTerminalCallback
+}
+
+@BigSyncBackgroundActor
+private final class DomainFollowUpGate {
+    private var isOpen = false
+    private var waiters = [CheckedContinuation<Void, Never>]()
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let continuations = waiters
+        waiters.removeAll()
+        continuations.forEach { $0.resume() }
     }
 }

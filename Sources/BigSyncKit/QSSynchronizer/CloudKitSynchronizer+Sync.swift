@@ -48,7 +48,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
 //        logger.info("QSCloudKitSynchronizer >> Finishing synchronization batch...")
@@ -59,7 +59,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         reportProgress("terminal-tail-adapters-cleaned")
@@ -77,7 +77,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         reportProgress("terminal-tail-pending-checked")
@@ -99,7 +99,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         let consumedServerBoundaryIdentifier: String?
@@ -110,11 +110,11 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         guard let terminalContext = activeRunContext else {
-            await failSynchronization(error: CancellationError())
+            await failSynchronization(error: CancellationError(), for: attemptID)
             return
         }
         let reconciliationBlockers: [DomainBlocker]
@@ -127,7 +127,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         reportProgress("terminal-tail-prepublication-completed")
@@ -143,7 +143,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
 
@@ -165,7 +165,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         switch disposition {
@@ -186,7 +186,7 @@ extension CloudKitSynchronizer {
                     publication: publication
                 )
             } catch {
-                await failSynchronization(error: error)
+                await failSynchronization(error: error, for: attemptID)
                 return
             }
             reportProgress("download-only-completed")
@@ -209,7 +209,7 @@ extension CloudKitSynchronizer {
                 settleCancellationIfCurrentAttempt(attemptID)
                 return
             } catch {
-                await failSynchronization(error: error)
+                await failSynchronization(error: error, for: attemptID)
                 return
             }
             await publishSynchronizationResult(result, context: terminalContext)
@@ -232,7 +232,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
         do {
@@ -242,7 +242,7 @@ extension CloudKitSynchronizer {
             // local-state commit failed.
             try keyValueStore.bigSyncValidateDurability()
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
 #if DEBUG
@@ -254,7 +254,7 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         } catch {
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
             return
         }
 #endif
@@ -546,9 +546,12 @@ extension CloudKitSynchronizer {
         beginSynchronization()
     }
 
-//    @BigSyncBackgroundActor
-    func failSynchronization(error: Error) async {
-        let attemptID = synchronizationAttemptID
+    /// A suspended callback must fail only the attempt that originally owned it.
+    /// Check before resetting tokens, forwarding imports, or releasing waiters:
+    /// a replacement can be admitted while it still waits for this callback.
+    @BigSyncBackgroundActor
+    func failSynchronization(error: Error, for attemptID: UUID) async {
+        guard synchronizationAttemptID == attemptID else { return }
         if error is CancellationError {
             settleCancellationIfCurrentAttempt(attemptID)
             return
@@ -630,6 +633,7 @@ extension CloudKitSynchronizer {
                         settleCancellationIfCurrentAttempt(attemptID)
                         return
                     } catch {
+                        guard synchronizationAttemptID == attemptID else { return }
                         logger.error("QSCloudKitSynchronizer >> Could not durably prepare token recovery: \(error)")
                     }
                 }
@@ -696,6 +700,7 @@ extension CloudKitSynchronizer {
                     }
                     shouldRetry = true
                 } catch {
+                    guard synchronizationAttemptID == attemptID else { return }
                     logger.error(
                         "QSCloudKitSynchronizer >> Failed to clear corrupt adapter cursor: \(error)"
                     )
@@ -1076,7 +1081,7 @@ extension CloudKitSynchronizer {
         let attemptID = synchronizationAttemptID
         guard !cancelSync else {
             guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled, for: attemptID)
             return
         }
 
@@ -1116,7 +1121,7 @@ extension CloudKitSynchronizer {
             }
         } catch {
             guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: error)
+            await failSynchronization(error: error, for: attemptID)
         }
     }
 
@@ -1478,7 +1483,7 @@ extension CloudKitSynchronizer {
         let attemptID = synchronizationAttemptID
         guard !cancelSync else {
             guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled, for: attemptID)
             return
         }
         
@@ -1501,7 +1506,7 @@ extension CloudKitSynchronizer {
         //        debugPrint("# uploadChanges()")
         guard !cancelSync else {
             guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: SyncError.cancelled)
+            await failSynchronization(error: SyncError.cancelled, for: attemptID)
             return
         }
         try Task.checkCancellation()
@@ -1520,7 +1525,7 @@ extension CloudKitSynchronizer {
                     defaultZoneID: recordZoneID,
                     context: context
                    ) {
-                    await failSynchronization(error: lifecycleError)
+                    await failSynchronization(error: lifecycleError, for: attemptID)
                     return
                 }
                 if isZoneNotFoundOrDeletedError(error) {
@@ -1537,7 +1542,7 @@ extension CloudKitSynchronizer {
                     logger.info("QSCloudKitSynchronizer >> Retrying upload due to error \(error.description.prefix(200)), beginning with fetching changes...")
                     await fetchChanges()
                 } else {
-                    await failSynchronization(error: error)
+                    await failSynchronization(error: error, for: attemptID)
                 }
             } else {
                 // The database token is a commit barrier for the zone changes it
