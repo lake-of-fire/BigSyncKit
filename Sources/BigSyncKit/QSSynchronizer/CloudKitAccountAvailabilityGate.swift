@@ -1,4 +1,5 @@
 import CloudKit
+import Dispatch
 
 enum CloudKitAccountAvailability: Equatable, Sendable {
     case available
@@ -6,34 +7,12 @@ enum CloudKitAccountAvailability: Equatable, Sendable {
     case failed
 }
 
-private actor CloudKitAccountAvailabilityRace {
-    private var resolvedValue: CloudKitAccountAvailability?
-    private var continuation:
-        CheckedContinuation<CloudKitAccountAvailability, Never>?
-
-    func resolve(_ value: CloudKitAccountAvailability) {
-        guard resolvedValue == nil else { return }
-        resolvedValue = value
-        continuation?.resume(returning: value)
-        continuation = nil
-    }
-
-    func value() async -> CloudKitAccountAvailability {
-        if let resolvedValue { return resolvedValue }
-        return await withCheckedContinuation { continuation in
-            if let resolvedValue {
-                continuation.resume(returning: resolvedValue)
-            } else {
-                self.continuation = continuation
-            }
-        }
-    }
-}
-
 struct CloudKitAccountAvailabilityGate: Sendable {
     typealias StatusProvider = @Sendable (String) async -> CloudKitAccountAvailability
     private let statusProvider: StatusProvider
     private let deadlineNanoseconds: UInt64
+    private let now: @Sendable () -> UInt64
+    private let sleep: @Sendable (UInt64) async throws -> Void
 
     static let defaultDeadlineNanoseconds: UInt64 = 20_000_000_000
 
@@ -58,36 +37,56 @@ struct CloudKitAccountAvailabilityGate: Sendable {
 
     init(
         statusProvider: @escaping StatusProvider,
-        deadlineNanoseconds: UInt64 = Self.defaultDeadlineNanoseconds
+        deadlineNanoseconds: UInt64 = Self.defaultDeadlineNanoseconds,
+        now: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        sleep: @escaping @Sendable (UInt64) async throws -> Void = {
+            try await Task.sleep(nanoseconds: $0)
+        }
     ) {
         self.statusProvider = statusProvider
         self.deadlineNanoseconds = deadlineNanoseconds
+        self.now = now
+        self.sleep = sleep
     }
 
     func availability(for containerIdentifier: String) async -> CloudKitAccountAvailability {
-        // Unstructured provider/deadline tasks do not inherit cancellation.
-        // Do not submit account work for a caller cancelled before admission.
         guard !Task.isCancelled else { return .failed }
-        let race = CloudKitAccountAvailabilityRace()
+        // Capture the budget before scheduling either task. Use the same
+        // settlement rule as worker deadlines, not a second timing protocol.
+        let race = BigSyncDeadlineRace<CloudKitAccountAvailability>(
+            durationNanoseconds: deadlineNanoseconds, now: now
+        )
+        guard race.remainingNanoseconds > 0 else { return .failed }
         let providerTask = Task {
-            let value = await statusProvider(containerIdentifier)
-            await race.resolve(value)
-        }
-        let deadlineTask = Task.detached { [race, deadlineNanoseconds] in
-            do {
-                try await Task.sleep(nanoseconds: deadlineNanoseconds)
-            } catch {
+            guard !Task.isCancelled else {
+                await race.resolve(.cancelled)
                 return
             }
-            await race.resolve(.failed)
+            guard race.remainingNanoseconds > 0 else {
+                await race.resolve(.timedOut)
+                return
+            }
+            let value = await statusProvider(containerIdentifier)
+            await race.resolve(.completed(value))
         }
-        let value = await withTaskCancellationHandler {
+        let deadlineTask = Task.detached { [race, sleep] in
+            await race.waitUntilDeadline(sleep: sleep)
+        }
+        let outcome = await withTaskCancellationHandler {
             await race.value()
         } onCancel: {
-            Task { await race.resolve(.failed) }
+            // Cancel only this logical provider, without joining a possibly
+            // noncooperative Apple request or disturbing another caller.
+            providerTask.cancel()
+            Task { await race.resolve(.cancelled) }
         }
         providerTask.cancel()
         deadlineTask.cancel()
-        return value
+        // Settlement may precede cancellation while delivery is still queued.
+        guard !Task.isCancelled else { return .failed }
+        switch outcome {
+        case .completed(let value): return value
+        case .timedOut, .cancelled: return .failed
+        }
     }
 }
