@@ -8,13 +8,58 @@ private typealias BigSyncSynchronizationDeadline =
     BigSyncDeadlineRace<CloudKitSynchronizer.SynchronizationResult?>
 private typealias BigSyncDeadlineOutcome = BigSyncSynchronizationDeadline.Outcome
 
+/// Immutable failure evidence only; these identifiers grant no sync authority.
+@_spi(CloudKitE2E)
+public struct BigSyncSynchronizationFailure: Sendable {
+    public enum Category: String, Sendable {
+        case failed, attemptCancellation, explicitSynchronizationCancellation, requestCancellation
+    }
+
+    public let category: Category
+    public let requestIdentifier: UUID
+    public let attemptIdentifier: UUID
+    public let runIdentifier: UUID?
+    public let lastProgressStage: String?
+    public let errorType: String
+    public let errorDomain: String
+    public let errorCode: Int
+    public let errorDescription: String
+    public let settlementTaskIsCancelled: Bool
+
+    internal init(
+        category: Category, requestIdentifier: UUID, attemptIdentifier: UUID,
+        runIdentifier: UUID?, lastProgressStage: String?, error: Error
+    ) {
+        let bridged = error as NSError
+        self.category = category
+        self.requestIdentifier = requestIdentifier
+        self.attemptIdentifier = attemptIdentifier
+        self.runIdentifier = runIdentifier
+        self.lastProgressStage = lastProgressStage
+        errorType = String(reflecting: type(of: error))
+        errorDomain = bridged.domain
+        errorCode = bridged.code
+        errorDescription = String(describing: error)
+        settlementTaskIsCancelled = Task.isCancelled
+    }
+}
+
+internal typealias BigSyncSynchronizationFailureHandler =
+    @BigSyncBackgroundActor @Sendable (BigSyncSynchronizationFailure) -> Void
+
 #if DEBUG
+@BigSyncBackgroundActor
+private final class BigSyncSynchronizationFailureCapture {
+    var failure: BigSyncSynchronizationFailure?
+}
+
 /// DEBUG qualification surface for callers that must distinguish an actual
 /// deadline from a completed request that legitimately produced no receipt.
 /// This does not expose or transfer synchronization authority.
 @_spi(CloudKitE2E)
 public enum BigSyncCloudKitE2EDeadlineOutcome: Sendable {
     case completed(CloudKitSynchronizer.SynchronizationResult?)
+    case failed(BigSyncSynchronizationFailure)
     case timedOut
     case cancelled
 }
@@ -571,6 +616,13 @@ public actor BigSyncBackgroundActor {
     @discardableResult
     public func synchronizeCloudKit()
         async -> CloudKitSynchronizer.SynchronizationResult? {
+        await synchronizeCloudKit(failureHandler: nil)
+    }
+
+    @BigSyncBackgroundActor
+    private func synchronizeCloudKit(
+        failureHandler: BigSyncSynchronizationFailureHandler?
+    ) async -> CloudKitSynchronizer.SynchronizationResult? {
         // A cancelled caller owns no admission and must not retire valid
         // startup/retry work belonging to another request.
         guard !Task.isCancelled else { return nil }
@@ -588,7 +640,10 @@ public actor BigSyncBackgroundActor {
             return nil
         }
 
-        return await synchronizeCloudKit(expectedSynchronizer: realmSynchronizer)
+        return await synchronizeCloudKit(
+            expectedSynchronizer: realmSynchronizer,
+            failureHandler: failureHandler
+        )
     }
 
     /// Bounds result acceptance from worker-actor entry even when an underlying
@@ -647,8 +702,12 @@ public actor BigSyncBackgroundActor {
     private func cloudKitE2EDeadlineOutcome(
         _ race: BigSyncSynchronizationDeadline
     ) async -> BigSyncCloudKitE2EDeadlineOutcome {
-        switch await synchronizationDeadlineOutcome(race) {
+        let capture = BigSyncSynchronizationFailureCapture()
+        switch await synchronizationDeadlineOutcome(race, failureHandler: { failure in
+            capture.failure = failure
+        }) {
         case .completed(let result):
+            if let failure = capture.failure { return .failed(failure) }
             return .completed(result)
         case .timedOut:
             return .timedOut
@@ -660,7 +719,8 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     private func synchronizationDeadlineOutcome(
-        _ race: BigSyncSynchronizationDeadline
+        _ race: BigSyncSynchronizationDeadline,
+        failureHandler: BigSyncSynchronizationFailureHandler? = nil
     ) async -> BigSyncDeadlineOutcome {
         // Constructing the immutable clock owner grants no admission. Do not
         // schedule any request for an already-cancelled lifecycle caller.
@@ -678,7 +738,7 @@ public actor BigSyncBackgroundActor {
                 await race.resolve(.timedOut)
                 return
             }
-            let result = await self?.synchronizeCloudKit()
+            let result = await self?.synchronizeCloudKit(failureHandler: failureHandler)
             await race.resolve(.completed(result))
         }
         let deadlineTask = Task.detached { [race] in
@@ -705,7 +765,8 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     private func synchronizeCloudKit(
-        expectedSynchronizer: CloudKitSynchronizer
+        expectedSynchronizer: CloudKitSynchronizer,
+        failureHandler: BigSyncSynchronizationFailureHandler? = nil
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
         guard !Task.isCancelled,
               realmSynchronizer === expectedSynchronizer else {
@@ -777,7 +838,7 @@ public actor BigSyncBackgroundActor {
         guard !Task.isCancelled,
               realmSynchronizer === expectedSynchronizer else { return nil }
         do {
-            let result = try await expectedSynchronizer.synchronize()
+            let result = try await expectedSynchronizer.synchronize(failureHandler: failureHandler)
             guard !Task.isCancelled,
                   realmSynchronizer === expectedSynchronizer else {
                 return nil
