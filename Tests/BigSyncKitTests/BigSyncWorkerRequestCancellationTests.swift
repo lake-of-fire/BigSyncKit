@@ -359,6 +359,219 @@ final class BigSyncWorkerRequestCancellationTests: XCTestCase {
     }
 }
 
+/// Exercises the production retry closure through a controlled sleep. The
+/// sleeper may finish after cancellation, as a real timer already queued for
+/// actor resumption can. No CloudKit requests are permitted by the fixture.
+final class BigSyncScheduledRetryTests: XCTestCase, @unchecked Sendable {
+    @BigSyncBackgroundActor
+    func testCancelledRetryCannotRetireReplacementRetry() async throws {
+        try await assertOldRetryPreservesReplacement(replaceSynchronizer: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testOldRetryCannotRetireReplacementSynchronizerRetry() async throws {
+        try await assertOldRetryPreservesReplacement(replaceSynchronizer: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testPendingRetryDoesNotRetainWorkerWhileSleeping() async throws {
+        let release = WorkerRetryRelease()
+        let sleeping = expectation(description: "retry sleep entered")
+        var fixture: WorkerPreflightFixture? = WorkerPreflightFixture()
+        weak var worker = fixture?.worker
+        let retry = try XCTUnwrap(fixture?.worker._test_scheduleAccountAvailabilityRetry { delay in
+            XCTAssertEqual(delay, 30_000_000_000)
+            sleeping.fulfill()
+            await release.wait()
+        })
+        addTeardownBlock {
+            retry.cancel()
+            await release.open()
+            await retry.value
+        }
+        await fulfillment(of: [sleeping], timeout: 2)
+        fixture = nil
+        XCTAssertNil(worker, "A dormant retry must not promote its weak worker before sleeping")
+        await release.open()
+        await retry.value
+        // Also release any retry scheduled by the failing pre-fix path.
+        if let worker { await worker.cancelSynchronization() }
+    }
+
+    @BigSyncBackgroundActor
+    func testLiveRetryPreservesDelayAndNextRetryAfterPreflightFailure() async throws {
+        let fixture = makeFixture()
+        let retry = try XCTUnwrap(fixture.worker._test_scheduleAccountAvailabilityRetry { delay in
+            XCTAssertEqual(delay, 30_000_000_000)
+        })
+        await retry.value
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 1)
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+        await fixture.worker.cancelSynchronization()
+        XCTAssertFalse(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+    }
+
+    @BigSyncBackgroundActor
+    func testFailedRetrySleepDoesNotEnterPreflight() async throws {
+        let fixture = makeFixture()
+        let retry = try XCTUnwrap(fixture.worker._test_scheduleAccountAvailabilityRetry { _ in
+            throw CancellationError()
+        })
+        await retry.value
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledSchedulerDoesNotReplaceLiveRetry() async throws {
+        let fixture = makeFixture()
+        let sleeping = expectation(description: "live retry sleep entered")
+        let release = WorkerRetryRelease()
+        let live = try XCTUnwrap(fixture.worker._test_scheduleAccountAvailabilityRetry { _ in
+            sleeping.fulfill()
+            await release.wait()
+        })
+        addTeardownBlock {
+            live.cancel()
+            await release.open()
+            await live.value
+        }
+        await fulfillment(of: [sleeping], timeout: 2)
+        let cancelled = Task { @BigSyncBackgroundActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = fixture.worker._test_scheduleAccountAvailabilityRetry { _ in
+                XCTFail("A cancelled caller installed a new retry")
+            }
+        }
+        await cancelled.value
+        XCTAssertFalse(live.isCancelled)
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        await fixture.worker.cancelSynchronization()
+        XCTAssertTrue(live.isCancelled)
+        await release.open()
+        await live.value
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testRepeatedReplacementKeepsOnlyNewestRetryOwned() async throws {
+        let fixture = makeFixture()
+        let releases = [WorkerRetryRelease(), WorkerRetryRelease(), WorkerRetryRelease()]
+        var tasks: [Task<Void, Never>] = []
+        for index in releases.indices {
+            let sleeping = expectation(description: "retry \(index) sleeping")
+            let release = releases[index]
+            let task = try XCTUnwrap(fixture.worker._test_scheduleAccountAvailabilityRetry { delay in
+                XCTAssertEqual(delay, 30_000_000_000)
+                sleeping.fulfill()
+                await release.wait()
+            })
+            tasks.append(task)
+            addTeardownBlock {
+                task.cancel()
+                await release.open()
+                await task.value
+            }
+            await fulfillment(of: [sleeping], timeout: 2)
+        }
+        for index in [1, 0] {
+            XCTAssertTrue(tasks[index].isCancelled)
+            await releases[index].open()
+            await tasks[index].value
+            XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+            XCTAssertFalse(tasks[2].isCancelled)
+        }
+        await fixture.worker.cancelSynchronization()
+        XCTAssertTrue(tasks[2].isCancelled)
+        await releases[2].open()
+        await tasks[2].value
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+        XCTAssertFalse(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+    }
+
+    @BigSyncBackgroundActor
+    private func assertOldRetryPreservesReplacement(replaceSynchronizer: Bool) async throws {
+        let fixture = makeFixture()
+        let originalSleeping = expectation(description: "original retry sleeping")
+        let replacementSleeping = expectation(description: "replacement retry sleeping")
+        let oldRelease = WorkerRetryRelease()
+        let newRelease = WorkerRetryRelease()
+        let old = try XCTUnwrap(fixture.worker._test_scheduleAccountAvailabilityRetry { delay in
+            XCTAssertEqual(delay, 30_000_000_000)
+            originalSleeping.fulfill()
+            await oldRelease.wait()
+        })
+        addTeardownBlock {
+            old.cancel()
+            await oldRelease.open()
+            await old.value
+        }
+        await fulfillment(of: [originalSleeping], timeout: 2)
+        if replaceSynchronizer {
+            let replacement = makeFixture()
+            fixture.worker._test_installSynchronizer(replacement.synchronizer)
+        }
+        let successor = try XCTUnwrap(fixture.worker._test_scheduleAccountAvailabilityRetry { delay in
+            XCTAssertEqual(delay, 30_000_000_000)
+            replacementSleeping.fulfill()
+            await newRelease.wait()
+        })
+        addTeardownBlock {
+            successor.cancel()
+            await newRelease.open()
+            await successor.value
+        }
+        await fulfillment(of: [replacementSleeping], timeout: 2)
+        XCTAssertTrue(old.isCancelled)
+        await oldRelease.open() // Delivers a normal sleep return despite cancellation.
+        await old.value
+        XCTAssertTrue(fixture.worker._test_hasScheduledAccountAvailabilityRetry,
+                      "An obsolete retry cleared the replacement's handle")
+        XCTAssertFalse(successor.isCancelled)
+        await fixture.worker.cancelSynchronization()
+        XCTAssertTrue(successor.isCancelled,
+                      "Worker cancellation lost ownership of the replacement retry")
+        await newRelease.open()
+        await successor.value
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+        XCTAssertFalse(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+    }
+
+    @BigSyncBackgroundActor
+    private func makeFixture() -> WorkerPreflightFixture {
+        let fixture = WorkerPreflightFixture()
+        addTeardownBlock { @BigSyncBackgroundActor in
+            await fixture.worker.cancelSynchronization()
+            await fixture.synchronizer.cancelSynchronizationAndWait()
+        }
+        return fixture
+    }
+}
+
+private actor WorkerRetryRelease {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+}
+
 private actor WorkerAvailabilityCalls {
     private(set) var count = 0
     func record() { count += 1 }
