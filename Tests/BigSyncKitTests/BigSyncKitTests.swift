@@ -6551,6 +6551,70 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    func testRetrySleepChunksHugeFiniteServerDelayWithoutOverflow() {
+        let directConversionLimit = Double(UInt64.max) / 1_000_000_000
+        let hugeDelay = max(
+            directConversionLimit * 2,
+            Double.greatestFiniteMagnitude
+        )
+
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: hugeDelay
+            ),
+            3_600_000_000_000
+        )
+    }
+
+    func testRetrySleepChunksInfiniteDelayConservatively() {
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: .infinity
+            ),
+            3_600_000_000_000
+        )
+    }
+
+    func testRetrySleepPreservesOrdinaryAndFractionalMinimums() {
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: 1
+            ),
+            1_000_000_000
+        )
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: 0.000_000_000_1
+            ),
+            1,
+            "Fractional nanoseconds must round upward, never shorten the retry minimum"
+        )
+        XCTAssertEqual(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: BigSyncRetrySleep.maximumChunkSeconds
+            ),
+            3_600_000_000_000
+        )
+    }
+
+    func testRetrySleepRejectsNonpositiveOrNaNChunks() {
+        XCTAssertNil(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: 0
+            )
+        )
+        XCTAssertNil(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: -1
+            )
+        )
+        XCTAssertNil(
+            BigSyncRetrySleep.nextChunkNanoseconds(
+                remainingSeconds: .nan
+            )
+        )
+    }
+
     func testCloudKitRetryBackoffGrowsAndCapsWithoutServerDirection() {
         XCTAssertEqual(
             CloudKitRetryBackoff.delay(
