@@ -16057,7 +16057,7 @@ final class BigSyncKitTests: XCTestCase {
             }.value
             XCTAssertTrue(writerIsCached)
             await cleanup.dispose()
-            await assertFixtureWriterReleased(cleanup.configuration, preserving: sentinel)
+            try await assertFixtureWriterReleased(cleanup.configuration, preserving: sentinel)
         }
     }
 
