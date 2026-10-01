@@ -498,6 +498,48 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testFailureObserverSuccessorRetainsAttemptAndTask() async throws {
+        let entered = expectation(description: "original account read held")
+        let release = ClosureRestorationGate()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: {
+                entered.fulfill()
+                await release.wait()
+                return "account-a"
+            }
+        )
+        synchronizer.addModelAdapter(AccountFencingModelAdapter(zoneID: synchronizer.recordZoneID))
+        let request = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize(failureHandler: { _ in
+                synchronizer.beginSynchronization()
+                synchronizer.reportProgress("successor-admitted")
+            })
+        }
+        addTeardownBlock { @BigSyncBackgroundActor in
+            request.cancel()
+            await synchronizer.cancelSynchronizationAndWait()
+            await release.open()
+            _ = await request.result
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        let originalAttempt = synchronizer.synchronizationAttemptID
+        await synchronizer.failSynchronization(
+            error: CloudKitSynchronizer.SyncError.higherModelVersionFound,
+            for: originalAttempt
+        )
+        XCTAssertNotEqual(synchronizer.synchronizationAttemptID, originalAttempt)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertNotNil(synchronizer.synchronizationTask)
+        switch await request.result {
+        case .success:
+            XCTFail("The original failed request must not inherit successor success")
+        case .failure(let error):
+            XCTAssertEqual(error as? CloudKitSynchronizer.SyncError, .higherModelVersionFound)
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testE2EWorkerPreservesOriginatingTransportFailure() async throws {
         let transport = AccountFencingTransport()
         transport.nextDatabaseChangesError = NSError(
