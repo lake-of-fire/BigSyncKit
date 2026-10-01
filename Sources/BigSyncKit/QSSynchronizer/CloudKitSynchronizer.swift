@@ -1,6 +1,6 @@
-/// Bridges callback-only CloudKit APIs with request-local cancellation and an
-/// optional budget captured before synchronous registration. Registration itself
-/// cannot be interrupted; late callbacks cannot renew the captured deadline.
+/// Bridges callback-only CloudKit APIs without pinning the caller to a checked
+/// continuation after its task is cancelled. The callback may still arrive,
+/// but `AsyncThrowingStream` safely discards it after termination.
 internal func awaitCancellableCloudKitCallback<Value: Sendable>(
     timeoutNanoseconds: UInt64? = nil,
     now: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
