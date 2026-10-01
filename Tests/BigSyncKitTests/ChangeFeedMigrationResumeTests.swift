@@ -368,7 +368,7 @@ final class ChangeFeedMigrationResumeTests: XCTestCase {
                 adapter.realmProvider = nil
             }.value
             await Task { @RealmBackgroundActor in
-                _ = RealmBackgroundActor.shared.removeCachedRealm(for: fixtureTargetConfiguration)
+                _ = await RealmBackgroundActor.shared.removeCachedRealm(for: fixtureTargetConfiguration)
             }.value
         }
         return adapter

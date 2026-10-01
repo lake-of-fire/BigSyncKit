@@ -16040,7 +16040,7 @@ final class BigSyncKitTests: XCTestCase {
         let sentinel = sentinelConfiguration
         addTeardownBlock {
             await Task { @RealmBackgroundActor in
-                _ = RealmBackgroundActor.shared.removeCachedRealm(for: sentinel)
+                _ = await RealmBackgroundActor.shared.removeCachedRealm(for: sentinel)
             }.value
         }
         try await Task { @RealmBackgroundActor in
@@ -16191,20 +16191,7 @@ final class BigSyncKitTests: XCTestCase {
                 adapter.realmProvider = nil
             }.value
             await Task { @RealmBackgroundActor in
-                let actor = RealmBackgroundActor.shared
-                // The fixture may already have moved its file. Match its unique
-                // configuration rather than recomputing the file-resource key.
-                let keys = actor.cachedRealms.compactMap { key, realm -> String? in
-                    let current = realm.configuration
-                    let matches = fixtureTargetConfiguration.inMemoryIdentifier.map {
-                        current.inMemoryIdentifier == $0
-                    } ?? (current.inMemoryIdentifier == nil
-                        && current.fileURL?.standardizedFileURL == fixtureTargetConfiguration.fileURL?.standardizedFileURL)
-                    guard matches else { return nil }
-                    XCTAssertFalse(realm.isInWriteTransaction, "Fixture teardown must join its writer first")
-                    return realm.isInWriteTransaction ? nil : key
-                }
-                for key in keys { actor.cachedRealms.removeValue(forKey: key) }
+                await RealmBackgroundActor.shared.releaseOwnedBigSyncFixture(fixtureTargetConfiguration)
             }.value
         })
         addTeardownBlock { await cleanup.dispose() }
@@ -17254,5 +17241,23 @@ extension BigSyncKitTests {
     @BigSyncBackgroundActor
     func testSemanticQuarantineAloneStopsAfterAcknowledgingSuccessfulSibling() async throws {
         try await assertSemanticQuarantinePreservesSiblingFailure(nil)
+    }
+}
+
+private extension RealmBackgroundActor {
+    func releaseOwnedBigSyncFixture(_ configuration: Realm.Configuration) {
+        // The fixture may already have moved its file. Match its unique
+        // configuration rather than recomputing the file-resource key.
+        let keys = cachedRealms.compactMap { key, realm -> String? in
+            let current = realm.configuration
+            let matches = configuration.inMemoryIdentifier.map {
+                current.inMemoryIdentifier == $0
+            } ?? (current.inMemoryIdentifier == nil
+                && current.fileURL?.standardizedFileURL == configuration.fileURL?.standardizedFileURL)
+            guard matches else { return nil }
+            XCTAssertFalse(realm.isInWriteTransaction, "Fixture teardown must join its writer first")
+            return realm.isInWriteTransaction ? nil : key
+        }
+        for key in keys { cachedRealms.removeValue(forKey: key) }
     }
 }
