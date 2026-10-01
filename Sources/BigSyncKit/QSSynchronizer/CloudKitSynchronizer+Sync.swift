@@ -760,6 +760,9 @@ extension CloudKitSynchronizer {
                 terminalHealthCategory != .accountTemporarilyUnavailable &&
                 !cancelledDueToUnauthentication
             finishSynchronizationDrain(with: .failure(error))
+            // Failure observers may synchronously admit a successor. This
+            // terminal tail owns only the attempt whose waiters it settled.
+            guard synchronizationAttemptID == attemptID else { return }
             // Preserve terminal ownership until the failed drain has released
             // its waiters, for the same reason as the successful terminal
             // paths above.

@@ -411,6 +411,135 @@ private enum InitialBindingAdmissionTestError: Error, Equatable {
 final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
 #if DEBUG
     @BigSyncBackgroundActor
+    private final class FailureObserverSnapshotCapture {
+        var failures: [BigSyncSynchronizationFailure] = []
+    }
+
+    @BigSyncBackgroundActor
+    func testReentrantFailureObserversPreserveOneSettlementSnapshot() async throws {
+        for cancelsSettlementTask in [false, true] {
+            let entered = expectation(description: "first account read held")
+            let release = ClosureRestorationGate()
+            let synchronizer = makeSynchronizer(
+                transport: AccountFencingTransport(),
+                accountIdentifierProvider: {
+                    entered.fulfill()
+                    await release.wait()
+                    return "account-a"
+                }
+            )
+            synchronizer.addModelAdapter(AccountFencingModelAdapter(zoneID: synchronizer.recordZoneID))
+            let captured = FailureObserverSnapshotCapture()
+            let handler: BigSyncSynchronizationFailureHandler = { failure in
+                captured.failures.append(failure)
+                guard captured.failures.count == 1 else { return }
+                if cancelsSettlementTask {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                } else {
+                    // Legal synchronous reentry must not erase the remaining
+                    // waiter's already-originated progress evidence.
+                    synchronizer.cancelSynchronization()
+                }
+            }
+            let first = Task { @BigSyncBackgroundActor in
+                try await synchronizer.synchronize(failureHandler: handler)
+            }
+            await fulfillment(of: [entered], timeout: 2)
+            let second = Task { @BigSyncBackgroundActor in
+                try await synchronizer.synchronize(failureHandler: handler)
+            }
+            addTeardownBlock { @BigSyncBackgroundActor in
+                first.cancel()
+                second.cancel()
+                await release.open()
+                await synchronizer.cancelSynchronizationAndWait()
+                _ = await first.result
+                _ = await second.result
+            }
+            // The first request is held above; this existing actor-owned flag
+            // proves the second request reached admission. No test-only runtime
+            // mutation or new production hook is needed.
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while !synchronizer.synchronizationRequestedWhileRunning,
+                  ContinuousClock.now < deadline {
+                await Task.yield()
+            }
+            guard synchronizer.synchronizationRequestedWhileRunning else {
+                XCTFail("Second request never reached the held drain")
+                continue
+            }
+            let attempt = synchronizer.synchronizationAttemptID
+            let run = synchronizer.activeRunContext?.runID
+            synchronizer.reportProgress("failure-observer-snapshot")
+            let settlement = Task { @BigSyncBackgroundActor in
+                synchronizer.cancelSynchronization()
+            }
+            await settlement.value
+            await release.open()
+            for request in [first, second] {
+                do {
+                    _ = try await request.value
+                    XCTFail("Cancellation returned synchronization success")
+                } catch {
+                    XCTAssertTrue(error is CancellationError)
+                }
+            }
+            XCTAssertEqual(captured.failures.count, 2)
+            XCTAssertEqual(Set(captured.failures.map(\.requestIdentifier)).count, 2)
+            for failure in captured.failures {
+                XCTAssertEqual(failure.category, .explicitSynchronizationCancellation)
+                XCTAssertEqual(failure.attemptIdentifier, attempt)
+                XCTAssertEqual(failure.runIdentifier, run)
+                XCTAssertEqual(failure.lastProgressStage, "failure-observer-snapshot")
+                XCTAssertFalse(failure.settlementTaskIsCancelled)
+            }
+            XCTAssertEqual(settlement.isCancelled, cancelsSettlementTask)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testFailureObserverSuccessorRetainsAttemptAndTask() async throws {
+        let entered = expectation(description: "original account read held")
+        let release = ClosureRestorationGate()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: {
+                entered.fulfill()
+                await release.wait()
+                return "account-a"
+            }
+        )
+        synchronizer.addModelAdapter(AccountFencingModelAdapter(zoneID: synchronizer.recordZoneID))
+        let request = Task { @BigSyncBackgroundActor in
+            try await synchronizer.synchronize(failureHandler: { _ in
+                synchronizer.beginSynchronization()
+                synchronizer.reportProgress("successor-admitted")
+            })
+        }
+        addTeardownBlock { @BigSyncBackgroundActor in
+            request.cancel()
+            await synchronizer.cancelSynchronizationAndWait()
+            await release.open()
+            _ = await request.result
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        let originalAttempt = synchronizer.synchronizationAttemptID
+        await synchronizer.failSynchronization(
+            error: CloudKitSynchronizer.SyncError.higherModelVersionFound,
+            for: originalAttempt
+        )
+        XCTAssertNotEqual(synchronizer.synchronizationAttemptID, originalAttempt)
+        XCTAssertTrue(synchronizer.syncing)
+        XCTAssertNotNil(synchronizer.synchronizationTask)
+        switch await request.result {
+        case .success:
+            XCTFail("The original failed request must not inherit successor success")
+        case .failure(let error):
+            XCTAssertEqual(error as? CloudKitSynchronizer.SyncError, .higherModelVersionFound)
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testE2EWorkerPreservesOriginatingTransportFailure() async throws {
         let transport = AccountFencingTransport()
         transport.nextDatabaseChangesError = NSError(
