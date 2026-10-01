@@ -115,7 +115,9 @@ jobs:
           run_logged full swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --xunit-output qualification-w1/full.xml
           python3 .github/verify_w1_execution.py full || full_status=$?
           focused_status=0
-          run_logged focused swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --filter 'SyncUndoCloseoutW1|CloudKitAccountAvailability|CloudKitSynchronizerAccountFencingTests|BigSyncWorkerRequestCancellationTests' --xunit-output qualification-w1/focused.xml
+          focused_filter="$(python3 .github/verify_w1_execution.py focused-filter)"
+          printf '%s\n' "$focused_filter" > qualification-w1/focused-filter.txt
+          run_logged focused swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --filter "$focused_filter" --xunit-output qualification-w1/focused.xml
           python3 .github/verify_w1_execution.py focused || focused_status=$?
           printf 'full=%s\nfocused=%s\n' "$full_status" "$focused_status" > qualification-w1/status.txt
           git diff --exit-code
