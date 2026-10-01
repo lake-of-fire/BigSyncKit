@@ -16033,33 +16033,6 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    func testDisposedAdapterFixtureReleasesOnlyItsCachedWriterRealm() async throws {
-        var sentinelConfiguration = Realm.Configuration(inMemoryIdentifier: "adapter-sentinel-" + UUID().uuidString)
-        sentinelConfiguration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
-        _ = try await RealmBackgroundActor.shared.cachedRealm(for: sentinelConfiguration)
-        let retainedSentinelConfiguration = sentinelConfiguration
-        addTeardownBlock {
-            _ = await RealmBackgroundActor.shared.removeCachedRealm(for: retainedSentinelConfiguration)
-        }
-        for _ in 0..<8 {
-            let fixture = try await makeRealmAdapterFixture()
-            let configuration = fixture.targetRealm.configuration
-            let cachedWriter = await RealmBackgroundActor.shared.existingCachedRealm(for: configuration)
-            XCTAssertNotNil(cachedWriter)
-            fixture.adapter.cancelSynchronization()
-            await fixture.adapter.waitForCancellation()
-            fixture.adapter.invalidateTokens()
-            fixture.adapter.realmProvider = nil
-            let removed = await RealmBackgroundActor.shared.removeCachedRealm(for: configuration)
-            XCTAssertTrue(removed)
-            let released = await RealmBackgroundActor.shared.existingCachedRealm(for: configuration)
-            let sentinel = await RealmBackgroundActor.shared.existingCachedRealm(for: sentinelConfiguration)
-            XCTAssertNil(released)
-            XCTAssertNotNil(sentinel, "Disposing one fixture cannot evict an unrelated configuration")
-        }
-    }
-
-    @BigSyncBackgroundActor
     func testRealmAdapterFixtureDisposalEvictsOnlyOwnedWriterRealms() async throws {
         var sentinelConfiguration = Realm.Configuration()
         sentinelConfiguration.inMemoryIdentifier = "fixture-disposal-sentinel-" + UUID().uuidString
