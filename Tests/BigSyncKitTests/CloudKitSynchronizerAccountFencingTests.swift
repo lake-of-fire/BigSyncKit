@@ -504,7 +504,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         let synchronizer = makeSynchronizer(
             transport: AccountFencingTransport(),
             accountIdentifierProvider: {
-                entered.fulfill()
+                await release.observeFirstEntry(entered)
                 await release.wait()
                 return "account-a"
             }
@@ -2591,7 +2591,13 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
 
 private actor ClosureRestorationGate {
     private var isOpen = false
+    private var observedFirstEntry = false
     private var waiters = [CheckedContinuation<Void, Never>]()
+    func observeFirstEntry(_ expectation: XCTestExpectation) {
+        guard !observedFirstEntry else { return }
+        observedFirstEntry = true
+        expectation.fulfill()
+    }
     func wait() async {
         if isOpen { return }
         await withCheckedContinuation { waiters.append($0) }
