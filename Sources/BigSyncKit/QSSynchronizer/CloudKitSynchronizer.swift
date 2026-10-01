@@ -15,12 +15,35 @@ import SwiftUtilities
 /// Bridges callback-only CloudKit APIs without pinning the caller to a checked
 /// continuation after its task is cancelled. The callback may still arrive,
 /// but `AsyncThrowingStream` safely discards it after termination.
-internal func awaitCancellableCloudKitCallback<Value>(
+internal func awaitCancellableCloudKitCallback<Value: Sendable>(
     timeoutNanoseconds: UInt64? = nil,
+    now: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
     _ start: (@escaping (Result<Value, Error>) -> Void) -> Void
 ) async throws -> Value {
+    try Task.checkCancellation()
+    let deadline = timeoutNanoseconds.map { duration in
+        let sum = now().addingReportingOverflow(duration)
+        return sum.overflow ? UInt64.max : sum.partialValue
+    }
+    let deadlineError: @Sendable () -> CKError = {
+        CKError(
+            .networkFailure,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "CloudKit callback exceeded its deadline"
+            ]
+        )
+    }
+    if let deadline, now() >= deadline { throw deadlineError() }
     let (stream, continuation) = AsyncThrowingStream<Value, Error>.makeStream()
+    defer { continuation.finish() }
+    try Task.checkCancellation()
     start { result in
+        // Delivery, not timer scheduling, decides whether a callback is on time.
+        if let deadline, now() >= deadline {
+            continuation.finish(throwing: deadlineError())
+            return
+        }
         switch result {
         case .success(let value):
             continuation.yield(value)
@@ -29,33 +52,34 @@ internal func awaitCancellableCloudKitCallback<Value>(
             continuation.finish(throwing: error)
         }
     }
-    let timeoutTask = timeoutNanoseconds.map { timeoutNanoseconds in
+    let timeoutTask = deadline.map { deadline in
         Task.detached {
-            do {
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-            } catch {
-                return
+            while !Task.isCancelled {
+                let instant = now()
+                guard instant < deadline else {
+                    continuation.finish(throwing: deadlineError())
+                    return
+                }
+                do { try await Task.sleep(nanoseconds: deadline - instant) }
+                catch { return } // Timer cancellation is not deadline expiry.
             }
-            continuation.finish(
-                throwing: CKError(
-                    .networkFailure,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "CloudKit callback exceeded its deadline"
-                    ]
-                )
-            )
         }
     }
-    defer {
-        timeoutTask?.cancel()
-        continuation.finish()
+    defer { timeoutTask?.cancel() }
+    do {
+        try Task.checkCancellation()
+        var iterator = stream.makeAsyncIterator()
+        guard let value = try await iterator.next() else {
+            throw CancellationError()
+        }
+        // Preserve an on-time accepted callback despite later scheduling, but
+        // never deliver its buffered result to a caller that was cancelled.
+        try Task.checkCancellation()
+        return value
+    } catch {
+        try Task.checkCancellation()
+        throw error
     }
-    var iterator = stream.makeAsyncIterator()
-    guard let value = try await iterator.next() else {
-        throw CancellationError()
-    }
-    return value
 }
 
 /// Durable, account-scoped progress for the one-time transition to the
