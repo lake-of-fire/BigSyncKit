@@ -23,6 +23,11 @@ private final class DictionaryKeyValueStore: NSObject, KeyValueStore {
     func synchronize() -> Bool { synchronizesDurably }
 }
 
+private struct RealmAdapterFixtureCleanup {
+    let configuration: Realm.Configuration
+    let dispose: @Sendable () async -> Void
+}
+
 private enum TestSynchronizationError: Error {
     case initialSetupFailed
     case backupDetectionFailed
@@ -16028,11 +16033,131 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testDisposedAdapterFixtureReleasesOnlyItsCachedWriterRealm() async throws {
+        var sentinelConfiguration = Realm.Configuration(inMemoryIdentifier: "adapter-sentinel-" + UUID().uuidString)
+        sentinelConfiguration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        _ = try await RealmBackgroundActor.shared.cachedRealm(for: sentinelConfiguration)
+        let retainedSentinelConfiguration = sentinelConfiguration
+        addTeardownBlock {
+            _ = await RealmBackgroundActor.shared.removeCachedRealm(for: retainedSentinelConfiguration)
+        }
+        for _ in 0..<8 {
+            let fixture = try await makeRealmAdapterFixture()
+            let configuration = fixture.targetRealm.configuration
+            let cachedWriter = await RealmBackgroundActor.shared.existingCachedRealm(for: configuration)
+            XCTAssertNotNil(cachedWriter)
+            fixture.adapter.cancelSynchronization()
+            await fixture.adapter.waitForCancellation()
+            fixture.adapter.invalidateTokens()
+            fixture.adapter.realmProvider = nil
+            let removed = await RealmBackgroundActor.shared.removeCachedRealm(for: configuration)
+            XCTAssertTrue(removed)
+            let released = await RealmBackgroundActor.shared.existingCachedRealm(for: configuration)
+            let sentinel = await RealmBackgroundActor.shared.existingCachedRealm(for: sentinelConfiguration)
+            XCTAssertNil(released)
+            XCTAssertNotNil(sentinel, "Disposing one fixture cannot evict an unrelated configuration")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRealmAdapterFixtureDisposalEvictsOnlyOwnedWriterRealms() async throws {
+        var sentinelConfiguration = Realm.Configuration()
+        sentinelConfiguration.inMemoryIdentifier = "fixture-disposal-sentinel-" + UUID().uuidString
+        sentinelConfiguration.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        let sentinel = sentinelConfiguration
+        addTeardownBlock {
+            await Task { @RealmBackgroundActor in
+                _ = RealmBackgroundActor.shared.removeCachedRealm(for: sentinel)
+            }.value
+        }
+        try await Task { @RealmBackgroundActor in
+            try await RealmBackgroundActor.shared.write(configuration: sentinel) { realm in
+                realm.add(BigSyncTrackedObject(id: "unrelated-sentinel", createdAt: Date(),
+                                              modifiedAt: Date(), explicitlyModifiedAt: nil))
+            }
+        }.value
+
+        for _ in 0..<24 {
+            let cleanup = try await makeSeededDisposableRealmAdapterFixture()
+            let writerIsCached = await Task { @RealmBackgroundActor in
+                await RealmBackgroundActor.shared.existingCachedRealm(for: cleanup.configuration) != nil
+            }.value
+            XCTAssertTrue(writerIsCached)
+            await cleanup.dispose()
+            await assertFixtureWriterReleased(cleanup.configuration, preserving: sentinel)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func makeSeededDisposableRealmAdapterFixture() async throws -> RealmAdapterFixtureCleanup {
+        var registeredCleanup: RealmAdapterFixtureCleanup?
+        let fixture = try await makeRealmAdapterFixture(cleanupRegistered: { registeredCleanup = $0 })
+        let configuration = try XCTUnwrap(registeredCleanup).configuration
+        try await Task { @RealmBackgroundActor in
+            try await RealmBackgroundActor.shared.write(configuration: configuration) { realm in
+                realm.add(BigSyncTrackedObject(id: "owned-fixture", createdAt: Date(),
+                                              modifiedAt: Date(), explicitlyModifiedAt: nil))
+            }
+        }.value
+        fixture.targetRealm.refresh()
+        XCTAssertNotNil(fixture.targetRealm.object(ofType: BigSyncTrackedObject.self,
+                                                  forPrimaryKey: "owned-fixture"))
+        // Return only the cleanup handle so independently held reader Realms
+        // leave scope before disposal and the in-memory release assertion.
+        return try XCTUnwrap(registeredCleanup)
+    }
+
+    @BigSyncBackgroundActor
+    func testRealmAdapterFixtureSetupFailureStillRegistersWriterCleanup() async throws {
+        let delegate = FakeModelAdapterDelegate()
+        delegate.initialSetupHandler = { throw TestSynchronizationError.initialSetupFailed }
+        var registeredCleanup: RealmAdapterFixtureCleanup?
+        do {
+            _ = try await makeRealmAdapterFixture(
+                setupDelegate: delegate, cleanupRegistered: { registeredCleanup = $0 }
+            )
+            XCTFail("Expected the initial setup delegate to fail after opening the writer")
+        } catch TestSynchronizationError.initialSetupFailed {
+            // Provider setup opened the writer before the delegate rejected readiness.
+        }
+        XCTAssertEqual(delegate.initialSetupCount, 1)
+        let cleanup = try XCTUnwrap(registeredCleanup)
+        let writerIsCached = await Task { @RealmBackgroundActor in
+            await RealmBackgroundActor.shared.existingCachedRealm(for: cleanup.configuration) != nil
+        }.value
+        XCTAssertTrue(writerIsCached)
+        await cleanup.dispose()
+        let writerWasReleased = await Task { @RealmBackgroundActor in
+            await RealmBackgroundActor.shared.existingCachedRealm(for: cleanup.configuration) == nil
+        }.value
+        XCTAssertTrue(writerWasReleased)
+    }
+
+    private func assertFixtureWriterReleased(
+        _ configuration: Realm.Configuration, preserving sentinel: Realm.Configuration
+    ) async throws {
+        try await Task { @RealmBackgroundActor in
+            let actor = RealmBackgroundActor.shared
+            let ownedWriter = await actor.existingCachedRealm(for: configuration)
+            XCTAssertNil(ownedWriter)
+            let unrelatedWriter = await actor.existingCachedRealm(for: sentinel)
+            XCTAssertNotNil(unrelatedWriter?.object(ofType: BigSyncTrackedObject.self,
+                                                    forPrimaryKey: "unrelated-sentinel"))
+            // Reopening the same in-memory identifier starts empty only after
+            // all of the fixture's reader and writer Realm owners were released.
+            let reopened = try await Realm(configuration: configuration, actor: actor)
+            XCTAssertNil(reopened.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "owned-fixture"))
+        }.value
+    }
+
+    @BigSyncBackgroundActor
     private func makeRealmAdapterFixture(
         accountScopePropertyByClassName: [String: String] = [:],
         priorityEntityTypeNames: [String] = [],
         committedInboundIdentityDeliveryEnabled: Bool = false,
-        fileBacked: Bool = false
+        fileBacked: Bool = false,
+        setupDelegate: ModelAdapterDelegate? = nil,
+        cleanupRegistered: ((RealmAdapterFixtureCleanup) -> Void)? = nil
     ) async throws -> (
         adapter: RealmSwiftAdapter,
         persistenceRealm: Realm,
@@ -16084,6 +16209,34 @@ final class BigSyncKitTests: XCTestCase {
                     isDirectory: true
                 )
         )
+        let fixtureTargetConfiguration = targetConfiguration
+        let cleanup = RealmAdapterFixtureCleanup(configuration: fixtureTargetConfiguration, dispose: {
+            await Task { @BigSyncBackgroundActor in
+                adapter.cancelSynchronization()
+                await adapter.waitForCancellation()
+                adapter.invalidateTokens()
+                adapter.realmProvider = nil
+            }.value
+            await Task { @RealmBackgroundActor in
+                let actor = RealmBackgroundActor.shared
+                // The fixture may already have moved its file. Match its unique
+                // configuration rather than recomputing the file-resource key.
+                let keys = actor.cachedRealms.compactMap { key, realm -> String? in
+                    let current = realm.configuration
+                    let matches = fixtureTargetConfiguration.inMemoryIdentifier.map {
+                        current.inMemoryIdentifier == $0
+                    } ?? (current.inMemoryIdentifier == nil
+                        && current.fileURL?.standardizedFileURL == fixtureTargetConfiguration.fileURL?.standardizedFileURL)
+                    guard matches else { return nil }
+                    XCTAssertFalse(realm.isInWriteTransaction, "Fixture teardown must join its writer first")
+                    return realm.isInWriteTransaction ? nil : key
+                }
+                for key in keys { actor.cachedRealms.removeValue(forKey: key) }
+            }.value
+        })
+        addTeardownBlock { await cleanup.dispose() }
+        cleanupRegistered?(cleanup)
+        adapter.modelAdapterDelegate = setupDelegate
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
 

@@ -2,6 +2,7 @@ import CloudKit
 import Foundation
 import Logging
 import RealmSwift
+import RealmSwiftGaps
 import XCTest
 @testable import BigSyncKit
 
@@ -350,7 +351,7 @@ final class ChangeFeedMigrationResumeTests: XCTestCase {
         var target = Realm.Configuration()
         target.inMemoryIdentifier = "change-feed-resume-\(label)-target-\(nonce)"
         target.objectTypes = [MigrationPeerObject.self, BigSyncPendingMutation.self]
-        return RealmSwiftAdapter(
+        let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistence,
             targetRealmConfigurations: [target],
             excludedClassNames: [],
@@ -358,6 +359,19 @@ final class ChangeFeedMigrationResumeTests: XCTestCase {
             logger: Logger(label: "ChangeFeedMigrationResumeTests"),
             startSetupTask: false
         )
+        let fixtureTargetConfiguration = target
+        addTeardownBlock {
+            await Task { @BigSyncBackgroundActor in
+                adapter.cancelSynchronization()
+                await adapter.waitForCancellation()
+                adapter.invalidateTokens()
+                adapter.realmProvider = nil
+            }.value
+            await Task { @RealmBackgroundActor in
+                _ = RealmBackgroundActor.shared.removeCachedRealm(for: fixtureTargetConfiguration)
+            }.value
+        }
+        return adapter
     }
 
     @BigSyncBackgroundActor
