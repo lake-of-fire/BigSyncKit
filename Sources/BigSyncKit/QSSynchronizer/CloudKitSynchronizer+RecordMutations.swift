@@ -6,6 +6,19 @@ struct PreparedMutationRetryKey: Hashable, Sendable {
     let generation: String?
 }
 
+/// Keep every returned failure for the requested identities available before
+/// any local processing or account-routed await can fail independently.
+func returnedMutationFailures<Value>(
+    in results: [CKRecord.ID: Result<Value, Error>],
+    for recordIDs: [CKRecord.ID]
+) -> [CKRecord.ID: NSError] {
+    recordIDs.reduce(into: [:]) { failures, recordID in
+        if case let .failure(error)? = results[recordID] {
+            failures[recordID] = error as NSError
+        }
+    }
+}
+
 enum BigSyncHandledMutationRetryError: Error, Equatable, Sendable {
     case generationBudgetExceeded(PreparedMutationRetryKey)
     case drainBudgetExceeded
@@ -63,7 +76,13 @@ func preservingSiblingMutationFailures(
     for recordID in failedRecordIDs where failures[recordID] == nil {
         failures[recordID] = error as NSError
     }
-    return CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: failures])
+    // An acknowledgement failure is a local durability failure, not a failed
+    // CloudKit save/delete. Such callers pass no failed record IDs: retain the
+    // local cause without relabelling successful server outcomes as failures.
+    return CKError(.partialFailure, userInfo: [
+        CKPartialErrorsByItemIDKey: failures,
+        NSUnderlyingErrorKey: error as NSError,
+    ])
 }
 
 struct HandledMutationRetryBudget {
@@ -147,6 +166,30 @@ extension CloudKitSynchronizer {
         )
     }
 
+    /// Inspect returned item failures before asking CloudKit for account identity
+    /// again. A returned account stop forbids that extra request; local receipt
+    /// commits still use the synchronous attempt/binding fence. Other validation
+    /// failures must not replace an already-known sibling retry constraint.
+    @BigSyncBackgroundActor
+    private func revalidateMutationResultContext(
+        for attemptID: UUID,
+        preserving failures: [CKRecord.ID: NSError]
+    ) async throws {
+        do {
+            try checkSynchronizationAttempt(attemptID)
+            if let context = activeRunContext { try checkRunContext(context) }
+            if !failures.isEmpty,
+               CloudKitRetryConstraints(partialMutationError(failures)).blocksAccountOperations {
+                return
+            }
+            try await revalidateActiveRunContext(for: attemptID)
+        } catch {
+            throw preservingSiblingMutationFailures(
+                error, failedRecordIDs: [], otherFailures: failures
+            )
+        }
+    }
+
     /// Every immediate retry strictly reduces the attempted multi-item size.
     /// Keep that ceiling for this drain so successful pieces do not regrow
     /// into the rejected request. No journal generation is acknowledged here.
@@ -206,7 +249,12 @@ extension CloudKitSynchronizer {
             let uncertain = prepared.filter(\.requiresAcceptanceCheck)
             if !uncertain.isEmpty, let lookup = recordStore as? any CloudKitRecordFetching {
                 let fetched = try await lookup.fetchRecords(with: uncertain.map { $0.record.recordID })
-                try await revalidateActiveRunContext(for: attemptID)
+                let returnedFailures = returnedMutationFailures(
+                    in: fetched, for: uncertain.map { $0.record.recordID }
+                )
+                try await revalidateMutationResultContext(
+                    for: attemptID, preserving: returnedFailures
+                )
                 var observations = [CKRecord]()
                 var lookupFailures = [CKRecord.ID: NSError]()
                 for candidate in uncertain {
@@ -218,7 +266,10 @@ extension CloudKitSynchronizer {
                     switch result {
                     case let .success(record):
                         guard record.recordID == id, record.recordType == candidate.record.recordType else {
-                            throw BigSyncRecordRebaseError.inconsistentReceipt(id.recordName)
+                            throw preservingSiblingMutationFailures(
+                                BigSyncRecordRebaseError.inconsistentReceipt(id.recordName),
+                                failedRecordIDs: [id], otherFailures: returnedFailures
+                            )
                         }
                         observations.append(record)
                     case let .failure(error):
@@ -231,21 +282,35 @@ extension CloudKitSynchronizer {
                     }
                 }
                 if !observations.isEmpty {
-                    for candidate in uncertain where observations.contains(where: {
-                        $0.recordID == candidate.record.recordID
-                    }) {
-                        try retryBudget.register(.init(recordID: candidate.record.recordID,
-                            generation: candidate.generation),
-                            maximumPerGeneration: Self.maximumHandledRecordRetries,
-                            maximumPerDrain: Self.maximumHandledRetriesPerDrain)
-                    }
                     let outcomes: [InboundLiveResult]
-                    do { outcomes = try await adapter.saveChanges(in: observations, forceSave: true) }
-                    catch { throw preservingSiblingMutationFailures(error,
-                        failedRecordIDs: observations.map(\.recordID), otherFailures: lookupFailures) }
-                    try await adapter.persistImportedChanges()
-                    try await adapter.didFinishImport()
-                    try await revalidateActiveRunContext(for: attemptID)
+                    do {
+                        for candidate in uncertain where observations.contains(where: {
+                            $0.recordID == candidate.record.recordID
+                        }) {
+                            try retryBudget.register(.init(recordID: candidate.record.recordID,
+                                generation: candidate.generation),
+                                maximumPerGeneration: Self.maximumHandledRecordRetries,
+                                maximumPerDrain: Self.maximumHandledRetriesPerDrain)
+                        }
+                        outcomes = try await adapter.saveChanges(in: observations, forceSave: true)
+                        try validateInboundLiveResults(outcomes, records: observations)
+                        try checkSynchronizationAttempt(attemptID)
+                        if let context = activeRunContext { try checkRunContext(context) }
+                        try await adapter.persistImportedChanges()
+                        try checkSynchronizationAttempt(attemptID)
+                        if let context = activeRunContext { try checkRunContext(context) }
+                        try await adapter.didFinishImport()
+                        try await revalidateMutationResultContext(
+                            for: attemptID, preserving: lookupFailures
+                        )
+                    } catch {
+                        try checkSynchronizationAttempt(attemptID)
+                        if let context = activeRunContext { try checkRunContext(context) }
+                        throw preservingSiblingMutationFailures(
+                            error, failedRecordIDs: observations.map(\.recordID),
+                            otherFailures: lookupFailures
+                        )
+                    }
                     try requireResolvedUploadConflictOutcomes(outcomes, preservingFailures: lookupFailures)
                     guard lookupFailures.isEmpty else { throw partialMutationError(lookupFailures) }
                     // The observed accepted base retires/supersedes the old
@@ -294,7 +359,12 @@ extension CloudKitSynchronizer {
                 continue
             }
             try Task.checkCancellation()
-            try await revalidateActiveRunContext(for: attemptID)
+            let returnedFailures = returnedMutationFailures(
+                in: mutationResults.saveResults, for: records.map(\.recordID)
+            )
+            try await revalidateMutationResultContext(
+                for: attemptID, preserving: returnedFailures
+            )
 
             var savedRecords = [CKRecord]()
             var missingRecordIDs = Set<CKRecord.ID>()
@@ -356,18 +426,39 @@ extension CloudKitSynchronizer {
             }
 
             if !savedRecords.isEmpty {
-                try await adapter.didUpload(
-                    savedRecords: savedRecords,
-                    matchingPreparedUploads: prepared
+                do {
+                    try await adapter.didUpload(
+                        savedRecords: savedRecords,
+                        matchingPreparedUploads: prepared
+                    )
+                } catch {
+                    try checkSynchronizationAttempt(attemptID)
+                    if let context = activeRunContext { try checkRunContext(context) }
+                    throw preservingSiblingMutationFailures(
+                        error, failedRecordIDs: [], otherFailures: returnedFailures
+                    )
+                }
+                try await revalidateMutationResultContext(
+                    for: attemptID, preserving: returnedFailures
                 )
-                try await revalidateActiveRunContext(for: attemptID)
             }
             if !missingRecordIDs.isEmpty {
-                try await adapter.requeueMissingServerRecords(
-                    Array(missingRecordIDs),
-                    matchingPreparedUploads: prepared
+                do {
+                    try await adapter.requeueMissingServerRecords(
+                        Array(missingRecordIDs),
+                        matchingPreparedUploads: prepared
+                    )
+                } catch {
+                    try checkSynchronizationAttempt(attemptID)
+                    if let context = activeRunContext { try checkRunContext(context) }
+                    throw preservingSiblingMutationFailures(
+                        error, failedRecordIDs: Array(missingRecordIDs),
+                        otherFailures: unresolvedFailures
+                    )
+                }
+                try await revalidateMutationResultContext(
+                    for: attemptID, preserving: returnedFailures
                 )
-                try await revalidateActiveRunContext(for: attemptID)
             }
             if !conflictedRecordsByID.isEmpty {
                 let conflictedRecords = Array(conflictedRecordsByID.values)
@@ -396,7 +487,9 @@ extension CloudKitSynchronizer {
                 try requireResolvedUploadConflictOutcomes(
                     results, preservingFailures: unresolvedFailures
                 )
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateMutationResultContext(
+                    for: attemptID, preserving: unresolvedFailures
+                )
                 do {
                     try await adapter.persistImportedChanges()
                 } catch {
@@ -408,7 +501,9 @@ extension CloudKitSynchronizer {
                         otherFailures: unresolvedFailures
                     )
                 }
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateMutationResultContext(
+                    for: attemptID, preserving: unresolvedFailures
+                )
             }
 
             guard unresolvedFailures.isEmpty else {
@@ -503,7 +598,12 @@ extension CloudKitSynchronizer {
                 continue
             }
             try Task.checkCancellation()
-            try await revalidateActiveRunContext(for: attemptID)
+            let returnedFailures = returnedMutationFailures(
+                in: mutationResults.deleteResults, for: recordIDs
+            )
+            try await revalidateMutationResultContext(
+                for: attemptID, preserving: returnedFailures
+            )
 
             var acknowledged = [CKRecord.ID]()
             var conflictedRecordsByID = [CKRecord.ID: CKRecord]()
@@ -557,22 +657,46 @@ extension CloudKitSynchronizer {
             }
 
             if !acknowledged.isEmpty {
-                try await adapter.didDelete(
-                    recordIDs: acknowledged,
-                    matchingPreparedDeletions: prepared
+                do {
+                    try await adapter.didDelete(
+                        recordIDs: acknowledged,
+                        matchingPreparedDeletions: prepared
+                    )
+                } catch {
+                    try checkSynchronizationAttempt(attemptID)
+                    if let context = activeRunContext { try checkRunContext(context) }
+                    // unknownItem is an idempotent success for deletion; do not
+                    // put those IDs back into the failed-item dictionary.
+                    let failed = returnedFailures.filter { !acknowledged.contains($0.key) }
+                    throw preservingSiblingMutationFailures(
+                        error, failedRecordIDs: [], otherFailures: failed
+                    )
+                }
+                try await revalidateMutationResultContext(
+                    for: attemptID, preserving: unresolvedFailures
                 )
-                try await revalidateActiveRunContext(for: attemptID)
             }
             if !conflictedRecordsByID.isEmpty {
                 // Rebase only server system fields before retrying the local
                 // tombstone. Applying inbound model values here would either
                 // overwrite the local delete or be (correctly) ignored by a
                 // local-wins importer, leaving stale conflict metadata.
-                try await adapter.rebasePendingDeletionMetadata(
-                    using: Array(conflictedRecordsByID.values),
-                    matchingPreparedGenerations: generations
+                do {
+                    try await adapter.rebasePendingDeletionMetadata(
+                        using: Array(conflictedRecordsByID.values),
+                        matchingPreparedGenerations: generations
+                    )
+                } catch {
+                    try checkSynchronizationAttempt(attemptID)
+                    if let context = activeRunContext { try checkRunContext(context) }
+                    throw preservingSiblingMutationFailures(
+                        error, failedRecordIDs: Array(conflictedRecordsByID.keys),
+                        otherFailures: unresolvedFailures
+                    )
+                }
+                try await revalidateMutationResultContext(
+                    for: attemptID, preserving: unresolvedFailures
                 )
-                try await revalidateActiveRunContext(for: attemptID)
             }
             guard unresolvedFailures.isEmpty else {
                 let error = partialMutationError(unresolvedFailures)
