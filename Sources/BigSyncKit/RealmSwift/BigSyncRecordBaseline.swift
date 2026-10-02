@@ -233,20 +233,21 @@ enum BigSyncRecordFingerprint {
     }
 
     private static func mapEntries(_ value: Any?, type: PropertyType) throws -> [(String, Data)] {
-        func entries<T: RealmCollectionValue>(_ map: Map<String, T>?) throws -> [(String, Data)] {
-            guard let map else { throw unsupported(type) }
-            return try map.map { ($0.key, try scalar($0.value, type: type)) }
+        // Read the same decoded Realm representation used for lists and sets.
+        // Casting Map<String, Int> cannot handle Int8/16/32/64, optional values,
+        // or PersistableEnum wrappers even though the schema advertises them as
+        // the same supported scalar type. Realm's bridge preserves stored null
+        // as NSNull, distinct from a missing key, without generic Optional boxing.
+        guard let collection = value as? RLMSwiftCollectionBase,
+              let map = collection._rlmCollection as? RLMDictionary<AnyObject, AnyObject> else {
+            throw unsupported(type)
         }
-        switch type {
-        case .int: return try entries(value as? Map<String, Int>)
-        case .bool: return try entries(value as? Map<String, Bool>)
-        case .float: return try entries(value as? Map<String, Float>)
-        case .double: return try entries(value as? Map<String, Double>)
-        case .string: return try entries(value as? Map<String, String>)
-        case .date: return try entries(value as? Map<String, Date>)
-        case .data: return try entries(value as? Map<String, Data>)
-        case .UUID: return try entries(value as? Map<String, UUID>)
-        default: throw unsupported(type)
+        return try map.allKeys.map { rawKey in
+            guard let key = rawKey as? String,
+                  let value = map.object(forKey: rawKey) else {
+                throw unsupported(type)
+            }
+            return (key, try scalar(value, type: type))
         }
     }
 }
