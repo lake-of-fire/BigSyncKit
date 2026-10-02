@@ -370,5 +370,78 @@ class W1InventoryTests(unittest.TestCase):
             self.assertFalse(report["passed"])
 
 
+class W1MergedNativeContractTests(unittest.TestCase):
+    # Independent acceptance contract, not inferred from verifier.REQUIRED.
+    # These are the runtime identities introduced by merged #83 and #84.
+    merged_cases = (
+        "CloudKitSynchronizerAccountFencingTests/testReentrantFailureObserversPreserveOneSettlementSnapshot",
+        "CloudKitSynchronizerAccountFencingTests/testFailureObserverSuccessorRetainsAttemptAndTask",
+        "SyncUndoCloseoutW1Tests/testFetchedDeletionPageReplaysAfterTargetFirstInterruptionWithoutDeletingAgain",
+    )
+
+    def inventory(self):
+        return list(dict.fromkeys((*verifier.REQUIRED, *self.merged_cases)))
+
+    def packet_strings(self, names):
+        return (W1InventoryTests.listing(names),
+                "".join(W1InventoryTests.events(name) for name in names))
+
+    def test_merged_regressions_cannot_disappear_from_both_inputs(self):
+        for omitted in self.merged_cases:
+            names = [name for name in self.inventory() if name != omitted]
+            listing, log = self.packet_strings(names)
+            for phase in ("discovery", "full", "focused"):
+                with self.subTest(omitted=omitted, phase=phase):
+                    report = verifier.validate(
+                        listing, [0, 0, 0],
+                        None if phase == "discovery" else log, phase=phase)
+                    self.assertFalse(report["passed"],
+                                     "A merged regression vanished from both inputs")
+
+    def test_complete_merged_contract_retains_real_case_accounting(self):
+        names = self.inventory()
+        listing, log = self.packet_strings(names)
+        for phase in ("full", "focused"):
+            with self.subTest(phase=phase):
+                report = verifier.validate(listing, [0, 0, 0], log, phase=phase)
+                self.assertTrue(report["passed"], report["errors"])
+                self.assertEqual(set(report["passed_cases"]), set(names))
+                self.assertEqual(report["missing_cases"], [])
+                self.assertEqual(report["unexpected_cases"], [])
+                for name in self.merged_cases:
+                    self.assertIn(name, report["critical_expected"])
+                    self.assertIsNotNone(verifier.FOCUSED.match("BigSyncKitTests." + name))
+
+    def test_cli_rejects_missing_merged_regression_with_zero_pipeline_exits(self):
+        helper = W1ExecutionTests()
+        for omitted in self.merged_cases:
+            names = [name for name in self.inventory() if name != omitted]
+            listing, log = self.packet_strings(names)
+            with self.subTest(omitted=omitted), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                helper.packet(directory)
+                (directory / "discovery.log").write_text(listing, encoding="utf-8")
+                (directory / "full.log").write_text(log, encoding="utf-8")
+                result = helper.run_cli(directory)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                report = json.loads((directory / "full-identity.json").read_text())
+                self.assertFalse(report["passed"])
+                self.assertFalse(report["assembled_application_qualified"])
+                self.assertFalse(report["signed_cloudkit_qualified"])
+                self.assertTrue(any(omitted in error for error in report["errors"]))
+
+    def test_merged_regressions_cannot_pass_as_skips_or_duplicate_execution(self):
+        names = self.inventory()
+        listing, log = self.packet_strings(names)
+        for name in self.merged_cases:
+            for replacement in (W1InventoryTests.events(name, "skipped"),
+                                W1InventoryTests.events(name) * 2):
+                changed = log.replace(W1InventoryTests.events(name), replacement)
+                for phase in ("full", "focused"):
+                    with self.subTest(name=name, phase=phase, replacement=replacement):
+                        report = verifier.validate(listing, [0, 0, 0], changed, phase=phase)
+                        self.assertFalse(report["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()
