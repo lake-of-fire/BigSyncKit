@@ -688,6 +688,20 @@ final class AccountScopeAuthorityFence: @unchecked Sendable {
         return try body()
     }
 
+    /// Commits only an explicitly requested port whose destination account was
+    /// freshly validated in this generation. Ordinary run/writer authority may
+    /// remain poisoned throughout: this does not reopen it. Any notification
+    /// delivered after that validation began rejects the port commit.
+    func withRevalidatedPortGeneration<T>(
+        _ expected: UInt64,
+        _ body: () throws -> T
+    ) rethrows -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard invalidationGeneration == expected else { return nil }
+        return try body()
+    }
+
     func poison(requiresGenerationRotation: Bool = true) {
         lock.lock()
         invalidationGeneration += 1
@@ -2842,9 +2856,43 @@ public class CloudKitSynchronizer: NSObject {
             throw BigSyncCloudAccountPortError.corruptRequirement
         }
         let attemptID = synchronizationAttemptID
-        guard let fenceGeneration = accountScopeAuthorityFence
-            .authorizedInvalidationGenerationSnapshot else {
-            throw CancellationError()
+        // A pending port deliberately prevents ordinary account validation
+        // from reopening the fence. Establish authority for this explicit
+        // operation independently, including after a process restart, without
+        // granting any run or journal writer authority.
+        let fenceGeneration = accountScopeAuthorityFence
+            .invalidationGenerationSnapshot
+        let statusProvider = accountStatusProvider
+        let availability = await CloudKitAccountAvailabilityGate(
+            statusProvider: { _ in
+                do {
+                    let status = try await statusProvider()
+                    return status == .available ? .available : .unavailable(status)
+                } catch {
+                    return .failed
+                }
+            }
+        ).availability(for: containerIdentifier)
+        try checkAccountValidationAttempt(
+            attemptID,
+            fenceGeneration: fenceGeneration
+        )
+        guard !syncing, !synchronizationDrainIsActive,
+              try pendingCloudAccountPortRequirement() == expected else {
+            throw BigSyncCloudAccountPortError.corruptRequirement
+        }
+        switch availability {
+        case .available:
+            break
+        case .unavailable(let status):
+            switch status {
+            case .noAccount, .restricted:
+                throw CKError(.notAuthenticated)
+            default:
+                throw CKError(.accountTemporarilyUnavailable)
+            }
+        case .failed:
+            throw CKError(.accountTemporarilyUnavailable)
         }
         let accountIdentifier = try await accountIdentifierProvider()
         try checkAccountValidationAttempt(
@@ -2871,7 +2919,7 @@ public class CloudKitSynchronizer: NSObject {
         )
 
         guard try accountScopeAuthorityFence
-            .withAuthorizedInvalidationGeneration(fenceGeneration, {
+            .withRevalidatedPortGeneration(fenceGeneration, {
                 _ = try BigSyncReplicaBindingStateStore.activatePort(
                     expected,
                     store: keyValueStore,
