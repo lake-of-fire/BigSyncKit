@@ -20,9 +20,12 @@ EXPECTED = {
     "SyncUndoCloseoutW1Tests": (
         "testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline",
         "testTerminalLocalDeleteRetiresItsSupersededStagedSave",
+        "testFetchedDeletionPageReplaysAfterTargetFirstInterruptionWithoutDeletingAgain",
     ),
     "CloudKitSynchronizerAccountFencingTests": (
         "testCancelledWorkerPreflightDoesNotScheduleRetry",
+        "testReentrantFailureObserversPreserveOneSettlementSnapshot",
+        "testFailureObserverSuccessorRetainsAttemptAndTask",
     ),
     "CloudKitAccountAvailabilityCancellationTests": (
         "testAlreadyCancelledRequestDoesNotInvokeStatusProvider",
