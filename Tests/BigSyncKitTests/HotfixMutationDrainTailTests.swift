@@ -31,6 +31,9 @@ final class HotfixMutationDrainTailTests: XCTestCase {
             HotfixMutationDrainTailObject.self,
             BigSyncPendingMutation.self,
         ]
+        let assetDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mutation-tail-assets-" + nonce)
+        realmFixtureOwner.ownDirectory(assetDirectory)
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistence,
             targetRealmConfigurations: [target],
@@ -41,8 +44,7 @@ final class HotfixMutationDrainTailTests: XCTestCase {
             ),
             logger: Logger(label: "HotfixMutationDrainTailTests"),
             startSetupTask: false,
-            assetDirectoryURL: FileManager.default.temporaryDirectory
-                .appendingPathComponent("mutation-tail-assets-" + nonce)
+            assetDirectoryURL: assetDirectory
         )
         realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()

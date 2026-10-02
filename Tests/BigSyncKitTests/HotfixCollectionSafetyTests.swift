@@ -99,6 +99,9 @@ final class HotfixCollectionSafetyTests: XCTestCase {
             HotfixCollectionReviewUnkeyed.self,
             BigSyncPendingMutation.self,
         ]
+        let assetDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hotfix-collection-assets-" + nonce)
+        realmFixtureOwner.ownDirectory(assetDirectory)
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistence,
             targetRealmConfigurations: [target],
@@ -109,8 +112,7 @@ final class HotfixCollectionSafetyTests: XCTestCase {
             ),
             logger: Logger(label: "HotfixCollectionSafetyTests"),
             startSetupTask: false,
-            assetDirectoryURL: FileManager.default.temporaryDirectory
-                .appendingPathComponent("hotfix-collection-assets-" + nonce)
+            assetDirectoryURL: assetDirectory
         )
         realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()

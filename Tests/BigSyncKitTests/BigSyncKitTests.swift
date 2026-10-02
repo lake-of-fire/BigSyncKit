@@ -1142,6 +1142,8 @@ private actor ReevaluationHeldCompletion {
 }
 
 final class BigSyncKitTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 
     @BigSyncBackgroundActor
     func testClosureMigrationFailureCannotForwardJournalBeforePreparation() async throws {
@@ -5441,6 +5443,7 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertTrue(adapter.hasChanges(record: record, object: parent))
     }
 
+    @BigSyncBackgroundActor
     func testAdapterProviderUsesExplicitTrackingDirectory() {
         let identifier = UUID().uuidString
         let directory = FileManager.default.temporaryDirectory
@@ -5460,6 +5463,9 @@ final class BigSyncKitTests: XCTestCase {
             assetDirectoryURL: directory.appendingPathComponent("assets"),
             logger: Logger(label: "BigSyncKitTests")
         )
+
+        realmFixtureOwner.ownDirectory(directory)
+        realmFixtureOwner.own(provider.adapter)
 
         XCTAssertEqual(
             provider.persistenceConfiguration.fileURL?
@@ -5791,6 +5797,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         let record = makeRecord(
             type: BigSyncTrackedObject.className(),
@@ -5891,6 +5898,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.unsetCancellation()
         persistenceRealm.refresh()
         targetRealm.refresh()
@@ -6003,6 +6011,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         let delegate = FakeModelAdapterDelegate()
         adapter.modelAdapterDelegate = delegate
         try await adapter.unsetCancellation()
@@ -8106,6 +8115,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(replacement)
         try await replacement._test_setup()
         let reopenedPersistenceRealm = try XCTUnwrap(
             replacement.realmProvider?.persistenceRealm
@@ -12558,6 +12568,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         let delegate = FakeModelAdapterDelegate()
         delegate.initialSetupHandler = {
             throw TestSynchronizationError.initialSetupFailed
@@ -12661,6 +12672,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
 
         try await adapter.unsetCancellation()
         persistenceRealm.refresh()
@@ -12697,6 +12709,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         let delegate = FakeModelAdapterDelegate()
         delegate.initialSetupHandler = {
             throw TestSynchronizationError.initialSetupFailed
@@ -12848,6 +12861,7 @@ final class BigSyncKitTests: XCTestCase {
             ),
             logger: Logger(label: "BigSyncKitTests")
         )
+        realmFixtureOwner.own(adapter)
 
         // The actor cannot start the queued bootstrap task until this test
         // suspends, so cancellation deterministically precedes setup entry.
@@ -12889,6 +12903,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
 
         let persistenceRealm = try await Realm(
             configuration: persistenceConfiguration,
@@ -13004,6 +13019,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         let targetRealm = try await Realm(
             configuration: targetConfiguration,
             actor: BigSyncBackgroundActor.shared
@@ -13523,6 +13539,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         let persistenceRealm = try await Realm(
             configuration: persistenceConfiguration,
             actor: BigSyncBackgroundActor.shared
@@ -14418,6 +14435,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         synchronizer.addModelAdapter(adapter)
 
         try await synchronizer._test_validateSynchronizationAccount()
@@ -14698,6 +14716,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
 
         try await activateChangeFeedNamespace(
             adapter,
@@ -14799,6 +14818,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(replacement)
         try await replacement._test_setup()
         let reopenedPersistenceRealm = try XCTUnwrap(
             replacement.realmProvider?.persistenceRealm
@@ -14870,6 +14890,7 @@ final class BigSyncKitTests: XCTestCase {
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
 
         let database = FakeCloudKitDatabase()
         database.completesEmptyZoneChangeOperation = true
@@ -16033,6 +16054,168 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testFixtureOwnerReleasesEveryAdapterIncarnationAndPreservesUnrelatedWriter() async throws {
+        let owner = RealmAdapterFixtureOwner(testCase: self)
+        let identifier = UUID().uuidString
+        var target = Realm.Configuration()
+        target.inMemoryIdentifier = "fixture-owner-target-" + identifier
+        target.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        tracking.inMemoryIdentifier = "fixture-owner-tracking-" + identifier
+        let configuration = target
+        var sentinel = target
+        sentinel.inMemoryIdentifier = "fixture-owner-sentinel-" + identifier
+        let sentinelConfiguration = sentinel
+        addTeardownBlock {
+            await Task { @RealmBackgroundActor in
+                _ = await RealmBackgroundActor.shared.removeCachedRealm(for: sentinelConfiguration)
+            }.value
+        }
+        try await Task { @RealmBackgroundActor in
+            try await RealmBackgroundActor.shared.write(configuration: sentinelConfiguration) { realm in
+                realm.add(BigSyncTrackedObject(id: "unrelated-sentinel", createdAt: Date(),
+                                              modifiedAt: Date(), explicitlyModifiedAt: nil))
+            }
+        }.value
+
+        let first = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
+            targetRealmConfigurations: [configuration], excludedClassNames: [],
+            recordZoneID: .init(zoneName: "fixture-owner"),
+            logger: Logger(label: "FixtureOwnerTests"), startSetupTask: false)
+        owner.own(first)
+        try await first.ensureSetup()
+        let reopened = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
+            targetRealmConfigurations: [configuration], excludedClassNames: [],
+            recordZoneID: first.recordZoneID,
+            logger: Logger(label: "FixtureOwnerReopenTests"), startSetupTask: false)
+        owner.own(reopened)
+        try await reopened.ensureSetup()
+        try await Task { @RealmBackgroundActor in
+            try await RealmBackgroundActor.shared.write(configuration: configuration) { realm in
+                realm.add(BigSyncTrackedObject(id: "owned-fixture", createdAt: Date(),
+                                              modifiedAt: Date(), explicitlyModifiedAt: nil))
+            }
+        }.value
+
+        await owner.dispose()
+        XCTAssertNil(first.realmProvider)
+        XCTAssertNil(reopened.realmProvider)
+        try await assertFixtureWriterReleased(configuration, preserving: sentinelConfiguration)
+        // XCTest invokes the registered owner again; disposal remains harmless.
+        await owner.dispose()
+        try await assertFixtureWriterReleased(configuration, preserving: sentinelConfiguration)
+    }
+
+    @BigSyncBackgroundActor
+    func testFixtureOwnerSetupFailureReleasesWriterBeforeRemovingOwnedDirectory() async throws {
+        let owner = RealmAdapterFixtureOwner(testCase: self)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fixture-owner-failure-" + UUID().uuidString, isDirectory: true)
+        owner.ownDirectory(directory)
+        let assetDirectory = directory.appendingPathComponent("assets", isDirectory: true)
+        try FileManager.default.createDirectory(at: assetDirectory, withIntermediateDirectories: true)
+        var target = Realm.Configuration()
+        target.fileURL = directory.appendingPathComponent("target.realm")
+        target.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        let configuration = target
+        var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        tracking.fileURL = directory.appendingPathComponent("tracking.realm")
+        let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
+            targetRealmConfigurations: [configuration], excludedClassNames: [],
+            recordZoneID: .init(zoneName: "fixture-owner-failure"),
+            logger: Logger(label: "FixtureOwnerFailureTests"), startSetupTask: false,
+            assetDirectoryURL: assetDirectory)
+        owner.own(adapter)
+        let delegate = FakeModelAdapterDelegate()
+        delegate.initialSetupHandler = { throw TestSynchronizationError.initialSetupFailed }
+        adapter.modelAdapterDelegate = delegate
+        do {
+            try await adapter.ensureSetup()
+            XCTFail("Expected setup to fail after opening the fixture writer")
+        } catch TestSynchronizationError.initialSetupFailed { }
+        XCTAssertEqual(delegate.initialSetupCount, 1)
+        let writerWasOpened = await Task { @RealmBackgroundActor in
+            await RealmBackgroundActor.shared.existingCachedRealm(for: configuration) != nil
+        }.value
+        XCTAssertTrue(writerWasOpened)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: assetDirectory.path))
+
+        await owner.dispose()
+        XCTAssertNil(adapter.realmProvider)
+        let writerWasReleased = await Task { @RealmBackgroundActor in
+            await RealmBackgroundActor.shared.existingCachedRealm(for: configuration) == nil
+        }.value
+        XCTAssertTrue(writerWasReleased)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @BigSyncBackgroundActor
+    func testFixtureOwnerWaitsForForwardingBeforeWriterReleaseAndDirectoryRemoval() async throws {
+        let owner = RealmAdapterFixtureOwner(testCase: self)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fixture-owner-await-" + UUID().uuidString, isDirectory: true)
+        owner.ownDirectory(directory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var target = Realm.Configuration()
+        target.fileURL = directory.appendingPathComponent("target.realm")
+        target.objectTypes = [BigSyncTrackedObject.self, BigSyncPendingMutation.self]
+        let configuration = target
+        var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        tracking.fileURL = directory.appendingPathComponent("tracking.realm")
+        let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
+            targetRealmConfigurations: [configuration], excludedClassNames: [],
+            recordZoneID: .init(zoneName: "fixture-owner-await"),
+            logger: Logger(label: "FixtureOwnerAwaitTests"), startSetupTask: false)
+        owner.own(adapter)
+        try await adapter.ensureSetup()
+        adapter.invalidateTokens()
+        let enteredForwarding = AsyncGate()
+        let releaseForwarding = AsyncGate()
+        let enteredDisposal = AsyncGate()
+        let finishedDisposal = AsyncGate()
+        addTeardownBlock { await releaseForwarding.open() }
+        adapter._testBeforePendingMutationTrackingWrite = {
+            await enteredForwarding.open()
+            await releaseForwarding.wait()
+        }
+        try await Task { @RealmBackgroundActor in
+            try await RealmBackgroundActor.shared.write(configuration: configuration) { realm in
+                let object = BigSyncTrackedObject(id: "owned-fixture", createdAt: Date(),
+                                                  modifiedAt: Date(), explicitlyModifiedAt: nil)
+                realm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }.value
+        adapter.realmProvider?.targetReaderRealms?.first?.refresh()
+        adapter._test_enqueueObservedJournalRecordNames([BigSyncTrackedObject.className() + ".owned-fixture"])
+        adapter._test_startObservedRealmChangesTaskIfNeeded()
+        await enteredForwarding.wait()
+        let disposal = Task { @BigSyncBackgroundActor in
+            await enteredDisposal.open()
+            await owner.dispose()
+            await finishedDisposal.open()
+        }
+        await enteredDisposal.wait()
+        for _ in 0..<20 { await Task.yield() }
+        let disposedBeforeForwardingJoined = await finishedDisposal.hasOpened()
+        XCTAssertFalse(disposedBeforeForwardingJoined)
+        let writerIsStillOwned = await Task { @RealmBackgroundActor in
+            await RealmBackgroundActor.shared.existingCachedRealm(for: configuration) != nil
+        }.value
+        XCTAssertTrue(writerIsStillOwned)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+
+        await releaseForwarding.open()
+        await disposal.value
+        XCTAssertNil(adapter.realmProvider)
+        let writerWasReleased = await Task { @RealmBackgroundActor in
+            await RealmBackgroundActor.shared.existingCachedRealm(for: configuration) == nil
+        }.value
+        XCTAssertTrue(writerWasReleased)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @BigSyncBackgroundActor
     func testRealmAdapterFixtureDisposalEvictsOnlyOwnedWriterRealms() async throws {
         var sentinelConfiguration = Realm.Configuration()
         sentinelConfiguration.inMemoryIdentifier = "fixture-disposal-sentinel-" + UUID().uuidString
@@ -16139,6 +16322,10 @@ final class BigSyncKitTests: XCTestCase {
         let identifier = UUID().uuidString
         var persistenceConfiguration = RealmSwiftAdapter.defaultPersistenceConfiguration()
         var targetConfiguration = Realm.Configuration()
+        let fixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+        let assetDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncKitTests-assets-\(identifier)", isDirectory: true)
+        fixtureOwner.ownDirectory(assetDirectory)
         if fileBacked {
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("BigSyncKitTests-file-backed-\(identifier)",
@@ -16146,6 +16333,7 @@ final class BigSyncKitTests: XCTestCase {
             try FileManager.default.createDirectory(
                 at: directory, withIntermediateDirectories: true
             )
+            fixtureOwner.ownDirectory(directory)
             persistenceConfiguration.fileURL = directory
                 .appendingPathComponent("tracking.realm")
             targetConfiguration.fileURL = directory
@@ -16176,25 +16364,15 @@ final class BigSyncKitTests: XCTestCase {
             recordZoneID: CKRecordZone.ID(zoneName: "realm-adapter-zone", ownerName: CKCurrentUserDefaultName),
             logger: Logger(label: "BigSyncKitTests"),
             startSetupTask: false,
-            assetDirectoryURL: FileManager.default.temporaryDirectory
-                .appendingPathComponent(
-                    "BigSyncKitTests-assets-\(identifier)",
-                    isDirectory: true
-                )
+            assetDirectoryURL: assetDirectory
         )
-        let fixtureTargetConfiguration = targetConfiguration
-        let cleanup = RealmAdapterFixtureCleanup(configuration: fixtureTargetConfiguration, dispose: {
-            await Task { @BigSyncBackgroundActor in
-                adapter.cancelSynchronization()
-                await adapter.waitForCancellation()
-                adapter.invalidateTokens()
-                adapter.realmProvider = nil
-            }.value
-            await Task { @RealmBackgroundActor in
-                await RealmBackgroundActor.shared.releaseOwnedBigSyncFixture(fixtureTargetConfiguration)
-            }.value
+        fixtureOwner.own(adapter)
+        let cleanup = RealmAdapterFixtureCleanup(configuration: targetConfiguration, dispose: { [adapter] in
+            // Keep this fixture alive until explicit disposal, including the
+            // seeded in-memory lifetime assertions below.
+            await fixtureOwner.dispose()
+            _ = adapter
         })
-        addTeardownBlock { await cleanup.dispose() }
         cleanupRegistered?(cleanup)
         adapter.modelAdapterDelegate = setupDelegate
         try await adapter.resetSyncCaches()
@@ -17299,11 +17477,10 @@ final class RealmAdapterFixtureOwner {
             }.value
             releasedAllWriters = releasedAllWriters && released
         }
-        targetConfigurations.removeAll()
-
-        // The eviction assertion reports an unjoined writer. Preserve its
-        // files if that assertion fails rather than deleting a live Realm.
+        // The eviction assertion reports an unjoined writer. Preserve both
+        // its files and configuration so a repeated disposal checks it again.
         guard releasedAllWriters else { return }
+        targetConfigurations.removeAll()
         // Never remove an open fixture's files ahead of its awaited cleanup.
         for directory in directories.reversed() {
             try? FileManager.default.removeItem(at: directory)

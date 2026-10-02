@@ -57,14 +57,16 @@ final class RealmGroupingRegressionTests: XCTestCase {
             return configuration
         }
         let zone = CKRecordZone.ID(zoneName: "grouping-" + nonce, ownerName: CKCurrentUserDefaultName)
+        let assetDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("grouping-assets-" + nonce)
+        realmFixtureOwner.ownDirectory(assetDirectory)
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistence,
             targetRealmConfigurations: configurations,
             excludedClassNames: [], recordZoneID: zone,
             logger: Logger(label: "RealmGroupingRegressionTests"),
             startSetupTask: false,
-            assetDirectoryURL: FileManager.default.temporaryDirectory
-                .appendingPathComponent("grouping-assets-" + nonce)
+            assetDirectoryURL: assetDirectory
         )
         realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
