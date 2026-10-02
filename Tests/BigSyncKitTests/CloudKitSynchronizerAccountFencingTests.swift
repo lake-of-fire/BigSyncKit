@@ -2838,19 +2838,26 @@ extension CloudKitSynchronizerAccountFencingTests {
 
 extension CloudKitSynchronizerAccountFencingTests {
     @BigSyncBackgroundActor
-    func testExplicitPortActivationCannotAdoptAlreadyPoisonedAuthority()
+    func testExplicitPortActivationRevalidatesAfterAccountNotificationWithoutOpeningWriterAuthority()
     async throws {
         let identity = AccountFencingAccountIdentity("account-a")
-        let authority = AccountAuthorityFenceReference()
+        let transport = AccountFencingTransport()
         let synchronizer = makeSynchronizer(
-            transport: AccountFencingTransport(),
+            transport: transport,
             accountIdentifierProvider: { await identity.current() },
             accountReplacementPolicy: .requireExplicitDatasetPort,
             initialReplicaBindingAdmissionHandler: { _ in }
         )
-        authority.synchronizer = synchronizer
         try await synchronizer._test_validateSynchronizationAccount()
         await identity.replace(with: "account-b")
+        let observerFinished = expectation(description: "account notification invalidated authority")
+        synchronizer._testAccountChangeObserverDidFinishHandler = {
+            observerFinished.fulfill()
+        }
+        // No adapter: the real observer invalidates authority but does not
+        // start an unrelated drain. The validation below discovers the port.
+        NotificationCenter.default.post(name: .CKAccountChanged, object: nil)
+        await fulfillment(of: [observerFinished], timeout: 2)
 
         let requirement: BigSyncCloudAccountPortRequirement
         do {
@@ -2861,17 +2868,185 @@ extension CloudKitSynchronizerAccountFencingTests {
             requirement = pending
         }
 
+        XCTAssertTrue(synchronizer.accountScopeAuthorityFence.rejectsAuthority)
+        try await synchronizer.activateCloudAccountPort(requirement)
+
+        XCTAssertNil(try synchronizer.pendingCloudAccountPortRequirement())
+        XCTAssertTrue(synchronizer.accountScopeAuthorityFence.rejectsAuthority)
+        XCTAssertTrue(synchronizer.accountValidationRequired)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+        XCTAssertEqual(transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testExplicitPortActivationRevalidatesPersistedRequirementAfterRestart()
+    async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let store = AccountFencingStore()
+        let identifier = UUID().uuidString
+        let original = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            store: store,
+            identifier: identifier,
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { _ in }
+        )
+        try await original._test_validateSynchronizationAccount()
+        await identity.replace(with: "account-b")
+        let requirement: BigSyncCloudAccountPortRequirement
+        do {
+            try await original._test_validateSynchronizationAccount()
+            XCTFail("Expected an explicit dataset port requirement")
+            return
+        } catch BigSyncCloudAccountPortError.required(let pending) {
+            requirement = pending
+        }
+        let transport = AccountFencingTransport()
+        let restarted = makeSynchronizer(
+            transport: transport,
+            store: store,
+            identifier: identifier,
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { _ in }
+        )
+        XCTAssertTrue(restarted.accountScopeAuthorityFence.rejectsAuthority)
+        try await restarted.activateCloudAccountPort(requirement)
+        XCTAssertNil(try restarted.pendingCloudAccountPortRequirement())
+        XCTAssertTrue(restarted.accountScopeAuthorityFence.rejectsAuthority)
+        XCTAssertNil(try restarted.accountScopeLease())
+        XCTAssertEqual(transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testExplicitPortActivationRejectsNotificationDuringFreshStatusValidation()
+    async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let authority = AccountAuthorityFenceReference()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { await identity.current() },
+            accountStatusProvider: {
+                await authority.poisonIfArmed()
+                return .available
+            },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { _ in }
+        )
+        authority.synchronizer = synchronizer
+        try await synchronizer._test_validateSynchronizationAccount()
+        await identity.replace(with: "account-b")
+        let requirement: BigSyncCloudAccountPortRequirement
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected an explicit dataset port requirement")
+            return
+        } catch BigSyncCloudAccountPortError.required(let pending) {
+            requirement = pending
+        }
+        // Already-poisoned admission is safe only after fresh validation;
+        // another poison while doing that validation must still win.
         await authority.poison()
+        await authority.arm()
         do {
             try await synchronizer.activateCloudAccountPort(requirement)
-            XCTFail("Expected poisoned port authority to be rejected")
+            XCTFail("Expected notification during fresh validation to reject activation")
         } catch is CancellationError {
         }
+        XCTAssertEqual(try synchronizer.pendingCloudAccountPortRequirement(), requirement)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+    }
 
-        XCTAssertEqual(
-            try synchronizer.pendingCloudAccountPortRequirement(),
-            requirement
+    @BigSyncBackgroundActor
+    func testExplicitPortActivationRejectsUnauthenticatedAndUnavailableFreshStatus()
+    async throws {
+        for status in [CKAccountStatus.noAccount, .temporarilyUnavailable] {
+            let identity = AccountFencingAccountIdentity("account-a")
+            let synchronizer = makeSynchronizer(
+                transport: AccountFencingTransport(),
+                accountIdentifierProvider: { await identity.current() },
+                accountStatusProvider: { status },
+                accountReplacementPolicy: .requireExplicitDatasetPort,
+                initialReplicaBindingAdmissionHandler: { _ in }
+            )
+            // This test hook isolates account identity/binding setup from status.
+            try await synchronizer._test_validateSynchronizationAccount()
+            await identity.replace(with: "account-b")
+            let requirement: BigSyncCloudAccountPortRequirement
+            do {
+                try await synchronizer._test_validateSynchronizationAccount()
+                XCTFail("Expected an explicit dataset port requirement")
+                return
+            } catch BigSyncCloudAccountPortError.required(let pending) {
+                requirement = pending
+            }
+            let requestsBeforeActivation = await identity.requests()
+            do {
+                try await synchronizer.activateCloudAccountPort(requirement)
+                XCTFail("Expected account unavailability to defer activation")
+            } catch let error as CKError {
+                XCTAssertEqual(error.code, status == .noAccount
+                    ? .notAuthenticated : .accountTemporarilyUnavailable)
+            }
+            let requestsAfterActivation = await identity.requests()
+            XCTAssertEqual(requestsAfterActivation, requestsBeforeActivation)
+            XCTAssertEqual(try synchronizer.pendingCloudAccountPortRequirement(), requirement)
+            XCTAssertNil(try synchronizer.accountScopeLease())
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testConcurrentExplicitPortActivationsCommitOnlyOnce() async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let entered = expectation(description: "both activations await status")
+        entered.expectedFulfillmentCount = 2
+        let release = ClosureRestorationGate()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { await identity.current() },
+            accountStatusProvider: {
+                entered.fulfill()
+                await release.wait()
+                return .available
+            },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { _ in }
         )
+        try await synchronizer._test_validateSynchronizationAccount()
+        await identity.replace(with: "account-b")
+        let requirement: BigSyncCloudAccountPortRequirement
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Expected an explicit dataset port requirement")
+            return
+        } catch BigSyncCloudAccountPortError.required(let pending) {
+            requirement = pending
+        }
+        addTeardownBlock { await release.open() }
+        let first = Task { @BigSyncBackgroundActor in
+            do {
+                try await synchronizer.activateCloudAccountPort(requirement)
+                return true
+            } catch {
+                return false
+            }
+        }
+        let second = Task { @BigSyncBackgroundActor in
+            do {
+                try await synchronizer.activateCloudAccountPort(requirement)
+                return true
+            } catch {
+                return false
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        await release.open()
+        let firstSucceeded = await first.value
+        let secondSucceeded = await second.value
+        XCTAssertNotEqual(firstSucceeded, secondSucceeded)
+        XCTAssertNil(try synchronizer.pendingCloudAccountPortRequirement())
+        XCTAssertNil(try synchronizer.accountScopeLease())
     }
 }
 
