@@ -338,7 +338,7 @@ extension BigSyncRecordBaseline {
         row.isComparisonInvalidated = false
         row.serverChangeTag = serverChangeTag
         row.acceptedSystemFields = systemFields
-        row.rowRevision = acceptedRevision ?? UUID().uuidString
+        row.revision = acceptedRevision ?? UUID().uuidString
         row.fields.removeAll()
         for (name, digest) in fields { row.fields[name] = digest }
         realm.add(row, update: .modified)
