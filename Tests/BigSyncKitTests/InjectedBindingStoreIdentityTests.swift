@@ -57,6 +57,34 @@ final class InjectedBindingStoreIdentityTests: XCTestCase {
         }
     }
 
+    func testReentrantInstallationSetupCannotReleasePublicRestoreLease() throws {
+        try withResources { identity, _, _ in
+            let previous = try identity.prepareInstallation()
+            let leaseURL = BackupDetection.defaultSentinelURL(
+                namespace: identity.durableStateNamespace,
+                sharedBaseURL: identity.sharedStateBaseURL
+            ).appendingPathExtension("lease")
+            let competitor = Darwin.open(leaseURL.path, O_RDWR)
+            guard competitor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+            defer { Darwin.close(competitor) }
+            let receipt = try identity.withManualBackupRestore(transactionIdentifier: UUID()) {
+                // A pending restore correctly rejects setup. Catching that
+                // rejection must not leave the replacement callback unfenced.
+                XCTAssertThrowsError(try identity.prepareInstallation())
+                let result = bigSyncFlock(competitor, LOCK_SH | LOCK_NB)
+                let failure = errno
+                if result == 0 { _ = bigSyncFlock(competitor, LOCK_UN) }
+                XCTAssertEqual(result, -1)
+                XCTAssertTrue(failure == EWOULDBLOCK || failure == EAGAIN)
+            }
+            XCTAssertEqual(receipt.oldInstallationIdentifier, previous)
+            XCTAssertNotEqual(receipt.newInstallationIdentifier, previous)
+            XCTAssertEqual(try identity.prepareInstallation(), receipt.newInstallationIdentifier)
+            XCTAssertEqual(bigSyncFlock(competitor, LOCK_SH | LOCK_NB), 0)
+            XCTAssertEqual(bigSyncFlock(competitor, LOCK_UN), 0)
+        }
+    }
+
     private func withResources(
         _ body: (BigSyncClientIdentity, FileKeyValueStore, URL) throws -> Void
     ) throws {
