@@ -1620,15 +1620,19 @@ extension CloudKitSynchronizer {
     func uploadChanges(
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
+        let operationError: Error?
         do {
             for adapter in modelAdapters {
                 try Task.checkCancellation()
                 try await synchronizeAdapter(adapter)
             }
-            try await completion(nil)
+            operationError = nil
         } catch {
-            try await completion(error)
+            operationError = error
         }
+        // Delivery errors belong to the caller, not to the operation just
+        // completed. Never feed a throwing callback back into itself.
+        try await completion(operationError)
     }
     
     @BigSyncBackgroundActor
@@ -1667,28 +1671,24 @@ extension CloudKitSynchronizer {
                 try await completion(error)
                 return
             }
-            do {
-                try await uploadRecordsUsingAsyncStore(
-                    adapter: adapter,
-                    restrictedToEntityType: restrictedToEntityType,
-                    attemptID: attemptID,
-                    completion: { [weak self] (error) in
-                        guard let self else {
-                            try await completion(CancellationError())
-                            return
-                        }
-                        do {
-                            try checkSynchronizationAttempt(attemptID)
-                        } catch {
-                            try await completion(error)
-                            return
-                        }
-                        try await completion(error)
+            try await uploadRecordsUsingAsyncStore(
+                adapter: adapter,
+                restrictedToEntityType: restrictedToEntityType,
+                attemptID: attemptID,
+                completion: { [weak self] (error) in
+                    guard let self else {
+                        try await completion(CancellationError())
+                        return
                     }
-                )
-            } catch {
-                try await completion(error)
-            }
+                    do {
+                        try checkSynchronizationAttempt(attemptID)
+                    } catch {
+                        try await completion(error)
+                        return
+                    }
+                    try await completion(error)
+                }
+            )
         }
     }
     
@@ -1719,6 +1719,23 @@ extension CloudKitSynchronizer {
         attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
+        let operationError: Error?
+        do {
+            try await prepareRecordZoneID(zoneID, attemptID: attemptID)
+            operationError = nil
+        } catch {
+            operationError = error
+        }
+        // A downstream failure is not evidence that fetching or creating the
+        // zone failed. Do not revalidate, recover the zone, or deliver twice.
+        try await completion(operationError)
+    }
+
+    @BigSyncBackgroundActor
+    private func prepareRecordZoneID(
+        _ zoneID: CKRecordZone.ID,
+        attemptID: UUID
+    ) async throws {
         do {
             // Validate immediately before and after each account-routed await.
             try await revalidateActiveRunContext(for: attemptID)
@@ -1730,24 +1747,17 @@ extension CloudKitSynchronizer {
                     accountScopeIdentifier: context.accountScopeIdentifier
                 )
             }
-            try await completion(nil)
         } catch {
-            do {
-                // A returned account stop forbids further CloudKit work,
-                // including an otherwise routine account revalidation.
-                try checkSynchronizationAttempt(attemptID)
-                if !CloudKitRetryConstraints(error).blocksAccountOperations {
-                    try await revalidateActiveRunContext(for: attemptID)
-                }
-            } catch {
-                try await completion(error)
-                return
+            // A returned account stop forbids further CloudKit work,
+            // including an otherwise routine account revalidation.
+            try checkSynchronizationAttempt(attemptID)
+            if !CloudKitRetryConstraints(error).blocksAccountOperations {
+                try await revalidateActiveRunContext(for: attemptID)
             }
 
             guard !CloudKitRetryConstraints(error).blocksAccountOperations,
                   let context = activeRunContext else {
-                try await completion(error)
-                return
+                throw error
             }
             let classification = CloudKitLossClassifier.classify(
                 error: error,
@@ -1755,8 +1765,7 @@ extension CloudKitSynchronizer {
             )
             guard let disposition = classification.zoneDispositions[zoneID]
             else {
-                try await completion(error)
-                return
+                throw error
             }
             if let lifecycleError = applyCloudKitLoss(
                 disposition,
@@ -1765,8 +1774,7 @@ extension CloudKitSynchronizer {
                 allowsEncryptedBootstrapAbsence:
                     isEncryptedDataResetRecoveryActive
             ) {
-                try await completion(lifecycleError)
-                return
+                throw lifecycleError
             }
 
             let newZone = CKRecordZone(zoneID: zoneID)
@@ -1784,16 +1792,10 @@ extension CloudKitSynchronizer {
                 logger.info(
                     "QSCloudKitSynchronizer >> Created custom record zone: \(newZone.description)"
                 )
-                try await completion(nil)
             } catch {
-                do {
-                    try checkSynchronizationAttempt(attemptID)
-                    if !CloudKitRetryConstraints(error).blocksAccountOperations {
-                        try await revalidateRunContext(context)
-                    }
-                } catch {
-                    try await completion(error)
-                    return
+                try checkSynchronizationAttempt(attemptID)
+                if !CloudKitRetryConstraints(error).blocksAccountOperations {
+                    try await revalidateRunContext(context)
                 }
                 if !CloudKitRetryConstraints(error).blocksAccountOperations,
                    let lifecycleError = applyCloudKitLoss(
@@ -1802,9 +1804,9 @@ extension CloudKitSynchronizer {
                     context: context,
                     allowsEncryptedBootstrapAbsence: false
                 ) {
-                    try await completion(lifecycleError)
+                    throw lifecycleError
                 } else {
-                    try await completion(error)
+                    throw error
                 }
             }
         }
