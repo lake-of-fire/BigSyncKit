@@ -1,4 +1,5 @@
 import CloudKit
+import Darwin
 import Foundation
 import XCTest
 @testable import BigSyncKit
@@ -71,5 +72,127 @@ final class InjectedBindingStoreIdentityTests: XCTestCase {
         )
         let store = FileKeyValueStore(fileURL: root.appendingPathComponent("bigsync-state.plist"), writesAtomically: true)
         try body(identity, store, root)
+    }
+}
+
+/// A second independently opened descriptor exercises the actual advisory
+/// lock, not just the registry's Mode value. All files are test-owned.
+final class BigSyncClientIdentityLeaseRegressionTests: XCTestCase {
+    private enum TestFailure: Error { case replacement }
+
+    func testSharedRetentionPreservesExclusiveOwner() throws {
+        try withLease { url, competitor in
+            try BigSyncClientIdentityLeaseRegistry.withExclusive(at: url) {
+                XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: competitor))
+                try BigSyncClientIdentityLeaseRegistry.retainShared(at: url)
+                XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: competitor))
+            }
+            XCTAssertTrue(try canAcquire(LOCK_SH, descriptor: competitor))
+            XCTAssertFalse(try canAcquire(LOCK_EX, descriptor: competitor))
+        }
+    }
+
+    func testNestedExclusiveIsRejectedBeforeCallbackWithoutDowngrade() throws {
+        try withLease { url, competitor in
+            try BigSyncClientIdentityLeaseRegistry.withExclusive(at: url) {
+                var nestedCallbackRan = false
+                XCTAssertThrowsError(try BigSyncClientIdentityLeaseRegistry.withExclusive(at: url) {
+                    nestedCallbackRan = true
+                }) { error in
+                    XCTAssertEqual(error as? BigSyncClientIdentityLeaseError, .restoreInProgress)
+                }
+                XCTAssertFalse(nestedCallbackRan)
+                XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: competitor))
+            }
+            XCTAssertTrue(try canAcquire(LOCK_SH, descriptor: competitor))
+        }
+    }
+
+    func testThrowingOuterOwnerRestoresSharedLeaseAndPermitsRetry() throws {
+        try withLease { url, competitor in
+            XCTAssertThrowsError(try BigSyncClientIdentityLeaseRegistry.withExclusive(at: url) {
+                try BigSyncClientIdentityLeaseRegistry.retainShared(at: url)
+                XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: competitor))
+                throw TestFailure.replacement
+            }) { error in
+                XCTAssertTrue(error is TestFailure)
+            }
+            XCTAssertTrue(try canAcquire(LOCK_SH, descriptor: competitor))
+            XCTAssertFalse(try canAcquire(LOCK_EX, descriptor: competitor))
+            try BigSyncClientIdentityLeaseRegistry.withExclusive(at: url) {
+                XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: competitor))
+            }
+        }
+    }
+
+    func testDifferentClientExclusiveOwnersRemainIndependent() throws {
+        try withLease { firstURL, firstCompetitor in
+            try withLease { secondURL, secondCompetitor in
+                try BigSyncClientIdentityLeaseRegistry.withExclusive(at: firstURL) {
+                    try BigSyncClientIdentityLeaseRegistry.withExclusive(at: secondURL) {
+                        XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: firstCompetitor))
+                        XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: secondCompetitor))
+                    }
+                    XCTAssertTrue(try canAcquire(LOCK_SH, descriptor: secondCompetitor))
+                    XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: firstCompetitor))
+                }
+            }
+        }
+    }
+
+    func testRejectedUpgradeRestoresProcessSharedLease() throws {
+        try withLease { url, competitor in
+            guard bigSyncFlock(competitor, LOCK_SH | LOCK_NB) == 0 else {
+                throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            }
+            defer { _ = bigSyncFlock(competitor, LOCK_UN) }
+            var callbackRan = false
+            XCTAssertThrowsError(try BigSyncClientIdentityLeaseRegistry.withExclusive(at: url) {
+                callbackRan = true
+            }) { error in
+                XCTAssertEqual(error as? BigSyncClientIdentityLeaseError, .restoreInProgress)
+            }
+            XCTAssertFalse(callbackRan)
+            XCTAssertEqual(bigSyncFlock(competitor, LOCK_UN), 0)
+            XCTAssertFalse(try canAcquire(LOCK_EX, descriptor: competitor))
+            XCTAssertTrue(try canAcquire(LOCK_SH, descriptor: competitor))
+        }
+    }
+
+    func testReadOnlyCacheProbeDoesNotChangeExclusiveOwnership() throws {
+        try withLease { url, competitor in
+            BigSyncClientIdentityLeaseRegistry.publishInstallationIdentifier("old", at: url)
+            try BigSyncClientIdentityLeaseRegistry.withExclusive(at: url) {
+                XCTAssertNil(BigSyncClientIdentityLeaseRegistry.cachedInstallationIdentifier(at: url))
+                BigSyncClientIdentityLeaseRegistry.invalidateInstallationIdentifier(at: url)
+                XCTAssertFalse(try canAcquire(LOCK_SH, descriptor: competitor))
+            }
+        }
+    }
+
+    private func withLease(_ body: (URL, Int32) throws -> Void) throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncLease-\(UUID().uuidString)", isDirectory: true)
+        let url = root.appendingPathComponent("client.lease")
+        try BigSyncClientIdentityLeaseRegistry.retainShared(at: url)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let competitor = Darwin.open(url.path, O_RDWR)
+        guard competitor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(competitor) }
+        try body(url, competitor)
+    }
+
+    private func canAcquire(_ operation: Int32, descriptor: Int32) throws -> Bool {
+        if bigSyncFlock(descriptor, operation | LOCK_NB) == 0 {
+            guard bigSyncFlock(descriptor, LOCK_UN) == 0 else {
+                throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            }
+            return true
+        }
+        let failure = errno
+        guard failure == EWOULDBLOCK || failure == EAGAIN else {
+            throw POSIXError(.init(rawValue: failure) ?? .EIO)
+        }
+        return false
     }
 }
