@@ -77,6 +77,9 @@ private final class BoundContractControl: Object, ChangeMetadataRecordable,
 }
 
 final class SyncRetainedRecordContractTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
     private let nonce = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
     @BigSyncBackgroundActor
@@ -93,6 +96,7 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
             targetRealmConfigurations: [config], excludedClassNames: [],
             recordZoneID: .init(zoneName: "retained-contract"), logger: Logger(label: "RetainedContractTests"), startSetupTask: false)
+        realmFixtureOwner.own(adapter)
         adapter.mergePolicy = .custom
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()

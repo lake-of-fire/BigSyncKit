@@ -32,6 +32,9 @@ private final class WorkerReviewObjectMap: Object, ChangeMetadataRecordable {
 /// review finding, not a passing expected-failure test or a production repair.
 final class WorkerReviewReconciliationTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString
         var persistence = RealmSwiftAdapter.defaultPersistenceConfiguration()
@@ -48,6 +51,7 @@ final class WorkerReviewReconciliationTests: XCTestCase {
             startSetupTask: false,
             assetDirectoryURL: FileManager.default.temporaryDirectory.appendingPathComponent("worker-review-assets-" + nonce)
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

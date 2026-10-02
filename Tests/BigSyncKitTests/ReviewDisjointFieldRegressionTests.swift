@@ -18,7 +18,11 @@ final class ReviewDisjointFieldRow: Object, ChangeMetadataRecordable {
 
 /// Desired behavior, not a characterization of the known stale-base defect.
 /// Keep this file byte-identical between the red and green stack tiers.
+/// Apply fixture-lifecycle changes to both tiers before comparing results.
 final class ReviewDisjointFieldRegressionTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
     @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString
@@ -42,6 +46,7 @@ final class ReviewDisjointFieldRegressionTests: XCTestCase {
             logger: Logger(label: "ReviewDisjointFieldRegressionTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

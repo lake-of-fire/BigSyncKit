@@ -69,6 +69,9 @@ private final class IncomingRepresentationSemanticRecord: Object, ChangeMetadata
 }
 
 final class IncomingRepresentationSemanticRecordTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
     private struct Fixture {
         let adapter: RealmSwiftAdapter
         let realm: Realm
@@ -113,6 +116,7 @@ final class IncomingRepresentationSemanticRecordTests: XCTestCase {
             logger: Logger(label: "IncomingRepresentationSemanticRecordTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         adapter.mergePolicy = .custom
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()

@@ -30,6 +30,9 @@ private final class GroupingSecondObject: Object, ChangeMetadataRecordable {
 /// implementation. Identical primary keys in separate schemas detect cross-
 /// Realm mixing; partial acknowledgements and newer generations detect loss.
 final class RealmGroupingRegressionTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
     private struct Table {
         let realm: Realm
         let type: Object.Type
@@ -63,6 +66,7 @@ final class RealmGroupingRegressionTests: XCTestCase {
             assetDirectoryURL: FileManager.default.temporaryDirectory
                 .appendingPathComponent("grouping-assets-" + nonce)
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

@@ -19,6 +19,9 @@ private final class ReceiptValidationRow: Object, ChangeMetadataRecordable,
 
 final class SyncRecordReceiptValidationTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm, [PreparedRecordUpload]) {
         var target = Realm.Configuration()
         target.inMemoryIdentifier = "receipt-validation-" + UUID().uuidString
@@ -36,6 +39,7 @@ final class SyncRecordReceiptValidationTests: XCTestCase {
             excludedClassNames: [], recordZoneID: .init(zoneName: "receipt-validation"),
             logger: Logger(label: "SyncRecordReceiptValidationTests"), startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom
