@@ -87,12 +87,10 @@ enum BigSyncClientIdentityLeaseRegistry {
     static func retainShared(at url: URL) throws {
         lock.lock()
         defer { lock.unlock() }
-        let lease = try lease(at: url)
-        guard lease.mode != .shared else { return }
-        guard bigSyncFlock(lease.descriptor, LOCK_SH) == 0 else {
-            throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
-        }
-        lease.mode = .shared
+        // An existing exclusive holder already satisfies this minimum lease.
+        // Identity setup can reenter from a replacement/rollback callback;
+        // only the outer restore owner may downgrade its exclusive lock.
+        _ = try lease(at: url)
     }
 
     static func cachedInstallationIdentifier(at url: URL) -> String? {
@@ -127,10 +125,14 @@ enum BigSyncClientIdentityLeaseRegistry {
         lock.lock()
         defer { lock.unlock() }
         let lease = try lease(at: url)
-        if lease.mode == .shared {
-            guard bigSyncFlock(lease.descriptor, LOCK_UN) == 0 else {
-                throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
-            }
+        // A recursive registry lock permits read-only identity probes, not
+        // another restore of this client. Its nested defer would otherwise
+        // release the outer operation's cross-process exclusion too early.
+        guard lease.mode == .shared else {
+            throw BigSyncClientIdentityLeaseError.restoreInProgress
+        }
+        guard bigSyncFlock(lease.descriptor, LOCK_UN) == 0 else {
+            throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
         }
         guard bigSyncFlock(lease.descriptor, LOCK_EX | LOCK_NB) == 0 else {
             let lockError = Int32(errno)
