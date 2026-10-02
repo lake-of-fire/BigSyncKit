@@ -5,16 +5,20 @@
         attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> Void
     ) async throws {
+        let operationError: Error?
         do {
             try await drainRecordUploadsUsingAsyncStore(
                 adapter: adapter,
                 restrictedToEntityType: restrictedToEntityType,
                 attemptID: attemptID
             )
-            try await completion(nil)
+            operationError = nil
         } catch {
-            try await completion(error)
+            operationError = error
         }
+        // Delivery errors belong to the caller, not to the operation just
+        // completed. Never feed a throwing callback back into itself.
+        try await completion(operationError)
     }
 
     @BigSyncBackgroundActor
@@ -24,14 +28,18 @@
         attemptID: UUID,
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> Void
     ) async throws {
+        let operationError: Error?
         do {
             try await drainRecordDeletionsUsingAsyncStore(
                 adapter: adapter,
                 restrictedToEntityType: restrictedToEntityType,
                 attemptID: attemptID
             )
-            try await completion(nil)
+            operationError = nil
         } catch {
-            try await completion(error)
+            operationError = error
         }
+        // Delivery errors belong to the caller, not to the operation just
+        // completed. Never feed a throwing callback back into itself.
+        try await completion(operationError)
     }
