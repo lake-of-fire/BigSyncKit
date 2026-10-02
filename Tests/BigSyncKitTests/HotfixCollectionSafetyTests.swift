@@ -80,6 +80,9 @@ private final class HotfixCollectionReviewUnsupported: Object,
 
 final class HotfixCollectionSafetyTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (
         adapter: RealmSwiftAdapter, target: Realm, tracking: Realm
     ) {
@@ -96,6 +99,9 @@ final class HotfixCollectionSafetyTests: XCTestCase {
             HotfixCollectionReviewUnkeyed.self,
             BigSyncPendingMutation.self,
         ]
+        let assetDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hotfix-collection-assets-" + nonce)
+        realmFixtureOwner.ownDirectory(assetDirectory)
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistence,
             targetRealmConfigurations: [target],
@@ -106,9 +112,9 @@ final class HotfixCollectionSafetyTests: XCTestCase {
             ),
             logger: Logger(label: "HotfixCollectionSafetyTests"),
             startSetupTask: false,
-            assetDirectoryURL: FileManager.default.temporaryDirectory
-                .appendingPathComponent("hotfix-collection-assets-" + nonce)
+            assetDirectoryURL: assetDirectory
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .server

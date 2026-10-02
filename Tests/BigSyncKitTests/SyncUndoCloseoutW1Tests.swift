@@ -53,13 +53,16 @@ final class W1RetainedArticle: Object, ChangeMetadataRecordable,
 /// Real target/tracking Realms and production adapter entry points. Synthetic
 /// CloudKit records are adapter inputs, not evidence of signed cloud delivery.
 final class SyncUndoCloseoutW1Tests: XCTestCase {
+    @BigSyncBackgroundActor
+    lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
     let noteID = UUID(uuidString: "A0000000-0000-0000-0000-000000000001")!
 
     @BigSyncBackgroundActor
     func fixture(enableRecordRebasing: Bool = true) async throws -> (RealmSwiftAdapter, Realm) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("w1-realms-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        realmFixtureOwner.ownDirectory(directory)
         var target = Realm.Configuration()
         target.fileURL = directory.appendingPathComponent("target.realm")
         target.objectTypes = [W1ContractNote.self, W1RetainedArticle.self, BigSyncPendingMutation.self]
@@ -76,6 +79,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
             targetRealmConfigurations: [target], excludedClassNames: [],
             recordZoneID: .init(zoneName: "w1-closeout"),
             logger: Logger(label: "W1Closeout"), startSetupTask: false)
+        realmFixtureOwner.own(adapter)
         adapter.mergePolicy = .custom
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()

@@ -32,6 +32,9 @@ private final class WorkerReviewObjectMap: Object, ChangeMetadataRecordable {
 /// review finding, not a passing expected-failure test or a production repair.
 final class WorkerReviewReconciliationTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString
         var persistence = RealmSwiftAdapter.defaultPersistenceConfiguration()
@@ -39,6 +42,8 @@ final class WorkerReviewReconciliationTests: XCTestCase {
         var target = Realm.Configuration()
         target.inMemoryIdentifier = "worker-review-target-" + nonce
         target.objectTypes = [WorkerReviewReceiver.self, WorkerReviewObjectMap.self, BigSyncPendingMutation.self]
+        let assetDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("worker-review-assets-" + nonce)
+        realmFixtureOwner.ownDirectory(assetDirectory)
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistence,
             targetRealmConfigurations: [target],
@@ -46,8 +51,9 @@ final class WorkerReviewReconciliationTests: XCTestCase {
             recordZoneID: CKRecordZone.ID(zoneName: "worker-review", ownerName: CKCurrentUserDefaultName),
             logger: Logger(label: "WorkerReview"),
             startSetupTask: false,
-            assetDirectoryURL: FileManager.default.temporaryDirectory.appendingPathComponent("worker-review-assets-" + nonce)
+            assetDirectoryURL: assetDirectory
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

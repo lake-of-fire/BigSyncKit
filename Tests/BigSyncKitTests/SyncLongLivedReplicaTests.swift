@@ -159,7 +159,8 @@ private final class TimelineReplica {
     var realm: Realm { adapter.realmProvider!.targetReaderRealms!.first! }
     var recordName: String { SyncTimelineSnapshot.className() + ".document" }
 
-    init(label: String, directory: URL, transport: TimelineTransport) async throws {
+    init(label: String, directory: URL, transport: TimelineTransport,
+         fixtureOwner: RealmAdapterFixtureOwner) async throws {
         binding = "binding-" + label
         var target = Realm.Configuration()
         target.fileURL = directory.appendingPathComponent(label + "-target.realm")
@@ -180,6 +181,7 @@ private final class TimelineReplica {
             logger: Logger(label: "TimelineReplica"), startSetupTask: false,
             assetDirectoryURL: directory.appendingPathComponent(label + "-assets")
         )
+        fixtureOwner.own(adapter)
         // Reopen the actual disk state; never clear tracking to simulate restart.
         try await adapter.ensureSetup()
         adapter.invalidateTokens()
@@ -242,17 +244,21 @@ private final class TimelineReplica {
 }
 
 final class SyncLongLivedReplicaTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func directory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("sync-timeline-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        realmFixtureOwner.ownDirectory(url)
         return url
     }
 
     @BigSyncBackgroundActor
     func testSevenDaysOfTypingDuringOldUploadPreservesEveryLineAndDrains() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         try owner.write("day 0\n", day: 0)
         let oldGeneration = try XCTUnwrap(owner.generation())
         let expected = (0...7).map { "day \($0)\n" }.joined()
@@ -281,7 +287,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testLostSuccessfulReplySurvivesDiskAdapterReopen() async throws {
         let server = TimelineTransport(), dir = try directory()
-        var owner: TimelineReplica? = try await TimelineReplica(label: "owner", directory: dir, transport: server)
+        var owner: TimelineReplica? = try await TimelineReplica(label: "owner", directory: dir, transport: server, fixtureOwner: realmFixtureOwner)
         try owner!.write("seven days of unsent work", day: 7)
         let generation = try XCTUnwrap(owner!.generation())
         let name = owner!.recordName
@@ -293,7 +299,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         XCTAssertEqual(accepted?["text"] as? String, "seven days of unsent work")
         await owner!.stop()
         owner = nil
-        let reopened = try await TimelineReplica(label: "owner", directory: dir, transport: server)
+        let reopened = try await TimelineReplica(label: "owner", directory: dir, transport: server, fixtureOwner: realmFixtureOwner)
         XCTAssertEqual(reopened.generation(), generation)
         XCTAssertEqual(reopened.value(), "seven days of unsent work")
         try await reopened.drain()
@@ -307,7 +313,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testCancelledReplyCannotAcknowledgeAcceptedWork() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         try owner.write("work across a week", day: 7)
         let generation = try XCTUnwrap(owner.generation())
         await server.enqueue(.init(afterMutation: { throw CancellationError() }))
@@ -323,7 +329,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testDeleteDuringAcceptedSaveNeverUploadsLiveTombstone() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         try owner.write("old work", day: 1)
         await server.enqueue(.init(afterMutation: {
             try await { @BigSyncBackgroundActor in
@@ -346,7 +352,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testResurrectionDuringDeleteResponsePreservesNewLiveGeneration() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         try owner.write("old", day: 1)
         try await owner.drain()
         try owner.write("old", day: 2, deleted: true)
@@ -371,8 +377,8 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testReceiverDoesNotReauthorThirtyDaysOfOwnerSnapshotsWithClockRollback() async throws {
         let server = TimelineTransport(), dir = try directory()
-        let owner = try await TimelineReplica(label: "owner", directory: dir, transport: server)
-        let receiver = try await TimelineReplica(label: "receiver", directory: dir, transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: dir, transport: server, fixtureOwner: realmFixtureOwner)
+        let receiver = try await TimelineReplica(label: "receiver", directory: dir, transport: server, fixtureOwner: realmFixtureOwner)
         for day in 0..<30 {
             // Payload order is causal; the authoring clock jumps both ways.
             let time = day.isMultiple(of: 2) ? Double(day + 100) : -Double(day)
@@ -395,7 +401,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testPendingLocalWeekSurvivesScriptedConflictDuringUpload() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         try owner.write("base", day: 0)
         try await owner.drain()
         let receivedBase = try await server.record(named: owner.recordName)
@@ -419,7 +425,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testMalformedConflictCannotConsumePendingWeekOrRetryWithoutProgress() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         try owner.write("seven days retained", day: 7)
         let generation = try XCTUnwrap(owner.generation())
         let invalid = CKRecord(recordType: SyncTimelineSnapshot.className(), recordID: .init(
@@ -440,7 +446,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testOldUploadReceiptCannotAcknowledgeAReplacementBinding() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         try owner.write("old account work", day: 7)
         try await owner.adapter.didFinishImport()
         let batch = try await owner.adapter.prepareUploadBatch(limit: 10)
@@ -459,7 +465,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testDuplicateOldAcknowledgementCannotEraseLaterOfflineWeek() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         try owner.write("day 0", day: 0)
         try await owner.adapter.didFinishImport()
         let old = try await owner.adapter.prepareUploadBatch(limit: 10)
@@ -479,7 +485,7 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     @BigSyncBackgroundActor
     func testScriptedFailuresAcrossFourteenDaysKeepExactPendingGenerationUntilAccepted() async throws {
         let server = TimelineTransport()
-        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server)
+        let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
         var expected = ""
         for day in 0..<14 {
             expected += "day-\(day): substantive work\n"

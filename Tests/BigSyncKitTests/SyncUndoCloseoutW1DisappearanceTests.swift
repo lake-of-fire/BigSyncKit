@@ -28,6 +28,7 @@ extension SyncUndoCloseoutW1Tests {
         let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: original.persistenceRealmConfiguration,
             targetRealmConfigurations: original.targetRealmConfigurations, excludedClassNames: [],
             recordZoneID: original.recordZoneID, logger: Logger(label: "W1Restart"), startSetupTask: false)
+        realmFixtureOwner.own(adapter)
         try await adapter.activateReplicaBinding(accountScopeIdentifier: "w1-account",
             replicaBindingGenerationIdentifier: "w1-binding")
         try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.test.w1-closeout", databaseScope: .private)

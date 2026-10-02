@@ -18,6 +18,9 @@ private final class HotfixMutationDrainTailObject: Object, ChangeMetadataRecorda
 
 final class HotfixMutationDrainTailTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString
         var persistence = RealmSwiftAdapter.defaultPersistenceConfiguration()
@@ -28,6 +31,9 @@ final class HotfixMutationDrainTailTests: XCTestCase {
             HotfixMutationDrainTailObject.self,
             BigSyncPendingMutation.self,
         ]
+        let assetDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mutation-tail-assets-" + nonce)
+        realmFixtureOwner.ownDirectory(assetDirectory)
         let adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: persistence,
             targetRealmConfigurations: [target],
@@ -38,9 +44,9 @@ final class HotfixMutationDrainTailTests: XCTestCase {
             ),
             logger: Logger(label: "HotfixMutationDrainTailTests"),
             startSetupTask: false,
-            assetDirectoryURL: FileManager.default.temporaryDirectory
-                .appendingPathComponent("mutation-tail-assets-" + nonce)
+            assetDirectoryURL: assetDirectory
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom
