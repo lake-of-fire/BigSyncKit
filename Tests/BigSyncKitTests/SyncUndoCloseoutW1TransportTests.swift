@@ -150,6 +150,68 @@ extension SyncUndoCloseoutW1Tests {
     }
 
     @BigSyncBackgroundActor
+    func testFetchedDeletionPageReplaysAfterTargetFirstInterruptionWithoutDeletingAgain()
+    async throws {
+        let (adapter, _, object, incoming) = try await acceptedNote()
+        let transport = W1ScriptedTransport(servesZonePages: true)
+        let firstSynchronizer = synchronizer(adapter, transport: transport)
+
+        try await fetchScriptedW1ZonePage(firstSynchronizer, adapter: adapter)
+        let seededCursor = await adapter.serverChangeToken
+        XCTAssertEqual(seededCursor?.serializedData,
+            W1ScriptedTransport.seedZoneCursor)
+        await transport.serveDeletionPage(for: incoming.recordID)
+
+        adapter._testAfterDisappearanceTargetWrite = {
+            throw W1InjectedFailure.afterTarget
+        }
+        do {
+            try await fetchScriptedW1ZonePage(firstSynchronizer, adapter: adapter)
+            XCTFail("Expected interruption before the deletion disposition commits")
+        } catch W1InjectedFailure.afterTarget { }
+        adapter._testAfterDisappearanceTargetWrite = nil
+
+        XCTAssertTrue(object.isDeleted)
+        XCTAssertEqual(adapter.realmProvider?.persistenceRealm?.objects(SyncedEntity.self)
+            .first?.entityState, .synced)
+        let interruptedCursor = await adapter.serverChangeToken
+        XCTAssertEqual(interruptedCursor?.serializedData,
+            W1ScriptedTransport.seedZoneCursor)
+        XCTAssertEqual(firstSynchronizer.activeZoneTokens[adapter.recordZoneID]?
+            .serializedData, W1ScriptedTransport.seedZoneCursor)
+
+        let (restarted, reopened) = try await restart(adapter)
+        let replaySynchronizer = synchronizer(restarted, transport: transport)
+        let restartedCursor = await restarted.serverChangeToken
+        XCTAssertEqual(restartedCursor?.serializedData,
+            W1ScriptedTransport.seedZoneCursor)
+        try await fetchScriptedW1ZonePage(replaySynchronizer, adapter: restarted)
+        let fetchedCursors = await transport.zoneCursorHistory()
+        XCTAssertEqual(fetchedCursors, [
+            nil, W1ScriptedTransport.seedZoneCursor,
+            W1ScriptedTransport.seedZoneCursor
+        ])
+        let replayedCursor = await restarted.serverChangeToken
+        XCTAssertEqual(replayedCursor?.serializedData,
+            W1ScriptedTransport.deletionZoneCursor)
+        XCTAssertEqual(restarted.realmProvider?.persistenceRealm?.objects(SyncedEntity.self)
+            .first?.entityState, .deletedRemotely)
+
+        try await replaySynchronizer.synchronizeAdapter(restarted)
+        try await restarted.cleanUp()
+        reopened.refresh()
+        XCTAssertNil(reopened.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
+        let calls = await transport.history()
+        XCTAssertTrue(calls.isEmpty,
+            "Replayed remote deletion must not issue a server mutation")
+        let serverRecords = try await transport.inventory()
+        XCTAssertTrue(serverRecords.isEmpty)
+        let audit = try await restarted.auditSynchronizationState(serverRecords: serverRecords)
+        XCTAssertTrue(audit.isClean, audit.issues.joined(separator: ","))
+        try await quiet(restarted, realm: reopened)
+    }
+
+    @BigSyncBackgroundActor
     func testActualUploadDrainForwardsPreparedMissingEvidenceAndPreservesInFlightV2() async throws {
         let (adapter, realm, object, _) = try await acceptedNote()
         _ = try await edit(object, text: "V1", time: 30, realm: realm, adapter: adapter)
