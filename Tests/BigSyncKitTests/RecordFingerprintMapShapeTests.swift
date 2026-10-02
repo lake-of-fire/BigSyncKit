@@ -8,6 +8,7 @@ private enum FingerprintMapChoice: Int, PersistableEnum {
     case second = 2
 }
 
+@objc(BigSyncRecordFingerprintMapShapeFixture)
 private final class FingerprintMapShapeObject: Object {
     override class func shouldIncludeInDefaultSchema() -> Bool { false }
 

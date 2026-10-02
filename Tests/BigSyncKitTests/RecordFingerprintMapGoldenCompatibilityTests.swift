@@ -3,6 +3,7 @@ import RealmSwift
 import XCTest
 @testable import BigSyncKit
 
+@objc(BigSyncRecordFingerprintMapGoldenFixture)
 private final class FingerprintMapGoldenObject: Object {
     override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted(primaryKey: true) var id = "record"
