@@ -63,6 +63,9 @@ private final class SyncIntentSnapshot: Object, ChangeMetadataRecordable,
 
 final class SyncSemanticIntentTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString
         var target = Realm.Configuration()
@@ -86,6 +89,7 @@ final class SyncSemanticIntentTests: XCTestCase {
             logger: Logger(label: "SyncSemanticIntentTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

@@ -48,6 +48,9 @@ private final class OrderedSemanticRecord: Object, ChangeMetadataRecordable,
 
 /// Exercises target transactions, retransmission and actual upload acknowledgements.
 final class OrderedSemanticRecordTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
     private struct Fixture {
         let adapter: RealmSwiftAdapter
         let realm: Realm
@@ -68,6 +71,7 @@ final class OrderedSemanticRecordTests: XCTestCase {
             targetRealmConfigurations: [target], excludedClassNames: [], recordZoneID: zone,
             logger: Logger(label: "OrderedSemanticRecordTests"), startSetupTask: false,
             assetDirectoryURL: FileManager.default.temporaryDirectory.appendingPathComponent("ordered-" + nonce))
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

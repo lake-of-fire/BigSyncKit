@@ -30,6 +30,9 @@ private final class SyncEpochControl: Object, ChangeMetadataRecordable,
 
 final class SyncEpochBundleReproductionTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString
         var target = Realm.Configuration()
@@ -52,6 +55,7 @@ final class SyncEpochBundleReproductionTests: XCTestCase {
             logger: Logger(label: "SyncEpochBundleReproductionTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

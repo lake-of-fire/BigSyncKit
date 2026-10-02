@@ -26,6 +26,9 @@ private final class RebaseIntegrationBoundaryRow: Object,
 /// The ordinary deletion path and the value-bearing inbound path are tested
 /// separately: a CloudKit deleted-record ID does not contain a lifetime.
 final class SyncRebaseIntegrationBoundaryTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
     private let lowerNonce = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     private let higherNonce = UUID(uuidString: "ffffffff-ffff-ffff-ffff-ffffffffffff")!
 
@@ -50,6 +53,7 @@ final class SyncRebaseIntegrationBoundaryTests: XCTestCase {
             logger: Logger(label: "SyncRebaseIntegrationBoundaryTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom
@@ -354,6 +358,7 @@ final class SyncRebaseIntegrationBoundaryTests: XCTestCase {
             excludedClassNames: [], recordZoneID: .init(zoneName: "integration-boundary"),
             logger: Logger(label: "PersistedBoundaryTests"), startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         adapter.mergePolicy = .custom
         try await adapter.activateReplicaBinding(accountScopeIdentifier: "account",
             replicaBindingGenerationIdentifier: "binding")
@@ -393,7 +398,7 @@ final class SyncRebaseIntegrationBoundaryTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("bigsync-forwarded-reopen-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+        realmFixtureOwner.ownDirectory(directory)
         var target = Realm.Configuration()
         target.fileURL = directory.appendingPathComponent("target.realm")
         target.objectTypes = [RebaseIntegrationBoundaryRow.self, BigSyncPendingMutation.self]

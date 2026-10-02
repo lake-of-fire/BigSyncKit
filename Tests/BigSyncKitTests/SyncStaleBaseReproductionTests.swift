@@ -18,6 +18,9 @@ private final class SyncStaleBaseRow: Object, ChangeMetadataRecordable {
 
 final class SyncStaleBaseReproductionTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString
         var target = Realm.Configuration()
@@ -42,6 +45,7 @@ final class SyncStaleBaseReproductionTests: XCTestCase {
             logger: Logger(label: "SyncStaleBaseReproductionTests"),
             startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

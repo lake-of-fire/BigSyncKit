@@ -20,6 +20,9 @@ private final class ReceiptRebaseRow: Object, ChangeMetadataRecordable,
 
 final class SyncRecordReceiptTests: XCTestCase {
     @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
+    @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         var target = Realm.Configuration()
         target.inMemoryIdentifier = "receipt-target-" + UUID().uuidString
@@ -37,6 +40,7 @@ final class SyncRecordReceiptTests: XCTestCase {
             excludedClassNames: [], recordZoneID: .init(zoneName: "receipts"),
             logger: Logger(label: "SyncRecordReceiptTests"), startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

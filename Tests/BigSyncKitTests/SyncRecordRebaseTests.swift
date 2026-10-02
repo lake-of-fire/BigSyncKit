@@ -54,6 +54,9 @@ private final class RebaseControl: Object, ChangeMetadataRecordable,
 }
 
 final class SyncRecordRebaseTests: XCTestCase {
+    @BigSyncBackgroundActor
+    private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
+
     private enum Fault: Error { case beforeTrackingCommit }
 
     @BigSyncBackgroundActor
@@ -81,6 +84,7 @@ final class SyncRecordRebaseTests: XCTestCase {
             recordZoneID: .init(zoneName: "rebase"),
             logger: Logger(label: "SyncRecordRebaseTests"), startSetupTask: false
         )
+        realmFixtureOwner.own(adapter)
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         adapter.mergePolicy = .custom

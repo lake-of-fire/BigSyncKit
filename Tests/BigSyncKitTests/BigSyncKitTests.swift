@@ -17244,10 +17244,80 @@ extension BigSyncKitTests {
     }
 }
 
+/// One XCTest case owns all adapter incarnations for its unique target Realms.
+/// Registration precedes fallible setup, so a partially opened fixture is also
+/// cleaned up. Weak adapter handles preserve the fixture's ordinary lifetimes.
+@BigSyncBackgroundActor
+final class RealmAdapterFixtureOwner {
+    private final class AdapterHandle {
+        weak var adapter: RealmSwiftAdapter?
+
+        init(_ adapter: RealmSwiftAdapter) {
+            self.adapter = adapter
+        }
+    }
+
+    private var adapters: [AdapterHandle] = []
+    private var targetConfigurations: [Realm.Configuration] = []
+    private var directories: [URL] = []
+
+    init(testCase: XCTestCase) {
+        testCase.addTeardownBlock { [self] in
+            await dispose()
+        }
+    }
+
+    func own(_ adapter: RealmSwiftAdapter) {
+        adapters.append(AdapterHandle(adapter))
+        targetConfigurations.append(contentsOf: adapter.targetRealmConfigurations)
+    }
+
+    func ownDirectory(_ directory: URL) {
+        directories.append(directory)
+    }
+
+    func dispose() async {
+        // A restarted fixture can have several adapters for the same target.
+        // Stop every surviving owner before evicting even the first writer.
+        let liveAdapters = adapters.compactMap(\.adapter)
+        for adapter in liveAdapters {
+            adapter.cancelSynchronization()
+        }
+        for adapter in liveAdapters {
+            await adapter.waitForCancellation()
+            adapter.invalidateTokens()
+            // The provider owns the uncached tracking Realm, target readers,
+            // and references to the cached target writers.
+            adapter.realmProvider = nil
+        }
+        adapters.removeAll()
+
+        var releasedAllWriters = true
+        for configuration in targetConfigurations {
+            let released = await Task { @RealmBackgroundActor in
+                await RealmBackgroundActor.shared.releaseOwnedBigSyncFixture(configuration)
+            }.value
+            releasedAllWriters = releasedAllWriters && released
+        }
+        targetConfigurations.removeAll()
+
+        // The eviction assertion reports an unjoined writer. Preserve its
+        // files if that assertion fails rather than deleting a live Realm.
+        guard releasedAllWriters else { return }
+        // Never remove an open fixture's files ahead of its awaited cleanup.
+        for directory in directories.reversed() {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        directories.removeAll()
+    }
+}
+
 private extension RealmBackgroundActor {
-    func releaseOwnedBigSyncFixture(_ configuration: Realm.Configuration) {
+    @discardableResult
+    func releaseOwnedBigSyncFixture(_ configuration: Realm.Configuration) -> Bool {
         // The fixture may already have moved its file. Match its unique
         // configuration rather than recomputing the file-resource key.
+        var releasedAllWriters = true
         let keys = cachedRealms.compactMap { key, realm -> String? in
             let current = realm.configuration
             let matches = configuration.inMemoryIdentifier.map {
@@ -17256,8 +17326,13 @@ private extension RealmBackgroundActor {
                 && current.fileURL?.standardizedFileURL == configuration.fileURL?.standardizedFileURL)
             guard matches else { return nil }
             XCTAssertFalse(realm.isInWriteTransaction, "Fixture teardown must join its writer first")
-            return realm.isInWriteTransaction ? nil : key
+            if realm.isInWriteTransaction {
+                releasedAllWriters = false
+                return nil
+            }
+            return key
         }
         for key in keys { cachedRealms.removeValue(forKey: key) }
+        return releasedAllWriters
     }
 }
