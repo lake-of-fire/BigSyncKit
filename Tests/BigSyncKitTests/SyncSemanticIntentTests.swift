@@ -2,6 +2,7 @@ import CloudKit
 import Foundation
 import Logging
 import RealmSwift
+import RealmSwiftGaps
 import XCTest
 @testable import BigSyncKit
 
@@ -158,19 +159,36 @@ final class SyncSemanticIntentTests: XCTestCase {
         )], forceSave: true)
         try await beginRestore(adapter)
         let realm = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
-        let value = try XCTUnwrap(realm.object(ofType: SyncIntentMutable.self, forPrimaryKey: "one"))
-        try realm.write {
-            value.payload = "post-restore-user-edit"
-            value.refreshChangeMetadata(explicitlyModified: true,
-                                        at: Date(timeIntervalSinceReferenceDate: 3_000))
-        }
-        let generation = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        let objectID = "one"
+        let recordName = SyncIntentMutable.className() + "." + objectID
+        let configuration = realm.configuration
+        try await Task { @RealmBackgroundActor in
+            try await RealmBackgroundActor.shared.write(configuration: configuration) { writer in
+                let value = try XCTUnwrap(writer.object(
+                    ofType: SyncIntentMutable.self, forPrimaryKey: objectID
+                ))
+                value.payload = "post-restore-user-edit"
+                value.refreshChangeMetadata(
+                    explicitlyModified: true,
+                    at: Date(timeIntervalSinceReferenceDate: 3_000)
+                )
+            }
+        }.value
+        await realm.asyncRefresh()
+        let generation = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation)
         _ = try await adapter.saveChanges(in: [record(
             SyncIntentMutable.self, adapter: adapter, payload: "server", at: 4_000
         )], forceSave: true)
         realm.refresh()
+        let value = try XCTUnwrap(realm.object(
+            ofType: SyncIntentMutable.self, forPrimaryKey: objectID
+        ))
         XCTAssertEqual(value.payload, "post-restore-user-edit")
-        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, generation)
+        XCTAssertEqual(realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation, generation)
     }
 
     @BigSyncBackgroundActor
