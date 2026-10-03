@@ -6151,6 +6151,9 @@ final class BigSyncKitTests: XCTestCase {
         defer { print("\(diagnosticPrefix) body-exited") }
         print("\(diagnosticPrefix) fixture-open-started")
         let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter._testJournalForwardingTrace = { print("\($0) fixture=asset-retry") }
+        defer { fixture.adapter._testJournalForwardingTrace = nil }
+        print("\(diagnosticPrefix) fixture-open-completed")
         print("\(diagnosticPrefix) forced-setup-started")
         try await fixture.adapter._test_setup()
         let expectedData = Data("durable-asset-payload".utf8)
@@ -6205,7 +6208,10 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: firstURL), expectedData)
 
         print("\(diagnosticPrefix) import-finalization-started")
-        try await fixture.adapter.didFinishImport()
+        try await fixture.adapter.didFinishImport(progress: {
+            print("\(diagnosticPrefix) progress \($0)")
+        })
+        print("\(diagnosticPrefix) import-finalization-completed")
         XCTAssertFalse(FileManager.default.fileExists(atPath: firstURL.path))
 
         print("\(diagnosticPrefix) asset-materialization-started")
@@ -14682,9 +14688,17 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testCacheResetWaitsForObservedJournalForwardingCancellation()
     async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE cache-reset-barrier"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
+        print("\(diagnosticPrefix) fixture-open-started")
         let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter._testJournalForwardingTrace = { print("\($0) fixture=cache-reset-barrier") }
+        defer { fixture.adapter._testJournalForwardingTrace = nil }
+        print("\(diagnosticPrefix) fixture-open-completed")
         let objectID = "reset-journal-barrier"
         let configuration = fixture.targetRealm.configuration
+        print("\(diagnosticPrefix) writer-transaction-started")
         try await Task { @RealmBackgroundActor in
             try await RealmBackgroundActor.shared.write(configuration: configuration) { realm in
                 let object = BigSyncTrackedObject(
@@ -14695,7 +14709,10 @@ final class BigSyncKitTests: XCTestCase {
                 object.refreshChangeMetadata(explicitlyModified: true)
             }
         }.value
+        print("\(diagnosticPrefix) writer-transaction-completed")
+        print("\(diagnosticPrefix) reader-refresh-started")
         await fixture.targetRealm.asyncRefresh()
+        print("\(diagnosticPrefix) reader-refresh-completed")
         let recordName = BigSyncTrackedObject.className() + "." + objectID
         let expectedGeneration = try XCTUnwrap(
             fixture.targetRealm.object(
@@ -14703,6 +14720,7 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: recordName
             )?.generation
         )
+        print("\(diagnosticPrefix) generation-unwrapped")
         let enteredForwarding = AsyncGate()
         let releaseForwarding = AsyncGate()
         let finishedReset = AsyncGate()
@@ -14714,17 +14732,29 @@ final class BigSyncKitTests: XCTestCase {
             adapter._testBeforePendingMutationTrackingWrite = nil
         }
         fixture.adapter._testBeforePendingMutationTrackingWrite = {
+            print("\(diagnosticPrefix) before-write-hook-entered")
             await enteredForwarding.open()
+            print("\(diagnosticPrefix) release-wait-started")
             await releaseForwarding.wait()
+            print("\(diagnosticPrefix) release-wait-completed")
         }
+        print("\(diagnosticPrefix) hook-installed")
         fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
+        print("\(diagnosticPrefix) observed-enqueued")
         fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
+        print("\(diagnosticPrefix) observed-start-requested")
+        print("\(diagnosticPrefix) entry-wait-started")
         await enteredForwarding.wait()
+        print("\(diagnosticPrefix) entry-wait-completed")
 
         let reset = Task { @BigSyncBackgroundActor in
             fixture.adapter.cancelSynchronization()
+            print("\(diagnosticPrefix) cancellation-join-started")
             await fixture.adapter.waitForCancellation()
+            print("\(diagnosticPrefix) cancellation-join-completed")
+            print("\(diagnosticPrefix) cache-reset-started")
             try await fixture.adapter.resetSyncCaches()
+            print("\(diagnosticPrefix) cache-reset-completed")
             await finishedReset.open()
         }
         for _ in 0..<20 {
@@ -14733,8 +14763,11 @@ final class BigSyncKitTests: XCTestCase {
         let resetCompletedBeforeRelease = await finishedReset.hasOpened()
         XCTAssertFalse(resetCompletedBeforeRelease)
 
+        print("\(diagnosticPrefix) release-started")
         await releaseForwarding.open()
+        print("\(diagnosticPrefix) reset-task-join-started")
         try await reset.value
+        print("\(diagnosticPrefix) reset-task-join-completed")
         fixture.persistenceRealm.refresh()
         XCTAssertNil(
             fixture.persistenceRealm.object(
@@ -14763,6 +14796,9 @@ final class BigSyncKitTests: XCTestCase {
         defer { print("\(diagnosticPrefix) body-exited") }
         print("\(diagnosticPrefix) fixture-open-started")
         let fixture = try await makeRealmAdapterFixture()
+        fixture.adapter._testJournalForwardingTrace = { print("\($0) fixture=post-write-reset") }
+        defer { fixture.adapter._testJournalForwardingTrace = nil }
+        print("\(diagnosticPrefix) fixture-open-completed")
         let objectID = "reset-after-forward-journal"
         let configuration = fixture.targetRealm.configuration
         try await Task { @RealmBackgroundActor in
@@ -14782,6 +14818,7 @@ final class BigSyncKitTests: XCTestCase {
         let expectedGeneration = try XCTUnwrap(targetRealm.object(
             ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
         )?.generation)
+        print("\(diagnosticPrefix) generation-unwrapped")
         let enteredPostWrite = AsyncGate()
         let releasePostWrite = AsyncGate()
         // Teardown runs LIFO: release this barrier before fixture disposal joins forwarding.
@@ -14797,8 +14834,11 @@ final class BigSyncKitTests: XCTestCase {
             print("\(diagnosticPrefix) post-write-release-wait-started")
             await releasePostWrite.wait()
         }
+        print("\(diagnosticPrefix) hook-installed")
         fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
+        print("\(diagnosticPrefix) observed-enqueued")
         fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
+        print("\(diagnosticPrefix) observed-start-requested")
         print("\(diagnosticPrefix) post-write-entry-wait-started")
         await enteredPostWrite.wait()
 
