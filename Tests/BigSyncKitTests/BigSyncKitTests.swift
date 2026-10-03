@@ -1535,16 +1535,21 @@ final class BigSyncKitTests: XCTestCase {
     private func reviewJournalBatch(count: Int, deletion: Bool = false) async throws
         -> (RealmSwiftAdapter, Realm, [BigSyncTrackedObject]) {
         let fixture = try await makeRealmAdapterFixture()
-        let objects = (0..<count).map { i in
-            BigSyncTrackedObject(id: "review-limit-\(i)", createdAt: Date(),
-                                 modifiedAt: Date(), explicitlyModifiedAt: nil)
-        }
-        try await fixture.targetRealm.asyncWrite {
-            for object in objects {
-                fixture.targetRealm.add(object)
-                object.refreshChangeMetadata(explicitlyModified: true)
+        let configuration = fixture.targetRealm.configuration
+        let objectIDs = (0..<count).map { "review-limit-\($0)" }
+        try await Task { @RealmBackgroundActor in
+            try await RealmBackgroundActor.shared.write(configuration: configuration) { writer in
+                for objectID in objectIDs {
+                    let object = BigSyncTrackedObject(
+                        id: objectID, createdAt: Date(), modifiedAt: Date(), explicitlyModifiedAt: nil
+                    )
+                    writer.add(object)
+                    object.refreshChangeMetadata(explicitlyModified: true)
+                }
             }
-        }
+        }.value
+        var targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        await targetRealm.asyncRefresh()
         try await fixture.adapter.didFinishImport()
         if deletion {
             let prepared = try await fixture.adapter.preparedRecordsToUpload(
@@ -1555,15 +1560,27 @@ final class BigSyncKitTests: XCTestCase {
             })
             try await fixture.adapter.didUpload(savedRecords: prepared.map(\.record),
                                                 matchingGenerations: generations)
-            try await fixture.targetRealm.asyncWrite {
-                for object in objects {
-                    object.isDeleted = true
-                    object.refreshChangeMetadata(explicitlyModified: true)
+            try await Task { @RealmBackgroundActor in
+                try await RealmBackgroundActor.shared.write(configuration: configuration) { writer in
+                    for objectID in objectIDs {
+                        let object = try XCTUnwrap(writer.object(
+                            ofType: BigSyncTrackedObject.self, forPrimaryKey: objectID
+                        ))
+                        object.isDeleted = true
+                        object.refreshChangeMetadata(explicitlyModified: true)
+                    }
                 }
-            }
+            }.value
         }
+        targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        await targetRealm.asyncRefresh()
         try await fixture.adapter.didFinishImport()
-        return (fixture.adapter, fixture.targetRealm, objects)
+        targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        await targetRealm.asyncRefresh()
+        let objects = try objectIDs.map { objectID in
+            try XCTUnwrap(targetRealm.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: objectID))
+        }
+        return (fixture.adapter, targetRealm, objects)
     }
 
     @BigSyncBackgroundActor
@@ -1742,27 +1759,43 @@ final class BigSyncKitTests: XCTestCase {
 
     @BigSyncBackgroundActor
     func testReviewDownloadOnlyDomainWritesAndModeChangeCannotTurnIntoFullReceipt() async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE download-only-domain"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
+        print("\(diagnosticPrefix) journal-fixture-open-started")
         let (adapter, realm, objects) = try await reviewJournalBatch(count: 1)
         let database = FakeCloudKitDatabase()
         database.completesEmptyZoneChangeOperation = true
-        let sync = makeSynchronizer(database: database, recordZoneID: adapter.recordZoneID)
+        let sync = makeSynchronizer(database: database, recordZoneID: adapter.recordZoneID, progressHandler: {
+            print("\(diagnosticPrefix) progress \($0)")
+        })
         sync.addModelAdapter(adapter)
         sync.syncMode = .downloadOnly
         let called = AsyncGate()
+        let configuration = realm.configuration
+        let objectID = objects[0].id
         sync.domainPrepublicationHandler = { _ in
             try await { @BigSyncBackgroundActor in
-                try await realm.asyncWrite {
-                    objects[0].tags.append("domain-reconciliation")
-                    objects[0].refreshChangeMetadata(explicitlyModified: true)
-                }
+                try await Task { @RealmBackgroundActor in
+                    print("\(diagnosticPrefix) writer-transaction-started")
+                    try await RealmBackgroundActor.shared.write(configuration: configuration) { writer in
+                        let object = try XCTUnwrap(writer.object(
+                            ofType: BigSyncTrackedObject.self, forPrimaryKey: objectID
+                        ))
+                        object.tags.append("domain-reconciliation")
+                        object.refreshChangeMetadata(explicitlyModified: true)
+                    }
+                }.value
                 // Both requests and mode changes during the hook must not
                 // change the authority of the captured download-only drain.
                 sync.syncMode = .sync
                 sync.beginSynchronization()
             }()
+            print("\(diagnosticPrefix) domain-hook-completed")
             await called.open()
             return []
         }
+        print("\(diagnosticPrefix) synchronization-request-started")
         let result = try await sync.synchronize()
         let hookCalled = await called.hasOpened()
         XCTAssertTrue(hookCalled)
@@ -1777,14 +1810,20 @@ final class BigSyncKitTests: XCTestCase {
                 result.terminalBoundary?.runID
             )
         }
-        realm.refresh()
-        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+        var currentRealm = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        print("\(diagnosticPrefix) reader-refresh-started")
+        await currentRealm.asyncRefresh()
+        XCTAssertEqual(currentRealm.objects(BigSyncPendingMutation.self).count, 1)
         sync.domainPrepublicationHandler = nil
+        print("\(diagnosticPrefix) synchronization-request-started")
         let full = try await sync.synchronize()
         XCTAssertEqual(full.completionScope, .fullSynchronization)
         XCTAssertNotNil(full.receipt)
-        realm.refresh()
-        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+        currentRealm = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        print("\(diagnosticPrefix) reader-refresh-started")
+        await currentRealm.asyncRefresh()
+        XCTAssertTrue(currentRealm.objects(BigSyncPendingMutation.self).isEmpty)
+        print("\(diagnosticPrefix) synchronization-cancel-join-started")
         await sync.cancelSynchronizationAndWait()
     }
 
@@ -6107,52 +6146,69 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testPendingAssetRematerializesAfterTerminalAttemptCleanup()
     async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE asset-retry"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
+        print("\(diagnosticPrefix) fixture-open-started")
         let fixture = try await makeRealmAdapterFixture()
+        print("\(diagnosticPrefix) forced-setup-started")
         try await fixture.adapter._test_setup()
         let expectedData = Data("durable-asset-payload".utf8)
-        let object = BigSyncTrackedObject(
-            id: "asset-retry",
-            createdAt: Date(),
-            modifiedAt: Date(),
-            explicitlyModifiedAt: nil
-        )
-        object.payload = expectedData
-        try await fixture.targetRealm.asyncWrite {
-            fixture.targetRealm.add(object)
-            object.refreshChangeMetadata(explicitlyModified: true)
-        }
+        let objectID = "asset-retry"
+        let configuration = fixture.targetRealm.configuration
+        try await Task { @RealmBackgroundActor in
+            print("\(diagnosticPrefix) writer-transaction-started")
+            try await RealmBackgroundActor.shared.write(configuration: configuration) { writer in
+                let object = BigSyncTrackedObject(
+                    id: objectID, createdAt: Date(), modifiedAt: Date(), explicitlyModifiedAt: nil
+                )
+                object.payload = expectedData
+                writer.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }.value
+        let targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        print("\(diagnosticPrefix) reader-refresh-started")
+        await targetRealm.asyncRefresh()
         // The live journal observer may already have forwarded this generation;
         // explicitly drain once more so the assertion is insensitive to that
         // scheduling race while still exercising the production boundary.
+        print("\(diagnosticPrefix) journal-forward-started")
         _ = try await fixture.adapter._test_forwardPendingMutations(
-            in: fixture.targetRealm
+            in: targetRealm
         )
-        let recordName = BigSyncTrackedObject.className() + "." + object.id
+        let recordName = BigSyncTrackedObject.className() + "." + objectID
         XCTAssertNotNil(
-            fixture.targetRealm.object(
+            targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
             )
         )
+        let persistenceRealm = try XCTUnwrap(fixture.adapter.realmProvider?.persistenceRealm)
+        persistenceRealm.refresh()
         XCTAssertNotNil(
-            fixture.persistenceRealm.object(
+            persistenceRealm.object(
                 ofType: SyncedEntity.self,
                 forPrimaryKey: recordName
             )
         )
 
+        print("\(diagnosticPrefix) asset-materialization-started")
         let firstPreparedRecords = try await fixture.adapter.preparedRecordsToUpload(
             limit: 1,
             restrictedToEntityType: nil
         )
         let first = try XCTUnwrap(firstPreparedRecords.first)
+        let firstGeneration = first.generation
         let firstAsset = try XCTUnwrap(first.record["payload"] as? CKAsset)
         let firstURL = try XCTUnwrap(firstAsset.fileURL)
         XCTAssertEqual(try Data(contentsOf: firstURL), expectedData)
 
+        print("\(diagnosticPrefix) import-finalization-started")
         try await fixture.adapter.didFinishImport()
         XCTAssertFalse(FileManager.default.fileExists(atPath: firstURL.path))
 
+        print("\(diagnosticPrefix) asset-materialization-started")
         let retryPreparedRecords = try await fixture.adapter.preparedRecordsToUpload(
             limit: 1,
             restrictedToEntityType: nil
@@ -6160,7 +6216,7 @@ final class BigSyncKitTests: XCTestCase {
         let retry = try XCTUnwrap(retryPreparedRecords.first)
         let retryAsset = try XCTUnwrap(retry.record["payload"] as? CKAsset)
         let retryURL = try XCTUnwrap(retryAsset.fileURL)
-        XCTAssertEqual(retry.generation, first.generation)
+        XCTAssertEqual(retry.generation, firstGeneration)
         XCTAssertEqual(try Data(contentsOf: retryURL), expectedData)
     }
 
@@ -13721,26 +13777,34 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testExpiredOrCorruptCursorRebuildsTrackingWithoutLosingJournal()
     async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE cursor-recovery"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
         let recoveryErrors: [Error] = [
             CKError(.changeTokenExpired),
             CloudKitChangeFeedError.corruptCursor,
         ]
 
         for (index, recoveryError) in recoveryErrors.enumerated() {
+            print("\(diagnosticPrefix) fixture-open-started")
             let fixture = try await makeRealmAdapterFixture()
             let database = FakeCloudKitDatabase()
             database.completesEmptyZoneChangeOperation = true
-            let synchronizer = makeSynchronizer(database: database)
+            let synchronizer = makeSynchronizer(database: database, progressHandler: {
+                print("\(diagnosticPrefix) progress \($0)")
+            })
             synchronizer.addModelAdapter(fixture.adapter)
 
             // Complete the one-time transport migration first. The injected
             // cursor failure below must request a *new* server-first epoch,
             // not rely on first-install behavior.
+            print("\(diagnosticPrefix) synchronization-request-started")
             _ = try await synchronizer.synchronize()
 
             let objectID = "cursor-recovery-\(index)"
             let configuration = fixture.targetRealm.configuration
             try await Task { @RealmBackgroundActor in
+                print("\(diagnosticPrefix) writer-transaction-started")
                 try await RealmBackgroundActor.shared.write(configuration: configuration) { realm in
                     let object = BigSyncTrackedObject(
                         id: objectID,
@@ -13753,22 +13817,27 @@ final class BigSyncKitTests: XCTestCase {
                     object.refreshChangeMetadata(explicitlyModified: true)
                 }
             }.value
-            await fixture.targetRealm.asyncRefresh()
+            var targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+            print("\(diagnosticPrefix) reader-refresh-started")
+            await targetRealm.asyncRefresh()
             let recordName = BigSyncTrackedObject.className() + "." + objectID
             let generation = try XCTUnwrap(
-                fixture.targetRealm.object(
+                targetRealm.object(
                     ofType: BigSyncPendingMutation.self,
                     forPrimaryKey: recordName
                 )?.generation
             )
             database.nextDatabaseChangesError = recoveryError
 
+            print("\(diagnosticPrefix) synchronization-request-started")
             let result = try await synchronizer.synchronize()
 
-            await fixture.targetRealm.asyncRefresh()
+            targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+            print("\(diagnosticPrefix) reader-refresh-started")
+            await targetRealm.asyncRefresh()
             XCTAssertNotNil(result.receipt)
             XCTAssertNil(
-                fixture.targetRealm.object(
+                targetRealm.object(
                     ofType: BigSyncPendingMutation.self,
                     forPrimaryKey: recordName
                 )
@@ -14081,12 +14150,17 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testEncryptedDataResetRebuildsJournalAndPreservesTargetRealm()
     async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE encrypted-reset"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
+        print("\(diagnosticPrefix) fixture-open-started")
         let fixture = try await makeRealmAdapterFixture()
         let now = Date()
         let liveID = "encrypted-reset-live"
         let tombstoneID = "encrypted-reset-tombstone"
         let configuration = fixture.targetRealm.configuration
         try await Task { @RealmBackgroundActor in
+            print("\(diagnosticPrefix) writer-transaction-started")
             try await RealmBackgroundActor.shared.write(configuration: configuration) { realm in
                 // Retained pre-journal live data is intentional reset coverage.
                 let live = BigSyncTrackedObject(
@@ -14105,14 +14179,16 @@ final class BigSyncKitTests: XCTestCase {
                 tombstone.refreshChangeMetadata(explicitlyModified: true, at: now)
             }
         }.value
-        await fixture.targetRealm.asyncRefresh()
+        var targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        print("\(diagnosticPrefix) reader-refresh-started")
+        await targetRealm.asyncRefresh()
         let liveRecordName = BigSyncTrackedObject.className() + "." + liveID
         let tombstoneRecordName = BigSyncTrackedObject.className() + "." + tombstoneID
-        XCTAssertNil(fixture.targetRealm.object(
+        XCTAssertNil(targetRealm.object(
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: liveRecordName
         ))
-        XCTAssertNotNil(fixture.targetRealm.object(
+        XCTAssertNotNil(targetRealm.object(
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: tombstoneRecordName
         ))
@@ -14128,9 +14204,12 @@ final class BigSyncKitTests: XCTestCase {
             )],
             moreComing: false
         )]
-        let synchronizer = makeSynchronizer(database: database)
+        let synchronizer = makeSynchronizer(database: database, progressHandler: {
+            print("\(diagnosticPrefix) progress \($0)")
+        })
         synchronizer.addModelAdapter(fixture.adapter)
 
+        print("\(diagnosticPrefix) synchronization-request-started")
         let result = try await synchronizer.synchronize()
 
         XCTAssertNotNil(result.receipt)
@@ -14146,23 +14225,25 @@ final class BigSyncKitTests: XCTestCase {
             recordName: tombstoneRecordName,
             zoneID: fixture.adapter.recordZoneID
         )))
-        await fixture.targetRealm.asyncRefresh()
-        let live = try XCTUnwrap(fixture.targetRealm.object(
+        targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        print("\(diagnosticPrefix) reader-refresh-started")
+        await targetRealm.asyncRefresh()
+        let live = try XCTUnwrap(targetRealm.object(
             ofType: BigSyncTrackedObject.self, forPrimaryKey: liveID
         ))
         XCTAssertEqual(Array(live.tags), ["local-live"])
         // The reset never deletes target data. After the recovered upload is
         // acknowledged, ordinary tombstone cleanup may physically remove an
         // object the user had already deleted.
-        XCTAssertNil(fixture.targetRealm.object(
+        XCTAssertNil(targetRealm.object(
             ofType: BigSyncTrackedObject.self,
             forPrimaryKey: tombstoneID
         ))
-        XCTAssertNil(fixture.targetRealm.object(
+        XCTAssertNil(targetRealm.object(
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: liveRecordName
         ))
-        XCTAssertNil(fixture.targetRealm.object(
+        XCTAssertNil(targetRealm.object(
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: tombstoneRecordName
         ))
@@ -14620,58 +14701,82 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testResetRecoversJournalForwardedBeforeCancellationFromDurableState()
     async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE post-write-reset"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
+        print("\(diagnosticPrefix) fixture-open-started")
         let fixture = try await makeRealmAdapterFixture()
-        let object = BigSyncTrackedObject(
-            id: "reset-after-forward-journal",
-            createdAt: Date(),
-            modifiedAt: Date(),
-            explicitlyModifiedAt: nil
-        )
-        try await fixture.targetRealm.asyncWrite {
-            fixture.targetRealm.add(object)
-            object.refreshChangeMetadata(explicitlyModified: true)
-        }
-        let recordName = BigSyncTrackedObject.className() + "." + object.id
-        let mutation = try XCTUnwrap(
-            fixture.targetRealm.object(
-                ofType: BigSyncPendingMutation.self,
-                forPrimaryKey: recordName
-            )
-        )
+        let objectID = "reset-after-forward-journal"
+        let configuration = fixture.targetRealm.configuration
+        try await Task { @RealmBackgroundActor in
+            print("\(diagnosticPrefix) writer-transaction-started")
+            try await RealmBackgroundActor.shared.write(configuration: configuration) { writer in
+                let object = BigSyncTrackedObject(
+                    id: objectID, createdAt: Date(), modifiedAt: Date(), explicitlyModifiedAt: nil
+                )
+                writer.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }.value
+        let targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        print("\(diagnosticPrefix) reader-refresh-started")
+        await targetRealm.asyncRefresh()
+        let recordName = BigSyncTrackedObject.className() + "." + objectID
+        let expectedGeneration = try XCTUnwrap(targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation)
         let enteredPostWrite = AsyncGate()
         let releasePostWrite = AsyncGate()
+        // Teardown runs LIFO: release this barrier before fixture disposal joins forwarding.
+        let adapter = fixture.adapter
+        addTeardownBlock { @BigSyncBackgroundActor in
+            print("\(diagnosticPrefix) post-write-release-started")
+            await releasePostWrite.open()
+            adapter._testAfterPendingMutationTrackingWrite = nil
+        }
         fixture.adapter._testAfterPendingMutationTrackingWrite = {
+            print("\(diagnosticPrefix) post-write-entered")
             await enteredPostWrite.open()
+            print("\(diagnosticPrefix) post-write-release-wait-started")
             await releasePostWrite.wait()
         }
         fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
         fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
+        print("\(diagnosticPrefix) post-write-entry-wait-started")
         await enteredPostWrite.wait()
 
         let reset = Task { @BigSyncBackgroundActor in
             fixture.adapter.cancelSynchronization()
+            print("\(diagnosticPrefix) cancellation-join-started")
             await fixture.adapter.waitForCancellation()
+            print("\(diagnosticPrefix) cache-reset-started")
             try await fixture.adapter.resetSyncCaches()
         }
         for _ in 0..<20 {
             await Task.yield()
         }
+        print("\(diagnosticPrefix) post-write-release-started")
         await releasePostWrite.open()
+        print("\(diagnosticPrefix) reset-task-join-started")
         try await reset.value
+        fixture.adapter._testAfterPendingMutationTrackingWrite = nil
 
         // Cache reset deliberately discards transient observer work. The
         // target-Realm journal remains authoritative and setup must recover it
         // without relying on an account-agnostic in-memory queue.
         XCTAssertFalse(fixture.adapter._test_hasPendingObservedRealmChanges())
+        print("\(diagnosticPrefix) setup-resumption-started")
         try await fixture.adapter.unsetCancellation()
 
+        let persistenceRealm = try XCTUnwrap(fixture.adapter.realmProvider?.persistenceRealm)
+        persistenceRealm.refresh()
         let tracking = try XCTUnwrap(
-            fixture.adapter.realmProvider?.persistenceRealm?.object(
+            persistenceRealm.object(
                 ofType: SyncedEntity.self,
                 forPrimaryKey: recordName
             )
         )
-        XCTAssertEqual(tracking.pendingGeneration, mutation.generation)
+        XCTAssertEqual(tracking.pendingGeneration, expectedGeneration)
         XCTAssertFalse(fixture.adapter._test_hasPendingObservedRealmChanges())
     }
 
@@ -16456,30 +16561,33 @@ final class BigSyncKitTests: XCTestCase {
         generation: String
     ) {
         let fixture = try await makeRealmAdapterFixture()
-        let object = BigSyncTrackedObject(
-            id: id,
-            createdAt: Date(),
-            modifiedAt: Date(),
-            explicitlyModifiedAt: nil
-        )
-        object.tags.append("local")
-        try await fixture.targetRealm.asyncWrite {
-            fixture.targetRealm.add(object)
-            object.refreshChangeMetadata(explicitlyModified: true)
-        }
+        let configuration = fixture.targetRealm.configuration
+        try await Task { @RealmBackgroundActor in
+            try await RealmBackgroundActor.shared.write(configuration: configuration) { writer in
+                let object = BigSyncTrackedObject(
+                    id: id, createdAt: Date(), modifiedAt: Date(), explicitlyModifiedAt: nil
+                )
+                object.tags.append("local")
+                writer.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }.value
+        let targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        await targetRealm.asyncRefresh()
         let recordName = BigSyncTrackedObject.className() + "." + id
-        let generation = try XCTUnwrap(
-            fixture.targetRealm.object(
-                ofType: BigSyncPendingMutation.self,
-                forPrimaryKey: recordName
-            )?.generation
-        )
-        return (fixture.adapter, fixture.targetRealm, recordName, generation)
+        let generation = try XCTUnwrap(targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )?.generation)
+        return (fixture.adapter, targetRealm, recordName, generation)
     }
 
     @BigSyncBackgroundActor
     func testLocalDatasetRebootstrapRebasesRetainedRowsToDestinationBinding()
     async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE destination-rebootstrap"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
+        print("\(diagnosticPrefix) fixture-open-started")
         let fixture = try await makeRealmAdapterFixture()
         let targetConfiguration = fixture.targetRealm.configuration
         BigSyncMutationPolicy(excludedClassNames: []).install(
@@ -16491,51 +16599,61 @@ final class BigSyncKitTests: XCTestCase {
                 )
             }
         )
-        let object = BigSyncTrackedObject(
-            id: "retained-for-destination",
-            createdAt: Date(),
-            modifiedAt: Date(),
-            explicitlyModifiedAt: nil
-        )
-        let recordName = BigSyncTrackedObject.className() + "." + object.id
-        try await fixture.targetRealm.asyncWrite {
-            fixture.targetRealm.add(object)
-            fixture.targetRealm.add(BigSyncPendingMutation(
-                recordName: recordName,
-                entityType: BigSyncTrackedObject.className(),
-                objectIdentifier: object.id,
-                replicaBindingGenerationIdentifier: "source-binding",
-                generation: "source-generation"
-            ))
-        }
+        let objectID = "retained-for-destination"
+        let recordName = BigSyncTrackedObject.className() + "." + objectID
+        try await Task { @RealmBackgroundActor in
+            print("\(diagnosticPrefix) writer-transaction-started")
+            try await RealmBackgroundActor.shared.write(configuration: targetConfiguration) { writer in
+                let object = BigSyncTrackedObject(
+                    id: objectID, createdAt: Date(), modifiedAt: Date(), explicitlyModifiedAt: nil
+                )
+                writer.add(object)
+                // Deliberately retain the old binding/generation to exercise rebootstrap.
+                writer.add(BigSyncPendingMutation(
+                    recordName: recordName,
+                    entityType: BigSyncTrackedObject.className(),
+                    objectIdentifier: objectID,
+                    replicaBindingGenerationIdentifier: "source-binding",
+                    generation: "source-generation"
+                ))
+            }
+        }.value
 
         let scope = "destination-account"
         let epoch = 4_000_000_001
+        print("\(diagnosticPrefix) transport-activation-started")
         try await fixture.adapter.activateTransportNamespace(
             containerIdentifier: "iCloud.test",
             databaseScope: .private
         )
+        print("\(diagnosticPrefix) binding-activation-started")
         try await fixture.adapter.activateReplicaBinding(
             accountScopeIdentifier: scope,
             replicaBindingGenerationIdentifier: "destination-binding"
         )
+        print("\(diagnosticPrefix) reset-preparation-started")
         try await fixture.adapter.prepareChangeFeedReset(
             accountScopeIdentifier: scope,
             epoch: epoch,
             mode: .localDatasetRebootstrap
         )
+        print("\(diagnosticPrefix) server-bootstrap-started")
         try await fixture.adapter.beginChangeFeedServerBootstrap(
             accountScopeIdentifier: scope,
             epoch: epoch,
             mode: .localDatasetRebootstrap
         )
+        print("\(diagnosticPrefix) retained-row-reconciliation-started")
         try await fixture.adapter.reconcileAfterChangeFeedServerBootstrap(
             accountScopeIdentifier: scope,
             epoch: epoch,
             mode: .localDatasetRebootstrap
         )
 
-        let pending = try XCTUnwrap(fixture.targetRealm.object(
+        let targetRealm = try XCTUnwrap(fixture.adapter.realmProvider?.targetReaderRealms?.first)
+        print("\(diagnosticPrefix) reader-refresh-started")
+        await targetRealm.asyncRefresh()
+        let pending = try XCTUnwrap(targetRealm.object(
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: recordName
         ))
@@ -16544,15 +16662,19 @@ final class BigSyncKitTests: XCTestCase {
             "destination-binding"
         )
         XCTAssertNotEqual(pending.generation, "source-generation")
-        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(
+        let pendingGeneration = pending.generation
+        let pendingBinding = pending.replicaBindingGenerationIdentifier
+        let persistenceRealm = try XCTUnwrap(fixture.adapter.realmProvider?.persistenceRealm)
+        persistenceRealm.refresh()
+        let tracking = try XCTUnwrap(persistenceRealm.object(
             ofType: SyncedEntity.self,
             forPrimaryKey: recordName
         ))
         XCTAssertEqual(tracking.entityState, .new)
-        XCTAssertEqual(tracking.pendingGeneration, pending.generation)
+        XCTAssertEqual(tracking.pendingGeneration, pendingGeneration)
         XCTAssertEqual(
             tracking.pendingReplicaBindingGenerationIdentifier,
-            "destination-binding"
+            pendingBinding
         )
     }
 
@@ -17004,11 +17126,17 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testRepeatedEncryptedResetAfterCompletionUsesFreshEpoch()
     async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE fresh-epoch"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
+        print("\(diagnosticPrefix) journaled-fixture-open-started")
         let fixture = try await makeJournaledZoneFixture(id: "encrypted-fresh-epoch")
         let store = DictionaryKeyValueStore()
         let database = FakeCloudKitDatabase()
         database.completesEmptyZoneChangeOperation = true
-        let synchronizer = makeSynchronizer(database: database, keyValueStore: store)
+        let synchronizer = makeSynchronizer(database: database, keyValueStore: store, progressHandler: {
+            print("\(diagnosticPrefix) progress \($0)")
+        })
         synchronizer.addModelAdapter(fixture.adapter)
         let accountScope = CloudKitSynchronizer.accountScopeIdentifier(
             for: database.accountIdentifier
@@ -17035,6 +17163,7 @@ final class BigSyncKitTests: XCTestCase {
                 kind: .encryptedDataReset,
                 accountScopeIdentifier: accountScope
             )
+            print("\(diagnosticPrefix) synchronization-request-started")
             let result = try await synchronizer.synchronize()
             XCTAssertNotNil(result.receipt, "reset \(resetIndex)")
             XCTAssertFalse(
@@ -17514,6 +17643,8 @@ final class RealmAdapterFixtureOwner {
     }
 
     func dispose() async {
+        print("MR-UNDO-NATIVE fixture-disposal-started")
+        defer { print("MR-UNDO-NATIVE fixture-disposal-finished") }
         // A restarted fixture can have several adapters for the same target.
         // Stop every surviving owner before evicting even the first writer.
         let liveAdapters = adapters.compactMap(\.adapter)
@@ -17521,7 +17652,9 @@ final class RealmAdapterFixtureOwner {
             adapter.cancelSynchronization()
         }
         for adapter in liveAdapters {
+            print("MR-UNDO-NATIVE fixture-disposal-cancellation-join-started")
             await adapter.waitForCancellation()
+            print("MR-UNDO-NATIVE fixture-disposal-cancellation-join-finished")
             adapter.invalidateTokens()
             // The provider owns the uncached tracking Realm, target readers,
             // and references to the cached target writers.
@@ -17531,9 +17664,11 @@ final class RealmAdapterFixtureOwner {
 
         var releasedAllWriters = true
         for configuration in targetConfigurations {
+            print("MR-UNDO-NATIVE fixture-disposal-writer-eviction-started")
             let released = await Task { @RealmBackgroundActor in
                 await RealmBackgroundActor.shared.releaseOwnedBigSyncFixture(configuration)
             }.value
+            print("MR-UNDO-NATIVE fixture-disposal-writer-eviction-finished")
             releasedAllWriters = releasedAllWriters && released
         }
         // The eviction assertion reports an unjoined writer. Preserve both
