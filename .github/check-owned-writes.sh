@@ -12,7 +12,11 @@ if [[ ! -d "$host/SwiftParser.swiftmodule" || ! -d "$host/SwiftSyntax.swiftmodul
     exit 1
 fi
 work="$(mktemp -d "${TMPDIR:-/tmp}/bigsync-owned-writes.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+preserve_scratch() {
+    mkdir -p "$HOME/.Trash"
+    mv "$work" "$HOME/.Trash/"
+}
+trap preserve_scratch EXIT
 "$compiler" --version
 "$compiler" -swift-version 6 -I "$host" -L "$host" \
     -lSwiftParser -lSwiftSyntax -Xlinker -rpath -Xlinker "$host" \
