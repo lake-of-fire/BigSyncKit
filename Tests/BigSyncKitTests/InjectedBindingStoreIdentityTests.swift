@@ -80,6 +80,46 @@ final class InjectedBindingStoreIdentityTests: XCTestCase {
 final class BigSyncClientIdentityLeaseRegressionTests: XCTestCase {
     private enum TestFailure: Error { case replacement }
 
+    func testValidationRejectsBeforeFirstIdentityUnderExclusiveLeaseAndAllowsStartup() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncInitialValidation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "initial-validation", containerName: "iCloud.test.restore",
+            recordZoneID: .init(zoneName: "restore-zone"), sharedStateBaseURL: root
+        )
+        let leaseURL = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace, sharedBaseURL: root
+        ).appendingPathExtension("lease")
+        var validations = 0
+        var replacements = 0
+        var rollbacks = 0
+        let transaction = UUID()
+        for _ in 0..<2 {
+            XCTAssertThrowsError(try identity.withManualBackupRestore(
+                transactionIdentifier: transaction,
+                validation: {
+                    validations += 1
+                    let competitor = Darwin.open(leaseURL.path, O_RDWR)
+                    guard competitor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+                    defer { Darwin.close(competitor) }
+                    XCTAssertFalse(try self.canAcquire(LOCK_SH, descriptor: competitor))
+                    throw TestFailure.replacement
+                },
+                { replacements += 1 },
+                rollback: { rollbacks += 1 }
+            )) { error in
+                XCTAssertTrue(error is TestFailure)
+            }
+            XCTAssertNil(identity.currentInstallationIdentifier())
+        }
+        XCTAssertEqual(validations, 2)
+        XCTAssertEqual(replacements, 0)
+        XCTAssertEqual(rollbacks, 0)
+        let installation = try identity.prepareInstallation()
+        XCTAssertEqual(identity.currentInstallationIdentifier(), installation)
+    }
+
     func testSharedRetentionPreservesExclusiveOwner() throws {
         try withLease { url, competitor in
             try BigSyncClientIdentityLeaseRegistry.withExclusive(at: url) {
