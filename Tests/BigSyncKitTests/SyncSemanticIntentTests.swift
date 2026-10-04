@@ -153,16 +153,23 @@ final class SyncSemanticIntentTests: XCTestCase {
 
     @BigSyncBackgroundActor
     func testBackupBootstrapStillProtectsGenuineNewMutation() async throws {
+        let diagnosticPrefix = "MR-UNDO-NATIVE backup-new-mutation"
+        print("\(diagnosticPrefix) body-entered")
+        defer { print("\(diagnosticPrefix) body-exited") }
+        print("\(diagnosticPrefix) fixture-open-started")
         let (adapter, _) = try await fixture()
+        print("\(diagnosticPrefix) inbound-record-apply-started")
         _ = try await adapter.saveChanges(in: [record(
             SyncIntentMutable.self, adapter: adapter, payload: "backup", at: 2_000
         )], forceSave: true)
+        print("\(diagnosticPrefix) restore-bootstrap-started")
         try await beginRestore(adapter)
         let realm = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
         let objectID = "one"
         let recordName = SyncIntentMutable.className() + "." + objectID
         let configuration = realm.configuration
         try await Task { @RealmBackgroundActor in
+            print("\(diagnosticPrefix) writer-transaction-started")
             try await RealmBackgroundActor.shared.write(configuration: configuration) { writer in
                 let value = try XCTUnwrap(writer.object(
                     ofType: SyncIntentMutable.self, forPrimaryKey: objectID
@@ -174,19 +181,23 @@ final class SyncSemanticIntentTests: XCTestCase {
                 )
             }
         }.value
+        print("\(diagnosticPrefix) reader-refresh-started")
         await realm.asyncRefresh()
         let generation = try XCTUnwrap(realm.object(
             ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
         )?.generation)
+        print("\(diagnosticPrefix) inbound-record-apply-started")
         _ = try await adapter.saveChanges(in: [record(
             SyncIntentMutable.self, adapter: adapter, payload: "server", at: 4_000
         )], forceSave: true)
-        realm.refresh()
-        let value = try XCTUnwrap(realm.object(
+        let currentRealm = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        print("\(diagnosticPrefix) reader-refresh-started")
+        await currentRealm.asyncRefresh()
+        let value = try XCTUnwrap(currentRealm.object(
             ofType: SyncIntentMutable.self, forPrimaryKey: objectID
         ))
         XCTAssertEqual(value.payload, "post-restore-user-edit")
-        XCTAssertEqual(realm.object(
+        XCTAssertEqual(currentRealm.object(
             ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
         )?.generation, generation)
     }
