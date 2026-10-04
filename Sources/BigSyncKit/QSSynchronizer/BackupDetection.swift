@@ -498,7 +498,8 @@ enum BackupDetection {
         namespace: String,
         transactionIdentifier: UUID,
         sharedSentinelBaseURL: URL? = nil,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        allowsAbsentManualRecordsForCancellation: Bool = false
     ) throws -> ManualRestorePreflight {
         let sentinelURL = defaultSentinelURL(
             namespace: namespace,
@@ -511,7 +512,9 @@ enum BackupDetection {
             try manualRestorePreflightLocked(
                 transactionIdentifier: transactionIdentifier,
                 sentinelURL: sentinelURL,
-                fileManager: fileManager
+                fileManager: fileManager,
+                allowsAbsentManualRecordsForCancellation:
+                    allowsAbsentManualRecordsForCancellation
             )
         }
     }
@@ -519,7 +522,8 @@ enum BackupDetection {
     private static func manualRestorePreflightLocked(
         transactionIdentifier: UUID,
         sentinelURL: URL,
-        fileManager: FileManager
+        fileManager: FileManager,
+        allowsAbsentManualRecordsForCancellation: Bool = false
     ) throws -> ManualRestorePreflight {
         let intentURL = manualRestoreIntentURL(sentinelURL: sentinelURL)
         let eventURL = restoreEventURL(sentinelURL: sentinelURL)
@@ -529,6 +533,26 @@ enum BackupDetection {
             sentinelURL: sentinelURL
         )
         let completedExists = fileManager.fileExists(atPath: completedURL.path)
+        // Only cancellation can finish without an installation, and only
+        // after proving that no durable manual record exists under this lock.
+        // This does not publish identity or consume restored marker evidence.
+        if allowsAbsentManualRecordsForCancellation,
+           !intentExists, !eventExists, !completedExists {
+            // fileExists follows symlinks and can also hide inspection errors.
+            // Require an explicit missing-file result for every artifact.
+            for url in [intentURL, eventURL, completedURL] {
+                do {
+                    _ = try fileManager.attributesOfItem(atPath: url.path)
+                } catch let error as CocoaError where
+                    error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+                    continue
+                } catch {
+                    throw Error.manualRestoreStateAmbiguous
+                }
+                throw Error.manualRestoreStateAmbiguous
+            }
+            return .newTransaction
+        }
         let completed = completedExists ? manualRestoreReceipt(at: completedURL) : nil
         let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
         let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil

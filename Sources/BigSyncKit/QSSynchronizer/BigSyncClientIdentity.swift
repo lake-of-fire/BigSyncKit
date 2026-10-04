@@ -417,6 +417,8 @@ public struct BigSyncClientIdentity: Sendable {
     /// Removes only a matching pre-replacement intent after the caller has
     /// durably verified rollback. A durable restore event can never be
     /// cancelled through this API because it already owns the replacement.
+    /// With no durable manual records, cancellation is an idempotent no-op
+    /// even before first installation; it never establishes identity.
     public func cancelManualBackupRestoreIntent(
         transactionIdentifier: UUID
     ) throws {
@@ -426,7 +428,8 @@ public struct BigSyncClientIdentity: Sendable {
                 preflight = try BackupDetection.manualRestorePreflight(
                     namespace: durableStateNamespace,
                     transactionIdentifier: transactionIdentifier,
-                    sharedSentinelBaseURL: sharedStateBaseURL
+                    sharedSentinelBaseURL: sharedStateBaseURL,
+                    allowsAbsentManualRecordsForCancellation: true
                 )
             } catch BackupDetection.Error.manualRestoreTransactionMismatch {
                 throw BigSyncManualBackupRestoreError.transactionMismatch
