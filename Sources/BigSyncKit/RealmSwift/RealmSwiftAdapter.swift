@@ -2207,7 +2207,10 @@ public final class RealmSwiftAdapter:
 #endif
             .sink { @Sendable [weak self] _ in
                 guard let self else { return }
-                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                // This drain shares the actor and tracking Realm with foreground
+                // synchronization. Do not demote its admission: a foreground
+                // drain can queue behind its already acquired async transaction.
+                Task { @BigSyncBackgroundActor [weak self] in
                     self?.startObservedRealmChangesTaskIfNeeded()
                 }
             }
@@ -2286,11 +2289,16 @@ public final class RealmSwiftAdapter:
         traceJournalForwarding("observed-admission-accepted task=\(taskID)")
 #endif
         observedRealmChangesTaskID = taskID
-        observedRealmChangesTask = Task(priority: .background) {
+        // Preserve the admitting task's priority. Callers can wait on a
+        // post-write lifecycle barrier rather than this task's value, so Swift
+        // cannot donate their priority through a Task.value dependency.
+        observedRealmChangesTask = Task {
             @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
 #if DEBUG
-            traceJournalForwarding("observed-task-entered task=\(taskID)")
+            traceJournalForwarding(
+                "observed-task-entered task=\(taskID) priority=\(Task.currentPriority.rawValue)"
+            )
             defer { traceJournalForwarding("observed-task-exited task=\(taskID)") }
 #endif
             do {

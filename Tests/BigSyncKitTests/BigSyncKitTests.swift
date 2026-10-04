@@ -14821,6 +14821,7 @@ final class BigSyncKitTests: XCTestCase {
         print("\(diagnosticPrefix) generation-unwrapped")
         let enteredPostWrite = AsyncGate()
         let releasePostWrite = AsyncGate()
+        let admissionPriority = TaskPriority.userInitiated
         // Teardown runs LIFO: release this barrier before fixture disposal joins forwarding.
         let adapter = fixture.adapter
         addTeardownBlock { @BigSyncBackgroundActor in
@@ -14830,6 +14831,7 @@ final class BigSyncKitTests: XCTestCase {
         }
         fixture.adapter._testAfterPendingMutationTrackingWrite = {
             print("\(diagnosticPrefix) post-write-entered")
+            XCTAssertGreaterThanOrEqual(Task.currentPriority, admissionPriority)
             await enteredPostWrite.open()
             print("\(diagnosticPrefix) post-write-release-wait-started")
             await releasePostWrite.wait()
@@ -14837,21 +14839,23 @@ final class BigSyncKitTests: XCTestCase {
         print("\(diagnosticPrefix) hook-installed")
         fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
         print("\(diagnosticPrefix) observed-enqueued")
-        fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
+        await Task(priority: admissionPriority) { @BigSyncBackgroundActor in
+            fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
+        }.value
         print("\(diagnosticPrefix) observed-start-requested")
         print("\(diagnosticPrefix) post-write-entry-wait-started")
         await enteredPostWrite.wait()
 
+        let cancellationRequested = AsyncGate()
         let reset = Task { @BigSyncBackgroundActor in
             fixture.adapter.cancelSynchronization()
+            await cancellationRequested.open()
             print("\(diagnosticPrefix) cancellation-join-started")
             await fixture.adapter.waitForCancellation()
             print("\(diagnosticPrefix) cache-reset-started")
             try await fixture.adapter.resetSyncCaches()
         }
-        for _ in 0..<20 {
-            await Task.yield()
-        }
+        await cancellationRequested.wait()
         print("\(diagnosticPrefix) post-write-release-started")
         await releasePostWrite.open()
         print("\(diagnosticPrefix) reset-task-join-started")
