@@ -13,7 +13,7 @@ Current canonical main contains newer implementations of those responsibilities 
 
 Canonical BigSync requires RealmSwift `from: 20.0.5`. Reader #214 pairs this child head with Reader's exact Realm 20.0.5 Tuist selection.
 
-This qualification PR changes no runtime source. It runs the complete BigSync package tests in Debug and Release on macOS. Reader/Core consumer compilation and signed CloudKit journeys remain separate gates.
+This qualification PR changes no runtime source. Its macOS workflow runs the complete BigSync package tests in Debug and builds the production package in Release. It does not run Release tests. These are workflow scopes, not a claim that a particular run passed; Reader/Core consumer compilation and signed CloudKit journeys remain separate gates.
 
 
 ## Sibling path dependencies
