@@ -25,6 +25,22 @@ final class BackupDetectionTests: XCTestCase {
         func synchronize() -> Bool { true }
     }
 
+    private final class InspectionErrorFileManager: FileManager, @unchecked Sendable {
+        let failingPath: String
+
+        init(failingPath: String) {
+            self.failingPath = failingPath
+            super.init()
+        }
+
+        override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
+            if path == failingPath {
+                throw CocoaError(.fileReadNoPermission)
+            }
+            return try super.attributesOfItem(atPath: path)
+        }
+    }
+
     private let store = Store()
 
     private final class CountingDurableStore: NSObject,
@@ -452,6 +468,16 @@ final class BackupDetectionTests: XCTestCase {
             }
             XCTAssertEqual(receipt, first)
         }
+
+        let completedBytes = try Data(contentsOf: completedReceiptURL)
+        let rawReceipt = try XCTUnwrap(BackupDetection.manualRestoreReceipt(at: completedReceiptURL))
+        XCTAssertThrowsError(try BackupDetection.cancelManualRestoreIntent(
+            namespace: identity.durableStateNamespace,
+            receipt: rawReceipt, sharedSentinelBaseURL: base
+        )) { error in
+            XCTAssertEqual(error as? BackupDetection.Error, .manualRestoreStateAmbiguous)
+        }
+        XCTAssertEqual(try Data(contentsOf: completedReceiptURL), completedBytes)
 
         let resumed = try identity.withManualBackupRestore(
             transactionIdentifier: transactionIdentifier,
@@ -1008,6 +1034,432 @@ final class BackupDetectionTests: XCTestCase {
             sharedSentinelBaseURL: base
         ))
         XCTAssertEqual(identity.currentInstallationIdentifier(), original)
+    }
+
+    func testCancelAbsentManualIntentBeforeFirstInstallationIsIdempotent() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "cancel-before-first-installation",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+            sharedStateBaseURL: base
+        )
+        let sentinel = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace, sharedBaseURL: base
+        )
+        let transaction = UUID()
+        for identifier in [transaction, transaction, UUID()] {
+            try identity.cancelManualBackupRestoreIntent(transactionIdentifier: identifier)
+            XCTAssertNil(identity.currentInstallationIdentifier())
+            for url in [sentinel, BackupDetection.markerURL(sentinelURL: sentinel),
+                        BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel),
+                        BackupDetection.restoreEventURL(sentinelURL: sentinel),
+                        BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            }
+        }
+        // Cancellation alone cannot grant normal restore admission.
+        var replacementCount = 0
+        XCTAssertThrowsError(try identity.withManualBackupRestore(
+            transactionIdentifier: transaction, { replacementCount += 1 }
+        )) { error in
+            XCTAssertEqual(error as? BigSyncManualBackupRestoreError, .stateAmbiguous)
+        }
+        XCTAssertEqual(replacementCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+        let installation = try identity.prepareInstallation()
+        XCTAssertEqual(identity.currentInstallationIdentifier(), installation)
+    }
+
+    func testCancelMalformedOrphanManualRecordsWithoutSentinelRemainsFenced() throws {
+        for kind in 0..<3 {
+            let base = temporaryRoot()
+            let identity = BigSyncClientIdentity(
+                synchronizerName: "cancel-malformed-orphan",
+                containerName: "container",
+                recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+                sharedStateBaseURL: base
+            )
+            let sentinel = BackupDetection.defaultSentinelURL(
+                namespace: identity.durableStateNamespace, sharedBaseURL: base
+            )
+            let artifacts = [BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel),
+                             BackupDetection.restoreEventURL(sentinelURL: sentinel),
+                             BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)]
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            let bytes = Data("malformed orphan manual record".utf8)
+            try bytes.write(to: artifacts[kind], options: .atomic)
+            for _ in 0..<2 {
+                XCTAssertThrowsError(try identity.cancelManualBackupRestoreIntent(
+                    transactionIdentifier: UUID()
+                )) { error in
+                    XCTAssertEqual(error as? BigSyncManualBackupRestoreError, .stateAmbiguous)
+                }
+                XCTAssertEqual(try Data(contentsOf: artifacts[kind]), bytes)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+                XCTAssertNil(identity.currentInstallationIdentifier())
+            }
+        }
+    }
+
+    func testCancelValidOrphanManualRecordsWithoutSentinelRemainsFenced() throws {
+        let source = temporaryRoot()
+        let namespace = "cancel-valid-orphan-source"
+        _ = try BackupDetection.run(store: store, namespace: namespace, sharedSentinelBaseURL: source)
+        let transaction = UUID()
+        _ = try BackupDetection.prepareManualRestoreIntent(
+            namespace: namespace, transactionIdentifier: transaction, sharedSentinelBaseURL: source
+        )
+        let sourceSentinel = BackupDetection.defaultSentinelURL(
+            namespace: namespace, sharedBaseURL: source
+        )
+        let intentBytes = try Data(contentsOf: BackupDetection.manualRestoreIntentURL(
+            sentinelURL: sourceSentinel
+        ))
+        _ = try BackupDetection.beginManualRestore(
+            namespace: namespace, transactionIdentifier: transaction, sharedSentinelBaseURL: source
+        )
+        let records = [intentBytes,
+                       try Data(contentsOf: BackupDetection.restoreEventURL(sentinelURL: sourceSentinel)),
+                       try Data(contentsOf: BackupDetection.completedManualRestoreReceiptURL(
+                           sentinelURL: sourceSentinel
+                       ))]
+        for kind in 0..<3 {
+            let base = temporaryRoot()
+            let identity = BigSyncClientIdentity(
+                synchronizerName: "cancel-valid-orphan",
+                containerName: "container",
+                recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+                sharedStateBaseURL: base
+            )
+            let sentinel = BackupDetection.defaultSentinelURL(
+                namespace: identity.durableStateNamespace, sharedBaseURL: base
+            )
+            let artifacts = [BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel),
+                             BackupDetection.restoreEventURL(sentinelURL: sentinel),
+                             BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)]
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            try records[kind].write(to: artifacts[kind], options: .atomic)
+            XCTAssertNotNil(BackupDetection.manualRestoreReceipt(at: artifacts[kind]))
+            for identifier in [transaction, UUID()] {
+                XCTAssertThrowsError(try identity.cancelManualBackupRestoreIntent(
+                    transactionIdentifier: identifier
+                )) { error in
+                    XCTAssertEqual(error as? BigSyncManualBackupRestoreError, .stateAmbiguous)
+                }
+                XCTAssertEqual(try Data(contentsOf: artifacts[kind]), records[kind])
+                XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+                XCTAssertNil(identity.currentInstallationIdentifier())
+            }
+        }
+    }
+
+    func testCancelDanglingOrphanManualRecordsWithoutSentinelRemainsFenced() throws {
+        for kind in 0..<3 {
+            let base = temporaryRoot()
+            let identity = BigSyncClientIdentity(
+                synchronizerName: "cancel-dangling-orphan",
+                containerName: "container",
+                recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+                sharedStateBaseURL: base
+            )
+            let sentinel = BackupDetection.defaultSentinelURL(
+                namespace: identity.durableStateNamespace, sharedBaseURL: base
+            )
+            let artifacts = [BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel),
+                             BackupDetection.restoreEventURL(sentinelURL: sentinel),
+                             BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)]
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            let destination = base.appendingPathComponent("missing-receipt").path
+            try FileManager.default.createSymbolicLink(
+                atPath: artifacts[kind].path, withDestinationPath: destination
+            )
+            XCTAssertThrowsError(try identity.cancelManualBackupRestoreIntent(
+                transactionIdentifier: UUID()
+            )) { error in
+                XCTAssertEqual(error as? BigSyncManualBackupRestoreError, .stateAmbiguous)
+            }
+            XCTAssertEqual(
+                try FileManager.default.destinationOfSymbolicLink(atPath: artifacts[kind].path),
+                destination
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+            XCTAssertNil(identity.currentInstallationIdentifier())
+        }
+    }
+
+    func testPublicManualRestoreRejectsDanglingMixedCompanions() throws {
+        try assertMixedManualRestoreCompanionsRemainFenced(dangling: true)
+    }
+
+    func testPublicManualRestoreRejectsMalformedMixedCompanions() throws {
+        try assertMixedManualRestoreCompanionsRemainFenced(dangling: false)
+    }
+
+    private func assertMixedManualRestoreCompanionsRemainFenced(dangling: Bool) throws {
+        for kind in 0..<2 {
+            let base = temporaryRoot()
+            let identity = BigSyncClientIdentity(
+                synchronizerName: "mixed-manual-artifacts",
+                containerName: "container",
+                recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+                sharedStateBaseURL: base
+            )
+            let installation = try identity.prepareInstallation()
+            let transaction = UUID()
+            let receipt = try BackupDetection.prepareManualRestoreIntent(
+                namespace: identity.durableStateNamespace,
+                transactionIdentifier: transaction, sharedSentinelBaseURL: base
+            )
+            XCTAssertEqual(receipt.oldInstallationIdentifier, installation)
+            let sentinel = BackupDetection.defaultSentinelURL(
+                namespace: identity.durableStateNamespace, sharedBaseURL: base
+            )
+            let intent = BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel)
+            let companion = [BackupDetection.restoreEventURL(sentinelURL: sentinel),
+                             BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)][kind]
+            let sentinelBytes = try Data(contentsOf: sentinel)
+            let intentBytes = try Data(contentsOf: intent)
+            let malformedBytes = Data("malformed mixed companion".utf8)
+            let destination = base.appendingPathComponent("missing-companion").path
+            if dangling {
+                try FileManager.default.createSymbolicLink(
+                    atPath: companion.path, withDestinationPath: destination
+                )
+            } else {
+                try malformedBytes.write(to: companion, options: .atomic)
+            }
+            for _ in 0..<2 {
+                XCTAssertThrowsError(try identity.cancelManualBackupRestoreIntent(
+                    transactionIdentifier: transaction
+                )) { error in
+                    XCTAssertEqual(error as? BigSyncManualBackupRestoreError, .stateAmbiguous)
+                }
+                // Direct raw cancellation must inspect companions itself;
+                // public preflight is not a substitute for its locked check.
+                XCTAssertThrowsError(try BackupDetection.cancelManualRestoreIntent(
+                    namespace: identity.durableStateNamespace,
+                    receipt: receipt, sharedSentinelBaseURL: base
+                )) { error in
+                    XCTAssertEqual(error as? BackupDetection.Error, .manualRestoreStateAmbiguous)
+                }
+                var replacementCount = 0
+                var rollbackCount = 0
+                XCTAssertThrowsError(try identity.withManualBackupRestore(
+                    transactionIdentifier: transaction,
+                    { replacementCount += 1 },
+                    rollback: { rollbackCount += 1 }
+                )) { error in
+                    XCTAssertEqual(error as? BigSyncManualBackupRestoreError, .stateAmbiguous)
+                }
+                XCTAssertEqual(replacementCount, 0)
+                XCTAssertEqual(rollbackCount, 0)
+                XCTAssertEqual(try Data(contentsOf: sentinel), sentinelBytes)
+                XCTAssertEqual(try Data(contentsOf: intent), intentBytes)
+                if dangling {
+                    XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(
+                        atPath: companion.path
+                    ), destination)
+                } else {
+                    XCTAssertEqual(try Data(contentsOf: companion), malformedBytes)
+                }
+                XCTAssertEqual(BackupDetection.installationIdentifier(sentinelURL: sentinel), installation)
+                XCTAssertNil(identity.currentInstallationIdentifier())
+                XCTAssertNil(identity.currentMutationJournalIdentity())
+            }
+        }
+    }
+
+    func testManualRestoreInspectionErrorsRemainAmbiguousWithMatchingIntent() throws {
+        let namespace = "mixed-inspection-error"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(store: store, namespace: namespace, sharedSentinelBaseURL: base)
+        let transaction = UUID()
+        let receipt = try BackupDetection.prepareManualRestoreIntent(
+            namespace: namespace, transactionIdentifier: transaction, sharedSentinelBaseURL: base
+        )
+        let sentinel = BackupDetection.defaultSentinelURL(namespace: namespace, sharedBaseURL: base)
+        let intent = BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel)
+        let sentinelBytes = try Data(contentsOf: sentinel)
+        let intentBytes = try Data(contentsOf: intent)
+        for artifact in [intent, BackupDetection.restoreEventURL(sentinelURL: sentinel),
+                         BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)] {
+            let manager = InspectionErrorFileManager(failingPath: artifact.path)
+            for cancellation in [false, true] {
+                XCTAssertThrowsError(try BackupDetection.manualRestorePreflight(
+                    namespace: namespace, transactionIdentifier: transaction,
+                    sharedSentinelBaseURL: base, fileManager: manager,
+                    allowsAbsentManualRecordsForCancellation: cancellation
+                )) { error in
+                    XCTAssertEqual(error as? BackupDetection.Error, .manualRestoreStateAmbiguous)
+                }
+            }
+            XCTAssertThrowsError(try BackupDetection.cancelManualRestoreIntent(
+                namespace: namespace, receipt: receipt,
+                sharedSentinelBaseURL: base, fileManager: manager
+            )) { error in
+                XCTAssertEqual(error as? BackupDetection.Error, .manualRestoreStateAmbiguous)
+            }
+            XCTAssertEqual(try Data(contentsOf: sentinel), sentinelBytes)
+            XCTAssertEqual(try Data(contentsOf: intent), intentBytes)
+        }
+    }
+
+    func testRawAndPublicCancellationRejectValidEventBeforeIdentityPublication() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "cancel-valid-event",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+            sharedStateBaseURL: base
+        )
+        _ = try identity.prepareInstallation()
+        let transaction = UUID()
+        let receipt = try BackupDetection.prepareManualRestoreIntent(
+            namespace: identity.durableStateNamespace,
+            transactionIdentifier: transaction, sharedSentinelBaseURL: base
+        )
+        XCTAssertThrowsError(try BackupDetection.beginManualRestore(
+            namespace: identity.durableStateNamespace,
+            transactionIdentifier: transaction, sharedSentinelBaseURL: base,
+            sentinelPublisher: { _, _ in throw CocoaError(.fileWriteUnknown) }
+        ))
+        let sentinel = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace, sharedBaseURL: base
+        )
+        let artifacts = [sentinel, BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel),
+                         BackupDetection.restoreEventURL(sentinelURL: sentinel)]
+        let bytes = try artifacts.map { try Data(contentsOf: $0) }
+        XCTAssertThrowsError(try identity.cancelManualBackupRestoreIntent(
+            transactionIdentifier: transaction
+        )) { error in
+            guard let error = error as? BigSyncManualBackupRestoreError,
+                  case .handoffPending(let pending) = error else {
+                return XCTFail("A valid event must remain noncancellable")
+            }
+            XCTAssertEqual(pending.transactionIdentifier, transaction)
+        }
+        XCTAssertThrowsError(try BackupDetection.cancelManualRestoreIntent(
+            namespace: identity.durableStateNamespace,
+            receipt: receipt, sharedSentinelBaseURL: base
+        )) { error in
+            XCTAssertEqual(error as? BackupDetection.Error, .manualRestoreStateAmbiguous)
+        }
+        for (artifact, original) in zip(artifacts, bytes) {
+            XCTAssertEqual(try Data(contentsOf: artifact), original)
+        }
+        XCTAssertNil(identity.currentInstallationIdentifier())
+    }
+
+    func testRawManualIntentCancellationPreservesCompletedPredecessorAndIsIdempotent() throws {
+        let namespace = "cancel-successor-intent"
+        let base = temporaryRoot()
+        _ = try BackupDetection.run(store: store, namespace: namespace, sharedSentinelBaseURL: base)
+        let predecessor = try BackupDetection.beginManualRestore(
+            namespace: namespace, transactionIdentifier: UUID(), sharedSentinelBaseURL: base
+        )
+        try BackupDetection.markRestoreResetCompleted(
+            namespace: namespace,
+            expectedEventIdentifier: predecessor.restoreEventIdentifier.uuidString.lowercased(),
+            sharedSentinelBaseURL: base
+        )
+        let sentinel = BackupDetection.defaultSentinelURL(namespace: namespace, sharedBaseURL: base)
+        let completed = BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)
+        let sentinelBytes = try Data(contentsOf: sentinel)
+        let completedBytes = try Data(contentsOf: completed)
+        let successor = try BackupDetection.prepareManualRestoreIntent(
+            namespace: namespace, transactionIdentifier: UUID(), sharedSentinelBaseURL: base
+        )
+        XCTAssertEqual(successor.oldInstallationIdentifier, predecessor.newInstallationIdentifier)
+        for _ in 0..<2 {
+            try BackupDetection.cancelManualRestoreIntent(
+                namespace: namespace, receipt: successor, sharedSentinelBaseURL: base
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath:
+                BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel).path
+            ))
+            XCTAssertEqual(try Data(contentsOf: sentinel), sentinelBytes)
+            XCTAssertEqual(try Data(contentsOf: completed), completedBytes)
+        }
+    }
+
+    func testCancelMarkerOnlyRestorePreservesEvidenceWithoutPublishingIdentity() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "cancel-marker-only",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+            sharedStateBaseURL: base
+        )
+        let sentinel = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace, sharedBaseURL: base
+        )
+        let installed = temporaryRoot().appendingPathComponent("installed")
+        _ = try BackupDetection.run(
+            store: store, namespace: identity.durableStateNamespace, sentinelURL: installed
+        )
+        try simulateRestoredMarker(from: installed, to: sentinel)
+        let marker = BackupDetection.markerURL(sentinelURL: sentinel)
+        let bytes = try Data(contentsOf: marker)
+        let transaction = UUID()
+        for _ in 0..<2 {
+            try identity.cancelManualBackupRestoreIntent(transactionIdentifier: transaction)
+            XCTAssertEqual(try Data(contentsOf: marker), bytes)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+            XCTAssertNil(identity.currentInstallationIdentifier())
+            XCTAssertNil(identity.currentMutationJournalIdentity())
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: identity.synchronizationStateFileURL.path
+            ))
+            for url in [BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel),
+                        BackupDetection.restoreEventURL(sentinelURL: sentinel),
+                        BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            }
+        }
+        // Ordinary startup must still recognize the restored marker.
+        _ = try identity.prepareInstallation()
+        XCTAssertEqual(try Data(contentsOf: marker), bytes)
+        XCTAssertTrue(BackupDetection.restoreResetIsRequired(
+            namespace: identity.durableStateNamespace, sharedSentinelBaseURL: base
+        ))
+        XCTAssertNotNil(BackupDetection.restoreResetEventIdentifier(
+            namespace: identity.durableStateNamespace, sharedSentinelBaseURL: base
+        ))
+    }
+
+    func testCancelMismatchedManualIntentPreservesFenceAndBytes() throws {
+        let base = temporaryRoot()
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "cancel-mismatched-intent",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+            sharedStateBaseURL: base
+        )
+        let installation = try identity.prepareInstallation()
+        let transaction = UUID()
+        _ = try BackupDetection.prepareManualRestoreIntent(
+            namespace: identity.durableStateNamespace,
+            transactionIdentifier: transaction, sharedSentinelBaseURL: base
+        )
+        let sentinel = BackupDetection.defaultSentinelURL(
+            namespace: identity.durableStateNamespace, sharedBaseURL: base
+        )
+        let intent = BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel)
+        let sentinelBytes = try Data(contentsOf: sentinel)
+        let intentBytes = try Data(contentsOf: intent)
+        XCTAssertThrowsError(try identity.cancelManualBackupRestoreIntent(
+            transactionIdentifier: UUID()
+        )) { error in
+            XCTAssertEqual(error as? BigSyncManualBackupRestoreError, .transactionMismatch)
+        }
+        XCTAssertNil(identity.currentInstallationIdentifier())
+        XCTAssertEqual(try Data(contentsOf: sentinel), sentinelBytes)
+        XCTAssertEqual(try Data(contentsOf: intent), intentBytes)
+        try identity.cancelManualBackupRestoreIntent(transactionIdentifier: transaction)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: intent.path))
+        XCTAssertEqual(try Data(contentsOf: sentinel), sentinelBytes)
+        XCTAssertEqual(identity.currentInstallationIdentifier(), installation)
     }
 
     func testClientIdentityRejectsMismatchedTransactionBeforeReplacement() throws {

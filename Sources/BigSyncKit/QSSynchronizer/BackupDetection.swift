@@ -474,12 +474,36 @@ enum BackupDetection {
             sentinelURL: sentinelURL,
             fileManager: fileManager
         ) {
-            guard !fileManager.fileExists(
-                atPath: restoreEventURL(sentinelURL: sentinelURL).path
-            ), installationIdentifier(
+            // The public admission check cannot protect a direct raw call or
+            // a companion artifact published before this lock was acquired.
+            let state: ManualRestorePreflight
+            do {
+                state = try manualRestorePreflightLocked(
+                    transactionIdentifier: receipt.transactionIdentifier,
+                    sentinelURL: sentinelURL,
+                    fileManager: fileManager
+                )
+            } catch Error.manualRestoreTransactionMismatch {
+                // Raw cancellation historically rejects any nonmatching
+                // receipt as ambiguous rather than granting removal.
+                throw Error.manualRestoreStateAmbiguous
+            }
+            guard installationIdentifier(
                 sentinelURL: sentinelURL,
                 fileManager: fileManager
             ) == receipt.oldInstallationIdentifier else {
+                throw Error.manualRestoreStateAmbiguous
+            }
+            switch state {
+            case .resumeIntent(let existing):
+                guard existing == receipt else {
+                    throw Error.manualRestoreStateAmbiguous
+                }
+            case .newTransaction:
+                // An already removed intent remains an idempotent no-op only
+                // when the complete durable state proves the old installation.
+                return
+            case .resumeEvent, .completed:
                 throw Error.manualRestoreStateAmbiguous
             }
             try removeManualRestoreIntentLocked(
@@ -498,7 +522,8 @@ enum BackupDetection {
         namespace: String,
         transactionIdentifier: UUID,
         sharedSentinelBaseURL: URL? = nil,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        allowsAbsentManualRecordsForCancellation: Bool = false
     ) throws -> ManualRestorePreflight {
         let sentinelURL = defaultSentinelURL(
             namespace: namespace,
@@ -511,7 +536,9 @@ enum BackupDetection {
             try manualRestorePreflightLocked(
                 transactionIdentifier: transactionIdentifier,
                 sentinelURL: sentinelURL,
-                fileManager: fileManager
+                fileManager: fileManager,
+                allowsAbsentManualRecordsForCancellation:
+                    allowsAbsentManualRecordsForCancellation
             )
         }
     }
@@ -519,16 +546,37 @@ enum BackupDetection {
     private static func manualRestorePreflightLocked(
         transactionIdentifier: UUID,
         sentinelURL: URL,
-        fileManager: FileManager
+        fileManager: FileManager,
+        allowsAbsentManualRecordsForCancellation: Bool = false
     ) throws -> ManualRestorePreflight {
         let intentURL = manualRestoreIntentURL(sentinelURL: sentinelURL)
         let eventURL = restoreEventURL(sentinelURL: sentinelURL)
-        let intentExists = fileManager.fileExists(atPath: intentURL.path)
-        let eventExists = fileManager.fileExists(atPath: eventURL.path)
         let completedURL = completedManualRestoreReceiptURL(
             sentinelURL: sentinelURL
         )
-        let completedExists = fileManager.fileExists(atPath: completedURL.path)
+        // Inspect the path itself: fileExists follows links and suppresses
+        // errors, so a valid record could otherwise hide a dangling companion.
+        // Every path must be proven present or explicitly missing under this
+        // same lock, regardless of the other records or admission mode.
+        let intentExists = try manualRestoreArtifactExists(
+            at: intentURL,
+            fileManager: fileManager
+        )
+        let eventExists = try manualRestoreArtifactExists(
+            at: eventURL,
+            fileManager: fileManager
+        )
+        let completedExists = try manualRestoreArtifactExists(
+            at: completedURL,
+            fileManager: fileManager
+        )
+        // Only cancellation can finish without an installation, and only
+        // after proving that no durable manual record exists under this lock.
+        // This does not publish identity or consume restored marker evidence.
+        if allowsAbsentManualRecordsForCancellation,
+           !intentExists, !eventExists, !completedExists {
+            return .newTransaction
+        }
         let completed = completedExists ? manualRestoreReceipt(at: completedURL) : nil
         let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
         let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil
@@ -578,6 +626,21 @@ enum BackupDetection {
             throw Error.manualRestoreStateAmbiguous
         }
         return .newTransaction
+    }
+
+    private static func manualRestoreArtifactExists(
+        at url: URL,
+        fileManager: FileManager
+    ) throws -> Bool {
+        do {
+            _ = try fileManager.attributesOfItem(atPath: url.path)
+            return true
+        } catch let error as CocoaError where
+            error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+            return false
+        } catch {
+            throw Error.manualRestoreStateAmbiguous
+        }
     }
 
     private static func prepareManualRestoreIntentLocked(

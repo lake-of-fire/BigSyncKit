@@ -576,6 +576,29 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    @BigSyncBackgroundActor
+    var _testJournalForwardingTrace: (@BigSyncBackgroundActor @Sendable (String) -> Void)?
+    @BigSyncBackgroundActor
+    private var journalForwardingTraceEventSequence: UInt64 = 0
+    @BigSyncBackgroundActor
+    private var journalForwardingTraceOperationSequence: UInt64 = 0
+    private let journalForwardingTraceAdapterID = UUID()
+
+    @BigSyncBackgroundActor
+    private func beginJournalForwardingTraceOperation() -> UInt64 {
+        guard _testJournalForwardingTrace != nil else { return 0 }
+        journalForwardingTraceOperationSequence &+= 1
+        return journalForwardingTraceOperationSequence
+    }
+
+    /// Synchronous, instance-scoped diagnostics; never suspends or changes admission.
+    @BigSyncBackgroundActor
+    private func traceJournalForwarding(_ message: @autoclosure () -> String) {
+        guard let trace = _testJournalForwardingTrace else { return }
+        journalForwardingTraceEventSequence &+= 1
+        trace("MR-UNDO-NATIVE transaction-boundary adapter=\(journalForwardingTraceAdapterID) "
+            + "event=\(journalForwardingTraceEventSequence) \(message())")
+    }
     var _testBeforeChangeFeedResetCompletionMarkerWrite:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
 #endif
@@ -2184,7 +2207,10 @@ public final class RealmSwiftAdapter:
 #endif
             .sink { @Sendable [weak self] _ in
                 guard let self else { return }
-                Task(priority: .background) { @BigSyncBackgroundActor [weak self] in
+                // This drain shares the actor and tracking Realm with foreground
+                // synchronization. Do not demote its admission: a foreground
+                // drain can queue behind its already acquired async transaction.
+                Task { @BigSyncBackgroundActor [weak self] in
                     self?.startObservedRealmChangesTaskIfNeeded()
                 }
             }
@@ -2243,13 +2269,38 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     private func startObservedRealmChangesTaskIfNeeded() {
+#if DEBUG
+        traceJournalForwarding(
+            "observed-admission cancelled=\(cancelSync) preparing=\(isPreparingFencedMigration) "
+                + "setupInterrupted=\(isSetupInterrupted) "
+                + "existingTask=\(String(describing: observedRealmChangesTaskID)) "
+                + "queued=\(observedJournalRecordNames.values.reduce(0) { $0 + $1.count })"
+        )
+#endif
         guard !cancelSync, !isPreparingFencedMigration,
-              observedRealmChangesTask == nil else { return }
+              observedRealmChangesTask == nil else {
+#if DEBUG
+            traceJournalForwarding("observed-admission-declined")
+#endif
+            return
+        }
         let taskID = UUID()
+#if DEBUG
+        traceJournalForwarding("observed-admission-accepted task=\(taskID)")
+#endif
         observedRealmChangesTaskID = taskID
-        observedRealmChangesTask = Task(priority: .background) {
+        // Preserve the admitting task's priority. Callers can wait on a
+        // post-write lifecycle barrier rather than this task's value, so Swift
+        // cannot donate their priority through a Task.value dependency.
+        observedRealmChangesTask = Task {
             @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
+#if DEBUG
+            traceJournalForwarding(
+                "observed-task-entered task=\(taskID) priority=\(Task.currentPriority.rawValue)"
+            )
+            defer { traceJournalForwarding("observed-task-exited task=\(taskID)") }
+#endif
             do {
                 try await processObservedRealmChanges()
             } catch is CancellationError {
@@ -2274,10 +2325,20 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     private func processObservedRealmChanges() async throws {
         guard let targetReaderRealms = realmProvider?.targetReaderRealms else {
+#if DEBUG
+            traceJournalForwarding("observed-process-no-realms taskCancelled=\(Task.isCancelled)")
+#endif
             return
         }
         let observed = observedJournalRecordNames
         observedJournalRecordNames.removeAll(keepingCapacity: true)
+#if DEBUG
+        traceJournalForwarding(
+            "observed-process-entered realms=\(targetReaderRealms.count) "
+                + "names=\(observed.values.reduce(0) { $0 + $1.count })"
+        )
+        defer { traceJournalForwarding("observed-process-exited") }
+#endif
 
         do {
             try Task.checkCancellation()
@@ -2300,6 +2361,11 @@ public final class RealmSwiftAdapter:
             try Task.checkCancellation()
             guard !cancelSync else { throw CancellationError() }
         } catch {
+#if DEBUG
+            traceJournalForwarding(
+                "observed-process-requeue cancelled=\(cancelSync) taskCancelled=\(Task.isCancelled)"
+            )
+#endif
             for (idx, recordNames) in observed {
                 observedJournalRecordNames[idx, default: []]
                     .formUnion(recordNames)
@@ -2454,9 +2520,24 @@ public final class RealmSwiftAdapter:
         notifyDelegate: Bool = true,
         updateStatus: Bool = true
     ) async throws -> Int {
+#if DEBUG
+        let traceOperation = beginJournalForwardingTraceOperation()
+        traceJournalForwarding("forward-entered operation=\(traceOperation) pending=\(pending.count)")
+        defer { traceJournalForwarding("forward-exited operation=\(traceOperation)") }
+#endif
         guard let realmProvider,
-              let persistenceRealm = realmProvider.persistenceRealm else { return 0 }
-        guard !pending.isEmpty else { return 0 }
+              let persistenceRealm = realmProvider.persistenceRealm else {
+#if DEBUG
+            traceJournalForwarding("forward-no-provider operation=\(traceOperation)")
+#endif
+            return 0
+        }
+        guard !pending.isEmpty else {
+#if DEBUG
+            traceJournalForwarding("forward-empty operation=\(traceOperation)")
+#endif
+            return 0
+        }
         let ignoredGenerationsByRecordName = pending.reduce(into: [String: String]()) {
             result, mutation in
             if self.modelTypes[mutation.entityType] == nil
@@ -2470,22 +2551,65 @@ public final class RealmSwiftAdapter:
                 && self.pendingMutationIsEligibleForActiveTransport($0)
         }
 
+#if DEBUG
+        if _testJournalForwardingTrace != nil {
+            traceJournalForwarding(
+                "forward-eligibility operation=\(traceOperation) tracked=\(trackedPending.count) "
+                    + "ignored=\(ignoredGenerationsByRecordName.count)"
+            )
+            for mutation in pending {
+                let accountMatches = accountScopePropertyByClassName[mutation.entityType] == nil
+                    || (activeAccountScopeIdentifier != nil
+                        && mutation.accountScopeIdentifier == activeAccountScopeIdentifier)
+                let bindingMatches = mutation.replicaBindingGenerationIdentifier
+                    == activeReplicaBindingGenerationIdentifier
+                traceJournalForwarding(
+                    "forward-row operation=\(traceOperation) record=\(mutation.recordName) "
+                        + "known=\(modelTypes[mutation.entityType] != nil) "
+                        + "excluded=\(excludedClassNames.contains(mutation.entityType)) "
+                        + "accountMatches=\(accountMatches) "
+                        + "bindingMatches=\(bindingMatches)"
+                )
+            }
+        }
+#endif
         var forwardedCount = 0
         for chunk in trackedPending.chunks(ofCount: 1000) {
 #if DEBUG
+            traceJournalForwarding(
+                "before-hook-entered operation=\(traceOperation) "
+                    + "installed=\(_testBeforePendingMutationTrackingWrite != nil)"
+            )
             try await _testBeforePendingMutationTrackingWrite?()
+            traceJournalForwarding("before-hook-returned operation=\(traceOperation)")
 #endif
             // Queue behind any persistence transaction already admitted on
             // this actor. A direct `write` can attempt a nested begin while an
             // earlier `asyncWrite` is suspended at its commit boundary.
+#if DEBUG
+            traceJournalForwarding(
+                "tracking-write-requested operation=\(traceOperation) "
+                    + "inTransaction=\(persistenceRealm.isInWriteTransaction) chunk=\(chunk.count)"
+            )
+#endif
             try await persistenceRealm.asyncWrite {
+#if DEBUG
+                traceJournalForwarding("tracking-closure-entered operation=\(traceOperation)")
+                defer { traceJournalForwarding("tracking-closure-exited operation=\(traceOperation)") }
+#endif
                 // A frozen/page snapshot can become stale while this task is
                 // waiting for the tracking transaction. Re-resolve each
                 // identity only after that transaction is acquired, keeping
                 // the live-journal read and tracking publication in one
                 // non-suspending boundary so an older pass cannot overwrite a
                 // newer generation already forwarded by reentrant work.
+#if DEBUG
+                traceJournalForwarding("tracking-target-refresh-started operation=\(traceOperation)")
+#endif
                 targetReaderRealm.refresh()
+#if DEBUG
+                traceJournalForwarding("tracking-target-refresh-completed operation=\(traceOperation)")
+#endif
                 let currentMutations: [BigSyncPendingMutationSnapshot] =
                     chunk.compactMap { mutation in
                         guard let current = targetReaderRealm.object(
@@ -2497,6 +2621,11 @@ public final class RealmSwiftAdapter:
                             in: targetReaderRealm
                         )
                     }
+#if DEBUG
+                traceJournalForwarding(
+                    "tracking-live-snapshot operation=\(traceOperation) count=\(currentMutations.count)"
+                )
+#endif
                 for mutation in currentMutations {
                     try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
@@ -2533,7 +2662,13 @@ public final class RealmSwiftAdapter:
                 }
             }
 #if DEBUG
+            traceJournalForwarding("tracking-write-returned operation=\(traceOperation)")
+            traceJournalForwarding(
+                "after-hook-entered operation=\(traceOperation) "
+                    + "installed=\(_testAfterPendingMutationTrackingWrite != nil)"
+            )
             try await _testAfterPendingMutationTrackingWrite?()
+            traceJournalForwarding("after-hook-returned operation=\(traceOperation)")
 #endif
         }
 
