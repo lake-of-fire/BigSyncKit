@@ -1,6 +1,7 @@
 import CloudKit
 import Foundation
 import RealmSwift
+import RealmSwiftGaps
 
 /// A queued target/tracking write must still belong to this transport attempt.
 /// This is a local fence, not another coordinator or durable work queue.
@@ -98,7 +99,7 @@ extension RealmSwiftAdapter {
 #if DEBUG
         try await _testAfterDisappearanceTargetWrite?()
 #endif
-        try await tracking.asyncWrite {
+        try await tracking.asyncWritePreservingOwnership {
             target.refresh()
             try validateRecordEvidenceCut(cut, in: target)
             let name = recordID.recordName
@@ -153,7 +154,7 @@ extension RealmSwiftAdapter {
 #if DEBUG
         try await _testBeforeRemoteDeletionTargetWrite?()
 #endif
-        try await target.asyncWrite {
+        try await target.asyncWritePreservingOwnership {
             try validateRecordEvidenceCut(cut, in: target)
             let object = target.object(ofType: type, forPrimaryKey: objectID)
             if let object, !objectIsEligibleForActiveAccount(object, entityType: type.className()) {
@@ -246,7 +247,7 @@ extension RealmSwiftAdapter {
 #if DEBUG
             try await _testBeforeMissingServerTargetWrite?()
 #endif
-            try await target.asyncWrite {
+            try await target.asyncWritePreservingOwnership {
                 try validateRecordEvidenceCut(cut, in: target)
                 let name = recordID.recordName
                 let base = target.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
@@ -389,7 +390,7 @@ extension RealmSwiftAdapter {
                 throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
             }
             var committedRevision: String?
-            try await target.asyncWrite {
+            try await target.asyncWritePreservingOwnership {
                 try validateRecordEvidenceCut(proof.cut, in: target)
                 let name = recordID.recordName
                 let object = target.object(ofType: type, forPrimaryKey: objectID)
