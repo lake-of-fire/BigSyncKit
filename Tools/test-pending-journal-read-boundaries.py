@@ -38,7 +38,14 @@ def methods(source: str, range_only: bool) -> str:
     last = selected.index("    /// Immediately updates.", first)
     # Keep the snapshot collector and forwarding bodies unchanged. The SDK's
     # polymorphic primary-key/lifecycle decoder is an explicit collaborator.
-    return selected[:first] + selected[last:]
+    selected = selected[:first] + selected[last:]
+    if not range_only:
+        # Retain the actual production committed-read boundary used by all
+        # selected bodies, rather than replacing it with a harness implementation.
+        helper_start = source.index("    @BigSyncBackgroundActor\n    func committedRealmReadSnapshot(")
+        helper_end = source.index("    private func pendingMutationSnapshots(", helper_start)
+        selected = source[helper_start:helper_end] + selected
+    return selected
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)

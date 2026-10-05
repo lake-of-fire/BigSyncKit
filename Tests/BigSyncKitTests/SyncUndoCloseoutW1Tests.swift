@@ -54,6 +54,63 @@ final class W1RetainedArticle: Object, ChangeMetadataRecordable,
 /// CloudKit records are adapter inputs, not evidence of signed cloud delivery.
 final class SyncUndoCloseoutW1Tests: XCTestCase {
     @BigSyncBackgroundActor
+    func testDeletionRebaseIgnoresProvisionalResurrectionAndKeepsOriginalJournal() async throws {
+        try await verifyDeletionRebaseDuringForeignWrite(removesJournal: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionRebaseRetainsCommittedDebtDuringProvisionalJournalRemoval() async throws {
+        try await verifyDeletionRebaseDuringForeignWrite(removesJournal: true)
+    }
+
+    @BigSyncBackgroundActor
+    private func verifyDeletionRebaseDuringForeignWrite(removesJournal: Bool) async throws {
+        let (adapter, realm) = try await fixture()
+        let value = W1ContractNote()
+        value.id = noteID
+        try realm.write {
+            realm.add(value)
+            value.isDeleted = true
+            value.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await adapter._test_forwardPendingMutations(in: realm)
+        let deletion = try XCTUnwrap(try await adapter.preparedRecordDeletions(
+            limit: 1, restrictedToEntityType: nil).first)
+        let generation = try XCTUnwrap(deletion.generation)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let tracked = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: deletion.recordID.recordName))
+        try tracking.write { tracked.encodedRecord = nil }
+        let journal = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: deletion.recordID.recordName))
+        realm.beginWrite()
+        defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+        if removesJournal {
+            realm.delete(journal)
+        } else {
+            value.isDeleted = false
+            value.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let server = note(adapter)
+        try await adapter.rebasePendingDeletionMetadata(using: [server],
+            matchingPreparedGenerations: [deletion.recordID.recordName: generation])
+        XCTAssertTrue(realm.isInWriteTransaction, "Rebase cannot settle the target's independent owner")
+        XCTAssertNotNil(tracked.encodedRecord, "The original committed deletion still owns its system fields")
+        XCTAssertEqual(tracked.entityState, .deletedLocally)
+        XCTAssertEqual(tracked.pendingGeneration, generation)
+        if removesJournal {
+            XCTAssertNil(realm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: deletion.recordID.recordName))
+        } else {
+            XCTAssertFalse(value.isDeleted)
+        }
+        realm.cancelWrite()
+        XCTAssertTrue(value.isDeleted)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: deletion.recordID.recordName)?.generation, generation)
+    }
+
+    @BigSyncBackgroundActor
     lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 
     let noteID = UUID(uuidString: "A0000000-0000-0000-0000-000000000001")!

@@ -8807,6 +8807,7 @@ public final class RealmSwiftAdapter:
                 try validateInboundAccountScope(record)
             }
             try await persistenceRealm.asyncWritePreservingOwnership {
+                var committedTargets = [ObjectIdentifier: Realm]()
                 for record in chunk {
                     try Task.checkCancellation()
                     guard !cancelSync,
@@ -8825,8 +8826,16 @@ public final class RealmSwiftAdapter:
                           let targetRealm = realmProvider
                             .targetReaderRealmPerSchemaName[
                                 syncedEntity.entityType
-                            ],
-                          let targetMutation = targetRealm.object(
+                            ] else { continue }
+                    let nativeIdentity = ObjectIdentifier(ObjectiveCSupport.convert(object: targetRealm))
+                    let snapshot: Realm
+                    if let existing = committedTargets[nativeIdentity] {
+                        snapshot = existing
+                    } else {
+                        snapshot = committedRealmReadSnapshot(in: targetRealm)
+                        committedTargets[nativeIdentity] = snapshot
+                    }
+                    guard let targetMutation = snapshot.object(
                             ofType: BigSyncPendingMutation.self,
                             forPrimaryKey: syncedEntity.identifier
                           ),
@@ -8836,7 +8845,7 @@ public final class RealmSwiftAdapter:
                           ),
                           pendingMutationTargetsDeletedObject(
                             targetMutation,
-                            in: targetRealm
+                            in: snapshot
                           ) else { continue }
                     try save(record: record, for: syncedEntity)
                     // `save` changes only the opaque system-field archive.
