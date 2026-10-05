@@ -759,3 +759,78 @@ extension SyncUndoCloseoutW1Tests {
         )
     }
 }
+
+
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testTerminalBoundaryCannotBorrowProvisionalTargetJournalRemoval() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30)
+            )
+        }
+        let name = W1ContractNote.className() + "." + noteID.uuidString
+        XCTAssertNotNil(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name
+        ))
+
+        realm.beginWrite()
+        defer {
+            if realm.isInWriteTransaction { realm.cancelWrite() }
+        }
+        realm.delete(try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name
+        )))
+        XCTAssertNil(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name
+        ))
+        XCTAssertTrue(try adapter.hasPendingChangesAtTerminalBoundary())
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalBoundaryCannotBorrowProvisionalTrackingAcknowledgement() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30)
+            )
+        }
+        try await adapter.didFinishImport()
+        let name = W1ContractNote.className() + "." + noteID.uuidString
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let tracked = try XCTUnwrap(tracking.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: name
+        ))
+        XCTAssertNotNil(tracked.pendingGeneration)
+
+        // Leave only committed tracking debt so this specifically exercises
+        // the persistence-Realm side of the terminal cutoff.
+        try realm.write {
+            realm.delete(try XCTUnwrap(realm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name
+            )))
+        }
+        tracking.beginWrite()
+        defer {
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        }
+        tracked.state = SyncedEntityState.synced.rawValue
+        tracked.clearPendingMutation()
+        XCTAssertNil(tracked.pendingGeneration)
+        XCTAssertTrue(try adapter.hasPendingChangesAtTerminalBoundary())
+    }
+}

@@ -934,10 +934,13 @@ public final class RealmSwiftAdapter:
             throw BigSyncAccountScopeLeaseError.unavailable
         }
         await persistenceRealm.asyncRefresh()
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
         var blockers = [CloudKitSynchronizer.DomainBlocker]()
         let quarantines = activeInboundSemanticQuarantines(
             accountScopeIdentifier: activeAccountScopeIdentifier,
-            in: persistenceRealm
+            in: committedPersistence
         ).count
         if quarantines > 0 {
             blockers.append(.init(
@@ -945,7 +948,7 @@ public final class RealmSwiftAdapter:
                 detail: String(quarantines)
             ))
         }
-        let deferredRelationships = persistenceRealm.objects(
+        let deferredRelationships = committedPersistence.objects(
             PendingRelationship.self
         ).count
         if deferredRelationships > 0 {
@@ -956,8 +959,11 @@ public final class RealmSwiftAdapter:
         }
         if let context = recordRebaseContext {
             for target in realmProvider?.targetReaderRealms ?? [] {
-                target.refresh()
-                let inspection = try inspectRecordEvidence(in: target, context: context)
+                let committedTarget = committedRealmReadSnapshot(in: target)
+                let inspection = try inspectRecordEvidence(
+                    in: committedTarget,
+                    context: context
+                )
                 if inspection.hasSubmissionDebt {
                     blockers.append(.init(code: "unresolved-record-submission", detail: String(inspection.unresolvedSubmissionCount)))
                 }
@@ -2384,7 +2390,7 @@ public final class RealmSwiftAdapter:
     /// then freeze unconditionally because refresh notification delivery can
     /// itself open a write.
     @BigSyncBackgroundActor
-    func committedMutationJournalSnapshot(in realm: Realm) -> Realm {
+    func committedRealmReadSnapshot(in realm: Realm) -> Realm {
         if !realm.isFrozen && !realm.isInWriteTransaction {
             realm.refresh()
         }
@@ -2480,7 +2486,7 @@ public final class RealmSwiftAdapter:
         // Freeze the journal boundary so paging does not change which generations
         // this drain promises to forward, while avoiding one O(N) snapshot array.
         progress?("adapter-import-journal-snapshot-started")
-        let committedTarget = committedMutationJournalSnapshot(
+        let committedTarget = committedRealmReadSnapshot(
             in: targetReaderRealm
         )
         let mutations = committedTarget.objects(BigSyncPendingMutation.self)
@@ -2622,7 +2628,7 @@ public final class RealmSwiftAdapter:
 #if DEBUG
                 traceJournalForwarding("tracking-target-refresh-started operation=\(traceOperation)")
 #endif
-                let committedTarget = committedMutationJournalSnapshot(
+                let committedTarget = committedRealmReadSnapshot(
                     in: targetReaderRealm
                 )
 #if DEBUG
@@ -8661,14 +8667,26 @@ public final class RealmSwiftAdapter:
             var conflicts = Set<String>()
             var hasSubmissionDebt = false
             for realm in targetReaderRealms {
-                realm.refresh()
-                guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
-                let inspection = try inspectRecordEvidence(in: realm, context: context)
-                if !inspection.isConsistent { throw BigSyncComparisonEvidenceError(issues: inspection.issues.sorted()) }
-                hasSubmissionDebt = hasSubmissionDebt || inspection.hasSubmissionDebt
-                conflicts.formUnion(realm.objects(BigSyncRecordConflict.self).where {
-                    $0.namespace == context.namespace && !$0.isResolved
-                }.map(\.recordName))
+                let committedRealm = committedRealmReadSnapshot(in: realm)
+                guard committedRealm.schema.objectSchema.contains(where: {
+                    $0.className == BigSyncRecordConflict.className()
+                }) else { continue }
+                let inspection = try inspectRecordEvidence(
+                    in: committedRealm,
+                    context: context
+                )
+                if !inspection.isConsistent {
+                    throw BigSyncComparisonEvidenceError(
+                        issues: inspection.issues.sorted()
+                    )
+                }
+                hasSubmissionDebt = hasSubmissionDebt
+                    || inspection.hasSubmissionDebt
+                conflicts.formUnion(
+                    committedRealm.objects(BigSyncRecordConflict.self).where {
+                        $0.namespace == context.namespace && !$0.isResolved
+                    }.map(\.recordName)
+                )
             }
             if !conflicts.isEmpty { throw BigSyncUnresolvedRecordConflicts(recordNames: conflicts.sorted()) }
             if hasSubmissionDebt { return true }
@@ -8677,9 +8695,11 @@ public final class RealmSwiftAdapter:
             targetReaderRealm.schema.objectSchema.contains(where: {
                 $0.className == BigSyncPendingMutation.className()
             }) {
-            targetReaderRealm.refresh()
+            let committedTarget = committedRealmReadSnapshot(
+                in: targetReaderRealm
+            )
             if transportEligiblePendingMutations(
-                targetReaderRealm.objects(BigSyncPendingMutation.self)
+                committedTarget.objects(BigSyncPendingMutation.self)
             )
                 .contains(where: {
                     pendingMutationIsEligibleForActiveTransport(
@@ -8690,8 +8710,10 @@ public final class RealmSwiftAdapter:
             }
         }
 
-        persistenceRealm.refresh()
-        updateHasChanges(realm: persistenceRealm)
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
+        updateHasChanges(realm: committedPersistence)
         return hasChanges
     }
 
