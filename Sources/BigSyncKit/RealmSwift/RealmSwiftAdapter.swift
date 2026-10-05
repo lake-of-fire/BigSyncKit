@@ -576,6 +576,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterAcceptedRetainedDeletionTrackingAdmission:
+        (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testBeforeCursorTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     @BigSyncBackgroundActor
@@ -10316,6 +10318,7 @@ extension RealmSwiftAdapter {
         var seen = Set<CKRecord.ID>()
         var generations = [String: String]()
         var admittedRecords = [CKRecord]()
+        var retainedCleanupRecords = [CKRecord]()
         var accepted = [String: RealmSwiftAcceptedComparisonReceipt]()
         typealias ReceiptItem = (saved: CKRecord, type: Object.Type, proof: BigSyncPreparedRecordBase)
         var groups = [String: (realm: Realm, items: [ReceiptItem])]()
@@ -10378,11 +10381,21 @@ extension RealmSwiftAdapter {
                             && (!(item.type is BigSyncRecordContractProviding.Type)
                                 || (proof.submissionIdentity != nil && base?.revision == proof.submissionIdentity))
                         guard base?.revision == proof.revision || alreadyInstalled,
-                              let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name),
-                              pendingMutationIsEligibleForActiveTransport(pending),
                               let id = getObjectIdentifier(recordName: name, entityType: item.type.className()),
                               let object = realm.object(ofType: item.type, forPrimaryKey: id),
                               !BigSyncRecordLifecycle.isPhysicalDeletion(object) else { continue }
+                        let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
+                        if pending == nil, alreadyInstalled,
+                           BigSyncRecordLifecycle.retainsTombstone(item.type),
+                           (object as? SoftDeletable)?.isDeleted == true {
+                            // A prior acknowledgement may have committed its
+                            // exact accepted baseline and journal removal before
+                            // cleanup lost authority. Resume only that receipt;
+                            // this is not admission to acknowledge new work.
+                            retainedCleanupRecords.append(saved)
+                            continue
+                        }
+                        guard let pending, pendingMutationIsEligibleForActiveTransport(pending) else { continue }
                         BigSyncRecordBaseline.install(recordName: name, namespace: proof.context.namespace,
                             fields: proof.fields, serverChangeTag: saved.recordChangeTag,
                             schemaSignature: proof.schemaSignature,
@@ -10418,7 +10431,7 @@ extension RealmSwiftAdapter {
         // the tracking acknowledgement to be terminal and retire only the
         // matching retained-deletion lineage.
         try await retireAcceptedRetainedDeletionQuarantines(
-            savedRecords: admittedRecords
+            savedRecords: admittedRecords + retainedCleanupRecords
         )
     }
 }
@@ -10526,6 +10539,9 @@ extension RealmSwiftAdapter {
 
         try await tracking.asyncWritePreservingOwnership {
             try validateCleanup()
+#if DEBUG
+            try _testAfterAcceptedRetainedDeletionTrackingAdmission?()
+#endif
             // Candidate selection can become stale while the tracking writer
             // waits. Revalidate the exact detached lineage IDs after admission;
             // no managed quarantine row crosses the suspension.
