@@ -80,11 +80,21 @@
                        currentEntity.pendingGeneration == uploadedGeneration else {
                         continue
                     }
+                    // A residual target journal may be forwarded again after
+                    // this exact server version was already acknowledged. That
+                    // permits journal repair, not retirement of a later deletion.
+                    let cachedReceipt = getRecord(for: currentEntity)
+                    let repeatsCachedVersion = record.recordChangeTag?.isEmpty == false
+                        && cachedReceipt?.recordID == record.recordID
+                        && cachedReceipt?.recordType == record.recordType
+                        && cachedReceipt?.recordChangeTag == record.recordChangeTag
                     try save(record: record, for: currentEntity)
                     try validateAcknowledgementOwner()
                     currentEntity.state = SyncedEntityState.synced.rawValue
                     currentEntity.clearPendingMutation()
-                    acknowledgedInThisWrite[record.recordID.recordName] = uploadedGeneration
+                    if !repeatsCachedVersion {
+                        acknowledgedInThisWrite[record.recordID.recordName] = uploadedGeneration
+                    }
                     acknowledgedGenerations[record.recordID.recordName] = uploadedGeneration
                     acknowledgedEntityTypes[record.recordID.recordName] =
                         currentEntity.entityType
