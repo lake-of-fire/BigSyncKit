@@ -35,6 +35,10 @@
         }
     }
 
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedGenerations: [String: String]
+    ) async throws {}
     var cursorLoadingProvider: (@Sendable () async -> RecordZoneChangeCursor?)?
     var fetchedRecordFailure: Error?
     var serverChangeToken: RecordZoneChangeCursor? { get async { await cursorLoadingProvider?() } }
