@@ -120,6 +120,12 @@ def main() -> int:
             raise RuntimeError("Runtime case inventory is empty or duplicated")
         report["required_runtime_case_names"] = cases
         save()
+        # Pair the compiler with the selected Apple SDK on macOS. A Swiftly
+        # compiler earlier on PATH can reject newer SDK module flags before any
+        # collaborator or production history executes. Keep Linux portable.
+        compiler = ["xcrun", "--sdk", "macosx", "swiftc"] if platform.system() == "Darwin" else ["swiftc"]
+        if command(compiler + ["--version"], out / "compiler-version.log"):
+            raise RuntimeError("Compiler discovery failed; not a behavioral result")
         configs = ("debug", "release") if args.configuration == "both" else (args.configuration,)
         for configuration in configs:
             build = out / configuration
@@ -127,7 +133,7 @@ def main() -> int:
             opt = "-Onone" if configuration == "debug" else "-O"
             extension = "dylib" if platform.system() == "Darwin" else "so"
             library = build / f"libRealmSwift.{extension}"
-            common = ["swiftc", "-swift-version", "6", "-warnings-as-errors", "-parse-as-library"]
+            common = compiler + ["-swift-version", "6", "-warnings-as-errors", "-parse-as-library"]
             compile_realm = common + ["-emit-module", "-emit-library", "-module-name", "RealmSwift",
                 str(helpers / "RealmCollaborator.swift"), "-o", str(library),
                 "-emit-module-path", str(build / "RealmSwift.swiftmodule"), opt]
