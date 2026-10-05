@@ -74,8 +74,8 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
             value.refreshChangeMetadata(explicitlyModified: true)
         }
         _ = try await adapter._test_forwardPendingMutations(in: realm)
-        let deletion = try XCTUnwrap(try await adapter.preparedRecordDeletions(
-            limit: 1, restrictedToEntityType: nil).first)
+        let prepared = try await adapter.preparedRecordDeletions(limit: 1, restrictedToEntityType: nil)
+        let deletion = try XCTUnwrap(prepared.first)
         let generation = try XCTUnwrap(deletion.generation)
         let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
         let tracked = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self,
