@@ -47,7 +47,7 @@ extension RealmSwiftAdapter {
             .contains(where: {
                 $0.className == BigSyncPendingMutation.className()
             }) {
-            let snapshot = committedMutationJournalSnapshot(in: realm)
+            let snapshot = committedRealmReadSnapshot(in: realm)
             for mutation in snapshot.objects(BigSyncPendingMutation.self).filter(
                 "entityType IN %@",
                 requestedEntityTypes
@@ -92,7 +92,7 @@ extension RealmSwiftAdapter {
         guard let realm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
-        let snapshot = committedMutationJournalSnapshot(in: realm)
+        let snapshot = committedRealmReadSnapshot(in: realm)
         var generations = [String: String]()
         for recordName in recordNames {
             guard let generation = snapshot.object(
