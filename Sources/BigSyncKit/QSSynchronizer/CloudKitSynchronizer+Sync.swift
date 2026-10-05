@@ -1,4 +1,18 @@
     @BigSyncBackgroundActor
+    func notifyDelegateForDeletedZoneIDs(
+        _ zoneIDs: [CKRecordZone.ID],
+        attemptID: UUID
+    ) async throws {
+        for zoneID in zoneIDs {
+            // Lifecycle state and tracking recovery are owned exclusively by
+            // the fenced migration. The delegate receives an informational
+            // notification only after the account/run has been revalidated.
+            try await revalidateActiveRunContext(for: attemptID)
+            self.delegate?.synchronizer(self, zoneIDWasDeleted: zoneID)
+        }
+    }
+    
+    @BigSyncBackgroundActor
     func loadTokens(
         for zoneIDs: [CKRecordZone.ID],
         attemptID expectedAttemptID: UUID? = nil
