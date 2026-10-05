@@ -1303,11 +1303,24 @@ public final class RealmSwiftAdapter:
         }
         guard activeAccountScopeIdentifier == accountScopeIdentifier,
               activeReplicaBindingGenerationIdentifier
-                == replicaBindingGenerationIdentifier,
-              let token = persistenceRealm.objects(ServerToken.self).first?
-                .token else {
+                == replicaBindingGenerationIdentifier else {
             return nil
         }
+        // Cursor and change-feed epoch form one durable publication identity.
+        // Read them from one committed tracking version so a provisional token
+        // or rebuild transition cannot be paired with the other's old value.
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
+        guard let token = committedPersistence.objects(
+            ServerToken.self
+        ).first?.token else {
+            return nil
+        }
+        let changeFeedEpoch = committedPersistence.object(
+            ofType: RebuildProvenanceState.self,
+            forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+        )?.epoch ?? 0
         return CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
             containerIdentifier: containerIdentifier,
             databaseScope: databaseScope,
@@ -1315,7 +1328,7 @@ public final class RealmSwiftAdapter:
             replicaBindingGenerationIdentifier:
                 replicaBindingGenerationIdentifier,
             recordZoneID: recordZoneID,
-            changeFeedEpoch: try changeFeedEpoch() ?? 0,
+            changeFeedEpoch: changeFeedEpoch,
             cursorData: token
         )
     }
@@ -1325,7 +1338,10 @@ public final class RealmSwiftAdapter:
         guard let persistenceRealm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
-        return persistenceRealm.object(
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
+        return committedPersistence.object(
             ofType: RebuildProvenanceState.self,
             forPrimaryKey: RebuildProvenanceState.primaryKeyValue
         )?.epoch ?? 0
