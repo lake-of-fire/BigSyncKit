@@ -2420,12 +2420,13 @@ public final class RealmSwiftAdapter:
         for recordNames: some Sequence<String>,
         in realm: Realm
     ) -> [BigSyncPendingMutationSnapshot] {
-        recordNames.compactMap { recordName in
-            guard let mutation = realm.object(
+        let snapshot = committedRealmReadSnapshot(in: realm)
+        return recordNames.compactMap { recordName in
+            guard let mutation = snapshot.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
             ) else { return nil }
-            return pendingMutationSnapshot(mutation, in: realm)
+            return pendingMutationSnapshot(mutation, in: snapshot)
         }
     }
 
@@ -2674,7 +2675,7 @@ public final class RealmSwiftAdapter:
                     guard !cancelSync else { throw CancellationError() }
                     // The account can change while this task is suspended
                     // waiting for the persistence transaction. Recheck the
-                    // live journal snapshot at the final publication boundary
+                    // committed journal snapshot at the final publication boundary
                     // so old-account work is never copied into the new run's
                     // tracking Realm.
                     guard pendingMutationIsEligibleForActiveTransport(
