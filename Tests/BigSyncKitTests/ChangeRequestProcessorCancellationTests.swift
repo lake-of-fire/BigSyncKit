@@ -423,6 +423,66 @@ extension ChangeRequestProcessorCancellationTests {
     }
 
     @BigSyncBackgroundActor
+    func testResetCancelsAndJoinsEveryOverlappingProcessingChild() async {
+        let processor = ChangeRequestProcessor()
+        let firstEntered = expectation(description: "first overlapping child held")
+        let secondEntered = expectation(description: "second overlapping child held")
+        let firstCancelled = expectation(description: "reset cancels first child")
+        let secondCancelled = expectation(description: "reset cancels second child")
+        let firstGate = ProcessorCancellationGate()
+        let secondGate = ProcessorCancellationGate()
+        let restartReturned = ProcessorCancellationSignal()
+        let first = ProcessorCancellationAdapter(save: { records in
+            await withTaskCancellationHandler {
+                firstEntered.fulfill(); await firstGate.wait()
+                return ProcessorCancellationAdapter.liveResults(records)
+            } onCancel: { firstCancelled.fulfill() }
+        })
+        let second = ProcessorCancellationAdapter(save: { records in
+            await withTaskCancellationHandler {
+                secondEntered.fulfill(); await secondGate.wait()
+                return ProcessorCancellationAdapter.liveResults(records)
+            } onCancel: { secondCancelled.fulfill() }
+        })
+        let run = await processor.beginRun()
+        addLive(processor, first, run: run, name: "Item.first-overlap")
+        let firstRequest = Task { @BigSyncBackgroundActor in
+            try await processor.finishProcessing(for: first)
+        }
+        addTeardownBlock {
+            firstRequest.cancel(); await firstGate.open(); _ = await firstRequest.result
+        }
+        await fulfillment(of: [firstEntered], timeout: 2)
+        addLive(processor, second, run: run, name: "Item.second-overlap")
+        let secondRequest = Task { @BigSyncBackgroundActor in
+            try await processor.finishProcessing(for: second)
+        }
+        addTeardownBlock {
+            secondRequest.cancel(); await secondGate.open(); _ = await secondRequest.result
+        }
+        await fulfillment(of: [secondEntered], timeout: 2)
+
+        let restart = Task { @BigSyncBackgroundActor in
+            let next = await processor.beginRun()
+            restartReturned.record()
+            return next
+        }
+        addTeardownBlock { restart.cancel(); _ = await restart.result }
+        await fulfillment(of: [firstCancelled, secondCancelled], timeout: 2)
+        await secondGate.open()
+        assertCancelled(await secondRequest.result)
+        XCTAssertEqual(restartReturned.count, 0,
+                       "beginRun returned while an older overlapping child was still running")
+        await firstGate.open()
+        assertCancelled(await firstRequest.result)
+        let nextRun = await restart.value
+        XCTAssertNotEqual(nextRun, run)
+        XCTAssertEqual(restartReturned.count, 1)
+        XCTAssertFalse(processor.cancelSync)
+        XCTAssertTrue(processor.getErrors().isEmpty)
+    }
+
+    @BigSyncBackgroundActor
     func testUncancelledBatchingRestrictionAndAdapterOrderRemainIntact() async throws {
         let processor = ChangeRequestProcessor()
         processor.fetchedChangeBatchSize = 1

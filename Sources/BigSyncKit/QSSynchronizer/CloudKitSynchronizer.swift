@@ -342,8 +342,7 @@ internal class ChangeRequestProcessor {
     private var changeRequests = [ChangeRequest]()
     private var localErrors: [Error] = []
     private var activeRunID = UUID()
-    private var processingTask: Task<InboundProcessingOutcomes, Error>?
-    private var processingTaskID: UUID?
+    private var processingTasks = [UUID: Task<InboundProcessingOutcomes, Error>]()
     internal var fetchedChangeBatchSize = ChangeRequestProcessor.defaultFetchedChangeBatchSize
     
     internal func addFetchedChangeRequest(_ request: ChangeRequest) {
@@ -421,13 +420,9 @@ internal class ChangeRequestProcessor {
                 runID: runID
             )
         }
-        processingTaskID = taskID
-        processingTask = task
+        processingTasks[taskID] = task
         defer {
-            if processingTaskID == taskID {
-                processingTask = nil
-                processingTaskID = nil
-            }
+            processingTasks.removeValue(forKey: taskID)
         }
         // Cancellation belongs to this captured child, not whichever task a
         // later caller may have installed in processingTask. Awaiting the result
@@ -593,15 +588,19 @@ internal class ChangeRequestProcessor {
 
     func reset() {
         cancelSync = true
-        processingTask?.cancel()
+        for task in processingTasks.values {
+            task.cancel()
+        }
         changeRequests.removeAll(keepingCapacity: false)
         localErrors.removeAll(keepingCapacity: false)
     }
 
     func waitForProcessingToStop() async {
-        let task = processingTask
-        task?.cancel()
-        _ = await task?.result
+        // Snapshot every admitted child. reset() closes new admission first, so
+        // this set cannot gain another current-run child while it is joined.
+        let tasks = Array(processingTasks.values)
+        for task in tasks { task.cancel() }
+        for task in tasks { _ = await task.result }
     }
     
     @BigSyncBackgroundActor
