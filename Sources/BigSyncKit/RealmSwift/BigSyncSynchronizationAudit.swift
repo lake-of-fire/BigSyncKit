@@ -81,14 +81,44 @@ extension RealmSwiftAdapter {
     ) async throws -> BigSyncSynchronizationAudit {
         try await ensureSetup()
         guard let realmProvider,
-              let persistenceRealm = realmProvider.persistenceRealm,
-              let targetReaderRealms = realmProvider.targetReaderRealms else {
+              let livePersistenceRealm = realmProvider.persistenceRealm,
+              let liveTargetReaderRealms = realmProvider.targetReaderRealms else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
 
-        persistenceRealm.refresh()
-        for realm in targetReaderRealms {
-            realm.refresh()
+        // A terminal audit must not certify another owner's provisional
+        // acknowledgement or report its uncommitted edits as durable debt.
+        // Freeze after refresh: a notification can itself open a write. Cache
+        // by native Realm identity so schema aliases and the inventory/evidence
+        // passes use the same committed version for each Realm in this audit.
+        // These snapshots never escape or survive an actor suspension. They
+        // are not a cross-file transaction or a server-boundary lease.
+        var committedSnapshots = [ObjectIdentifier: Realm]()
+        func committedSnapshot(_ realm: Realm) -> Realm {
+            let identity = ObjectIdentifier(ObjectiveCSupport.convert(object: realm))
+            if let snapshot = committedSnapshots[identity] { return snapshot }
+            if !realm.isFrozen && !realm.isInWriteTransaction { realm.refresh() }
+            let snapshot = realm.freeze()
+            committedSnapshots[identity] = snapshot
+            return snapshot
+        }
+        let persistenceRealm = committedSnapshot(livePersistenceRealm)
+        let targetReaderRealms = liveTargetReaderRealms.map(committedSnapshot)
+        let targetReaderRealmPerSchemaName = realmProvider
+            .targetReaderRealmPerSchemaName.mapValues(committedSnapshot)
+
+        func trackingIsEligible(_ entity: SyncedEntity) -> Bool {
+            guard accountScopePropertyByClassName[entity.entityType] != nil else { return true }
+            // The ordinary eligibility helper resolves its target through the
+            // live provider. Audit against this same frozen target instead;
+            // otherwise an uncommitted account change can filter durable rows.
+            guard let type = realmObjectClass(name: entity.entityType),
+                  let identifier = getObjectIdentifier(
+                    recordName: entity.identifier, entityType: entity.entityType
+                  ),
+                  let object = targetReaderRealmPerSchemaName[entity.entityType]?
+                    .object(ofType: type, forPrimaryKey: identifier) else { return false }
+            return objectIsEligibleForActiveAccount(object, entityType: entity.entityType)
         }
 
         let ownedTypeNames = Set(modelTypes.keys).subtracting(excludedClassNames)
@@ -117,7 +147,7 @@ extension RealmSwiftAdapter {
         }
 
         let trackedEntities = persistenceRealm.objects(SyncedEntity.self).filter {
-            ownedTypeNames.contains($0.entityType) && self.syncedEntityIsEligibleForActiveAccount($0)
+            ownedTypeNames.contains($0.entityType) && trackingIsEligible($0)
         }
         var trackedEntitiesByName = [String: [SyncedEntity]]()
         for trackedEntity in trackedEntities {
@@ -135,8 +165,7 @@ extension RealmSwiftAdapter {
         for (entityType, objectClass) in modelTypes.sorted(by: { $0.key < $1.key }) {
             guard ownedTypeNames.contains(entityType),
                   processedTypes.insert(entityType).inserted,
-                  let targetRealm = realmProvider
-                    .targetReaderRealmPerSchemaName[entityType],
+                  let targetRealm = targetReaderRealmPerSchemaName[entityType],
                   let primaryKey = objectClass.primaryKey()
                     ?? objectClass.sharedSchema()?.primaryKeyProperty?.name else {
                 continue

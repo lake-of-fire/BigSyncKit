@@ -1,5 +1,6 @@
 import CloudKit
 import Foundation
+import Logging
 import RealmSwift
 import XCTest
 @testable import BigSyncKit
@@ -314,5 +315,225 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(object.modifiedAt, modified)
         XCTAssertEqual(object.explicitlyModifiedAt, explicitlyModified)
         XCTAssertNil(tracked.encodedRecord)
+    }
+}
+
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testAuditRejectsProvisionalCompletionAcrossTargetAndTracking() async throws {
+        let (adapter, realm, object, incoming) = try await acceptedNote()
+        let generation = try await edit(object, text: "committed-pending", time: 30,
+                                        realm: realm, adapter: adapter)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let name = incoming.recordID.recordName
+        let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+        let before = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertFalse(before.isClean)
+        XCTAssertEqual(before.pendingMutationCount, 1)
+        realm.beginWrite()
+        defer {
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+            if realm.isInWriteTransaction { realm.cancelWrite() }
+        }
+        // Simulate an incomplete acknowledgement owned by another caller.
+        // None of these provisional postimages can certify durable completion.
+        object.text = try XCTUnwrap(incoming["text"] as? String)
+        object.modifiedAt = try XCTUnwrap(incoming["modifiedAt"] as? Date)
+        object.explicitlyModifiedAt = incoming["explicitlyModifiedAt"] as? Date
+        realm.delete(try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)))
+        tracking.beginWrite()
+        entity.entityState = .synced
+        entity.clearPendingMutation()
+        let during = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(during, before)
+        XCTAssertFalse(during.isClean)
+        XCTAssertTrue(realm.isInWriteTransaction)
+        XCTAssertTrue(tracking.isInWriteTransaction)
+        XCTAssertNil(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+        XCTAssertNil(entity.pendingGeneration)
+        if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        if realm.isInWriteTransaction { realm.cancelWrite() }
+        let after = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(after, before)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+        XCTAssertEqual(object.text, "committed-pending")
+    }
+
+    @BigSyncBackgroundActor
+    func testAuditRetainsTrackingDebtBehindHeldAcknowledgement() async throws {
+        let (adapter, realm, object, incoming) = try await acceptedNote()
+        let generation = try await edit(object, text: "pending", time: 30,
+                                        realm: realm, adapter: adapter)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self,
+                                                   forPrimaryKey: incoming.recordID.recordName))
+        let before = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(entity.pendingGeneration, generation)
+        tracking.beginWrite()
+        defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+        entity.entityState = .synced
+        entity.clearPendingMutation()
+        let during = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(during, before)
+        XCTAssertTrue(tracking.isInWriteTransaction)
+        XCTAssertNil(entity.pendingGeneration)
+        if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        XCTAssertEqual(entity.pendingGeneration, generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testAuditIgnoresHeldProvisionalTargetMutation() async throws {
+        let (adapter, realm, object, incoming) = try await acceptedNote()
+        let before = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertTrue(before.isClean, before.issues.joined(separator: ","))
+        realm.beginWrite()
+        defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+        object.text = "provisional-edit"
+        object.refreshChangeMetadata(explicitlyModified: true,
+            at: Date(timeIntervalSinceReferenceDate: 40))
+        let provisionalGeneration = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: incoming.recordID.recordName)?.generation)
+        let during = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(during, before)
+        XCTAssertTrue(realm.isInWriteTransaction)
+        XCTAssertEqual(object.text, "provisional-edit")
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: incoming.recordID.recordName)?.generation, provisionalGeneration)
+        if realm.isInWriteTransaction { realm.cancelWrite() }
+        let after = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(after, before)
+    }
+
+    @BigSyncBackgroundActor
+    func testAuditRetainsSubmittedCandidateBehindProvisionalRemoval() async throws {
+        let (adapter, realm, object, incoming) = try await acceptedNote()
+        _ = try await edit(object, text: "submitted", time: 30, realm: realm, adapter: adapter)
+        _ = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        let before = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(before.unresolvedSubmissionCount, 1)
+        let submission = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first)
+        let candidateIdentity = submission.candidateIdentity
+        realm.beginWrite()
+        defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+        realm.delete(submission)
+        let during = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(during, before)
+        XCTAssertEqual(during.unresolvedSubmissionCount, 1)
+        XCTAssertTrue(realm.isInWriteTransaction)
+        XCTAssertTrue(realm.objects(BigSyncRecordSubmission.self).isEmpty)
+        if realm.isInWriteTransaction { realm.cancelWrite() }
+        XCTAssertEqual(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity, candidateIdentity)
+    }
+
+    @BigSyncBackgroundActor
+    func testAuditRetainsRelationshipDebtBehindProvisionalRemoval() async throws {
+        let (adapter, _, _, incoming) = try await acceptedNote()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self,
+                                                   forPrimaryKey: incoming.recordID.recordName))
+        let relationship = PendingRelationship()
+        relationship.relationshipName = "audit-pending-relationship"
+        relationship.targetIdentifier = incoming.recordID.recordName
+        relationship.forSyncedEntity = entity
+        try tracking.write { tracking.add(relationship) }
+        let before = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(before.pendingRelationshipCount, 1)
+        tracking.beginWrite()
+        defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+        tracking.delete(relationship)
+        let during = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(during, before)
+        XCTAssertEqual(during.pendingRelationshipCount, 1)
+        XCTAssertTrue(tracking.isInWriteTransaction)
+        XCTAssertTrue(tracking.objects(PendingRelationship.self).isEmpty)
+        if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        XCTAssertEqual(tracking.objects(PendingRelationship.self).count, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testAuditResamplesActuallyCommittedOwnerOnNextInvocation() async throws {
+        let (adapter, realm, object, incoming) = try await acceptedNote()
+        let before = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertTrue(before.isClean, before.issues.joined(separator: ","))
+        try realm.write {
+            object.text = "committed-after-audit"
+            object.refreshChangeMetadata(explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 40))
+        }
+        let after = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertFalse(after.isClean)
+        XCTAssertEqual(after.pendingMutationCount, 1)
+        XCTAssertNotEqual(after, before)
+    }
+
+    // Bind an existing string property as the disposable adapter's account
+    // scope, without adding any test-only Realm model to global discovery.
+    @BigSyncBackgroundActor
+    private func auditAccountScopedFixture() async throws -> (RealmSwiftAdapter, Realm, CKRecord) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("w1-audit-account-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        realmFixtureOwner.ownDirectory(directory)
+        let accountProperties = [W1ContractNote.className(): "text"]
+        var target = Realm.Configuration()
+        target.fileURL = directory.appendingPathComponent("target.realm")
+        target.objectTypes = [W1ContractNote.self, BigSyncPendingMutation.self]
+        BigSyncMutationPolicy.enableRecordRebasing(in: &target)
+        BigSyncMutationPolicy(excludedClassNames: [], accountScopePropertyByClassName: accountProperties)
+            .install(configurations: [target], mutationJournalIdentityProvider: {
+                .init(installationIdentifier: "w1-local", replicaBindingGenerationIdentifier: "w1-binding")
+            })
+        var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        tracking.fileURL = directory.appendingPathComponent("tracking.realm")
+        let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
+            targetRealmConfigurations: [target], excludedClassNames: [],
+            accountScopePropertyByClassName: accountProperties,
+            recordZoneID: .init(zoneName: "w1-audit-account"),
+            logger: Logger(label: "W1AuditAccount"), startSetupTask: false)
+        realmFixtureOwner.own(adapter)
+        try await adapter.activateReplicaBinding(accountScopeIdentifier: "server-text",
+            replicaBindingGenerationIdentifier: "w1-binding")
+        try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.test.w1-closeout",
+            databaseScope: .private)
+        try await adapter.ensureSetup()
+        adapter.invalidateTokens()
+        let incoming = try tagged(note(adapter), "audit-account-tag")
+        _ = try await deliver([incoming], to: adapter)
+        let realm = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        return (adapter, realm, incoming)
+    }
+
+    @BigSyncBackgroundActor
+    func testAuditAccountFilterIgnoresProvisionalDeparture() async throws {
+        let (adapter, realm, incoming) = try await auditAccountScopedFixture()
+        let before = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertTrue(before.isClean, before.issues.joined(separator: ","))
+        let object = try XCTUnwrap(realm.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
+        realm.beginWrite()
+        defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+        object.text = "other-account"
+        let during = try await adapter.auditSynchronizationState(serverRecords: [incoming])
+        XCTAssertEqual(during, before)
+        XCTAssertEqual(during.trackingRecordCount, 1)
+        XCTAssertTrue(realm.isInWriteTransaction)
+        XCTAssertEqual(object.text, "other-account")
+    }
+
+    @BigSyncBackgroundActor
+    func testAuditAccountFilterDoesNotAdoptProvisionalArrival() async throws {
+        let (adapter, realm, _) = try await auditAccountScopedFixture()
+        try await adapter.activateReplicaBinding(accountScopeIdentifier: "second-account",
+            replicaBindingGenerationIdentifier: "w1-binding")
+        let before = try await adapter.auditSynchronizationState(serverRecords: [])
+        XCTAssertTrue(before.isClean, before.issues.joined(separator: ","))
+        XCTAssertEqual(before.trackingRecordCount, 0)
+        let object = try XCTUnwrap(realm.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
+        realm.beginWrite()
+        defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+        object.text = "second-account"
+        let during = try await adapter.auditSynchronizationState(serverRecords: [])
+        XCTAssertEqual(during, before)
+        XCTAssertEqual(during.trackingRecordCount, 0)
+        XCTAssertTrue(realm.isInWriteTransaction)
     }
 }
