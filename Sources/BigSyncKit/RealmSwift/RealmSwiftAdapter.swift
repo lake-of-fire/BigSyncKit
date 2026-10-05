@@ -933,11 +933,17 @@ public final class RealmSwiftAdapter:
         guard let activeAccountScopeIdentifier else {
             throw BigSyncAccountScopeLeaseError.unavailable
         }
-        await persistenceRealm.asyncRefresh()
+        // Do not async-refresh a shared handle that may currently be
+        // inside another reentrant owner's write. The committed snapshot helper
+        // advances only an unowned live handle and otherwise freezes the read
+        // transaction version beneath that provisional write.
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
         var blockers = [CloudKitSynchronizer.DomainBlocker]()
         let quarantines = activeInboundSemanticQuarantines(
             accountScopeIdentifier: activeAccountScopeIdentifier,
-            in: persistenceRealm
+            in: committedPersistence
         ).count
         if quarantines > 0 {
             blockers.append(.init(
@@ -945,7 +951,7 @@ public final class RealmSwiftAdapter:
                 detail: String(quarantines)
             ))
         }
-        let deferredRelationships = persistenceRealm.objects(
+        let deferredRelationships = committedPersistence.objects(
             PendingRelationship.self
         ).count
         if deferredRelationships > 0 {
@@ -956,8 +962,11 @@ public final class RealmSwiftAdapter:
         }
         if let context = recordRebaseContext {
             for target in realmProvider?.targetReaderRealms ?? [] {
-                target.refresh()
-                let inspection = try inspectRecordEvidence(in: target, context: context)
+                let committedTarget = committedRealmReadSnapshot(in: target)
+                let inspection = try inspectRecordEvidence(
+                    in: committedTarget,
+                    context: context
+                )
                 if inspection.hasSubmissionDebt {
                     blockers.append(.init(code: "unresolved-record-submission", detail: String(inspection.unresolvedSubmissionCount)))
                 }
@@ -1294,11 +1303,24 @@ public final class RealmSwiftAdapter:
         }
         guard activeAccountScopeIdentifier == accountScopeIdentifier,
               activeReplicaBindingGenerationIdentifier
-                == replicaBindingGenerationIdentifier,
-              let token = persistenceRealm.objects(ServerToken.self).first?
-                .token else {
+                == replicaBindingGenerationIdentifier else {
             return nil
         }
+        // Cursor and change-feed epoch form one durable publication identity.
+        // Read them from one committed tracking version so a provisional token
+        // or rebuild transition cannot be paired with the other's old value.
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
+        guard let token = committedPersistence.objects(
+            ServerToken.self
+        ).first?.token else {
+            return nil
+        }
+        let changeFeedEpoch = committedPersistence.object(
+            ofType: RebuildProvenanceState.self,
+            forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+        )?.epoch ?? 0
         return CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
             containerIdentifier: containerIdentifier,
             databaseScope: databaseScope,
@@ -1306,7 +1328,7 @@ public final class RealmSwiftAdapter:
             replicaBindingGenerationIdentifier:
                 replicaBindingGenerationIdentifier,
             recordZoneID: recordZoneID,
-            changeFeedEpoch: try changeFeedEpoch() ?? 0,
+            changeFeedEpoch: changeFeedEpoch,
             cursorData: token
         )
     }
@@ -1316,7 +1338,10 @@ public final class RealmSwiftAdapter:
         guard let persistenceRealm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
-        return persistenceRealm.object(
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
+        return committedPersistence.object(
             ofType: RebuildProvenanceState.self,
             forPrimaryKey: RebuildProvenanceState.primaryKeyValue
         )?.epoch ?? 0
@@ -2377,6 +2402,20 @@ public final class RealmSwiftAdapter:
         }
     }
 
+    /// Returns a frozen view pinned to this Realm's committed read version.
+    /// A reentrant owner may have an open write on the shared live handle; Realm
+    /// freezing is keyed from the read transaction version, so provisional
+    /// mutations are excluded. Refresh first only when no write owns the handle,
+    /// then freeze unconditionally because refresh notification delivery can
+    /// itself open a write.
+    @BigSyncBackgroundActor
+    func committedRealmReadSnapshot(in realm: Realm) -> Realm {
+        if !realm.isFrozen && !realm.isInWriteTransaction {
+            realm.refresh()
+        }
+        return realm.freeze()
+    }
+
     private func pendingMutationSnapshots(
         for recordNames: some Sequence<String>,
         in realm: Realm
@@ -2466,9 +2505,11 @@ public final class RealmSwiftAdapter:
         // Freeze the journal boundary so paging does not change which generations
         // this drain promises to forward, while avoiding one O(N) snapshot array.
         progress?("adapter-import-journal-snapshot-started")
-        let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
+        let committedTarget = committedRealmReadSnapshot(
+            in: targetReaderRealm
+        )
+        let mutations = committedTarget.objects(BigSyncPendingMutation.self)
             .sorted(byKeyPath: "recordName")
-            .freeze()
         let mutationCount = mutations.count
         progress?("adapter-import-journal-snapshot-completed")
         let pageSize = 1_000
@@ -2484,7 +2525,7 @@ public final class RealmSwiftAdapter:
                 pending.append(
                     pendingMutationSnapshot(
                         mutations[index],
-                        in: targetReaderRealm
+                        in: committedTarget
                     )
                 )
             }
@@ -2599,26 +2640,28 @@ public final class RealmSwiftAdapter:
 #endif
                 // A frozen/page snapshot can become stale while this task is
                 // waiting for the tracking transaction. Re-resolve each
-                // identity only after that transaction is acquired, keeping
-                // the live-journal read and tracking publication in one
-                // non-suspending boundary so an older pass cannot overwrite a
-                // newer generation already forwarded by reentrant work.
+                // identity only after that transaction is acquired, but from
+                // the target's committed read version: another suspended target
+                // owner may still have provisional journal/object changes on
+                // the shared live handle.
 #if DEBUG
                 traceJournalForwarding("tracking-target-refresh-started operation=\(traceOperation)")
 #endif
-                targetReaderRealm.refresh()
+                let committedTarget = committedRealmReadSnapshot(
+                    in: targetReaderRealm
+                )
 #if DEBUG
                 traceJournalForwarding("tracking-target-refresh-completed operation=\(traceOperation)")
 #endif
                 let currentMutations: [BigSyncPendingMutationSnapshot] =
                     chunk.compactMap { mutation in
-                        guard let current = targetReaderRealm.object(
+                        guard let current = committedTarget.object(
                             ofType: BigSyncPendingMutation.self,
                             forPrimaryKey: mutation.recordName
                         ) else { return nil }
                         return pendingMutationSnapshot(
                             current,
-                            in: targetReaderRealm
+                            in: committedTarget
                         )
                     }
 #if DEBUG
@@ -8643,14 +8686,26 @@ public final class RealmSwiftAdapter:
             var conflicts = Set<String>()
             var hasSubmissionDebt = false
             for realm in targetReaderRealms {
-                realm.refresh()
-                guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
-                let inspection = try inspectRecordEvidence(in: realm, context: context)
-                if !inspection.isConsistent { throw BigSyncComparisonEvidenceError(issues: inspection.issues.sorted()) }
-                hasSubmissionDebt = hasSubmissionDebt || inspection.hasSubmissionDebt
-                conflicts.formUnion(realm.objects(BigSyncRecordConflict.self).where {
-                    $0.namespace == context.namespace && !$0.isResolved
-                }.map(\.recordName))
+                let committedRealm = committedRealmReadSnapshot(in: realm)
+                guard committedRealm.schema.objectSchema.contains(where: {
+                    $0.className == BigSyncRecordConflict.className()
+                }) else { continue }
+                let inspection = try inspectRecordEvidence(
+                    in: committedRealm,
+                    context: context
+                )
+                if !inspection.isConsistent {
+                    throw BigSyncComparisonEvidenceError(
+                        issues: inspection.issues.sorted()
+                    )
+                }
+                hasSubmissionDebt = hasSubmissionDebt
+                    || inspection.hasSubmissionDebt
+                conflicts.formUnion(
+                    committedRealm.objects(BigSyncRecordConflict.self).where {
+                        $0.namespace == context.namespace && !$0.isResolved
+                    }.map(\.recordName)
+                )
             }
             if !conflicts.isEmpty { throw BigSyncUnresolvedRecordConflicts(recordNames: conflicts.sorted()) }
             if hasSubmissionDebt { return true }
@@ -8659,9 +8714,11 @@ public final class RealmSwiftAdapter:
             targetReaderRealm.schema.objectSchema.contains(where: {
                 $0.className == BigSyncPendingMutation.className()
             }) {
-            targetReaderRealm.refresh()
+            let committedTarget = committedRealmReadSnapshot(
+                in: targetReaderRealm
+            )
             if transportEligiblePendingMutations(
-                targetReaderRealm.objects(BigSyncPendingMutation.self)
+                committedTarget.objects(BigSyncPendingMutation.self)
             )
                 .contains(where: {
                     pendingMutationIsEligibleForActiveTransport(
@@ -8672,8 +8729,10 @@ public final class RealmSwiftAdapter:
             }
         }
 
-        persistenceRealm.refresh()
-        updateHasChanges(realm: persistenceRealm)
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
+        updateHasChanges(realm: committedPersistence)
         return hasChanges
     }
 
@@ -10359,49 +10418,71 @@ extension RealmSwiftAdapter {
                 ($0.recordID.recordName, $0)
             }
         )
-        let candidates = Array(activeInboundSemanticQuarantines(
-            accountScopeIdentifier: context.account,
-            in: tracking
-        ).filter { [self] quarantine in
-            guard quarantine.eventKind == "deletion",
-                  quarantine.validationCode
-                    == "retained-record-physically-deleted",
-                  quarantine.semanticScopeIdentifier
-                    == "retained-physical-deletion:" + quarantine.recordName,
-                  let saved = savedByName[quarantine.recordName],
-                  saved.recordType == quarantine.entityType,
-                  let type = self.realmObjectClass(name: quarantine.entityType),
-                  BigSyncRecordLifecycle.retainsTombstone(type),
-                  let target = provider
-                    .targetReaderRealmPerSchemaName[quarantine.entityType],
-                  let objectID = self.getObjectIdentifier(
-                    recordName: quarantine.recordName,
-                    entityType: quarantine.entityType
-                  ),
-                  let object = target.object(
+
+        func eligibleLineageIDs(in trackingRealm: Realm) -> Set<String> {
+            var result = Set<String>()
+            for quarantine in activeInboundSemanticQuarantines(
+                accountScopeIdentifier: context.account,
+                in: trackingRealm
+            ) {
+                guard quarantine.eventKind == "deletion",
+                      quarantine.validationCode
+                        == "retained-record-physically-deleted",
+                      quarantine.semanticScopeIdentifier
+                        == "retained-physical-deletion:"
+                            + quarantine.recordName,
+                      let saved = savedByName[quarantine.recordName],
+                      saved.recordType == quarantine.entityType,
+                      let type = self.realmObjectClass(
+                        name: quarantine.entityType
+                      ),
+                      BigSyncRecordLifecycle.retainsTombstone(type),
+                      let liveTarget = provider
+                        .targetReaderRealmPerSchemaName[
+                            quarantine.entityType
+                        ],
+                      let objectID = self.getObjectIdentifier(
+                        recordName: quarantine.recordName,
+                        entityType: quarantine.entityType
+                      ) else {
+                    continue
+                }
+
+                // Target eligibility is a read-only proof. Never let another
+                // target owner's provisional resurrection/tombstone decide
+                // whether durable quarantine evidence can be retired.
+                let target = committedRealmReadSnapshot(in: liveTarget)
+                guard let object = target.object(
                     ofType: type,
                     forPrimaryKey: objectID
-                  ),
-                  let tombstone = object as? SoftDeletable,
-                  tombstone.isDeleted else { return false }
+                ), let tombstone = object as? SoftDeletable,
+                   tombstone.isDeleted else {
+                    continue
+                }
 
-            // The tracking receipt must be terminal for the exact submitted
-            // record. A newer pending generation means this acknowledgement
-            // did not consume the prepared upload and cannot resolve evidence.
-            guard let entity = tracking.object(
-                ofType: SyncedEntity.self,
-                forPrimaryKey: quarantine.recordName
-            ), entity.entityType == quarantine.entityType,
-                  entity.entityState == .synced,
-                  entity.pendingGeneration == nil,
-                  let cached = self.getRecord(for: entity),
-                  cached.recordID.recordName == saved.recordID.recordName,
-                  cached.recordID.zoneID == saved.recordID.zoneID,
-                  cached.recordChangeTag == saved.recordChangeTag else {
-                return false
+                // The tracking receipt must be terminal for the exact submitted
+                // record. A newer pending generation means this acknowledgement
+                // did not consume the prepared upload.
+                guard let entity = trackingRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: quarantine.recordName
+                ), entity.entityType == quarantine.entityType,
+                   entity.entityState == .synced,
+                   entity.pendingGeneration == nil,
+                   let cached = self.getRecord(for: entity),
+                   cached.recordID.recordName
+                    == saved.recordID.recordName,
+                   cached.recordID.zoneID == saved.recordID.zoneID,
+                   cached.recordChangeTag == saved.recordChangeTag else {
+                    continue
+                }
+                result.insert(quarantine.lineageID)
             }
-            return true
-        })
+            return result
+        }
+
+        let committedTracking = committedRealmReadSnapshot(in: tracking)
+        let candidates = eligibleLineageIDs(in: committedTracking)
         guard !candidates.isEmpty else { return }
 
         try await tracking.asyncWritePreservingOwnership {
@@ -10410,9 +10491,21 @@ extension RealmSwiftAdapter {
                   activeAccountScopeIdentifier == context.account else {
                 throw CancellationError()
             }
-            let lineageIDs = candidates.map(\.lineageID)
-            let receiptIDs = try Self.retireQuarantines(lineageIDs, in: tracking)
-            Self.removeUnreferencedPageReceipts(receiptIDs, in: tracking)
+            // Candidate selection can become stale while the tracking writer
+            // waits. Revalidate the exact detached lineage IDs after admission;
+            // no managed quarantine row crosses the suspension.
+            let lineageIDs = candidates.intersection(
+                eligibleLineageIDs(in: tracking)
+            )
+            guard !lineageIDs.isEmpty else { return }
+            let receiptIDs = try Self.retireQuarantines(
+                Array(lineageIDs),
+                in: tracking
+            )
+            Self.removeUnreferencedPageReceipts(
+                receiptIDs,
+                in: tracking
+            )
         }
     }
 }
@@ -10675,37 +10768,86 @@ extension RealmSwiftAdapter {
     ) async throws -> Set<String> {
         guard let context = recordRebaseContext, let provider = realmProvider,
               let tracking = provider.persistenceRealm else { return [] }
+        let targetRealms = provider.targetReaderRealms ?? []
         var resolvedConflictIDs = Set<String>()
-        for realm in provider.targetReaderRealms ?? [] {
-            realm.refresh()
-            guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
-            for row in realm.objects(BigSyncRecordConflict.self).where({
-                $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
-            }) { resolvedConflictIDs.insert(row.id) }
+        for realm in targetRealms {
+            let committedRealm = committedRealmReadSnapshot(in: realm)
+            guard committedRealm.schema.objectSchema.contains(where: {
+                $0.className == BigSyncRecordConflict.className()
+            }) else { continue }
+            for row in committedRealm.objects(BigSyncRecordConflict.self).where({
+                $0.namespace == context.namespace
+                    && $0.isResolved
+                    && !$0.isPreservationReceipt
+            }) {
+                resolvedConflictIDs.insert(row.id)
+            }
         }
         guard !resolvedConflictIDs.isEmpty else { return [] }
-        let resolvedScopes = Set(resolvedConflictIDs.map { "record-conflict:" + $0 })
+        var retiredConflictIDs = Set<String>()
         try await tracking.asyncWritePreservingOwnership {
             // Retiring quarantine/page evidence is a separate mutation from
             // the durable target decision. Its transaction wait can outlive
             // the UI account lease even when adapter namespace strings have
             // not yet changed. Reuse the caller's final-write authority here.
             try validateAuthority()
-            guard recordRebaseContext == context else { throw CancellationError() }
-            let quarantines = activeInboundSemanticQuarantines(accountScopeIdentifier: context.account, in: tracking).filter { row in
-                guard let scope = row.semanticScopeIdentifier else { return false }
+            guard recordRebaseContext == context else {
+                throw CancellationError()
+            }
+
+            // The target resolution is the authority for this cleanup. It can
+            // change while the tracking writer waits, so resample committed
+            // target state after admission rather than carrying managed rows or
+            // trusting the earlier candidate set.
+            var stillResolved = Set<String>()
+            for realm in targetRealms {
+                let committedRealm = committedRealmReadSnapshot(in: realm)
+                guard committedRealm.schema.objectSchema.contains(where: {
+                    $0.className == BigSyncRecordConflict.className()
+                }) else { continue }
+                for row in committedRealm.objects(
+                    BigSyncRecordConflict.self
+                ).where({
+                    $0.namespace == context.namespace
+                        && $0.isResolved
+                        && !$0.isPreservationReceipt
+                }) where resolvedConflictIDs.contains(row.id) {
+                    stillResolved.insert(row.id)
+                }
+            }
+            guard !stillResolved.isEmpty else { return }
+            let resolvedScopes = Set(
+                stillResolved.map { "record-conflict:" + $0 }
+            )
+            let quarantines = activeInboundSemanticQuarantines(
+                accountScopeIdentifier: context.account,
+                in: tracking
+            ).filter { row in
+                guard let scope = row.semanticScopeIdentifier else {
+                    return false
+                }
                 return resolvedScopes.contains(scope)
                     && row.accountScopeIdentifier == context.account
-                    && row.containerIdentifier == self.activeContainerIdentifier
-                    && row.databaseScopeRawValue == self.activeDatabaseScopeRawValue
-                    && row.zoneOwnerName == self.recordZoneID.ownerName && row.zoneName == self.recordZoneID.zoneName
+                    && row.containerIdentifier
+                        == self.activeContainerIdentifier
+                    && row.databaseScopeRawValue
+                        == self.activeDatabaseScopeRawValue
+                    && row.zoneOwnerName == self.recordZoneID.ownerName
+                    && row.zoneName == self.recordZoneID.zoneName
             }
-            let receiptIDs = try Self.retireQuarantines(quarantines.map(\.lineageID), in: tracking)
-            Self.removeUnreferencedPageReceipts(receiptIDs, in: tracking)
+            let receiptIDs = try Self.retireQuarantines(
+                quarantines.map(\.lineageID),
+                in: tracking
+            )
+            Self.removeUnreferencedPageReceipts(
+                receiptIDs,
+                in: tracking
+            )
+            retiredConflictIDs = stillResolved
         }
-        // Only this snapshot has completed the tracking phase. A resolution
-        // committed during the wait must retain its archive for a later pass.
-        return resolvedConflictIDs
+        // Only resolutions revalidated after tracking admission completed this
+        // phase. A later resolution retains its archive for a later pass.
+        return retiredConflictIDs
     }
 
     /// After additional local editing, make a new review snapshot. This does

@@ -626,3 +626,260 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
 }
 
 enum W1InjectedFailure: Error { case afterTarget }
+
+
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testPendingMutationInventoryReadsCommittedJournalDuringProvisionalOwnerWrite() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.text = "committed"
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30)
+            )
+        }
+        let committed = try XCTUnwrap(
+            realm.objects(BigSyncPendingMutation.self).first
+        )
+        let committedGeneration = committed.generation
+        let committedChangedAt = committed.changedAt
+
+        realm.beginWrite()
+        defer {
+            if realm.isInWriteTransaction { realm.cancelWrite() }
+        }
+        object.text = "provisional"
+        object.isDeleted = true
+        object.refreshChangeMetadata(
+            explicitlyModified: true,
+            at: Date(timeIntervalSinceReferenceDate: 40)
+        )
+        XCTAssertNotEqual(
+            realm.objects(BigSyncPendingMutation.self).first?.generation,
+            committedGeneration
+        )
+
+        let inventory = try adapter.pendingMutationInventory(
+            entityTypes: [W1ContractNote.className()]
+        )
+        XCTAssertEqual(inventory.count, 1)
+        XCTAssertEqual(inventory.first?.recordName,
+            W1ContractNote.className() + "." + noteID.uuidString)
+        XCTAssertEqual(inventory.first?.changedAt, committedChangedAt)
+        XCTAssertFalse(try XCTUnwrap(inventory.first).isDeletion)
+    }
+
+    @BigSyncBackgroundActor
+    func testJournalForwardingStartsFromCommittedVersionDuringProvisionalOwnerWrite() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.text = "committed"
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30)
+            )
+        }
+        let committedGeneration = try XCTUnwrap(
+            realm.objects(BigSyncPendingMutation.self).first?.generation
+        )
+
+        realm.beginWrite()
+        object.text = "provisional"
+        object.refreshChangeMetadata(
+            explicitlyModified: true,
+            at: Date(timeIntervalSinceReferenceDate: 40)
+        )
+        let provisionalGeneration = try XCTUnwrap(
+            realm.objects(BigSyncPendingMutation.self).first?.generation
+        )
+        XCTAssertNotEqual(provisionalGeneration, committedGeneration)
+        defer {
+            if realm.isInWriteTransaction { realm.cancelWrite() }
+        }
+
+        try await adapter.didFinishImport()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        XCTAssertEqual(
+            tracking.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: W1ContractNote.className() + "." + noteID.uuidString
+            )?.pendingGeneration,
+            committedGeneration
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testTrackingAdmissionDoesNotBorrowProvisionalSuccessorGeneration() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.text = "committed"
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30)
+            )
+        }
+        let committedGeneration = try XCTUnwrap(
+            realm.objects(BigSyncPendingMutation.self).first?.generation
+        )
+        adapter._testBeforePendingMutationTrackingWrite = {
+            realm.beginWrite()
+            object.text = "provisional"
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 40)
+            )
+        }
+        defer {
+            adapter._testBeforePendingMutationTrackingWrite = nil
+            if realm.isInWriteTransaction { realm.cancelWrite() }
+        }
+
+        try await adapter.didFinishImport()
+        XCTAssertNotEqual(
+            realm.objects(BigSyncPendingMutation.self).first?.generation,
+            committedGeneration
+        )
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        XCTAssertEqual(
+            tracking.object(
+                ofType: SyncedEntity.self,
+                forPrimaryKey: W1ContractNote.className() + "." + noteID.uuidString
+            )?.pendingGeneration,
+            committedGeneration
+        )
+    }
+}
+
+
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testTerminalBoundaryCannotBorrowProvisionalTargetJournalRemoval() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30)
+            )
+        }
+        let name = W1ContractNote.className() + "." + noteID.uuidString
+        XCTAssertNotNil(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name
+        ))
+
+        realm.beginWrite()
+        defer {
+            if realm.isInWriteTransaction { realm.cancelWrite() }
+        }
+        realm.delete(try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name
+        )))
+        XCTAssertNil(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name
+        ))
+        XCTAssertTrue(try adapter.hasPendingChangesAtTerminalBoundary())
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalBoundaryCannotBorrowProvisionalTrackingAcknowledgement() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(
+                explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30)
+            )
+        }
+        try await adapter.didFinishImport()
+        let name = W1ContractNote.className() + "." + noteID.uuidString
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let tracked = try XCTUnwrap(tracking.object(
+            ofType: SyncedEntity.self,
+            forPrimaryKey: name
+        ))
+        XCTAssertNotNil(tracked.pendingGeneration)
+
+        // Leave only committed tracking debt so this specifically exercises
+        // the persistence-Realm side of the terminal cutoff.
+        try realm.write {
+            realm.delete(try XCTUnwrap(realm.object(
+                ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name
+            )))
+        }
+        tracking.beginWrite()
+        defer {
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        }
+        tracked.state = SyncedEntityState.synced.rawValue
+        tracked.clearPendingMutation()
+        XCTAssertNil(tracked.pendingGeneration)
+        XCTAssertTrue(try adapter.hasPendingChangesAtTerminalBoundary())
+    }
+}
+
+
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testPublicationBoundaryAndEpochIgnoreProvisionalTrackingTransition() async throws {
+        let (adapter, _) = try await fixture()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let committedToken = Data("committed-token".utf8)
+        try tracking.write {
+            let token = ServerToken()
+            token.token = committedToken
+            tracking.add(token)
+            let rebuild = RebuildProvenanceState()
+            rebuild.epoch = 7
+            tracking.add(rebuild, update: .modified)
+        }
+        let committedBoundary = try XCTUnwrap(
+            adapter.consumedServerBoundaryIdentifier(
+                accountScopeIdentifier: "w1-account",
+                replicaBindingGenerationIdentifier: "w1-binding",
+                containerIdentifier: "iCloud.test.w1-closeout",
+                databaseScope: .private
+            )
+        )
+        XCTAssertEqual(try adapter.changeFeedEpoch(), 7)
+
+        tracking.beginWrite()
+        defer {
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        }
+        tracking.objects(ServerToken.self).first?.token =
+            Data("provisional-token".utf8)
+        tracking.object(
+            ofType: RebuildProvenanceState.self,
+            forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+        )?.epoch = 8
+
+        XCTAssertEqual(
+            try adapter.consumedServerBoundaryIdentifier(
+                accountScopeIdentifier: "w1-account",
+                replicaBindingGenerationIdentifier: "w1-binding",
+                containerIdentifier: "iCloud.test.w1-closeout",
+                databaseScope: .private
+            ),
+            committedBoundary
+        )
+        XCTAssertEqual(try adapter.changeFeedEpoch(), 7)
+    }
+}
