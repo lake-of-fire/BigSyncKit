@@ -1,4 +1,5 @@
 import CloudKit
+import CoreFoundation
 import Foundation
 
 /// Last terminally complete transport boundary. This is synchronization
@@ -37,11 +38,78 @@ public struct BigSyncDurablePublicationEvidence: Sendable, Equatable {
         self.runID = runID
         self.publishedAt = publishedAt
     }
+
+    static let persistenceVersion = 1
+
+    /// Decode only the typed property-list representation written below.
+    /// A malformed present binding is not an intentionally unbound receipt;
+    /// lossy numeric conversion must not manufacture a matching version/epoch.
+    init(persistedValue raw: Any) throws {
+        guard let value = raw as? [String: Any],
+              Self.persistedNonnegativeInteger(value["version"])
+                == Self.persistenceVersion,
+              let domainScopeIdentifier =
+                value["domainScopeIdentifier"] as? String,
+              !domainScopeIdentifier.isEmpty,
+              let accountScopeIdentifier =
+                value["accountScopeIdentifier"] as? String,
+              !accountScopeIdentifier.isEmpty,
+              let zoneOwnerName = value["zoneOwnerName"] as? String,
+              !zoneOwnerName.isEmpty,
+              let zoneName = value["zoneName"] as? String,
+              !zoneName.isEmpty,
+              let changeFeedEpoch = Self.persistedNonnegativeInteger(
+                value["changeFeedEpoch"]
+              ),
+              let consumedServerBoundaryIdentifier = value[
+                "consumedServerBoundaryIdentifier"
+              ] as? String,
+              !consumedServerBoundaryIdentifier.isEmpty,
+              let runIDString = value["runID"] as? String,
+              let runID = UUID(uuidString: runIDString),
+              let publishedAt = value["publishedAt"] as? Date,
+              publishedAt.timeIntervalSinceReferenceDate.isFinite else {
+            throw DurableKeyValueStoreError.mutationNotDurable
+        }
+        let binding: String?
+        if let rawBinding = value["replicaBindingGenerationIdentifier"] {
+            guard let identifier = rawBinding as? String, !identifier.isEmpty else {
+                throw DurableKeyValueStoreError.mutationNotDurable
+            }
+            binding = identifier
+        } else {
+            binding = nil
+        }
+        self.init(
+            domainScopeIdentifier: domainScopeIdentifier,
+            accountScopeIdentifier: accountScopeIdentifier,
+            replicaBindingGenerationIdentifier: binding,
+            zoneOwnerName: zoneOwnerName,
+            zoneName: zoneName,
+            changeFeedEpoch: changeFeedEpoch,
+            consumedServerBoundaryIdentifier:
+                consumedServerBoundaryIdentifier,
+            runID: runID,
+            publishedAt: publishedAt
+        )
+    }
+
+    private static func persistedNonnegativeInteger(_ raw: Any?) -> Int? {
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        switch String(cString: number.objCType) {
+        case "c", "C", "s", "S", "i", "I", "l", "L", "q", "Q":
+            guard let value = Int(exactly: number), value >= 0 else { return nil }
+            return value
+        default:
+            // Even an integral real is not the integer property-list field
+            // emitted by this format. Never truncate a future/corrupt value.
+            return nil
+        }
+    }
 }
 
 extension CloudKitSynchronizer {
-    private static let durablePublicationEvidenceVersion = 1
-
     private var durablePublicationEvidenceKey: String {
         durableStateKey("TerminalPublication.v1")
     }
@@ -61,12 +129,13 @@ extension CloudKitSynchronizer {
     ) throws {
         guard !domainScopeIdentifier.isEmpty,
               !consumedServerBoundaryIdentifier.isEmpty,
-              changeFeedEpoch >= 0 else {
+              changeFeedEpoch >= 0,
+              timestamp.timeIntervalSinceReferenceDate.isFinite else {
             throw DurableKeyValueStoreError.mutationNotDurable
         }
         try checkRunContext(context)
         var value: [String: Any] = [
-            "version": Self.durablePublicationEvidenceVersion,
+            "version": BigSyncDurablePublicationEvidence.persistenceVersion,
             "domainScopeIdentifier": domainScopeIdentifier,
             "accountScopeIdentifier": context.accountScopeIdentifier,
             "zoneOwnerName": recordZoneID.ownerName,
@@ -92,49 +161,7 @@ extension CloudKitSynchronizer {
         ) else {
             return nil
         }
-        guard let value = raw as? [String: Any],
-              (value["version"] as? NSNumber)?.intValue
-                == Self.durablePublicationEvidenceVersion,
-              let domainScopeIdentifier =
-                value["domainScopeIdentifier"] as? String,
-              !domainScopeIdentifier.isEmpty,
-              let accountScopeIdentifier =
-                value["accountScopeIdentifier"] as? String,
-              !accountScopeIdentifier.isEmpty,
-              let zoneOwnerName = value["zoneOwnerName"] as? String,
-              !zoneOwnerName.isEmpty,
-              let zoneName = value["zoneName"] as? String,
-              !zoneName.isEmpty,
-              let changeFeedEpochNumber =
-                value["changeFeedEpoch"] as? NSNumber,
-              changeFeedEpochNumber.intValue >= 0,
-              let consumedServerBoundaryIdentifier = value[
-                "consumedServerBoundaryIdentifier"
-              ] as? String,
-              !consumedServerBoundaryIdentifier.isEmpty,
-              let runIDString = value["runID"] as? String,
-              let runID = UUID(uuidString: runIDString),
-              let publishedAt = value["publishedAt"] as? Date else {
-            throw DurableKeyValueStoreError.mutationNotDurable
-        }
-        let binding = value[
-            "replicaBindingGenerationIdentifier"
-        ] as? String
-        guard binding?.isEmpty != true else {
-            throw DurableKeyValueStoreError.mutationNotDurable
-        }
-        return BigSyncDurablePublicationEvidence(
-            domainScopeIdentifier: domainScopeIdentifier,
-            accountScopeIdentifier: accountScopeIdentifier,
-            replicaBindingGenerationIdentifier: binding,
-            zoneOwnerName: zoneOwnerName,
-            zoneName: zoneName,
-            changeFeedEpoch: changeFeedEpochNumber.intValue,
-            consumedServerBoundaryIdentifier:
-                consumedServerBoundaryIdentifier,
-            runID: runID,
-            publishedAt: publishedAt
-        )
+        return try BigSyncDurablePublicationEvidence(persistedValue: raw)
     }
 
     /// Restores terminal evidence only when the current CloudKit account,
