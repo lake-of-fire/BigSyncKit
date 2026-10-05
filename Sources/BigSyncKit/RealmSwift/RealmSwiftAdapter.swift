@@ -933,7 +933,10 @@ public final class RealmSwiftAdapter:
         guard let activeAccountScopeIdentifier else {
             throw BigSyncAccountScopeLeaseError.unavailable
         }
-        await persistenceRealm.asyncRefresh()
+        // Do not async-refresh a shared handle that may currently be
+        // inside another reentrant owner's write. The committed snapshot helper
+        // advances only an unowned live handle and otherwise freezes the read
+        // transaction version beneath that provisional write.
         let committedPersistence = committedRealmReadSnapshot(
             in: persistenceRealm
         )
