@@ -731,7 +731,6 @@ extension SyncUndoCloseoutW1Tests {
         let committedGeneration = try XCTUnwrap(
             realm.objects(BigSyncPendingMutation.self).first?.generation
         )
-        var provisionalGeneration: String?
         adapter._testBeforePendingMutationTrackingWrite = {
             realm.beginWrite()
             object.text = "provisional"
@@ -739,9 +738,6 @@ extension SyncUndoCloseoutW1Tests {
                 explicitlyModified: true,
                 at: Date(timeIntervalSinceReferenceDate: 40)
             )
-            provisionalGeneration = realm.objects(
-                BigSyncPendingMutation.self
-            ).first?.generation
         }
         defer {
             adapter._testBeforePendingMutationTrackingWrite = nil
@@ -749,7 +745,10 @@ extension SyncUndoCloseoutW1Tests {
         }
 
         try await adapter.didFinishImport()
-        XCTAssertNotEqual(provisionalGeneration, committedGeneration)
+        XCTAssertNotEqual(
+            realm.objects(BigSyncPendingMutation.self).first?.generation,
+            committedGeneration
+        )
         let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
         XCTAssertEqual(
             tracking.object(
