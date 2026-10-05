@@ -20,7 +20,10 @@ public struct BigSyncSynchronizationAudit: Codable, Equatable, Sendable {
     public let resolvedPreservationReceiptCount: Int
     public let retainedTombstoneCount: Int
 
-    public var isClean: Bool { issues.isEmpty && unresolvedSubmissionCount == 0 }
+    public var isClean: Bool {
+        issues.isEmpty && unresolvedSubmissionCount == 0
+            && pendingMutationCount == 0 && pendingRelationshipCount == 0
+    }
 
     init(serverRecordCount: Int, ownedServerRecordCount: Int, unknownServerRecordCount: Int,
          localObjectCount: Int, trackingRecordCount: Int, pendingMutationCount: Int,
@@ -54,21 +57,45 @@ public struct BigSyncSynchronizationAudit: Codable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        // Only an absent version belongs to the original pre-comparison
+        // format. An explicit null or malformed version is not legacy proof.
+        let version = try values.contains(.comparisonEvidenceVersion)
+            ? values.decode(Int.self, forKey: .comparisonEvidenceVersion) : 0
+        guard version == 0 || version == 1 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .comparisonEvidenceVersion, in: values,
+                debugDescription: "Unsupported synchronization audit evidence version")
+        }
+        func count(_ key: CodingKeys, addedWithComparisonEvidence: Bool = false) throws -> Int {
+            // Historical v0 artifacts omitted these fields. A v1 artifact
+            // promises the inspection was performed and must supply every
+            // result; missing/null evidence must never become a zero count.
+            if version == 0, addedWithComparisonEvidence, !values.contains(key) {
+                return 0
+            }
+            let value = try values.decode(Int.self, forKey: key)
+            guard value >= 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key, in: values,
+                    debugDescription: "Synchronization audit counts must be nonnegative")
+            }
+            return value
+        }
         self.init(
-            serverRecordCount: try values.decode(Int.self, forKey: .serverRecordCount),
-            ownedServerRecordCount: try values.decode(Int.self, forKey: .ownedServerRecordCount),
-            unknownServerRecordCount: try values.decode(Int.self, forKey: .unknownServerRecordCount),
-            localObjectCount: try values.decode(Int.self, forKey: .localObjectCount),
-            trackingRecordCount: try values.decode(Int.self, forKey: .trackingRecordCount),
-            pendingMutationCount: try values.decode(Int.self, forKey: .pendingMutationCount),
-            pendingRelationshipCount: try values.decode(Int.self, forKey: .pendingRelationshipCount),
+            serverRecordCount: try count(.serverRecordCount),
+            ownedServerRecordCount: try count(.ownedServerRecordCount),
+            unknownServerRecordCount: try count(.unknownServerRecordCount),
+            localObjectCount: try count(.localObjectCount),
+            trackingRecordCount: try count(.trackingRecordCount),
+            pendingMutationCount: try count(.pendingMutationCount),
+            pendingRelationshipCount: try count(.pendingRelationshipCount),
             issues: try values.decode([String].self, forKey: .issues),
-            comparisonEvidenceVersion: try values.decodeIfPresent(Int.self, forKey: .comparisonEvidenceVersion) ?? 0,
-            unresolvedSubmissionCount: try values.decodeIfPresent(Int.self, forKey: .unresolvedSubmissionCount) ?? 0,
-            acceptedBaselineCount: try values.decodeIfPresent(Int.self, forKey: .acceptedBaselineCount) ?? 0,
-            invalidatedBaselineCount: try values.decodeIfPresent(Int.self, forKey: .invalidatedBaselineCount) ?? 0,
-            resolvedPreservationReceiptCount: try values.decodeIfPresent(Int.self, forKey: .resolvedPreservationReceiptCount) ?? 0,
-            retainedTombstoneCount: try values.decodeIfPresent(Int.self, forKey: .retainedTombstoneCount) ?? 0)
+            comparisonEvidenceVersion: version,
+            unresolvedSubmissionCount: try count(.unresolvedSubmissionCount, addedWithComparisonEvidence: true),
+            acceptedBaselineCount: try count(.acceptedBaselineCount, addedWithComparisonEvidence: true),
+            invalidatedBaselineCount: try count(.invalidatedBaselineCount, addedWithComparisonEvidence: true),
+            resolvedPreservationReceiptCount: try count(.resolvedPreservationReceiptCount, addedWithComparisonEvidence: true),
+            retainedTombstoneCount: try count(.retainedTombstoneCount, addedWithComparisonEvidence: true))
     }
 }
 
