@@ -10418,49 +10418,71 @@ extension RealmSwiftAdapter {
                 ($0.recordID.recordName, $0)
             }
         )
-        let candidates = Array(activeInboundSemanticQuarantines(
-            accountScopeIdentifier: context.account,
-            in: tracking
-        ).filter { [self] quarantine in
-            guard quarantine.eventKind == "deletion",
-                  quarantine.validationCode
-                    == "retained-record-physically-deleted",
-                  quarantine.semanticScopeIdentifier
-                    == "retained-physical-deletion:" + quarantine.recordName,
-                  let saved = savedByName[quarantine.recordName],
-                  saved.recordType == quarantine.entityType,
-                  let type = self.realmObjectClass(name: quarantine.entityType),
-                  BigSyncRecordLifecycle.retainsTombstone(type),
-                  let target = provider
-                    .targetReaderRealmPerSchemaName[quarantine.entityType],
-                  let objectID = self.getObjectIdentifier(
-                    recordName: quarantine.recordName,
-                    entityType: quarantine.entityType
-                  ),
-                  let object = target.object(
+
+        func eligibleLineageIDs(in trackingRealm: Realm) -> Set<String> {
+            var result = Set<String>()
+            for quarantine in activeInboundSemanticQuarantines(
+                accountScopeIdentifier: context.account,
+                in: trackingRealm
+            ) {
+                guard quarantine.eventKind == "deletion",
+                      quarantine.validationCode
+                        == "retained-record-physically-deleted",
+                      quarantine.semanticScopeIdentifier
+                        == "retained-physical-deletion:"
+                            + quarantine.recordName,
+                      let saved = savedByName[quarantine.recordName],
+                      saved.recordType == quarantine.entityType,
+                      let type = self.realmObjectClass(
+                        name: quarantine.entityType
+                      ),
+                      BigSyncRecordLifecycle.retainsTombstone(type),
+                      let liveTarget = provider
+                        .targetReaderRealmPerSchemaName[
+                            quarantine.entityType
+                        ],
+                      let objectID = self.getObjectIdentifier(
+                        recordName: quarantine.recordName,
+                        entityType: quarantine.entityType
+                      ) else {
+                    continue
+                }
+
+                // Target eligibility is a read-only proof. Never let another
+                // target owner's provisional resurrection/tombstone decide
+                // whether durable quarantine evidence can be retired.
+                let target = committedRealmReadSnapshot(in: liveTarget)
+                guard let object = target.object(
                     ofType: type,
                     forPrimaryKey: objectID
-                  ),
-                  let tombstone = object as? SoftDeletable,
-                  tombstone.isDeleted else { return false }
+                ), let tombstone = object as? SoftDeletable,
+                   tombstone.isDeleted else {
+                    continue
+                }
 
-            // The tracking receipt must be terminal for the exact submitted
-            // record. A newer pending generation means this acknowledgement
-            // did not consume the prepared upload and cannot resolve evidence.
-            guard let entity = tracking.object(
-                ofType: SyncedEntity.self,
-                forPrimaryKey: quarantine.recordName
-            ), entity.entityType == quarantine.entityType,
-                  entity.entityState == .synced,
-                  entity.pendingGeneration == nil,
-                  let cached = self.getRecord(for: entity),
-                  cached.recordID.recordName == saved.recordID.recordName,
-                  cached.recordID.zoneID == saved.recordID.zoneID,
-                  cached.recordChangeTag == saved.recordChangeTag else {
-                return false
+                // The tracking receipt must be terminal for the exact submitted
+                // record. A newer pending generation means this acknowledgement
+                // did not consume the prepared upload.
+                guard let entity = trackingRealm.object(
+                    ofType: SyncedEntity.self,
+                    forPrimaryKey: quarantine.recordName
+                ), entity.entityType == quarantine.entityType,
+                   entity.entityState == .synced,
+                   entity.pendingGeneration == nil,
+                   let cached = self.getRecord(for: entity),
+                   cached.recordID.recordName
+                    == saved.recordID.recordName,
+                   cached.recordID.zoneID == saved.recordID.zoneID,
+                   cached.recordChangeTag == saved.recordChangeTag else {
+                    continue
+                }
+                result.insert(quarantine.lineageID)
             }
-            return true
-        })
+            return result
+        }
+
+        let committedTracking = committedRealmReadSnapshot(in: tracking)
+        let candidates = eligibleLineageIDs(in: committedTracking)
         guard !candidates.isEmpty else { return }
 
         try await tracking.asyncWritePreservingOwnership {
@@ -10469,9 +10491,21 @@ extension RealmSwiftAdapter {
                   activeAccountScopeIdentifier == context.account else {
                 throw CancellationError()
             }
-            let lineageIDs = candidates.map(\.lineageID)
-            let receiptIDs = try Self.retireQuarantines(lineageIDs, in: tracking)
-            Self.removeUnreferencedPageReceipts(receiptIDs, in: tracking)
+            // Candidate selection can become stale while the tracking writer
+            // waits. Revalidate the exact detached lineage IDs after admission;
+            // no managed quarantine row crosses the suspension.
+            let lineageIDs = candidates.intersection(
+                eligibleLineageIDs(in: tracking)
+            )
+            guard !lineageIDs.isEmpty else { return }
+            let receiptIDs = try Self.retireQuarantines(
+                Array(lineageIDs),
+                in: tracking
+            )
+            Self.removeUnreferencedPageReceipts(
+                receiptIDs,
+                in: tracking
+            )
         }
     }
 }
