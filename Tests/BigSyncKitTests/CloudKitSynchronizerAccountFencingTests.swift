@@ -32,6 +32,10 @@
         }
     }
 
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedGenerations: [String: String]
+    ) async throws {}
     var serverChangeToken: RecordZoneChangeCursor? { get async { nil } }
     func saveToken(_ token: RecordZoneChangeCursor?) async throws {}
 
