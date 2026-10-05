@@ -1022,20 +1022,40 @@ extension CloudKitSynchronizer {
     }
     
     @BigSyncBackgroundActor
-    func loadTokens(for zoneIDs: [CKRecordZone.ID]) async throws -> [CKRecordZone.ID] {
-        var filteredZoneIDs = [CKRecordZone.ID]()
-        activeZoneTokens = [CKRecordZone.ID: RecordZoneChangeCursor]()
-        
-        for zoneID in zoneIDs {
-            // Manabi explicitly registers its one supported synchronization
-            // zone. Ignore unrelated private-database zones instead of
-            // dynamically constructing an incompletely configured adapter.
-            guard let adapter = modelAdapterDictionary[zoneID] else { continue }
-            filteredZoneIDs.append(zoneID)
-            activeZoneTokens[zoneID] = await adapter.serverChangeToken
+    func loadTokens(
+        for zoneIDs: [CKRecordZone.ID],
+        attemptID expectedAttemptID: UUID? = nil
+    ) async throws -> [CKRecordZone.ID] {
+        let attemptID = expectedAttemptID ?? synchronizationAttemptID
+        let runID = synchronizationRunID
+        let context = activeRunContext
+        // Snapshot only registered adapters before any cursor read can suspend.
+        // An old read must neither adopt a replacement adapter nor publish its
+        // cursor into a successor run's in-memory page state.
+        let adapters = zoneIDs.compactMap { zoneID in
+            modelAdapterDictionary[zoneID].map { (zoneID: zoneID, adapter: $0) }
         }
-        
-        return filteredZoneIDs
+        func validateOwner() throws {
+            try checkSynchronizationAttempt(attemptID)
+            guard synchronizationRunID == runID, activeRunContext == context,
+                  adapters.allSatisfy({ modelAdapterDictionary[$0.zoneID] === $0.adapter }) else {
+                throw CancellationError()
+            }
+            if let context { try checkRunContext(context) }
+        }
+        try validateOwner()
+        var loadedTokens = [CKRecordZone.ID: RecordZoneChangeCursor]()
+        for (zoneID, adapter) in adapters {
+            let token = await adapter.serverChangeToken
+            try validateOwner()
+            loadedTokens[zoneID] = token
+        }
+        // No suspension or callout between final validation and publication.
+        // Rejection preserves the prior map; success still replaces it, even
+        // for empty input or a registered adapter with no persisted cursor.
+        try validateOwner()
+        activeZoneTokens = loadedTokens
+        return adapters.map(\.zoneID)
     }
     
     func resetActiveTokens() {
@@ -1273,7 +1293,7 @@ extension CloudKitSynchronizer {
         }
 
         let zoneIDsToFetch = try await loadTokens(
-            for: Array(changedZoneIDs)
+            for: Array(changedZoneIDs), attemptID: attemptID
         )
         try await revalidateActiveRunContext(for: attemptID)
         guard !zoneIDsToFetch.isEmpty else {
@@ -1297,7 +1317,13 @@ extension CloudKitSynchronizer {
     func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID]) async throws {
         let attemptID = synchronizationAttemptID
         let runID = synchronizationRunID
-        defer { changeRequestProcessor.clearErrors() }
+        defer {
+            // A cancelled request may unwind after another run has begun.
+            // Clear only the processor errors belonging to this fetch's owner.
+            if synchronizationAttemptID == attemptID, synchronizationRunID == runID {
+                changeRequestProcessor.clearErrors()
+            }
+        }
 
         for zoneID in zoneIDs {
             var pageCursor = activeZoneTokens[zoneID]
