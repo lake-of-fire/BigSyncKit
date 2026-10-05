@@ -47,8 +47,11 @@ extension RealmSwiftAdapter {
             .contains(where: {
                 $0.className == BigSyncPendingMutation.className()
             }) {
-            realm.refresh()
-            for mutation in realm.objects(BigSyncPendingMutation.self).filter(
+            // This observer does not own a target write. Capture the committed
+            // version after refresh, which can itself deliver reentrant writes.
+            if !realm.isInWriteTransaction { realm.refresh() }
+            let snapshot = realm.freeze()
+            for mutation in snapshot.objects(BigSyncPendingMutation.self).filter(
                 "entityType IN %@",
                 requestedEntityTypes
             ) {
@@ -62,7 +65,7 @@ extension RealmSwiftAdapter {
                     changedAt: mutation.changedAt,
                     isDeletion: pendingMutationTargetsDeletedObject(
                         mutation,
-                        in: realm
+                        in: snapshot
                     )
                 )
                 if let existing = byRecordName[item.recordName],
@@ -92,10 +95,11 @@ extension RealmSwiftAdapter {
         guard let realm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
-        realm.refresh()
+        if !realm.isInWriteTransaction { realm.refresh() }
+        let snapshot = realm.freeze()
         var generations = [String: String]()
         for recordName in recordNames {
-            guard let generation = realm.object(
+            guard let generation = snapshot.object(
                 ofType: SyncedEntity.self,
                 forPrimaryKey: recordName
             )?.pendingGeneration else { continue }

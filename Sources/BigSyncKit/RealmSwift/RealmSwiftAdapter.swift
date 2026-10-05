@@ -2,12 +2,14 @@
         for recordNames: some Sequence<String>,
         in realm: Realm
     ) -> [BigSyncPendingMutationSnapshot] {
-        recordNames.compactMap { recordName in
-            guard let mutation = realm.object(
+        if !realm.isInWriteTransaction { realm.refresh() }
+        let snapshot = realm.freeze()
+        return recordNames.compactMap { recordName in
+            guard let mutation = snapshot.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
             ) else { return nil }
-            return pendingMutationSnapshot(mutation, in: realm)
+            return pendingMutationSnapshot(mutation, in: snapshot)
         }
     }
 
@@ -37,9 +39,10 @@
         // Freeze the journal boundary so paging does not change which generations
         // this drain promises to forward, while avoiding one O(N) snapshot array.
         progress?("adapter-import-journal-snapshot-started")
-        let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
+        if !targetReaderRealm.isInWriteTransaction { targetReaderRealm.refresh() }
+        let snapshot = targetReaderRealm.freeze()
+        let mutations = snapshot.objects(BigSyncPendingMutation.self)
             .sorted(byKeyPath: "recordName")
-            .freeze()
         let mutationCount = mutations.count
         progress?("adapter-import-journal-snapshot-completed")
         let pageSize = 1_000
@@ -55,7 +58,7 @@
                 pending.append(
                     pendingMutationSnapshot(
                         mutations[index],
-                        in: targetReaderRealm
+                        in: snapshot
                     )
                 )
             }
@@ -69,25 +72,27 @@
                 // A frozen/page snapshot can become stale while this task is
                 // waiting for the tracking transaction. Re-resolve each
                 // identity only after that transaction is acquired, keeping
-                // the live-journal read and tracking publication in one
-                // non-suspending boundary so an older pass cannot overwrite a
-                // newer generation already forwarded by reentrant work.
+                // committed target read and tracking publication in one
+                // non-suspending boundary. Owning the tracking write does not
+                // authorize reading another owner's provisional target write.
+                // Journal fields and deletion disposition share this snapshot.
 #if DEBUG
                 traceJournalForwarding("tracking-target-refresh-started operation=\(traceOperation)")
 #endif
-                targetReaderRealm.refresh()
+                if !targetReaderRealm.isInWriteTransaction { targetReaderRealm.refresh() }
 #if DEBUG
                 traceJournalForwarding("tracking-target-refresh-completed operation=\(traceOperation)")
 #endif
+                let snapshot = targetReaderRealm.freeze()
                 let currentMutations: [BigSyncPendingMutationSnapshot] =
                     chunk.compactMap { mutation in
-                        guard let current = targetReaderRealm.object(
+                        guard let current = snapshot.object(
                             ofType: BigSyncPendingMutation.self,
                             forPrimaryKey: mutation.recordName
                         ) else { return nil }
                         return pendingMutationSnapshot(
                             current,
-                            in: targetReaderRealm
+                            in: snapshot
                         )
                     }
 #if DEBUG
@@ -100,7 +105,7 @@
                     guard !cancelSync else { throw CancellationError() }
                     // The account can change while this task is suspended
                     // waiting for the persistence transaction. Recheck the
-                    // live journal snapshot at the final publication boundary
+                    // committed journal snapshot at the final publication boundary
                     // so old-account work is never copied into the new run's
                     // tracking Realm.
                     guard pendingMutationIsEligibleForActiveTransport(
