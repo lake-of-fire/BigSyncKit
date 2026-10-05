@@ -55,8 +55,12 @@
         // The prepared retained tombstone is the exact server-restoring
         // disposition. Its acknowledgement may retire only this record's
         // quarantine; unrelated evidence must remain an audit blocker.
+        let saved = try prepared.map {
+            try tagged(BigSyncRecordPayload.decode(BigSyncRecordPayload.encode($0.record)),
+                       "retained-tombstone-accepted")
+        }
         try await adapter.didUpload(
-            savedRecords: prepared.map(\.record),
+            savedRecords: saved,
             matchingPreparedUploads: prepared
         )
         try await adapter.cleanUp()
@@ -73,7 +77,7 @@
             )
         )
         let audit = try await adapter.auditSynchronizationState(
-            serverRecords: prepared.map(\.record)
+            serverRecords: saved
         )
         XCTAssertFalse(audit.isClean)
         XCTAssertTrue(
