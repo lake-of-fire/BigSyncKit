@@ -1,8 +1,8 @@
 import Foundation
 import RealmSwift
 
-@BigSyncBackgroundActor
-public final class RealmSwiftAdapter {
+// Match production: isolate its methods, not the whole adapter class.
+public final class RealmSwiftAdapter: @unchecked Sendable {
     public var realmProvider: RealmProvider?
     var modelTypes: [String: Object.Type] = ["Note": Note.self]
     var excludedClassNames: [String] = []
@@ -36,9 +36,11 @@ public final class RealmSwiftAdapter {
         value.isDeletion = deleted
         persistenceRealm.add(value)
     }
+    @BigSyncBackgroundActor
     func discover(_ names: [String], in realm: Realm) -> [BigSyncPendingMutationSnapshot] {
         pendingMutationSnapshots(for: names, in: realm)
     }
+    @BigSyncBackgroundActor
     func forward(in realm: Realm, progress: (@BigSyncBackgroundActor @Sendable (String) -> Void)? = nil) async throws -> Int {
         try await forwardPendingMutations(in: realm, progress: progress)
     }

@@ -31,6 +31,9 @@ def methods(source: str, range_only: bool) -> str:
     # Extraction prepares executable production bodies; behavior is asserted by
     # RuntimeCases, never by matching the implementation's text.
     start = source.index("    private func pendingMutationSnapshots(")
+    actor_annotation = "    @BigSyncBackgroundActor\n"
+    if source[:start].endswith(actor_annotation):
+        start -= len(actor_annotation)
     stop = len(source) if range_only else source.index(
         "    @BigSyncBackgroundActor\n    private func enqueueCreatedAndModified(", start)
     selected = source[start:stop].rstrip("\n") + "\n"
@@ -44,7 +47,7 @@ def methods(source: str, range_only: bool) -> str:
         # Retain the actual production committed-read boundary used by all
         # selected bodies, rather than replacing it with a harness implementation.
         helper_start = source.index(helper_marker)
-        helper_end = source.index("    private func pendingMutationSnapshots(", helper_start)
+        helper_end = start
         selected = source[helper_start:helper_end] + selected
     return selected
 

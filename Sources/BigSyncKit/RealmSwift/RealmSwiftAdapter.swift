@@ -2418,6 +2418,7 @@ public final class RealmSwiftAdapter:
         return realm.freeze()
     }
 
+    @BigSyncBackgroundActor
     private func pendingMutationSnapshots(
         for recordNames: some Sequence<String>,
         in realm: Realm
