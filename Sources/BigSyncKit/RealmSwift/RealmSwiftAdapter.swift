@@ -576,6 +576,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforeCursorTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     @BigSyncBackgroundActor
     var _testJournalForwardingTrace: (@BigSyncBackgroundActor @Sendable (String) -> Void)?
     @BigSyncBackgroundActor
@@ -8891,7 +8893,8 @@ public final class RealmSwiftAdapter:
         let expectedReplicaActivationIdentifier =
             activeReplicaBindingGenerationIdentifier
                 ?? Self.unboundReplicaActivationIdentifier
-        let expectedChangeFeedEpoch = persistenceRealm.object(
+        let committedPersistence = committedRealmReadSnapshot(in: persistenceRealm)
+        let expectedChangeFeedEpoch = committedPersistence.object(
             ofType: RebuildProvenanceState.self,
             forPrimaryKey: RebuildProvenanceState.primaryKeyValue
         )?.epoch ?? 0
@@ -8912,6 +8915,9 @@ public final class RealmSwiftAdapter:
         } else {
             resetNamespace = nil
         }
+#if DEBUG
+        try _testBeforeCursorTrackingWrite?()
+#endif
         try await persistenceRealm.asyncWritePreservingOwnership {
             try Task.checkCancellation()
             guard !cancelSync,
@@ -8985,6 +8991,7 @@ public final class RealmSwiftAdapter:
             throw RealmSwiftInboundPageCommitError
                 .transportNamespaceUnavailable
         }
+        let committedPersistence = committedRealmReadSnapshot(in: persistenceRealm)
         let namespace = InboundPageNamespace(
             accountScopeIdentifier: accountScopeIdentifier,
             containerIdentifier: activeContainerIdentifier,
@@ -8994,7 +9001,7 @@ public final class RealmSwiftAdapter:
             replicaActivationIdentifier:
                 activeReplicaBindingGenerationIdentifier
                     ?? Self.unboundReplicaActivationIdentifier,
-            changeFeedEpoch: persistenceRealm.object(
+            changeFeedEpoch: committedPersistence.object(
                 ofType: RebuildProvenanceState.self,
                 forPrimaryKey: RebuildProvenanceState.primaryKeyValue
             )?.epoch ?? 0
@@ -9023,6 +9030,9 @@ public final class RealmSwiftAdapter:
         try Task.checkCancellation()
         guard !cancelSync else { throw CancellationError() }
         let expectedCancellationGeneration = cancellationGeneration
+#if DEBUG
+        try _testBeforeCursorTrackingWrite?()
+#endif
         try await persistenceRealm.asyncWritePreservingOwnership {
             try requireCurrentTransport(
                 namespace,

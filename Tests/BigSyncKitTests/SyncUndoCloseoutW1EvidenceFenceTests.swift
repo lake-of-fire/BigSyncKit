@@ -805,3 +805,33 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertTrue(realm.isInWriteTransaction)
     }
 }
+
+// Exercise the ID-bearing observer processor before a later lifecycle scan can
+// hide the lost invalidation. The test owns only its provisional target write.
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testObservedJournalDebtSurvivesProvisionalRemovalAndAbort() async throws {
+        let (adapter, realm, object, incoming) = try await acceptedNote()
+        let name = incoming.recordID.recordName
+        try realm.write {
+            object.text = "committed observed edit"
+            object.refreshChangeMetadata(explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30))
+        }
+        let mutation = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name))
+        let generation = mutation.generation
+        realm.beginWrite()
+        defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+        realm.delete(mutation)
+        adapter._test_enqueueObservedJournalRecordNames([name])
+        try await adapter._test_processObservedRealmChanges()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        XCTAssertEqual(tracking.freeze().object(ofType: SyncedEntity.self,
+            forPrimaryKey: name)?.pendingGeneration, generation)
+        XCTAssertTrue(realm.isInWriteTransaction)
+        realm.cancelWrite()
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation, generation)
+    }
+}

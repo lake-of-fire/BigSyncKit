@@ -1308,41 +1308,62 @@ extension CloudKitSynchronizer {
             delegate?.synchronizerWillFetchChanges(self, in: $0)
         }
         reportProgress("zone-fetch-start")
-        try await fetchZoneChanges(zoneIDsToFetch)
+        try await fetchZoneChanges(zoneIDsToFetch, attemptID: attemptID)
         try await revalidateActiveRunContext(for: attemptID)
         return pageCursor
     }
 
     @BigSyncBackgroundActor
-    func fetchZoneChanges(_ zoneIDs: [CKRecordZone.ID]) async throws {
-        let attemptID = synchronizationAttemptID
+    func fetchZoneChanges(
+        _ zoneIDs: [CKRecordZone.ID],
+        attemptID expectedAttemptID: UUID? = nil
+    ) async throws {
+        let attemptID = expectedAttemptID ?? synchronizationAttemptID
         let runID = synchronizationRunID
+        let context = activeRunContext
+        try checkSynchronizationAttempt(attemptID)
+        let adapters = zoneIDs.compactMap { zoneID in
+            modelAdapterDictionary[zoneID].map { (zoneID: zoneID, adapter: $0) }
+        }
         defer {
             // A cancelled request may unwind after another run has begun.
             // Clear only the processor errors belonging to this fetch's owner.
-            if synchronizationAttemptID == attemptID, synchronizationRunID == runID {
+            if synchronizationAttemptID == attemptID,
+               synchronizationRunID == runID,
+               activeRunContext == context,
+               adapters.allSatisfy({ modelAdapterDictionary[$0.zoneID] === $0.adapter }) {
                 changeRequestProcessor.clearErrors()
             }
         }
 
-        for zoneID in zoneIDs {
+        for (zoneID, adapter) in adapters {
             var pageCursor = activeZoneTokens[zoneID]
             var pageIndex = 0
-            guard let adapter = modelAdapterDictionary[zoneID] else {
-                continue
+            func validateFetchOwner() throws {
+                try checkSynchronizationAttempt(attemptID)
+                guard synchronizationRunID == runID,
+                      activeRunContext == context,
+                      modelAdapterDictionary[zoneID] === adapter else {
+                    throw CancellationError()
+                }
+                if let context { try checkRunContext(context) }
             }
+            try validateFetchOwner()
             let isServerBootstrap: Bool
             if let migrating = adapter as? any ChangeFeedResetMigrating {
                 isServerBootstrap =
                     await migrating.isChangeFeedServerBootstrapActive()
                 try await revalidateActiveRunContext(for: attemptID)
+                try validateFetchOwner()
             } else {
                 isServerBootstrap = false
             }
 
             var moreComing = true
             while moreComing {
+                try validateFetchOwner()
                 try await revalidateActiveRunContext(for: attemptID)
+                try validateFetchOwner()
                 let page: CloudKitRecordZoneChangePage
                 do {
                     page = try await changeFeed.recordZoneChanges(
@@ -1352,7 +1373,7 @@ extension CloudKitSynchronizer {
                         resultsLimit: 200
                     )
                 } catch {
-                    try checkSynchronizationAttempt(attemptID)
+                    try validateFetchOwner()
                     guard let context = activeRunContext,
                           !CloudKitRetryConstraints(error).blocksAccountOperations else {
                         throw error
@@ -1366,6 +1387,7 @@ extension CloudKitSynchronizer {
                         throw error
                     }
                     try await revalidateRunContext(context)
+                    try validateFetchOwner()
                     if let lifecycleError = applyCloudKitLoss(
                         disposition,
                         zoneID: zoneID,
@@ -1384,6 +1406,7 @@ extension CloudKitSynchronizer {
                     continue
                 }
                 try await revalidateActiveRunContext(for: attemptID)
+                try validateFetchOwner()
                 try ChangeRequestProcessor.validateInboundPageIdentities(
                     records: page.records,
                     deletedRecordIDs: page.deletedRecordIDs,
@@ -1422,6 +1445,7 @@ extension CloudKitSynchronizer {
                     !isAuthoritativeOwnUpload($0)
                 }
 
+                try validateFetchOwner()
                 for record in acceptedRecords {
                     changeRequestProcessor.addFetchedChangeRequest(
                         ChangeRequest(
@@ -1449,6 +1473,7 @@ extension CloudKitSynchronizer {
 
                 let pageOutcomes = try await changeRequestProcessor
                     .finishProcessing(for: adapter)
+                try validateFetchOwner()
                 if let firstError = changeRequestProcessor.getErrors().first {
                     throw firstError
                 }
@@ -1470,6 +1495,7 @@ extension CloudKitSynchronizer {
                     .validateAuthoritativeOwnUploadRecords(
                         authoritativeOwnUploadRecords
                     )
+                try validateFetchOwner()
                 try validateInboundLiveResults(
                     authoritativeOwnUploadResults,
                     records: authoritativeOwnUploadRecords
@@ -1480,6 +1506,7 @@ extension CloudKitSynchronizer {
                     synchronizationDrainDidImportChanges = true
                 }
                 try await revalidateActiveRunContext(for: attemptID)
+                try validateFetchOwner()
 
                 var acceptedResultIndex = 0
                 var authoritativeOwnUploadResultIndex = 0
@@ -1534,6 +1561,7 @@ extension CloudKitSynchronizer {
                 // refetches this exact page. Realm-backed adapters bind the
                 // exact dispositions and proven quarantine supersessions to
                 // the cursor in one tracking-Realm transaction.
+                try validateFetchOwner()
                 try await adapter.commitInboundPage(InboundPageCommit(
                     previousCursor: pageCursor,
                     nextCursor: page.cursor,
@@ -1541,6 +1569,7 @@ extension CloudKitSynchronizer {
                     deletionResults: normalizedDeletionResults
                 ))
                 try await revalidateActiveRunContext(for: attemptID)
+                try validateFetchOwner()
                 // Deferred relationships are already durable in the adapter's
                 // persistence Realm and were proven by commitInboundPage.
                 // Apply them only after the cursor commit so a successful
@@ -1548,6 +1577,7 @@ extension CloudKitSynchronizer {
                 // page to advance.
                 try await adapter.persistImportedChanges()
                 try await revalidateActiveRunContext(for: attemptID)
+                try validateFetchOwner()
                 activeZoneTokens[zoneID] = page.cursor
                 pageCursor = page.cursor
                 moreComing = page.moreComing

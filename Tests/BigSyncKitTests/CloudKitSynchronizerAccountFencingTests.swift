@@ -3800,3 +3800,73 @@ extension CloudKitSynchronizerAccountFencingTests {
         XCTAssertEqual(transport.recordMutationCount, 0)
     }
 }
+
+extension CloudKitSynchronizerAccountFencingTests {
+    @BigSyncBackgroundActor
+    func testSuccessfulHeldZonePageCannotReachReplacedAdapterOwner() async throws {
+        let (sync, adapter, transport) = await cursorCleanupFixture()
+        let entered = expectation(description: "original adapter page held")
+        let release = ClosureRestorationGate()
+        let cursor = cursorLoadingToken("obsolete-page")
+        let record = CKRecord(recordType: "AccountFencingObject",
+            recordID: CKRecord.ID(recordName: "held-page", zoneID: sync.recordZoneID))
+        transport.zoneChangeHandler = {
+            entered.fulfill()
+            await release.wait()
+            return .init(cursor: cursor, records: [record], deletedRecordIDs: [], moreComing: false)
+        }
+        let originalFailure = NSError(domain: "OriginalAdapterMustStayUnread", code: 1)
+        adapter.fetchedRecordFailure = originalFailure
+        let request = Task { @BigSyncBackgroundActor in
+            try await sync.fetchZoneChanges([sync.recordZoneID])
+        }
+        addTeardownBlock { request.cancel(); await release.open(); _ = await request.result }
+        await fulfillment(of: [entered], timeout: 2)
+        sync.modelAdapterDictionary[sync.recordZoneID] = AccountFencingModelAdapter(zoneID: sync.recordZoneID)
+        await release.open()
+        do {
+            try await request.value
+            XCTFail("A page admitted for the replaced adapter must be rejected")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertNil(sync.activeZoneTokens[sync.recordZoneID])
+        XCTAssertFalse(sync.synchronizationDrainDidImportChanges)
+        XCTAssertEqual(transport.recordMutationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testZoneFetchRejectsOriginalCallerAttemptBeforeTransportRead() async {
+        let (sync, _, transport) = await cursorCleanupFixture()
+        do {
+            try await sync.fetchZoneChanges([sync.recordZoneID], attemptID: UUID())
+            XCTFail("Retired caller must not adopt the current fetch owner")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(transport.zoneChangeFetchCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testMultipleCursorReadsNeverPublishAnIntermediateMap() async throws {
+        let (sync, adapter, transport) = cursorLoadingFixture()
+        let second = AccountFencingModelAdapter(zoneID: makeZoneID())
+        sync.modelAdapterDictionary[second.recordZoneID] = second
+        let entered = expectation(description: "second cursor held")
+        let release = ClosureRestorationGate()
+        let firstCursor = cursorLoadingToken("first")
+        let secondCursor = cursorLoadingToken("second")
+        adapter.cursorLoadingProvider = { firstCursor }
+        second.cursorLoadingProvider = { entered.fulfill(); await release.wait(); return secondCursor }
+        let request = Task { @BigSyncBackgroundActor in
+            try await sync.loadTokens(for: [adapter.recordZoneID, second.recordZoneID])
+        }
+        addTeardownBlock { request.cancel(); await release.open(); _ = await request.result }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(sync.activeZoneTokens.count, 1)
+        XCTAssertEqual(sync.activeZoneTokens[adapter.recordZoneID]?.serializedData, Data("prior".utf8))
+        XCTAssertNil(sync.activeZoneTokens[second.recordZoneID])
+        await release.open()
+        let zones = try await request.value
+        XCTAssertEqual(zones, [adapter.recordZoneID, second.recordZoneID])
+        XCTAssertEqual(sync.activeZoneTokens[adapter.recordZoneID]?.serializedData, firstCursor.serializedData)
+        XCTAssertEqual(sync.activeZoneTokens[second.recordZoneID]?.serializedData, secondCursor.serializedData)
+        XCTAssertEqual(transport.operationCount, 0)
+    }
+}
