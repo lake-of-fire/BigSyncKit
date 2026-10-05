@@ -79,7 +79,7 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(tracked.pendingGeneration, generation)
         XCTAssertNil(tracked.encodedRecord)
         XCTAssertEqual(object.text, "provisional local")
-        realm.cancelWrite()
+        if realm.isInWriteTransaction { realm.cancelWrite() }
         XCTAssertEqual(object.text, "committed local")
         XCTAssertEqual(object.modifiedAt, Date(timeIntervalSinceReferenceDate: 30))
         XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
@@ -116,7 +116,7 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(tracked.entityState, .new)
         XCTAssertEqual(tracked.pendingGeneration, generation)
         XCTAssertNil(tracked.encodedRecord)
-        realm.cancelWrite()
+        if realm.isInWriteTransaction { realm.cancelWrite() }
         XCTAssertEqual(realm.object(ofType: BigSyncRecordBaseline.self,
                                    forPrimaryKey: name)?.revision, committed)
     }
@@ -137,7 +137,7 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertNil(proof, "Uncommitted deletion must not authorize a server delete")
         XCTAssertTrue(realm.isInWriteTransaction)
         XCTAssertTrue(object.isDeleted)
-        realm.cancelWrite()
+        if realm.isInWriteTransaction { realm.cancelWrite() }
         XCTAssertFalse(object.isDeleted)
         XCTAssertEqual(object.text, "still live")
     }
@@ -164,7 +164,7 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(proof?.revision, revision)
         XCTAssertTrue(realm.isInWriteTransaction)
         XCTAssertFalse(object.isDeleted)
-        realm.cancelWrite()
+        if realm.isInWriteTransaction { realm.cancelWrite() }
         XCTAssertTrue(object.isDeleted)
         XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
             forPrimaryKey: incoming.recordID.recordName)?.generation, generation)
@@ -201,7 +201,7 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(tracked.encodedRecord, originalArchive)
         XCTAssertTrue(realm.isInWriteTransaction)
         XCTAssertNil(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
-        realm.cancelWrite()
+        if realm.isInWriteTransaction { realm.cancelWrite() }
         XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
                                    forPrimaryKey: name)?.generation, generation)
     }
@@ -213,7 +213,10 @@ extension SyncUndoCloseoutW1Tests {
                                         realm: realm, adapter: adapter)
         realm.beginWrite()
         BigSyncRecordBaseline.invalidate(recordName: incoming.recordID.recordName, in: realm)
-        adapter._testBeforeRemoteDeletionTargetWrite = { realm.cancelWrite() }
+        adapter._testBeforeRemoteDeletionTargetWrite = {
+            XCTAssertTrue(realm.isInWriteTransaction)
+            if realm.isInWriteTransaction { realm.cancelWrite() }
+        }
         defer {
             adapter._testBeforeRemoteDeletionTargetWrite = nil
             if realm.isInWriteTransaction { realm.cancelWrite() }
@@ -286,7 +289,7 @@ extension SyncUndoCloseoutW1Tests {
         adapter._testAfterDisappearanceTargetWrite = {
             XCTAssertTrue(tracking.isInWriteTransaction,
                           "Target reconciliation must not settle the tracking owner")
-            tracking.cancelWrite()
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
         }
         defer {
             adapter._testAfterDisappearanceTargetWrite = nil
