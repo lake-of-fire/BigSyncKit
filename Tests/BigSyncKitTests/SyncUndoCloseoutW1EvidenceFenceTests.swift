@@ -3,7 +3,7 @@ import Foundation
 import Logging
 import RealmSwift
 import XCTest
-@testable import BigSyncKit
+@_spi(CloudKitE2E) @testable import BigSyncKit
 
 
 // These are committed-read tests, not permission to mutate another owner's
