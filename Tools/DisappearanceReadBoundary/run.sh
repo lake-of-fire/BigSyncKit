@@ -6,7 +6,9 @@ scratch="$(mktemp -d "${TMPDIR:-/tmp}/bigsync-disappearance.XXXXXX")"
 cleanup() {
     if [[ -d "$scratch" ]]; then
         mkdir -p "$HOME/.Trash"
-        mv "$scratch" "$HOME/.Trash/$(basename "$scratch")-$(uuidgen)"
+        local trash_directory
+        trash_directory="$(mktemp -d "$HOME/.Trash/bigsync-scratch.XXXXXX")"
+        mv "$scratch" "$trash_directory/"
     fi
 }
 trap cleanup EXIT
