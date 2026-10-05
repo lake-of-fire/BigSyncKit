@@ -8860,7 +8860,12 @@ public final class RealmSwiftAdapter:
         get async {
             return await { @BigSyncBackgroundActor in
                 guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
-                let serverToken = persistenceRealm.objects(ServerToken.self).first
+                // Another independently owned tracking write may be suspended.
+                // Its provisional cursor is not permission to skip a server page.
+                // Refresh may open such a write through notification reentry;
+                // freeze unconditionally and let only detached bytes escape.
+                let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+                let serverToken = snapshot.objects(ServerToken.self).first
                 return serverToken?.token.map(RecordZoneChangeCursor.init(serializedData:))
             }()
         }
