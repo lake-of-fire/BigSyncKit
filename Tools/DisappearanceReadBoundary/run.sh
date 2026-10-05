@@ -3,7 +3,13 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/bigsync-disappearance.XXXXXX")"
-trap 'rm -rf "$scratch"' EXIT
+cleanup() {
+    if [[ -d "$scratch" ]]; then
+        mkdir -p "$HOME/.Trash"
+        mv "$scratch" "$HOME/.Trash/$(basename "$scratch")-$(uuidgen)"
+    fi
+}
+trap cleanup EXIT
 cp "$here/Package.swift" "$scratch/Package.swift"
 cp -R "$here/Sources" "$here/Tests" "$scratch/"
 # Compile the complete selected production file, never a copied implementation.

@@ -3,7 +3,13 @@ set -euo pipefail
 tool_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$tool_root/../.." && pwd)"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/bigsync-audit-read.XXXXXX")"
-trap 'rm -rf "$scratch"' EXIT
+cleanup() {
+    if [[ -d "$scratch" ]]; then
+        mkdir -p "$HOME/.Trash"
+        mv "$scratch" "$HOME/.Trash/$(basename "$scratch")-$(uuidgen)"
+    fi
+}
+trap cleanup EXIT
 cp "$tool_root/Package.swift" "$scratch/"
 cp -R "$tool_root/Sources" "$tool_root/Tests" "$scratch/"
 # Compile the complete selected production sources, never a second audit model.
