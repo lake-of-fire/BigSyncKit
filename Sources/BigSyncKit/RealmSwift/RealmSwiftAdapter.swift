@@ -2377,6 +2377,20 @@ public final class RealmSwiftAdapter:
         }
     }
 
+    /// Returns a frozen view pinned to this Realm's committed read version.
+    /// A reentrant owner may have an open write on the shared live handle; Realm
+    /// freezing is keyed from the read transaction version, so provisional
+    /// mutations are excluded. Refresh first only when no write owns the handle,
+    /// then freeze unconditionally because refresh notification delivery can
+    /// itself open a write.
+    @BigSyncBackgroundActor
+    func committedMutationJournalSnapshot(in realm: Realm) -> Realm {
+        if !realm.isFrozen && !realm.isInWriteTransaction {
+            realm.refresh()
+        }
+        return realm.freeze()
+    }
+
     private func pendingMutationSnapshots(
         for recordNames: some Sequence<String>,
         in realm: Realm
@@ -2466,9 +2480,11 @@ public final class RealmSwiftAdapter:
         // Freeze the journal boundary so paging does not change which generations
         // this drain promises to forward, while avoiding one O(N) snapshot array.
         progress?("adapter-import-journal-snapshot-started")
-        let mutations = targetReaderRealm.objects(BigSyncPendingMutation.self)
+        let committedTarget = committedMutationJournalSnapshot(
+            in: targetReaderRealm
+        )
+        let mutations = committedTarget.objects(BigSyncPendingMutation.self)
             .sorted(byKeyPath: "recordName")
-            .freeze()
         let mutationCount = mutations.count
         progress?("adapter-import-journal-snapshot-completed")
         let pageSize = 1_000
@@ -2484,7 +2500,7 @@ public final class RealmSwiftAdapter:
                 pending.append(
                     pendingMutationSnapshot(
                         mutations[index],
-                        in: targetReaderRealm
+                        in: committedTarget
                     )
                 )
             }
@@ -2599,26 +2615,28 @@ public final class RealmSwiftAdapter:
 #endif
                 // A frozen/page snapshot can become stale while this task is
                 // waiting for the tracking transaction. Re-resolve each
-                // identity only after that transaction is acquired, keeping
-                // the live-journal read and tracking publication in one
-                // non-suspending boundary so an older pass cannot overwrite a
-                // newer generation already forwarded by reentrant work.
+                // identity only after that transaction is acquired, but from
+                // the target's committed read version: another suspended target
+                // owner may still have provisional journal/object changes on
+                // the shared live handle.
 #if DEBUG
                 traceJournalForwarding("tracking-target-refresh-started operation=\(traceOperation)")
 #endif
-                targetReaderRealm.refresh()
+                let committedTarget = committedMutationJournalSnapshot(
+                    in: targetReaderRealm
+                )
 #if DEBUG
                 traceJournalForwarding("tracking-target-refresh-completed operation=\(traceOperation)")
 #endif
                 let currentMutations: [BigSyncPendingMutationSnapshot] =
                     chunk.compactMap { mutation in
-                        guard let current = targetReaderRealm.object(
+                        guard let current = committedTarget.object(
                             ofType: BigSyncPendingMutation.self,
                             forPrimaryKey: mutation.recordName
                         ) else { return nil }
                         return pendingMutationSnapshot(
                             current,
-                            in: targetReaderRealm
+                            in: committedTarget
                         )
                     }
 #if DEBUG
