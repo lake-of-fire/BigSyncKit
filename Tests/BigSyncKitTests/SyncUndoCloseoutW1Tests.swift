@@ -116,7 +116,10 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     let noteID = UUID(uuidString: "A0000000-0000-0000-0000-000000000001")!
 
     @BigSyncBackgroundActor
-    func fixture(enableRecordRebasing: Bool = true) async throws -> (RealmSwiftAdapter, Realm) {
+    func fixture(
+        enableRecordRebasing: Bool = true,
+        replicaBindingGenerationIdentifier: String? = "w1-binding"
+    ) async throws -> (RealmSwiftAdapter, Realm) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("w1-realms-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         realmFixtureOwner.ownDirectory(directory)
@@ -128,7 +131,8 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         }
         BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [target],
             mutationJournalIdentityProvider: {
-                .init(installationIdentifier: "w1-local", replicaBindingGenerationIdentifier: "w1-binding")
+                .init(installationIdentifier: "w1-local",
+                    replicaBindingGenerationIdentifier: replicaBindingGenerationIdentifier)
             })
         var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
         tracking.fileURL = directory.appendingPathComponent("tracking.realm")
@@ -141,7 +145,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         try await adapter.resetSyncCaches()
         adapter.invalidateTokens()
         try await adapter.activateReplicaBinding(accountScopeIdentifier: "w1-account",
-            replicaBindingGenerationIdentifier: "w1-binding")
+            replicaBindingGenerationIdentifier: replicaBindingGenerationIdentifier)
         try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.test.w1-closeout",
             databaseScope: .private)
         return (adapter, try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first))
@@ -938,5 +942,205 @@ extension SyncUndoCloseoutW1Tests {
             committedBoundary
         )
         XCTAssertEqual(try adapter.changeFeedEpoch(), 7)
+    }
+}
+
+
+private final class DeletionMetadataRefreshSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    private var observed = false
+
+    func arm() {
+        lock.lock(); defer { lock.unlock() }
+        armed = true
+    }
+
+    func receive() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard armed, !observed else { return false }
+        observed = true
+        return true
+    }
+
+    var didObserve: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return observed
+    }
+}
+
+extension SyncUndoCloseoutW1Tests {
+    private enum DeletionMetadataRefreshMode {
+        case current, cancelGeneration, cancelTask, replaceAccount, replaceContext
+    }
+
+    @BigSyncBackgroundActor
+    private func exerciseDeletionMetadataRefresh(
+        mode: DeletionMetadataRefreshMode, unbound: Bool = false
+    ) async throws {
+        let (adapter, target) = try await fixture(
+            replicaBindingGenerationIdentifier: unbound ? nil : "w1-binding")
+        let object = W1ContractNote()
+        object.id = noteID
+        try target.write {
+            target.add(object)
+            object.text = "original deletion intent"
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        _ = try await adapter._test_forwardPendingMutations(in: target)
+        let name = W1ContractNote.className() + "." + noteID.uuidString
+        let journal = try XCTUnwrap(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+        let generation = journal.generation
+        if !unbound {
+            let prepared = try await adapter.preparedRecordDeletions(limit: 1, restrictedToEntityType: nil)
+            XCTAssertEqual(prepared.first?.recordID.recordName, name)
+            XCTAssertEqual(prepared.first?.generation, generation)
+        } else {
+            XCTAssertNil(adapter.recordRebaseContext, "The metadata-only entry point permits legacy unbound transport")
+        }
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+        // Seed real opaque system fields so rejection asserts their exact
+        // preservation, rather than merely a nil-to-nil no-op.
+        let original = try tagged(note(adapter), "before-deletion-conflict")
+        try tracking.write { try adapter.save(record: original, for: entity) }
+        let priorEncoded = try XCTUnwrap(entity.encodedRecord)
+        let server = try tagged(note(adapter, time: 50), "current-deletion-conflict")
+        let priorBinding = entity.pendingReplicaBindingGenerationIdentifier
+        let priorText = object.text
+        let expectedModifiedAt = object.modifiedAt.addingTimeInterval(1)
+        let priorJournalChangedAt = journal.changedAt
+        let priorJournalAccount = journal.accountScopeIdentifier
+        let priorExplicitlyModifiedAt = object.explicitlyModifiedAt
+        let priorBaselineRevision = target.objects(BigSyncRecordBaseline.self).first?.revision
+        let priorSubmissionCount = target.objects(BigSyncRecordSubmission.self).count
+        let signal = DeletionMetadataRefreshSignal()
+        let writerQueue = DispatchQueue(label: "test.deletion-metadata-refresh." + UUID().uuidString)
+        let configuration = target.configuration
+        let identifier = noteID
+        let priorAutorefresh = target.autorefresh
+        target.autorefresh = false
+        let observation = target.observe { notification, _ in
+            guard case .didChange = notification, signal.receive() else { return }
+            switch mode {
+            case .current: break
+            case .cancelGeneration:
+                adapter.cancelSynchronization()
+                // An ABA of the cancellation Boolean cannot revive the
+                // generation captured by this metadata response.
+                do { try adapter.prepareForFencedMigrationAfterCancellation() }
+                catch { XCTFail("Could not restore cancellation Boolean: \(error)") }
+            case .cancelTask:
+                withUnsafeCurrentTask { $0?.cancel() }
+            case .replaceAccount:
+                adapter.activeAccountScopeIdentifier = "replacement-account"
+            case .replaceContext:
+                adapter.mergePolicy = .server
+            }
+        }
+        adapter._testAfterDeletionMetadataTrackingAdmission = {
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            signal.arm()
+            try writerQueue.sync {
+                let writer = try Realm(configuration: configuration, queue: writerQueue)
+                try writer.write {
+                    let value = try XCTUnwrap(writer.object(ofType: W1ContractNote.self, forPrimaryKey: identifier))
+                    // Local-only fixture metadata supplies a committed version
+                    // without reauthoring deletion intent or its journal.
+                    value.modifiedAt = value.modifiedAt.addingTimeInterval(1)
+                }
+            }
+        }
+        defer {
+            adapter._testAfterDeletionMetadataTrackingAdmission = nil
+            observation.invalidate()
+            target.autorefresh = priorAutorefresh
+        }
+        let request = Task { @BigSyncBackgroundActor in
+            try await adapter.rebasePendingDeletionMetadata(using: [server],
+                matchingPreparedGenerations: [name: generation])
+        }
+        addTeardownBlock { request.cancel(); _ = await request.result }
+        let outcome = await request.result
+        XCTAssertTrue(signal.didObserve, "Must revoke during actual committed-target refresh delivery")
+        XCTAssertEqual(request.isCancelled, mode == .cancelTask)
+        switch outcome {
+        case .success: XCTAssertEqual(mode, .current)
+        case .failure(let error):
+            XCTAssertNotEqual(mode, .current)
+            XCTAssertTrue(error is CancellationError)
+        }
+        if mode != .current {
+            XCTAssertEqual(entity.encodedRecord, priorEncoded, "Rejected transaction must retain the original CAS archive")
+            XCTAssertEqual(adapter.getRecord(for: entity)?.recordChangeTag, original.recordChangeTag)
+        } else {
+            XCTAssertEqual(adapter.getRecord(for: entity)?.recordChangeTag, server.recordChangeTag)
+        }
+        XCTAssertEqual(entity.entityState, .deletedLocally)
+        XCTAssertEqual(entity.pendingGeneration, generation)
+        XCTAssertEqual(entity.pendingReplicaBindingGenerationIdentifier, priorBinding)
+        XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+        XCTAssertTrue(object.isDeleted)
+        XCTAssertEqual(object.text, priorText)
+        XCTAssertEqual(object.modifiedAt, expectedModifiedAt, "Metadata rebase must not reauthor the target timestamps")
+        XCTAssertEqual(journal.changedAt, priorJournalChangedAt)
+        XCTAssertEqual(journal.accountScopeIdentifier, priorJournalAccount)
+        XCTAssertEqual(journal.replicaBindingGenerationIdentifier, priorBinding)
+        XCTAssertEqual(object.explicitlyModifiedAt, priorExplicitlyModifiedAt)
+        XCTAssertEqual(target.objects(BigSyncRecordBaseline.self).first?.revision, priorBaselineRevision)
+        XCTAssertEqual(target.objects(BigSyncRecordSubmission.self).count, priorSubmissionCount)
+        observation.invalidate()
+        adapter._testAfterDeletionMetadataTrackingAdmission = nil
+        adapter.activeAccountScopeIdentifier = "w1-account"
+        adapter.mergePolicy = .custom
+        try await adapter.unsetCancellation()
+        // Retry from the healthy parent task with the original prepared map.
+        try await adapter.rebasePendingDeletionMetadata(using: [server],
+            matchingPreparedGenerations: [name: generation])
+        XCTAssertEqual(adapter.getRecord(for: entity)?.recordChangeTag, server.recordChangeTag)
+        XCTAssertEqual(entity.entityState, .deletedLocally)
+        XCTAssertEqual(entity.pendingGeneration, generation)
+        XCTAssertEqual(entity.pendingReplicaBindingGenerationIdentifier, priorBinding)
+        XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+        XCTAssertTrue(object.isDeleted)
+        XCTAssertEqual(object.text, priorText)
+        XCTAssertEqual(object.modifiedAt, expectedModifiedAt, "Metadata rebase must not reauthor the target timestamps")
+        XCTAssertEqual(journal.changedAt, priorJournalChangedAt)
+        XCTAssertEqual(journal.accountScopeIdentifier, priorJournalAccount)
+        XCTAssertEqual(journal.replicaBindingGenerationIdentifier, priorBinding)
+        XCTAssertEqual(object.explicitlyModifiedAt, priorExplicitlyModifiedAt)
+        XCTAssertEqual(target.objects(BigSyncRecordBaseline.self).first?.revision, priorBaselineRevision)
+        XCTAssertEqual(target.objects(BigSyncRecordSubmission.self).count, priorSubmissionCount)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionMetadataRefreshCancellationGenerationABARejectsAndRetries() async throws {
+        try await exerciseDeletionMetadataRefresh(mode: .cancelGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionMetadataRefreshTaskCancellationRejectsAndRetries() async throws {
+        try await exerciseDeletionMetadataRefresh(mode: .cancelTask)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionMetadataRefreshAccountReplacementRejectsAndRetries() async throws {
+        try await exerciseDeletionMetadataRefresh(mode: .replaceAccount)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionMetadataRefreshContextReplacementRejectsAndRetries() async throws {
+        try await exerciseDeletionMetadataRefresh(mode: .replaceContext)
+    }
+
+    @BigSyncBackgroundActor
+    func testCurrentDeletionMetadataRefreshPreservesDeletionIntent() async throws {
+        try await exerciseDeletionMetadataRefresh(mode: .current)
+    }
+
+    @BigSyncBackgroundActor
+    func testUnboundDeletionMetadataRefreshPreservesCompatibility() async throws {
+        try await exerciseDeletionMetadataRefresh(mode: .current, unbound: true)
     }
 }

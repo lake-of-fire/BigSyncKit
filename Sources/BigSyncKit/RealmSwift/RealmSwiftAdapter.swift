@@ -576,6 +576,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterDeletionMetadataTrackingAdmission:
+        (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testAfterAcceptedRetainedDeletionTrackingAdmission:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testBeforeCursorTrackingWrite:
@@ -8803,18 +8805,43 @@ public final class RealmSwiftAdapter:
               let persistenceRealm = realmProvider.persistenceRealm,
               !serverRecords.isEmpty else { return }
 
-        for chunk in serverRecords.chunks(ofCount: 500) {
+        // Preserve nil/unbound transport compatibility while retaining the
+        // exact authority that owns this metadata-only response across awaits
+        // and synchronous target refresh notification reentry.
+        let expectedCancellationGeneration = cancellationGeneration
+        let expectedAccount = activeAccountScopeIdentifier
+        let expectedContext = recordRebaseContext
+        let expectedContainer = activeContainerIdentifier
+        let expectedDatabaseScope = activeDatabaseScopeRawValue
+        let expectedBinding = activeReplicaBindingGenerationIdentifier
+        func validateMetadataAuthority() throws {
             try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            guard !cancelSync,
+                  cancellationGeneration == expectedCancellationGeneration,
+                  activeAccountScopeIdentifier == expectedAccount,
+                  recordRebaseContext == expectedContext,
+                  activeContainerIdentifier == expectedContainer,
+                  activeDatabaseScopeRawValue == expectedDatabaseScope,
+                  activeReplicaBindingGenerationIdentifier == expectedBinding else {
+                throw CancellationError()
+            }
+        }
+        try validateMetadataAuthority()
+        for chunk in serverRecords.chunks(ofCount: 500) {
+            try validateMetadataAuthority()
             for record in chunk {
                 try validateInboundAccountScope(record)
             }
             try await persistenceRealm.asyncWritePreservingOwnership {
+                try validateMetadataAuthority()
+#if DEBUG
+                try _testAfterDeletionMetadataTrackingAdmission?()
+#endif
+                try validateMetadataAuthority()
                 var committedTargets = [ObjectIdentifier: Realm]()
                 for record in chunk {
-                    try Task.checkCancellation()
-                    guard !cancelSync,
-                          record.recordID.zoneID == zoneID,
+                    try validateMetadataAuthority()
+                    guard record.recordID.zoneID == zoneID,
                           let preparedGeneration =
                             matchingPreparedGenerations[
                                 record.recordID.recordName
@@ -8838,6 +8865,7 @@ public final class RealmSwiftAdapter:
                         snapshot = committedRealmReadSnapshot(in: targetRealm)
                         committedTargets[nativeIdentity] = snapshot
                     }
+                    try validateMetadataAuthority()
                     guard let targetMutation = snapshot.object(
                             ofType: BigSyncPendingMutation.self,
                             forPrimaryKey: syncedEntity.identifier
@@ -8850,6 +8878,8 @@ public final class RealmSwiftAdapter:
                             targetMutation,
                             in: snapshot
                           ) else { continue }
+                    try validateMetadataAuthority()
+                    try validateInboundAccountScope(record)
                     try save(record: record, for: syncedEntity)
                     // `save` changes only the opaque system-field archive.
                     // Restate these invariants to make future edits fail safe.
@@ -8861,6 +8891,7 @@ public final class RealmSwiftAdapter:
                                 .replicaBindingGenerationIdentifier
                     )
                 }
+                try validateMetadataAuthority()
             }
             await Task.yield()
         }
