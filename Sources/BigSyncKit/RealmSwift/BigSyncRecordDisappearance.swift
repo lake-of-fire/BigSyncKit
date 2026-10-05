@@ -10,6 +10,21 @@ struct BigSyncRecordEvidenceCut: Sendable {
     let cancellationGeneration: UInt64
 }
 
+// Read-only evidence must not borrow a target or tracking transaction owned
+// by another suspended caller. Refresh may itself deliver a callback which
+// opens a write, so freeze after refresh unconditionally. Only detached values
+// escape this synchronous scope; every later phase samples a new snapshot.
+@BigSyncBackgroundActor
+private func withCommittedDisappearanceSnapshot<Value>(
+    in realm: Realm,
+    _ read: (Realm) throws -> Value
+) rethrows -> Value {
+    if !realm.isFrozen && !realm.isInWriteTransaction {
+        realm.refresh()
+    }
+    return try read(realm.freeze())
+}
+
 extension RealmSwiftAdapter {
     /// One interpretation for staged retry, receipts and read-only audit. The
     /// persisted archive is authoritative; no initializer supplies missing data.
@@ -100,37 +115,38 @@ extension RealmSwiftAdapter {
         try await _testAfterDisappearanceTargetWrite?()
 #endif
         try await tracking.asyncWritePreservingOwnership {
-            target.refresh()
-            try validateRecordEvidenceCut(cut, in: target)
-            let name = recordID.recordName
-            guard let base = target.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name),
-                  base.namespace == cut.context.namespace,
-                  base.isComparisonInvalidated, base.revision == revision else { return }
-            let mutation = target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
-            if let mutation, !pendingMutationIsEligibleForActiveTransport(mutation) { return }
-            let object = target.object(ofType: type, forPrimaryKey: objectID)
-            if let object, !objectIsEligibleForActiveAccount(object, entityType: type.className()) { return }
-            let entity = tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name)
-                ?? SyncedEntity(entityType: type.className(), identifier: name,
-                                state: SyncedEntityState.deletedRemotely.rawValue)
-            guard entity.entityType == type.className() else {
-                throw BigSyncRecordRebaseError.inconsistentReceipt(name)
-            }
-            tracking.add(entity, update: .modified)
-            entity.encodedRecord = nil
-            if let mutation {
-                entity.entityState = object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == false
-                    ? .new : .deletedLocally
-                entity.setPendingMutation(generation: mutation.generation,
-                    replicaBindingGenerationIdentifier: mutation.replicaBindingGenerationIdentifier)
-            } else {
-                // This path committed an admitted remote tombstone, not a
-                // successful acknowledgement of some unobserved local edit.
-                guard object == nil || object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == true else {
+            try withCommittedDisappearanceSnapshot(in: target) { snapshot in
+                try validateRecordEvidenceCut(cut, in: snapshot)
+                let name = recordID.recordName
+                guard let base = snapshot.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name),
+                      base.namespace == cut.context.namespace,
+                      base.isComparisonInvalidated, base.revision == revision else { return }
+                let mutation = snapshot.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
+                if let mutation, !pendingMutationIsEligibleForActiveTransport(mutation) { return }
+                let object = snapshot.object(ofType: type, forPrimaryKey: objectID)
+                if let object, !objectIsEligibleForActiveAccount(object, entityType: type.className()) { return }
+                let entity = tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name)
+                    ?? SyncedEntity(entityType: type.className(), identifier: name,
+                                    state: SyncedEntityState.deletedRemotely.rawValue)
+                guard entity.entityType == type.className() else {
                     throw BigSyncRecordRebaseError.inconsistentReceipt(name)
                 }
-                entity.entityState = .deletedRemotely
-                entity.clearPendingMutation()
+                tracking.add(entity, update: .modified)
+                entity.encodedRecord = nil
+                if let mutation {
+                    entity.entityState = object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == false
+                        ? .new : .deletedLocally
+                    entity.setPendingMutation(generation: mutation.generation,
+                        replicaBindingGenerationIdentifier: mutation.replicaBindingGenerationIdentifier)
+                } else {
+                    // This path committed an admitted remote tombstone, not a
+                    // successful acknowledgement of some unobserved local edit.
+                    guard object == nil || object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == true else {
+                        throw BigSyncRecordRebaseError.inconsistentReceipt(name)
+                    }
+                    entity.entityState = .deletedRemotely
+                    entity.clearPendingMutation()
+                }
             }
         }
     }
@@ -144,8 +160,13 @@ extension RealmSwiftAdapter {
     ) async throws -> InboundDeletionDisposition {
         let cut = try currentRecordEvidenceCut()
         let name = recordID.recordName
-        let revision = target.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)?.revision
-        let submissionIdentity = matchingSubmission(recordName: name, context: cut.context, in: target)?.candidateIdentity
+        let (revision, submissionIdentity) = try withCommittedDisappearanceSnapshot(in: target) { snapshot in
+            try validateRecordEvidenceCut(cut, in: snapshot)
+            return (
+                snapshot.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)?.revision,
+                matchingSubmission(recordName: name, context: cut.context, in: snapshot)?.candidateIdentity
+            )
+        }
         guard let objectID = getObjectIdentifier(recordName: name, entityType: type.className()) else {
             throw BigSyncRecordRebaseError.inconsistentReceipt(name)
         }
@@ -179,10 +200,11 @@ extension RealmSwiftAdapter {
             // API, without re-authoring timestamps or inventing a second outbox.
             if mutation == nil, let object,
                let tracking = realmProvider?.persistenceRealm {
-                tracking.refresh()
-                let entity = tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name)
-                if entity?.entityState == .new || entity?.entityState == .changed
-                    || entity?.entityState == .deletedLocally {
+                let hasCommittedLocalWork = withCommittedDisappearanceSnapshot(in: tracking) { snapshot in
+                    let state = snapshot.object(ofType: SyncedEntity.self, forPrimaryKey: name)?.entityState
+                    return state == .new || state == .changed || state == .deletedLocally
+                }
+                if hasCommittedLocalWork {
                     (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
                     mutation = target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
                 }
@@ -303,54 +325,73 @@ struct BigSyncPreparedDeletionEvidence: Sendable {
     let schemaSignature: String
 }
 
+// A preparation produces either transport evidence or a tracking-only repair,
+// never both. All associated values are detached before the next suspension.
+private enum BigSyncPhysicalDeletionPreparation {
+    case none
+    case deletion(BigSyncPreparedDeletionEvidence)
+    case repairTracking(revision: String)
+}
+
 extension RealmSwiftAdapter {
     @BigSyncBackgroundActor
     func preparePhysicalDeletionEvidence(
         recordID: CKRecord.ID, type: Object.Type, generation: String, in target: Realm
     ) async throws -> BigSyncPreparedDeletionEvidence? {
         let cut = try currentRecordEvidenceCut()
-        target.refresh()
-        try validateRecordEvidenceCut(cut, in: target)
-        guard let contract = try BigSyncCompiledRecordContract.compile(type.init()),
-              contract.declaration.deletion == .physical,
-              recordID.zoneID == recordZoneID,
-              let objectID = getObjectIdentifier(recordName: recordID.recordName, entityType: type.className()) else {
-            throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
-        }
-        let name = recordID.recordName
-        let object = target.object(ofType: type, forPrimaryKey: objectID)
-        if let object, !objectIsEligibleForActiveAccount(object, entityType: type.className()) { return nil }
-        let mutation = target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
-        let base = target.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
-        let submitted = matchingSubmission(recordName: name, context: cut.context, in: target)
-        if mutation == nil {
-            // A crash after the target-first delete acknowledgement can leave
-            // old tracking work. The durable disposition has no journal or
-            // submission and a retained invalidated revision; finish only its
-            // cache phase. Do not manufacture another CloudKit deletion.
-            guard submitted == nil, let base, base.namespace == cut.context.namespace,
-                  base.schemaSignature == contract.signature,
-                  base.isComparisonInvalidated, !base.revision.isEmpty,
-                  base.fields.count == 0, base.serverChangeTag == nil, base.acceptedSystemFields == nil,
-                  object == nil || object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == true else {
-                throw BigSyncRecordRebaseError.inconsistentReceipt(name)
+        let preparation: BigSyncPhysicalDeletionPreparation = try withCommittedDisappearanceSnapshot(in: target) { snapshot in
+            try validateRecordEvidenceCut(cut, in: snapshot)
+            guard let contract = try BigSyncCompiledRecordContract.compile(type.init()),
+                  contract.declaration.deletion == .physical,
+                  recordID.zoneID == recordZoneID,
+                  let objectID = getObjectIdentifier(recordName: recordID.recordName, entityType: type.className()) else {
+                throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
             }
+            let name = recordID.recordName
+            let object = snapshot.object(ofType: type, forPrimaryKey: objectID)
+            if let object, !objectIsEligibleForActiveAccount(object, entityType: type.className()) { return .none }
+            let mutation = snapshot.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
+            let base = snapshot.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
+            let submitted = matchingSubmission(recordName: name, context: cut.context, in: snapshot)
+            if mutation == nil {
+                // A crash after the target-first delete acknowledgement can leave
+                // old tracking work. The durable disposition has no journal or
+                // submission and a retained invalidated revision; finish only its
+                // cache phase. Do not manufacture another CloudKit deletion.
+                guard submitted == nil, let base, base.namespace == cut.context.namespace,
+                      base.schemaSignature == contract.signature,
+                      base.isComparisonInvalidated, !base.revision.isEmpty,
+                      base.fields.count == 0, base.serverChangeTag == nil, base.acceptedSystemFields == nil,
+                      object == nil || object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == true else {
+                    throw BigSyncRecordRebaseError.inconsistentReceipt(name)
+                }
+                return .repairTracking(revision: base.revision)
+            }
+            guard let mutation, mutation.generation == generation,
+                  pendingMutationIsEligibleForActiveTransport(mutation),
+                  object == nil || object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == true else { return .none }
+            if let submitted {
+                guard submitted.generation != generation else {
+                    throw BigSyncRecordRebaseError.inconsistentReceipt(name)
+                }
+                _ = try validatedSubmissionRecord(submitted, recordID: recordID, type: type, context: cut.context)
+            }
+            return .deletion(.init(recordID: recordID, entityType: type.className(), cut: cut,
+                revision: base?.revision, submissionIdentity: submitted?.candidateIdentity,
+                schemaSignature: contract.signature))
+        }
+        switch preparation {
+        case .none:
+            return nil
+        case .deletion(let evidence):
+            return evidence
+        case .repairTracking(let revision):
+            // The next phase must re-sample the live target after acquiring its
+            // tracking write, never reuse this preparation's frozen snapshot.
             try await publishPhysicalDisappearance(recordID: recordID, type: type,
-                cut: cut, revision: base.revision, in: target)
+                cut: cut, revision: revision, in: target)
             return nil
         }
-        guard let mutation, mutation.generation == generation,
-              pendingMutationIsEligibleForActiveTransport(mutation),
-              object == nil || object.map(BigSyncRecordLifecycle.isPhysicalDeletion) == true else { return nil }
-        if let submitted {
-            guard submitted.generation != generation else {
-                throw BigSyncRecordRebaseError.inconsistentReceipt(name)
-            }
-            _ = try validatedSubmissionRecord(submitted, recordID: recordID, type: type, context: cut.context)
-        }
-        return .init(recordID: recordID, entityType: type.className(), cut: cut,
-            revision: base?.revision, submissionIdentity: submitted?.candidateIdentity,
-            schemaSignature: contract.signature)
     }
 
     @BigSyncBackgroundActor
