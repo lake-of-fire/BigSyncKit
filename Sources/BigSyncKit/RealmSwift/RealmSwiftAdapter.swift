@@ -10438,6 +10438,18 @@ extension RealmSwiftAdapter {
               let provider = realmProvider,
               let tracking = provider.persistenceRealm else { return }
 
+        let cleanupCancellationGeneration = cancellationGeneration
+        func validateCleanup() throws {
+            try Task.checkCancellation()
+            guard !cancelSync,
+                  cancellationGeneration == cleanupCancellationGeneration,
+                  recordRebaseContext == context,
+                  activeAccountScopeIdentifier == context.account else {
+                throw CancellationError()
+            }
+        }
+        try validateCleanup()
+
         let savedByName = Dictionary(
             uniqueKeysWithValues: savedRecords.map {
                 ($0.recordID.recordName, $0)
@@ -10508,20 +10520,19 @@ extension RealmSwiftAdapter {
 
         let committedTracking = committedRealmReadSnapshot(in: tracking)
         let candidates = eligibleLineageIDs(in: committedTracking)
+        try validateCleanup()
         guard !candidates.isEmpty else { return }
 
         try await tracking.asyncWritePreservingOwnership {
-            try Task.checkCancellation()
-            guard !cancelSync, recordRebaseContext == context,
-                  activeAccountScopeIdentifier == context.account else {
-                throw CancellationError()
-            }
+            try validateCleanup()
             // Candidate selection can become stale while the tracking writer
             // waits. Revalidate the exact detached lineage IDs after admission;
             // no managed quarantine row crosses the suspension.
             let lineageIDs = candidates.intersection(
                 eligibleLineageIDs(in: tracking)
             )
+            // Snapshot refresh may synchronously revoke this cleanup's owner.
+            try validateCleanup()
             guard !lineageIDs.isEmpty else { return }
             let receiptIDs = try Self.retireQuarantines(
                 Array(lineageIDs),
@@ -10531,6 +10542,7 @@ extension RealmSwiftAdapter {
                 receiptIDs,
                 in: tracking
             )
+            try validateCleanup()
         }
     }
 }
@@ -10603,8 +10615,8 @@ extension RealmSwiftAdapter {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else {
                 continue
             }
-            realm.refresh()
-            for row in realm.objects(BigSyncRecordConflict.self).where({
+            let snapshot = committedRealmReadSnapshot(in: realm)
+            for row in snapshot.objects(BigSyncRecordConflict.self).where({
                 $0.namespace == context.namespace && !$0.isResolved
             }) where seen.insert(row.id).inserted {
                 let local = try BigSyncRecordPayload.decode(row.localPayload)
@@ -10793,6 +10805,17 @@ extension RealmSwiftAdapter {
     ) async throws -> Set<String> {
         guard let context = recordRebaseContext, let provider = realmProvider,
               let tracking = provider.persistenceRealm else { return [] }
+        let cleanupCancellationGeneration = cancellationGeneration
+        func validateCleanup() throws {
+            try Task.checkCancellation()
+            guard !cancelSync,
+                  cancellationGeneration == cleanupCancellationGeneration,
+                  recordRebaseContext == context,
+                  activeAccountScopeIdentifier == context.account else {
+                throw CancellationError()
+            }
+        }
+        try validateCleanup()
         let targetRealms = provider.targetReaderRealms ?? []
         var resolvedConflictIDs = Set<String>()
         for realm in targetRealms {
@@ -10808,6 +10831,7 @@ extension RealmSwiftAdapter {
                 resolvedConflictIDs.insert(row.id)
             }
         }
+        try validateCleanup()
         guard !resolvedConflictIDs.isEmpty else { return [] }
         var retiredConflictIDs = Set<String>()
         try await tracking.asyncWritePreservingOwnership {
@@ -10816,9 +10840,7 @@ extension RealmSwiftAdapter {
             // the UI account lease even when adapter namespace strings have
             // not yet changed. Reuse the caller's final-write authority here.
             try validateAuthority()
-            guard recordRebaseContext == context else {
-                throw CancellationError()
-            }
+            try validateCleanup()
 
             // The target resolution is the authority for this cleanup. It can
             // change while the tracking writer waits, so resample committed
@@ -10840,6 +10862,10 @@ extension RealmSwiftAdapter {
                     stillResolved.insert(row.id)
                 }
             }
+            // The committed snapshot is evidence, not a replacement lease.
+            // Refresh can deliver a callback that revokes the original owner.
+            try validateAuthority()
+            try validateCleanup()
             guard !stillResolved.isEmpty else { return }
             let resolvedScopes = Set(
                 stillResolved.map { "record-conflict:" + $0 }
@@ -10868,6 +10894,8 @@ extension RealmSwiftAdapter {
                 receiptIDs,
                 in: tracking
             )
+            try validateAuthority()
+            try validateCleanup()
             retiredConflictIDs = stillResolved
         }
         // Only resolutions revalidated after tracking admission completed this
@@ -10929,8 +10957,8 @@ public extension RealmSwiftAdapter {
         var identities = Set<String>()
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
-            realm.refresh()
-            for row in realm.objects(BigSyncRecordConflict.self).where({ $0.namespace == context.namespace && !$0.isPreservationReceipt }) {
+            let snapshot = committedRealmReadSnapshot(in: realm)
+            for row in snapshot.objects(BigSyncRecordConflict.self).where({ $0.namespace == context.namespace && !$0.isPreservationReceipt }) {
                 guard identities.insert(row.id).inserted else { continue }
                 snapshots.append(["id": row.id, "recordName": row.recordName,
                     "entityType": row.entityType, "generation": row.generation,
