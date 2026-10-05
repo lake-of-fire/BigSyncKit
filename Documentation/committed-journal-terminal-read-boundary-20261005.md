@@ -46,10 +46,16 @@ The boundary is now used for:
 4. semantic publication blockers;
 5. terminal pending/conflict/comparison-evidence checks;
 6. the consumed server cursor and change-feed epoch, read from one committed
-   tracking version.
+   tracking version;
+7. resolved-conflict quarantine retirement, including a committed target
+   recheck after tracking-write admission;
+8. retained-deletion quarantine retirement, which now carries only detached
+   lineage IDs across the write wait and revalidates target/tracking evidence
+   after admission.
 
 Final target/tracking writes still use their existing independently owned
-transactions and exact generation/account/binding checks. No queue, schema,
+transactions and exact generation/account/binding checks. Managed conflict or
+quarantine rows are not carried across the new cleanup suspension boundaries. No queue, schema,
 journal, transport representation, acknowledgement rule or persistent authority
 is added.
 
