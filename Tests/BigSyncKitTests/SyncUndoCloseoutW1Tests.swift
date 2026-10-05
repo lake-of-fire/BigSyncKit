@@ -834,3 +834,52 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertTrue(try adapter.hasPendingChangesAtTerminalBoundary())
     }
 }
+
+
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testPublicationBoundaryAndEpochIgnoreProvisionalTrackingTransition() async throws {
+        let (adapter, _) = try await fixture()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let committedToken = Data("committed-token".utf8)
+        try tracking.write {
+            let token = ServerToken()
+            token.token = committedToken
+            tracking.add(token)
+            let rebuild = RebuildProvenanceState()
+            rebuild.epoch = 7
+            tracking.add(rebuild, update: .modified)
+        }
+        let committedBoundary = try XCTUnwrap(
+            adapter.consumedServerBoundaryIdentifier(
+                accountScopeIdentifier: "w1-account",
+                replicaBindingGenerationIdentifier: "w1-binding",
+                containerIdentifier: "iCloud.test.w1-closeout",
+                databaseScope: .private
+            )
+        )
+        XCTAssertEqual(try adapter.changeFeedEpoch(), 7)
+
+        tracking.beginWrite()
+        defer {
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        }
+        tracking.objects(ServerToken.self).first?.token =
+            Data("provisional-token".utf8)
+        tracking.object(
+            ofType: RebuildProvenanceState.self,
+            forPrimaryKey: RebuildProvenanceState.primaryKeyValue
+        )?.epoch = 8
+
+        XCTAssertEqual(
+            try adapter.consumedServerBoundaryIdentifier(
+                accountScopeIdentifier: "w1-account",
+                replicaBindingGenerationIdentifier: "w1-binding",
+                containerIdentifier: "iCloud.test.w1-closeout",
+                databaseScope: .private
+            ),
+            committedBoundary
+        )
+        XCTAssertEqual(try adapter.changeFeedEpoch(), 7)
+    }
+}
