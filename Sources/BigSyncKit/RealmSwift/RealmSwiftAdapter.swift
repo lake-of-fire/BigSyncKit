@@ -10734,37 +10734,86 @@ extension RealmSwiftAdapter {
     ) async throws -> Set<String> {
         guard let context = recordRebaseContext, let provider = realmProvider,
               let tracking = provider.persistenceRealm else { return [] }
+        let targetRealms = provider.targetReaderRealms ?? []
         var resolvedConflictIDs = Set<String>()
-        for realm in provider.targetReaderRealms ?? [] {
-            realm.refresh()
-            guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
-            for row in realm.objects(BigSyncRecordConflict.self).where({
-                $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
-            }) { resolvedConflictIDs.insert(row.id) }
+        for realm in targetRealms {
+            let committedRealm = committedRealmReadSnapshot(in: realm)
+            guard committedRealm.schema.objectSchema.contains(where: {
+                $0.className == BigSyncRecordConflict.className()
+            }) else { continue }
+            for row in committedRealm.objects(BigSyncRecordConflict.self).where({
+                $0.namespace == context.namespace
+                    && $0.isResolved
+                    && !$0.isPreservationReceipt
+            }) {
+                resolvedConflictIDs.insert(row.id)
+            }
         }
         guard !resolvedConflictIDs.isEmpty else { return [] }
-        let resolvedScopes = Set(resolvedConflictIDs.map { "record-conflict:" + $0 })
+        var retiredConflictIDs = Set<String>()
         try await tracking.asyncWritePreservingOwnership {
             // Retiring quarantine/page evidence is a separate mutation from
             // the durable target decision. Its transaction wait can outlive
             // the UI account lease even when adapter namespace strings have
             // not yet changed. Reuse the caller's final-write authority here.
             try validateAuthority()
-            guard recordRebaseContext == context else { throw CancellationError() }
-            let quarantines = activeInboundSemanticQuarantines(accountScopeIdentifier: context.account, in: tracking).filter { row in
-                guard let scope = row.semanticScopeIdentifier else { return false }
+            guard recordRebaseContext == context else {
+                throw CancellationError()
+            }
+
+            // The target resolution is the authority for this cleanup. It can
+            // change while the tracking writer waits, so resample committed
+            // target state after admission rather than carrying managed rows or
+            // trusting the earlier candidate set.
+            var stillResolved = Set<String>()
+            for realm in targetRealms {
+                let committedRealm = committedRealmReadSnapshot(in: realm)
+                guard committedRealm.schema.objectSchema.contains(where: {
+                    $0.className == BigSyncRecordConflict.className()
+                }) else { continue }
+                for row in committedRealm.objects(
+                    BigSyncRecordConflict.self
+                ).where({
+                    $0.namespace == context.namespace
+                        && $0.isResolved
+                        && !$0.isPreservationReceipt
+                }) where resolvedConflictIDs.contains(row.id) {
+                    stillResolved.insert(row.id)
+                }
+            }
+            guard !stillResolved.isEmpty else { return }
+            let resolvedScopes = Set(
+                stillResolved.map { "record-conflict:" + $0 }
+            )
+            let quarantines = activeInboundSemanticQuarantines(
+                accountScopeIdentifier: context.account,
+                in: tracking
+            ).filter { row in
+                guard let scope = row.semanticScopeIdentifier else {
+                    return false
+                }
                 return resolvedScopes.contains(scope)
                     && row.accountScopeIdentifier == context.account
-                    && row.containerIdentifier == self.activeContainerIdentifier
-                    && row.databaseScopeRawValue == self.activeDatabaseScopeRawValue
-                    && row.zoneOwnerName == self.recordZoneID.ownerName && row.zoneName == self.recordZoneID.zoneName
+                    && row.containerIdentifier
+                        == self.activeContainerIdentifier
+                    && row.databaseScopeRawValue
+                        == self.activeDatabaseScopeRawValue
+                    && row.zoneOwnerName == self.recordZoneID.ownerName
+                    && row.zoneName == self.recordZoneID.zoneName
             }
-            let receiptIDs = try Self.retireQuarantines(quarantines.map(\.lineageID), in: tracking)
-            Self.removeUnreferencedPageReceipts(receiptIDs, in: tracking)
+            let receiptIDs = try Self.retireQuarantines(
+                quarantines.map(\.lineageID),
+                in: tracking
+            )
+            Self.removeUnreferencedPageReceipts(
+                receiptIDs,
+                in: tracking
+            )
+            retiredConflictIDs = stillResolved
         }
-        // Only this snapshot has completed the tracking phase. A resolution
-        // committed during the wait must retain its archive for a later pass.
-        return resolvedConflictIDs
+        // Only resolutions revalidated after tracking admission completed this
+        // phase. A later resolution retains its archive for a later pass.
+        return retiredConflictIDs
     }
 
     /// After additional local editing, make a new review snapshot. This does
