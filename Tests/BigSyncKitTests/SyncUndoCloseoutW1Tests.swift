@@ -369,12 +369,17 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         unrelatedCopy.changeFeedEpoch = unrelated.changeFeedEpoch
         try tracking.write { tracking.add(unrelatedCopy) }
 
-        // The prepared retained tombstone is the exact server-restoring
-        // disposition. Its acknowledgement may retire only this record's
-        // quarantine; unrelated evidence must remain an audit blocker.
+        // Preparation must follow the deletion observation it may retire.
+        // The earlier candidate supplied the record ID, not cleanup authority.
+        let restoringPrepared = try await adapter.preparedRecordsToUpload(
+            limit: 50, restrictedToEntityType: nil
+        )
+        let restoringSaved = try restoringPrepared.map {
+            try tagged($0.record, "accepted-retained-restoration")
+        }
         try await adapter.didUpload(
-            savedRecords: prepared.map(\.record),
-            matchingPreparedUploads: prepared
+            savedRecords: restoringSaved,
+            matchingPreparedUploads: restoringPrepared
         )
         try await adapter.cleanUp()
         XCTAssertNil(
@@ -390,7 +395,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
             )
         )
         let audit = try await adapter.auditSynchronizationState(
-            serverRecords: prepared.map(\.record)
+            serverRecords: restoringSaved
         )
         XCTAssertFalse(audit.isClean)
         XCTAssertTrue(
@@ -1142,5 +1147,185 @@ extension SyncUndoCloseoutW1Tests {
     @BigSyncBackgroundActor
     func testUnboundDeletionMetadataRefreshPreservesCompatibility() async throws {
         try await exerciseDeletionMetadataRefresh(mode: .current, unbound: true)
+    }
+}
+
+// Preparation-ordered quarantine settlement. These use the existing file-backed
+// W1 adapter fixtures and public preparation/acknowledgement/page APIs.
+extension SyncUndoCloseoutW1Tests {
+    private enum PreparedQuarantineInjectedFailure: Error { case tracking }
+
+    @BigSyncBackgroundActor
+    private func preparedQuarantineFixture() async throws -> (
+        adapter: RealmSwiftAdapter, realm: Realm,
+        object: W1RetainedArticle, prepared: [PreparedRecordUpload]
+    ) {
+        let (adapter, realm) = try await fixture()
+        let object = W1RetainedArticle()
+        try realm.write {
+            realm.add(object)
+            object.epoch = "E0"
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        XCTAssertEqual(prepared.count, 1)
+        return (adapter, realm, object, prepared)
+    }
+
+    @BigSyncBackgroundActor
+    private func observePreparedQuarantineDeletion(
+        _ adapter: RealmSwiftAdapter, recordID: CKRecord.ID, label: String
+    ) async throws -> (lineage: String, proof: String) {
+        let previous = await adapter.serverChangeToken
+        let results = try await adapter.deleteRecords(with: [recordID])
+        guard case let .quarantined(lineage) = try XCTUnwrap(results.first).disposition else {
+            throw CocoaError(.coderValueNotFound)
+        }
+        let cursor = RecordZoneChangeCursor(serializedData: Data((label + UUID().uuidString).utf8))
+        try await adapter.commitInboundPage(.init(
+            previousCursor: previous, nextCursor: cursor,
+            liveResults: [], deletionResults: results
+        ))
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let quarantine = try XCTUnwrap(tracking.object(
+            ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage
+        ))
+        XCTAssertFalse(quarantine.committedPageReceiptID.isEmpty)
+        return (lineage, quarantine.committedPageReceiptID)
+    }
+
+    @BigSyncBackgroundActor
+    func testPreparedRetainedUploadCannotAdoptLaterDeletionPage() async throws {
+        let f = try await preparedQuarantineFixture()
+        let item = try XCTUnwrap(f.prepared.first)
+        let saved = try tagged(item.record, "prepared-before-deletion")
+        let evidence = try await observePreparedQuarantineDeletion(
+            f.adapter, recordID: saved.recordID, label: "later-deletion-"
+        )
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        do {
+            try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: f.prepared)
+            XCTFail("A response cannot adopt a quarantine absent from its preparation")
+        } catch let error as RealmSwiftAdapter.RetainedDeletionQuarantineNeedsFreshPreparation {
+            XCTAssertEqual(error.recordNames, [saved.recordID.recordName])
+        }
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: evidence.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: evidence.proof))
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: saved.recordID.recordName)?.pendingGeneration, item.generation)
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: saved.recordID.recordName)?.generation, item.generation)
+        XCTAssertTrue(f.object.isDeleted)
+    }
+
+    @BigSyncBackgroundActor
+    func testPreparedRetainedUploadCannotAdoptReobservedDeletionPage() async throws {
+        let f = try await preparedQuarantineFixture()
+        let recordID = try XCTUnwrap(f.prepared.first).record.recordID
+        _ = try await observePreparedQuarantineDeletion(f.adapter, recordID: recordID, label: "first-")
+        let prepared = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let item = try XCTUnwrap(prepared.first)
+        let saved = try tagged(item.record, "prepared-before-reobservation")
+        let later = try await observePreparedQuarantineDeletion(f.adapter, recordID: recordID, label: "later-")
+        do {
+            try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+            XCTFail("Reobserved deletion evidence requires a new preparation")
+        } catch let error as RealmSwiftAdapter.RetainedDeletionQuarantineNeedsFreshPreparation {
+            XCTAssertEqual(error.recordNames, [recordID.recordName])
+        }
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: later.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: later.proof))
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName)?.generation, item.generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testSpentRetainedAcknowledgementCannotRetireNewDeletionPage() async throws {
+        let f = try await preparedQuarantineFixture()
+        let recordID = try XCTUnwrap(f.prepared.first).record.recordID
+        let first = try await observePreparedQuarantineDeletion(f.adapter, recordID: recordID, label: "before-upload-")
+        let prepared = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let saved = try tagged(XCTUnwrap(prepared.first).record, "accepted-before-later-deletion")
+        try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: first.lineage))
+        XCTAssertNil(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName))
+        let later = try await observePreparedQuarantineDeletion(f.adapter, recordID: recordID, label: "after-upload-")
+        let revision = f.realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: recordID.recordName)?.revision
+        try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: later.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: later.proof))
+        XCTAssertEqual(f.realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: recordID.recordName)?.revision, revision)
+        XCTAssertNil(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName))
+    }
+
+    @BigSyncBackgroundActor
+    func testRetainedAcknowledgementAtomicFailureKeepsItsOriginalRetryGeneration() async throws {
+        let f = try await preparedQuarantineFixture()
+        let recordID = try XCTUnwrap(f.prepared.first).record.recordID
+        let evidence = try await observePreparedQuarantineDeletion(f.adapter, recordID: recordID, label: "atomic-")
+        let prepared = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let item = try XCTUnwrap(prepared.first)
+        let saved = try tagged(item.record, "accepted-atomic-retry")
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        f.adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = {
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName)?.entityState, .synced)
+            XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName)?.generation, item.generation)
+            throw PreparedQuarantineInjectedFailure.tracking
+        }
+        defer { f.adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil }
+        do {
+            try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+            XCTFail("The injected failure must reject the complete tracking transaction")
+        } catch PreparedQuarantineInjectedFailure.tracking { }
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: evidence.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: evidence.proof))
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName)?.pendingGeneration, item.generation)
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName)?.generation, item.generation)
+        f.adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil
+        try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: evidence.lineage))
+        XCTAssertNil(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName))
+    }
+
+    @BigSyncBackgroundActor
+    func testFreshPreparedRetainedUploadCanSettleAfterEarlierResponseIsRejected() async throws {
+        let f = try await preparedQuarantineFixture()
+        let old = try XCTUnwrap(f.prepared.first)
+        let earlierResponse = try tagged(old.record, "earlier-response")
+        let evidence = try await observePreparedQuarantineDeletion(f.adapter, recordID: old.record.recordID, label: "fresh-")
+        do {
+            try await f.adapter.didUpload(savedRecords: [earlierResponse], matchingPreparedUploads: f.prepared)
+            XCTFail("The earlier preparation cannot settle later evidence")
+        } catch is RealmSwiftAdapter.RetainedDeletionQuarantineNeedsFreshPreparation { }
+        let current = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let response = try tagged(XCTUnwrap(current.first).record, "new-restoring-response")
+        try await f.adapter.didUpload(savedRecords: [response], matchingPreparedUploads: current)
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: evidence.lineage))
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: evidence.proof))
+        XCTAssertNil(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: response.recordID.recordName))
+        XCTAssertEqual(f.realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: response.recordID.recordName)?.serverChangeTag, response.recordChangeTag)
+    }
+
+    @BigSyncBackgroundActor
+    func testUnannotatedRetainedPreparedValueCannotBorrowCurrentQuarantine() async throws {
+        let f = try await preparedQuarantineFixture()
+        let recordID = try XCTUnwrap(f.prepared.first).record.recordID
+        let evidence = try await observePreparedQuarantineDeletion(f.adapter, recordID: recordID, label: "unannotated-")
+        let current = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let item = try XCTUnwrap(current.first)
+        let unannotated = PreparedRecordUpload(record: item.record, generation: item.generation,
+            comparisonBase: item.comparisonBase, requiresAcceptanceCheck: item.requiresAcceptanceCheck)
+        let saved = try tagged(item.record, "unannotated-response")
+        do {
+            try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: [unannotated])
+            XCTFail("Missing cleanup evidence is not consent to discover it at acknowledgement")
+        } catch is RealmSwiftAdapter.RetainedDeletionQuarantineNeedsFreshPreparation { }
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: evidence.lineage))
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName)?.generation, item.generation)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName)?.pendingGeneration, item.generation)
     }
 }
