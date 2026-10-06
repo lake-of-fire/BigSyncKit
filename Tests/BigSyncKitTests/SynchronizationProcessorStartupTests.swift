@@ -18,6 +18,109 @@ final class SynchronizationProcessorStartupTests: XCTestCase, @unchecked Sendabl
     }
 
     @BigSyncBackgroundActor
+    func testRunContextRejectsSynchronousAccountPoisonBeforeActorCancellation() throws {
+        let transport = StartupProcessorTransport()
+        let zone = CKRecordZone.ID(
+            zoneName: "processor-run-context-" + UUID().uuidString,
+            ownerName: CKCurrentUserDefaultName
+        )
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "processor-run-context-" + UUID().uuidString
+        )
+        let sync = CloudKitSynchronizer(
+            identifier: UUID().uuidString,
+            containerIdentifier: "iCloud.test.processor-run-context",
+            database: transport,
+            recordZoneID: zone,
+            keyValueStore: StartupProcessorStore(),
+            accountIdentifierProvider: { "account-a" },
+            accountStatusProvider: { .available },
+            changeFeed: transport,
+            subscriptionStore: transport,
+            zoneStore: transport,
+            recordStore: transport,
+            backupDetectionBaseURL: directory,
+            logger: Logger(label: "ProcessorRunContext")
+        )
+        addTeardownBlock { @BigSyncBackgroundActor in
+            await sync.cancelSynchronizationAndWait()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        sync.accountScopeAuthorityFence.clear()
+        let runID = UUID()
+        let context = CloudKitSynchronizer.RunContext(
+            attemptID: sync.synchronizationAttemptID,
+            runID: runID,
+            accountIdentifier: "account-a",
+            accountScopeIdentifier:
+                CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        )
+        sync.synchronizationRunID = runID
+        sync.activeRunContext = context
+        XCTAssertNoThrow(try sync.checkRunContext(context))
+
+        // CKAccountChanged poisons this fence synchronously before its actor
+        // task can rotate the attempt or clear activeRunContext.
+        sync.accountScopeAuthorityFence.poison()
+        XCTAssertEqual(sync.synchronizationAttemptID, context.attemptID)
+        XCTAssertEqual(sync.activeRunContext, context)
+        XCTAssertThrowsError(
+            try sync.checkSynchronizationAttempt(context.attemptID)
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertThrowsError(try sync.checkRunContext(context)) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(
+            transport.operationCalls, 0,
+            "Synchronous poison rejection must require no account or CloudKit request"
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testAttemptCheckStillAllowsFreshValidationWhileFenceIsPoisoned() throws {
+        let transport = StartupProcessorTransport()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "processor-prevalidation-" + UUID().uuidString
+        )
+        let zone = CKRecordZone.ID(
+            zoneName: "processor-prevalidation-" + UUID().uuidString,
+            ownerName: CKCurrentUserDefaultName
+        )
+        let sync = CloudKitSynchronizer(
+            identifier: UUID().uuidString,
+            containerIdentifier: "iCloud.test.processor-prevalidation",
+            database: transport,
+            recordZoneID: zone,
+            keyValueStore: StartupProcessorStore(),
+            accountIdentifierProvider: { "account-a" },
+            accountStatusProvider: { .available },
+            changeFeed: transport,
+            subscriptionStore: transport,
+            zoneStore: transport,
+            recordStore: transport,
+            backupDetectionBaseURL: directory,
+            logger: Logger(label: "ProcessorPrevalidation")
+        )
+        addTeardownBlock { @BigSyncBackgroundActor in
+            await sync.cancelSynchronizationAndWait()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        sync.accountScopeAuthorityFence.clear()
+        sync.activeRunContext = nil
+        sync.accountScopeAuthorityFence.poison()
+        XCTAssertTrue(sync.accountScopeAuthorityFence.rejectsAuthority)
+        XCTAssertNoThrow(
+            try sync.checkSynchronizationAttempt(sync.synchronizationAttemptID),
+            "Poison must not deadlock the fresh account-validation attempt"
+        )
+        XCTAssertEqual(transport.operationCalls, 0)
+    }
+
+    @BigSyncBackgroundActor
     private func checkHandoff(invalidateAccountOnly: Bool) async throws {
         let applied = expectation(description: "prior processor apply held")
         let joining = expectation(description: "startup cancels prior processor before joining it")
@@ -74,6 +177,10 @@ final class SynchronizationProcessorStartupTests: XCTestCase, @unchecked Sendabl
         XCTAssertEqual(observation.activations, 0, "A retired startup reached adapter activation")
         XCTAssertNil(sync.activeRunContext, "A cancelled startup published a stale run context")
         XCTAssertEqual(sync.synchronizationRunID, oldRun, "A retired startup published a processor run")
+        XCTAssertTrue(
+            sync.changeRequestProcessor.cancelSync,
+            "A rejected startup must not reopen its inbound processor"
+        )
         XCTAssertEqual(transport.operationCalls, 0, "No CloudKit operation belongs to this retired startup")
     }
 }
