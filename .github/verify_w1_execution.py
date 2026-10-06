@@ -76,6 +76,17 @@ EXPECTED = {
         "testValidatedBeginRunCancellationDuringJoinLeavesProcessorStopped",
         "testValidatedBeginRunAuthorityFailureAfterJoinLeavesProcessorStopped",
     ),
+    "SyncPhaseAttemptOwnershipTests": (
+        "testDirectAuthenticationStopSettlesTwoWaitersWithOriginalError",
+        "testWrappedAuthenticationStopSettlesTwoWaitersWithOriginalError",
+        "testDirectTemporaryAccountStopSettlesTwoWaitersWithOriginalError",
+        "testWrappedTemporaryAccountStopSettlesTwoWaitersWithOriginalError",
+        "testExternalPoisonAtAccountStopHealthCancelsTwoWaiters",
+        "testCancellationAtAccountStopHealthCancelsTwoWaiters",
+        "testCancelledAccountStopWaiterDoesNotReplaceRemainingWaiterError",
+        "testWrappedAuthenticationAndTokenExpiryPreservesRecoveryBeforeSettlement",
+        "testAccountStopFailureHandlerSuccessorPreservesTwoWaiterEvidence",
+    ),
     "SynchronizationProcessorStartupTests": (
         "testStartupCancelledDuringProcessorJoinDoesNotActivateRetiredContext",
         "testStartupInvalidatedDuringProcessorJoinDoesNotActivateRetiredContext",

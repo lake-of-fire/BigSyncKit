@@ -25,6 +25,8 @@ private actor SyncPhaseGate {
 private final class SyncPhaseProbe {
     let accountGate = SyncPhaseGate()
     var blockAccount = false
+    var accountIdentifierCalls = 0
+    var accountStatusCalls = 0
     var phaseFinished = false
     var importCount = 0
     var cleanupCount = 0
@@ -33,12 +35,20 @@ private final class SyncPhaseProbe {
     var deletionPreparationCount = 0
     var savedTokens = [RecordZoneChangeCursor?]()
     var recordError: Error?
+    var capturedAccountFailures = [BigSyncSynchronizationFailure]()
+    var accountSuccessorAttempt: UUID?
+    var accountSuccessorTask: Task<Void, Never>?
     var onProgress: (@BigSyncBackgroundActor (String) -> Void)?
     var onPersist: (@BigSyncBackgroundActor () async throws -> Void)?
     var onSave: (@BigSyncBackgroundActor () async throws -> Void)?
     func accountIdentifier() async -> String {
+        accountIdentifierCalls += 1
         if blockAccount { await accountGate.wait() }
         return "sync-phase-account"
+    }
+    func accountStatus() -> CKAccountStatus {
+        accountStatusCalls += 1
+        return .available
     }
     func noteCleanup() { cleanupCount += 1 }
     func noteImport() { importCount += 1 }
@@ -111,6 +121,9 @@ private final class SyncPhaseAdapter: NSObject, ModelAdapter, @unchecked Sendabl
 
 private final class SyncPhaseStore: NSObject, KeyValueStore {
     private var values = [String: Any]()
+    var persistedPropertyLists: [[String: Any]] {
+        values.values.compactMap { $0 as? [String: Any] }
+    }
     func object(forKey key: String) -> Any? { values[key] }
     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
     func set(value: Any?, forKey key: String) { values[key] = value }
@@ -126,9 +139,23 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     private(set) var databaseFetchCount = 0
     private(set) var recordMutationCount = 0
     private var deletions = [CloudKitZoneDeletion]()
+    private var heldFailure: NSError?
+    private var failureEntered: XCTestExpectation?
+    private var failureGate: SyncPhaseGate?
+    func holdDatabaseFailure(_ error: NSError, entered: XCTestExpectation,
+                             gate: SyncPhaseGate) {
+        heldFailure = error
+        failureEntered = entered
+        failureGate = gate
+    }
     func returnDeletion(in zone: CKRecordZone.ID) { deletions = [.init(zoneID: zone, kind: .deleted)] }
     func databaseChanges(since: DatabaseChangeCursor?, resultsLimit: Int?) async throws -> CloudKitDatabaseChangePage {
         databaseFetchCount += 1
+        if let heldFailure {
+            failureEntered?.fulfill()
+            await failureGate?.wait()
+            throw heldFailure
+        }
         return .init(cursor: .init(serializedData: Data("phase-db".utf8)),
                      changedZoneIDs: [], deletions: deletions, moreComing: false)
     }
@@ -198,7 +225,7 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
         let sync = CloudKitSynchronizer(identifier: UUID().uuidString,
             containerIdentifier: "iCloud.test.phase-ownership", database: SyncPhaseDatabase(),
             recordZoneID: zone, keyValueStore: SyncPhaseStore(),
-            accountIdentifierProvider: { await probe.accountIdentifier() }, accountStatusProvider: { .available },
+            accountIdentifierProvider: { await probe.accountIdentifier() }, accountStatusProvider: { await probe.accountStatus() },
             progressHandler: { probe.onProgress?($0) },
             changeFeed: transport, subscriptionStore: transport, zoneStore: transport,
             recordStore: transport, backupDetectionBaseURL: directory, logger: Logger(label: "SyncPhaseOwnership"))
@@ -219,12 +246,14 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
             await probe.accountGate.open()
             await sync.cancelSynchronizationAndWait()
             probe.onPersist = nil; probe.onSave = nil; probe.onProgress = nil
+            probe.accountSuccessorTask = nil
             throw error
         }
         sync.cancelSynchronization()
         await probe.accountGate.open()
         await sync.cancelSynchronizationAndWait()
         probe.onPersist = nil; probe.onSave = nil; probe.onProgress = nil
+        probe.accountSuccessorTask = nil
     }
 
     @BigSyncBackgroundActor
@@ -680,6 +709,246 @@ extension SyncPhaseAttemptOwnershipTests {
             XCTAssertEqual(probe.importCount, 0)
             XCTAssertNotEqual(sync.synchronizationAttemptID, attempt)
         }
+    }
+
+    // Both callers use the real waiter API. The transport gate holds the first
+    // drain while the second registers; the coalesced-request flag is the join
+    // signal, with a watchdog only to report a broken fixture without hanging.
+    private enum AccountStopInterruption { case none, externalPoison, cancellation, callerCancellation }
+
+    @BigSyncBackgroundActor
+    private func checkAccountStopSettlement(
+        code: CKError.Code, wrapped: Bool,
+        interruption: AccountStopInterruption = .none,
+        admitsSuccessor: Bool = false, includesTokenExpiry: Bool = false
+    ) async throws {
+        try await withFixture { sync, _, probe, transport in
+            let accountError = NSError(domain: CKErrorDomain, code: code.rawValue)
+            let underlying = includesTokenExpiry
+                ? NSError(domain: CKErrorDomain, code: CKError.Code.partialFailure.rawValue,
+                          userInfo: [CKPartialErrorsByItemIDKey: [
+                            "account": accountError,
+                            "cursor": NSError(domain: CKErrorDomain,
+                                              code: CKError.Code.changeTokenExpired.rawValue),
+                          ]])
+                : accountError
+            let original = wrapped
+                ? NSError(domain: "AccountStopEnvelope", code: 61,
+                          userInfo: [NSUnderlyingErrorKey: underlying])
+                : underlying
+            let entered = self.expectation(description: "first caller reached controlled feed")
+            let release = SyncPhaseGate()
+            await transport.holdDatabaseFailure(original, entered: entered, gate: release)
+            let delegate = SyncPhaseFailureDelegate()
+            sync.delegate = delegate
+            let handler: BigSyncSynchronizationFailureHandler = { failure in
+                probe.capturedAccountFailures.append(failure)
+                if admitsSuccessor, probe.accountSuccessorAttempt == nil {
+                    probe.blockAccount = true
+                    sync.beginSynchronization()
+                    probe.accountSuccessorAttempt = sync.synchronizationAttemptID
+                    probe.accountSuccessorTask = sync.synchronizationTask
+                }
+            }
+            let first = Task { @BigSyncBackgroundActor in
+                try await sync.synchronize(failureHandler: handler)
+            }
+            await self.fulfillment(of: [entered], timeout: 3)
+            guard let context = sync.activeRunContext else {
+                sync.cancelSynchronization()
+                await release.open()
+                _ = await first.result
+                XCTFail("Fixture did not publish a run before feed admission")
+                return
+            }
+            let identifierCallsBeforeStop = probe.accountIdentifierCalls
+            let statusCallsBeforeStop = probe.accountStatusCalls
+            sync.synchronizationRequestedWhileRunning = false
+            let second = Task { @BigSyncBackgroundActor in
+                try await sync.synchronize(failureHandler: handler)
+            }
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while !sync.synchronizationRequestedWhileRunning,
+                  ProcessInfo.processInfo.systemUptime < deadline {
+                await Task.yield()
+            }
+            guard sync.synchronizationRequestedWhileRunning else {
+                sync.cancelSynchronization()
+                await release.open()
+                _ = await first.result
+                _ = await second.result
+                XCTFail("Second real waiter did not coalesce into held drain")
+                return
+            }
+            // Install after startup's .syncing notification. This exercises the
+            // terminal health callout, before the classified stop owns poison.
+            let observer = SyncPhaseNotificationObserver(
+                name: .SynchronizerSyncHealthDidChange, sync: sync
+            ) {
+                switch interruption {
+                case .none, .callerCancellation: break
+                case .externalPoison: sync.accountScopeAuthorityFence.poison()
+                case .cancellation: sync.cancelSynchronization()
+                }
+            }
+            defer { observer.stop() }
+            if interruption == .callerCancellation {
+                first.cancel()
+                let cancellationDeadline = ProcessInfo.processInfo.systemUptime + 3
+                while probe.capturedAccountFailures.isEmpty,
+                      ProcessInfo.processInfo.systemUptime < cancellationDeadline {
+                    await Task.yield()
+                }
+                XCTAssertEqual(probe.capturedAccountFailures.first?.category, .requestCancellation)
+            }
+            await release.open()
+            let results = [await first.result, await second.result]
+            for (index, result) in results.enumerated() {
+                switch result {
+                case .success: XCTFail("Account stop published a receipt success")
+                case .failure(let error):
+                    if interruption == .none
+                        || (interruption == .callerCancellation && index == 1) {
+                        XCTAssertTrue((error as NSError) === original)
+                    } else {
+                        XCTAssertTrue(error is CancellationError)
+                    }
+                }
+            }
+            let failures = probe.capturedAccountFailures
+            XCTAssertEqual(failures.count, 2)
+            XCTAssertEqual(Set(failures.map(\.requestIdentifier)).count, 2)
+            for failure in failures {
+                XCTAssertEqual(failure.attemptIdentifier, context.attemptID)
+                XCTAssertEqual(failure.runIdentifier, context.runID)
+                if interruption == .none
+                    || (interruption == .callerCancellation && failure.category == .failed) {
+                    XCTAssertEqual(failure.category, .failed)
+                    XCTAssertEqual(failure.errorDomain, original.domain)
+                    XCTAssertEqual(failure.errorCode, original.code)
+                } else {
+                    XCTAssertNotEqual(failure.category, .failed)
+                    XCTAssertEqual(failure.errorType, String(reflecting: CancellationError.self))
+                }
+            }
+            if interruption == .callerCancellation {
+                XCTAssertEqual(failures.filter { $0.category == .requestCancellation }.count, 1)
+                XCTAssertEqual(failures.filter { $0.category == .failed }.count, 1)
+            }
+            XCTAssertTrue((delegate.captured as NSError?) === original)
+            XCTAssertEqual(observer.deliveries, 1)
+            XCTAssertThrowsError(try sync.checkSynchronizationAttempt(context.attemptID)) {
+                XCTAssertTrue($0 is CancellationError)
+            }
+            XCTAssertThrowsError(try sync.checkRunContext(context)) {
+                XCTAssertTrue($0 is CancellationError)
+            }
+            XCTAssertEqual(probe.uploadPreparationCount, 0)
+            XCTAssertEqual(probe.deletionPreparationCount, 0)
+            let fetches = await transport.databaseFetchCount
+            let mutations = await transport.recordMutationCount
+            XCTAssertEqual(fetches, 1)
+            XCTAssertEqual(mutations, 0)
+            if admitsSuccessor {
+                XCTAssertNotEqual(probe.accountSuccessorAttempt, context.attemptID)
+                XCTAssertEqual(sync.synchronizationAttemptID, probe.accountSuccessorAttempt)
+                XCTAssertNotNil(probe.accountSuccessorTask)
+                XCTAssertNotNil(sync.synchronizationTask)
+                XCTAssertTrue(sync.syncing)
+                XCTAssertTrue(sync.synchronizationDrainIsActive)
+                XCTAssertFalse(sync.cancelSync)
+            } else {
+                XCTAssertEqual(probe.accountIdentifierCalls, identifierCallsBeforeStop)
+                XCTAssertEqual(probe.accountStatusCalls, statusCallsBeforeStop)
+                XCTAssertNil(sync.synchronizationTask)
+                XCTAssertNil(sync.activeRunContext)
+                XCTAssertFalse(sync.syncing)
+                XCTAssertFalse(sync.synchronizationDrainIsActive)
+                XCTAssertFalse(sync.synchronizationRequestedWhileRunning)
+                if interruption == .none || interruption == .callerCancellation {
+                    XCTAssertTrue(sync.accountScopeAuthorityFence.rejectsAuthority)
+                    XCTAssertTrue(sync.accountValidationRequired)
+                    XCTAssertEqual(sync.cancelledDueToUnauthentication, code == .notAuthenticated)
+                }
+            }
+            // The successor state was checked before cancellation. Join its
+            // controlled provider before querying health so this read cannot
+            // accidentally release new synchronization work.
+            if admitsSuccessor {
+                sync.cancelSynchronization()
+                await probe.accountGate.open()
+                await sync.cancelSynchronizationAndWait()
+            }
+            probe.blockAccount = false
+            let savedHealth = try await sync.syncHealthSnapshot()
+            let health = try XCTUnwrap(savedHealth)
+            XCTAssertEqual(health.category, code == .notAuthenticated
+                ? .notAuthenticated : .accountTemporarilyUnavailable)
+            XCTAssertNotNil(health.lastFailureAt)
+            XCTAssertNil(health.lastSuccessAt)
+            XCTAssertNil(health.retryNotBefore)
+            XCTAssertEqual(health.accountScopeIdentifier, context.accountScopeIdentifier)
+            if includesTokenExpiry {
+                let store = try XCTUnwrap(sync.keyValueStore as? SyncPhaseStore)
+                let request = try XCTUnwrap(store.persistedPropertyLists.first {
+                    ($0["phase"] as? String) == "requested"
+                        && ($0["accountScopeIdentifier"] as? String) == context.accountScopeIdentifier
+                })
+                XCTAssertEqual(request["mode"] as? String, ChangeFeedResetMode.serverReconciliation.rawValue)
+                XCTAssertEqual(request["zoneName"] as? String, sync.recordZoneID.zoneName)
+                XCTAssertTrue(probe.savedTokens.contains { $0 == nil })
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDirectAuthenticationStopSettlesTwoWaitersWithOriginalError() async throws {
+        try await checkAccountStopSettlement(code: .notAuthenticated, wrapped: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testWrappedAuthenticationStopSettlesTwoWaitersWithOriginalError() async throws {
+        try await checkAccountStopSettlement(code: .notAuthenticated, wrapped: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testDirectTemporaryAccountStopSettlesTwoWaitersWithOriginalError() async throws {
+        try await checkAccountStopSettlement(code: .accountTemporarilyUnavailable, wrapped: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testWrappedTemporaryAccountStopSettlesTwoWaitersWithOriginalError() async throws {
+        try await checkAccountStopSettlement(code: .accountTemporarilyUnavailable, wrapped: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testExternalPoisonAtAccountStopHealthCancelsTwoWaiters() async throws {
+        try await checkAccountStopSettlement(code: .notAuthenticated, wrapped: true,
+                                             interruption: .externalPoison)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancellationAtAccountStopHealthCancelsTwoWaiters() async throws {
+        try await checkAccountStopSettlement(code: .accountTemporarilyUnavailable, wrapped: true,
+                                             interruption: .cancellation)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledAccountStopWaiterDoesNotReplaceRemainingWaiterError() async throws {
+        try await checkAccountStopSettlement(code: .notAuthenticated, wrapped: true,
+                                             interruption: .callerCancellation)
+    }
+
+    @BigSyncBackgroundActor
+    func testWrappedAuthenticationAndTokenExpiryPreservesRecoveryBeforeSettlement() async throws {
+        try await checkAccountStopSettlement(code: .notAuthenticated, wrapped: true,
+                                             includesTokenExpiry: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountStopFailureHandlerSuccessorPreservesTwoWaiterEvidence() async throws {
+        try await checkAccountStopSettlement(code: .notAuthenticated, wrapped: true,
+                                             admitsSuccessor: true)
     }
 
     @BigSyncBackgroundActor

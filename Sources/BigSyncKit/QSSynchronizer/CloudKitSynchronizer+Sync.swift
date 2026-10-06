@@ -626,6 +626,8 @@ extension CloudKitSynchronizer {
         }
         guard canContinue() else { return }
         let failureContext = activeRunContext
+        let failureAuthorityGeneration =
+            accountScopeAuthorityFence.invalidationGenerationSnapshot
         logger.info("QSCloudKitSynchronizer >> Failing or backing off synchronization...")
         guard canContinue() else { return }
         
@@ -650,6 +652,7 @@ extension CloudKitSynchronizer {
         guard canContinue() else { return }
         
         var shouldRetry = false
+        var stopsAccount = false
         var retryDelay: TimeInterval = 0
         var terminalHealthCategory = syncHealthCategory(for: error)
         let terminalZoneDeletionKind = (error as? ChangeFeedMigrationError)?
@@ -726,16 +729,11 @@ extension CloudKitSynchronizer {
             // request here; CKAccountChanged reopens the availability gate.
             if codes.contains(.notAuthenticated) {
                 shouldRetry = false
-                changeRequestProcessor.reset()
-                cancelledDueToUnauthentication = true
-                accountValidationRequired = true
-                accountScopeAuthorityFence.poison(requiresGenerationRotation: false)
+                stopsAccount = true
                 terminalHealthCategory = .notAuthenticated
             } else if codes.contains(.accountTemporarilyUnavailable) {
                 shouldRetry = false
-                changeRequestProcessor.reset()
-                accountValidationRequired = true
-                accountScopeAuthorityFence.poison(requiresGenerationRotation: false)
+                stopsAccount = true
                 clearPersistedTransientRetryState()
                 terminalHealthCategory = .accountTemporarilyUnavailable
             } else if constraints.requiresDeferredRetry {
@@ -803,8 +801,13 @@ extension CloudKitSynchronizer {
         }
 
         guard canContinue() else { return }
-        syncing = shouldRetry && !cancelSync
-        synchronizationTask = nil
+        // Keep the drain owned through the health notification. Its observer
+        // may cancel or replace this attempt, and must not coalesce a successor
+        // into a drain that has already dropped its running state.
+        if !stopsAccount {
+            syncing = shouldRetry && !cancelSync
+            synchronizationTask = nil
+        }
 
         if let context = failureContext {
             do {
@@ -833,6 +836,14 @@ extension CloudKitSynchronizer {
         }
 
         guard canContinue() else { return }
+        if stopsAccount {
+            finishAccountStoppedSynchronization(
+                error: error, attemptID: attemptID, context: failureContext,
+                authorityGeneration: failureAuthorityGeneration,
+                category: terminalHealthCategory
+            )
+            return
+        }
         guard shouldRetry, !cancelSync else {
             // A final journal drain can discover a local mutation while this
             // failed attempt is still marked as running. Its delegate wakeup

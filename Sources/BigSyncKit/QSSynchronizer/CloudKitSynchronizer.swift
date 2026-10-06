@@ -733,12 +733,18 @@ final class AccountScopeAuthorityFence: @unchecked Sendable {
         return try body()
     }
 
-    func poison(requiresGenerationRotation: Bool = true) {
+    @discardableResult
+    func poison(
+        requiresGenerationRotation: Bool = true,
+        ifInvalidationGenerationMatches expected: UInt64? = nil
+    ) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
+        if let expected, invalidationGeneration != expected { return false }
         invalidationGeneration += 1
         isPoisoned = true
         rotatesGeneration = rotatesGeneration || requiresGenerationRotation
-        lock.unlock()
+        return true
     }
 
     func clear() {
@@ -2108,6 +2114,47 @@ public class CloudKitSynchronizer: NSObject {
         guard synchronizationAttemptID == attemptID,
               synchronizationDrainIsActive else { return }
         cancelSynchronization(category: .attemptCancellation)
+    }
+
+    /// Final settlement owns only its classified account revocation. Health
+    /// persistence and its notification must finish before entering this region.
+    internal func finishAccountStoppedSynchronization(
+        error: Error, attemptID: UUID, context: RunContext?,
+        authorityGeneration: UInt64,
+        category: CloudKitSyncHealthSnapshot.Category
+    ) {
+        guard synchronizationAttemptID == attemptID else { return }
+        // External poison wins even if it crossed the caller's last check.
+        guard !Task.isCancelled, !cancelSync,
+              accountScopeAuthorityFence.poison(
+                requiresGenerationRotation: false,
+                ifInvalidationGenerationMatches: authorityGeneration
+              ) else {
+            settleCancellationIfCurrentAttempt(attemptID)
+            return
+        }
+        // No suspension or application callout occurs between revocation and
+        // retirement. The drain captures its waiters before delivering handlers;
+        // a handler-admitted successor owns every subsequent state mutation.
+        // Rotate the existing attempt fence before clearing its context: an
+        // old callback must not regain prevalidation admission through nil.
+        synchronizationAttemptID = UUID()
+        cancelAttemptCallbacks(for: attemptID)
+        changeRequestProcessor.reset()
+        cancelledDueToUnauthentication = category == .notAuthenticated
+        accountValidationRequired = true
+        activeRunContext = nil
+        activeAccountValidationAuthority = nil
+        activeReceiptAuthorizationID = nil
+        reservedReceiptAuthorizationID = nil
+        syncing = false
+        synchronizationTask = nil
+        retrySleepUntil = nil
+        finishSynchronizationDrain(
+            with: .failure(error),
+            failureAttemptIdentifier: attemptID,
+            failureRunIdentifier: context?.runID
+        )
     }
 
     private func cancelSynchronizationRequest(_ requestID: UUID) {
