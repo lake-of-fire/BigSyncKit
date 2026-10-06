@@ -148,6 +148,9 @@ extension CloudKitSynchronizer {
         ]
         value["replicaBindingGenerationIdentifier"] =
             context.replicaBindingGenerationIdentifier
+        // The writer must never replace good evidence with a value that its
+        // own persisted-value decoder would reject. Keep one v1 contract.
+        _ = try BigSyncDurablePublicationEvidence(persistedValue: value)
         try keyValueStore.bigSyncSetDurably(
             value: value,
             forKey: durablePublicationEvidenceKey
@@ -219,6 +222,9 @@ extension CloudKitSynchronizer {
                     containerIdentifier: containerIdentifier,
                     databaseScope: database.databaseScope
                   ) else { return nil }
+            // Refresh/inspection may synchronously revoke the original owner.
+            // No positive evidence can escape after that final callout.
+            guard try inspectionOwnerIsCurrent() else { return nil }
             return evidence
         }
 
@@ -256,6 +262,7 @@ extension CloudKitSynchronizer {
               try adapter.changeFeedEpoch() == evidence.changeFeedEpoch else {
             return nil
         }
+        guard try inspectionOwnerIsCurrent() else { return nil }
         return evidence
     }
 

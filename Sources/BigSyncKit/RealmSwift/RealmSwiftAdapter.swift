@@ -1217,10 +1217,14 @@ public final class RealmSwiftAdapter:
                         else { return false }
                     }
                 }
-                let persistenceRealm = try Realm(configuration: persistenceConfiguration)
+                let livePersistenceRealm = try Realm(configuration: persistenceConfiguration)
                 for configuration in targetConfigurations {
-                    let realm = try Realm(configuration: configuration)
-                    if !configuration.readOnly { realm.refresh() }
+                    let liveRealm = try Realm(configuration: configuration)
+                    // A coordinated open can reuse a handle held by another
+                    // writer. Read its committed base, not provisional debt.
+                    // An immutable read-only configuration is already stable.
+                    let realm = configuration.readOnly ? liveRealm
+                        : adapter.committedRealmReadSnapshot(in: liveRealm)
                     if let binding = evidence.replicaBindingGenerationIdentifier {
                         let parts = [evidence.accountScopeIdentifier, containerIdentifier, String(databaseScope.rawValue),
                                      evidence.zoneOwnerName, evidence.zoneName, binding]
@@ -1250,7 +1254,11 @@ public final class RealmSwiftAdapter:
                         }
                     }
                 }
-                if !persistenceConfiguration.readOnly { persistenceRealm.refresh() }
+                // Cursor, epoch and pending tracking state must come from one
+                // committed version, including after refresh callback reentry.
+                let persistenceRealm = persistenceConfiguration.readOnly
+                    ? livePersistenceRealm
+                    : adapter.committedRealmReadSnapshot(in: livePersistenceRealm)
                 let rebuild = persistenceRealm.object(
                     ofType: RebuildProvenanceState.self,
                     forPrimaryKey: RebuildProvenanceState.primaryKeyValue
