@@ -702,7 +702,7 @@ final class SyncRetainedRecordContractTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    private func unbasedRecoveryFixture() async throws -> (RealmSwiftAdapter, Realm, RetainedContractRow, BigSyncRecordConflictSnapshot) {
+    private func unbasedRecoveryFixture(commitPage: Bool = false) async throws -> (RealmSwiftAdapter, Realm, RetainedContractRow, BigSyncRecordConflictSnapshot) {
         let (adapter, realm) = try await fixture()
         let object = RetainedContractRow()
         try realm.write {
@@ -710,7 +710,17 @@ final class SyncRetainedRecordContractTests: XCTestCase {
             object.title = "mine"
             object.refreshChangeMetadata(explicitlyModified: true)
         }
-        _ = try await deliver([record(adapter, title: "theirs")], to: adapter)
+        let results = try await deliver([record(adapter, title: "theirs")], to: adapter)
+        if commitPage {
+            let first = RecordZoneChangeCursor(serializedData: Data("conflict-page".utf8))
+            try await adapter.commitInboundPage(.init(previousCursor: nil, nextCursor: first,
+                liveResults: results, deletionResults: []))
+            // Advance the head so the quarantine's exact receipt is collectible
+            // after retirement, rather than protected as the current feed head.
+            try await adapter.commitInboundPage(.init(previousCursor: first,
+                nextCursor: .init(serializedData: Data("successor-page".utf8)),
+                liveResults: [], deletionResults: []))
+        }
         return (adapter, realm, object, try XCTUnwrap(try adapter.unresolvedRecordConflicts().first))
     }
 
@@ -997,4 +1007,527 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         XCTAssertEqual(second.title, "second local")
     }
 
+}
+
+// Real Realm notification reentry at the public archive-cleanup boundary.
+// The signal write changes only fixture-owned local archive metadata; it does
+// not fabricate a submitted/accepted record or mutate a pending journal.
+private final class CleanupRefreshAuthority: @unchecked Sendable {
+    enum Mode: Sendable { case live, revokeLease, cancelTask, cancelAdapterGeneration, replaceAccount }
+    enum Failure: Error { case revoked, holdTrackingCleanup }
+    let mode: Mode
+    private let lock = NSLock()
+    private var seeded = false
+    private var observed = false
+    private var armed = false
+
+    init(_ mode: Mode) { self.mode = mode }
+    func armOnce() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !seeded else { return false }
+        seeded = true; armed = true
+        return true
+    }
+    func receiveChange() {
+        lock.lock()
+        let shouldObserve = armed && !observed
+        if shouldObserve { observed = true }
+        lock.unlock()
+        if shouldObserve, mode == .cancelTask {
+            withUnsafeCurrentTask { $0?.cancel() }
+        }
+    }
+    var didObserve: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return observed
+    }
+    func validate() throws {
+        if mode == .revokeLease && didObserve { throw Failure.revoked }
+    }
+}
+
+extension SyncRetainedRecordContractTests {
+    @BigSyncBackgroundActor
+    private struct CleanupRefreshFixture {
+        let adapter: RealmSwiftAdapter
+        let target: Realm
+        let tracking: Realm
+        let conflictID: String
+        let lineageID: String
+        let pageReceiptID: String
+        let originalTitle: String
+        let pendingGeneration: String?
+    }
+
+    @BigSyncBackgroundActor
+    private func cleanupRefreshFixture() async throws -> CleanupRefreshFixture {
+        let (adapter, target, object, conflict) = try await unbasedRecoveryFixture(commitPage: true)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let quarantine = try XCTUnwrap(tracking.objects(BigSyncInboundSemanticQuarantine.self).first)
+        let lineage = quarantine.lineageID
+        let pageReceiptID = quarantine.committedPageReceiptID
+        XCTAssertFalse(pageReceiptID.isEmpty)
+        XCTAssertEqual(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: pageReceiptID)?.isHead, false)
+        do {
+            try await adapter.resolveRecordConflict(
+                id: conflict.id, expectedGeneration: conflict.generation,
+                choice: .keepLocal, validateAuthority: {
+                    // Preserve the actual committed target / unretired tracking
+                    // prefix. This predicate is tied to state, not call count.
+                    if !target.isInWriteTransaction,
+                       target.object(ofType: BigSyncRecordConflict.self,
+                                     forPrimaryKey: conflict.id)?.isResolved == true {
+                        throw CleanupRefreshAuthority.Failure.holdTrackingCleanup
+                    }
+                }
+            )
+            XCTFail("Expected the tracking phase to remain pending")
+        } catch CleanupRefreshAuthority.Failure.holdTrackingCleanup { }
+        XCTAssertTrue(try XCTUnwrap(target.object(
+            ofType: BigSyncRecordConflict.self, forPrimaryKey: conflict.id)).isResolved)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+                                       forPrimaryKey: lineage))
+        return .init(adapter: adapter, target: target, tracking: tracking,
+                     conflictID: conflict.id, lineageID: lineage, pageReceiptID: pageReceiptID,
+                     originalTitle: object.title,
+                     pendingGeneration: target.objects(BigSyncPendingMutation.self).first?.generation)
+    }
+
+    @BigSyncBackgroundActor
+    private func exerciseCleanupRefresh(
+        mode: CleanupRefreshAuthority.Mode, retry: Bool = false
+    ) async throws {
+        let fixture = try await cleanupRefreshFixture()
+        let authority = CleanupRefreshAuthority(mode)
+        let writerQueue = DispatchQueue(label: "test.cleanup-refresh." + UUID().uuidString)
+        let configuration = fixture.target.configuration
+        let conflictID = fixture.conflictID
+        let priorAutorefresh = fixture.target.autorefresh
+        fixture.target.autorefresh = false
+        let observation = fixture.target.observe { notification, _ in
+            if case .didChange = notification {
+                let previouslyObserved = authority.didObserve
+                authority.receiveChange()
+                guard !previouslyObserved, authority.didObserve else { return }
+                if mode == .cancelAdapterGeneration {
+                    fixture.adapter.cancelSynchronization()
+                    // Restore the Boolean immediately: rejection must depend
+                    // on the captured generation, not merely cancelSync.
+                    do { try fixture.adapter.prepareForFencedMigrationAfterCancellation() }
+                    catch { XCTFail("Could not restore adapter cancellation flag: \(error)") }
+                } else if mode == .replaceAccount {
+                    fixture.adapter.activeAccountScopeIdentifier = "replacement-account"
+                }
+            }
+        }
+        defer {
+            observation.invalidate()
+            fixture.target.autorefresh = priorAutorefresh
+        }
+        let request = Task { @BigSyncBackgroundActor in
+            try await fixture.adapter.discardResolvedRecordConflictArchives(validateAuthority: {
+                try authority.validate()
+                guard fixture.tracking.isInWriteTransaction, authority.armOnce() else { return }
+                // The private cleanup has selected its initial candidates and
+                // holds the *tracking* writer. A separate scheduler commits the
+                // target metadata; the ensuing target refresh delivers the real
+                // notification which revokes the caller or cancels this task.
+                try writerQueue.sync {
+                    let writer = try Realm(configuration: configuration, queue: writerQueue)
+                    try writer.write {
+                        let row = try XCTUnwrap(writer.object(
+                            ofType: BigSyncRecordConflict.self, forPrimaryKey: conflictID))
+                        row.createdAt = row.createdAt.addingTimeInterval(1)
+                    }
+                }
+            })
+        }
+        addTeardownBlock { request.cancel(); _ = await request.result }
+        let outcome = await request.result
+        XCTAssertTrue(authority.didObserve, "Must exercise real target refresh notification delivery")
+        if mode == .live {
+            try outcome.get()
+            XCTAssertNil(fixture.tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+                                                 forPrimaryKey: fixture.lineageID))
+            XCTAssertNil(fixture.target.object(ofType: BigSyncRecordConflict.self,
+                                               forPrimaryKey: fixture.conflictID))
+        } else {
+            switch outcome {
+            case .success: XCTFail("Revoked cleanup must not publish success")
+            case .failure(let error):
+                if mode == .cancelTask { XCTAssertTrue(error is CancellationError) }
+                else if mode == .revokeLease { XCTAssertTrue(error is CleanupRefreshAuthority.Failure) }
+                else { XCTAssertTrue(error is CancellationError) }
+            }
+            XCTAssertEqual(request.isCancelled, mode == .cancelTask)
+            XCTAssertNotNil(fixture.tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+                                                    forPrimaryKey: fixture.lineageID))
+            XCTAssertNotNil(fixture.tracking.object(ofType: BigSyncInboundPageReceipt.self,
+                forPrimaryKey: fixture.pageReceiptID), "Rejected cleanup must retain its exact committed page proof")
+            XCTAssertTrue(try XCTUnwrap(fixture.target.object(
+                ofType: BigSyncRecordConflict.self, forPrimaryKey: fixture.conflictID)).isResolved,
+                "Reject cleanup, not the previously committed target decision")
+            if retry {
+                observation.invalidate()
+                fixture.adapter.activeAccountScopeIdentifier = "account"
+                try await fixture.adapter.unsetCancellation()
+                try await fixture.adapter.discardResolvedRecordConflictArchives()
+                XCTAssertNil(fixture.tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+                                                     forPrimaryKey: fixture.lineageID))
+                XCTAssertNil(fixture.target.object(ofType: BigSyncRecordConflict.self,
+                                                   forPrimaryKey: fixture.conflictID))
+            }
+        }
+        if mode == .live || retry {
+            XCTAssertNil(fixture.tracking.object(ofType: BigSyncInboundPageReceipt.self,
+                forPrimaryKey: fixture.pageReceiptID))
+        }
+        XCTAssertNotNil(fixture.tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: BigSyncInboundPageReceipt.canonicalID), "Current feed head remains protected")
+        XCTAssertEqual(try value(fixture.target).title, fixture.originalTitle)
+        XCTAssertEqual(fixture.target.objects(BigSyncPendingMutation.self).first?.generation,
+                       fixture.pendingGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testRefreshRevocationCannotRetireResolvedQuarantineOrArchive() async throws {
+        try await exerciseCleanupRefresh(mode: .revokeLease)
+    }
+
+    @BigSyncBackgroundActor
+    func testRefreshTaskCancellationCannotRetireResolvedQuarantineOrArchive() async throws {
+        try await exerciseCleanupRefresh(mode: .cancelTask)
+    }
+
+    @BigSyncBackgroundActor
+    func testCurrentRefreshCleanupStillRetiresQuarantineAndArchive() async throws {
+        try await exerciseCleanupRefresh(mode: .live)
+    }
+
+    @BigSyncBackgroundActor
+    func testRefreshAdapterGenerationRevocationPreservesPageReceiptAndRetries() async throws {
+        try await exerciseCleanupRefresh(mode: .cancelAdapterGeneration, retry: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testRefreshAccountContextRevocationPreservesPageReceiptAndRetries() async throws {
+        try await exerciseCleanupRefresh(mode: .replaceAccount, retry: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testRefreshRejectedCleanupCanRetryWithoutChangingCommittedDecision() async throws {
+        try await exerciseCleanupRefresh(mode: .revokeLease, retry: true)
+    }
+}
+
+extension SyncRetainedRecordContractTests {
+    @BigSyncBackgroundActor
+    private func exportedConflictValues(_ adapter: RealmSwiftAdapter) throws -> [[String: Any]] {
+        let bytes = try adapter.exportPreservedRecordConflicts()
+        let archive = try XCTUnwrap(PropertyListSerialization.propertyList(
+            from: bytes, format: nil) as? [String: Any])
+        XCTAssertEqual(archive["format"] as? String, "BigSyncPreservedConflicts-v1")
+        return try XCTUnwrap(archive["records"] as? [[String: Any]])
+    }
+
+    @BigSyncBackgroundActor
+    func testConflictPreviewIgnoresAnotherOwnersProvisionalResolution() async throws {
+        for commits in [false, true] {
+            let (adapter, realm, object, original) = try await unbasedRecoveryFixture()
+            let pending = realm.objects(BigSyncPendingMutation.self).first?.generation
+            let archived = try XCTUnwrap(realm.object(
+                ofType: BigSyncRecordConflict.self, forPrimaryKey: original.id))
+            try realm.beginWrite()
+            defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+            // This local fixture transition models another owner's pending
+            // archive update, not an acknowledged conflict-resolution command.
+            archived.isResolved = true
+            let during = try adapter.unresolvedRecordConflicts()
+            XCTAssertEqual(during.map(\.id), [original.id])
+            XCTAssertEqual(during.first?.localTitle, original.localTitle)
+            XCTAssertEqual(during.first?.incomingTitle, original.incomingTitle)
+            XCTAssertEqual(during.first?.generation, original.generation)
+            XCTAssertTrue(realm.isInWriteTransaction)
+            if commits { try realm.commitWrite() } else { realm.cancelWrite() }
+            let after = try adapter.unresolvedRecordConflicts()
+            XCTAssertEqual(after.map(\.id), commits ? [] : [original.id])
+            XCTAssertEqual(object.title, "mine")
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testConflictExportExcludesProvisionalPayloadAndRemoval() async throws {
+        for removesRow in [false, true] {
+            for commits in [false, true] {
+                let (adapter, realm, object, original) = try await unbasedRecoveryFixture()
+                let before = try XCTUnwrap(try exportedConflictValues(adapter).first)
+                let pending = realm.objects(BigSyncPendingMutation.self).first?.generation
+                let archived = try XCTUnwrap(realm.object(
+                    ofType: BigSyncRecordConflict.self, forPrimaryKey: original.id))
+                let provisional = Data("private provisional archive bytes".utf8)
+                try realm.beginWrite()
+                defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+                if removesRow { realm.delete(archived) }
+                else { archived.localPayload = provisional }
+                let during = try exportedConflictValues(adapter)
+                XCTAssertEqual(during.count, 1)
+                XCTAssertEqual(NSDictionary(dictionary: try XCTUnwrap(during.first)),
+                               NSDictionary(dictionary: before))
+                XCTAssertTrue(realm.isInWriteTransaction, "Export must not settle the held owner")
+                if commits { try realm.commitWrite() } else { realm.cancelWrite() }
+                let after = try exportedConflictValues(adapter)
+                if removesRow && commits {
+                    XCTAssertTrue(after.isEmpty)
+                } else {
+                    XCTAssertEqual(after.first?["localPayload"] as? Data,
+                                   commits ? provisional : before["localPayload"] as? Data)
+                }
+                XCTAssertEqual(object.title, "mine")
+                XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+            }
+        }
+    }
+}
+
+
+extension SyncRetainedRecordContractTests {
+    private enum RetainedAcknowledgementRetryGuard { case wrongTag, wrongContext, newerGeneration }
+
+    @BigSyncBackgroundActor
+    private func exerciseRetainedAcknowledgementRefresh(
+        mode: CleanupRefreshAuthority.Mode,
+        retryGuard: RetainedAcknowledgementRetryGuard? = nil
+    ) async throws {
+        let (adapter, target) = try await fixture()
+        _ = try await deliver([record(adapter)], to: adapter)
+        let object = try value(target)
+        try target.write {
+            object.epoch = try BigSyncLifetimeID.next(after: object.epoch, nonce: nonce)
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let initialPrepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let recordForDeletion = try XCTUnwrap(initialPrepared.first?.record)
+        let results = try await adapter.deleteRecords(with: [recordForDeletion.recordID])
+        guard case .quarantined(let lineage) = try XCTUnwrap(results.first).disposition else {
+            return XCTFail("A real retained physical deletion must create quarantine evidence")
+        }
+        let cursor = RecordZoneChangeCursor(serializedData: Data("retained-deletion-page".utf8))
+        try await adapter.commitInboundPage(.init(previousCursor: nil, nextCursor: cursor,
+            liveResults: [], deletionResults: results))
+        try await adapter.commitInboundPage(.init(previousCursor: cursor,
+            nextCursor: .init(serializedData: Data("retained-successor-page".utf8)),
+            liveResults: [], deletionResults: []))
+        // Bind the exact already-committed page before supplying its restoring
+        // response. A received old tag alone cannot order later deletions.
+        // Server-response bytes must outlive the prepared upload files retired
+        // by an intervening didFinishImport in the newer-generation retry.
+        func acceptedResponse(_ record: CKRecord, tag: String) throws -> CKRecord {
+            let copy = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(record))
+            guard copy.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
+                throw CocoaError(.coderValueNotFound)
+            }
+            _ = copy.perform(NSSelectorFromString("setRecordChangeTag:"), with: tag as NSString)
+            let result = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(copy))
+            XCTAssertEqual(result.recordChangeTag, tag)
+            return result
+        }
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let saved = try acceptedResponse(XCTUnwrap(prepared.first).record, tag: "accepted-after-deletion")
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let originalGeneration = try XCTUnwrap(target.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: saved.recordID.recordName)?.generation)
+        let originalTrackingState = try XCTUnwrap(tracking.object(
+            ofType: SyncedEntity.self, forPrimaryKey: saved.recordID.recordName)).entityState
+        let receiptID = try XCTUnwrap(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: lineage)).committedPageReceiptID
+        XCTAssertFalse(receiptID.isEmpty)
+        XCTAssertEqual(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: receiptID)?.isHead, false)
+        var expectedTitle = object.title
+        let epoch = object.epoch
+        let authority = CleanupRefreshAuthority(mode)
+        let writerQueue = DispatchQueue(label: "test.retained-ack-refresh." + UUID().uuidString)
+        let configuration = target.configuration
+        let priorAutorefresh = target.autorefresh
+        target.autorefresh = false
+        let observation = target.observe { notification, _ in
+            guard case .didChange = notification, !authority.didObserve else { return }
+            authority.receiveChange()
+            guard authority.didObserve else { return }
+            if mode == .cancelAdapterGeneration {
+                adapter.cancelSynchronization()
+                do { try adapter.prepareForFencedMigrationAfterCancellation() }
+                catch { XCTFail("Could not restore cancellation flag: \(error)") }
+            } else if mode == .replaceAccount {
+                adapter.activeAccountScopeIdentifier = "replacement-account"
+            }
+        }
+        adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = {
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: saved.recordID.recordName)?.generation, originalGeneration)
+            XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.entityState, .synced)
+            guard authority.armOnce() else { return }
+            // Tracking acknowledgement is provisional in this transaction.
+            // The target journal remains intact until acknowledgement and
+            // quarantine retirement commit together. Deliver real refresh
+            // notification revocation before that tracking commit.
+            try writerQueue.sync {
+                let writer = try Realm(configuration: configuration, queue: writerQueue)
+                try writer.write {
+                    let row = try XCTUnwrap(writer.object(ofType: RetainedContractRow.self,
+                        forPrimaryKey: "article"))
+                    row.modifiedAt = row.modifiedAt.addingTimeInterval(1)
+                }
+            }
+        }
+        defer {
+            adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil
+            observation.invalidate()
+            target.autorefresh = priorAutorefresh
+        }
+        let request = Task { @BigSyncBackgroundActor in
+            try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+        }
+        addTeardownBlock { request.cancel(); _ = await request.result }
+        let outcome = await request.result
+        switch outcome {
+        case .success:
+            XCTAssertEqual(mode, .live, "Revoked accepted-deletion cleanup must reject")
+        case .failure(let error):
+            XCTAssertNotEqual(mode, .live)
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(request.isCancelled, mode == .cancelTask)
+        XCTAssertTrue(authority.didObserve, "Must deliver a real refresh before tracking settlement")
+        if mode == .live {
+            XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.entityState, .synced)
+            XCTAssertNil(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.pendingGeneration)
+            XCTAssertTrue(target.objects(BigSyncPendingMutation.self).isEmpty)
+        } else {
+            XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.entityState, originalTrackingState)
+            XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.pendingGeneration, originalGeneration)
+            XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: saved.recordID.recordName)?.generation, originalGeneration)
+        }
+        if mode != .live {
+            XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+                forPrimaryKey: lineage))
+            XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+                forPrimaryKey: receiptID))
+            observation.invalidate()
+            adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil
+            adapter.activeAccountScopeIdentifier = "account"
+            try await adapter.unsetCancellation()
+            // These variants exercise revoked preparation under different
+            // reply/local inputs. Current-owner guards are covered separately
+            // by the W1 preparation tests; cancellation is the authority here.
+            if let retryGuard {
+                switch retryGuard {
+                case .wrongTag:
+                    let mismatched = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(saved))
+                    guard mismatched.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
+                        return XCTFail("CloudKit SDK cannot construct tagged system-field fixture")
+                    }
+                    _ = mismatched.perform(NSSelectorFromString("setRecordChangeTag:"),
+                        with: "different-accepted-tag" as NSString)
+                    let wrongTag = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(mismatched))
+                    XCTAssertEqual(wrongTag.recordChangeTag, "different-accepted-tag")
+                    do {
+                        try await adapter.didUpload(savedRecords: [wrongTag], matchingPreparedUploads: prepared)
+                        XCTFail("A revoked prepared cleanup must not be revived")
+                    } catch { XCTAssertTrue(error is CancellationError) }
+                case .wrongContext:
+                    adapter.activeAccountScopeIdentifier = "replacement-account"
+                    do {
+                        try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+                        XCTFail("A revoked prepared cleanup must not be revived")
+                    } catch { XCTAssertTrue(error is CancellationError) }
+                    adapter.activeAccountScopeIdentifier = "account"
+                case .newerGeneration:
+                    try target.write {
+                        object.title = "newer retained intent"
+                        object.refreshChangeMetadata(explicitlyModified: true)
+                    }
+                    try await adapter.didFinishImport()
+                    let generation = try XCTUnwrap(target.objects(BigSyncPendingMutation.self).first?.generation)
+                    do {
+                        try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+                        XCTFail("A revoked prepared cleanup must not be revived")
+                    } catch { XCTAssertTrue(error is CancellationError) }
+                    XCTAssertEqual(target.objects(BigSyncPendingMutation.self).first?.generation, generation)
+                    XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+                        forPrimaryKey: saved.recordID.recordName)?.pendingGeneration, generation)
+                    expectedTitle = object.title
+                }
+                XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+                    forPrimaryKey: lineage), "An ineligible retry must preserve quarantine evidence")
+                XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+                    forPrimaryKey: receiptID))
+            }
+            // A replaced/cancelled attempt does not renew an old prepared
+            // cleanup. Retained journal input permits a fresh preparation and
+            // a new simulated server-restoring response in the healthy attempt.
+            let current = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+            XCTAssertFalse(current.isEmpty)
+            let freshResponses = try current.map {
+                try acceptedResponse($0.record, tag: "accepted-current-retry")
+            }
+            try await adapter.didUpload(savedRecords: freshResponses, matchingPreparedUploads: current)
+        }
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: lineage))
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: receiptID))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: BigSyncInboundPageReceipt.canonicalID))
+        XCTAssertTrue(try value(target).isDeleted)
+        XCTAssertEqual(try value(target).epoch, epoch)
+        XCTAssertEqual(try value(target).title, expectedTitle)
+        try await requireQuiet(adapter)
+    }
+
+    @BigSyncBackgroundActor
+    func testAcceptedRetainedDeletionRefreshGenerationRevocationPreservesReceiptsAndRetries() async throws {
+        try await exerciseRetainedAcknowledgementRefresh(mode: .cancelAdapterGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testAcceptedRetainedDeletionRefreshTaskCancellationPreservesReceiptsAndRetries() async throws {
+        try await exerciseRetainedAcknowledgementRefresh(mode: .cancelTask)
+    }
+
+    @BigSyncBackgroundActor
+    func testAcceptedRetainedDeletionRefreshAccountRevocationPreservesReceiptsAndRetries() async throws {
+        try await exerciseRetainedAcknowledgementRefresh(mode: .replaceAccount)
+    }
+
+    @BigSyncBackgroundActor
+    func testAcceptedRetainedDeletionRetryRejectsWrongChangeTag() async throws {
+        try await exerciseRetainedAcknowledgementRefresh(mode: .cancelAdapterGeneration, retryGuard: .wrongTag)
+    }
+
+    @BigSyncBackgroundActor
+    func testAcceptedRetainedDeletionRetryRejectsWrongContext() async throws {
+        try await exerciseRetainedAcknowledgementRefresh(mode: .cancelAdapterGeneration, retryGuard: .wrongContext)
+    }
+
+    @BigSyncBackgroundActor
+    func testAcceptedRetainedDeletionRetryPreservesNewerPendingGeneration() async throws {
+        try await exerciseRetainedAcknowledgementRefresh(mode: .cancelAdapterGeneration, retryGuard: .newerGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testCurrentAcceptedRetainedDeletionRefreshRetiresOnlyHistoricalReceipt() async throws {
+        try await exerciseRetainedAcknowledgementRefresh(mode: .live)
+    }
 }

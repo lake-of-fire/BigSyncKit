@@ -1,0 +1,93 @@
+{
+  "reviewed_base": "e15f300c18b263d96c1a82287e9076e87cfd76ac",
+  "publication_base": "4c306609ca5d965359eda69da3ffbc0b2fbdcd93",
+  "native_file": "Tests/BigSyncKitTests/SyncDisappearanceOwnerBoundaryTests.swift",
+  "native_owner": "SyncUndoCloseoutW1Tests",
+  "native_methods": [
+    "testDisappearanceTrackingRefreshGenerationABARejectsBeforeTargetCommit",
+    "testDisappearanceTrackingRefreshAccountReplacementRollsBackTarget",
+    "testDisappearanceTrackingRefreshTaskCancellationPreservesTarget",
+    "testCurrentDisappearanceTrackingRefreshPreservesLegacyIntent",
+    "testDisappearanceRefreshRejectionCanRetryWithoutReauthoringContent",
+    "testDisappearancePreparationRejectsIdentityProviderCancellation",
+    "testCurrentDisappearancePreparationRetainsExactEvidence"
+  ],
+  "native_executed": false,
+  "shipping_original_blob": "8bc82068e4f8cbdefac8ded946dcf42b54524ad9",
+  "shipping_result_blob": "405278f9231ae0b1d7310431963d25c5a5601aa7",
+  "portable_scope": "complete disappearance file plus verbatim current owner methods; explicit SDK/domain collaborators",
+  "matrix": {
+    "fixed-debug": {
+      "exit": 0,
+      "seconds": 1.8832673679999061,
+      "tests": 40,
+      "passed": 40,
+      "failed": 0,
+      "skipped": 0
+    },
+    "fixed-release": {
+      "exit": 0,
+      "seconds": 7.706481704999987,
+      "tests": 40,
+      "passed": 40,
+      "failed": 0,
+      "skipped": 0
+    },
+    "no-empty-noop-debug": {
+      "exit": 1,
+      "seconds": 2.998013837999679,
+      "tests": 40,
+      "passed": 39,
+      "failed": 1,
+      "skipped": 0
+    },
+    "no-final-owner-debug": {
+      "exit": 1,
+      "seconds": 2.348089412000263,
+      "tests": 40,
+      "passed": 31,
+      "failed": 9,
+      "skipped": 0
+    },
+    "no-post-identity-owner-debug": {
+      "exit": 1,
+      "seconds": 2.3022071000000324,
+      "tests": 40,
+      "passed": 39,
+      "failed": 1,
+      "skipped": 0
+    },
+    "no-provider-owner-debug": {
+      "exit": 1,
+      "seconds": 1.935501893000037,
+      "tests": 40,
+      "passed": 38,
+      "failed": 2,
+      "skipped": 0
+    },
+    "original-debug": {
+      "exit": 1,
+      "seconds": 2.877406568999959,
+      "tests": 40,
+      "passed": 23,
+      "failed": 17,
+      "skipped": 0
+    },
+    "recapture-per-record-debug": {
+      "exit": 1,
+      "seconds": 1.8816969280001103,
+      "tests": 40,
+      "passed": 39,
+      "failed": 1,
+      "skipped": 0
+    },
+    "snapshot-before-identity-debug": {
+      "exit": 1,
+      "seconds": 1.9277723129998776,
+      "tests": 40,
+      "passed": 38,
+      "failed": 2,
+      "skipped": 0
+    }
+  }
+}

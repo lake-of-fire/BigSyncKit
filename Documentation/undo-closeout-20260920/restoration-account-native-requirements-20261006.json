@@ -1,0 +1,106 @@
+{
+  "source_commit": "60be9d147acadd5683361d96067b1809ea395884",
+  "source_parent": "e15f300c18b263d96c1a82287e9076e87cfd76ac",
+  "source_tree": "781d29b95679f8d988a4ba9c01affa6e8725cb0b",
+  "review_pr": 120,
+  "reader_integration_pr": 286,
+  "qualification": {
+    "native_sdk_compilation": false,
+    "native_test_discovery": false,
+    "native_behavior_execution": false,
+    "reader_inventory_registration_by_this_increment": false,
+    "assembled_application": false,
+    "release_authorized": false
+  },
+  "retained_packet": {
+    "name": "BigSync120_review_20261006.zip",
+    "sha256": "e180e438c8ea1bb54123a0754a80e61f80ee5104a724139a9259bcf05622b6cb",
+    "bytes": 327868,
+    "verified_payload_members": 277,
+    "fresh_exported_debug_reproduction": {
+      "publication": {"passed": 55, "failed": 0, "exit": 0},
+      "cold_inspection": {"passed": 15, "failed": 0, "exit": 0},
+      "account_authority": {"passed": 29, "failed": 0, "exit": 0}
+    },
+    "scope": "Complete small source files and labeled selected declarations with explicit collaborators; not a complete repository or native SDK build. Do not replace full repository files with excerpt files."
+  },
+  "post_publication_positive_repeats": {
+    "publication": {"debug_passed": 55, "optimized_passed": 55},
+    "cold_inspection": {"debug_passed": 15, "optimized_passed": 15},
+    "account_authority": {"debug_passed": 29, "optimized_passed": 29},
+    "scope": "The same named cases repeat across configurations; counts are not additive native coverage."
+  },
+  "required_method_count": 33,
+  "suites": [
+    {
+      "file": "Tests/BigSyncKitTests/AccountAuthorityPersistenceTests.swift",
+      "source_blob": "e06d5b28951478749effedd0aefb1bbbd31948b9",
+      "class": "AccountAuthorityPersistenceTests",
+      "new_source_requires_reader_project_registration": true,
+      "methods": [
+        "testAbsentReplicaStateRemainsAbsent",
+        "testUnboundAndSameAccountBindingRemainIdempotent",
+        "testExistingOwnerRequiresPort",
+        "testRestoredOwnerCannotBeReboundUntilAdmitted",
+        "testPendingPortRoundTripsActivationAndCancellation",
+        "testRepeatedPortRequestRetainsOriginalTransition",
+        "testMalformedActiveOwnerCannotBecomeFirstBinding",
+        "testMalformedRestoredOwnerCannotBecomeFirstBinding",
+        "testInstallationRestoreCannotEraseMalformedOwnership",
+        "testMalformedBindingVersionCannotPrepareOrBind",
+        "testIncompletePendingEnvelopeFailsClosed",
+        "testPendingPortRejectsNonfiniteDates",
+        "testPendingPortCannotNameTheSameSourceAndDestination",
+        "testPendingPortStillRejectsWrongBoundDigest",
+        "testBothOwnerFieldsAreNeverAdmitted",
+        "testBinaryAndXMLBindingRoundTripPreservesOriginalBytes",
+        "testUnknownBindingFieldsRemainCompatible",
+        "testExactLeaseGenerationBoundsRemainAccepted",
+        "testLeaseNumericFieldsRejectBooleanFractionAndOverflow",
+        "testLeaseValidityRequiresPersistedBoolean",
+        "testLiveLeaseRejectsNonfiniteValidationDates",
+        "testLiveLeaseRequiresCompleteIdentityAndDate",
+        "testInvalidatedLeaseRetainsGenerationWithoutRevivingOldPayload",
+        "testLeaseBinaryAndXMLRoundTripPreservesBooleanAndGeneration",
+        "testDurableReadErrorsCannotBecomeMissingBinding"
+      ],
+      "native_executed": false,
+      "controlled_execution": "Identical 25 repository XCTest methods passed with explicit storage/client/protocol collaborators and an OpenSSL SHA-256 import facade. Four additional tool-only tests cover actual private lease reader/writer bodies."
+    },
+    {
+      "file": "Tests/BigSyncKitTests/CloudKitSynchronizerAccountFencingTests.swift",
+      "source_blob": "431ca0f0288bc73e38594bae4417cc69aa3e97a5",
+      "class": "CloudKitSynchronizerAccountFencingTests",
+      "new_source_requires_reader_project_registration": false,
+      "methods": [
+        "testFinalPublicationInspectionRejectsReentrantFencePoison",
+        "testFinalPublicationInspectionCannotDeliverRevokedPositiveEvidence",
+        "testFinalPublicationInspectionPreservesTaskCancellation",
+        "testFinalPublicationInspectionRetainsUnchangedOwnerSuccess"
+      ],
+      "native_executed": false,
+      "controlled_execution": "Authored and syntax-parsed only; controlled production-method results are separate."
+    },
+    {
+      "file": "Tests/BigSyncKitTests/SyncUndoCloseoutW1EvidenceFenceTests.swift",
+      "source_blob": "b4541299b611c6a90c7121c018caf02e9d921b2e",
+      "class": "SyncUndoCloseoutW1Tests",
+      "new_source_requires_reader_project_registration": false,
+      "methods": [
+        "testColdRestorationKeepsCommittedCursorBehindProvisionalRemoval",
+        "testColdRestorationCannotCertifyProvisionalSuccessorCursor",
+        "testColdRestorationIgnoresProvisionalTargetJournalUntilCommit",
+        "testColdRestorationKeepsOriginalAfterProvisionalTargetJournalRollback"
+      ],
+      "native_executed": false,
+      "controlled_execution": "Authored and syntax-parsed only; controlled Realm-view results are separate."
+    }
+  ],
+  "integration_requirements": [
+    "Preserve the current #96 and concurrent #118 production changes; never replace a complete file with an older sibling snapshot.",
+    "Deliberately select the reviewed component in Reader #286, register the new source in Project.swift and all 33 exact identities in both native inventories.",
+    "Resolve runnable selectors from the actual retained enabled Xcode catalog; these method names are requirements, not native discovery receipts.",
+    "Run the owning current-composition account/replica, publication-restoration, W1 receipt/journal and Mark/Unmark coverage on the approved Apple executor.",
+    "Preserve other workers' active batches, original failures and historical source-scoped evidence; no signed, installed-fixture, second-account, performance or release gate is granted."
+  ]
+}

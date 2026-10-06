@@ -1,0 +1,46 @@
+import Foundation
+import RealmSwift
+
+// Match production: isolate its methods, not the whole adapter class.
+public final class RealmSwiftAdapter: @unchecked Sendable {
+    public var realmProvider: RealmProvider?
+    var modelTypes: [String: Object.Type] = ["Note": Note.self]
+    var excludedClassNames: [String] = []
+    var accountScopePropertyByClassName: [String: String] = [:]
+    var activeAccountScopeIdentifier: String? = "account"
+    var activeReplicaBindingGenerationIdentifier: String? = "binding"
+    var cancelSync = false
+    weak var modelAdapterDelegate: (any ModelAdapterDelegate)?
+    var _testJournalForwardingTrace: ((String) -> Void)?
+    var _testBeforePendingMutationTrackingWrite: (() async throws -> Void)?
+    var _testAfterPendingMutationTrackingWrite: (() async throws -> Void)?
+    public init(_ provider: RealmProvider?) { realmProvider = provider }
+    func beginJournalForwardingTraceOperation() -> Int { 1 }
+    func traceJournalForwarding(_ value: String) { _testJournalForwardingTrace?(value) }
+    func updateHasChanges(realm: Realm) {}
+    func pendingMutationIsEligibleForActiveTransport(_ value: BigSyncPendingMutationSnapshot) -> Bool {
+        value.replicaBindingGenerationIdentifier == activeReplicaBindingGenerationIdentifier
+            && (accountScopePropertyByClassName[value.entityType] == nil || value.accountScopeIdentifier == activeAccountScopeIdentifier)
+    }
+    // The real polymorphic target decoder/lifecycle policy is not exercised.
+    func pendingMutationTargetsDeletedObject(_ value: BigSyncPendingMutation, in realm: Realm) -> Bool {
+        realm.object(ofType: Note.self, forPrimaryKey: value.objectIdentifier)?.isDeleted ?? false
+    }
+    func updateTracking(objectIdentifier: String, entityName: String, inserted: Bool,
+                        modified: Bool, deleted: Bool, generation: String?,
+                        replicaBindingGenerationIdentifier: String?, persistenceRealm: Realm) {
+        let name = entityName + "." + objectIdentifier
+        let value = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: name) ?? SyncedEntity()
+        value.set("key", name); value.pendingGeneration = generation
+        value.pendingReplicaBindingGenerationIdentifier = replicaBindingGenerationIdentifier
+        value.isDeletion = deleted
+        persistenceRealm.add(value)
+    }
+    @BigSyncBackgroundActor
+    func discover(_ names: [String], in realm: Realm) -> [BigSyncPendingMutationSnapshot] {
+        pendingMutationSnapshots(for: names, in: realm)
+    }
+    @BigSyncBackgroundActor
+    func forward(in realm: Realm, progress: (@BigSyncBackgroundActor @Sendable (String) -> Void)? = nil) async throws -> Int {
+        try await forwardPendingMutations(in: realm, progress: progress)
+    }

@@ -291,3 +291,120 @@ extension SyncUndoCloseoutW1Tests {
         _ = wakeups
     }
 }
+
+// These histories exercise the real tracking Realm, not a snapshot stand-in.
+// The transactions are deliberately held across the read to model another
+// independently owned writer. Only this fixture's ServerToken rows are changed.
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testCursorReadIgnoresProvisionalUpdateThenObservesCommitOrRollback() async throws {
+        for commits in [false, true] {
+            let (adapter, _, _, _) = try await acceptedNote()
+            let original = RecordZoneChangeCursor(serializedData: Data("committed-before".utf8))
+            try await adapter.saveToken(original)
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            try tracking.beginWrite()
+            defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+            let token = try XCTUnwrap(tracking.objects(ServerToken.self).first)
+            token.token = Data("provisional-next".utf8)
+            let during = await adapter.serverChangeToken
+            XCTAssertEqual(during?.serializedData, original.serializedData)
+            XCTAssertTrue(tracking.isInWriteTransaction, "A read must not settle another writer")
+            if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+            let after = await adapter.serverChangeToken
+            XCTAssertEqual(after?.serializedData,
+                           commits ? Data("provisional-next".utf8) : original.serializedData)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCursorReadIgnoresProvisionalRemovalThenObservesCommittedAbsence() async throws {
+        for commits in [false, true] {
+            let (adapter, _, _, _) = try await acceptedNote()
+            let original = RecordZoneChangeCursor(serializedData: Data("before-removal".utf8))
+            try await adapter.saveToken(original)
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            try tracking.beginWrite()
+            defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+            tracking.delete(tracking.objects(ServerToken.self))
+            let during = await adapter.serverChangeToken
+            XCTAssertEqual(during?.serializedData, original.serializedData)
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+            let after = await adapter.serverChangeToken
+            XCTAssertEqual(after?.serializedData, commits ? nil : original.serializedData)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testFirstProvisionalCursorDoesNotBecomeBootstrapEvidence() async throws {
+        for commits in [false, true] {
+            let (adapter, _, _, _) = try await acceptedNote()
+            try await adapter.saveToken(nil)
+            let absent = await adapter.serverChangeToken
+            XCTAssertNil(absent)
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            try tracking.beginWrite()
+            defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+            let token = tracking.objects(ServerToken.self).first ?? ServerToken()
+            if token.realm == nil { tracking.add(token) }
+            token.token = Data("first-provisional".utf8)
+            let during = await adapter.serverChangeToken
+            XCTAssertNil(during, "Only a committed cursor may advance bootstrap")
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+            let after = await adapter.serverChangeToken
+            XCTAssertEqual(after?.serializedData, commits ? Data("first-provisional".utf8) : nil)
+        }
+    }
+}
+
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testCursorSettersUseCommittedEpochAndRevalidateAfterHeldOwnerSettles() async throws {
+        for commits in [false, true] {
+            for commitsPage in [false, true] {
+                let (adapter, _) = try await fixture()
+                let original = RecordZoneChangeCursor(serializedData: Data("epoch-before".utf8))
+                let next = RecordZoneChangeCursor(serializedData: Data("epoch-next".utf8))
+                try await adapter.saveToken(original)
+                let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+                try tracking.write {
+                    let rebuild = tracking.object(ofType: RebuildProvenanceState.self,
+                        forPrimaryKey: RebuildProvenanceState.primaryKeyValue) ?? RebuildProvenanceState()
+                    rebuild.epoch = 7
+                    tracking.add(rebuild, update: .modified)
+                }
+                try tracking.beginWrite()
+                defer {
+                    adapter._testBeforeCursorTrackingWrite = nil
+                    if tracking.isInWriteTransaction { tracking.cancelWrite() }
+                }
+                tracking.object(ofType: RebuildProvenanceState.self,
+                    forPrimaryKey: RebuildProvenanceState.primaryKeyValue)?.epoch = 8
+                // Settle the independent owner after the production setter
+                // captures its epoch, before its own write is admitted.
+                adapter._testBeforeCursorTrackingWrite = {
+                    adapter._testBeforeCursorTrackingWrite = nil
+                    XCTAssertTrue(tracking.isInWriteTransaction)
+                    if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+                }
+                do {
+                    if commitsPage {
+                        try await adapter.commitInboundPage(.init(previousCursor: original,
+                            nextCursor: next, liveResults: [], deletionResults: []))
+                    } else {
+                        try await adapter.saveToken(next)
+                    }
+                    XCTAssertFalse(commits, "Committed successor epoch must invalidate the prepared setter")
+                } catch {
+                    XCTAssertTrue(commits, "Aborted provisional epoch must not poison the prepared setter")
+                    XCTAssertTrue(error is CancellationError)
+                }
+                XCTAssertNil(adapter._testBeforeCursorTrackingWrite)
+                let after = await adapter.serverChangeToken
+                XCTAssertEqual(after?.serializedData, commits ? original.serializedData : next.serializedData)
+            }
+        }
+    }
+}

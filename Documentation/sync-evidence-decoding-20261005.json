@@ -1,0 +1,245 @@
+{
+  "review_base": "9665f09462f7d5ef5bc0acc6163a29cf6d4c6e7f",
+  "publication_parent": "3c15173ec8d5a3e63c030bfc87429307f3097efa",
+  "scope": "Foundation evidence codec declarations; not full package or native SDK",
+  "toolchain": "Swift 6.2.1 / Swift 6 / Linux x86_64 / warnings-as-errors",
+  "unique_methods": 36,
+  "native_sdk_qualified": false,
+  "source_manifest": {
+    "Sources/BigSyncKit/RealmSwift/BigSyncSynchronizationAudit.swift": {
+      "git_blob": "42ef1dda512b5ae0ce78238faa298bc1b68c2ba2",
+      "sha256": "374e53e7ff8f128cc330bfce8857c2a96e7be66d3e1d4a83daca397bc9e04c0a",
+      "bytes": 18691
+    },
+    "Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift": {
+      "git_blob": "6df674e03ec2b1b492ca8f5353cacc1bdf79e544",
+      "sha256": "dc9b88e1ca06114ef11e181bd871b6a88bd760943543c2596f1574f5b16b3472",
+      "bytes": 12199
+    },
+    "Tests/BigSyncKitTests/SyncAuditArtifactDecodingTests.swift": {
+      "git_blob": "7d2d7b3554d69b6031cd83fdcc37251f3930fed6",
+      "sha256": "1d1734719e03ef46a3c9976a07d331456fd3c8ce3035eabc5167cc978490f2a0",
+      "bytes": 8845
+    },
+    "Tests/BigSyncKitTests/DurablePublicationEvidenceDecodingTests.swift": {
+      "git_blob": "12e2f1d3009451eeccbe63d4abf2d20d95e75a36",
+      "sha256": "e892326dddeca40581c00cb6e8ffd2542ab0d98fa67fe7656510483da56499df",
+      "bytes": 9667
+    },
+    "Tools/test-sync-evidence-codecs.py": {
+      "git_blob": "802ead683f04893d443fe82be3e8182a7a0522f9",
+      "sha256": "c14c2a3fc5576f48ccc4ac1652e75feb35e7a6037d3e90168daafb60b6c6c778",
+      "bytes": 9990
+    }
+  },
+  "runs": {
+    "audit-original-final-debug": {
+      "exit": 1,
+      "passed_methods": 8,
+      "failed_methods": [
+        "SyncAuditArtifactDecodingTests.testAllCountsRejectNegativeValues",
+        "SyncAuditArtifactDecodingTests.testCurrentVersionRejectsNullComparisonCounts",
+        "SyncAuditArtifactDecodingTests.testCurrentVersionRequiresEveryComparisonCount",
+        "SyncAuditArtifactDecodingTests.testLegacyOptionalFieldsRejectMalformedPresentValues",
+        "SyncAuditArtifactDecodingTests.testNestedDecodeReportsMissingComparisonFieldPath",
+        "SyncAuditArtifactDecodingTests.testNullVersionCannotDowngradeCurrentArtifactToLegacy",
+        "SyncAuditArtifactDecodingTests.testPendingCountsCannotBeCleanWithoutIssueStrings",
+        "SyncAuditArtifactDecodingTests.testUnsupportedAndMalformedVersionsReject"
+      ],
+      "log_sha256": "44c0a21ba83196b747b83cf64925fc9244c69b719f68df1c506ea65fc3a64098"
+    },
+    "audit-work-final-debug": {
+      "exit": 0,
+      "passed_methods": 16,
+      "failed_methods": [],
+      "log_sha256": "7083e3979fd3d5cd5d83e4ab793360d691a35196094ee095c700ec2670635535"
+    },
+    "audit-work-release": {
+      "exit": 0,
+      "passed_methods": 16,
+      "failed_methods": [],
+      "log_sha256": "4824eac59e26b461f5dd77d845e844726ce9707a93c63797560b1acbd3f9375c"
+    },
+    "publication-original-debug": {
+      "exit": 1,
+      "passed_methods": 15,
+      "failed_methods": [
+        "DurablePublicationEvidenceDecodingTests.testEpochRejectsBooleanFractionAndIntegralReal",
+        "DurablePublicationEvidenceDecodingTests.testNonfinitePublicationDatesReject",
+        "DurablePublicationEvidenceDecodingTests.testPresentBindingMustBeNonemptyString",
+        "DurablePublicationEvidenceDecodingTests.testSerializedMalformedNumbersAndBindingStillReject",
+        "DurablePublicationEvidenceDecodingTests.testVersionRejectsBooleanFractionAndIntegralReal"
+      ],
+      "log_sha256": "e82ea6384eb57ff9e317331c75c3e850be8081c0b649b9fa0570c5b3e5923967"
+    },
+    "publication-work-debug": {
+      "exit": 0,
+      "passed_methods": 20,
+      "failed_methods": [],
+      "log_sha256": "595f9fcc10c44171847b83c9cfbbfeda2d452f07dc7c46e626cdb31d849ada18"
+    },
+    "publication-work-release": {
+      "exit": 0,
+      "passed_methods": 20,
+      "failed_methods": [],
+      "log_sha256": "d19b3ba68b4dbdf3b1d5dae0eb94691ca5626dd93743d31a4e8e0b8141c0f0d0"
+    },
+    "audit-clean-predicate": {
+      "exit": 1,
+      "passed_methods": 15,
+      "failed_methods": [
+        "SyncAuditArtifactDecodingTests.testPendingCountsCannotBeCleanWithoutIssueStrings"
+      ],
+      "log_sha256": "97f0d5484459ebed130a5f35a218448671b426d6664601b9556b9fe74bea4e54"
+    },
+    "audit-missing-evidence": {
+      "exit": 1,
+      "passed_methods": 14,
+      "failed_methods": [
+        "SyncAuditArtifactDecodingTests.testCurrentVersionRequiresEveryComparisonCount",
+        "SyncAuditArtifactDecodingTests.testNestedDecodeReportsMissingComparisonFieldPath"
+      ],
+      "log_sha256": "81832cdb19cd6e79ee003ee7a483fd5ea37c94e1539b39dcfe071da4f83a74ca"
+    },
+    "publication-binding": {
+      "exit": 1,
+      "passed_methods": 18,
+      "failed_methods": [
+        "DurablePublicationEvidenceDecodingTests.testPresentBindingMustBeNonemptyString",
+        "DurablePublicationEvidenceDecodingTests.testSerializedMalformedNumbersAndBindingStillReject"
+      ],
+      "log_sha256": "5845a947679415e4aeaeef7464a912705eb42e63da928624ed167e9e4837c64c"
+    },
+    "publication-numeric-final": {
+      "exit": 1,
+      "passed_methods": 17,
+      "failed_methods": [
+        "DurablePublicationEvidenceDecodingTests.testEpochRejectsBooleanFractionAndIntegralReal",
+        "DurablePublicationEvidenceDecodingTests.testSerializedMalformedNumbersAndBindingStillReject",
+        "DurablePublicationEvidenceDecodingTests.testVersionRejectsBooleanFractionAndIntegralReal"
+      ],
+      "log_sha256": "cd588591e4acd936d58064bafdf0fa26365f79bf4dd256eec682c6d0daeb7a1f"
+    },
+    "publication-date": {
+      "exit": 1,
+      "passed_methods": 19,
+      "failed_methods": [
+        "DurablePublicationEvidenceDecodingTests.testNonfinitePublicationDatesReject"
+      ],
+      "log_sha256": "d0093bb7c9024984f52e0624fbd3d53e30e707820bf529228e300cb88a668ebd"
+    },
+    "final-runner-fixed": {
+      "results": {
+        "debug": {
+          "exit": 0,
+          "passed_methods": 36,
+          "failed_methods": [],
+          "matches_expected_outcome": true
+        },
+        "release": {
+          "exit": 0,
+          "passed_methods": 36,
+          "failed_methods": [],
+          "matches_expected_outcome": true
+        }
+      },
+      "report_sha256": "1547edbd23f4d0ecea9bc5899fbf44a21bccc9f1157196acc5eaaaa8e8b28aeb",
+      "logs": {
+        "toolchain.log": "eb9fe405b65bcda75635327f6ca704543098f4e7d882bf5d2541a6fca34725d6",
+        "debug.log": "c8aa1c80111c086c2a2fa131030d370184b10ac83f50e284e60d919f94175f46",
+        "release.log": "ccf77c3095ea53ce6109bac01842c664928af1add76e01c8797cc440d597404e"
+      }
+    },
+    "final-runner-original-complete": {
+      "results": {
+        "debug": {
+          "exit": 1,
+          "passed_methods": 23,
+          "failed_methods": [
+            "DurablePublicationEvidenceDecodingTests.testEpochRejectsBooleanFractionAndIntegralReal",
+            "DurablePublicationEvidenceDecodingTests.testNonfinitePublicationDatesReject",
+            "DurablePublicationEvidenceDecodingTests.testPresentBindingMustBeNonemptyString",
+            "DurablePublicationEvidenceDecodingTests.testSerializedMalformedNumbersAndBindingStillReject",
+            "DurablePublicationEvidenceDecodingTests.testVersionRejectsBooleanFractionAndIntegralReal",
+            "SyncAuditArtifactDecodingTests.testAllCountsRejectNegativeValues",
+            "SyncAuditArtifactDecodingTests.testCurrentVersionRejectsNullComparisonCounts",
+            "SyncAuditArtifactDecodingTests.testCurrentVersionRequiresEveryComparisonCount",
+            "SyncAuditArtifactDecodingTests.testLegacyOptionalFieldsRejectMalformedPresentValues",
+            "SyncAuditArtifactDecodingTests.testNestedDecodeReportsMissingComparisonFieldPath",
+            "SyncAuditArtifactDecodingTests.testNullVersionCannotDowngradeCurrentArtifactToLegacy",
+            "SyncAuditArtifactDecodingTests.testPendingCountsCannotBeCleanWithoutIssueStrings",
+            "SyncAuditArtifactDecodingTests.testUnsupportedAndMalformedVersionsReject"
+          ],
+          "matches_expected_outcome": true
+        }
+      },
+      "report_sha256": "89a170f775f7d87a953a140bd0c9fcf825c9769091b1a4295d572f0040675740",
+      "logs": {
+        "toolchain.log": "eb9fe405b65bcda75635327f6ca704543098f4e7d882bf5d2541a6fca34725d6",
+        "debug.log": "59fa12a9c17bcdb59cef5ec3e12a3c7d8772980eb463e6b762c868f3f88c2365"
+      }
+    }
+  },
+  "required_methods": {
+    "SyncAuditArtifactDecodingTests": [
+      "testLegacyArtifactRemainsVersionZeroWithoutInventingInspection",
+      "testExplicitLegacyVersionPreservesAvailableCounts",
+      "testCompleteCurrentArtifactRoundTripsNonzeroEvidence",
+      "testCurrentVersionRequiresEveryComparisonCount",
+      "testCurrentVersionRejectsNullComparisonCounts",
+      "testNullVersionCannotDowngradeCurrentArtifactToLegacy",
+      "testUnsupportedAndMalformedVersionsReject",
+      "testAllCountsRejectNegativeValues",
+      "testCountsRejectFractionBooleanAndString",
+      "testPendingCountsCannotBeCleanWithoutIssueStrings",
+      "testIssuesRemainUncleanWithoutPendingCounts",
+      "testUnknownServerRecordsDoNotBecomeNewDebtPolicy",
+      "testRequiredOriginalFieldsCannotBeMissing",
+      "testLegacyOptionalFieldsRejectMalformedPresentValues",
+      "testBinaryAndXMLPropertyListsPreserveArtifactValues",
+      "testNestedDecodeReportsMissingComparisonFieldPath"
+    ],
+    "DurablePublicationEvidenceDecodingTests": [
+      "testBoundEvidencePreservesEveryValue",
+      "testAbsentBindingRetainsIntentionalUnboundFormat",
+      "testPresentBindingMustBeNonemptyString",
+      "testVersionRejectsBooleanFractionAndIntegralReal",
+      "testVersionRejectsUnknownNegativeAndOverflowValues",
+      "testEpochRejectsBooleanFractionAndIntegralReal",
+      "testEpochRejectsNegativeAndUnrepresentableValues",
+      "testExactIntegerWidthsRemainSupported",
+      "testEpochZeroAndLargestSupportedIntegerRemainExact",
+      "testEveryRequiredFieldRejectsAbsenceAndNull",
+      "testRequiredTextRejectsEmptyAndNonStringValues",
+      "testInvalidRunIdentifierRejectsWithoutInventingOne",
+      "testNonfinitePublicationDatesReject",
+      "testPublicationDateRejectsWrongTypes",
+      "testFiniteHistoricalAndFutureDatesAreNotExpiryPolicy",
+      "testOpaqueStringsRetainTheirOriginalUTF8Bytes",
+      "testExtraFieldsRemainForwardCompatibleWithinKnownVersion",
+      "testBinaryAndXMLPropertyListsPreserveValidBoundAndUnboundRecords",
+      "testSerializedMalformedNumbersAndBindingStillReject",
+      "testWrongTopLevelShapesReject"
+    ]
+  },
+  "preserved_bodies": {
+    "Sources/BigSyncKit/RealmSwift/BigSyncSynchronizationAudit.swift": {
+      "added": 41,
+      "removed": 14,
+      "preserved_body_identical": true,
+      "new_whitespace_errors": false
+    },
+    "Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift": {
+      "added": 74,
+      "removed": 47,
+      "preserved_body_identical": true,
+      "new_whitespace_errors": false
+    }
+  },
+  "syntax_parse_exit": 0,
+  "incomplete_attempts": [
+    "Initial generic error-path fixture mismatch: corrected and original/fixed rerun",
+    "publication-numeric: interrupted before completed runtime; final fresh run retained",
+    "final-runner-original: interrupted setup; final-runner-original-complete supplies runtime result"
+  ]
+}
