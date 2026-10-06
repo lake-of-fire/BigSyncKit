@@ -1,4 +1,3 @@
-// Portable test collaborator only; this is not the native SDK or adapter implementation.
 import CloudKit
 import Foundation
 import RealmSwift
@@ -8,10 +7,35 @@ extension Realm {
     @BigSyncBackgroundActor
     public func asyncWritePreservingOwnership(_ operation: () throws -> Void) async throws {
         try Task.checkCancellation()
-        try write(operation)
+        try write { try operation(); try Task.checkCancellation() }
+        DisappearanceCallbacks.afterWrite?(self)
     }
 }
-struct BigSyncRecordRebaseContext: Sendable, Equatable { let namespace: String }
+struct BigSyncRecordRebaseContext: Sendable, Equatable {
+    let namespace: String
+    var binding: String { "binding-1" }
+    func validate(in realm: Realm) throws {
+        precondition(realm.isInWriteTransaction)
+        guard let identity = BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm),
+              !identity.installationIdentifier.isEmpty,
+              identity.replicaBindingGenerationIdentifier == binding else { throw CancellationError() }
+    }
+}
+enum DisappearanceCallbacks {
+    @TaskLocal static var identity: (@Sendable () -> Void)?
+    @TaskLocal static var compile: (@Sendable () throws -> Void)?
+    @TaskLocal static var lifecycle: (@Sendable () -> Void)?
+    @TaskLocal static var eligibility: (@Sendable () -> Void)?
+    @TaskLocal static var afterWrite: (@Sendable (Realm) -> Void)?
+    @TaskLocal static var journal: (@Sendable () -> Void)?
+}
+enum BigSyncMutationTrackingRegistry {
+    struct Identity { let installationIdentifier: String; let replicaBindingGenerationIdentifier: String }
+    static func currentMutationJournalIdentity(in realm: Realm) -> Identity? {
+        DisappearanceCallbacks.identity?()
+        return Identity(installationIdentifier: "installation-1", replicaBindingGenerationIdentifier: "binding-1")
+    }
+}
 enum BigSyncRecordRebaseError: Error { case inconsistentReceipt(String) }
 enum BigSyncRecordContractError: Error { case unexpectedPhysicalDeletion(String) }
 enum RealmSwiftAdapterAcknowledgementError: Error { case recordWasNotPrepared }
@@ -30,10 +54,10 @@ struct BigSyncCompiledRecordContract {
     struct Declaration { let deletion: Deletion = .physical }
     let signature = "signature-1"
     let declaration = Declaration()
-    static func compile(_ object: Object) throws -> Self? { Self() }
+    static func compile(_ object: Object) throws -> Self? { try DisappearanceCallbacks.compile?(); return object is HarnessLegacyNote ? nil : Self() }
 }
 enum BigSyncRecordFingerprint { static func fields(of object: Object) throws -> [String: Data] { [:] } }
-enum BigSyncRecordLifecycle { static func isPhysicalDeletion(_ object: Object) -> Bool { (object as? SoftDeletable)?.isDeleted == true } }
+enum BigSyncRecordLifecycle { static func isPhysicalDeletion(_ object: Object) -> Bool { DisappearanceCallbacks.lifecycle?(); return (object as? SoftDeletable)?.isDeleted == true } }
 final class BigSyncRecordBaseline: Object {
     var recordName = ""
     override var rowID: String { recordName }
@@ -94,6 +118,7 @@ final class SyncedEntity: Object {
         r.pendingReplicaBindingGenerationIdentifier = pendingReplicaBindingGenerationIdentifier; return r
     }
 }
+final class HarnessLegacyNote: Object {}
 final class HarnessNote: Object, SoftDeletable, ChangeMetadataRecordable {
     var id = "note"; override var rowID: String { id }
     var isDeleted = false; var account = "account-1"; var text = "committed"
@@ -103,7 +128,7 @@ final class HarnessNote: Object, SoftDeletable, ChangeMetadataRecordable {
     func journalCurrentValuePreservingChangeMetadata(at: Date) {
         let realm = realm!
         let r = BigSyncPendingMutation(); r.recordName = Self.className() + "." + id
-        r.generation = UUID().uuidString; realm.add(r)
+        r.generation = UUID().uuidString; realm.add(r); DisappearanceCallbacks.journal?()
     }
 }
 struct ComparisonBase {
@@ -123,16 +148,21 @@ final class RealmProvider { let persistenceRealm: Realm?; let targetReaderRealmP
 enum BigSyncRecordPayload {
     static func identity(_ parts: [String]) -> String { parts.joined(separator: "|") }
     static func decode(_ data: Data, assetManager: Int? = nil) throws -> CKRecord {
-        let record = CKRecord(recordType: HarnessNote.className(), recordID: .init(recordName: HarnessNote.className() + ".note", zoneID: .init(zoneName: "zone")))
+        let name = data.isEmpty ? HarnessNote.className() + ".note" : String(decoding: data, as: UTF8.self)
+        let record = CKRecord(recordType: HarnessNote.className(), recordID: .init(recordName: name, zoneID: .init(zoneName: "zone")))
         record.recordChangeTag = "accepted-tag"; return record
     }
 }
 public final class RealmSwiftAdapter: @unchecked Sendable {
-    let realmProvider: RealmProvider?
+    var realmProvider: RealmProvider?
     let recordZoneID = CKRecordZone.ID(zoneName: "zone")
     let persistentAssetManager = 0
     var context = BigSyncRecordRebaseContext(namespace: "namespace-1")
     var cancellationGeneration: UInt64 = 0
+    var cancelSync = false
+    var comparisonEnabled = true
+    var recordRebaseContext: BigSyncRecordRebaseContext? { comparisonEnabled ? context : nil }
+    var legacyRequeues = [([CKRecord.ID], [String: String])]()
     var binding = "binding-1"; var account = "account-1"
     var _testAfterDisappearanceTargetWrite: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeRemoteDeletionTargetWrite: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
@@ -143,20 +173,13 @@ public final class RealmSwiftAdapter: @unchecked Sendable {
         let prefix = entityType + "."; guard recordName.hasPrefix(prefix) else { return nil }
         return String(recordName.dropFirst(prefix.count))
     }
-    func realmObjectClass(name: String) -> Object.Type? { name == HarnessNote.className() ? HarnessNote.self : nil }
-    @BigSyncBackgroundActor func currentRecordEvidenceCut() throws -> BigSyncRecordEvidenceCut {
-        try Task.checkCancellation(); return .init(context: context, cancellationGeneration: cancellationGeneration)
-    }
-    @BigSyncBackgroundActor func validateRecordEvidenceCut(_ cut: BigSyncRecordEvidenceCut, in realm: Realm) throws {
-        try Task.checkCancellation()
-        guard cut.context == context && cut.cancellationGeneration == cancellationGeneration else { throw CancellationError() }
-    }
+    func realmObjectClass(name: String) -> Object.Type? { name == HarnessNote.className() ? HarnessNote.self : (name == HarnessLegacyNote.className() ? HarnessLegacyNote.self : nil) }
     func matchingSubmission(recordName: String, context: BigSyncRecordRebaseContext, in realm: Realm) -> BigSyncRecordSubmission? {
         realm.object(ofType: BigSyncRecordSubmission.self, forPrimaryKey: BigSyncRecordPayload.identity([context.namespace, recordName]))
     }
     func pendingMutationIsEligibleForActiveTransport(_ mutation: BigSyncPendingMutation) -> Bool { mutation.replicaBindingGenerationIdentifier == binding }
-    func objectIsEligibleForActiveAccount(_ object: Object, entityType: String) -> Bool { (object as? HarnessNote)?.account == account }
-    @BigSyncBackgroundActor func requeueMissingServerRecords(_ ids: [CKRecord.ID], matchingPreparedGenerations: [String: String]) async throws {}
+    func objectIsEligibleForActiveAccount(_ object: Object, entityType: String) -> Bool { DisappearanceCallbacks.eligibility?(); return (object as? HarnessNote)?.account == account }
+    @BigSyncBackgroundActor func requeueMissingServerRecords(_ ids: [CKRecord.ID], matchingPreparedGenerations: [String: String]) async throws { legacyRequeues.append((ids, matchingPreparedGenerations)) }
     @BigSyncBackgroundActor func didDelete(recordIDs: [CKRecord.ID], matchingGenerations: [String: String]) async throws {}
     @BigSyncBackgroundActor func updateHasChanges(realm: Realm) {}
 }

@@ -17,7 +17,12 @@ cp -R "$here/Sources" "$here/Tests" "$scratch/"
 # Compile the complete selected production file, never a copied implementation.
 cp "$root/Sources/BigSyncKit/RealmSwift/BigSyncRecordDisappearance.swift" \
     "$scratch/Sources/BigSyncKit/BigSyncRecordDisappearance.swift"
+# Owner validation must also be the actual selected adapter methods, not a
+# collaborator's second implementation. Extraction fails on an unknown layout.
+python3 "$here/extract-owner-methods.py" \
+    "$root/Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift" \
+    "$scratch/Sources/BigSyncKit/ExistingEvidenceOwnerMethods.swift"
 # Existing DEBUG suspension hooks are required in BOTH optimization modes.
-# This is a portable read-boundary check, not native SDK or app qualification.
+# This is a portable boundary check, not native SDK or app qualification.
 swift test --package-path "$scratch" --jobs 1 \
     -Xswiftc -DDEBUG -Xswiftc -warnings-as-errors "$@"
