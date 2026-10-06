@@ -4,7 +4,7 @@ import RealmSwift
 import XCTest
 @testable import BigSyncKit
 
-private struct Fixture: Sendable {
+struct Fixture: Sendable {
     let target: Realm
     let tracking: Realm
     let adapter: RealmSwiftAdapter
@@ -68,7 +68,7 @@ private struct Fixture: Sendable {
 }
 
 @BigSyncBackgroundActor
-private func exerciseSnapshots(deleted: Bool = false, journal: Bool = true,
+func exerciseSnapshots(deleted: Bool = false, journal: Bool = true,
                  state: SyncedEntityState = .changed, invalidated: Bool = false,
                  _ test: @BigSyncBackgroundActor @Sendable (Fixture) async throws -> Void) async throws {
     let f = try Fixture(deleted: deleted, journal: journal, state: state, invalidated: invalidated)
