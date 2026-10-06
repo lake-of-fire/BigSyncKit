@@ -3066,10 +3066,7 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
-    private struct PersistedAccountScopeLease {
-        let generation: Int64
-        let lease: BigSyncAccountScopeLease?
-    }
+    private typealias PersistedAccountScopeLease = BigSyncPersistedAccountScopeLease
 
     private func readAccountScopeLeaseDurably() throws
         -> PersistedAccountScopeLease {
@@ -3078,34 +3075,7 @@ public class CloudKitSynchronizer: NSObject {
         ) else {
             return PersistedAccountScopeLease(generation: 0, lease: nil)
         }
-        guard let value = raw as? [String: Any],
-              (value["version"] as? NSNumber)?.intValue == 1,
-              let generationNumber = value["generation"] as? NSNumber,
-              generationNumber.int64Value >= 0,
-              let isValid = value["isValid"] as? Bool else {
-            throw BigSyncAccountScopeLeaseError.corrupt
-        }
-        let generation = generationNumber.int64Value
-        guard isValid else {
-            return PersistedAccountScopeLease(
-                generation: generation,
-                lease: nil
-            )
-        }
-        guard let accountScopeIdentifier =
-                value["accountScopeIdentifier"] as? String,
-              !accountScopeIdentifier.isEmpty,
-              let validatedAt = value["validatedAt"] as? Date else {
-            throw BigSyncAccountScopeLeaseError.corrupt
-        }
-        return PersistedAccountScopeLease(
-            generation: generation,
-            lease: BigSyncAccountScopeLease(
-                accountScopeIdentifier: accountScopeIdentifier,
-                invalidationGeneration: generation,
-                validatedAt: validatedAt
-            )
-        )
+        return try PersistedAccountScopeLease(persistedValue: raw)
     }
 
     private func persistAccountScopeLease(
@@ -3122,6 +3092,7 @@ public class CloudKitSynchronizer: NSObject {
             value["accountScopeIdentifier"] = accountScopeIdentifier
             value["validatedAt"] = validatedAt
         }
+        _ = try PersistedAccountScopeLease(persistedValue: value)
         try keyValueStore.bigSyncSetDurably(
             value: value,
             forKey: accountScopeLeaseKey
