@@ -80,6 +80,7 @@ EXPECTED = {
         "testStartupCancelledDuringProcessorJoinDoesNotActivateRetiredContext",
         "testStartupInvalidatedDuringProcessorJoinDoesNotActivateRetiredContext",
         "testRunContextRejectsSynchronousAccountPoisonBeforeActorCancellation",
+        "testAttemptCheckStillAllowsFreshValidationWhileFenceIsPoisoned",
     ),
 }
 REQUIRED = tuple(f"{suite}/{method}" for suite, methods in EXPECTED.items() for method in methods)

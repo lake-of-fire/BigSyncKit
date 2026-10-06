@@ -2142,15 +2142,21 @@ public class CloudKitSynchronizer: NSObject {
         guard synchronizationAttemptID == attemptID, !cancelSync else {
             throw CancellationError()
         }
+        // Before account validation there is deliberately no active RunContext:
+        // a poisoned fence is exactly why the attempt must validate/reconcile.
+        // Once a context has been published, synchronous account poison revokes
+        // every continuation immediately, before actor-isolated cancellation
+        // can rotate the attempt or set cancelSync.
+        if activeRunContext?.attemptID == attemptID,
+           accountScopeAuthorityFence.rejectsAuthority {
+            throw CancellationError()
+        }
     }
 
     internal func checkRunContext(_ context: RunContext) throws {
-        try Task.checkCancellation()
-        guard !accountScopeAuthorityFence.rejectsAuthority,
-              activeRunContext == context,
-              synchronizationAttemptID == context.attemptID,
-              synchronizationRunID == context.runID,
-              !cancelSync else {
+        try checkSynchronizationAttempt(context.attemptID)
+        guard activeRunContext == context,
+              synchronizationRunID == context.runID else {
             throw CancellationError()
         }
         if let expectedBinding =
