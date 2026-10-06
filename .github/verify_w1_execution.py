@@ -71,6 +71,16 @@ EXPECTED = {
         "testCancelledRestorationWaiterDoesNotEnterPreflight",
         "testCancellingOneWaiterPreservesRestorationAndLiveWaiter",
     ),
+    "ChangeRequestProcessorCancellationTests": (
+        "testValidatedBeginRunPrecancelledDoesNotResetCurrentRun",
+        "testValidatedBeginRunCancellationDuringJoinLeavesProcessorStopped",
+        "testValidatedBeginRunAuthorityFailureAfterJoinLeavesProcessorStopped",
+    ),
+    "SynchronizationProcessorStartupTests": (
+        "testStartupCancelledDuringProcessorJoinDoesNotActivateRetiredContext",
+        "testStartupInvalidatedDuringProcessorJoinDoesNotActivateRetiredContext",
+        "testRunContextRejectsSynchronousAccountPoisonBeforeActorCancellation",
+    ),
 }
 REQUIRED = tuple(f"{suite}/{method}" for suite, methods in EXPECTED.items() for method in methods)
 IDENTIFIER = r"[A-Za-z_][A-Za-z_0-9]*"
@@ -87,7 +97,8 @@ EVENT = re.compile(
 FOCUSED_FILTER = (
     r"^BigSyncKitTests\.(?:SyncUndoCloseoutW1[^/]*|CloudKitAccountAvailability[^/]*|"
     r"CloudKitCallbackAdmissionTests|CloudKitSynchronizerAccountFencingTests|"
-    r"BigSyncWorkerRequestCancellationTests|BigSyncScheduledRetryTests|"
+    r"BigSyncWorkerRequestCancellationTests|ChangeRequestProcessorCancellationTests|"
+    r"SynchronizationProcessorStartupTests|BigSyncScheduledRetryTests|"
     r"BigSyncDeadlineRaceTests)/"
 )
 FOCUSED = re.compile(FOCUSED_FILTER)

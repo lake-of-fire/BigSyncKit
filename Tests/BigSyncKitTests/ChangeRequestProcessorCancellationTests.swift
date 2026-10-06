@@ -193,6 +193,7 @@ private final class ProcessorCancellationObservation {
     var deletions = 0
     var childSawCancellation = false
     var returned = false
+    var validationAllowed = true
     nonisolated let cancellationSignal = ProcessorCancellationSignal()
 }
 
@@ -593,4 +594,136 @@ private final class ProcessorCancellationSignal: @unchecked Sendable {
     private var value = 0
     var count: Int { lock.withLock { value } }
     func record() { lock.withLock { value += 1 } }
+}
+
+
+extension ChangeRequestProcessorCancellationTests {
+    @BigSyncBackgroundActor
+    func testValidatedBeginRunPrecancelledDoesNotResetCurrentRun() async throws {
+        let processor = ChangeRequestProcessor()
+        let adapter = ProcessorCancellationAdapter()
+        let originalRun = await processor.beginRun()
+        addLive(processor, adapter, run: originalRun, name: "Item.keep")
+
+        let rejected = Task { @BigSyncBackgroundActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await processor.beginRun {
+                try Task.checkCancellation()
+            }
+        }
+        assertCancelled(await rejected.result)
+        XCTAssertFalse(processor.cancelSync)
+        XCTAssertTrue(processor.hasPendingChangeRequests(for: adapter))
+
+        let result = try await processor.finishProcessing(for: adapter)
+        XCTAssertEqual(result.liveResults.map(\.event.recordName), ["Item.keep"])
+        XCTAssertTrue(processor.getErrors().isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testValidatedBeginRunCancellationDuringJoinLeavesProcessorStopped() async {
+        let processor = ChangeRequestProcessor()
+        let entered = expectation(description: "old processor child held")
+        let cancelled = expectation(description: "replacement reset cancels old child")
+        let gate = ProcessorCancellationGate()
+        let adapter = ProcessorCancellationAdapter(save: { records in
+            await withTaskCancellationHandler {
+                entered.fulfill()
+                await gate.wait()
+                return ProcessorCancellationAdapter.liveResults(records)
+            } onCancel: {
+                cancelled.fulfill()
+            }
+        })
+        let run = await processor.beginRun()
+        addLive(processor, adapter, run: run)
+        let oldRequest = Task { @BigSyncBackgroundActor in
+            try await processor.finishProcessing(for: adapter)
+        }
+        addTeardownBlock {
+            oldRequest.cancel()
+            await gate.open()
+            _ = await oldRequest.result
+        }
+        await fulfillment(of: [entered], timeout: 2)
+
+        let replacement = Task { @BigSyncBackgroundActor in
+            try await processor.beginRun {
+                try Task.checkCancellation()
+            }
+        }
+        addTeardownBlock {
+            replacement.cancel()
+            await gate.open()
+            _ = await replacement.result
+        }
+        await fulfillment(of: [cancelled], timeout: 2)
+        replacement.cancel()
+        await gate.open()
+        assertCancelled(await oldRequest.result)
+        switch await replacement.result {
+        case .failure(let error):
+            XCTAssertTrue(error is CancellationError)
+        case .success:
+            XCTFail("Cancelled replacement reopened the processor")
+        }
+        XCTAssertTrue(processor.cancelSync)
+
+        _ = await processor.beginRun()
+        XCTAssertFalse(processor.cancelSync, "A later live owner can reopen the processor")
+    }
+
+    @BigSyncBackgroundActor
+    func testValidatedBeginRunAuthorityFailureAfterJoinLeavesProcessorStopped() async {
+        let processor = ChangeRequestProcessor()
+        let entered = expectation(description: "old processor child held")
+        let cancelled = expectation(description: "replacement reset cancels old child")
+        let gate = ProcessorCancellationGate()
+        let observation = ProcessorCancellationObservation()
+        observation.validationAllowed = true
+        let adapter = ProcessorCancellationAdapter(save: { records in
+            await withTaskCancellationHandler {
+                entered.fulfill()
+                await gate.wait()
+                return ProcessorCancellationAdapter.liveResults(records)
+            } onCancel: {
+                cancelled.fulfill()
+            }
+        })
+        let run = await processor.beginRun()
+        addLive(processor, adapter, run: run)
+        let oldRequest = Task { @BigSyncBackgroundActor in
+            try await processor.finishProcessing(for: adapter)
+        }
+        addTeardownBlock {
+            oldRequest.cancel()
+            await gate.open()
+            _ = await oldRequest.result
+        }
+        await fulfillment(of: [entered], timeout: 2)
+
+        let replacement = Task { @BigSyncBackgroundActor in
+            try await processor.beginRun {
+                guard observation.validationAllowed else {
+                    throw CancellationError()
+                }
+            }
+        }
+        addTeardownBlock {
+            replacement.cancel()
+            await gate.open()
+            _ = await replacement.result
+        }
+        await fulfillment(of: [cancelled], timeout: 2)
+        observation.validationAllowed = false
+        await gate.open()
+        assertCancelled(await oldRequest.result)
+        switch await replacement.result {
+        case .failure(let error):
+            XCTAssertTrue(error is CancellationError)
+        case .success:
+            XCTFail("Invalidated replacement reopened the processor")
+        }
+        XCTAssertTrue(processor.cancelSync)
+    }
 }
