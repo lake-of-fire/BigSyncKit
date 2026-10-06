@@ -26,24 +26,50 @@ fileprivate func isZoneNotFoundOrDeletedError(_ error: Error?) -> Bool {
 extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func performSynchronization() async {
-        logger.info("QSCloudKitSynchronizer >> Perform synchronization...")
-        self.postNotification(.SynchronizerWillSynchronize)
-        self.serverChangeToken = self.storedDatabaseToken
-        self.uploadRetries = 0
-        self.didNotifyUpload = Set<CKRecordZone.ID>()
-        await fetchChanges()
+        let attemptID = synchronizationAttemptID
+        do {
+            try checkSynchronizationAttempt(attemptID)
+            logger.info("QSCloudKitSynchronizer >> Perform synchronization...")
+            self.postNotification(.SynchronizerWillSynchronize)
+            // Notifications are synchronous callouts. An observer can cancel
+            // this attempt or admit a successor before this method continues.
+            try checkSynchronizationAttempt(attemptID)
+            let token = self.storedDatabaseToken
+            try checkSynchronizationAttempt(attemptID)
+            self.serverChangeToken = token
+            self.uploadRetries = 0
+            self.didNotifyUpload = Set<CKRecordZone.ID>()
+            await fetchChanges()
+        } catch {
+            await failSynchronization(error: error, for: attemptID)
+        }
     }
 
     @BigSyncBackgroundActor
     func changesFinishedSynchronizing() async {
         let attemptID = synchronizationAttemptID
+        // A progress callback is a synchronous external callout, not a safe
+        // point to abandon the original drain's ownership. Reuse the existing
+        // attempt predicate and cancellation settlement without a new ticket.
+        func canContinue() -> Bool {
+            do {
+                try checkSynchronizationAttempt(attemptID)
+                return true
+            } catch {
+                settleCancellationIfCurrentAttempt(attemptID)
+                return false
+            }
+        }
+        guard canContinue() else { return }
         let isDownloadOnly = activeSynchronizationMode == .downloadOnly
         guard beginRunCallback(for: attemptID) else { return }
         defer { endRunCallback() }
         do {
             reportProgress("terminal-tail-start")
+            guard canContinue() else { return }
             try await revalidateActiveRunContext(for: attemptID)
             reportProgress("terminal-tail-account-revalidated")
+            guard canContinue() else { return }
         } catch is CancellationError {
             settleCancellationIfCurrentAttempt(attemptID)
             return
@@ -63,16 +89,17 @@ extension CloudKitSynchronizer {
             return
         }
         reportProgress("terminal-tail-adapters-cleaned")
+        guard canContinue() else { return }
 
         do {
             // The final import can legitimately forward zero new journal rows
             // while durable tracking work remains.
             // Recheck all adapters after the last suspension and convert any
             // pending state into a tail drain before authorizing a receipt.
-            if !isDownloadOnly,
-               try adaptersHavePendingChangesAtTerminalBoundary() {
-                synchronizationRequestedWhileRunning = true
-            }
+            let hasPendingChanges = try !isDownloadOnly
+                && adaptersHavePendingChangesAtTerminalBoundary()
+            guard canContinue() else { return }
+            if hasPendingChanges { synchronizationRequestedWhileRunning = true }
         } catch is CancellationError {
             settleCancellationIfCurrentAttempt(attemptID)
             return
@@ -81,10 +108,12 @@ extension CloudKitSynchronizer {
             return
         }
         reportProgress("terminal-tail-pending-checked")
+        guard canContinue() else { return }
         
 //        logger.info("QSCloudKitSynchronizer >> Finished synchronization batch")
         if !isDownloadOnly, synchronizationRequestedWhileRunning {
             reportProgress("terminal-tail-restarting")
+            guard canContinue() else { return }
             restartSynchronizationForTerminalWork()
             return
         }
@@ -106,6 +135,7 @@ extension CloudKitSynchronizer {
         do {
             consumedServerBoundaryIdentifier = try
                 currentConsumedServerBoundaryIdentifier(for: activeRunContext)
+            guard canContinue() else { return }
         } catch is CancellationError {
             settleCancellationIfCurrentAttempt(attemptID)
             return
@@ -131,6 +161,7 @@ extension CloudKitSynchronizer {
             return
         }
         reportProgress("terminal-tail-prepublication-completed")
+        guard canContinue() else { return }
 
         let publication: TerminalDomainPublication
         do {
@@ -171,6 +202,7 @@ extension CloudKitSynchronizer {
         switch disposition {
         case .restartRequired:
             reportProgress("terminal-tail-restarting")
+            guard canContinue() else { return }
             restartSynchronizationForTerminalWork()
             return
         case .downloadOnly:
@@ -190,6 +222,7 @@ extension CloudKitSynchronizer {
                 return
             }
             reportProgress("download-only-completed")
+            guard canContinue() else { return }
             await publishSynchronizationResult(result, context: terminalContext)
             return
         case .blocked:
@@ -259,6 +292,7 @@ extension CloudKitSynchronizer {
         }
 #endif
         reportProgress("terminal-receipt")
+        guard canContinue() else { return }
         await publishSynchronizationResult(result, context: terminalContext)
     }
 
@@ -276,6 +310,7 @@ extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     private func cleanUpAndForwardTerminalImports(for attemptID: UUID) async throws {
+        try checkSynchronizationAttempt(attemptID)
         resetActiveTokens()
 
         uploadRetries = 0
@@ -298,6 +333,7 @@ extension CloudKitSynchronizer {
         context terminalContext: RunContext,
         consumedServerBoundaryIdentifier: String?
     ) async throws -> [DomainBlocker] {
+        try checkRunContext(terminalContext)
         var publicationBlockers = [DomainBlocker]()
         var inboundIdentityDeliveries = [
             (adapter: ModelAdapter, batch: CommittedInboundIdentityBatch)
@@ -309,6 +345,7 @@ extension CloudKitSynchronizer {
                     inboundIdentityDeliveries.append((adapter, batch))
                 }
             }
+            try checkRunContext(terminalContext)
             publicationBlockers.append(contentsOf:
                 try await domainPrepublicationHandler(
                 PrepublicationBoundaryContext(
@@ -328,16 +365,20 @@ extension CloudKitSynchronizer {
                 )
             ))
             reportProgress("terminal-tail-domain-handler-completed")
+            try checkRunContext(terminalContext)
             try await revalidateRunContext(terminalContext)
             reportProgress("terminal-tail-domain-context-revalidated")
+            try checkRunContext(terminalContext)
             for delivery in inboundIdentityDeliveries {
                 reportProgress("terminal-tail-inbound-ack-started")
+                try checkRunContext(terminalContext)
                 try await delivery.adapter
                     .acknowledgeCommittedInboundIdentityBatch(
                         deliveryID: delivery.batch.deliveryID
                     )
                 try await revalidateRunContext(terminalContext)
                 reportProgress("terminal-tail-inbound-ack-completed")
+                try checkRunContext(terminalContext)
             }
             // Domain reconciliation is allowed to commit authoritative
             // local writes. Forward those durable target-journal
@@ -348,12 +389,15 @@ extension CloudKitSynchronizer {
             // generation first.
             for adapter in modelAdapters {
                 reportProgress("terminal-tail-import-forwarding-started")
+                try checkRunContext(terminalContext)
                 try await adapter.didFinishImport { checkpoint in
                     self.reportProgress("terminal-tail-\(checkpoint)")
                 }
                 reportProgress("terminal-tail-import-forwarding-completed")
+                try checkRunContext(terminalContext)
                 try await revalidateRunContext(terminalContext)
                 reportProgress("terminal-tail-import-forwarding-revalidated")
+                try checkRunContext(terminalContext)
             }
         }
         return publicationBlockers
@@ -365,12 +409,14 @@ extension CloudKitSynchronizer {
         isDownloadOnly: Bool,
         reconciliationBlockers: [DomainBlocker]
     ) async throws -> TerminalDomainPublication {
+        try checkRunContext(terminalContext)
         var publicationBlockers = reconciliationBlockers
         var domainPublicationScopeIdentifier: String?
         for adapter in modelAdapters {
             publicationBlockers.append(contentsOf:
                 try await adapter.semanticPublicationBlockers()
             )
+            try checkRunContext(terminalContext)
         }
         try await revalidateRunContext(terminalContext)
         if !isDownloadOnly, publicationBlockers.isEmpty,
@@ -397,14 +443,20 @@ extension CloudKitSynchronizer {
         publication: TerminalDomainPublication,
         consumedServerBoundaryIdentifier: String?
     ) throws -> TerminalPublicationDisposition {
-        if !isDownloadOnly,
-           try adaptersHavePendingChangesAtTerminalBoundary() {
+        try checkRunContext(terminalContext)
+        let hasPendingChanges = try !isDownloadOnly
+            && adaptersHavePendingChangesAtTerminalBoundary()
+        try checkRunContext(terminalContext)
+        if hasPendingChanges {
             reportProgress("terminal-tail-pending-target")
+            try checkRunContext(terminalContext)
             synchronizationRequestedWhileRunning = true
         }
-        if try currentConsumedServerBoundaryIdentifier(
+        let currentBoundary = try currentConsumedServerBoundaryIdentifier(
             for: terminalContext
-        ) != consumedServerBoundaryIdentifier {
+        )
+        try checkRunContext(terminalContext)
+        if currentBoundary != consumedServerBoundaryIdentifier {
             if isDownloadOnly {
                 // Outbound wakeups are intentionally ignored in this
                 // mode; a changed inbound cursor is not such a wakeup.
@@ -412,6 +464,7 @@ extension CloudKitSynchronizer {
                 throw SyncError.inboundBoundaryChanged
             }
             reportProgress("terminal-tail-inbound-boundary-changed")
+            try checkRunContext(terminalContext)
             synchronizationRequestedWhileRunning = true
         }
         if isDownloadOnly { return .downloadOnly }
@@ -425,8 +478,8 @@ extension CloudKitSynchronizer {
         consumedServerBoundaryIdentifier: String?,
         publication: TerminalDomainPublication
     ) throws -> SynchronizationResult {
-        activeReceiptAuthorizationID = nil
         try checkRunContext(terminalContext)
+        activeReceiptAuthorizationID = nil
         try keyValueStore.bigSyncValidateDurability()
         return SynchronizationResult(
             didImportChanges: synchronizationDrainDidImportChanges,
@@ -449,7 +502,9 @@ extension CloudKitSynchronizer {
         consumedServerBoundaryIdentifier: String?,
         publication: TerminalDomainPublication
     ) throws -> SynchronizationResult {
+        try checkRunContext(terminalContext)
         try recordSyncHealth(.semanticBlocked, context: terminalContext)
+        try checkRunContext(terminalContext)
         try keyValueStore.bigSyncValidateDurability()
         activeReceiptAuthorizationID = nil
         return SynchronizationResult(
@@ -471,6 +526,7 @@ extension CloudKitSynchronizer {
         consumedServerBoundaryIdentifier: String?,
         publication: TerminalDomainPublication
     ) throws -> SynchronizationResult {
+        try checkRunContext(terminalContext)
         let authorizationID = UUID()
         activeReceiptAuthorizationID = authorizationID
         let receipt = SynchronizationReceipt(
@@ -491,6 +547,7 @@ extension CloudKitSynchronizer {
             guard let changeFeedEpoch = try adapter.changeFeedEpoch() else {
                 throw DurableKeyValueStoreError.mutationNotDurable
             }
+            try checkRunContext(terminalContext)
             try persistDurablePublicationEvidence(
                 domainScopeIdentifier: domainPublicationScopeIdentifier,
                 context: terminalContext,
@@ -498,9 +555,8 @@ extension CloudKitSynchronizer {
                 changeFeedEpoch: changeFeedEpoch
             )
         }
-        if let context = activeRunContext {
-            try recordSyncHealth(.succeeded, context: context)
-        }
+        try recordSyncHealth(.succeeded, context: terminalContext)
+        try checkRunContext(terminalContext)
         return result
     }
 
@@ -1159,8 +1215,9 @@ extension CloudKitSynchronizer {
         }
 
         do {
-            try Task.checkCancellation()
+            try checkSynchronizationAttempt(attemptID)
             postNotification(.SynchronizerWillFetchChanges)
+            try checkSynchronizationAttempt(attemptID)
 
             let token = try await fetchDatabaseChanges()
             try await revalidateActiveRunContext(for: attemptID)
@@ -1247,6 +1304,7 @@ extension CloudKitSynchronizer {
         }
 
         reportProgress("database-fetch-completion")
+        try checkSynchronizationAttempt(attemptID)
         let configuredZoneID = recordZoneID
         let configuredZoneIDs: Set<CKRecordZone.ID> = [configuredZoneID]
         var recoverableEncryptedZoneIDs = Set<CKRecordZone.ID>()
@@ -1590,16 +1648,13 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func processFetchedChanges() async throws {
         let attemptID = synchronizationAttemptID
-        guard !cancelSync else {
-            guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: SyncError.cancelled, for: attemptID)
-            return
-        }
-        
+        try checkSynchronizationAttempt(attemptID)
         for adapter in modelAdapters {
-            try Task.checkCancellation()
+            try checkSynchronizationAttempt(attemptID)
             try await runFetchedChangesPhase(for: adapter, restrictedToEntityType: nil)
+            try checkSynchronizationAttempt(attemptID)
             try await saveActiveTokenIfNeeded(for: adapter)
+            try checkSynchronizationAttempt(attemptID)
         }
     }
 }
@@ -1610,24 +1665,21 @@ extension CloudKitSynchronizer {
     @BigSyncBackgroundActor
     func uploadChanges() async throws {
         let attemptID = synchronizationAttemptID
+        try checkSynchronizationAttempt(attemptID)
         logger.info("QSCloudKitSynchronizer >> Upload changes...")
         reportProgress("upload-start")
         //        debugPrint("# uploadChanges()")
-        guard !cancelSync else {
-            guard synchronizationAttemptID == attemptID else { return }
-            await failSynchronization(error: SyncError.cancelled, for: attemptID)
-            return
-        }
-        try Task.checkCancellation()
-        
+        try checkSynchronizationAttempt(attemptID)
+
         postNotification(.SynchronizerWillUploadChanges)
-        
+        try checkSynchronizationAttempt(attemptID)
+
         try await uploadChanges() { [weak self] (error) in
             try Task.checkCancellation()
             guard let self,
                   synchronizationAttemptID == attemptID else { return }
             
-            if let error = error as? NSError {
+            if let error {
                 if let context = activeRunContext,
                    let lifecycleError = applyCloudKitLoss(
                     error: error,
@@ -1645,10 +1697,10 @@ extension CloudKitSynchronizer {
                         try await revalidateActiveRunContext(for: attemptID)
                     }
                 }
-                if shouldRetryUpload(for: error) {
+                if shouldRetryUpload(for: error as NSError) {
                     //                    print("# uploadChanges() failed, retrying via fetchChanges()")
                     uploadRetries += 1
-                    logger.info("QSCloudKitSynchronizer >> Retrying upload due to error \(error.description.prefix(200)), beginning with fetching changes...")
+                    logger.info("QSCloudKitSynchronizer >> Retrying upload due to error \((error as NSError).description.prefix(200)), beginning with fetching changes...")
                     await fetchChanges()
                 } else {
                     await failSynchronization(error: error, for: attemptID)
@@ -1665,6 +1717,7 @@ extension CloudKitSynchronizer {
                     .localAcknowledgementBeforeTerminalPublication
                 )
 #endif
+                try checkSynchronizationAttempt(attemptID)
                 // Always re-fetch after upload. The next fetch either imports
                 // concurrent server changes or reaches the terminal receipt.
                 await fetchChanges(afterUpload: true)
@@ -1676,11 +1729,14 @@ extension CloudKitSynchronizer {
     func uploadChanges(
         completion: @Sendable @BigSyncBackgroundActor @escaping (Error?) async throws -> ()
     ) async throws {
+        let attemptID = synchronizationAttemptID
         let operationError: Error?
         do {
+            try checkSynchronizationAttempt(attemptID)
             for adapter in modelAdapters {
-                try Task.checkCancellation()
+                try checkSynchronizationAttempt(attemptID)
                 try await synchronizeAdapter(adapter)
+                try checkSynchronizationAttempt(attemptID)
             }
             operationError = nil
         } catch {
@@ -1870,16 +1926,23 @@ extension CloudKitSynchronizer {
 
     @BigSyncBackgroundActor
     func synchronizeAdapter(_ adapter: ModelAdapter) async throws {
+        let attemptID = synchronizationAttemptID
+        try checkSynchronizationAttempt(attemptID)
         for priorityEntityType in adapter.priorityEntityTypeNames {
-            try Task.checkCancellation()
+            try checkSynchronizationAttempt(attemptID)
             try await runSyncPhase(for: adapter, restrictedToEntityType: priorityEntityType)
+            try checkSynchronizationAttempt(attemptID)
         }
 
-        try Task.checkCancellation()
+        try checkSynchronizationAttempt(attemptID)
         try await runFetchedChangesPhase(for: adapter, restrictedToEntityType: nil)
+        try checkSynchronizationAttempt(attemptID)
         try await saveActiveTokenIfNeeded(for: adapter)
+        try checkSynchronizationAttempt(attemptID)
         try await uploadRecordsIfNeeded(adapter: adapter, restrictedToEntityType: nil)
+        try checkSynchronizationAttempt(attemptID)
         try await uploadDeletionsIfNeeded(adapter: adapter, restrictedToEntityType: nil)
+        try checkSynchronizationAttempt(attemptID)
     }
 
     @BigSyncBackgroundActor
@@ -1887,9 +1950,14 @@ extension CloudKitSynchronizer {
         for adapter: ModelAdapter,
         restrictedToEntityType restrictedEntityType: String?
     ) async throws {
+        let attemptID = synchronizationAttemptID
+        try checkSynchronizationAttempt(attemptID)
         try await runFetchedChangesPhase(for: adapter, restrictedToEntityType: restrictedEntityType)
+        try checkSynchronizationAttempt(attemptID)
         try await uploadRecordsIfNeeded(adapter: adapter, restrictedToEntityType: restrictedEntityType)
+        try checkSynchronizationAttempt(attemptID)
         try await uploadDeletionsIfNeeded(adapter: adapter, restrictedToEntityType: restrictedEntityType)
+        try checkSynchronizationAttempt(attemptID)
     }
 
     @BigSyncBackgroundActor
@@ -1897,11 +1965,14 @@ extension CloudKitSynchronizer {
         for adapter: ModelAdapter,
         restrictedToEntityType restrictedEntityType: String?
     ) async throws {
+        let attemptID = synchronizationAttemptID
+        try checkSynchronizationAttempt(attemptID)
         let changeRequestProcessor = changeRequestProcessor
         try await changeRequestProcessor.finishProcessing(
             for: adapter,
             restrictedToEntityType: restrictedEntityType
         )
+        try checkSynchronizationAttempt(attemptID)
         if let firstError = changeRequestProcessor.getErrors().first {
             changeRequestProcessor.clearErrors()
             throw firstError
@@ -1909,19 +1980,26 @@ extension CloudKitSynchronizer {
         do {
             try await adapter.persistImportedChanges()
         } catch {
+            // A retired persistence callback cannot clear a successor's
+            // processor errors, even when it returns an ordinary error.
+            try checkSynchronizationAttempt(attemptID)
             changeRequestProcessor.clearErrors()
             throw error
         }
+        try checkSynchronizationAttempt(attemptID)
         changeRequestProcessor.clearErrors()
     }
 
     @BigSyncBackgroundActor
     func saveActiveTokenIfNeeded(for adapter: ModelAdapter) async throws {
+        let attemptID = synchronizationAttemptID
+        try checkSynchronizationAttempt(attemptID)
         if let token = activeZoneToken(zoneID: adapter.recordZoneID) {
-            try await revalidateActiveRunContext(
-                for: synchronizationAttemptID
-            )
+            try await revalidateActiveRunContext(for: attemptID)
             try await adapter.saveToken(token)
+            // A committed token remains committed. Reject only this stale
+            // continuation before its caller can begin another mutation phase.
+            try checkSynchronizationAttempt(attemptID)
         }
     }
 
