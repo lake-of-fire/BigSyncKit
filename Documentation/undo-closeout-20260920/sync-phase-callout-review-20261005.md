@@ -2,11 +2,11 @@
 
 ## Input and integration ownership
 
-Direct child of BigSyncKit #96 development head `4482f8b0c96719b98213b677b2c34f1035e1d744`, tree `d040bb45e5a59df745eb2333fa8291c599dafabd`. Reader #286 remains the sole hotfix application continuation. Common #257 from the previous review is already merged into its development stack; it is not replayed here.
+BigSyncKit #113 is based on #96 development head `4482f8b0c96719b98213b677b2c34f1035e1d744`, tree `d040bb45e5a59df745eb2333fa8291c599dafabd`. Initial implementation commit: `f572246fca4190c615392849eaddfa85642ac7f6`. Its final successor changes only the native test fixture and this report; production remains byte-identical. Reader #286 remains the sole hotfix application continuation. Common #257 from the previous review is already merged into its development stack; it is not replayed here.
 
-Only one existing production file changes: `CloudKitSynchronizer+Sync.swift` (123 additions, 45 deletions). Its full 84,215-byte original was verified as Git blob `d8b0e89013169e686324e662a1886f8fc20c085a` before editing. Final complete production blob: `43572ed10569f44c67a3765f26a550e9847c84c3`, SHA-256 `c52cbf4fa97d749ce3cf7a88cdcb470f8e7512cc61d01353cb43dda22d5e8b9a`.
+Only one existing production file changes: `CloudKitSynchronizer+Sync.swift` (GitHub comparison: 121 additions, 43 deletions). Its full 84,215-byte original was verified as Git blob `d8b0e89013169e686324e662a1886f8fc20c085a` before editing. Final complete production blob: `43572ed10569f44c67a3765f26a550e9847c84c3`, SHA-256 `c52cbf4fa97d749ce3cf7a88cdcb470f8e7512cc61d01353cb43dda22d5e8b9a`.
 
-The complementary processor/startup work in #112 changes `CloudKitSynchronizer.swift`, not this file. Its current reviewed head was `7cfe47fa2828c46b429f842c6f22ab727e2d877b`, with the overlapping-child registry refinement. Preserve and compose that work separately; this child does not claim to select or replace it. Do not use temporary composition #110/#111 as feature ancestry. No Reader pins, inventories, current Xcode runner, protected target or release flags are changed by this component publication.
+The complementary processor/startup work in #112 changes `CloudKitSynchronizer.swift`, not this file. Its reviewed head was `7cfe47fa2828c46b429f842c6f22ab727e2d877b`, with the overlapping-child registry refinement. Preserve and compose that work separately; this child does not claim to select or replace it. Do not use temporary composition #110/#111 as feature ancestry. No Reader pins, inventories, current Xcode runner, protected target or release flags are changed by this component publication.
 
 ## Findings and correction
 
@@ -51,13 +51,17 @@ Four explicitly separated lanes:
 
 The terminal lane records entry to the application's completion callback; it does not pretend that the original publisher lacks its later context validation. That actual publisher is compiled in both versions. Lifecycle storage, adapter effects, account validation collaborators and domain providers are explicit models. These tests neither execute native Realm/CloudKit transactions nor typecheck the full Apple application module.
 
-All 32 final build/run receipts reconcile individual named outcomes and exit status. A combined optimized wrapper was stopped by the tool timeout while building the original Swift-6 terminal lane; that incomplete folder was separated, then the missing lanes were rerun to completion. It is not counted as a pass. Original and changed full sources, exact extraction script, collaborators, cases, receipt accounting and reproduction runner are supplied in the review artifact. Original and corrected complete files frontend-parse; the final native file also frontend-parses with DEBUG. Parsing is not native SDK typechecking.
+All 32 final build/run receipts reconcile individual named outcomes and exit status. A combined optimized wrapper was stopped by the tool timeout while building the original Swift-6 terminal lane; that incomplete folder was separated, then the missing lanes were rerun to completion. It is not counted as a pass. Original and changed full sources, exact extraction script, collaborators, cases, receipt accounting and reproduction runner are supplied in the review artifact. Production and final native files frontend-parse both with and without DEBUG. Parsing is not native SDK typechecking.
+
+### Independent second-pass controls
+
+Four strict Swift 6 unoptimized controls retain identical scenarios and restore only one original boundary. Restoring `runFetchedChangesPhase` yields 19 passes / 6 failures in the 25-case phase lane. Removing only the database-completion guard yields 5 / 1. Restoring only the terminal caller while retaining the corrected helpers yields 11 / 7. Restoring only the conditional NSError branch yields 15 / 1. Each control's failure identities are recorded and agree with a subset of the complete original-source failure set. These controls do not change the production revision or add unique cases.
 
 ## Native regressions authored, not executed
 
-`Tests/BigSyncKitTests/SyncPhaseAttemptOwnershipTests.swift`, final blob `cfcac3588b1a89e6928dfde0a82ec47e141b2ded`, contains **19 XCTest methods**. It exercises actual synchronizer/processor APIs and synchronous NotificationCenter delivery with injected in-memory state and transport adapters. No new Realm Object type is declared. Account identifiers and page data are synthetic, not genuine account-switch or released-data evidence.
+`Tests/BigSyncKitTests/SyncPhaseAttemptOwnershipTests.swift`, final blob `0debe312cede9120ff6087e7c6fa2b4fc09cc90d`, contains **19 XCTest methods**. It exercises actual synchronizer/processor APIs and synchronous NotificationCenter delivery with injected in-memory state and transport adapters. No new Realm Object type is declared. Account identifiers and page data are synthetic, not genuine account-switch or released-data evidence.
 
-The second review added terminal/health histories and a genuinely suspended persistence history. Notification tests use a bounded watchdog and explicitly release/join their fixture-owned tasks on failure; a missing callback or missed suspension fails rather than silently counting as coverage. The callback test for terminal progress loops over six checkpoints within one method, not six distinct native method identities.
+The second review added terminal/health histories and a genuinely suspended persistence history. Final fixture-only refinement opens the entered gate before fulfilling its expectation, guards the DEBUG-only callback-count assertion without hiding the class in non-DEBUG builds, and applies the existing bounded account-gate watchdog to terminal/health cases too. Notification tests release/join their fixture-owned tasks on failure; a missing callback or missed suspension fails rather than silently counting as coverage. The callback test for terminal progress loops over six checkpoints within one method, not six distinct native method identities. Earlier native blob `cfcac3588b1a89e6928dfde0a82ec47e141b2ded` is the initial published fixture, not the final selection.
 
 Required identities:
 

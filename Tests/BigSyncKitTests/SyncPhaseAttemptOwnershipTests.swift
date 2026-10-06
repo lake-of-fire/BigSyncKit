@@ -508,7 +508,7 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
         try await withFixture { sync, adapter, probe, _ in
             let entered = SyncPhaseGate(), release = SyncPhaseGate()
             let arrived = expectation(description: "persistence entered")
-            probe.onPersist = { arrived.fulfill(); await entered.open(); await release.wait() }
+            probe.onPersist = { await entered.open(); arrived.fulfill(); await release.wait() }
             let task = Task { @BigSyncBackgroundActor in
                 try await sync.runFetchedChangesPhase(for: adapter, restrictedToEntityType: nil)
             }
@@ -559,13 +559,15 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
                     sync.synchronizationRequestedWhileRunning = true
                     sync.syncing = true
                 }
-                await sync.changesFinishedSynchronizing()
+                try await completeBeforeReleasingAccountGate(probe) { await sync.changesFinishedSynchronizing() }
                 XCTAssertTrue(reached, "The tested checkpoint did not execute: \(checkpoint)")
                 XCTAssertEqual(sync.activeZoneTokens[adapter.recordZoneID], token, checkpoint)
                 XCTAssertEqual(sync.uploadRetries, 19, checkpoint)
                 XCTAssertEqual(sync.activeReceiptAuthorizationID, expectedAuthorization, checkpoint)
                 XCTAssertEqual(completions, 0, "Old terminal completion entered the application handler")
+#if DEBUG
                 XCTAssertEqual(sync._testActiveRunCallbackCount, 0)
+#endif
                 if checkpoint == "terminal-tail-account-revalidated" {
                     XCTAssertEqual(probe.importCount, 0)
                     XCTAssertEqual(probe.cleanupCount, 0)
@@ -593,7 +595,7 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
                 sync.activeReceiptAuthorizationID = authorization
             }
             defer { observer.stop(); sync.synchronizationCompletionHandler = nil; sync.domainPrepublicationHandler = nil }
-            await sync.changesFinishedSynchronizing()
+            try await completeBeforeReleasingAccountGate(probe) { await sync.changesFinishedSynchronizing() }
             XCTAssertEqual(observer.deliveries, 1)
             XCTAssertEqual(sync.activeReceiptAuthorizationID, authorization)
             XCTAssertEqual(completions, 0)
