@@ -36,7 +36,7 @@ extension SyncUndoCloseoutW1Tests {
         let (_, inspection, _, trackingConfig, evidence) = try await publicationRestorationFixture()
         // Open on this thread, like matches(), after the final await. The held
         // owner and synchronous inspection may share the native cached handle.
-        let owner = try Realm(configuration: trackingConfig)
+        let owner = try Realm(configuration: trackingConfig, queue: nil)
         XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test.w1-closeout", databaseScope: .private))
         owner.beginWrite()
         defer { if owner.isInWriteTransaction { owner.cancelWrite() } }
@@ -51,20 +51,21 @@ extension SyncUndoCloseoutW1Tests {
     @BigSyncBackgroundActor
     func testColdRestorationCannotCertifyProvisionalSuccessorCursor() async throws {
         let (adapter, inspection, _, trackingConfig, original) = try await publicationRestorationFixture()
-        let owner = try Realm(configuration: trackingConfig)
+        let owner = try Realm(configuration: trackingConfig, queue: nil)
         let cursorData = Data("restoration-provisional-successor".utf8)
+        let successorBoundary = try XCTUnwrap(CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
+                containerIdentifier: "iCloud.test.w1-closeout", databaseScope: .private,
+                accountScopeIdentifier: original.accountScopeIdentifier,
+                replicaBindingGenerationIdentifier: original.replicaBindingGenerationIdentifier,
+                recordZoneID: adapter.recordZoneID, changeFeedEpoch: original.changeFeedEpoch,
+                cursorData: cursorData))
         let successor = BigSyncDurablePublicationEvidence(
             domainScopeIdentifier: original.domainScopeIdentifier,
             accountScopeIdentifier: original.accountScopeIdentifier,
             replicaBindingGenerationIdentifier: original.replicaBindingGenerationIdentifier,
             zoneOwnerName: original.zoneOwnerName, zoneName: original.zoneName,
             changeFeedEpoch: original.changeFeedEpoch,
-            consumedServerBoundaryIdentifier: CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
-                containerIdentifier: "iCloud.test.w1-closeout", databaseScope: .private,
-                accountScopeIdentifier: original.accountScopeIdentifier,
-                replicaBindingGenerationIdentifier: original.replicaBindingGenerationIdentifier,
-                recordZoneID: adapter.recordZoneID, changeFeedEpoch: original.changeFeedEpoch,
-                cursorData: cursorData), runID: original.runID, publishedAt: original.publishedAt)
+            consumedServerBoundaryIdentifier: successorBoundary, runID: original.runID, publishedAt: original.publishedAt)
         XCTAssertFalse(try inspection.matches(successor, containerIdentifier: "iCloud.test.w1-closeout", databaseScope: .private))
         let token = try XCTUnwrap(owner.objects(ServerToken.self).first)
         owner.beginWrite()
@@ -81,7 +82,7 @@ extension SyncUndoCloseoutW1Tests {
     @BigSyncBackgroundActor
     func testColdRestorationIgnoresProvisionalTargetJournalUntilCommit() async throws {
         let (_, inspection, targetConfig, _, evidence) = try await publicationRestorationFixture()
-        let owner = try Realm(configuration: targetConfig)
+        let owner = try Realm(configuration: targetConfig, queue: nil)
         let object = try XCTUnwrap(owner.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
         XCTAssertTrue(try inspection.matches(evidence, containerIdentifier: "iCloud.test.w1-closeout", databaseScope: .private))
         owner.beginWrite()
@@ -98,7 +99,7 @@ extension SyncUndoCloseoutW1Tests {
     @BigSyncBackgroundActor
     func testColdRestorationKeepsOriginalAfterProvisionalTargetJournalRollback() async throws {
         let (_, inspection, targetConfig, _, evidence) = try await publicationRestorationFixture()
-        let owner = try Realm(configuration: targetConfig)
+        let owner = try Realm(configuration: targetConfig, queue: nil)
         let object = try XCTUnwrap(owner.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
         let originalText = object.text
         owner.beginWrite()
