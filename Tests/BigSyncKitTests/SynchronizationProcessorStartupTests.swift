@@ -65,6 +65,11 @@ final class SynchronizationProcessorStartupTests: XCTestCase, @unchecked Sendabl
         sync.accountScopeAuthorityFence.poison()
         XCTAssertEqual(sync.synchronizationAttemptID, context.attemptID)
         XCTAssertEqual(sync.activeRunContext, context)
+        XCTAssertThrowsError(
+            try sync.checkSynchronizationAttempt(context.attemptID)
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
         XCTAssertThrowsError(try sync.checkRunContext(context)) { error in
             XCTAssertTrue(error is CancellationError)
         }
@@ -72,6 +77,47 @@ final class SynchronizationProcessorStartupTests: XCTestCase, @unchecked Sendabl
             transport.operationCalls, 0,
             "Synchronous poison rejection must require no account or CloudKit request"
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testAttemptCheckStillAllowsFreshValidationWhileFenceIsPoisoned() throws {
+        let transport = StartupProcessorTransport()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "processor-prevalidation-" + UUID().uuidString
+        )
+        let zone = CKRecordZone.ID(
+            zoneName: "processor-prevalidation-" + UUID().uuidString,
+            ownerName: CKCurrentUserDefaultName
+        )
+        let sync = CloudKitSynchronizer(
+            identifier: UUID().uuidString,
+            containerIdentifier: "iCloud.test.processor-prevalidation",
+            database: transport,
+            recordZoneID: zone,
+            keyValueStore: StartupProcessorStore(),
+            accountIdentifierProvider: { "account-a" },
+            accountStatusProvider: { .available },
+            changeFeed: transport,
+            subscriptionStore: transport,
+            zoneStore: transport,
+            recordStore: transport,
+            backupDetectionBaseURL: directory,
+            logger: Logger(label: "ProcessorPrevalidation")
+        )
+        addTeardownBlock { @BigSyncBackgroundActor in
+            await sync.cancelSynchronizationAndWait()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        sync.accountScopeAuthorityFence.clear()
+        sync.activeRunContext = nil
+        sync.accountScopeAuthorityFence.poison()
+        XCTAssertTrue(sync.accountScopeAuthorityFence.rejectsAuthority)
+        XCTAssertNoThrow(
+            try sync.checkSynchronizationAttempt(sync.synchronizationAttemptID),
+            "Poison must not deadlock the fresh account-validation attempt"
+        )
+        XCTAssertEqual(transport.operationCalls, 0)
     }
 
     @BigSyncBackgroundActor
