@@ -1310,7 +1310,11 @@ extension SyncRetainedRecordContractTests {
         }
         try await adapter.didFinishImport()
         let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
-        let saved = try XCTUnwrap(prepared.first?.record)
+        let submitted = try XCTUnwrap(prepared.first?.record)
+        // A CloudKit save reply owns its bytes independently of the adapter's
+        // upload files. The newer-generation retry calls didFinishImport,
+        // which correctly retires those files before this reply is replayed.
+        let saved = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(submitted))
         let results = try await adapter.deleteRecords(with: [saved.recordID])
         guard case .quarantined(let lineage) = try XCTUnwrap(results.first).disposition else {
             return XCTFail("A real retained physical deletion must create quarantine evidence")
