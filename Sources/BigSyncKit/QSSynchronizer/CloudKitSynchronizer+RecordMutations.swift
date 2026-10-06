@@ -1,6 +1,67 @@
 import CloudKit
 import Foundation
 
+/// Bind each returned record to the request whose result slot contained it.
+/// A batch member is not interchangeable with a different member of that batch.
+private func mutationResponseRecordMatches(
+    _ record: CKRecord,
+    expectedID: CKRecord.ID,
+    expectedType: String?
+) -> Bool {
+    guard record.recordID == expectedID else { return false }
+    return expectedType.map { $0.utf8.elementsEqual(record.recordType.utf8) } ?? true
+}
+
+/// Validate before any local acknowledgement/import or account-routed await.
+/// Keep invalid slots as failures rather than abandoning successful siblings.
+/// The original conflict error remains an underlying cause so its retry-after
+/// and account constraints survive rejection of the malformed record payload.
+private func validatedMutationResults<Value>(
+    _ results: [CKRecord.ID: Result<Value, Error>],
+    expected: [(recordID: CKRecord.ID, recordType: String?)],
+    successRecord: (Value) -> CKRecord?
+) -> [CKRecord.ID: Result<Value, Error>] {
+    var validated = [CKRecord.ID: Result<Value, Error>]()
+    for identity in expected {
+        let id = identity.recordID
+        guard let result = results[id] else {
+            validated[id] = .failure(CocoaError(.coderValueNotFound))
+            continue
+        }
+        let record: CKRecord?
+        let originalFailure: NSError?
+        switch result {
+        case let .success(value):
+            record = successRecord(value)
+            originalFailure = nil
+        case let .failure(error):
+            let failure = error as NSError
+            record = failure.domain == CKErrorDomain
+                && failure.code == CKError.serverRecordChanged.rawValue
+                ? failure.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord
+                : nil
+            originalFailure = failure
+        }
+        if let record, !mutationResponseRecordMatches(
+            record, expectedID: id, expectedType: identity.recordType
+        ) {
+            let invalid = BigSyncRecordRebaseError.inconsistentReceipt(id.recordName) as NSError
+            if let originalFailure {
+                var info = invalid.userInfo
+                info[NSUnderlyingErrorKey] = originalFailure
+                validated[id] = .failure(NSError(
+                    domain: invalid.domain, code: invalid.code, userInfo: info
+                ))
+            } else {
+                validated[id] = .failure(invalid)
+            }
+        } else {
+            validated[id] = result
+        }
+    }
+    return validated
+}
+
 struct PreparedMutationRetryKey: Hashable, Sendable {
     let recordID: CKRecord.ID
     let generation: String?
@@ -269,7 +330,9 @@ extension CloudKitSynchronizer {
                     }
                     switch result {
                     case let .success(record):
-                        guard record.recordID == id, record.recordType == candidate.record.recordType else {
+                        guard mutationResponseRecordMatches(
+                            record, expectedID: id, expectedType: candidate.record.recordType
+                        ) else {
                             throw preservingSiblingMutationFailures(
                                 BigSyncRecordRebaseError.inconsistentReceipt(id.recordName),
                                 failedRecordIDs: [id], otherFailures: returnedFailures
@@ -363,8 +426,13 @@ extension CloudKitSynchronizer {
                 continue
             }
             try Task.checkCancellation()
+            let saveResults = validatedMutationResults(
+                mutationResults.saveResults,
+                expected: records.map { ($0.recordID, $0.recordType) },
+                successRecord: { $0 }
+            )
             let returnedFailures = returnedMutationFailures(
-                in: mutationResults.saveResults, for: records.map(\.recordID)
+                in: saveResults, for: records.map(\.recordID)
             )
             try await revalidateMutationResultContext(
                 for: attemptID, preserving: returnedFailures
@@ -380,7 +448,7 @@ extension CloudKitSynchronizer {
                     recordID: record.recordID,
                     generation: generations[record.recordID.recordName]
                 )
-                guard let result = mutationResults.saveResults[record.recordID] else {
+                guard let result = saveResults[record.recordID] else {
                     unresolvedFailures[record.recordID] = CocoaError(
                         .coderValueNotFound
                     ) as NSError
@@ -606,8 +674,16 @@ extension CloudKitSynchronizer {
                 continue
             }
             try Task.checkCancellation()
+            // Generic deletion preparation carries no record type. The
+            // adapter retains that model-specific check; ID and zone must
+            // already match before any metadata-rebase call is dispatched.
+            let deleteResults = validatedMutationResults(
+                mutationResults.deleteResults,
+                expected: recordIDs.map { ($0, nil) },
+                successRecord: { _ in nil }
+            )
             let returnedFailures = returnedMutationFailures(
-                in: mutationResults.deleteResults, for: recordIDs
+                in: deleteResults, for: recordIDs
             )
             try await revalidateMutationResultContext(
                 for: attemptID, preserving: returnedFailures
@@ -621,7 +697,7 @@ extension CloudKitSynchronizer {
                     recordID: recordID,
                     generation: generations[recordID.recordName]
                 )
-                guard let result = mutationResults.deleteResults[recordID] else {
+                guard let result = deleteResults[recordID] else {
                     unresolvedFailures[recordID] = CocoaError(
                         .coderValueNotFound
                     ) as NSError
