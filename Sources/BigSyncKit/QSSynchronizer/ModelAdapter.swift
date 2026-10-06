@@ -640,19 +640,29 @@ public struct PreparedRecordUpload: @unchecked Sendable {
 
     let comparisonBase: BigSyncPreparedRecordBase?
     let requiresAcceptanceCheck: Bool
+    let retainedDeletionQuarantineEvidence: RealmSwiftAdapter.RetainedDeletionQuarantineEvidence?
 
     public init(record: CKRecord, generation: String?) {
         self.record = record
         self.generation = generation
         self.comparisonBase = nil
         self.requiresAcceptanceCheck = false
+        self.retainedDeletionQuarantineEvidence = nil
     }
 
-    init(record: CKRecord, generation: String?, comparisonBase: BigSyncPreparedRecordBase?, requiresAcceptanceCheck: Bool = false) {
+    init(
+        record: CKRecord,
+        generation: String?,
+        comparisonBase: BigSyncPreparedRecordBase?,
+        requiresAcceptanceCheck: Bool = false,
+        retainedDeletionQuarantineEvidence:
+            RealmSwiftAdapter.RetainedDeletionQuarantineEvidence? = nil
+    ) {
         self.record = record
         self.generation = generation
         self.comparisonBase = comparisonBase
         self.requiresAcceptanceCheck = requiresAcceptanceCheck
+        self.retainedDeletionQuarantineEvidence = retainedDeletionQuarantineEvidence
     }
 }
 

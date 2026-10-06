@@ -1309,13 +1309,9 @@ extension SyncRetainedRecordContractTests {
             object.refreshChangeMetadata(explicitlyModified: true)
         }
         try await adapter.didFinishImport()
-        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
-        let submitted = try XCTUnwrap(prepared.first?.record)
-        // A CloudKit save reply owns its bytes independently of the adapter's
-        // upload files. The newer-generation retry calls didFinishImport,
-        // which correctly retires those files before this reply is replayed.
-        let saved = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(submitted))
-        let results = try await adapter.deleteRecords(with: [saved.recordID])
+        let initialPrepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let recordForDeletion = try XCTUnwrap(initialPrepared.first?.record)
+        let results = try await adapter.deleteRecords(with: [recordForDeletion.recordID])
         guard case .quarantined(let lineage) = try XCTUnwrap(results.first).disposition else {
             return XCTFail("A real retained physical deletion must create quarantine evidence")
         }
@@ -1325,7 +1321,27 @@ extension SyncRetainedRecordContractTests {
         try await adapter.commitInboundPage(.init(previousCursor: cursor,
             nextCursor: .init(serializedData: Data("retained-successor-page".utf8)),
             liveResults: [], deletionResults: []))
+        // Bind the exact already-committed page before supplying its restoring
+        // response. A received old tag alone cannot order later deletions.
+        // Server-response bytes must outlive the prepared upload files retired
+        // by an intervening didFinishImport in the newer-generation retry.
+        func acceptedResponse(_ record: CKRecord, tag: String) throws -> CKRecord {
+            let copy = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(record))
+            guard copy.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
+                throw CocoaError(.coderValueNotFound)
+            }
+            _ = copy.perform(NSSelectorFromString("setRecordChangeTag:"), with: tag as NSString)
+            let result = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(copy))
+            XCTAssertEqual(result.recordChangeTag, tag)
+            return result
+        }
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let saved = try acceptedResponse(XCTUnwrap(prepared.first).record, tag: "accepted-after-deletion")
         let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let originalGeneration = try XCTUnwrap(target.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: saved.recordID.recordName)?.generation)
+        let originalTrackingState = try XCTUnwrap(tracking.object(
+            ofType: SyncedEntity.self, forPrimaryKey: saved.recordID.recordName)).entityState
         let receiptID = try XCTUnwrap(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
             forPrimaryKey: lineage)).committedPageReceiptID
         XCTAssertFalse(receiptID.isEmpty)
@@ -1352,13 +1368,15 @@ extension SyncRetainedRecordContractTests {
         }
         adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = {
             XCTAssertTrue(tracking.isInWriteTransaction)
-            XCTAssertTrue(target.objects(BigSyncPendingMutation.self).isEmpty)
+            XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: saved.recordID.recordName)?.generation, originalGeneration)
             XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
                 forPrimaryKey: saved.recordID.recordName)?.entityState, .synced)
             guard authority.armOnce() else { return }
-            // The actual acknowledgement and initial cleanup candidate
-            // selection have finished. Commit only a local metadata signal;
-            // the tracking transaction then refreshes the real target Realm.
+            // Tracking acknowledgement is provisional in this transaction.
+            // The target journal remains intact until acknowledgement and
+            // quarantine retirement commit together. Deliver real refresh
+            // notification revocation before that tracking commit.
             try writerQueue.sync {
                 let writer = try Realm(configuration: configuration, queue: writerQueue)
                 try writer.write {
@@ -1386,12 +1404,21 @@ extension SyncRetainedRecordContractTests {
             XCTAssertTrue(error is CancellationError)
         }
         XCTAssertEqual(request.isCancelled, mode == .cancelTask)
-        XCTAssertTrue(authority.didObserve, "Must deliver a real refresh after terminal acknowledgement")
-        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
-            forPrimaryKey: saved.recordID.recordName)?.entityState, .synced)
-        XCTAssertNil(tracking.object(ofType: SyncedEntity.self,
-            forPrimaryKey: saved.recordID.recordName)?.pendingGeneration)
-        XCTAssertTrue(target.objects(BigSyncPendingMutation.self).isEmpty)
+        XCTAssertTrue(authority.didObserve, "Must deliver a real refresh before tracking settlement")
+        if mode == .live {
+            XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.entityState, .synced)
+            XCTAssertNil(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.pendingGeneration)
+            XCTAssertTrue(target.objects(BigSyncPendingMutation.self).isEmpty)
+        } else {
+            XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.entityState, originalTrackingState)
+            XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: saved.recordID.recordName)?.pendingGeneration, originalGeneration)
+            XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: saved.recordID.recordName)?.generation, originalGeneration)
+        }
         if mode != .live {
             XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
                 forPrimaryKey: lineage))
@@ -1412,10 +1439,16 @@ extension SyncRetainedRecordContractTests {
                         with: "different-accepted-tag" as NSString)
                     let wrongTag = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(mismatched))
                     XCTAssertEqual(wrongTag.recordChangeTag, "different-accepted-tag")
+                    do {
                     try await adapter.didUpload(savedRecords: [wrongTag], matchingPreparedUploads: prepared)
+                        XCTFail("A revoked prepared cleanup must not be revived")
+                    } catch { XCTAssertTrue(error is CancellationError) }
                 case .wrongContext:
                     adapter.activeAccountScopeIdentifier = "replacement-account"
+                    do {
                     try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+                        XCTFail("A revoked prepared cleanup must not be revived")
+                    } catch { XCTAssertTrue(error is CancellationError) }
                     adapter.activeAccountScopeIdentifier = "account"
                 case .newerGeneration:
                     try target.write {
@@ -1424,7 +1457,10 @@ extension SyncRetainedRecordContractTests {
                     }
                     try await adapter.didFinishImport()
                     let generation = try XCTUnwrap(target.objects(BigSyncPendingMutation.self).first?.generation)
+                    do {
                     try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+                        XCTFail("A revoked prepared cleanup must not be revived")
+                    } catch { XCTAssertTrue(error is CancellationError) }
                     XCTAssertEqual(target.objects(BigSyncPendingMutation.self).first?.generation, generation)
                     XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
                         forPrimaryKey: saved.recordID.recordName)?.pendingGeneration, generation)
@@ -1435,14 +1471,15 @@ extension SyncRetainedRecordContractTests {
                 XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
                     forPrimaryKey: receiptID))
             }
-            if retryGuard == .newerGeneration {
-                let current = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
-                try await adapter.didUpload(savedRecords: current.map(\.record), matchingPreparedUploads: current)
-            } else {
-                // Replaying the same public acknowledgement retains the accepted
-                // receipt and gives the cleanup a fresh authority generation.
-                try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+            // A replaced/cancelled attempt does not renew an old prepared
+            // cleanup. Retained journal input permits a fresh preparation and
+            // a new simulated server-restoring response in the healthy attempt.
+            let current = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+            XCTAssertFalse(current.isEmpty)
+            let freshResponses = try current.map {
+                try acceptedResponse($0.record, tag: "accepted-current-retry")
             }
+            try await adapter.didUpload(savedRecords: freshResponses, matchingPreparedUploads: current)
         }
         XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
             forPrimaryKey: lineage))
