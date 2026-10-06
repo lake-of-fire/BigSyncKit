@@ -282,6 +282,7 @@ final class UnicodeStringTransportTests: XCTestCase {
                 forPrimaryKey: record.recordID.recordName)?.generation)
             record["tags"] = [a, b] as CKRecordValue
             realm.beginWrite()
+            defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
             try Self.applyTags(record, to: row, using: adapter)
             XCTAssertEqual(row.tags.count, 2)
             realm.cancelWrite()
