@@ -3623,7 +3623,7 @@ public final class RealmSwiftAdapter:
                         return Set(newValue) != Set(existingValue)
                     case .string:
                         guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.MutableSet<String> else { return true }
-                        return Set(newValue) != Set(existingValue)
+                        return !BigSyncStringIdentity.unorderedValuesEqual(newValue, existingValue)
                     case .bool:
                         guard let newValue = newValue as? [Bool], let existingValue = existingValue as? RealmSwift.MutableSet<Bool> else { return true }
                         return Set(newValue) != Set(existingValue)
@@ -3670,12 +3670,13 @@ public final class RealmSwiftAdapter:
                         }
                         if let existingValue =
                             existingValue as? RealmSwift.List<String> {
-                            return newValue != Array(existingValue)
+                            return !BigSyncStringIdentity.orderedValuesEqual(newValue, existingValue)
                         }
                         if let existingValue =
                             existingValue as? RealmSwift.List<URL> {
-                            return newValue
-                                != existingValue.map(\.absoluteString)
+                            return !BigSyncStringIdentity.orderedValuesEqual(
+                                newValue, existingValue.lazy.map(\.absoluteString)
+                            )
                         }
                         return true
                     case .bool:
@@ -3751,7 +3752,7 @@ public final class RealmSwiftAdapter:
                         return newValue != existingValue
                     case .string:
                         guard let newValue = newValue as? String, let existingValue = existingValue as? String else { return true }
-                        return newValue != existingValue
+                        return !BigSyncStringIdentity.equal(newValue, existingValue)
                     case .bool:
                         guard let newValue = newValue as? Bool, let existingValue = existingValue as? Bool else { return true }
                         return newValue != existingValue
@@ -4113,12 +4114,10 @@ public final class RealmSwiftAdapter:
                 recordValue = set
             case .string:
                 let value = try requireArray(String.self, expected: "an array of strings")
-                var set = Set<String>()
-                try value.forEach {
-                    try Task.checkCancellation()
-                    set.insert($0)
-                }
-                recordValue = set
+                // Let Realm deduplicate the validated array by stored identity.
+                // Swift Set<String> would first collapse byte-distinct Unicode
+                // spellings. The common assignment below checks cancellation.
+                recordValue = value
             case .bool:
                 let value = try requireArray(Bool.self, expected: "an array of booleans")
                 var set = Set<Bool>()
