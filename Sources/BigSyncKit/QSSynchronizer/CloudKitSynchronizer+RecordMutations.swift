@@ -62,6 +62,18 @@ private func validatedMutationResults<Value>(
     return validated
 }
 
+/// A repairable record outcome is not permission to ignore operation-level
+/// recovery. Preserve constrained failures for the outer synchronization
+/// lifecycle instead of consuming them in an immediate repair/retry loop.
+/// Only ordinary miss/conflict codes may be handled here. Other recognized
+/// CloudKit failures must not disappear merely because the outer code is one
+/// of those two; internal non-CloudKit SDK details retain their existing path.
+private func mutationFailureAllowsImmediateRepair(_ error: Error) -> Bool {
+    let constraints = CloudKitRetryConstraints(error)
+    return !constraints.requiresDeferredRetry
+        && constraints.codes.isSubset(of: [.unknownItem, .serverRecordChanged])
+}
+
 struct PreparedMutationRetryKey: Hashable, Sendable {
     let recordID: CKRecord.ID
     let generation: String?
@@ -341,11 +353,13 @@ extension CloudKitSynchronizer {
                         observations.append(record)
                     case let .failure(error):
                         let ns = error as NSError
-                        if ns.domain != CKErrorDomain || ns.code != CKError.unknownItem.rawValue {
+                        if ns.domain != CKErrorDomain || ns.code != CKError.unknownItem.rawValue
+                            || !mutationFailureAllowsImmediateRepair(ns) {
                             lookupFailures[id] = ns
                         }
-                        // Not found does not prove the earlier request never
-                        // ran; retry the same candidate with its save fence.
+                        // An unconstrained miss may retry the same candidate
+                        // with its save fence. A miss carrying a delay, account
+                        // stop or token recovery must retain that constraint.
                     }
                 }
                 if !observations.isEmpty {
@@ -465,7 +479,8 @@ extension CloudKitSynchronizer {
                         continue
                     }
                     let code = CKError.Code(rawValue: nsError.code)
-                    guard code == .unknownItem || code == .serverRecordChanged else {
+                    guard code == .unknownItem || code == .serverRecordChanged,
+                          mutationFailureAllowsImmediateRepair(nsError) else {
                         unresolvedFailures[record.recordID] = nsError
                         continue
                     }
@@ -715,6 +730,7 @@ extension CloudKitSynchronizer {
                         acknowledged.append(recordID)
                     } else if nsError.domain == CKErrorDomain,
                               nsError.code == CKError.serverRecordChanged.rawValue,
+                              mutationFailureAllowsImmediateRepair(nsError),
                               let serverRecord = nsError.userInfo[
                                   CKRecordChangedErrorServerRecordKey
                               ] as? CKRecord {

@@ -6,8 +6,9 @@ import XCTest
 @_spi(CloudKitE2E) @testable import BigSyncKit
 
 private enum ResponseRoute: Sendable {
-    case save, saveConflict, deleteConflict, lookup
+    case save, saveConflict, saveMissing, deleteConflict, lookup, lookupMissing
     var deletes: Bool { self == .deleteConflict }
+    var looksUp: Bool { self == .lookup || self == .lookupMissing }
 }
 private enum ResponseAlteration: Sendable {
     case none, name, zone, owner, type, siblingIdentity, missingResult, missingConflictRecord
@@ -40,7 +41,7 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     func hasChanges(record: CKRecord, object: Object) -> Bool { true }
     func saveChanges(in records: [CKRecord], forceSave: Bool) async throws -> [InboundLiveResult] {
         imported.append(contentsOf: records)
-        if route == .lookup {
+        if route.looksUp {
             for record in records { pending.remove(record.recordID.recordName) }
         }
         return records.enumerated().map {
@@ -58,7 +59,7 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
             let record = CKRecord(recordType: "IdentityFixture", recordID: .init(recordName: name, zoneID: recordZoneID))
             record["text"] = "local-" + name as CKRecordValue
             return .init(record: record, generation: "pending-" + name,
-                         comparisonBase: nil, requiresAcceptanceCheck: route == .lookup)
+                         comparisonBase: nil, requiresAcceptanceCheck: route.looksUp)
         }
     }
     @BigSyncBackgroundActor
@@ -112,18 +113,27 @@ private actor ResponseIdentityTransport: CloudKitRecordStore, CloudKitRecordFetc
     let alteration: ResponseAlteration
     let siblingError: CKError?
     let conflictRetryAfter: TimeInterval?
+    let repairUnderlyingError: Error?
     let account: ResponseAccountProbe
     private(set) var mutationCount = 0
     private(set) var lookupCount = 0
     init(route: ResponseRoute, alteration: ResponseAlteration, siblingError: CKError?, account: ResponseAccountProbe,
-         conflictRetryAfter: TimeInterval?) {
+         conflictRetryAfter: TimeInterval?, repairUnderlyingError: Error? = nil) {
         self.route = route; self.alteration = alteration; self.siblingError = siblingError; self.account = account
         self.conflictRetryAfter = conflictRetryAfter
+        self.repairUnderlyingError = repairUnderlyingError
     }
     private func conflict(_ id: CKRecord.ID) -> CKError {
         var info: [String: Any] = alteration == .missingConflictRecord ? [:] : [CKRecordChangedErrorServerRecordKey: returned(id)]
         if let conflictRetryAfter { info[CKErrorRetryAfterKey] = conflictRetryAfter }
+        if let repairUnderlyingError { info[NSUnderlyingErrorKey] = repairUnderlyingError }
         return CKError(.serverRecordChanged, userInfo: info)
+    }
+    private func missing() -> CKError {
+        var info = [String: Any]()
+        if let conflictRetryAfter { info[CKErrorRetryAfterKey] = conflictRetryAfter }
+        if let repairUnderlyingError { info[NSUnderlyingErrorKey] = repairUnderlyingError }
+        return CKError(.unknownItem, userInfo: info)
     }
     private func returned(_ id: CKRecord.ID, type: String = "IdentityFixture") -> CKRecord {
         let returnedID: CKRecord.ID
@@ -149,7 +159,9 @@ private actor ResponseIdentityTransport: CloudKitRecordStore, CloudKitRecordFetc
             if id.recordName == "other", let siblingError { saves[id] = .failure(siblingError); continue }
             guard id.recordName == "target", mutationCount == 1 else { saves[id] = .success(record); continue }
             if alteration == .missingResult { continue }
-            if route == .saveConflict {
+            if route == .saveMissing {
+                saves[id] = .failure(missing())
+            } else if route == .saveConflict {
                 saves[id] = .failure(conflict(id))
             } else {
                 saves[id] = .success(returned(id))
@@ -171,6 +183,10 @@ private actor ResponseIdentityTransport: CloudKitRecordStore, CloudKitRecordFetc
         guard lookupCount <= 3 else { throw UnexpectedRetry() }
         var results = [CKRecord.ID: Result<CKRecord, Error>]()
         for id in recordIDs {
+            if route == .lookupMissing, lookupCount == 1 {
+                results[id] = .failure(missing())
+                continue
+            }
             if id.recordName == "other", let siblingError { results[id] = .failure(siblingError); continue }
             if id.recordName == "target" {
                 if alteration == .missingResult { continue }
@@ -208,12 +224,14 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
     @BigSyncBackgroundActor
     private func run(_ route: ResponseRoute, _ alteration: ResponseAlteration, sibling: CKError? = nil,
                      acknowledgeFailure: Error? = nil, failsAccountAfterResult: Bool = false,
-                     conflictRetryAfter: TimeInterval? = nil) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
+                     conflictRetryAfter: TimeInterval? = nil,
+                     repairUnderlyingError: Error? = nil) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
         let adapter = ResponseIdentityAdapter(route: route, siblingFailure: sibling != nil)
         adapter.acknowledgeFailure = acknowledgeFailure
         let account = ResponseAccountProbe(failsAfterResult: failsAccountAfterResult)
         let transport = ResponseIdentityTransport(route: route, alteration: alteration, siblingError: sibling,
-                                                   account: account, conflictRetryAfter: conflictRetryAfter)
+                                                   account: account, conflictRetryAfter: conflictRetryAfter,
+                                                   repairUnderlyingError: repairUnderlyingError)
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("response-identity-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }
         let sync = CloudKitSynchronizer(identifier: UUID().uuidString,
@@ -246,10 +264,10 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
         XCTAssertTrue(adapter.requeued.isEmpty, file: file, line: line)
         let mutations = await transport.mutationCount
         let lookups = await transport.lookupCount
-        XCTAssertEqual(mutations, route == .lookup ? 0 : 1, file: file, line: line)
-        XCTAssertEqual(lookups, route == .lookup ? 1 : 0, file: file, line: line)
+        XCTAssertEqual(mutations, route.looksUp ? 0 : 1, file: file, line: line)
+        XCTAssertEqual(lookups, route.looksUp ? 1 : 0, file: file, line: line)
         let acknowledged = route.deletes ? adapter.deleted.map(\.recordName) : adapter.uploaded.map { $0.recordID.recordName }
-        XCTAssertEqual(acknowledged, route == .lookup ? [] : ["success"], file: file, line: line)
+        XCTAssertEqual(acknowledged, route.looksUp ? [] : ["success"], file: file, line: line)
         let error = try XCTUnwrap(failure, "Malformed response must remain a failure", file: file, line: line)
         let constraints = CloudKitRetryConstraints(error)
         XCTAssertFalse(constraints.containsOnlySizeLimitFailures, file: file, line: line)
@@ -475,5 +493,305 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
         XCTAssertTrue(adapter.imported.isEmpty)
         XCTAssertTrue(adapter.uploaded.isEmpty)
         XCTAssertTrue(adapter.pending.contains("target"))
+    }
+}
+
+
+extension SyncMutationResponseIdentityTests {
+    // A valid conflict payload does not override a delay, an account stop, or
+    // token recovery carried in the same error. Successful sibling receipts
+    // remain independently eligible; no repair or transport retry occurs here.
+    @BigSyncBackgroundActor
+    private func requireDeferredRepair(
+        _ route: ResponseRoute,
+        retryAfter: TimeInterval? = nil,
+        underlying: CKError? = nil,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let (adapter, transport, account, failure) = try await run(
+            route, .none, conflictRetryAfter: retryAfter,
+            repairUnderlyingError: underlying
+        )
+        XCTAssertTrue(adapter.pending.contains("target"), file: file, line: line)
+        XCTAssertTrue(adapter.imported.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.rebased.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.requeued.isEmpty, file: file, line: line)
+        let mutationCount = await transport.mutationCount
+        let lookupCount = await transport.lookupCount
+        XCTAssertEqual(mutationCount, route.looksUp ? 0 : 1, file: file, line: line)
+        XCTAssertEqual(lookupCount, route.looksUp ? 1 : 0, file: file, line: line)
+        let acknowledged = route.deletes ? adapter.deleted.map(\.recordName)
+            : adapter.uploaded.map { $0.recordID.recordName }
+        XCTAssertEqual(acknowledged, route.looksUp ? [] : ["success"], file: file, line: line)
+        if underlying?.code == .notAuthenticated || underlying?.code == .accountTemporarilyUnavailable {
+            let probes = await account.callsAfterResult
+            XCTAssertEqual(probes, 0, "Known account stop cannot trigger another identity request", file: file, line: line)
+        }
+        let error = try XCTUnwrap(failure, file: file, line: line)
+        let constraints = CloudKitRetryConstraints(error)
+        XCTAssertFalse(constraints.containsOnlySizeLimitFailures, file: file, line: line)
+        if let retryAfter {
+            XCTAssertEqual(constraints.serverMinimum, retryAfter, file: file, line: line)
+            XCTAssertTrue(constraints.requiresDeferredRetry, file: file, line: line)
+        }
+        if let underlying {
+            XCTAssertTrue(constraints.codes.contains(underlying.code), file: file, line: line)
+            if underlying.code == .requestRateLimited {
+                XCTAssertEqual(constraints.serverMinimum, 137, file: file, line: line)
+            }
+            if underlying.code == .changeTokenExpired {
+                XCTAssertTrue(constraints.requestsTokenRecovery, file: file, line: line)
+            } else if underlying.code == .notAuthenticated || underlying.code == .accountTemporarilyUnavailable {
+                XCTAssertTrue(constraints.blocksAccountOperations, file: file, line: line)
+            } else if underlying.code == .requestRateLimited || underlying.code == .networkFailure {
+                XCTAssertTrue(constraints.requiresDeferredRetry, file: file, line: line)
+            }
+        }
+        let children = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError], file: file, line: line)
+        let target = CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)
+        let original = try XCTUnwrap(children[target], file: file, line: line)
+        XCTAssertEqual(original.domain, CKErrorDomain, file: file, line: line)
+        XCTAssertEqual(original.code,
+            (route == .saveMissing || route == .lookupMissing)
+                ? CKError.unknownItem.rawValue : CKError.serverRecordChanged.rawValue,
+            "Preserve the original record failure, not an invented new retry error", file: file, line: line)
+        if !route.looksUp {
+            XCTAssertNil(children[.init(recordName: "success", zoneID: adapter.recordZoneID)], file: file, line: line)
+        }
+    }
+    @BigSyncBackgroundActor
+    func testUploadConflictPreservesOwnRetryDeadline() async throws {
+        try await requireDeferredRepair(.saveConflict, retryAfter: 73)
+    }
+    @BigSyncBackgroundActor
+    func testUploadConflictPreservesNestedRateLimit() async throws {
+        try await requireDeferredRepair(.saveConflict, underlying: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]))
+    }
+    @BigSyncBackgroundActor
+    func testUploadConflictPreservesNestedAuthenticationStop() async throws {
+        try await requireDeferredRepair(.saveConflict, underlying: CKError(.notAuthenticated))
+    }
+    @BigSyncBackgroundActor
+    func testUploadConflictPreservesNestedTemporaryAccountStop() async throws {
+        try await requireDeferredRepair(.saveConflict, underlying: CKError(.accountTemporarilyUnavailable))
+    }
+    @BigSyncBackgroundActor
+    func testUploadConflictPreservesNestedTokenRecovery() async throws {
+        try await requireDeferredRepair(.saveConflict, underlying: CKError(.changeTokenExpired))
+    }
+    @BigSyncBackgroundActor
+    func testUploadConflictPreservesNestedNetworkFailure() async throws {
+        try await requireDeferredRepair(.saveConflict, underlying: CKError(.networkFailure))
+    }
+    @BigSyncBackgroundActor
+    func testMissingUploadPreservesOwnRetryDeadline() async throws {
+        try await requireDeferredRepair(.saveMissing, retryAfter: 73)
+    }
+    @BigSyncBackgroundActor
+    func testMissingUploadPreservesNestedRateLimit() async throws {
+        try await requireDeferredRepair(.saveMissing, underlying: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]))
+    }
+    @BigSyncBackgroundActor
+    func testMissingUploadPreservesNestedAuthenticationStop() async throws {
+        try await requireDeferredRepair(.saveMissing, underlying: CKError(.notAuthenticated))
+    }
+    @BigSyncBackgroundActor
+    func testMissingUploadPreservesNestedTemporaryAccountStop() async throws {
+        try await requireDeferredRepair(.saveMissing, underlying: CKError(.accountTemporarilyUnavailable))
+    }
+    @BigSyncBackgroundActor
+    func testMissingUploadPreservesNestedTokenRecovery() async throws {
+        try await requireDeferredRepair(.saveMissing, underlying: CKError(.changeTokenExpired))
+    }
+    @BigSyncBackgroundActor
+    func testMissingUploadPreservesNestedNetworkFailure() async throws {
+        try await requireDeferredRepair(.saveMissing, underlying: CKError(.networkFailure))
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictPreservesOwnRetryDeadline() async throws {
+        try await requireDeferredRepair(.deleteConflict, retryAfter: 73)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictPreservesNestedRateLimit() async throws {
+        try await requireDeferredRepair(.deleteConflict, underlying: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]))
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictPreservesNestedAuthenticationStop() async throws {
+        try await requireDeferredRepair(.deleteConflict, underlying: CKError(.notAuthenticated))
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictPreservesNestedTemporaryAccountStop() async throws {
+        try await requireDeferredRepair(.deleteConflict, underlying: CKError(.accountTemporarilyUnavailable))
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictPreservesNestedTokenRecovery() async throws {
+        try await requireDeferredRepair(.deleteConflict, underlying: CKError(.changeTokenExpired))
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictPreservesNestedNetworkFailure() async throws {
+        try await requireDeferredRepair(.deleteConflict, underlying: CKError(.networkFailure))
+    }
+    @BigSyncBackgroundActor
+    func testAcceptanceMissPreservesOwnRetryDeadline() async throws {
+        try await requireDeferredRepair(.lookupMissing, retryAfter: 73)
+    }
+    @BigSyncBackgroundActor
+    func testAcceptanceMissPreservesNestedRateLimit() async throws {
+        try await requireDeferredRepair(.lookupMissing, underlying: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]))
+    }
+    @BigSyncBackgroundActor
+    func testAcceptanceMissPreservesNestedAuthenticationStop() async throws {
+        try await requireDeferredRepair(.lookupMissing, underlying: CKError(.notAuthenticated))
+    }
+    @BigSyncBackgroundActor
+    func testAcceptanceMissPreservesNestedTemporaryAccountStop() async throws {
+        try await requireDeferredRepair(.lookupMissing, underlying: CKError(.accountTemporarilyUnavailable))
+    }
+    @BigSyncBackgroundActor
+    func testAcceptanceMissPreservesNestedTokenRecovery() async throws {
+        try await requireDeferredRepair(.lookupMissing, underlying: CKError(.changeTokenExpired))
+    }
+    @BigSyncBackgroundActor
+    func testAcceptanceMissPreservesNestedNetworkFailure() async throws {
+        try await requireDeferredRepair(.lookupMissing, underlying: CKError(.networkFailure))
+    }
+
+    @BigSyncBackgroundActor
+    func testUnconstrainedMissingUploadStillRequeuesAndRetries() async throws {
+        let (adapter, transport, _, error) = try await run(.saveMissing, .none)
+        XCTAssertNil(error)
+        XCTAssertTrue(adapter.pending.isEmpty)
+        XCTAssertEqual(adapter.requeued.map(\.recordName), ["target"])
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(Set(adapter.uploaded.map { $0.recordID.recordName }), ["success", "target"])
+    }
+
+    @BigSyncBackgroundActor
+    func testUnconstrainedAcceptanceMissStillSubmitsConditionalCandidate() async throws {
+        let (adapter, transport, _, error) = try await run(.lookupMissing, .none)
+        XCTAssertNil(error)
+        XCTAssertTrue(adapter.pending.isEmpty)
+        XCTAssertTrue(adapter.imported.isEmpty)
+        let calls = await transport.mutationCount
+        let lookups = await transport.lookupCount
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(lookups, 1)
+        XCTAssertEqual(Set(adapter.uploaded.map { $0.recordID.recordName }), ["success", "target"])
+    }
+
+    @BigSyncBackgroundActor
+    func testConstrainedConflictPreservesLocalAcknowledgementFailure() async throws {
+        let local = NSError(domain: "LocalAcknowledgementFailure", code: 29)
+        let (adapter, transport, _, failure) = try await run(
+            .saveConflict, .none, acknowledgeFailure: local, conflictRetryAfter: 73
+        )
+        let error = try XCTUnwrap(failure)
+        XCTAssertEqual(CloudKitRetryConstraints(error).serverMinimum, 73)
+        XCTAssertEqual((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError, local)
+        XCTAssertTrue(adapter.pending.contains("target"))
+        XCTAssertTrue(adapter.imported.isEmpty)
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testConstrainedConflictKeepsAcknowledgementCancellationTerminal() async throws {
+        let (adapter, transport, _, failure) = try await run(
+            .saveConflict, .none, acknowledgeFailure: CancellationError(), conflictRetryAfter: 73
+        )
+        XCTAssertTrue(failure is CancellationError)
+        XCTAssertTrue(adapter.pending.contains("target"))
+        XCTAssertTrue(adapter.imported.isEmpty)
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 1)
+    }
+}
+
+
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    func testValidConflictPreservesExplicitZeroRetryFloor() async throws {
+        try await requireDeferredRepair(.saveConflict, retryAfter: 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testConstrainedConflictPreservesStrongestSiblingDeadline() async throws {
+        let (adapter, transport, _, failure) = try await run(
+            .saveConflict, .none,
+            sibling: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]),
+            conflictRetryAfter: 73
+        )
+        let error = try XCTUnwrap(failure)
+        XCTAssertEqual(CloudKitRetryConstraints(error).serverMinimum, 137)
+        XCTAssertEqual(adapter.pending, ["target", "other"])
+        XCTAssertEqual(adapter.uploaded.map { $0.recordID.recordName }, ["success"])
+        XCTAssertTrue(adapter.imported.isEmpty)
+        let children = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        XCTAssertEqual(children[.init(recordName: "target", zoneID: adapter.recordZoneID)]?.code,
+            CKError.serverRecordChanged.rawValue)
+        XCTAssertEqual(children[.init(recordName: "other", zoneID: adapter.recordZoneID)]?.code,
+            CKError.Code.requestRateLimited.rawValue)
+        XCTAssertNil(children[.init(recordName: "success", zoneID: adapter.recordZoneID)])
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 1)
+    }
+}
+
+
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    func testUploadConflictPreservesOtherRecognizedCloudKitFailures() async throws {
+        for code: CKError.Code in [.quotaExceeded, .zoneNotFound, .operationCancelled] {
+            try await requireDeferredRepair(.saveConflict, underlying: CKError(code))
+        }
+    }
+    @BigSyncBackgroundActor
+    func testMissingUploadPreservesOtherRecognizedCloudKitFailures() async throws {
+        for code: CKError.Code in [.quotaExceeded, .zoneNotFound, .operationCancelled] {
+            try await requireDeferredRepair(.saveMissing, underlying: CKError(code))
+        }
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictPreservesOtherRecognizedCloudKitFailures() async throws {
+        for code: CKError.Code in [.quotaExceeded, .zoneNotFound, .operationCancelled] {
+            try await requireDeferredRepair(.deleteConflict, underlying: CKError(code))
+        }
+    }
+    @BigSyncBackgroundActor
+    func testAcceptanceMissPreservesOtherRecognizedCloudKitFailures() async throws {
+        for code: CKError.Code in [.quotaExceeded, .zoneNotFound, .operationCancelled] {
+            try await requireDeferredRepair(.lookupMissing, underlying: CKError(code))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testOrdinaryConflictWithInternalSDKDetailStillRepairs() async throws {
+        let (adapter, transport, _, error) = try await run(
+            .saveConflict, .none,
+            repairUnderlyingError: NSError(domain: "CKInternalErrorDomain", code: 2004)
+        )
+        XCTAssertNil(error)
+        XCTAssertTrue(adapter.pending.isEmpty)
+        XCTAssertEqual(adapter.imported.map { $0.recordID.recordName }, ["target"])
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 2)
+    }
+
+    @BigSyncBackgroundActor
+    func testOrdinaryAcceptanceMissWithInternalSDKDetailStillSubmits() async throws {
+        let (adapter, transport, _, error) = try await run(
+            .lookupMissing, .none,
+            repairUnderlyingError: NSError(domain: "CKInternalErrorDomain", code: 2004)
+        )
+        XCTAssertNil(error)
+        XCTAssertTrue(adapter.pending.isEmpty)
+        XCTAssertTrue(adapter.imported.isEmpty)
+        let calls = await transport.mutationCount
+        let lookups = await transport.lookupCount
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(lookups, 1)
     }
 }
