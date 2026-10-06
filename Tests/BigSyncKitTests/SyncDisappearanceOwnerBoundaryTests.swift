@@ -429,8 +429,12 @@ extension SyncUndoCloseoutW1Tests {
         }
         let secondName = setup.records[1].recordID.recordName
         let secondGeneration = try XCTUnwrap(prepared.first { $0.recordID == setup.records[1].recordID }?.generation)
-        let secondRevision = try XCTUnwrap(setup.target.object(ofType: BigSyncRecordBaseline.self,
-            forPrimaryKey: secondName)?.revision)
+        let secondBaseline = try XCTUnwrap(setup.target.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: secondName))
+        let secondRevision = secondBaseline.revision
+        // The local physical deletion already invalidates its comparison lifetime.
+        // Rejecting the old response must preserve that captured state exactly.
+        let secondComparisonWasInvalidated = secondBaseline.isComparisonInvalidated
         let secondSubmission = setup.target.objects(BigSyncRecordSubmission.self).first {
             $0.recordName == secondName
         }?.candidateIdentity
@@ -474,8 +478,8 @@ extension SyncUndoCloseoutW1Tests {
 
             XCTAssertEqual(setup.target.object(ofType: BigSyncRecordBaseline.self,
                 forPrimaryKey: secondName)?.revision, secondRevision)
-            XCTAssertFalse(setup.target.object(ofType: BigSyncRecordBaseline.self,
-                forPrimaryKey: secondName)?.isComparisonInvalidated ?? true)
+            XCTAssertEqual(setup.target.object(ofType: BigSyncRecordBaseline.self,
+                forPrimaryKey: secondName)?.isComparisonInvalidated, secondComparisonWasInvalidated)
             XCTAssertEqual(setup.target.object(ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: secondName)?.generation, secondGeneration)
             XCTAssertEqual(setup.target.objects(BigSyncRecordSubmission.self).first {
