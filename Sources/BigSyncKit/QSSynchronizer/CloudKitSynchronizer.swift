@@ -342,8 +342,7 @@ internal class ChangeRequestProcessor {
     private var changeRequests = [ChangeRequest]()
     private var localErrors: [Error] = []
     private var activeRunID = UUID()
-    private var processingTask: Task<InboundProcessingOutcomes, Error>?
-    private var processingTaskID: UUID?
+    private var processingTasks = [UUID: Task<InboundProcessingOutcomes, Error>]()
     internal var fetchedChangeBatchSize = ChangeRequestProcessor.defaultFetchedChangeBatchSize
     
     internal func addFetchedChangeRequest(_ request: ChangeRequest) {
@@ -359,6 +358,13 @@ internal class ChangeRequestProcessor {
         activeRunID = UUID()
         cancelSync = false
         return activeRunID
+    }
+
+    private func checkProcessingRun(_ runID: UUID) throws {
+        try Task.checkCancellation()
+        guard !cancelSync, activeRunID == runID else {
+            throw CancellationError()
+        }
     }
 
     private func entityType(for request: ChangeRequest) -> String? {
@@ -404,6 +410,7 @@ internal class ChangeRequestProcessor {
         restrictedToEntityType restrictedEntityType: String?
     ) async throws -> InboundProcessingOutcomes {
         let runID = activeRunID
+        try checkProcessingRun(runID)
         let taskID = UUID()
         let task = Task { @BigSyncBackgroundActor [weak self] in
             guard let self else { throw CancellationError() }
@@ -413,15 +420,20 @@ internal class ChangeRequestProcessor {
                 runID: runID
             )
         }
-        processingTaskID = taskID
-        processingTask = task
+        processingTasks[taskID] = task
         defer {
-            if processingTaskID == taskID {
-                processingTask = nil
-                processingTaskID = nil
-            }
+            processingTasks.removeValue(forKey: taskID)
         }
-        return try await task.value
+        // Cancellation belongs to this captured child, not whichever task a
+        // later caller may have installed in processingTask. Awaiting the result
+        // still joins noncooperative adapter work before returning.
+        let result = await withTaskCancellationHandler {
+            await task.result
+        } onCancel: {
+            task.cancel()
+        }
+        try checkProcessingRun(runID)
+        return try result.get()
     }
     
     private func processFetchedChangeRequests(
@@ -429,14 +441,10 @@ internal class ChangeRequestProcessor {
         restrictedToEntityType restrictedEntityType: String?,
         runID: UUID
     ) async throws -> InboundProcessingOutcomes {
-        try Task.checkCancellation()
         var outcomes = InboundProcessingOutcomes()
         
         while true {
-            try Task.checkCancellation()
-            guard !cancelSync, activeRunID == runID else {
-                throw CancellationError()
-            }
+            try checkProcessingRun(runID)
             let batch = dequeueBatch(
                 for: adapter,
                 restrictedToEntityType: restrictedEntityType,
@@ -460,10 +468,7 @@ internal class ChangeRequestProcessor {
                         records: downloadedRecords
                     )
                     outcomes.liveResults.append(contentsOf: results)
-                    try Task.checkCancellation()
-                    guard !cancelSync, activeRunID == runID else {
-                        throw CancellationError()
-                    }
+                    try checkProcessingRun(runID)
                 }
                 
                 let deletedRecordIDs = try batch.compactMap {
@@ -479,10 +484,7 @@ internal class ChangeRequestProcessor {
                         recordIDs: deletedRecordIDs
                     )
                     outcomes.deletionResults.append(contentsOf: results)
-                    try Task.checkCancellation()
-                    guard !cancelSync, activeRunID == runID else {
-                        throw CancellationError()
-                    }
+                    try checkProcessingRun(runID)
                 }
             } catch is CancellationError {
                 // The page token is committed only after the complete fetched page
@@ -490,6 +492,9 @@ internal class ChangeRequestProcessor {
                 // redeliver it; requeueing can leak an old run into a newer one.
                 throw CancellationError()
             } catch {
+                // Adapter failures may arrive after reset while its old child
+                // is being joined. They do not belong to a successor run.
+                try checkProcessingRun(runID)
                 localErrors.append(error)
                 // As above, retaining a failed value batch is unnecessary because
                 // its page token has not advanced.
@@ -583,15 +588,19 @@ internal class ChangeRequestProcessor {
 
     func reset() {
         cancelSync = true
-        processingTask?.cancel()
+        for task in processingTasks.values {
+            task.cancel()
+        }
         changeRequests.removeAll(keepingCapacity: false)
         localErrors.removeAll(keepingCapacity: false)
     }
 
     func waitForProcessingToStop() async {
-        let task = processingTask
-        task?.cancel()
-        _ = await task?.result
+        // Snapshot every admitted child. reset() closes new admission first, so
+        // this set cannot gain another current-run child while it is joined.
+        let tasks = Array(processingTasks.values)
+        for task in tasks { task.cancel() }
+        for task in tasks { _ = await task.result }
     }
     
     @BigSyncBackgroundActor
@@ -621,9 +630,13 @@ internal class ChangeRequestProcessor {
     @BigSyncBackgroundActor
     @discardableResult
     func finishProcessing() async throws -> InboundProcessingOutcomes {
+        let runID = activeRunID
+        try checkProcessingRun(runID)
         var outcomes = InboundProcessingOutcomes()
         while let adapter = changeRequests.first?.adapter {
-            outcomes.append(try await finishProcessing(for: adapter))
+            let result = try await finishProcessing(for: adapter)
+            try checkProcessingRun(runID)
+            outcomes.append(result)
         }
         return outcomes
     }
@@ -1894,6 +1907,13 @@ public class CloudKitSynchronizer: NSObject {
                     )
                 )
                 let runID = await changeRequestProcessor.beginRun()
+                // Joining the prior processor can suspend after account
+                // validation. Do not publish a run or activate an adapter for
+                // a cancelled, replaced, or newly invalidated startup owner.
+                try checkAccountValidationAttempt(
+                    attemptID,
+                    fenceGeneration: accountValidationFenceGeneration
+                )
                 synchronizationRunID = runID
                 let context = RunContext(
                     attemptID: attemptID,

@@ -1014,7 +1014,7 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     func activeInboundSemanticQuarantines(
-        accountScopeIdentifier: String,
+        accountScopeIdentifier: String?,
         in persistenceRealm: Realm
     ) -> Results<BigSyncInboundSemanticQuarantine> {
         let containerIdentifier = activeContainerIdentifier
@@ -8344,6 +8344,7 @@ public final class RealmSwiftAdapter:
 
             try await persistenceRealm.asyncWritePreservingOwnership {
                 var acknowledgedInThisWrite = [String: String]()
+                var acknowledgedEntityTypesInThisWrite = [String: String]()
                 for record in chunk {
                     try Task.checkCancellation()
                     guard !cancelSync else { throw CancellationError() }
@@ -8368,6 +8369,7 @@ public final class RealmSwiftAdapter:
                     syncedEntity.state = SyncedEntityState.synced.rawValue
                     syncedEntity.clearPendingMutation()
                     acknowledgedInThisWrite[record.recordID.recordName] = uploadedGeneration
+                    acknowledgedEntityTypesInThisWrite[record.recordID.recordName] = syncedEntity.entityType
                     acknowledgedGenerations[record.recordID.recordName] = uploadedGeneration
                     acknowledgedEntityTypes[record.recordID.recordName] =
                         syncedEntity.entityType
@@ -8382,9 +8384,13 @@ public final class RealmSwiftAdapter:
                         comparisonReceipts: comparisonReceipts,
                         in: persistenceRealm
                     )
+                }
+                if !acknowledgedInThisWrite.isEmpty {
+                    // Every public acknowledgement path must keep restoring
+                    // work pending while deletion evidence remains unresolved.
+                    // Legacy generations supply no permission to retire it.
                     try requireRetainedDeletionQuarantinesSettled(
-                        retainedDeletionCleanup,
-                        acknowledgedGenerations: acknowledgedInThisWrite,
+                        acknowledgedEntityTypes: acknowledgedEntityTypesInThisWrite,
                         in: persistenceRealm
                     )
                 }
@@ -10742,16 +10748,14 @@ extension RealmSwiftAdapter {
     /// acknowledgement and any partial quarantine cleanup roll back together.
     @BigSyncBackgroundActor
     private func requireRetainedDeletionQuarantinesSettled(
-        _ cleanup: RetainedDeletionQuarantineCleanup,
-        acknowledgedGenerations: [String: String],
+        acknowledgedEntityTypes: [String: String],
         in tracking: Realm
     ) throws {
         precondition(tracking.isInWriteTransaction)
         let outstanding = Set(activeInboundSemanticQuarantines(
-            accountScopeIdentifier: cleanup.context.account, in: tracking
+            accountScopeIdentifier: activeAccountScopeIdentifier, in: tracking
         ).filter { quarantine in
-            acknowledgedGenerations[quarantine.recordName] != nil
-                && cleanup.receipts[quarantine.recordName]?.recordType == quarantine.entityType
+            acknowledgedEntityTypes[quarantine.recordName] == quarantine.entityType
                 && Self.isRetainedPhysicalDeletionQuarantine(quarantine)
         }.map(\.recordName))
         guard outstanding.isEmpty else {

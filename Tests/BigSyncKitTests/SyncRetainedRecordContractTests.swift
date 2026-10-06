@@ -1323,6 +1323,8 @@ extension SyncRetainedRecordContractTests {
             liveResults: [], deletionResults: []))
         // Bind the exact already-committed page before supplying its restoring
         // response. A received old tag alone cannot order later deletions.
+        // Server-response bytes must outlive the prepared upload files retired
+        // by an intervening didFinishImport in the newer-generation retry.
         func acceptedResponse(_ record: CKRecord, tag: String) throws -> CKRecord {
             let copy = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(record))
             guard copy.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
@@ -1426,6 +1428,9 @@ extension SyncRetainedRecordContractTests {
             adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil
             adapter.activeAccountScopeIdentifier = "account"
             try await adapter.unsetCancellation()
+            // These variants exercise revoked preparation under different
+            // reply/local inputs. Current-owner guards are covered separately
+            // by the W1 preparation tests; cancellation is the authority here.
             if let retryGuard {
                 switch retryGuard {
                 case .wrongTag:
@@ -1438,13 +1443,13 @@ extension SyncRetainedRecordContractTests {
                     let wrongTag = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(mismatched))
                     XCTAssertEqual(wrongTag.recordChangeTag, "different-accepted-tag")
                     do {
-                    try await adapter.didUpload(savedRecords: [wrongTag], matchingPreparedUploads: prepared)
+                        try await adapter.didUpload(savedRecords: [wrongTag], matchingPreparedUploads: prepared)
                         XCTFail("A revoked prepared cleanup must not be revived")
                     } catch { XCTAssertTrue(error is CancellationError) }
                 case .wrongContext:
                     adapter.activeAccountScopeIdentifier = "replacement-account"
                     do {
-                    try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+                        try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
                         XCTFail("A revoked prepared cleanup must not be revived")
                     } catch { XCTAssertTrue(error is CancellationError) }
                     adapter.activeAccountScopeIdentifier = "account"
@@ -1456,7 +1461,7 @@ extension SyncRetainedRecordContractTests {
                     try await adapter.didFinishImport()
                     let generation = try XCTUnwrap(target.objects(BigSyncPendingMutation.self).first?.generation)
                     do {
-                    try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+                        try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
                         XCTFail("A revoked prepared cleanup must not be revived")
                     } catch { XCTAssertTrue(error is CancellationError) }
                     XCTAssertEqual(target.objects(BigSyncPendingMutation.self).first?.generation, generation)

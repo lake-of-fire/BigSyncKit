@@ -11,13 +11,18 @@ extension SyncUndoCloseoutW1Tests {
     /// which writes user fields and rejects the reserved recordChangeTag key.
     /// The round-trip assertion verifies the resulting real system archive.
     func tagged(_ record: CKRecord, _ tag: String) throws -> CKRecord {
-        guard record.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
+        // A server response owns its bytes independently of the submitted
+        // record and of upload assets later retired by didFinishImport.
+        let response = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(record))
+        let originalTag = record.recordChangeTag
+        guard response.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
             throw NSError(domain: "W1NativeFixture", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "This CloudKit SDK cannot construct the tagged record fixture"])
         }
-        _ = record.perform(NSSelectorFromString("setRecordChangeTag:"), with: tag as NSString)
-        XCTAssertEqual(record.recordChangeTag, tag)
-        let decoded = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(record))
+        _ = response.perform(NSSelectorFromString("setRecordChangeTag:"), with: tag as NSString)
+        XCTAssertEqual(response.recordChangeTag, tag)
+        XCTAssertEqual(record.recordChangeTag, originalTag)
+        let decoded = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(response))
         XCTAssertEqual(decoded.recordChangeTag, tag)
         return decoded
     }
