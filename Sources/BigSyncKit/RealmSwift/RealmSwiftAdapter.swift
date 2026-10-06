@@ -4,11 +4,48 @@
         )
     }
 
+    /// Preserve the original response owner through legacy routing as well as
+    /// comparison-backed records. This closure retains existing transport facts,
+    /// including nil/unbound values; it does not allocate another generation.
+    /// Its checks never call the registry, model code or Realm notifications.
+    @BigSyncBackgroundActor
+    func captureRecordResponseAuthority() -> @BigSyncBackgroundActor @Sendable () throws -> Void {
+        let provider = realmProvider
+        let generation = cancellationGeneration
+        let account = activeAccountScopeIdentifier
+        let context = recordRebaseContext
+        let container = activeContainerIdentifier
+        let databaseScope = activeDatabaseScopeRawValue
+        let binding = activeReplicaBindingGenerationIdentifier
+        return { [self] in
+            try Task.checkCancellation()
+            guard !cancelSync,
+                  cancellationGeneration == generation,
+                  realmProvider === provider,
+                  activeAccountScopeIdentifier == account,
+                  recordRebaseContext == context,
+                  activeContainerIdentifier == container,
+                  activeDatabaseScopeRawValue == databaseScope,
+                  activeReplicaBindingGenerationIdentifier == binding else {
+                throw CancellationError()
+            }
+        }
+    }
+
+    /// Existing callers retain their current transaction semantics. A legacy
+    /// response owns the tracking write, not a shared target writer, and opts
+    /// into a committed target observation at that boundary.
+    private enum PreparedGenerationReadBoundary {
+        case current
+        case committedTarget
+    }
+
     @BigSyncBackgroundActor
     private func preparedGenerationIsEligibleForActiveTransport(
         recordName: String,
         entityType: String,
-        generation: String
+        generation: String,
+        readBoundary: PreparedGenerationReadBoundary = .current
     ) -> Bool {
         guard let persistenceEntity = realmProvider?.persistenceRealm?.object(
             ofType: SyncedEntity.self,
@@ -32,7 +69,13 @@
             .targetReaderRealmPerSchemaName[entityType] else {
             return false
         }
-        guard let mutation = targetRealm.object(
+        let evidence: Realm
+        switch readBoundary {
+        case .current: evidence = targetRealm
+        case .committedTarget:
+            evidence = committedRealmReadSnapshot(in: targetRealm)
+        }
+        guard let mutation = evidence.object(
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: recordName
         ) else {
@@ -83,8 +126,23 @@
         recordIDs deletedRecordIDs: [CKRecord.ID],
         matchingGenerations: [String: String]
     ) async throws {
+        try await didDelete(
+            recordIDs: deletedRecordIDs, matchingGenerations: matchingGenerations,
+            validateResponseAuthority: captureRecordResponseAuthority()
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func didDelete(
+        recordIDs deletedRecordIDs: [CKRecord.ID],
+        matchingGenerations: [String: String],
+        validateResponseAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void
+    ) async throws {
         guard let realmProvider,
-              let persistenceRealm = realmProvider.persistenceRealm else { return }
+              let persistenceRealm = realmProvider.persistenceRealm else {
+            if !deletedRecordIDs.isEmpty { try validateResponseAuthority() }
+            return
+        }
         guard Set(deletedRecordIDs).count == deletedRecordIDs.count,
               deletedRecordIDs.allSatisfy({ $0.zoneID == recordZoneID }) else {
             throw RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared
@@ -102,39 +160,45 @@
         var acknowledgedEntityTypes = [String: String]()
 
         for chunk in deletedRecordIDs.chunks(ofCount: 1000) {
-            try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateResponseAuthority()
             try await persistenceRealm.asyncWritePreservingOwnership {
+                try validateResponseAuthority()
                 for recordID in chunk {
-                    try Task.checkCancellation()
-                    guard !cancelSync else { throw CancellationError() }
-                    guard let syncedEntity = persistenceRealm.object(
-                        ofType: SyncedEntity.self,
-                        forPrimaryKey: recordID.recordName
-                    ), let deletedGeneration = matchingGenerations[recordID.recordName],
-                       syncedEntity.pendingGeneration == deletedGeneration,
-                       preparedGenerationIsEligibleForActiveTransport(
-                           recordName: recordID.recordName,
-                           entityType: syncedEntity.entityType,
-                           generation: deletedGeneration
-                       ) else {
-                        continue
-                    }
-                    if let type = realmObjectClass(name: syncedEntity.entityType),
+                    try validateResponseAuthority()
+                    let name = recordID.recordName
+                    guard let deletedGeneration = matchingGenerations[name],
+                          let selected = persistenceRealm.object(
+                            ofType: SyncedEntity.self, forPrimaryKey: name
+                          ), selected.pendingGeneration == deletedGeneration else { continue }
+                    let entityType = selected.entityType
+                    guard preparedGenerationIsEligibleForActiveTransport(
+                        recordName: name, entityType: entityType,
+                        generation: deletedGeneration, readBoundary: .committedTarget
+                    ) else { continue }
+                    if let type = realmObjectClass(name: entityType),
                        BigSyncRecordLifecycle.retainsTombstone(type) {
-                        throw BigSyncRecordContractError.unexpectedPhysicalDeletion(recordID.recordName)
+                        throw BigSyncRecordContractError.unexpectedPhysicalDeletion(name)
                     }
-                    syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
-                    syncedEntity.clearPendingMutation()
-                    acknowledgedGenerations[recordID.recordName] = deletedGeneration
-                    acknowledgedEntityTypes[recordID.recordName] =
-                        syncedEntity.entityType
+                    try validateResponseAuthority()
+                    guard let current = persistenceRealm.object(
+                        ofType: SyncedEntity.self, forPrimaryKey: name
+                    ), current.entityType == entityType,
+                       current.pendingGeneration == deletedGeneration,
+                       trackingMutationIsEligibleForActiveTransport(current) else { continue }
+                    current.state = SyncedEntityState.deletedRemotely.rawValue
+                    current.clearPendingMutation()
+                    acknowledgedGenerations[name] = deletedGeneration
+                    acknowledgedEntityTypes[name] = entityType
                 }
+                try validateResponseAuthority()
             }
         }
 
         if !acknowledgedGenerations.isEmpty,
            realmProvider.targetReaderRealms != nil {
+            // This is a new mutation phase. An old response may keep its earlier
+            // durable acknowledgement but cannot consume a successor's journal.
+            try validateResponseAuthority()
             var generationsByRealm = [
                 String: (realm: Realm, generations: [String: String])
             ]()
@@ -154,26 +218,28 @@
                 ].generations[recordName] = generation
             }
             for group in generationsByRealm.values {
+                try validateResponseAuthority()
                 let targetReaderRealm = group.realm
                 let generations = group.generations
                 try await targetReaderRealm.asyncWritePreservingOwnership {
+                    try validateResponseAuthority()
                     for (recordName, generation) in generations {
-                        try Task.checkCancellation()
-                        guard !cancelSync else { throw CancellationError() }
-                    guard let mutation = targetReaderRealm.object(
-                        ofType: BigSyncPendingMutation.self,
-                        forPrimaryKey: recordName
-                    ), mutation.generation == generation,
-                        pendingMutationIsEligibleForActiveTransport(
-                            mutation
-                        ) else { continue }
+                        try validateResponseAuthority()
+                        guard let mutation = targetReaderRealm.object(
+                            ofType: BigSyncPendingMutation.self,
+                            forPrimaryKey: recordName
+                        ), mutation.generation == generation,
+                           pendingMutationIsEligibleForActiveTransport(mutation) else { continue }
                         targetReaderRealm.delete(mutation)
                     }
+                    try validateResponseAuthority()
                 }
+                try validateResponseAuthority()
                 let newerMutations = pendingMutationSnapshots(
                     for: generations.keys,
                     in: targetReaderRealm
                 )
+                try validateResponseAuthority()
                 try await forwardPendingMutations(
                     newerMutations,
                     in: targetReaderRealm
@@ -181,6 +247,7 @@
             }
         }
 
+        guard (try? validateResponseAuthority()) != nil else { return }
         updateHasChanges(realm: persistenceRealm)
     }
 
@@ -203,15 +270,32 @@
         _ recordIDs: [CKRecord.ID],
         matchingPreparedGenerations: [String: String]
     ) async throws {
-        guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
+        try await requeueMissingServerRecords(
+            recordIDs, matchingPreparedGenerations: matchingPreparedGenerations,
+            validateResponseAuthority: captureRecordResponseAuthority()
+        )
+    }
+
+    /// The preparation-aware entry passes its original validator through this
+    /// handoff. Capturing here would let an old mixed response adopt a resumed
+    /// attempt after its comparison-backed records had already completed.
+    @BigSyncBackgroundActor
+    func requeueMissingServerRecords(
+        _ recordIDs: [CKRecord.ID],
+        matchingPreparedGenerations: [String: String],
+        validateResponseAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void
+    ) async throws {
+        guard let persistenceRealm = realmProvider?.persistenceRealm else {
+            if !recordIDs.isEmpty { try validateResponseAuthority() }
+            return
+        }
 
         for chunk in recordIDs.chunks(ofCount: 1000) {
-            try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateResponseAuthority()
             try await persistenceRealm.asyncWritePreservingOwnership {
+                try validateResponseAuthority()
                 for recordID in chunk {
-                    try Task.checkCancellation()
-                    guard !cancelSync else { throw CancellationError() }
+                    try validateResponseAuthority()
                     let recordName = recordID.recordName
                     guard recordID.zoneID == recordZoneID else {
                         throw BigSyncRecordRebaseError.inconsistentReceipt(recordName)
@@ -222,25 +306,35 @@
                         throw BigSyncRecordRebaseError.inconsistentReceipt(recordName)
                     }
                     guard let preparedGeneration = matchingPreparedGenerations[recordName],
-                          let syncedEntity = persistenceRealm.object(
-                            ofType: SyncedEntity.self,
-                            forPrimaryKey: recordName
-                          ),
-                          syncedEntity.pendingGeneration == preparedGeneration,
-                          preparedGenerationIsEligibleForActiveTransport(
-                              recordName: recordName,
-                              entityType: syncedEntity.entityType,
-                              generation: preparedGeneration
-                          ) else {
-                        continue
-                    }
-                    syncedEntity.entityState = .new
-                    syncedEntity.encodedRecord = nil
-                    // Keep the prepared generation. The matching journal row
-                    // remains the authority for retrying this exact mutation.
+                          let selected = persistenceRealm.object(
+                            ofType: SyncedEntity.self, forPrimaryKey: recordName
+                          ), selected.pendingGeneration == preparedGeneration else { continue }
+                    let entityType = selected.entityType
+                    guard preparedGenerationIsEligibleForActiveTransport(
+                        recordName: recordName, entityType: entityType,
+                        generation: preparedGeneration, readBoundary: .committedTarget
+                    ) else { continue }
+                    // Committed-target refresh can deliver notifications.
+                    // Recheck owner and the exact tracking generation/binding
+                    // after that callout, before clearing its CAS template.
+                    try validateResponseAuthority()
+                    guard let current = persistenceRealm.object(
+                        ofType: SyncedEntity.self, forPrimaryKey: recordName
+                    ), current.entityType == entityType,
+                       current.pendingGeneration == preparedGeneration,
+                       trackingMutationIsEligibleForActiveTransport(current) else { continue }
+                    current.entityState = .new
+                    current.encodedRecord = nil
+                    // Keep the prepared generation. Its durable journal still
+                    // owns retrying this mutation; no new edit is authored.
                 }
+                // Includes successful early exits from per-record eligibility.
+                try validateResponseAuthority()
             }
         }
+        // A completed write is not rolled back by late cancellation. Suppress
+        // only its optional status publication if a successor now owns it.
+        guard (try? validateResponseAuthority()) != nil else { return }
         updateHasChanges(realm: persistenceRealm)
     }
 
