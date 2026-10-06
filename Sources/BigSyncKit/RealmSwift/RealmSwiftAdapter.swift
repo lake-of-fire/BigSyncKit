@@ -3711,7 +3711,9 @@ public final class RealmSwiftAdapter:
                         return newValue != existingValue.reduce(into: [String: Int]()) { $0[$1.key] = $1.value }
                     case .string:
                         guard let newValue = result as? [String: String], let existingValue = existingValue as? RealmSwift.Map<String, String> else { return true }
-                        return newValue != existingValue.reduce(into: [String: String]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .bool:
                         guard let newValue = result as? [String: Bool], let existingValue = existingValue as? RealmSwift.Map<String, Bool> else { return true }
                         return newValue != existingValue.reduce(into: [String: Bool]()) { $0[$1.key] = $1.value }

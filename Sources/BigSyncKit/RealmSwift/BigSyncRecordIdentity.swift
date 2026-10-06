@@ -49,4 +49,19 @@ enum BigSyncStringIdentity {
     ) -> Bool where Left.Element == String, Right.Element == String {
         Set(lhs.map { Data($0.utf8) }) == Set(rhs.map { Data($0.utf8) })
     }
+
+    static func mappedValuesEqual<Left: Sequence, Right: Sequence>(
+        _ lhs: Left, _ rhs: Right
+    ) -> Bool where Left.Element == (key: String, value: String),
+                   Right.Element == (key: String, value: String) {
+        // Do not first collect Realm entries in a String-keyed dictionary:
+        // that would collapse canonically equivalent, byte-distinct keys.
+        func identities<Entries: Sequence>(_ entries: Entries) -> [Data: Data]
+            where Entries.Element == (key: String, value: String) {
+            entries.reduce(into: [:]) { result, entry in
+                result[Data(entry.key.utf8)] = Data(entry.value.utf8)
+            }
+        }
+        return identities(lhs) == identities(rhs)
+    }
 }

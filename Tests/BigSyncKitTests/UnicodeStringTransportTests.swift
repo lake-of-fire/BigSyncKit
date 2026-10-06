@@ -17,6 +17,7 @@ private final class UnicodeStringTransportRow: Object, ChangeMetadataRecordable,
     @Persisted var names: List<String>
     @Persisted var tags: MutableSet<String>
     @Persisted var urls: List<URL>
+    @Persisted var translations: Map<String, String>
     @Persisted var number = 7
     @Persisted var enabled = true
     @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 10)
@@ -80,6 +81,102 @@ final class UnicodeStringTransportTests: XCTestCase {
         let property = try XCTUnwrap(row.objectSchema.properties.first { $0.name == "tags" })
         try adapter.applyChange(property: property, record: record, object: row,
                                 syncedEntityIdentifier: record.recordID.recordName)
+    }
+
+    private static func encodedMap(_ entries: [String: String]) throws -> CKRecordValue {
+        try PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0) as CKRecordValue
+    }
+
+    @BigSyncBackgroundActor
+    func testMapValueByteChangeIsVisibleToAuditAndFingerprint() async throws {
+        try await withFixture { adapter, _ in
+            for (a, b) in Self.pairs {
+                let row = UnicodeStringTransportRow()
+                row.translations["word"] = a
+                let record = try Self.record(row, adapter)
+                record["translations"] = try Self.encodedMap(["word": b])
+                XCTAssertEqual(adapter.serverDifferencePropertyNames(record: record, object: row), ["translations"])
+                XCTAssertTrue(adapter.hasChanges(record: record, object: row))
+                let compared = try XCTUnwrap(adapter.decodedComparisonObject(
+                    record, type: UnicodeStringTransportRow.self) as? UnicodeStringTransportRow)
+                XCTAssertNotEqual(try BigSyncRecordFingerprint.fields(of: row)["translations"],
+                                  try BigSyncRecordFingerprint.fields(of: compared)["translations"])
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMapKeyByteReplacementIsVisibleToAudit() async throws {
+        try await withFixture { adapter, _ in
+            for (a, b) in Self.pairs {
+                let row = UnicodeStringTransportRow()
+                row.translations[a] = "unchanged"
+                let record = try Self.record(row, adapter)
+                record["translations"] = try Self.encodedMap([b: "unchanged"])
+                XCTAssertEqual(adapter.serverDifferencePropertyNames(record: record, object: row), ["translations"])
+                XCTAssertTrue(adapter.hasChanges(record: record, object: row))
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMapExactReplayAndEntryPermutationRemainNoOps() async throws {
+        try await withFixture { adapter, _ in
+            let row = UnicodeStringTransportRow()
+            row.translations["second"] = Self.pairs[0].1
+            row.translations["first"] = Self.pairs[0].0
+            let record = try Self.record(row, adapter)
+            record["translations"] = try Self.encodedMap([
+                "first": Self.pairs[0].0, "second": Self.pairs[0].1
+            ])
+            XCTAssertFalse(adapter.hasChanges(record: record, object: row))
+            XCTAssertTrue(adapter.serverDifferencePropertyNames(record: record, object: row).isEmpty)
+            record["translations"] = try Self.encodedMap(["first": Self.pairs[0].0])
+            XCTAssertEqual(adapter.serverDifferencePropertyNames(record: record, object: row), ["translations"])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMapComparisonKeepsEquivalentByteDistinctStoredKeys() async throws {
+        try await withFixture { adapter, _ in
+            let row = UnicodeStringTransportRow()
+            let (a, b) = Self.pairs[0]
+            row.translations[a] = "same value"
+            row.translations[b] = "same value"
+            XCTAssertEqual(row.translations.count, 2, "Realm must retain both stored key identities")
+            // Construct the incoming single-member map directly: the upload
+            // serializer's String-keyed dictionary is a separate boundary.
+            let record = try Self.record(row, adapter)
+            for key in [a, b] {
+                record["translations"] = try Self.encodedMap([key: "same value"])
+                XCTAssertEqual(adapter.serverDifferencePropertyNames(record: record, object: row), ["translations"])
+                XCTAssertTrue(adapter.hasChanges(record: record, object: row))
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testManagedIncomingMapReplacementPreservesExactValuesWithoutJournaling() async throws {
+        try await withFixture { adapter, configuration in
+            let realm = try Realm(configuration: configuration)
+            let row = UnicodeStringTransportRow()
+            row.translations["stale"] = "retained until replacement"
+            try realm.write { realm.add(row) }
+            let record = try Self.record(row, adapter)
+            let (a, b) = Self.pairs[0]
+            record["translations"] = try Self.encodedMap(["first": a, "second": b])
+            let property = try XCTUnwrap(row.objectSchema.properties.first { $0.name == "translations" })
+            try realm.write {
+                try adapter.applyChange(property: property, record: record, object: row,
+                                        syncedEntityIdentifier: record.recordID.recordName)
+            }
+            XCTAssertEqual(row.translations.count, 2)
+            XCTAssertNil(row.translations["stale"])
+            XCTAssertEqual(Data(try XCTUnwrap(row.translations["first"]).utf8), Data(a.utf8))
+            XCTAssertEqual(Data(try XCTUnwrap(row.translations["second"]).utf8), Data(b.utf8))
+            XCTAssertFalse(adapter.hasChanges(record: record, object: row))
+            XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+        }
     }
 
     @BigSyncBackgroundActor
