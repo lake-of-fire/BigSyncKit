@@ -326,8 +326,17 @@ extension CloudKitSynchronizer {
             let uncertain = prepared.filter(\.requiresAcceptanceCheck)
             if !uncertain.isEmpty, let lookup = recordStore as? any CloudKitRecordFetching {
                 let fetched = try await lookup.fetchRecords(with: uncertain.map { $0.record.recordID })
+                // Record malformed/missing slots before account revalidation
+                // can fail independently. Keep the raw lookup loop below: its
+                // identity rejection is deliberately fail-fast, while missing
+                // slots retain the existing valid-observation import policy.
+                let lookupResults = validatedMutationResults(
+                    fetched,
+                    expected: uncertain.map { ($0.record.recordID, $0.record.recordType) },
+                    successRecord: { $0 }
+                )
                 let returnedFailures = returnedMutationFailures(
-                    in: fetched, for: uncertain.map { $0.record.recordID }
+                    in: lookupResults, for: uncertain.map { $0.record.recordID }
                 )
                 try await revalidateMutationResultContext(
                     for: attemptID, preserving: returnedFailures

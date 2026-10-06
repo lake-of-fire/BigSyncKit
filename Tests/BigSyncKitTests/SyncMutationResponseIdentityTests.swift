@@ -795,3 +795,333 @@ extension SyncMutationResponseIdentityTests {
         XCTAssertEqual(lookups, 1)
     }
 }
+
+
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    func testMalformedLookupIdentitySurvivesAccountRevalidationFailure() async throws {
+        for alteration: ResponseAlteration in [.name, .zone, .owner, .type, .siblingIdentity] {
+            let (adapter, transport, _, failure) = try await run(
+                .lookup, alteration, failsAccountAfterResult: true
+            )
+            let error = try XCTUnwrap(failure)
+            let children = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+                as? [CKRecord.ID: NSError])
+            let invalid = CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)
+            let expected = BigSyncRecordRebaseError.inconsistentReceipt("target") as NSError
+            XCTAssertEqual(children[invalid]?.domain, expected.domain)
+            XCTAssertEqual(children[invalid]?.code, expected.code)
+            XCTAssertNil(children[.init(recordName: "success", zoneID: adapter.recordZoneID)])
+            XCTAssertEqual(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)?.domain,
+                           "ResponseAccountFailure")
+            XCTAssertTrue(adapter.imported.isEmpty)
+            XCTAssertTrue(adapter.uploaded.isEmpty)
+            XCTAssertEqual(adapter.pending, ["success", "target"])
+            let calls = await transport.mutationCount
+            let lookups = await transport.lookupCount
+            XCTAssertEqual(calls, 0)
+            XCTAssertEqual(lookups, 1)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingLookupResultSurvivesAccountRevalidationFailure() async throws {
+        let (adapter, transport, _, failure) = try await run(
+            .lookup, .missingResult, failsAccountAfterResult: true
+        )
+        let error = try XCTUnwrap(failure)
+        let children = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        let missing = CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)
+        let expected = CocoaError(.coderValueNotFound) as NSError
+        XCTAssertEqual(children[missing]?.domain, expected.domain)
+        XCTAssertEqual(children[missing]?.code, expected.code)
+        XCTAssertEqual(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)?.domain,
+                       "ResponseAccountFailure")
+        XCTAssertTrue(adapter.imported.isEmpty)
+        XCTAssertEqual(adapter.pending, ["success", "target"])
+        let calls = await transport.mutationCount
+        let lookups = await transport.lookupCount
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(lookups, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedLookupAndSiblingDeadlineSurviveAccountFailureTogether() async throws {
+        let (adapter, transport, _, failure) = try await run(
+            .lookup, .name,
+            sibling: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]),
+            failsAccountAfterResult: true
+        )
+        let error = try XCTUnwrap(failure)
+        let children = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        let expected = BigSyncRecordRebaseError.inconsistentReceipt("target") as NSError
+        XCTAssertEqual(children[.init(recordName: "target", zoneID: adapter.recordZoneID)]?.domain,
+                       expected.domain)
+        XCTAssertEqual(children[.init(recordName: "other", zoneID: adapter.recordZoneID)]?.code,
+                       CKError.Code.requestRateLimited.rawValue)
+        XCTAssertEqual(CloudKitRetryConstraints(error).serverMinimum, 137)
+        XCTAssertEqual(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)?.domain,
+                       "ResponseAccountFailure")
+        XCTAssertTrue(adapter.imported.isEmpty)
+        XCTAssertEqual(adapter.pending, ["success", "target", "other"])
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedLookupKeepsFailFastPolicyWithAuthenticationSibling() async throws {
+        try await reject(.lookup, .name, sibling: CKError(.notAuthenticated))
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingLookupStillImportsValidObservationBeforeReportingMissingSlot() async throws {
+        let (adapter, transport, _, failure) = try await run(.lookup, .missingResult)
+        let error = try XCTUnwrap(failure)
+        let children = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        XCTAssertNotNil(children[.init(recordName: "target", zoneID: adapter.recordZoneID)])
+        XCTAssertNil(children[.init(recordName: "success", zoneID: adapter.recordZoneID)])
+        XCTAssertEqual(adapter.imported.map { $0.recordID.recordName }, ["success"])
+        XCTAssertEqual(adapter.pending, ["target"])
+        XCTAssertTrue(adapter.uploaded.isEmpty)
+        let calls = await transport.mutationCount
+        let lookups = await transport.lookupCount
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(lookups, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testValidLookupAccountFailureRetainsOriginalIsolatedError() async throws {
+        let (adapter, transport, _, failure) = try await run(
+            .lookup, .none, failsAccountAfterResult: true
+        )
+        let error = try XCTUnwrap(failure)
+        XCTAssertEqual((error as NSError).domain, "ResponseAccountFailure")
+        XCTAssertNil((error as NSError).userInfo[CKPartialErrorsByItemIDKey])
+        XCTAssertTrue(adapter.imported.isEmpty)
+        XCTAssertEqual(adapter.pending, ["success", "target"])
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 0)
+    }
+}
+
+
+/// Computed userInfo creates a graph cycle without retaining a permanent
+/// strong-reference cycle in the fixture itself.
+private final class MultipleUnderlyingCycle: NSError, @unchecked Sendable {
+    private let retry = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]) as NSError
+    init() { super.init(domain: CKErrorDomain, code: CKError.Code.limitExceeded.rawValue, userInfo: nil) }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+    override var userInfo: [String: Any] {
+        [NSMultipleUnderlyingErrorsKey: [self, retry]]
+    }
+}
+
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    private func requireMultipleUnderlyingConstraint(_ route: ResponseRoute) async throws {
+        for code: CKError.Code in [.notAuthenticated, .accountTemporarilyUnavailable,
+                                    .requestRateLimited, .networkFailure, .changeTokenExpired] {
+            let cloudError = CKError(code, userInfo: code == .requestRateLimited
+                ? [CKErrorRetryAfterKey: 137] : [:])
+            // The aggregate's outer Cocoa domain is not itself a repair stop.
+            // The classifier must inspect its standard Foundation children.
+            let aggregate = NSError(domain: NSCocoaErrorDomain, code: 512,
+                userInfo: [NSMultipleUnderlyingErrorsKey: [cloudError as NSError]])
+            let (adapter, transport, account, failure) = try await run(
+                route, .none, repairUnderlyingError: aggregate
+            )
+            let error = try XCTUnwrap(failure)
+            let constraints = CloudKitRetryConstraints(error)
+            XCTAssertTrue(constraints.codes.contains(code))
+            if code == .notAuthenticated || code == .accountTemporarilyUnavailable {
+                XCTAssertTrue(constraints.blocksAccountOperations)
+                let probes = await account.callsAfterResult
+                XCTAssertEqual(probes, 0)
+            }
+            if code == .requestRateLimited {
+                XCTAssertEqual(constraints.serverMinimum, 137)
+                XCTAssertTrue(constraints.requiresDeferredRetry)
+            }
+            if code == .changeTokenExpired { XCTAssertTrue(constraints.requestsTokenRecovery) }
+            if code == .networkFailure { XCTAssertTrue(constraints.requiresDeferredRetry) }
+            XCTAssertTrue(adapter.imported.isEmpty)
+            XCTAssertTrue(adapter.rebased.isEmpty)
+            XCTAssertTrue(adapter.requeued.isEmpty)
+            XCTAssertTrue(adapter.pending.contains("target"))
+            let calls = await transport.mutationCount
+            let lookups = await transport.lookupCount
+            XCTAssertEqual(calls, route.looksUp ? 0 : 1)
+            XCTAssertEqual(lookups, route.looksUp ? 1 : 0)
+            let acknowledged = route.deletes ? adapter.deleted.map(\.recordName)
+                : adapter.uploaded.map { $0.recordID.recordName }
+            XCTAssertEqual(acknowledged, route.looksUp ? [] : ["success"])
+            let children = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+                as? [CKRecord.ID: NSError])
+            let slot = try XCTUnwrap(children[.init(recordName: "target", zoneID: adapter.recordZoneID)])
+            XCTAssertEqual(slot.code, route == .saveMissing || route == .lookupMissing
+                ? CKError.unknownItem.rawValue : CKError.serverRecordChanged.rawValue)
+            XCTAssertTrue((slot.userInfo[NSUnderlyingErrorKey] as? NSError) === aggregate)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadConflictRetainsMultipleUnderlyingConstraints() async throws {
+        try await requireMultipleUnderlyingConstraint(.saveConflict)
+    }
+    @BigSyncBackgroundActor
+    func testMissingUploadRetainsMultipleUnderlyingConstraints() async throws {
+        try await requireMultipleUnderlyingConstraint(.saveMissing)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictRetainsMultipleUnderlyingConstraints() async throws {
+        try await requireMultipleUnderlyingConstraint(.deleteConflict)
+    }
+    @BigSyncBackgroundActor
+    func testAcceptanceMissRetainsMultipleUnderlyingConstraints() async throws {
+        try await requireMultipleUnderlyingConstraint(.lookupMissing)
+    }
+
+    func testMultipleUnderlyingDeadlineCannotQualifyAsPureSizeFailure() {
+        let delay = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]) as NSError
+        let error = CKError(.limitExceeded, userInfo: [NSMultipleUnderlyingErrorsKey: [delay]])
+        let constraints = CloudKitRetryConstraints(error)
+        XCTAssertFalse(constraints.containsOnlySizeLimitFailures)
+        XCTAssertEqual(constraints.serverMinimum, 137)
+        XCTAssertTrue(constraints.requiresDeferredRetry)
+    }
+
+    func testMultipleUnderlyingLocalFailureCannotQualifyAsPureSizeFailure() {
+        let local = NSError(domain: "LocalDurability", code: 2)
+        let error = CKError(.limitExceeded, userInfo: [NSMultipleUnderlyingErrorsKey: [local]])
+        XCTAssertFalse(CloudKitRetryConstraints(error).containsOnlySizeLimitFailures)
+    }
+
+    func testMultipleUnderlyingPureSizeGraphRetainsImmediateSplitEligibility() {
+        let limit = CKError(.limitExceeded) as NSError
+        let branch = CKError(.batchRequestFailed,
+            userInfo: [NSMultipleUnderlyingErrorsKey: [limit, limit]]) as NSError
+        let error = CKError(.partialFailure, userInfo: [
+            CKPartialErrorsByItemIDKey: ["first": branch, "second": branch],
+            NSUnderlyingErrorKey: limit,
+            NSMultipleUnderlyingErrorsKey: [limit],
+        ])
+        XCTAssertTrue(CloudKitRetryConstraints(error).containsOnlySizeLimitFailures)
+        XCTAssertFalse(CloudKitRetryConstraints(error).requiresDeferredRetry)
+    }
+
+    func testMultipleUnderlyingSharedGraphVisitsEachNSErrorOnce() {
+        let account = CKError(.notAuthenticated) as NSError
+        let deadline = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]) as NSError
+        let shared = NSError(domain: "Aggregate", code: 1,
+            userInfo: [NSMultipleUnderlyingErrorsKey: [account, deadline]])
+        let error = CKError(.partialFailure, userInfo: [
+            CKPartialErrorsByItemIDKey: ["first": shared, "second": shared],
+            NSUnderlyingErrorKey: shared,
+            NSMultipleUnderlyingErrorsKey: [shared, deadline],
+        ])
+        let codes = cloudKitErrors(in: error).map(\.code)
+        XCTAssertEqual(codes.filter { $0 == .notAuthenticated }.count, 1)
+        XCTAssertEqual(codes.filter { $0 == .requestRateLimited }.count, 1)
+        XCTAssertEqual(codes.count, 3)
+    }
+
+    func testMultipleUnderlyingCycleTerminatesAndPreservesKnownDeadline() {
+        let error = MultipleUnderlyingCycle()
+        let constraints = CloudKitRetryConstraints(error)
+        XCTAssertFalse(constraints.containsOnlySizeLimitFailures)
+        XCTAssertEqual(constraints.serverMinimum, 137)
+        XCTAssertTrue(constraints.requiresDeferredRetry)
+        XCTAssertEqual(cloudKitErrors(in: error).count, 2)
+    }
+
+    func testSingularAndMultipleUnderlyingErrorsBothContributeConstraints() {
+        let account = CKError(.notAuthenticated) as NSError
+        let weaker = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 73]) as NSError
+        let stronger = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]) as NSError
+        let error = CKError(.unknownItem, userInfo: [
+            NSUnderlyingErrorKey: weaker,
+            NSMultipleUnderlyingErrorsKey: [stronger, account],
+        ])
+        let constraints = CloudKitRetryConstraints(error)
+        XCTAssertTrue(constraints.blocksAccountOperations)
+        XCTAssertEqual(constraints.serverMinimum, 137)
+        XCTAssertEqual((error as NSError).underlyingErrors.count, 3)
+    }
+
+    @BigSyncBackgroundActor
+    func testUnconstrainedInternalMultipleErrorsStillAllowOrdinaryRepair() async throws {
+        let detail = NSError(domain: "CKInternalErrorDomain", code: 2004)
+        let aggregate = NSError(domain: "InternalAggregate", code: 1,
+            userInfo: [NSMultipleUnderlyingErrorsKey: [detail]])
+        let (adapter, transport, _, failure) = try await run(
+            .saveConflict, .none, repairUnderlyingError: aggregate
+        )
+        XCTAssertNil(failure)
+        XCTAssertTrue(adapter.pending.isEmpty)
+        let count = await transport.mutationCount
+        XCTAssertEqual(count, 2)
+    }
+
+    func testEmptyMultipleUnderlyingListPreservesLeafClassification() {
+        let error = CKError(.limitExceeded, userInfo: [NSMultipleUnderlyingErrorsKey: [NSError]()])
+        XCTAssertTrue(CloudKitRetryConstraints(error).containsOnlySizeLimitFailures)
+        XCTAssertEqual(cloudKitErrors(in: error).count, 1)
+    }
+}
+
+
+extension SyncMutationResponseIdentityTests {
+    func testAggregateSizeProofKeepsExistingDepthLimit() {
+        for edges in [30, 31, 32, 40] {
+            var error: NSError = CKError(.limitExceeded) as NSError
+            for _ in 0..<edges {
+                error = CKError(.batchRequestFailed,
+                    userInfo: [NSMultipleUnderlyingErrorsKey: [error]]) as NSError
+            }
+            XCTAssertEqual(CloudKitRetryConstraints(error).containsOnlySizeLimitFailures,
+                           edges < 32)
+        }
+    }
+
+    func testAggregateTraversalFindsSharedCauseThroughItsShallowestPath() {
+        let deadline = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]) as NSError
+        var deep = deadline
+        for _ in 0..<40 {
+            deep = NSError(domain: "Wrapper", code: 1,
+                userInfo: [NSMultipleUnderlyingErrorsKey: [deep]])
+        }
+        let error = CKError(.unknownItem, userInfo: [
+            NSMultipleUnderlyingErrorsKey: [deep, deadline],
+            NSUnderlyingErrorKey: deep,
+        ])
+        let constraints = CloudKitRetryConstraints(error)
+        XCTAssertEqual(constraints.serverMinimum, 137)
+        XCTAssertEqual(cloudKitErrors(in: error).filter { $0.code == .requestRateLimited }.count, 1)
+    }
+
+    func testRepeatedAggregateChildrenDoNotMultiplyVisitedCloudErrors() {
+        let account = CKError(.notAuthenticated) as NSError
+        let shared = NSError(domain: "Aggregate", code: 1,
+            userInfo: [NSMultipleUnderlyingErrorsKey: Array(repeating: account, count: 128)])
+        let root = CKError(.serverRecordChanged,
+            userInfo: [NSMultipleUnderlyingErrorsKey: Array(repeating: shared, count: 128)])
+        XCTAssertTrue(CloudKitRetryConstraints(root).blocksAccountOperations)
+        XCTAssertEqual(cloudKitErrors(in: root).count, 2)
+    }
+
+    func testNonCloudWrapperAggregateAndSingleCauseRemainIndependent() {
+        let auth = CKError(.notAuthenticated) as NSError
+        let token = CKError(.changeTokenExpired) as NSError
+        let root = NSError(domain: "LocalAggregate", code: 2, userInfo: [
+            NSUnderlyingErrorKey: auth,
+            NSMultipleUnderlyingErrorsKey: [token],
+        ])
+        let constraints = CloudKitRetryConstraints(root)
+        XCTAssertTrue(constraints.blocksAccountOperations)
+        XCTAssertTrue(constraints.requestsTokenRecovery)
+        XCTAssertFalse(constraints.containsOnlySizeLimitFailures)
+    }
+}
