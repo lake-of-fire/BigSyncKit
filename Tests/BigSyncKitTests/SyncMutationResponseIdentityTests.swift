@@ -240,6 +240,7 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
             accountIdentifierProvider: { try await account.identity() }, accountStatusProvider: { .available },
             changeFeed: transport, subscriptionStore: transport, zoneStore: transport, recordStore: transport,
             backupDetectionBaseURL: dir, logger: Logger(label: "ResponseIdentity"))
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = .init(attemptID: sync.synchronizationAttemptID,
             runID: sync.synchronizationRunID, accountIdentifier: "identity-account",
             accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "identity-account"))

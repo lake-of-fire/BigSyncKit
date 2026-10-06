@@ -1213,6 +1213,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.addModelAdapter(fixture.adapter)
         synchronizer.syncing = true
         synchronizer.synchronizationDrainIsActive = true
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         synchronizer.activeRunContext = reviewContext(synchronizer)
         try fixture.adapter.prepareForFencedMigrationAfterCancellation()
         // Exercise the real failure handler's explicit flush, not just the
@@ -1429,6 +1430,7 @@ final class BigSyncKitTests: XCTestCase {
             sync.syncing = true
             sync.synchronizationDrainIsActive = true
             let original = reviewContext(sync)
+            sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
             sync.activeRunContext = original
             let entered = AsyncGate(), release = AsyncGate()
             let error = CKError(encrypted ? .zoneNotFound : .userDeletedZone, userInfo: encrypted
@@ -1517,6 +1519,7 @@ final class BigSyncKitTests: XCTestCase {
             let store = DictionaryKeyValueStore()
             let database = FakeCloudKitDatabase()
             let sync = makeSynchronizer(database: database, keyValueStore: store)
+            sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
             sync.activeRunContext = reviewContext(sync)
             database.nextDatabaseChangesError = CKError(encrypted ? .zoneNotFound : .userDeletedZone,
                 userInfo: encrypted ? [CKErrorUserDidResetEncryptedDataKey: true] : [:])
@@ -1665,6 +1668,7 @@ final class BigSyncKitTests: XCTestCase {
         }
         sync.syncing = true
         sync.synchronizationDrainIsActive = true
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = reviewContext(sync)
         var observedError: Error?
         do {
@@ -1701,6 +1705,7 @@ final class BigSyncKitTests: XCTestCase {
             sync.syncing = true
             sync.synchronizationDrainIsActive = true
             let context = reviewContext(sync)
+            sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
             sync.activeRunContext = context
             let error = CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [
                 "expired": CKError(.changeTokenExpired),
@@ -5007,6 +5012,7 @@ final class BigSyncKitTests: XCTestCase {
             accountIdentifierProvider: { "health-account" }
         )
         let successAt = Date(timeIntervalSinceReferenceDate: 123_456)
+        first.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         try first._test_recordSyncHealth(
             .succeeded,
             accountIdentifier: "health-account",
@@ -5037,6 +5043,7 @@ final class BigSyncKitTests: XCTestCase {
             identifier: identifier,
             accountIdentifierProvider: { "first-account" }
         )
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         try synchronizer._test_recordSyncHealth(
             .failed,
             accountIdentifier: "first-account",
@@ -5081,6 +5088,7 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         let retryNotBefore = Date(timeIntervalSinceReferenceDate: 456_789)
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         try synchronizer._test_recordSyncHealth(
             .transientRetry,
             accountIdentifier: "test-account",
@@ -6770,6 +6778,7 @@ final class BigSyncKitTests: XCTestCase {
             accountIdentifier: "test-account",
             accountScopeIdentifier: "test-account-scope"
         )
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = context
         sync.persistTransientRetryState(
             context: context,
@@ -6885,6 +6894,7 @@ final class BigSyncKitTests: XCTestCase {
         synchronizer.syncing = true
         synchronizer.synchronizationDrainIsActive = true
         synchronizer.consecutiveTransientCloudKitFailures = 4
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         synchronizer.activeRunContext = CloudKitSynchronizer.RunContext(
             attemptID: synchronizer.synchronizationAttemptID,
             runID: synchronizer.synchronizationRunID,
@@ -13976,6 +13986,7 @@ final class BigSyncKitTests: XCTestCase {
             // with the same active account context the synchronization run
             // installs before any CloudKit work.
             let attemptID = synchronizer.synchronizationAttemptID
+            synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
             synchronizer.activeRunContext = CloudKitSynchronizer.RunContext(
                 attemptID: attemptID,
                 runID: synchronizer.synchronizationRunID,
@@ -16873,6 +16884,7 @@ final class BigSyncKitTests: XCTestCase {
             accountIdentifier: database.accountIdentifier,
             accountScopeIdentifier: accountScope
         )
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         synchronizer.activeRunContext = context
         store.synchronizesDurably = false
 

@@ -207,6 +207,7 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
         sync._allowRecordZoneRebindingForTesting()
         sync.addModelAdapter(adapter)
         sync.synchronizationRunID = await sync.changeRequestProcessor.beginRun()
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = .init(attemptID: sync.synchronizationAttemptID,
             runID: sync.synchronizationRunID, accountIdentifier: "sync-phase-account",
             accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "sync-phase-account"))
