@@ -34,6 +34,20 @@ public enum BigSyncRecordIdentity {
 /// here can hide a real scalar edit or collapse distinct collection members.
 /// This helper does not change storage, wire encoding, or conflict policy.
 enum BigSyncStringIdentity {
+    static func mapKeysAreUnambiguous<Keys: Sequence>(_ keys: Keys) -> Bool
+        where Keys.Element == String {
+        var seen = Set<String>()
+        return keys.allSatisfy { seen.insert($0).inserted }
+    }
+
+    static func realmMapKeysAreUnambiguous(_ value: Any?) -> Bool {
+        guard let collection = value as? RLMSwiftCollectionBase,
+              let map = collection._rlmCollection as? RLMDictionary<AnyObject, AnyObject> else { return false }
+        let rawKeys = map.allKeys
+        let keys = rawKeys.compactMap { $0 as? String }
+        return keys.count == rawKeys.count && mapKeysAreUnambiguous(keys)
+    }
+
     static func equal(_ lhs: String, _ rhs: String) -> Bool {
         lhs.utf8.elementsEqual(rhs.utf8)
     }

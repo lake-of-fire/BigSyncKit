@@ -207,6 +207,14 @@ extension BigSyncRecordPayload {
             throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
         }
         let skipped = (object as? SyncSkippablePropertiesModel)?.skipSyncingProperties() ?? []
+        // Preflight before altering a supplied template or staging assets.
+        // The existing Swift dictionary wire boundary cannot retain keys that
+        // differ only by canonical Unicode spelling.
+        for property in object.objectSchema.properties where property.isMap && !skipped.contains(property.name) {
+            guard BigSyncStringIdentity.realmMapKeysAreUnambiguous(object[property.name]) else {
+                throw BigSyncRecordRebaseError.unsupportedField(property.name)
+            }
+        }
         let stringIntegers = (type(of: object) as? BigSyncStringEncodedIntegerModel.Type)?
             .bigSyncStringEncodedIntegerPropertyNames ?? []
         for property in object.objectSchema.properties {

@@ -411,12 +411,20 @@ private func maxDate(_ lhs: Date?, _ rhs: Date?) -> Date? {
 }
 
 private func decodedCloudKitMap(_ value: Any?) -> [String: Any]? {
-    guard let data = value as? Data else { return nil }
-    return try? PropertyListSerialization.propertyList(
-        from: data,
-        options: [],
-        format: nil
-    ) as? [String: Any]
+    guard let data = value as? Data,
+          let raw = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+          ), let dictionary = raw as? NSDictionary else { return nil }
+    // Inspect Foundation's literal keys before bridging to Swift Dictionary,
+    // whose canonical String equality can silently discard a stored member.
+    let keys = dictionary.allKeys.compactMap { $0 as? String }
+    guard keys.count == dictionary.count,
+          BigSyncStringIdentity.mapKeysAreUnambiguous(keys),
+          let result = dictionary as? [String: Any],
+          result.count == dictionary.count else { return nil }
+    return result
 }
 
 private func encodedCloudKitMap(_ value: [String: Any]) throws -> Data {
@@ -6217,6 +6225,16 @@ public final class RealmSwiftAdapter:
             skippedKeys = []
         }
         let defaultObject: Object? = skippedKeys.isEmpty ? nil : type(of: object).init()
+
+        // Reject unrepresentable maps before building a record or staging
+        // assets. The existing dictionary wire format cannot retain these keys.
+        for property in object.objectSchema.properties where property.isMap && !skippedKeys.contains(property.name) {
+            guard BigSyncStringIdentity.realmMapKeysAreUnambiguous(object[property.name]) else {
+                throw RealmSwiftRemoteRecordDecodingError.malformedField(
+                    recordName: syncedEntity.identifier, propertyName: property.name,
+                    expected: "a scalar Realm map with canonically unique keys for upload")
+            }
+        }
 
         //        let changedKeys = (syncedEntity.changedKeys ?? "").components(separatedBy: ",")
 

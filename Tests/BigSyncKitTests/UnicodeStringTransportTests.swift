@@ -26,6 +26,17 @@ private final class UnicodeStringTransportRow: Object, ChangeMetadataRecordable,
     @Persisted var isDeleted = false
 }
 
+@objc(BigSyncUnicodeLegacyMapTransportFixture)
+private final class UnicodeLegacyMapTransportRow: Object, ChangeMetadataRecordable {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+    @Persisted(primaryKey: true) var id = "legacy-map"
+    @Persisted var translations: Map<String, String>
+    @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 10)
+    @Persisted var modifiedAt = Date(timeIntervalSinceReferenceDate: 10)
+    @Persisted var explicitlyModifiedAt: Date? = Date(timeIntervalSinceReferenceDate: 10)
+    @Persisted var isDeleted = false
+}
+
 final class UnicodeStringTransportTests: XCTestCase {
     private static let pairs: [(String, String)] = [
         ("\u{304C}", "\u{304B}\u{3099}"),
@@ -44,7 +55,8 @@ final class UnicodeStringTransportTests: XCTestCase {
         var configuration = Realm.Configuration()
         configuration.fileURL = nil
         configuration.inMemoryIdentifier = "unicode-string-target-" + nonce
-        configuration.objectTypes = [UnicodeStringTransportRow.self, BigSyncPendingMutation.self]
+        configuration.objectTypes = [UnicodeStringTransportRow.self, UnicodeLegacyMapTransportRow.self,
+                                     BigSyncPendingMutation.self]
         BigSyncMutationPolicy.enableRecordRebasing(in: &configuration)
         BigSyncMutationPolicy(excludedClassNames: []).install(
             configurations: [configuration], mutationJournalIdentityProvider: {
@@ -63,8 +75,8 @@ final class UnicodeStringTransportTests: XCTestCase {
             logger: Logger(label: "UnicodeStringTransportTests"),
             startSetupTask: false, assetDirectoryURL: directory)
         fixtureOwner.own(adapter)
-        // These tests exercise the real decoders/comparer with task-owned
-        // Realm rows. No transport setup, CloudKit request or reset is needed.
+        // These tests exercise real codecs/comparison with task-owned rows.
+        // The legacy writer case also opens the local adapter provider.
         try await body(adapter, configuration)
     }
 
@@ -85,6 +97,56 @@ final class UnicodeStringTransportTests: XCTestCase {
 
     private static func encodedMap(_ entries: [String: String]) throws -> CKRecordValue {
         try PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0) as CKRecordValue
+    }
+
+    @BigSyncBackgroundActor
+    private static func legacyMapRecord(_ adapter: RealmSwiftAdapter) throws -> CKRecord? {
+        adapter.realmProvider?.targetReaderRealmPerSchemaName[UnicodeLegacyMapTransportRow.className()]?.refresh()
+        let entity = SyncedEntity()
+        entity.identifier = UnicodeLegacyMapTransportRow.className() + ".legacy-map"
+        entity.entityType = UnicodeLegacyMapTransportRow.className()
+        entity.entityState = .new
+        return try adapter.recordToUpload(syncedEntity: entity, isDummyRecord: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testAmbiguousLegacyMapUploadRejectsWithoutJournalMutation() async throws {
+        try await withFixture { adapter, configuration in
+            try await adapter.ensureSetup()
+            let realm = try Realm(configuration: configuration)
+            let row = UnicodeLegacyMapTransportRow()
+            let (a, b) = Self.pairs[0]
+            row.translations[a] = "first"
+            row.translations[b] = "second"
+            XCTAssertEqual(row.translations.count, 2)
+            try realm.write {
+                realm.add(row)
+                row.refreshChangeMetadata(explicitlyModified: true, at: row.modifiedAt)
+            }
+            let name = row.objectSchema.className + "." + row.id
+            let generation = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self,
+                                                       forPrimaryKey: name)?.generation)
+            do {
+                _ = try await Self.legacyMapRecord(adapter)
+                XCTFail("Ambiguous legacy upload must fail before serialization")
+            } catch {
+                XCTAssertTrue(error is RealmSwiftRemoteRecordDecodingError)
+            }
+            XCTAssertEqual(row.translations.count, 2)
+            XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+                                       forPrimaryKey: name)?.generation, generation)
+            try realm.write {
+                row.translations.removeAll()
+                row.translations["word"] = b
+                row.refreshChangeMetadata(explicitlyModified: true, at: Date(timeIntervalSinceReferenceDate: 20))
+            }
+            let upload = try await Self.legacyMapRecord(adapter)
+            let ordinary = try XCTUnwrap(upload)
+            let payload = try XCTUnwrap(ordinary["translations"] as? Data)
+            let decoded = try XCTUnwrap(try PropertyListSerialization.propertyList(
+                from: payload, options: [], format: nil) as? [String: String])
+            XCTAssertEqual(Data(try XCTUnwrap(decoded["word"]).utf8), Data(b.utf8))
+        }
     }
 
     @BigSyncBackgroundActor
@@ -141,16 +203,99 @@ final class UnicodeStringTransportTests: XCTestCase {
         try await withFixture { adapter, _ in
             let row = UnicodeStringTransportRow()
             let (a, b) = Self.pairs[0]
+            let record = try Self.record(row, adapter)
             row.translations[a] = "same value"
             row.translations[b] = "same value"
             XCTAssertEqual(row.translations.count, 2, "Realm must retain both stored key identities")
             // Construct the incoming single-member map directly: the upload
             // serializer's String-keyed dictionary is a separate boundary.
-            let record = try Self.record(row, adapter)
             for key in [a, b] {
                 record["translations"] = try Self.encodedMap([key: "same value"])
                 XCTAssertEqual(adapter.serverDifferencePropertyNames(record: record, object: row), ["translations"])
                 XCTAssertTrue(adapter.hasChanges(record: record, object: row))
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testAmbiguousOutgoingMapRejectsBeforeTemplateOrJournalMutation() async throws {
+        try await withFixture { adapter, configuration in
+            let realm = try Realm(configuration: configuration)
+            let row = UnicodeStringTransportRow()
+            let (a, b) = Self.pairs[0]
+            row.translations[a] = "first"
+            row.translations[b] = "second"
+            XCTAssertEqual(row.translations.count, 2)
+            try realm.write {
+                realm.add(row)
+                row.refreshChangeMetadata(explicitlyModified: true, at: row.modifiedAt)
+            }
+            let name = row.objectSchema.className + "." + row.id
+            let generation = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self,
+                                                       forPrimaryKey: name)?.generation)
+            let before = try BigSyncRecordFingerprint.fields(of: row)
+            let template = CKRecord(recordType: row.objectSchema.className,
+                                    recordID: .init(recordName: name, zoneID: adapter.recordZoneID))
+            template["scalar"] = "original template" as CKRecordValue
+            template["translations"] = try Self.encodedMap(["original": "template"])
+            let originalMap = template["translations"] as? Data
+            XCTAssertThrowsError(try BigSyncRecordPayload.record(
+                from: row, recordID: template.recordID, template: template)) { error in
+                guard let failure = error as? BigSyncRecordRebaseError,
+                      case .unsupportedField("translations") = failure else {
+                    return XCTFail("Expected unsupported map, got \(error)")
+                }
+            }
+            XCTAssertEqual(template["scalar"] as? String, "original template")
+            XCTAssertEqual(template["translations"] as? Data, originalMap)
+            XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: row), before)
+            XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+                                       forPrimaryKey: name)?.generation, generation)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testAmbiguousIncomingPropertyListRejectsBeforeRealmOrJournalMutation() async throws {
+        try await withFixture { adapter, configuration in
+            let realm = try Realm(configuration: configuration)
+            let row = UnicodeStringTransportRow()
+            row.translations["retained"] = "original"
+            try realm.write {
+                realm.add(row)
+                row.refreshChangeMetadata(explicitlyModified: true, at: row.modifiedAt)
+            }
+            let record = try Self.record(row, adapter)
+            let name = record.recordID.recordName
+            let generation = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self,
+                                                       forPrimaryKey: name)?.generation)
+            let before = try BigSyncRecordFingerprint.fields(of: row)
+            // Start with original XML bytes, bypassing Swift Dictionary's
+            // canonical-key collapse during fixture construction.
+            let xml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0"><dict>
+            <key>が</key><string>first</string>
+            <key>か\u{3099}</key><string>second</string>
+            </dict></plist>
+            """
+            let data = Data(xml.utf8)
+            let raw = try XCTUnwrap(try PropertyListSerialization.propertyList(
+                from: data, options: [], format: nil) as? NSDictionary)
+            XCTAssertEqual(raw.count, 2, "Native plist decoding must retain raw keys until explicit admission")
+            for payload in [data, try PropertyListSerialization.data(fromPropertyList: raw, format: .binary, options: 0)] {
+                record["translations"] = payload as CKRecordValue
+                let property = try XCTUnwrap(row.objectSchema.properties.first { $0.name == "translations" })
+                XCTAssertThrowsError(try realm.write {
+                    try adapter.applyChange(property: property, record: record, object: row,
+                                            syncedEntityIdentifier: name)
+                }) { error in
+                    XCTAssertTrue(error is RealmSwiftRemoteRecordDecodingError)
+                }
+                XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: row), before)
+                XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+                                           forPrimaryKey: name)?.generation, generation)
+                XCTAssertFalse(realm.isInWriteTransaction)
             }
         }
     }
