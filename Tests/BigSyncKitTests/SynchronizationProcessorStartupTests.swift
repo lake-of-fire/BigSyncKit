@@ -38,6 +38,9 @@ final class SynchronizationProcessorStartupTests: XCTestCase, @unchecked Sendabl
             accountIdentifierProvider: { "account-a" }, accountStatusProvider: { .available },
             changeFeed: transport, subscriptionStore: transport, zoneStore: transport,
             recordStore: transport, backupDetectionBaseURL: directory, logger: Logger(label: "ProcessorStartup"))
+        // Controlled transport fixtures do not implement Realm reset migration.
+        // Admit the fake through the existing Debug seam before testing ownership.
+        sync._allowRecordZoneRebindingForTesting()
         sync.addModelAdapter(adapter)
         let oldRun = await sync.changeRequestProcessor.beginRun()
         sync.synchronizationRunID = oldRun

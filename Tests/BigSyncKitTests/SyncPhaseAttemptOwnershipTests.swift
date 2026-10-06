@@ -202,6 +202,9 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
             progressHandler: { probe.onProgress?($0) },
             changeFeed: transport, subscriptionStore: transport, zoneStore: transport,
             recordStore: transport, backupDetectionBaseURL: directory, logger: Logger(label: "SyncPhaseOwnership"))
+        // Controlled transport fixtures do not implement Realm reset migration.
+        // Admit the fake through the existing Debug seam before testing ownership.
+        sync._allowRecordZoneRebindingForTesting()
         sync.addModelAdapter(adapter)
         sync.synchronizationRunID = await sync.changeRequestProcessor.beginRun()
         sync.activeRunContext = .init(attemptID: sync.synchronizationAttemptID,
