@@ -1,4 +1,5 @@
 import Foundation
+import Realm
 import RealmSwift
 
 /// Public, read-only record identity construction for application admission
