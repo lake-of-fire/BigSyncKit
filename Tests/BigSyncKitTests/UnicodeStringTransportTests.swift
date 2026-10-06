@@ -77,6 +77,9 @@ final class UnicodeStringTransportTests: XCTestCase {
         fixtureOwner.own(adapter)
         // These tests exercise real codecs/comparison with task-owned rows.
         // The legacy writer case also opens the local adapter provider.
+        // Managed fixtures explicitly open on RealmBackgroundActor. Some
+        // scenarios call back into BigSyncBackgroundActor and must retain
+        // actor-bound rows across that suspension rather than a thread Realm.
         try await body(adapter, configuration)
     }
 
@@ -113,7 +116,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     func testAmbiguousLegacyMapUploadRejectsWithoutJournalMutation() async throws {
         try await withFixture { adapter, configuration in
             try await adapter.ensureSetup()
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeLegacyMapTransportRow()
             let (a, b) = Self.pairs[0]
             row.translations[a] = "first"
@@ -220,7 +223,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testAmbiguousOutgoingMapRejectsBeforeTemplateOrJournalMutation() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow()
             let (a, b) = Self.pairs[0]
             row.translations[a] = "first"
@@ -257,7 +260,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testAmbiguousIncomingPropertyListRejectsBeforeRealmOrJournalMutation() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow()
             row.translations["retained"] = "original"
             try realm.write {
@@ -303,7 +306,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testManagedIncomingMapReplacementPreservesExactValuesWithoutJournaling() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow()
             row.translations["stale"] = "retained until replacement"
             try realm.write { realm.add(row) }
@@ -395,7 +398,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testIncomingSetKeepsEquivalentByteDistinctMembersManaged() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow(); try realm.write { realm.add(row) }
             for (a, b) in Self.pairs {
                 let record = try Self.record(row, adapter); record["tags"] = [b, a] as CKRecordValue
@@ -410,7 +413,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testIncomingSetAssignmentReplacesInsteadOfUnion() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow(); row.tags.insert("stale")
             try realm.write { realm.add(row) }
             let (a, b) = Self.pairs[0]
@@ -424,7 +427,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testExactDuplicateDeduplicatesButDistinctSpellingsDoNot() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow(); try realm.write { realm.add(row) }
             let (a, b) = Self.pairs[1]
             let record = try Self.record(row, adapter); record["tags"] = [a, b, a, b] as CKRecordValue
@@ -437,7 +440,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testAbsentSetFieldClearsManagedCollection() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow(); row.tags.insert("stale")
             try realm.write { realm.add(row) }
             let record = try Self.record(row, adapter); record["tags"] = nil
@@ -450,7 +453,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testMalformedSetRejectsWithoutPartialMutation() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow(); row.tags.insert("retained")
             try realm.write { realm.add(row) }
             let record = try Self.record(row, adapter); record["tags"] = [1, 2] as CKRecordValue
@@ -513,7 +516,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testManagedRollbackRetainsOriginalSetAndJournalGeneration() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow(); row.tags.insert("original")
             try realm.write {
                 realm.add(row)
@@ -559,7 +562,7 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testExistingFieldFingerprintsRemainUnchangedByReplay() async throws {
         try await withFixture { adapter, configuration in
-            let realm = try Realm(configuration: configuration)
+            let realm = try await Realm(configuration: configuration, actor: RealmBackgroundActor.shared)
             let row = UnicodeStringTransportRow(); let (a, b) = Self.pairs[0]
             row.tags.insert(a); row.tags.insert(b); try realm.write { realm.add(row) }
             let before = try BigSyncRecordFingerprint.fields(of: row)

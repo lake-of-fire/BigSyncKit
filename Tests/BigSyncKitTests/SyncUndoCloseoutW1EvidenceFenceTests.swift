@@ -54,11 +54,11 @@ extension SyncUndoCloseoutW1Tests {
         let owner = try Realm(configuration: trackingConfig, queue: nil)
         let cursorData = Data("restoration-provisional-successor".utf8)
         let successorBoundary = try XCTUnwrap(CloudKitSynchronizer.makeConsumedServerBoundaryIdentifier(
-                containerIdentifier: "iCloud.test.w1-closeout", databaseScope: .private,
-                accountScopeIdentifier: original.accountScopeIdentifier,
-                replicaBindingGenerationIdentifier: original.replicaBindingGenerationIdentifier,
-                recordZoneID: adapter.recordZoneID, changeFeedEpoch: original.changeFeedEpoch,
-                cursorData: cursorData))
+            containerIdentifier: "iCloud.test.w1-closeout", databaseScope: .private,
+            accountScopeIdentifier: original.accountScopeIdentifier,
+            replicaBindingGenerationIdentifier: original.replicaBindingGenerationIdentifier,
+            recordZoneID: adapter.recordZoneID, changeFeedEpoch: original.changeFeedEpoch,
+            cursorData: cursorData))
         let successor = BigSyncDurablePublicationEvidence(
             domainScopeIdentifier: original.domainScopeIdentifier,
             accountScopeIdentifier: original.accountScopeIdentifier,
