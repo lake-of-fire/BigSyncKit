@@ -574,6 +574,8 @@ public final class RealmSwiftAdapter:
     var _testAfterComparisonApplication: (@Sendable (Object) throws -> Void)?
     var _testAfterDisappearanceTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterDisappearanceTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeMissingServerTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeRemoteDeletionTargetWrite:

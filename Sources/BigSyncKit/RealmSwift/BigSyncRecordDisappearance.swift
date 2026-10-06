@@ -199,6 +199,9 @@ extension RealmSwiftAdapter {
                 }
             }
         }
+#if DEBUG
+        try await _testAfterDisappearanceTrackingWrite?()
+#endif
     }
 
     /// The feed supplies an admitted physical disappearance, not an uncertain

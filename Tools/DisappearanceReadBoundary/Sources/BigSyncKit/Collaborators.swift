@@ -165,6 +165,7 @@ public final class RealmSwiftAdapter: @unchecked Sendable {
     var legacyRequeues = [([CKRecord.ID], [String: String])]()
     var binding = "binding-1"; var account = "account-1"
     var _testAfterDisappearanceTargetWrite: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterDisappearanceTrackingWrite: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeRemoteDeletionTargetWrite: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeMissingServerTargetWrite: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     init(target: Realm, tracking: Realm) { realmProvider = RealmProvider(target: target, tracking: tracking) }
