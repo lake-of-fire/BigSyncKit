@@ -2146,7 +2146,8 @@ public class CloudKitSynchronizer: NSObject {
 
     internal func checkRunContext(_ context: RunContext) throws {
         try Task.checkCancellation()
-        guard activeRunContext == context,
+        guard !accountScopeAuthorityFence.rejectsAuthority,
+              activeRunContext == context,
               synchronizationAttemptID == context.attemptID,
               synchronizationRunID == context.runID,
               !cancelSync else {
