@@ -1542,3 +1542,210 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(f.object.title, "successor retained intent")
     }
 }
+
+// Receipt readers must declare ownership rather than infer it from Realm's
+// transaction flag. All fixtures below exercise native target/tracking state.
+extension SyncUndoCloseoutW1Tests {
+    @BigSyncBackgroundActor
+    func testComparisonReceiptSeparatesCommittedEvidenceFromOwnedProvisionalInvalidation() async throws {
+        let (adapter, realm, _, incoming) = try await acceptedNote()
+        let context = try XCTUnwrap(adapter.recordRebaseContext)
+        let baseline = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: incoming.recordID.recordName))
+        let revision = baseline.revision
+        realm.beginWrite()
+        defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+        baseline.isComparisonInvalidated = true
+        XCTAssertTrue(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm))
+        XCTAssertFalse(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm,
+            ownsTargetTransaction: true))
+        XCTAssertTrue(realm.isInWriteTransaction)
+        XCTAssertTrue(baseline.isComparisonInvalidated)
+        realm.cancelWrite()
+        XCTAssertTrue(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm))
+        try realm.write { baseline.isComparisonInvalidated = true }
+        XCTAssertFalse(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm))
+    }
+
+    @BigSyncBackgroundActor
+    func testComparisonReceiptDoesNotBorrowForeignProvisionalBaselineRepair() async throws {
+        let (adapter, realm, _, incoming) = try await acceptedNote()
+        let context = try XCTUnwrap(adapter.recordRebaseContext)
+        let baseline = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: incoming.recordID.recordName))
+        let revision = baseline.revision
+        try realm.write { baseline.isComparisonInvalidated = true }
+        realm.beginWrite()
+        defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+        baseline.isComparisonInvalidated = false
+        XCTAssertFalse(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm))
+        XCTAssertTrue(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm,
+            ownsTargetTransaction: true))
+        XCTAssertTrue(realm.isInWriteTransaction)
+        realm.cancelWrite()
+        XCTAssertTrue(baseline.isComparisonInvalidated)
+    }
+
+    @BigSyncBackgroundActor
+    func testComparisonReceiptResamplesBaselineCommittedByIdentityBoundaryCallout() async throws {
+        let (adapter, realm, _, incoming) = try await acceptedNote()
+        let context = try XCTUnwrap(adapter.recordRebaseContext)
+        let name = incoming.recordID.recordName
+        let baseline = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name))
+        let revision = baseline.revision
+        adapter._testAfterComparisonReceiptIdentityValidation = {
+            adapter._testAfterComparisonReceiptIdentityValidation = nil
+            try realm.write {
+                let current = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name))
+                current.revision = "callout-committed-successor"
+            }
+        }
+        defer { adapter._testAfterComparisonReceiptIdentityValidation = nil }
+        XCTAssertFalse(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: name, in: realm))
+        XCTAssertEqual(baseline.revision, "callout-committed-successor")
+        XCTAssertEqual(adapter.recordRebaseContext, context)
+        XCTAssertTrue(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: baseline.revision, recordName: name, in: realm))
+    }
+
+    @BigSyncBackgroundActor
+    func testComparisonReceiptIdentityBoundaryCancellationABARejects() async throws {
+        let (adapter, realm, _, incoming) = try await acceptedNote()
+        let context = try XCTUnwrap(adapter.recordRebaseContext)
+        let revision = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: incoming.recordID.recordName)).revision
+        adapter._testAfterComparisonReceiptIdentityValidation = {
+            adapter.cancelSynchronization()
+            try adapter.prepareForFencedMigrationAfterCancellation()
+        }
+        defer { adapter._testAfterComparisonReceiptIdentityValidation = nil }
+        XCTAssertThrowsError(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm)) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+        adapter._testAfterComparisonReceiptIdentityValidation = nil
+        XCTAssertTrue(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm))
+    }
+
+    @BigSyncBackgroundActor
+    func testComparisonReceiptRefreshCallbackContextReplacementRejects() async throws {
+        let (adapter, realm, object, incoming) = try await acceptedNote()
+        let context = try XCTUnwrap(adapter.recordRebaseContext)
+        let revision = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: incoming.recordID.recordName)).revision
+        let signal = DeletionMetadataRefreshSignal()
+        let previousAutorefresh = realm.autorefresh
+        realm.autorefresh = false
+        let observation = realm.observe { notification, _ in
+            guard case .didChange = notification, signal.receive() else { return }
+            adapter.mergePolicy = .server
+        }
+        defer {
+            observation.invalidate()
+            realm.autorefresh = previousAutorefresh
+            adapter.mergePolicy = .custom
+        }
+        signal.arm()
+        let queue = DispatchQueue(label: "test.comparison-receipt-refresh." + UUID().uuidString)
+        let configuration = realm.configuration
+        let identifier = object.id
+        try queue.sync {
+            let writer = try Realm(configuration: configuration, queue: queue)
+            try writer.write {
+                let value = try XCTUnwrap(writer.object(ofType: W1ContractNote.self, forPrimaryKey: identifier))
+                value.modifiedAt = value.modifiedAt.addingTimeInterval(1)
+            }
+        }
+        XCTAssertThrowsError(try adapter._test_comparisonReceiptIsCurrent(context: context,
+            revision: revision, recordName: incoming.recordID.recordName, in: realm)) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+        XCTAssertTrue(signal.didObserve)
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadPreparationCancellationABACannotRelabelSelectedRetainedEvidence() async throws {
+        let f = try await preparedQuarantineFixture()
+        let recordID = try XCTUnwrap(f.prepared.first).record.recordID
+        let evidence = try await observePreparedQuarantineDeletion(f.adapter,
+            recordID: recordID, label: "preparation-cancellation-")
+        let generation = try XCTUnwrap(f.prepared.first).generation
+        f.adapter._testAfterUploadRecordSelection = {
+            f.adapter._testAfterUploadRecordSelection = nil
+            await Task.yield()
+            f.adapter.cancelSynchronization()
+            try f.adapter.prepareForFencedMigrationAfterCancellation()
+        }
+        defer { f.adapter._testAfterUploadRecordSelection = nil }
+        do {
+            _ = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+            XCTFail("An older selection cannot adopt a resumed attempt's cleanup evidence")
+        } catch is CancellationError { }
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: evidence.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: evidence.proof))
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName)?.generation,
+            generation)
+        try await f.adapter.unsetCancellation()
+        let fresh = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let saved = try tagged(XCTUnwrap(fresh.first).record, "fresh-after-preparation-cancellation")
+        try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: fresh)
+        XCTAssertNil(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName))
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: evidence.lineage))
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadPreparationTaskCancellationKeepsSelectedRetainedGeneration() async throws {
+        let f = try await preparedQuarantineFixture()
+        let item = try XCTUnwrap(f.prepared.first)
+        f.adapter._testAfterUploadRecordSelection = {
+            f.adapter._testAfterUploadRecordSelection = nil
+            withUnsafeCurrentTask { $0?.cancel() }
+        }
+        defer { f.adapter._testAfterUploadRecordSelection = nil }
+        let request = Task { @BigSyncBackgroundActor in
+            try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        }
+        do {
+            _ = try await request.value
+            XCTFail("Task cancellation must reject the selected batch before attaching cleanup evidence")
+        } catch is CancellationError { }
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: item.record.recordID.recordName)?.generation, item.generation)
+        let fresh = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        XCTAssertEqual(fresh.first?.generation, item.generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadPreparationRejectsTransportChangeWithoutComparisonContext() async throws {
+        let (adapter, realm) = try await fixture(enableRecordRebasing: false)
+        adapter.mergePolicy = .server
+        let object = W1LegacyRetainedArticle()
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        XCTAssertNil(adapter.recordRebaseContext)
+        adapter._testAfterUploadRecordSelection = {
+            adapter._testAfterUploadRecordSelection = nil
+            try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.changed-during-preparation",
+                databaseScope: .shared)
+        }
+        defer { adapter._testAfterUploadRecordSelection = nil }
+        do {
+            _ = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+            XCTFail("A nil comparison context cannot mask replacement transport identity")
+        } catch is CancellationError { }
+        XCTAssertNil(adapter.recordRebaseContext)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+    }
+}
