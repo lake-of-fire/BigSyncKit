@@ -74,6 +74,35 @@ private func mutationFailureAllowsImmediateRepair(_ error: Error) -> Bool {
         && constraints.codes.isSubset(of: [.unknownItem, .serverRecordChanged])
 }
 
+/// Absence is a valid deletion receipt, but independent conditions attached to
+/// that receipt still constrain the operation. Keep those causes in a named
+/// envelope, separate from the dictionary of records whose deletion failed.
+private func preservingAcknowledgedDeletionConstraints(
+    _ error: Error?,
+    constraints: [CKRecord.ID: NSError]
+) -> Error? {
+    guard !constraints.isEmpty else { return error }
+    if let error, error is CancellationError { return error }
+    var failures = [AnyHashable: Error]()
+    var info = [String: Any]()
+    if let error {
+        let original = error as NSError
+        if original.domain == CKErrorDomain,
+           original.code == CKError.partialFailure.rawValue,
+           let items = original.userInfo[CKPartialErrorsByItemIDKey] as? [AnyHashable: Error] {
+            failures = items
+            info = original.userInfo
+        } else {
+            info[NSUnderlyingErrorKey] = original
+        }
+    }
+    failures["acknowledgedDeletionConstraints"] = CKError(
+        .partialFailure, userInfo: [CKPartialErrorsByItemIDKey: constraints]
+    )
+    info[CKPartialErrorsByItemIDKey] = failures
+    return CKError(.partialFailure, userInfo: info)
+}
+
 struct PreparedMutationRetryKey: Hashable, Sendable {
     let recordID: CKRecord.ID
     let generation: String?
@@ -326,8 +355,15 @@ extension CloudKitSynchronizer {
             let uncertain = prepared.filter(\.requiresAcceptanceCheck)
             if !uncertain.isEmpty, let lookup = recordStore as? any CloudKitRecordFetching {
                 let fetched = try await lookup.fetchRecords(with: uncertain.map { $0.record.recordID })
+                // Collect missing/malformed slots before the account await,
+                // while retaining the existing fail-fast lookup import policy.
+                let validatedFetched = validatedMutationResults(
+                    fetched,
+                    expected: uncertain.map { ($0.record.recordID, $0.record.recordType) },
+                    successRecord: { $0 }
+                )
                 let returnedFailures = returnedMutationFailures(
-                    in: fetched, for: uncertain.map { $0.record.recordID }
+                    in: validatedFetched, for: uncertain.map { $0.record.recordID }
                 )
                 try await revalidateMutationResultContext(
                     for: attemptID, preserving: returnedFailures
@@ -705,6 +741,7 @@ extension CloudKitSynchronizer {
             )
 
             var acknowledged = [CKRecord.ID]()
+            var acknowledgedConstraints = [CKRecord.ID: NSError]()
             var conflictedRecordsByID = [CKRecord.ID: CKRecord]()
             var unresolvedFailures = [CKRecord.ID: NSError]()
             for recordID in recordIDs {
@@ -728,6 +765,9 @@ extension CloudKitSynchronizer {
                        nsError.code == CKError.unknownItem.rawValue {
                         retryBudget.retire(retryKey)
                         acknowledged.append(recordID)
+                        if !mutationFailureAllowsImmediateRepair(nsError) {
+                            acknowledgedConstraints[recordID] = nsError
+                        }
                     } else if nsError.domain == CKErrorDomain,
                               nsError.code == CKError.serverRecordChanged.rawValue,
                               mutationFailureAllowsImmediateRepair(nsError),
@@ -768,9 +808,23 @@ extension CloudKitSynchronizer {
                     // unknownItem is an idempotent success for deletion; do not
                     // put those IDs back into the failed-item dictionary.
                     let failed = returnedFailures.filter { !acknowledged.contains($0.key) }
-                    throw preservingSiblingMutationFailures(
+                    let failure = preservingSiblingMutationFailures(
                         error, failedRecordIDs: [], otherFailures: failed
                     )
+                    throw preservingAcknowledgedDeletionConstraints(
+                        failure, constraints: acknowledgedConstraints
+                    ) ?? failure
+                }
+                try checkSynchronizationAttempt(attemptID)
+                if let context = activeRunContext { try checkRunContext(context) }
+                // Stop before any extra account request or metadata repair.
+                // These IDs were acknowledged, so they are not failed items.
+                if !acknowledgedConstraints.isEmpty,
+                   let failure = preservingAcknowledgedDeletionConstraints(
+                    unresolvedFailures.isEmpty ? nil : partialMutationError(unresolvedFailures),
+                    constraints: acknowledgedConstraints
+                ) {
+                    throw failure
                 }
                 try await revalidateMutationResultContext(
                     for: attemptID, preserving: unresolvedFailures

@@ -6,8 +6,8 @@ import XCTest
 @_spi(CloudKitE2E) @testable import BigSyncKit
 
 private enum ResponseRoute: Sendable {
-    case save, saveConflict, saveMissing, deleteConflict, lookup, lookupMissing
-    var deletes: Bool { self == .deleteConflict }
+    case save, saveConflict, saveMissing, deleteConflict, deleteMissing, lookup, lookupMissing
+    var deletes: Bool { self == .deleteConflict || self == .deleteMissing }
     var looksUp: Bool { self == .lookup || self == .lookupMissing }
 }
 private enum ResponseAlteration: Sendable {
@@ -173,7 +173,7 @@ private actor ResponseIdentityTransport: CloudKitRecordStore, CloudKitRecordFetc
             if id.recordName == "success" { deletes[id] = .failure(CKError(.unknownItem)); continue }
             guard id.recordName == "target", mutationCount == 1 else { deletes[id] = .success(()); continue }
             if alteration == .missingResult { continue }
-            deletes[id] = .failure(conflict(id))
+            deletes[id] = .failure(route == .deleteMissing ? missing() : conflict(id))
         }
         await account.didReceive()
         return .init(saveResults: saves, deleteResults: deletes)
@@ -793,5 +793,109 @@ extension SyncMutationResponseIdentityTests {
         let lookups = await transport.lookupCount
         XCTAssertEqual(calls, 1)
         XCTAssertEqual(lookups, 1)
+    }
+}
+
+
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    private func requireAcknowledgedDeletionConstraint(
+        retryAfter: TimeInterval? = nil, underlying: CKError? = nil,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let (adapter, transport, account, failure) = try await run(
+            .deleteMissing, .none, conflictRetryAfter: retryAfter,
+            repairUnderlyingError: underlying
+        )
+        XCTAssertTrue(adapter.pending.isEmpty, file: file, line: line)
+        XCTAssertEqual(Set(adapter.deleted.map(\.recordName)), ["success", "target"], file: file, line: line)
+        XCTAssertTrue(adapter.rebased.isEmpty, file: file, line: line)
+        let error = try XCTUnwrap(failure, file: file, line: line)
+        let constraints = CloudKitRetryConstraints(error)
+        if let retryAfter { XCTAssertEqual(constraints.serverMinimum, retryAfter, file: file, line: line) }
+        if let underlying { XCTAssertTrue(constraints.codes.contains(underlying.code), file: file, line: line) }
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [AnyHashable: Error], file: file, line: line)
+        XCTAssertNil(items[CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)], file: file, line: line)
+        XCTAssertNotNil(items["acknowledgedDeletionConstraints"], file: file, line: line)
+        let calls = await transport.mutationCount
+        let probes = await account.callsAfterResult
+        XCTAssertEqual(calls, 1, file: file, line: line)
+        XCTAssertEqual(probes, underlying?.code == .notAuthenticated || underlying?.code == .accountTemporarilyUnavailable ? 0 : 1,
+                       file: file, line: line)
+    }
+    @BigSyncBackgroundActor
+    func testDeleteMissAcknowledgesWhilePreservingRetryDeadline() async throws {
+        try await requireAcknowledgedDeletionConstraint(retryAfter: 73)
+        try await requireAcknowledgedDeletionConstraint(retryAfter: 0)
+    }
+    @BigSyncBackgroundActor
+    func testDeleteMissAcknowledgesWhilePreservingNestedIndependentStops() async throws {
+        for code: CKError.Code in [.notAuthenticated, .accountTemporarilyUnavailable, .changeTokenExpired,
+                                  .networkFailure, .networkUnavailable, .zoneBusy, .zoneNotFound,
+                                  .quotaExceeded, .operationCancelled, .requestRateLimited] {
+            try await requireAcknowledgedDeletionConstraint(underlying: CKError(code))
+        }
+    }
+    @BigSyncBackgroundActor
+    func testDeleteMissConstraintSurvivesAcknowledgementFailure() async throws {
+        let local = NSError(domain: "LocalAcknowledgementFailure", code: 29)
+        let (adapter, transport, _, failure) = try await run(
+            .deleteMissing, .none, acknowledgeFailure: local, conflictRetryAfter: 73
+        )
+        let error = try XCTUnwrap(failure)
+        XCTAssertEqual(CloudKitRetryConstraints(error).serverMinimum, 73)
+        XCTAssertEqual((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError, local)
+        XCTAssertTrue(adapter.deleted.isEmpty)
+        let calls = await transport.mutationCount; XCTAssertEqual(calls, 1)
+    }
+    @BigSyncBackgroundActor
+    func testDeleteMissConstraintKeepsAcknowledgementCancellationTerminal() async throws {
+        let (adapter, _, _, failure) = try await run(
+            .deleteMissing, .none, acknowledgeFailure: CancellationError(), conflictRetryAfter: 73
+        )
+        XCTAssertTrue(failure is CancellationError)
+        XCTAssertTrue(adapter.deleted.isEmpty)
+    }
+    @BigSyncBackgroundActor
+    func testUnconstrainedDeleteMissStillAcknowledgesWithoutFailure() async throws {
+        let (adapter, transport, _, failure) = try await run(.deleteMissing, .none)
+        XCTAssertNil(failure); XCTAssertTrue(adapter.pending.isEmpty)
+        XCTAssertEqual(Set(adapter.deleted.map(\.recordName)), ["success", "target"])
+        let calls = await transport.mutationCount; XCTAssertEqual(calls, 1)
+    }
+    @BigSyncBackgroundActor
+    func testMissingDeleteResultPreservesIdempotentSuccessfulSibling() async throws {
+        try await reject(.deleteConflict, .missingResult)
+    }
+    @BigSyncBackgroundActor
+    func testMissingLookupResultSurvivesAccountRevalidationFailure() async throws {
+        let (adapter, transport, _, failure) = try await run(.lookup, .missingResult, failsAccountAfterResult: true)
+        let error = try XCTUnwrap(failure)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError])
+        let target = CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)
+        let expected = CocoaError(.coderValueNotFound) as NSError
+        XCTAssertEqual(items[target]?.domain, expected.domain); XCTAssertEqual(items[target]?.code, expected.code)
+        XCTAssertEqual(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)?.domain, "ResponseAccountFailure")
+        XCTAssertTrue(adapter.imported.isEmpty)
+        let calls = await transport.mutationCount; XCTAssertEqual(calls, 0)
+    }
+    @BigSyncBackgroundActor
+    func testMalformedLookupResultSurvivesAccountRevalidationFailure() async throws {
+        let (adapter, _, _, failure) = try await run(.lookup, .name, failsAccountAfterResult: true)
+        let error = try XCTUnwrap(failure)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError])
+        let target = CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)
+        let expected = BigSyncRecordRebaseError.inconsistentReceipt("target") as NSError
+        XCTAssertEqual(items[target]?.domain, expected.domain); XCTAssertEqual(items[target]?.code, expected.code)
+        XCTAssertTrue(adapter.imported.isEmpty)
+    }
+    @BigSyncBackgroundActor
+    func testMissingLookupSlotImportsValidObservationButNeverSubmitsMutation() async throws {
+        let (adapter, transport, _, failure) = try await run(.lookup, .missingResult)
+        XCTAssertNotNil(failure); XCTAssertEqual(adapter.pending, ["target"])
+        XCTAssertEqual(adapter.imported.map { $0.recordID.recordName }, ["success"])
+        let calls = await transport.mutationCount; XCTAssertEqual(calls, 0)
+        let lookups = await transport.lookupCount; XCTAssertEqual(lookups, 1)
     }
 }
