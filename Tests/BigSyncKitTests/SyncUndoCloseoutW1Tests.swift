@@ -50,6 +50,18 @@ final class W1RetainedArticle: Object, ChangeMetadataRecordable,
     @Persisted var isDeleted = false
 }
 
+@objc(W1LegacyRetainedArticle)
+final class W1LegacyRetainedArticle: Object, ChangeMetadataRecordable, BigSyncRetainsSyncedTombstone {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+    @Persisted(primaryKey: true) var id = "legacy-article"
+    @Persisted var title = "initial"
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+    var retainsSyncedTombstone: Bool { true }
+}
+
 /// Real target/tracking Realms and production adapter entry points. Synthetic
 /// CloudKit records are adapter inputs, not evidence of signed cloud delivery.
 final class SyncUndoCloseoutW1Tests: XCTestCase {
@@ -125,7 +137,8 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         realmFixtureOwner.ownDirectory(directory)
         var target = Realm.Configuration()
         target.fileURL = directory.appendingPathComponent("target.realm")
-        target.objectTypes = [W1ContractNote.self, W1RetainedArticle.self, BigSyncPendingMutation.self]
+        target.objectTypes = [W1ContractNote.self, W1RetainedArticle.self,
+            W1LegacyRetainedArticle.self, BigSyncPendingMutation.self]
         if enableRecordRebasing {
             BigSyncMutationPolicy.enableRecordRebasing(in: &target)
         }
@@ -1327,5 +1340,205 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: evidence.lineage))
         XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordID.recordName)?.generation, item.generation)
         XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName)?.pendingGeneration, item.generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testLegacyGenerationAcknowledgementKeepsUnsettledRetainedDeletionPending() async throws {
+        let (adapter, realm) = try await fixture(enableRecordRebasing: false)
+        let object = W1LegacyRetainedArticle()
+        try realm.write {
+            realm.add(object)
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        XCTAssertEqual(prepared.count, 1)
+        XCTAssertFalse(BigSyncRecordBaseline.isEnabled(in: realm))
+        let item = try XCTUnwrap(prepared.first)
+        XCTAssertNil(item.comparisonBase)
+        let generation = try XCTUnwrap(item.generation)
+        let recordID = item.record.recordID
+        let saved = try tagged(item.record, "legacy-retained-response")
+        let evidence = try await observePreparedQuarantineDeletion(
+            adapter, recordID: recordID, label: "legacy-retained-"
+        )
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: recordID.recordName))
+        let state = entity.entityState
+        let cachedRecord = entity.encodedRecord
+        do {
+            try await adapter.didUpload(savedRecords: [saved],
+                matchingGenerations: [recordID.recordName: generation])
+            XCTFail("Legacy generations cannot consume unresolved restoring work")
+        } catch let error as RealmSwiftAdapter.RetainedDeletionQuarantineNeedsFreshPreparation {
+            XCTAssertEqual(error.recordNames, [recordID.recordName])
+        }
+        XCTAssertEqual(entity.entityState, state)
+        XCTAssertEqual(entity.encodedRecord, cachedRecord)
+        XCTAssertEqual(entity.pendingGeneration, generation)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordID.recordName)?.generation, generation)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: evidence.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: evidence.proof))
+        XCTAssertTrue(object.isDeleted)
+    }
+
+    @BigSyncBackgroundActor
+    func testLegacyGenerationAcknowledgementStillConsumesOrdinaryWork() async throws {
+        let (adapter, realm) = try await fixture(enableRecordRebasing: false)
+        let object = W1LegacyRetainedArticle()
+        try realm.write {
+            realm.add(object)
+            object.title = "ordinary legacy edit"
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let item = try XCTUnwrap(prepared.first)
+        XCTAssertEqual(prepared.count, 1)
+        XCTAssertNil(item.comparisonBase)
+        let generation = try XCTUnwrap(item.generation)
+        let saved = try tagged(item.record, "legacy-ordinary-response")
+        try await adapter.didUpload(savedRecords: [saved],
+            matchingGenerations: [saved.recordID.recordName: generation])
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: saved.recordID.recordName))
+        XCTAssertEqual(entity.entityState, .synced)
+        XCTAssertNil(entity.pendingGeneration)
+        XCTAssertNil(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: saved.recordID.recordName))
+        XCTAssertEqual(object.title, "ordinary legacy edit")
+    }
+
+    @BigSyncBackgroundActor
+    func testCurrentPreparedRetainedRetryRejectsDifferentAcceptedChangeTag() async throws {
+        let f = try await preparedQuarantineFixture()
+        let recordID = try XCTUnwrap(f.prepared.first).record.recordID
+        let evidence = try await observePreparedQuarantineDeletion(
+            f.adapter, recordID: recordID, label: "current-tag-"
+        )
+        let prepared = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let item = try XCTUnwrap(prepared.first)
+        let saved = try tagged(item.record, "current-accepted-tag")
+        let wrongTag = try tagged(saved, "different-retry-tag")
+        XCTAssertEqual(saved.recordChangeTag, "current-accepted-tag")
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        // Commit the accepted target baseline, then fail tracking without
+        // revoking preparation. Only that exact accepted tag can resume it.
+        f.adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = {
+            throw PreparedQuarantineInjectedFailure.tracking
+        }
+        defer { f.adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil }
+        do {
+            try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+            XCTFail("The tracking failure must leave an exact target receipt to resume")
+        } catch PreparedQuarantineInjectedFailure.tracking { }
+        f.adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil
+        let baseline = try XCTUnwrap(f.realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: recordID.recordName))
+        let acceptedRevision = baseline.revision
+        try await f.adapter.didUpload(savedRecords: [wrongTag], matchingPreparedUploads: prepared)
+        XCTAssertEqual(baseline.serverChangeTag, saved.recordChangeTag)
+        XCTAssertEqual(baseline.revision, acceptedRevision)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: recordID.recordName)?.pendingGeneration, item.generation)
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordID.recordName)?.generation, item.generation)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: evidence.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: evidence.proof))
+        try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: evidence.lineage))
+        XCTAssertNil(f.realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordID.recordName))
+    }
+
+    @BigSyncBackgroundActor
+    func testCurrentPreparedRetainedUploadRejectsDifferentAccountContext() async throws {
+        let f = try await preparedQuarantineFixture()
+        let recordID = try XCTUnwrap(f.prepared.first).record.recordID
+        let evidence = try await observePreparedQuarantineDeletion(
+            f.adapter, recordID: recordID, label: "current-context-"
+        )
+        let prepared = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let item = try XCTUnwrap(prepared.first)
+        let saved = try tagged(item.record, "current-context-response")
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        let baselineBefore = f.realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: recordID.recordName)?.revision
+        // Change only the context. No cancellation-generation revocation
+        // can mask the evidence's account check in this acknowledgement.
+        f.adapter.activeAccountScopeIdentifier = "different-account"
+        defer { f.adapter.activeAccountScopeIdentifier = "w1-account" }
+        do {
+            try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+            XCTFail("Current preparation cannot authorize another account")
+        } catch is CancellationError { }
+        XCTAssertEqual(f.realm.object(ofType: BigSyncRecordBaseline.self,
+            forPrimaryKey: recordID.recordName)?.revision, baselineBefore)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: recordID.recordName)?.pendingGeneration, item.generation)
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordID.recordName)?.generation, item.generation)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: evidence.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: evidence.proof))
+        f.adapter.activeAccountScopeIdentifier = "w1-account"
+        try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: evidence.lineage))
+        XCTAssertNil(f.realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordID.recordName))
+    }
+
+    @BigSyncBackgroundActor
+    func testCurrentPreparedRetainedUploadPreservesSuccessorGeneration() async throws {
+        let f = try await preparedQuarantineFixture()
+        let recordID = try XCTUnwrap(f.prepared.first).record.recordID
+        let evidence = try await observePreparedQuarantineDeletion(
+            f.adapter, recordID: recordID, label: "current-successor-"
+        )
+        let prepared = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let item = try XCTUnwrap(prepared.first)
+        let saved = try tagged(item.record, "accepted-older-generation")
+        try f.realm.write {
+            f.object.title = "successor retained intent"
+            f.object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await f.adapter.didFinishImport()
+        let successor = try XCTUnwrap(f.realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordID.recordName)?.generation)
+        XCTAssertNotEqual(successor, item.generation)
+        // This reply owns detached asset bytes, and its preparation's owner
+        // remains current. The successor journal alone prevents consumption.
+        try await f.adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+        let tracking = try XCTUnwrap(f.adapter.realmProvider?.persistenceRealm)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: recordID.recordName)?.pendingGeneration, successor)
+        XCTAssertEqual(f.realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordID.recordName)?.generation, successor)
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: evidence.lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: evidence.proof))
+        XCTAssertEqual(f.object.title, "successor retained intent")
+        let current = try await f.adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let currentItem = try XCTUnwrap(current.first)
+        XCTAssertEqual(currentItem.generation, successor)
+        let response = try tagged(currentItem.record, "accepted-successor-generation")
+        try await f.adapter.didUpload(savedRecords: [response], matchingPreparedUploads: current)
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: evidence.lineage))
+        XCTAssertNil(f.realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: recordID.recordName))
+        XCTAssertEqual(f.object.title, "successor retained intent")
     }
 }
