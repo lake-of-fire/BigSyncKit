@@ -61,10 +61,10 @@ struct CloudKitRetryConstraints {
                 memo[id] = (error, .complete(height: nil))
                 return nil
             }
-            var children = [Error]()
-            if let underlying = error.userInfo[NSUnderlyingErrorKey] as? Error {
-                children.append(underlying)
-            }
+            // Foundation combines NSUnderlyingErrorKey and
+            // NSMultipleUnderlyingErrorsKey. A size-only proof must not
+            // discard a local failure or constraint carried by either form.
+            var children = cloudKitUnderlyingErrors(in: error)
             switch cloudError.code {
             case .limitExceeded, .batchRequestFailed:
                 break
@@ -121,9 +121,26 @@ func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {
                 }
             }
         }
-        if let underlying = item.error.userInfo[NSUnderlyingErrorKey] as? Error {
+        // Match the same Foundation edge set used by size-only validation.
+        // Existing identity/depth guards also bound aggregate cycles and DAGs.
+        for underlying in cloudKitUnderlyingErrors(in: item.error) {
             queue.append((underlying as NSError, item.depth + 1))
         }
+    }
+    return errors
+}
+
+/// Use one interpretation of Foundation's singular and aggregate causes in both
+/// graph walks. Read userInfo once, preserving custom NSError subclasses and
+/// retaining every cause independently of the wrapper's error domain.
+private func cloudKitUnderlyingErrors(in error: NSError) -> [Error] {
+    let info = error.userInfo
+    var errors = [Error]()
+    if let underlying = info[NSUnderlyingErrorKey] as? Error {
+        errors.append(underlying)
+    }
+    if let multiple = info[NSMultipleUnderlyingErrorsKey] as? [Error] {
+        errors.append(contentsOf: multiple)
     }
     return errors
 }
