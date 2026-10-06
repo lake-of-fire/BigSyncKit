@@ -351,13 +351,31 @@ internal class ChangeRequestProcessor {
         changeRequests.append(request)
     }
 
+    private func activateNewRun() -> UUID {
+        activeRunID = UUID()
+        cancelSync = false
+        return activeRunID
+    }
+
     @discardableResult
     func beginRun() async -> UUID {
         reset()
         await waitForProcessingToStop()
-        activeRunID = UUID()
-        cancelSync = false
-        return activeRunID
+        return activateNewRun()
+    }
+
+    /// Starts a replacement run only while the caller's external authority
+    /// remains valid across the old-child join. A rejection after reset leaves
+    /// this processor stopped rather than reopening work for a retired owner.
+    @discardableResult
+    func beginRun(
+        validating validate: @BigSyncBackgroundActor @Sendable () throws -> Void
+    ) async throws -> UUID {
+        try validate()
+        reset()
+        await waitForProcessingToStop()
+        try validate()
+        return activateNewRun()
     }
 
     private func checkProcessingRun(_ runID: UUID) throws {
@@ -1906,15 +1924,12 @@ public class CloudKitSynchronizer: NSObject {
                         for: accountIdentifier
                     )
                 )
-                let runID = await changeRequestProcessor.beginRun()
-                // Joining the prior processor can suspend after account
-                // validation. Do not publish a run or activate an adapter for
-                // a cancelled, replaced, or newly invalidated startup owner.
-                try checkAccountValidationAttempt(
-                    attemptID,
-                    fenceGeneration: accountValidationFenceGeneration
-                )
-                synchronizationRunID = runID
+                let runID = try await changeRequestProcessor.beginRun {
+                    try checkAccountValidationAttempt(
+                        attemptID,
+                        fenceGeneration: accountValidationFenceGeneration
+                    )
+                }
                 let context = RunContext(
                     attemptID: attemptID,
                     runID: runID,
@@ -1925,8 +1940,27 @@ public class CloudKitSynchronizer: NSObject {
                     replicaBindingGenerationIdentifier:
                         replicaBindingGenerationIdentifier
                 )
-                activeRunContext = context
+                // Account-change notifications can poison authority from
+                // outside this actor. Publish the processor run and context
+                // under the same synchronous fence that protects writer commits.
+                let didPublishContext =
+                    accountScopeAuthorityFence.withAuthorizedInvalidationGeneration(
+                        accountValidationFenceGeneration
+                    ) {
+                        guard synchronizationAttemptID == attemptID,
+                              !Task.isCancelled else { return false }
+                        synchronizationRunID = runID
+                        activeRunContext = context
+                        return true
+                    } ?? false
+                guard didPublishContext else {
+                    changeRequestProcessor.reset()
+                    throw CancellationError()
+                }
                 for adapter in modelAdapters {
+                    // Cancellation or an actor-owned replacement after context
+                    // publication must still fail before adapter activation.
+                    try checkRunContext(context)
                     try await adapter.activateTransportNamespace(
                         containerIdentifier: containerIdentifier,
                         databaseScope: database.databaseScope

@@ -74,6 +74,10 @@ final class SynchronizationProcessorStartupTests: XCTestCase, @unchecked Sendabl
         XCTAssertEqual(observation.activations, 0, "A retired startup reached adapter activation")
         XCTAssertNil(sync.activeRunContext, "A cancelled startup published a stale run context")
         XCTAssertEqual(sync.synchronizationRunID, oldRun, "A retired startup published a processor run")
+        XCTAssertTrue(
+            sync.changeRequestProcessor.cancelSync,
+            "A rejected startup must not reopen its inbound processor"
+        )
         XCTAssertEqual(transport.operationCalls, 0, "No CloudKit operation belongs to this retired startup")
     }
 }
