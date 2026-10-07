@@ -819,6 +819,13 @@ extension CloudKitSynchronizer {
             }
 
             if !acknowledged.isEmpty {
+                // Selecting a conflict for repair does not resolve it. Until
+                // metadata rebasing finishes, every unacknowledged result must
+                // survive a sibling receipt constraint or account-check failure.
+                let acknowledgedIDs = Set(acknowledged)
+                let failuresBeforeRepair = returnedFailures.filter {
+                    !acknowledgedIDs.contains($0.key)
+                }
                 do {
                     try await adapter.didDelete(
                         recordIDs: acknowledged,
@@ -829,9 +836,8 @@ extension CloudKitSynchronizer {
                     if let context = activeRunContext { try checkRunContext(context) }
                     // unknownItem is an idempotent success for deletion; do not
                     // put those IDs back into the failed-item dictionary.
-                    let failed = returnedFailures.filter { !acknowledged.contains($0.key) }
                     let failure = preservingSiblingMutationFailures(
-                        error, failedRecordIDs: [], otherFailures: failed
+                        error, failedRecordIDs: [], otherFailures: failuresBeforeRepair
                     )
                     throw preservingAcknowledgedDeletionConstraints(
                         failure, constraints: acknowledgedConstraints
@@ -843,13 +849,13 @@ extension CloudKitSynchronizer {
                 // These IDs were acknowledged, so they are not failed items.
                 if !acknowledgedConstraints.isEmpty,
                    let failure = preservingAcknowledgedDeletionConstraints(
-                    unresolvedFailures.isEmpty ? nil : partialMutationError(unresolvedFailures),
+                    failuresBeforeRepair.isEmpty ? nil : partialMutationError(failuresBeforeRepair),
                     constraints: acknowledgedConstraints
                 ) {
                     throw failure
                 }
                 try await revalidateMutationResultContext(
-                    for: attemptID, preserving: unresolvedFailures
+                    for: attemptID, preserving: failuresBeforeRepair
                 )
             }
             if !conflictedRecordsByID.isEmpty {
