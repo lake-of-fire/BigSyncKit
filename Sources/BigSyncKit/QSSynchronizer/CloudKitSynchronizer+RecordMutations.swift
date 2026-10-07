@@ -81,12 +81,14 @@ private func validatedMutationResults<Value>(
 /// A repairable record outcome is not permission to ignore operation-level
 /// recovery. Preserve constrained failures for the outer synchronization
 /// lifecycle instead of consuming them in an immediate repair/retry loop.
+/// An incomplete bounded scan cannot prove the absence of deeper constraints.
 /// Only ordinary miss/conflict codes may be handled here. Other recognized
 /// CloudKit failures must not disappear merely because the outer code is one
 /// of those two; internal non-CloudKit SDK details retain their existing path.
 private func mutationFailureAllowsImmediateRepair(_ error: Error) -> Bool {
     let constraints = CloudKitRetryConstraints(error)
-    return !constraints.requiresDeferredRetry
+    return constraints.isErrorGraphComplete
+        && !constraints.requiresDeferredRetry
         && constraints.codes.isSubset(of: [.unknownItem, .serverRecordChanged])
 }
 
@@ -308,21 +310,24 @@ extension CloudKitSynchronizer {
         }
     }
 
-    /// Every immediate retry strictly reduces the attempted multi-item size.
-    /// Keep that ceiling for this drain so successful pieces do not regrow
+    /// Every immediate retry strictly reduces the requested batch limit.
+    /// An adapter may return too many records; that must not keep a drain
+    /// retrying forever at the same limit. Successful pieces cannot regrow
     /// into the rejected request. No journal generation is acknowledged here.
     @BigSyncBackgroundActor
     private func retrySmallerMutationBatch(
         after error: Error,
         attemptedCount: Int,
+        requestedBatchSize: Int,
         ceiling: inout Int?
     ) -> Bool {
         let constraints = CloudKitRetryConstraints(error)
         guard constraints.codes.contains(.limitExceeded) else { return false }
-        let reduced = max(1, attemptedCount / 2)
+        let reduced = max(1, min(attemptedCount, requestedBatchSize) / 2)
         batchSize = min(batchSize, reduced)
         ceiling = min(ceiling ?? batchSize, batchSize)
         return attemptedCount > 1
+            && batchSize < requestedBatchSize
             && constraints.containsOnlySizeLimitFailures
             && !constraints.requiresDeferredRetry
     }
@@ -341,6 +346,8 @@ extension CloudKitSynchronizer {
                 restrictedToEntityType: restrictedToEntityType,
                 attemptID: attemptID
             )
+            // A final synchronous adapter observation can revoke this caller.
+            try checkSynchronizationAttempt(attemptID)
             operationError = nil
         } catch {
             operationError = error
@@ -488,6 +495,7 @@ extension CloudKitSynchronizer {
                 if let context = activeRunContext { try checkRunContext(context) }
                 guard retrySmallerMutationBatch(
                     after: error, attemptedCount: records.count,
+                    requestedBatchSize: requestedBatchSize,
                     ceiling: &sizeLimitCeiling
                 ) else { throw error }
                 // Only pure, reducible limits retry here. Account stops,
@@ -621,6 +629,8 @@ extension CloudKitSynchronizer {
                         in: conflictedRecords,
                         forceSave: true
                     )
+                    // Reject revoked callers before interpreting their outcome.
+                    try checkSynchronizationAttempt(attemptID)
                     try ChangeRequestProcessor.validateInboundLiveResults(
                         results,
                         records: conflictedRecords
@@ -660,6 +670,7 @@ extension CloudKitSynchronizer {
                 let error = partialMutationError(unresolvedFailures)
                 if retrySmallerMutationBatch(
                     after: error, attemptedCount: records.count,
+                    requestedBatchSize: requestedBatchSize,
                     ceiling: &sizeLimitCeiling
                 ) {
                     await Task.yield()
@@ -698,6 +709,8 @@ extension CloudKitSynchronizer {
                 restrictedToEntityType: restrictedToEntityType,
                 attemptID: attemptID
             )
+            // A final synchronous adapter observation can revoke this caller.
+            try checkSynchronizationAttempt(attemptID)
             operationError = nil
         } catch {
             operationError = error
@@ -746,6 +759,7 @@ extension CloudKitSynchronizer {
                 if let context = activeRunContext { try checkRunContext(context) }
                 guard retrySmallerMutationBatch(
                     after: error, attemptedCount: recordIDs.count,
+                    requestedBatchSize: requestedBatchSize,
                     ceiling: &sizeLimitCeiling
                 ) else { throw error }
                 // Only pure, reducible limits retry here. Account stops,
@@ -891,6 +905,7 @@ extension CloudKitSynchronizer {
                 let error = partialMutationError(unresolvedFailures)
                 if retrySmallerMutationBatch(
                     after: error, attemptedCount: recordIDs.count,
+                    requestedBatchSize: requestedBatchSize,
                     ceiling: &sizeLimitCeiling
                 ) {
                     await Task.yield()

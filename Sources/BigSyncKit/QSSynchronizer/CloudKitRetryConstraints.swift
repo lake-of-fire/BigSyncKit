@@ -8,6 +8,9 @@ struct CloudKitRetryConstraints {
     let codes: Set<CKError.Code>
     let serverMinimum: TimeInterval?
     let containsOnlySizeLimitFailures: Bool
+    /// False when the bounded scan left a previously unseen cause unexamined.
+    /// Absence of a discovered constraint then cannot authorize local repair.
+    let isErrorGraphComplete: Bool
 
     var blocksAccountOperations: Bool {
         !codes.isDisjoint(with: [.notAuthenticated, .accountTemporarilyUnavailable])
@@ -23,7 +26,9 @@ struct CloudKitRetryConstraints {
     }
 
     init(_ error: Error) {
-        let errors = cloudKitErrors(in: error)
+        let inspection = inspectCloudKitErrors(in: error)
+        let errors = inspection.errors
+        isErrorGraphComplete = inspection.isComplete
         codes = Set(errors.map(\.code))
         serverMinimum = errors.compactMap {
             ($0.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
@@ -96,7 +101,13 @@ struct CloudKitRetryConstraints {
 }
 
 func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {
-    guard depth < 32 else { return [] }
+    inspectCloudKitErrors(in: error, depth: depth).errors
+}
+
+private func inspectCloudKitErrors(
+    in error: Error, depth: Int = 0
+) -> (errors: [CKError], isComplete: Bool) {
+    guard depth < 32 else { return ([], false) }
     // Breadth-first visitation finds each identity at its shallowest depth,
     // avoiding both repeated DAG fanout and a deep first path hiding evidence
     // that is also reachable by a shorter path. Keep identity objects alive.
@@ -104,12 +115,18 @@ func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {
     var queue = [(error: error as NSError, depth: depth)]
     var offset = 0
     var errors = [CKError]()
+    var isComplete = true
     while offset < queue.count {
         let item = queue[offset]
         offset += 1
-        guard item.depth < 32 else { continue }
         let id = ObjectIdentifier(item.error)
         guard visited[id] == nil else { continue }
+        // A deep alias already inspected on a shallower path is not missing
+        // evidence. Only unseen nodes beyond the ceiling make the scan partial.
+        guard item.depth < 32 else {
+            isComplete = false
+            continue
+        }
         visited[id] = item.error
         if let cloudError = item.error as? CKError {
             errors.append(cloudError)
@@ -127,7 +144,7 @@ func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {
             queue.append((underlying as NSError, item.depth + 1))
         }
     }
-    return errors
+    return (errors, isComplete)
 }
 
 /// Use one interpretation of Foundation's singular and aggregate causes in both

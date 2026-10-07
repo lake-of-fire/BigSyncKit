@@ -10,6 +10,9 @@ private enum ResponseRoute: Sendable {
     var deletes: Bool { self == .deleteConflict || self == .deleteMissing }
     var looksUp: Bool { self == .lookup || self == .lookupMissing }
 }
+private enum ResponseSizeLimit: Sendable {
+    case thrown, perItem, targetOnly
+}
 private enum ResponsePreparationAlteration: Sendable {
     case none, duplicateIdentity, conflictingGeneration, zone, owner
 }
@@ -32,11 +35,19 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     private(set) var rebased = [CKRecord]()
     private(set) var requeued = [CKRecord.ID]()
     private(set) var persistCount = 0
-    var hasChanges: Bool { !pending.isEmpty }
+    var cancelOnPendingStateRead = false
+    var cancelAfterConflictImport = false
+    var quarantineImportedRecords = false
+    var hasChanges: Bool {
+        if cancelOnPendingStateRead { withUnsafeCurrentTask { $0?.cancel() } }
+        return !pending.isEmpty
+    }
     var acknowledgeFailure: Error?
     var requeueFailure: Error?
     private(set) var requeueInvocations = 0
     var preparationAlteration: ResponsePreparationAlteration = .none
+    var respectsPreparationLimit = false
+    private(set) var preparationLimits = [Int]()
 
     private func preparedID(_ name: String) -> CKRecord.ID {
         let zone: CKRecordZone.ID
@@ -62,9 +73,12 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
         if route.looksUp {
             for record in records { pending.remove(record.recordID.recordName) }
         }
+        if cancelAfterConflictImport { withUnsafeCurrentTask { $0?.cancel() } }
         return records.enumerated().map {
             .init(event: .init(ordinal: $0.offset, entityType: $0.element.recordType, recordID: $0.element.recordID),
-                  disposition: .preservedPendingLocal(generation: "pending-" + $0.element.recordID.recordName))
+                  disposition: quarantineImportedRecords
+                    ? .quarantined(lineageID: "quarantine-" + $0.element.recordID.recordName)
+                    : .preservedPendingLocal(generation: "pending-" + $0.element.recordID.recordName))
         }
     }
     func persistImportedChanges() async throws { persistCount += 1 }
@@ -73,7 +87,10 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     @BigSyncBackgroundActor
     func preparedRecordsToUpload(limit: Int, restrictedToEntityType: String?) async throws -> [PreparedRecordUpload] {
         guard !route.deletes else { return [] }
-        var items: [PreparedRecordUpload] = pending.sorted().map { name in
+        preparationLimits.append(limit)
+        let names = pending.sorted()
+        let selected = respectsPreparationLimit ? Array(names.prefix(max(0, limit))) : names
+        var items: [PreparedRecordUpload] = selected.map { name in
             let record = CKRecord(recordType: "IdentityFixture", recordID: preparedID(name))
             record["text"] = "local-" + name as CKRecordValue
             return .init(record: record, generation: "pending-" + name,
@@ -99,7 +116,10 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     @BigSyncBackgroundActor
     func preparedRecordDeletions(limit: Int, restrictedToEntityType: String?) async throws -> [PreparedRecordDeletion] {
         guard route.deletes else { return [] }
-        var items: [PreparedRecordDeletion] = pending.sorted().map {
+        preparationLimits.append(limit)
+        let names = pending.sorted()
+        let selected = respectsPreparationLimit ? Array(names.prefix(max(0, limit))) : names
+        var items: [PreparedRecordDeletion] = selected.map {
             .init(recordID: preparedID($0), generation: "pending-" + $0)
         }
         if let last = items.last {
@@ -161,14 +181,18 @@ private actor ResponseIdentityTransport: CloudKitRecordStore, CloudKitRecordFetc
     let siblingError: CKError?
     let conflictRetryAfter: TimeInterval?
     let repairUnderlyingError: Error?
+    let sizeLimit: ResponseSizeLimit?
     let account: ResponseAccountProbe
     private(set) var mutationCount = 0
+    private(set) var attemptedMutationSizes = [Int]()
     private(set) var lookupCount = 0
     init(route: ResponseRoute, alteration: ResponseAlteration, siblingError: CKError?, account: ResponseAccountProbe,
-         conflictRetryAfter: TimeInterval?, repairUnderlyingError: Error? = nil) {
+         conflictRetryAfter: TimeInterval?, repairUnderlyingError: Error? = nil,
+         sizeLimit: ResponseSizeLimit? = nil) {
         self.route = route; self.alteration = alteration; self.siblingError = siblingError; self.account = account
         self.conflictRetryAfter = conflictRetryAfter
         self.repairUnderlyingError = repairUnderlyingError
+        self.sizeLimit = sizeLimit
     }
     private func conflict(_ id: CKRecord.ID) -> CKError {
         var info: [String: Any] = alteration == .missingConflictRecord ? [:] : [CKRecordChangedErrorServerRecordKey: returned(id)]
@@ -198,7 +222,29 @@ private actor ResponseIdentityTransport: CloudKitRecordStore, CloudKitRecordFetc
     func modifyRecords(saving records: [CKRecord], deleting recordIDs: [CKRecord.ID],
                        savePolicy: CKModifyRecordsOperation.RecordSavePolicy, atomically: Bool) async throws -> CloudKitRecordMutationResults {
         mutationCount += 1
+        attemptedMutationSizes.append(records.count + recordIDs.count)
+        // A nonshrinking predecessor is failed by the transport watchdog;
+        // the actual bounded retry implementation must stop before this point.
         guard mutationCount <= 3 else { throw UnexpectedRetry() }
+        if let sizeLimit {
+            var info = [String: Any]()
+            if let conflictRetryAfter { info[CKErrorRetryAfterKey] = conflictRetryAfter }
+            if let repairUnderlyingError { info[NSUnderlyingErrorKey] = repairUnderlyingError }
+            let error = CKError(.limitExceeded, userInfo: info)
+            if sizeLimit == .thrown { throw error }
+            var saves = [CKRecord.ID: Result<CKRecord, Error>]()
+            var deletes = [CKRecord.ID: Result<Void, Error>]()
+            for record in records {
+                saves[record.recordID] = sizeLimit == .targetOnly && record.recordID.recordName != "target"
+                    ? .success(record) : .failure(error)
+            }
+            for id in recordIDs {
+                deletes[id] = sizeLimit == .targetOnly && id.recordName != "target"
+                    ? .success(()) : .failure(error)
+            }
+            await account.didReceive()
+            return .init(saveResults: saves, deleteResults: deletes)
+        }
         var saves = [CKRecord.ID: Result<CKRecord, Error>]()
         var deletes = [CKRecord.ID: Result<Void, Error>]()
         for record in records {
@@ -275,16 +321,26 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
                      repairUnderlyingError: Error? = nil,
                      preparationAlteration: ResponsePreparationAlteration = .none,
                      failAccountAfterResultCall: Int? = nil,
-                     requeueFailure: Error? = nil) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
+                     requeueFailure: Error? = nil,
+                     cancelOnPendingStateRead: Bool = false,
+                     cancelAfterConflictImport: Bool = false,
+                     quarantineImportedRecords: Bool = false,
+                     sizeLimit: ResponseSizeLimit? = nil,
+                     respectsPreparationLimit: Bool = false) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
         let adapter = ResponseIdentityAdapter(route: route, siblingFailure: sibling != nil)
         adapter.acknowledgeFailure = acknowledgeFailure
         adapter.preparationAlteration = preparationAlteration
         adapter.requeueFailure = requeueFailure
+        adapter.cancelOnPendingStateRead = cancelOnPendingStateRead
+        adapter.cancelAfterConflictImport = cancelAfterConflictImport
+        adapter.quarantineImportedRecords = quarantineImportedRecords
+        adapter.respectsPreparationLimit = respectsPreparationLimit
         let account = ResponseAccountProbe(failsAfterResult: failsAccountAfterResult,
                                            failureAfterResultCall: failAccountAfterResultCall)
         let transport = ResponseIdentityTransport(route: route, alteration: alteration, siblingError: sibling,
                                                    account: account, conflictRetryAfter: conflictRetryAfter,
-                                                   repairUnderlyingError: repairUnderlyingError)
+                                                   repairUnderlyingError: repairUnderlyingError,
+                                                   sizeLimit: sizeLimit)
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("response-identity-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }
         let sync = CloudKitSynchronizer(identifier: UUID().uuidString,
@@ -1859,5 +1915,343 @@ extension SyncMutationResponseIdentityTests {
         XCTAssertEqual(adapter.requeueInvocations, 1)
         XCTAssertEqual(adapter.pending, ["target", "other"])
         XCTAssertTrue(adapter.imported.isEmpty)
+    }
+}
+
+
+// A synchronous adapter getter is a callout, and a completed import may return
+// an outcome after its calling task was cancelled. Neither grants successful
+// drain completion or authority to replace cancellation with a semantic error.
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    private func requireCancellationAtPendingStateRead(
+        _ route: ResponseRoute,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let caller = Task { @BigSyncBackgroundActor in
+            try await self.run(route, .none, cancelOnPendingStateRead: true)
+        }
+        let (adapter, transport, _, failure) = try await caller.value
+        XCTAssertTrue(failure is CancellationError, file: file, line: line)
+        // The receipts committed before cancellation remain committed.
+        XCTAssertTrue(adapter.pending.isEmpty, file: file, line: line)
+        if route.deletes {
+            XCTAssertEqual(Set(adapter.deleted.map(\.recordName)), ["success", "target"], file: file, line: line)
+        } else {
+            XCTAssertEqual(Set(adapter.uploaded.map { $0.recordID.recordName }), ["success", "target"], file: file, line: line)
+        }
+        let requests = await transport.mutationCount
+        XCTAssertEqual(requests, 1, file: file, line: line)
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadDrainRejectsCancellationFromFinalPendingStateRead() async throws {
+        try await requireCancellationAtPendingStateRead(.save)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionDrainRejectsCancellationFromFinalPendingStateRead() async throws {
+        try await requireCancellationAtPendingStateRead(.deleteMissing)
+    }
+
+    @BigSyncBackgroundActor
+    private func requireCancelledImportOutcome(
+        _ route: ResponseRoute, quarantined: Bool,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let caller = Task { @BigSyncBackgroundActor in
+            try await self.run(route, .none, cancelAfterConflictImport: true,
+                               quarantineImportedRecords: quarantined)
+        }
+        let (adapter, transport, _, failure) = try await caller.value
+        XCTAssertTrue(failure is CancellationError, file: file, line: line)
+        XCTAssertFalse(adapter.imported.isEmpty, "Must reach the actual import callout", file: file, line: line)
+        XCTAssertEqual(adapter.persistCount, 0, file: file, line: line)
+        if !route.looksUp {
+            XCTAssertEqual(adapter.uploaded.map { $0.recordID.recordName }, ["success"], file: file, line: line)
+            XCTAssertEqual(adapter.pending, ["target"], file: file, line: line)
+        }
+        let requests = await transport.mutationCount
+        let lookups = await transport.lookupCount
+        XCTAssertEqual(requests, route.looksUp ? 0 : 1, file: file, line: line)
+        XCTAssertEqual(lookups, route.looksUp ? 1 : 0, file: file, line: line)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledUploadConflictQuarantineDoesNotReplaceCancellation() async throws {
+        try await requireCancelledImportOutcome(.saveConflict, quarantined: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledUploadConflictOrdinaryOutcomeRemainsCancellation() async throws {
+        try await requireCancelledImportOutcome(.saveConflict, quarantined: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledLookupQuarantineRemainsCancellation() async throws {
+        try await requireCancelledImportOutcome(.lookup, quarantined: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testLiveUploadConflictQuarantineRemainsSemanticStop() async throws {
+        let (adapter, transport, _, failure) = try await run(
+            .saveConflict, .none, quarantineImportedRecords: true
+        )
+        let semantic = try XCTUnwrap(failure as? BigSyncSemanticUploadConflictError)
+        XCTAssertEqual(semantic.recordNames, ["target"])
+        XCTAssertEqual(adapter.pending, ["target"])
+        XCTAssertEqual(adapter.uploaded.map { $0.recordID.recordName }, ["success"])
+        let requests = await transport.mutationCount
+        XCTAssertEqual(requests, 1)
+    }
+}
+
+
+// Shrinking retry must make progress even if an adapter ignores a requested
+// limit. The watchdog is only a failing-fixture escape, never the pass condition.
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    private func requireSizeRetryProgress(
+        _ route: ResponseRoute, response: ResponseSizeLimit,
+        respectsLimit: Bool, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let (adapter, transport, _, failure) = try await run(
+            route, .none, sizeLimit: response, respectsPreparationLimit: respectsLimit
+        )
+        let error = try XCTUnwrap(failure, file: file, line: line)
+        XCTAssertTrue(CloudKitRetryConstraints(error).containsOnlySizeLimitFailures,
+            "Preserve the real size failure, not the fixture retry-watchdog error", file: file, line: line)
+        XCTAssertEqual(adapter.preparationLimits.count, 2, file: file, line: line)
+        XCTAssertEqual(adapter.preparationLimits.last, 1, file: file, line: line)
+        XCTAssertTrue(zip(adapter.preparationLimits, adapter.preparationLimits.dropFirst()).allSatisfy { $1 < $0 },
+            "Each retry must strictly reduce its requested limit", file: file, line: line)
+        let requests = await transport.mutationCount
+        let sizes = await transport.attemptedMutationSizes
+        XCTAssertEqual(requests, 2, file: file, line: line)
+        XCTAssertEqual(sizes, respectsLimit || response == .targetOnly ? [2, 1] : [2, 2], file: file, line: line)
+        if response == .targetOnly {
+            XCTAssertEqual(adapter.pending, ["target"], file: file, line: line)
+            if route.deletes { XCTAssertEqual(adapter.deleted.map(\.recordName), ["success"], file: file, line: line) }
+            else { XCTAssertEqual(adapter.uploaded.map { $0.recordID.recordName }, ["success"], file: file, line: line) }
+        } else {
+            XCTAssertEqual(adapter.pending, ["success", "target"], file: file, line: line)
+            XCTAssertTrue(adapter.uploaded.isEmpty, file: file, line: line)
+            XCTAssertTrue(adapter.deleted.isEmpty, file: file, line: line)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testThrownUploadSizeLimitStopsWhenPreparationIgnoresReducedLimit() async throws {
+        try await requireSizeRetryProgress(.save, response: .thrown, respectsLimit: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testPerItemUploadSizeLimitStopsWhenPreparationIgnoresReducedLimit() async throws {
+        try await requireSizeRetryProgress(.save, response: .perItem, respectsLimit: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testThrownDeletionSizeLimitStopsWhenPreparationIgnoresReducedLimit() async throws {
+        try await requireSizeRetryProgress(.deleteMissing, response: .thrown, respectsLimit: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testPerItemDeletionSizeLimitStopsWhenPreparationIgnoresReducedLimit() async throws {
+        try await requireSizeRetryProgress(.deleteMissing, response: .perItem, respectsLimit: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testCompliantUploadSizeRetryStillReachesSingleton() async throws {
+        for response: ResponseSizeLimit in [.thrown, .perItem] {
+            try await requireSizeRetryProgress(.save, response: response, respectsLimit: true)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCompliantDeletionSizeRetryStillReachesSingleton() async throws {
+        for response: ResponseSizeLimit in [.thrown, .perItem] {
+            try await requireSizeRetryProgress(.deleteMissing, response: response, respectsLimit: true)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPartialSizeFailureRetainsUploadSiblingAcknowledgement() async throws {
+        try await requireSizeRetryProgress(.save, response: .targetOnly, respectsLimit: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testPartialSizeFailureRetainsDeletionSiblingAcknowledgement() async throws {
+        try await requireSizeRetryProgress(.deleteMissing, response: .targetOnly, respectsLimit: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testSizeRetryStillHonorsExplicitServerDelay() async throws {
+        for route: ResponseRoute in [.save, .deleteMissing] {
+            for response: ResponseSizeLimit in [.thrown, .perItem] {
+                for floor: TimeInterval in [0, 137] {
+                    let (adapter, transport, _, failure) = try await run(
+                        route, .none, conflictRetryAfter: floor, sizeLimit: response
+                    )
+                    let constraints = CloudKitRetryConstraints(try XCTUnwrap(failure))
+                    XCTAssertEqual(constraints.serverMinimum, floor)
+                    XCTAssertTrue(constraints.requiresDeferredRetry)
+                    let requests = await transport.mutationCount
+                    XCTAssertEqual(requests, 1)
+                    XCTAssertEqual(adapter.preparationLimits.count, 1)
+                    XCTAssertEqual(adapter.pending, ["success", "target"])
+                }
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testSizeRetryDoesNotEraseAnIndependentLocalFailure() async throws {
+        let local = NSError(domain: "IndependentLocalFailure", code: 81)
+        for route: ResponseRoute in [.save, .deleteMissing] {
+            let (adapter, transport, _, failure) = try await run(
+                route, .none, repairUnderlyingError: local, sizeLimit: .perItem
+            )
+            XCTAssertFalse(CloudKitRetryConstraints(try XCTUnwrap(failure)).containsOnlySizeLimitFailures)
+            let requests = await transport.mutationCount
+            XCTAssertEqual(requests, 1)
+            XCTAssertEqual(adapter.preparationLimits.count, 1)
+            XCTAssertEqual(adapter.pending, ["success", "target"])
+        }
+    }
+}
+
+
+private final class ResponseInternalErrorCycle: NSError, @unchecked Sendable {
+    init() { super.init(domain: "InternalCycle", code: 1, userInfo: nil) }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+    override var userInfo: [String: Any] { [NSUnderlyingErrorKey: self] }
+}
+
+// A depth-limited scan is not proof that no independent constraint exists.
+// Preserve bounded traversal, but do not convert incomplete evidence into
+// immediate repair permission. No deeper CloudKit cause is invented here.
+extension SyncMutationResponseIdentityTests {
+    private func wrappedError(_ leaf: NSError, levels: Int) -> NSError {
+        var result = leaf
+        for _ in 0..<levels {
+            result = NSError(domain: "InternalErrorWrapper", code: 1,
+                userInfo: [NSUnderlyingErrorKey: result])
+        }
+        return result
+    }
+
+    @BigSyncBackgroundActor
+    private func requireIncompleteGraphStopsRepair(
+        _ route: ResponseRoute, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let deep = wrappedError(CKError(.notAuthenticated) as NSError, levels: 40)
+        let (adapter, transport, _, failure) = try await run(
+            route, .none, repairUnderlyingError: deep
+        )
+        let error = try XCTUnwrap(failure,
+            "A truncated graph cannot establish immediate-repair permission", file: file, line: line)
+        XCTAssertTrue(adapter.imported.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.rebased.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.requeued.isEmpty, file: file, line: line)
+        // We keep the original error graph rather than pretending to discover
+        // an account code beyond the existing traversal budget.
+        XCTAssertFalse(CloudKitRetryConstraints(error).blocksAccountOperations, file: file, line: line)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [AnyHashable: Error], file: file, line: line)
+        let id = CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)
+        let recordError: NSError
+        if route == .deleteMissing {
+            let envelope = try XCTUnwrap(items["acknowledgedDeletionConstraints"] as? CKError,
+                file: file, line: line)
+            let causes = try XCTUnwrap(envelope.userInfo[CKPartialErrorsByItemIDKey]
+                as? [CKRecord.ID: NSError], file: file, line: line)
+            recordError = try XCTUnwrap(causes[id], file: file, line: line)
+            XCTAssertNil(items[id], file: file, line: line)
+            XCTAssertEqual(Set(adapter.deleted.map(\.recordName)), ["success", "target"], file: file, line: line)
+            XCTAssertTrue(adapter.pending.isEmpty, file: file, line: line)
+        } else {
+            recordError = try XCTUnwrap(items[id] as? NSError, file: file, line: line)
+            XCTAssertTrue(adapter.pending.contains("target"), file: file, line: line)
+        }
+        XCTAssertTrue((recordError.userInfo[NSUnderlyingErrorKey] as? NSError) === deep, file: file, line: line)
+        let requests = await transport.mutationCount
+        let lookups = await transport.lookupCount
+        XCTAssertEqual(requests, route.looksUp ? 0 : 1, file: file, line: line)
+        XCTAssertEqual(lookups, route.looksUp ? 1 : 0, file: file, line: line)
+    }
+
+    @BigSyncBackgroundActor
+    func testTruncatedUploadConflictGraphDoesNotAuthorizeImmediateRepair() async throws {
+        try await requireIncompleteGraphStopsRepair(.saveConflict)
+    }
+
+    @BigSyncBackgroundActor
+    func testTruncatedMissingUploadGraphDoesNotAuthorizeImmediateRepair() async throws {
+        try await requireIncompleteGraphStopsRepair(.saveMissing)
+    }
+
+    @BigSyncBackgroundActor
+    func testTruncatedDeletionConflictGraphDoesNotAuthorizeImmediateRepair() async throws {
+        try await requireIncompleteGraphStopsRepair(.deleteConflict)
+    }
+
+    @BigSyncBackgroundActor
+    func testTruncatedLookupMissGraphDoesNotAuthorizeImmediateMutation() async throws {
+        try await requireIncompleteGraphStopsRepair(.lookupMissing)
+    }
+
+    @BigSyncBackgroundActor
+    func testTruncatedDeletionMissGraphAcknowledgesWithoutDiscardingUnexaminedEvidence() async throws {
+        try await requireIncompleteGraphStopsRepair(.deleteMissing)
+    }
+
+    @BigSyncBackgroundActor
+    func testCompleteRepairGraphAtDepthBoundaryRemainsEligible() async throws {
+        // Root repair error at depth zero, wrappers at 1...levels, leaf last.
+        for levels in [29, 30, 31] {
+            let detail = wrappedError(NSError(domain: "InternalDetail", code: 1), levels: levels)
+            let (adapter, transport, _, failure) = try await run(
+                .saveMissing, .none, repairUnderlyingError: detail
+            )
+            let requests = await transport.mutationCount
+            if levels < 31 {
+                XCTAssertNil(failure)
+                XCTAssertTrue(adapter.pending.isEmpty)
+                XCTAssertEqual(requests, 2)
+            } else {
+                XCTAssertNotNil(failure)
+                XCTAssertEqual(adapter.pending, ["target"])
+                XCTAssertTrue(adapter.requeued.isEmpty)
+                XCTAssertEqual(requests, 1)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDeepAliasOfAlreadyInspectedErrorDoesNotInvalidateCompleteGraph() async throws {
+        let leaf = NSError(domain: "SharedInternalDetail", code: 1)
+        let deep = wrappedError(leaf, levels: 30)
+        let aggregate = NSError(domain: "InternalAggregate", code: 1, userInfo: [
+            NSUnderlyingErrorKey: deep,
+            NSMultipleUnderlyingErrorsKey: [leaf],
+        ])
+        let (adapter, transport, _, failure) = try await run(
+            .saveMissing, .none, repairUnderlyingError: aggregate
+        )
+        XCTAssertNil(failure)
+        XCTAssertTrue(adapter.pending.isEmpty)
+        let requests = await transport.mutationCount
+        XCTAssertEqual(requests, 2)
+    }
+
+    @BigSyncBackgroundActor
+    func testFullyVisitedInternalCycleRetainsOrdinaryRepairBehavior() async throws {
+        let (adapter, transport, _, failure) = try await run(
+            .saveMissing, .none, repairUnderlyingError: ResponseInternalErrorCycle()
+        )
+        XCTAssertNil(failure)
+        XCTAssertTrue(adapter.pending.isEmpty)
+        let requests = await transport.mutationCount
+        XCTAssertEqual(requests, 2)
     }
 }
