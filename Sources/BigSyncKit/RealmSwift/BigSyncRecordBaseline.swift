@@ -107,7 +107,12 @@ enum BigSyncRecordRebasePlanner {
                 } else {
                     // Comparing IDs is an arbitration rule, not chronology.
                     // It must be the same on all members of a lifetime bundle.
-                    useRemote = (remoteLifetime ?? "") > (localLifetime ?? "")
+                    // Opaque legacy lifetimes retain their literal identity.
+                    // Swift's canonical String ordering can tie different UTF-8
+                    // IDs, causing each replica to preserve its own bundle.
+                    useRemote = (localLifetime ?? "").utf8.lexicographicallyPrecedes(
+                        (remoteLifetime ?? "").utf8
+                    )
                 }
             } else if bundle.allSatisfy({ local[$0] == base[$0] }) {
                 useRemote = true
@@ -162,7 +167,9 @@ enum BigSyncRecordFingerprint {
             let digest: Data
             if property.isMap {
                 let entries = try mapEntries(value, type: property.type)
-                digest = frame(entries.sorted { $0.0 < $1.0 }.flatMap {
+                digest = frame(entries.sorted {
+                    BigSyncStringIdentity.mapKeyPrecedes($0.0, $1.0)
+                }.flatMap {
                     [Data($0.0.utf8), $0.1]
                 })
             } else if property.isArray || property.isSet {

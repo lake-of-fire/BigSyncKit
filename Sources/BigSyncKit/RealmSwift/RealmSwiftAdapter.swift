@@ -586,9 +586,13 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterPendingRelationshipTargetWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterDeletionMetadataTrackingAdmission:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testAfterAcceptedRetainedDeletionTrackingAdmission:
+        (@BigSyncBackgroundActor @Sendable () throws -> Void)?
+    var _testBeforeMissingUploadTargetTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testAfterUploadRecordSelection:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
@@ -1744,7 +1748,8 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     func syncedEntityIsEligibleForActiveAccount(
-        _ syncedEntity: SyncedEntity
+        _ syncedEntity: SyncedEntity,
+        targetReadSnapshot: Realm? = nil
     ) -> Bool {
         guard accountScopePropertyByClassName[
             syncedEntity.entityType
@@ -1752,9 +1757,9 @@ public final class RealmSwiftAdapter:
         guard let objectClass = realmObjectClass(
             name: syncedEntity.entityType
         ), let objectIdentifier = getObjectIdentifier(for: syncedEntity),
-        let object = realmProvider?.targetReaderRealmPerSchemaName[
+        let target = realmProvider?.targetReaderRealmPerSchemaName[
             syncedEntity.entityType
-        ]?.object(
+        ], let object = (targetReadSnapshot ?? target).object(
             ofType: objectClass,
             forPrimaryKey: objectIdentifier
         ) else {
@@ -1770,9 +1775,11 @@ public final class RealmSwiftAdapter:
     private func preparedGenerationIsEligibleForActiveTransport(
         recordName: String,
         entityType: String,
-        generation: String
+        generation: String,
+        trackingReadSnapshot: Realm? = nil,
+        targetReadSnapshot: Realm? = nil
     ) -> Bool {
-        guard let persistenceEntity = realmProvider?.persistenceRealm?.object(
+        guard let persistenceEntity = (trackingReadSnapshot ?? realmProvider?.persistenceRealm)?.object(
             ofType: SyncedEntity.self,
             forPrimaryKey: recordName
         ), persistenceEntity.entityType == entityType,
@@ -1794,7 +1801,8 @@ public final class RealmSwiftAdapter:
             .targetReaderRealmPerSchemaName[entityType] else {
             return false
         }
-        guard let mutation = targetRealm.object(
+        let targetReadRealm = targetReadSnapshot ?? targetRealm
+        guard let mutation = targetReadRealm.object(
             ofType: BigSyncPendingMutation.self,
             forPrimaryKey: recordName
         ) else {
@@ -2717,7 +2725,17 @@ public final class RealmSwiftAdapter:
                         forPrimaryKey: mutation.recordName
                     ), tracked.pendingGeneration == mutation.generation,
                     tracked.pendingReplicaBindingGenerationIdentifier
-                        == mutation.replicaBindingGenerationIdentifier {
+                        == mutation.replicaBindingGenerationIdentifier,
+                       (mutation.isDeletion
+                            ? tracked.entityState == .deletedLocally
+                            : tracked.entityState == .new
+                                || tracked.entityState == .changed) {
+                        // A model may adopt retained tombstones while this
+                        // exact journal generation is already in the physical
+                        // deletion lane. Generation equality proves ownership,
+                        // not that the cached transport kind is still current.
+                        // Forward the existing generation through updateTracking
+                        // when its lane changed; never manufacture a new edit.
                         continue
                     }
                     updateTracking(
@@ -3651,7 +3669,9 @@ public final class RealmSwiftAdapter:
                         return Set(newValue) != Set(existingValue)
                     case .UUID:
                         guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.MutableSet<UUID> else { return true }
-                        return Set(newValue) != Set(Array(existingValue).map { $0.uuidString })
+                        let decoded = newValue.compactMap(UUID.init(uuidString:))
+                        guard decoded.count == newValue.count else { return true }
+                        return Set(decoded) != Set(existingValue)
                     default:
                         break
                     }
@@ -3706,7 +3726,9 @@ public final class RealmSwiftAdapter:
                         return newValue != Array(existingValue)
                     case .UUID:
                         guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.List<UUID> else { return true }
-                        return newValue != Array(existingValue).map { $0.uuidString }
+                        let decoded = newValue.compactMap(UUID.init(uuidString:))
+                        guard decoded.count == newValue.count else { return true }
+                        return decoded != Array(existingValue)
                     default:
                         break
                     }
@@ -3718,7 +3740,9 @@ public final class RealmSwiftAdapter:
                     switch property.type {
                     case .int:
                         guard let newValue = result as? [String: Int], let existingValue = existingValue as? RealmSwift.Map<String, Int> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Int]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .string:
                         guard let newValue = result as? [String: String], let existingValue = existingValue as? RealmSwift.Map<String, String> else { return true }
                         return !BigSyncStringIdentity.mappedValuesEqual(
@@ -3726,22 +3750,39 @@ public final class RealmSwiftAdapter:
                         )
                     case .bool:
                         guard let newValue = result as? [String: Bool], let existingValue = existingValue as? RealmSwift.Map<String, Bool> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Bool]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .float:
                         guard let newValue = result as? [String: Float], let existingValue = existingValue as? RealmSwift.Map<String, Float> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Float]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .double:
                         guard let newValue = result as? [String: Double], let existingValue = existingValue as? RealmSwift.Map<String, Double> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Double]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .date:
                         guard let newValue = result as? [String: Date], let existingValue = existingValue as? RealmSwift.Map<String, Date> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Date]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .UUID:
-                        guard let newValue = result as? [String: UUID], let existingValue = existingValue as? RealmSwift.Map<String, UUID> else { return true }
-                        return newValue != existingValue.reduce(into: [String: UUID]()) { $0[$1.key] = $1.value }
+                        guard let newValue = result as? [String: String], let existingValue = existingValue as? RealmSwift.Map<String, UUID> else { return true }
+                        var decoded = [String: UUID]()
+                        for (key, value) in newValue {
+                            guard let uuid = UUID(uuidString: value) else { return true }
+                            decoded[key] = uuid
+                        }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            decoded, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .data:
                         guard let newValue = result as? [String: Data], let existingValue = existingValue as? RealmSwift.Map<String, Data> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Data]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     default:
                         break
                     }
@@ -4674,8 +4715,6 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     func applyPendingRelationships(realmProvider: RealmProvider) async throws {
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-        let pendingRelationships = persistenceRealm.objects(PendingRelationship.self)
-        guard !pendingRelationships.isEmpty else { return }
 
         struct RelationshipGroupKey: Hashable, Sendable {
             let syncedEntityID: String
@@ -4712,9 +4751,12 @@ public final class RealmSwiftAdapter:
             }
         }
 
-        func currentRelationships(for group: RelationshipGroup) -> [PendingRelationship]? {
+        func currentRelationships(
+            for group: RelationshipGroup,
+            in trackingRealm: Realm
+        ) -> [PendingRelationship]? {
             let current = Array(
-                persistenceRealm.objects(PendingRelationship.self).filter(
+                trackingRealm.objects(PendingRelationship.self).filter(
                     "relationshipName == %@ AND forSyncedEntity.identifier == %@",
                     group.key.relationshipName,
                     group.key.syncedEntityID
@@ -4735,39 +4777,46 @@ public final class RealmSwiftAdapter:
             return currentElements == group.elements ? current : nil
         }
 
-        let groupedRelationships = Dictionary(
-            grouping: Array(pendingRelationships)
-        ) { relationship in
-            RelationshipGroupKey(
-                syncedEntityID: relationship.forSyncedEntity?.identifier ?? "",
-                relationshipName: relationship.relationshipName ?? ""
-            )
-        }
-        let groups = groupedRelationships.compactMap {
-            key, relationships -> RelationshipGroup? in
-            guard !key.syncedEntityID.isEmpty,
-                  !key.relationshipName.isEmpty,
-                  let entityType = relationships.first?.forSyncedEntity?
-                    .entityType else {
-                return nil
+        // Only committed deferred intents may reach a target transaction.
+        // A different owner can leave the shared tracking handle in a write
+        // while this actor resumes; its provisional rows are not import work.
+        // Keep this snapshot lexical so no frozen Realm survives a suspension.
+        let groups: [RelationshipGroup] = {
+            let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+            let groupedRelationships = Dictionary(
+                grouping: Array(snapshot.objects(PendingRelationship.self))
+            ) { relationship in
+                RelationshipGroupKey(
+                    syncedEntityID: relationship.forSyncedEntity?.identifier ?? "",
+                    relationshipName: relationship.relationshipName ?? ""
+                )
             }
-            return RelationshipGroup(
-                key: key,
-                entityType: entityType,
-                elements: relationships.map {
-                    RelationshipElement(
-                        position: $0.position,
-                        targetIdentifier: $0.targetIdentifier,
-                        sourceRecordChangeTag: $0.sourceRecordChangeTag,
-                        expectedModifiedAt: $0.expectedModifiedAt,
-                        expectedExplicitlyModifiedAt:
-                            $0.expectedExplicitlyModifiedAt
-                    )
-                }.sorted { lhs, rhs in
-                    lhs.position < rhs.position
+            return groupedRelationships.compactMap {
+                key, relationships -> RelationshipGroup? in
+                guard !key.syncedEntityID.isEmpty,
+                      !key.relationshipName.isEmpty,
+                      let entityType = relationships.first?.forSyncedEntity?
+                        .entityType else {
+                    return nil
                 }
-            )
-        }
+                return RelationshipGroup(
+                    key: key,
+                    entityType: entityType,
+                    elements: relationships.map {
+                        RelationshipElement(
+                            position: $0.position,
+                            targetIdentifier: $0.targetIdentifier,
+                            sourceRecordChangeTag: $0.sourceRecordChangeTag,
+                            expectedModifiedAt: $0.expectedModifiedAt,
+                            expectedExplicitlyModifiedAt:
+                                $0.expectedExplicitlyModifiedAt
+                        )
+                    }.sorted { lhs, rhs in
+                        lhs.position < rhs.position
+                    }
+                )
+            }
+        }()
 
         func datesMatch(_ lhs: Date?, _ rhs: Date?) -> Bool {
             switch (lhs, rhs) {
@@ -4817,11 +4866,19 @@ public final class RealmSwiftAdapter:
             try await targetRealm.asyncWritePreservingOwnership {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-                guard currentRelationships(for: group) != nil else {
+                // The target transaction owns its current local fields, but
+                // owns no tracking write. Re-sample the committed tracking
+                // intent and parent together after target admission: an
+                // uncommitted deletion/generation must not retire a durable
+                // relationship when its owner later rolls back.
+                let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
+                try Task.checkCancellation()
+                guard !cancelSync else { throw CancellationError() }
+                guard currentRelationships(for: group, in: trackingSnapshot) != nil else {
                     applicationOutcome = .superseded
                     return
                 }
-                guard let syncedEntity = persistenceRealm.object(
+                guard let syncedEntity = trackingSnapshot.object(
                     ofType: SyncedEntity.self,
                     forPrimaryKey: group.key.syncedEntityID
                 ), syncedEntity.entityType == group.entityType,
@@ -4921,6 +4978,9 @@ public final class RealmSwiftAdapter:
                 }
             }
 
+#if DEBUG
+            try await _testAfterPendingRelationshipTargetWrite?()
+#endif
             if case .unsupportedCollectionBridge = applicationOutcome {
                 logger.error(
                     "QSCloudKitSynchronizer >> Retaining deferred relationship \(group.key.relationshipName) for \(group.key.syncedEntityID) because its Realm collection bridge was unavailable"
@@ -4936,7 +4996,7 @@ public final class RealmSwiftAdapter:
             try await persistenceRealm.asyncWritePreservingOwnership {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-                guard let relationships = currentRelationships(for: group)
+                guard let relationships = currentRelationships(for: group, in: persistenceRealm)
                 else { return }
                 persistenceRealm.delete(relationships)
             }
@@ -5991,7 +6051,7 @@ public final class RealmSwiftAdapter:
             SyncedEntityState.deletedLocally.rawValue,
         ]
         let pendingEntities = transportEligiblePendingEntities(
-            persistenceRealm.objects(SyncedEntity.self)
+            committedRealmReadSnapshot(in: persistenceRealm).objects(SyncedEntity.self)
         )
         for entityType in priorityEntityTypeNames {
             guard isOwnedEntityType(entityType) else { continue }
@@ -6017,8 +6077,11 @@ public final class RealmSwiftAdapter:
         let dummyRecordIdentifiers = await dummyRecordIdentifiers
 #endif
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return [] }
+        // A reentrant owner may hold a provisional write on the shared
+        // tracking handle. Selection and generation capture share one durable cut.
+        let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
         let allResults = transportEligiblePendingEntities(
-            persistenceRealm.objects(SyncedEntity.self)
+            trackingSnapshot.objects(SyncedEntity.self)
         )
         let results: Results<SyncedEntity>
         if let restrictedEntityType {
@@ -6028,10 +6091,8 @@ public final class RealmSwiftAdapter:
         } else {
             results = allResults.where { $0.state == state.rawValue }
         }
-        // Capture only primary keys before materializing any records. The
-        // missing-target path in recordToUpload can mark a tracking row as
-        // deleted; iterating a live Results while that write occurs can leave
-        // Realm's fast enumerator pointing at invalidated storage.
+        // Keep the selected identifiers at the same committed tracking version
+        // while missing-target recovery or contract preparation may suspend.
         let candidateIdentifiers = Array(results.map(\.identifier))
         var resultArray = [PreparedRecordUpload]()
         var includedEntityIDs = Set<String>()
@@ -6044,7 +6105,7 @@ public final class RealmSwiftAdapter:
                 if resultArray.count >= limit {
                     return
                 }
-                guard let candidate = persistenceRealm.object(
+                guard let candidate = trackingSnapshot.object(
                     ofType: SyncedEntity.self,
                     forPrimaryKey: identifier
                 ) else {
@@ -6066,8 +6127,14 @@ public final class RealmSwiftAdapter:
                 return
             }
 
+            let targetSnapshot: Realm?
+            if let target = realmProvider?.targetReaderRealmPerSchemaName[syncedEntity.entityType] {
+                targetSnapshot = committedRealmReadSnapshot(in: target)
+            } else {
+                targetSnapshot = nil
+            }
             guard syncedEntityIsEligibleForActiveAccount(
-                syncedEntity
+                syncedEntity, targetReadSnapshot: targetSnapshot
             ) else { return }
 
             guard trackingMutationIsEligibleForActiveTransport(
@@ -6079,13 +6146,16 @@ public final class RealmSwiftAdapter:
                 return
             }
             let entityIdentifier = syncedEntity.identifier
-            guard !recordIsBlocked(entityIdentifier, entityType: syncedEntity.entityType) else { return }
+            guard !recordIsBlocked(entityIdentifier, entityType: syncedEntity.entityType,
+                targetReadSnapshot: targetSnapshot) else { return }
             let generation = syncedEntity.pendingGeneration
             if let generation,
                !preparedGenerationIsEligibleForActiveTransport(
                     recordName: entityIdentifier,
                     entityType: syncedEntity.entityType,
-                    generation: generation
+                    generation: generation,
+                    trackingReadSnapshot: trackingSnapshot,
+                    targetReadSnapshot: targetSnapshot
                ) {
                 return
             }
@@ -6096,11 +6166,16 @@ public final class RealmSwiftAdapter:
 #endif
             guard let record = try recordToUpload(
                 syncedEntity: syncedEntity,
-                isDummyRecord: isDummyRecord
-            ) else { return }
+                isDummyRecord: isDummyRecord,
+                targetReadSnapshot: targetSnapshot
+            ) else {
+                try await markCommittedMissingUploadTargetDeleted(syncedEntity)
+                return
+            }
             resultArray.append(
                 try await prepareContractUpload(record: record, generation: generation,
-                    comparisonBase: preparedComparisonBase(for: record, entityType: syncedEntity.entityType))
+                    comparisonBase: preparedComparisonBase(for: record, entityType: syncedEntity.entityType,
+                        targetReadSnapshot: targetSnapshot))
             )
             includedEntityIDs.insert(entityIdentifier)
         }
@@ -6122,12 +6197,57 @@ public final class RealmSwiftAdapter:
         return resultArray
     }
 
+    /// Missing-target recovery is a separate owned write. Both absence and the
+    /// selected tracking generation must remain true after any ownership wait.
+    @BigSyncBackgroundActor
+    private func markCommittedMissingUploadTargetDeleted(_ selected: SyncedEntity) async throws {
+        guard let provider = realmProvider, let tracking = provider.persistenceRealm,
+              let type = realmObjectClass(name: selected.entityType),
+              !BigSyncRecordLifecycle.retainsTombstone(type),
+              let objectID = getObjectIdentifier(for: selected),
+              let target = provider.targetReaderRealmPerSchemaName[type.className()] else { return }
+        let name = selected.identifier
+        let entityType = selected.entityType
+        let state = selected.state
+        let generation = selected.pendingGeneration
+        let binding = selected.pendingReplicaBindingGenerationIdentifier
+        let selectedCancellationGeneration = cancellationGeneration
+        let selectedAccount = activeAccountScopeIdentifier
+        let selectedContext = recordRebaseContext
+        let selectedContainer = activeContainerIdentifier
+        let selectedDatabaseScope = activeDatabaseScopeRawValue
+        let selectedIssuer = acknowledgementIssuerID
+#if DEBUG
+        try _testBeforeMissingUploadTargetTrackingWrite?()
+#endif
+        try await tracking.asyncWritePreservingOwnership {
+            // Refresh can deliver synchronous notifications. Sample absence
+            // before the final owner and exact-generation admission checks.
+            let targetSnapshot = committedRealmReadSnapshot(in: target)
+            try Task.checkCancellation()
+            guard !cancelSync, cancellationGeneration == selectedCancellationGeneration,
+                  realmProvider === provider, activeAccountScopeIdentifier == selectedAccount,
+                  recordRebaseContext == selectedContext,
+                  activeContainerIdentifier == selectedContainer,
+                  activeDatabaseScopeRawValue == selectedDatabaseScope,
+                  acknowledgementIssuerID == selectedIssuer,
+                  activeReplicaBindingGenerationIdentifier == binding else { throw CancellationError() }
+            guard let current = tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name),
+                  current.entityType == entityType, current.state == state,
+                  current.pendingGeneration == generation,
+                  current.pendingReplicaBindingGenerationIdentifier == binding,
+                  targetSnapshot.object(ofType: type, forPrimaryKey: objectID) == nil else { return }
+            current.entityState = .deletedLocally
+        }
+    }
+
     @BigSyncBackgroundActor
     func recordToUpload(
         syncedEntity: SyncedEntity,
         isDummyRecord: Bool,
         targetZoneID: CKRecordZone.ID? = nil,
-        includeAllProperties: Bool = false
+        includeAllProperties: Bool = false,
+        targetReadSnapshot: Realm? = nil
     ) throws -> CKRecord? {
         try Self.validateCloudKitRecordName(syncedEntity.identifier)
         let record = if let targetZoneID {
@@ -6157,25 +6277,18 @@ public final class RealmSwiftAdapter:
                 entityType: syncedEntity.entityType
             )
         }
-        let object = realmProvider?.targetReaderRealmPerSchemaName[objectClass.className()]?.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
+        let target = realmProvider?.targetReaderRealmPerSchemaName[objectClass.className()]
+        let targetSnapshot = targetReadSnapshot ?? target.map { committedRealmReadSnapshot(in: $0) }
+        let object = targetSnapshot?.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
         let entityState = syncedEntity.state
 
-        guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
+        guard realmProvider?.persistenceRealm != nil else { return nil }
         guard let object else {
             if BigSyncRecordLifecycle.retainsTombstone(objectClass) {
                 throw BigSyncRecordContractError.missingRetainedTarget(syncedEntity.identifier)
             }
-            // Object does not exist, but tracking syncedEntity thinks it does.
-            // We mark it as deleted so the iCloud record will get deleted too
-            try persistenceRealm.write {
-                // Resolve at the transaction boundary. A different operation
-                // may already have changed or removed this tracking row.
-                guard let current = persistenceRealm.object(
-                    ofType: SyncedEntity.self,
-                    forPrimaryKey: syncedEntity.identifier
-                ), current.state == entityState else { return }
-                current.entityState = .deletedLocally
-            }
+            // Selection owns the asynchronous tracking disposition. A serializer
+            // must not start a nested write or act on a provisional target absence.
             return nil
         }
         guard objectIsEligibleForActiveAccount(
@@ -8288,7 +8401,7 @@ public final class RealmSwiftAdapter:
         try validatePreparationOwner()
         if !hasChanges {
             if let persistenceRealm = realmProvider?.persistenceRealm {
-                updateHasChanges(realm: persistenceRealm)
+                updateHasChanges(realm: committedRealmReadSnapshot(in: persistenceRealm))
             }
             try validatePreparationOwner()
             if !hasChanges {
@@ -10401,14 +10514,17 @@ extension RealmSwiftAdapter {
     }
 
     @BigSyncBackgroundActor
-    private func preparedComparisonBase(for record: CKRecord, entityType: String) throws -> BigSyncPreparedRecordBase? {
+    private func preparedComparisonBase(for record: CKRecord, entityType: String,
+                                        targetReadSnapshot: Realm? = nil) throws -> BigSyncPreparedRecordBase? {
         guard let context = recordRebaseContext,
               let realm = realmProvider?.targetReaderRealmPerSchemaName[entityType],
               BigSyncRecordBaseline.isEnabled(in: realm),
               let type = realmObjectClass(name: entityType),
               try recordRebasePolicy(for: type.init()) != .disabled else { return nil }
         let object = try decodedComparisonObject(record, type: type)
-        let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: record.recordID.recordName)
+        let snapshot = targetReadSnapshot ?? committedRealmReadSnapshot(in: realm)
+        let base = snapshot.object(
+            ofType: BigSyncRecordBaseline.self, forPrimaryKey: record.recordID.recordName)
         return .init(context: context,
                      revision: base?.revision,
                      fields: try BigSyncRecordFingerprint.fields(of: object),
@@ -10988,10 +11104,12 @@ extension RealmSwiftAdapter {
     }
 
     @BigSyncBackgroundActor
-    private func recordIsBlocked(_ recordName: String, entityType: String) -> Bool {
+    private func recordIsBlocked(_ recordName: String, entityType: String,
+                                 targetReadSnapshot: Realm? = nil) -> Bool {
         guard let context = recordRebaseContext,
               let realm = realmProvider?.targetReaderRealmPerSchemaName[entityType] else { return false }
-        return BigSyncRecordEvidenceStore(context: context, realm: realm).isBlocked(recordName: recordName)
+        return BigSyncRecordEvidenceStore(context: context,
+            realm: targetReadSnapshot ?? realm).isBlocked(recordName: recordName)
     }
 
     private func conflictLifetimes(local: CKRecord, incoming: CKRecord,
