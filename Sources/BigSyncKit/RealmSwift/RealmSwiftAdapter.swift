@@ -586,6 +586,10 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforePendingRelationshipTargetWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforePendingRelationshipTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingRelationshipTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterDeletionMetadataTrackingAdmission:
@@ -4714,6 +4718,30 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     func applyPendingRelationships(realmProvider: RealmProvider) async throws {
+        let preparationCancellationGeneration = cancellationGeneration
+        let preparationProvider = self.realmProvider
+        let preparationContext = recordRebaseContext
+        let preparationAccount = activeAccountScopeIdentifier
+        let preparationIssuer = acknowledgementIssuerID
+        let preparationContainer = activeContainerIdentifier
+        let preparationDatabaseScope = activeDatabaseScopeRawValue
+        let preparationBinding = activeReplicaBindingGenerationIdentifier
+        func validatePreparationOwner() throws {
+            try Task.checkCancellation()
+            guard !cancelSync,
+                  cancellationGeneration == preparationCancellationGeneration,
+                  self.realmProvider === preparationProvider,
+                  recordRebaseContext == preparationContext,
+                  activeAccountScopeIdentifier == preparationAccount,
+                  acknowledgementIssuerID == preparationIssuer,
+                  activeContainerIdentifier == preparationContainer,
+                  activeDatabaseScopeRawValue == preparationDatabaseScope,
+                  activeReplicaBindingGenerationIdentifier == preparationBinding else {
+                throw CancellationError()
+            }
+        }
+        try validatePreparationOwner()
+        guard self.realmProvider === realmProvider else { throw CancellationError() }
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
 
         struct RelationshipGroupKey: Hashable, Sendable {
@@ -4831,9 +4859,10 @@ public final class RealmSwiftAdapter:
             }
         }
 
+        try validatePreparationOwner()
         for group in groups {
             try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validatePreparationOwner()
             guard let originObjectClass = self.realmObjectClass(
                 name: group.entityType
             ) else {
@@ -4853,7 +4882,7 @@ public final class RealmSwiftAdapter:
             ] else { continue }
             await targetRealm.asyncRefresh()
             try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validatePreparationOwner()
 
             enum RelationshipApplicationOutcome {
                 case applied
@@ -4863,9 +4892,12 @@ public final class RealmSwiftAdapter:
                 case unsupportedCollectionBridge
             }
             var applicationOutcome = RelationshipApplicationOutcome.applied
+#if DEBUG
+            try await _testBeforePendingRelationshipTargetWrite?()
+#endif
             try await targetRealm.asyncWritePreservingOwnership {
                 try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                try validatePreparationOwner()
                 // The target transaction owns its current local fields, but
                 // owns no tracking write. Re-sample the committed tracking
                 // intent and parent together after target admission: an
@@ -4873,7 +4905,7 @@ public final class RealmSwiftAdapter:
                 // relationship when its owner later rolls back.
                 let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
                 try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                try validatePreparationOwner()
                 guard currentRelationships(for: group, in: trackingSnapshot) != nil else {
                     applicationOutcome = .superseded
                     return
@@ -4993,9 +5025,12 @@ public final class RealmSwiftAdapter:
             if case .superseded = applicationOutcome {
                 continue
             }
+#if DEBUG
+            try await _testBeforePendingRelationshipTrackingWrite?()
+#endif
             try await persistenceRealm.asyncWritePreservingOwnership {
                 try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                try validatePreparationOwner()
                 guard let relationships = currentRelationships(for: group, in: persistenceRealm)
                 else { return }
                 persistenceRealm.delete(relationships)
@@ -6055,9 +6090,14 @@ public final class RealmSwiftAdapter:
         )
         for entityType in priorityEntityTypeNames {
             guard isOwnedEntityType(entityType) else { continue }
+            let targetSnapshot = realmProvider?.targetReaderRealmPerSchemaName[entityType]
+                .map { committedRealmReadSnapshot(in: $0) }
             if pendingEntities.where({
                 $0.state.in(pendingStates) && $0.entityType == entityType
-            }).contains(where: { !recordIsBlocked($0.identifier, entityType: $0.entityType) }) {
+            }).contains(where: { entity in
+                !recordIsBlocked(entity.identifier, entityType: entity.entityType,
+                    targetReadSnapshot: targetSnapshot)
+            }) {
                 return entityType
             }
         }
@@ -8637,78 +8677,92 @@ public final class RealmSwiftAdapter:
         limit: Int,
         restrictedToEntityType: String?
     ) async throws -> [PreparedRecordDeletion] {
+        let preparationCancellationGeneration = cancellationGeneration
+        let preparationProvider = realmProvider
+        let preparationContext = recordRebaseContext
+        let preparationAccount = activeAccountScopeIdentifier
+        let preparationIssuer = acknowledgementIssuerID
+        let preparationContainer = activeContainerIdentifier
+        let preparationDatabaseScope = activeDatabaseScopeRawValue
+        let preparationBinding = activeReplicaBindingGenerationIdentifier
+        func validatePreparationOwner() throws {
+            try Task.checkCancellation()
+            guard !cancelSync,
+                  cancellationGeneration == preparationCancellationGeneration,
+                  realmProvider === preparationProvider,
+                  recordRebaseContext == preparationContext,
+                  activeAccountScopeIdentifier == preparationAccount,
+                  acknowledgementIssuerID == preparationIssuer,
+                  activeContainerIdentifier == preparationContainer,
+                  activeDatabaseScopeRawValue == preparationDatabaseScope,
+                  activeReplicaBindingGenerationIdentifier == preparationBinding else {
+                throw CancellationError()
+            }
+        }
+        try validatePreparationOwner()
         var deletions = [PreparedRecordDeletion]()
-        guard let persistenceRealm = realmProvider?.persistenceRealm else { return [] }
+        guard let provider = realmProvider,
+              let persistenceRealm = provider.persistenceRealm else { return [] }
         let targetEntityType = restrictedToEntityType ?? prioritizedEntityTypeWithPendingUploadOrDeletion()
-        if let targetEntityType, !isOwnedEntityType(targetEntityType) {
-            return []
-        }
-        let allEntities = transportEligiblePendingEntities(
-            persistenceRealm.objects(SyncedEntity.self)
-        )
-        let deletedEntities: Results<SyncedEntity>
-        if let targetEntityType {
-            deletedEntities = allEntities.where {
-                $0.state == SyncedEntityState.deletedLocally.rawValue &&
-                $0.entityType == targetEntityType
-            }
-        } else {
-            deletedEntities = allEntities.where {
-                $0.state == SyncedEntityState.deletedLocally.rawValue
-            }
-        }
+        if let targetEntityType, !isOwnedEntityType(targetEntityType) { return [] }
 
-        // Evidence recovery can complete a tracking disposition. Snapshot
-        // keys, not a live Realm query being mutated by that queued write.
-        let identifiers = Array(deletedEntities.map(\.identifier))
-        for identifier in identifiers {
-            guard let syncedEntity = persistenceRealm.object(ofType: SyncedEntity.self,
-                forPrimaryKey: identifier), syncedEntity.entityState == .deletedLocally else { continue }
-            if let type = realmObjectClass(name: syncedEntity.entityType),
-               BigSyncRecordLifecycle.retainsTombstone(type) {
-                throw BigSyncRecordContractError.missingRetainedTarget(syncedEntity.identifier)
+        struct DeletionCandidate {
+            let identifier: String
+            let entityType: String
+            let generation: String
+        }
+        // Detach the complete durable selection before evidence preparation can
+        // suspend. Neither provisional tracking nor target state grants transport
+        // admission, and no frozen Realm/managed row crosses an ownership wait.
+        let candidates: [DeletionCandidate] = try {
+            let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
+            let entities = transportEligiblePendingEntities(trackingSnapshot.objects(SyncedEntity.self))
+            return try entities.compactMap { entity in
+                guard entity.entityState == .deletedLocally,
+                      isOwnedEntityType(entity.entityType),
+                      targetEntityType == nil || entity.entityType == targetEntityType else { return nil }
+                let type = realmObjectClass(name: entity.entityType)
+                if let type, BigSyncRecordLifecycle.retainsTombstone(type) {
+                    throw BigSyncRecordContractError.missingRetainedTarget(entity.identifier)
+                }
+                let targetSnapshot = provider.targetReaderRealmPerSchemaName[entity.entityType]
+                    .map { committedRealmReadSnapshot(in: $0) }
+                guard syncedEntityIsEligibleForActiveAccount(entity, targetReadSnapshot: targetSnapshot),
+                      let generation = entity.pendingGeneration,
+                      preparedGenerationIsEligibleForActiveTransport(
+                        recordName: entity.identifier, entityType: entity.entityType, generation: generation,
+                        trackingReadSnapshot: trackingSnapshot, targetReadSnapshot: targetSnapshot) else { return nil }
+                return DeletionCandidate(identifier: entity.identifier,
+                    entityType: entity.entityType, generation: generation)
             }
-            guard !cancelSync else { throw CancellationError() }
-            guard isOwnedEntityType(syncedEntity.entityType) else { continue }
-            guard syncedEntityIsEligibleForActiveAccount(
-                syncedEntity
-            ) else { continue }
-            guard let generation = syncedEntity.pendingGeneration else { continue }
-            if deletions.count >= limit {
-                break
-            }
-            if let type = realmObjectClass(name: syncedEntity.entityType),
+        }()
+        try validatePreparationOwner()
+        for candidate in candidates {
+            try validatePreparationOwner()
+            if deletions.count >= limit { break }
+            let recordID = CKRecord.ID(recordName: candidate.identifier, zoneID: zoneID)
+            if let type = realmObjectClass(name: candidate.entityType),
                type is BigSyncRecordContractProviding.Type,
-               let target = realmProvider?.targetReaderRealmPerSchemaName[type.className()] {
-                let recordID = CKRecord.ID(recordName: syncedEntity.identifier, zoneID: zoneID)
+               let target = provider.targetReaderRealmPerSchemaName[type.className()] {
                 if let evidence = try await preparePhysicalDeletionEvidence(
-                    recordID: recordID, type: type, generation: generation, in: target) {
-                    deletions.append(.init(recordID: recordID, generation: generation, evidence: evidence))
+                    recordID: recordID, type: type, generation: candidate.generation, in: target) {
+                    try validatePreparationOwner()
+                    deletions.append(.init(recordID: recordID, generation: candidate.generation, evidence: evidence))
                 } else {
-                    // Preparation saw a newer journal (or completed a target-
-                    // first receipt's tracking phase). Forward only this live
-                    // record's work, never sample it as the old delete's proof.
+                    try validatePreparationOwner()
+                    // Keep existing owned recovery and exact journal forwarding.
                     try await forwardPendingMutations(
                         pendingMutationSnapshots(for: [recordID.recordName], in: target),
                         in: target, notifyDelegate: false)
+                    try validatePreparationOwner()
                 }
-                continue
+            } else {
+                // A committed legacy disappearance needs no surviving target.
+                deletions.append(.init(recordID: recordID, generation: candidate.generation))
             }
-            guard preparedGenerationIsEligibleForActiveTransport(
-                recordName: syncedEntity.identifier, entityType: syncedEntity.entityType,
-                generation: generation) else { continue }
-            deletions.append(
-                PreparedRecordDeletion(
-                    recordID: CKRecord.ID(
-                        recordName: syncedEntity.identifier,
-                        zoneID: zoneID
-                    ),
-                    generation: generation
-                )
-            )
         }
-
-        updateHasChanges(realm: persistenceRealm)
+        updateHasChanges(realm: committedRealmReadSnapshot(in: persistenceRealm))
+        try validatePreparationOwner()
         return deletions
     }
 

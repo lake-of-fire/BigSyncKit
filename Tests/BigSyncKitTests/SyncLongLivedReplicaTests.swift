@@ -8,6 +8,7 @@ import XCTest
 @objc(SyncTimelineSnapshot)
 private final class SyncTimelineSnapshot: Object, ChangeMetadataRecordable,
     BigSyncAuthoritativeServerSnapshotModel, BigSyncInboundSemanticRecordValidating {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted(primaryKey: true) var id = "document"
     @Persisted var text = ""
     @Persisted var createdAt = Date(timeIntervalSince1970: 1)
@@ -248,6 +249,22 @@ private final class TimelineReplica {
 }
 
 final class SyncLongLivedReplicaTests: XCTestCase {
+    @BigSyncBackgroundActor
+    func testTimelineFixtureIsExcludedFromRuntimeDefaultSchemaButExplicitlyUsable() throws {
+        var discovered = Realm.Configuration()
+        discovered.inMemoryIdentifier = "timeline-default-schema-" + UUID().uuidString
+        let defaultRealm = try Realm(configuration: discovered)
+        XCTAssertFalse(defaultRealm.schema.objectSchema.contains {
+            $0.className == SyncTimelineSnapshot.className()
+        })
+        var explicit = Realm.Configuration()
+        explicit.inMemoryIdentifier = "timeline-explicit-schema-" + UUID().uuidString
+        explicit.objectTypes = [SyncTimelineSnapshot.self]
+        let explicitRealm = try Realm(configuration: explicit)
+        try explicitRealm.write { explicitRealm.add(SyncTimelineSnapshot()) }
+        XCTAssertEqual(explicitRealm.objects(SyncTimelineSnapshot.self).count, 1)
+    }
+
     @BigSyncBackgroundActor
     private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 
