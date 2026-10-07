@@ -79,4 +79,28 @@ enum BigSyncStringIdentity {
         }
         return identities(lhs) == identities(rhs)
     }
+
+    static func mappedScalarValuesEqual<Value: Equatable, Left: Sequence, Right: Sequence>(
+        _ lhs: Left, _ rhs: Right
+    ) -> Bool where Left.Element == (key: String, value: Value),
+                   Right.Element == (key: String, value: Value) {
+        // Scalar value equality stays unchanged. Keys use the same stored
+        // UTF-8 identity as string-valued maps and the field fingerprint.
+        func identities<Entries: Sequence>(_ entries: Entries) -> [Data: Value]
+            where Entries.Element == (key: String, value: Value) {
+            entries.reduce(into: [:]) { result, entry in
+                result[Data(entry.key.utf8)] = entry.value
+            }
+        }
+        return identities(lhs) == identities(rhs)
+    }
+
+    static func mapKeyPrecedes(_ lhs: String, _ rhs: String) -> Bool {
+        // Retain the established order for ordinary keys and add only the
+        // missing tie-break for canonically equivalent stored spellings.
+        // A wholesale switch to byte sorting would change existing hashes.
+        if lhs < rhs { return true }
+        if rhs < lhs { return false }
+        return lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
+    }
 }
