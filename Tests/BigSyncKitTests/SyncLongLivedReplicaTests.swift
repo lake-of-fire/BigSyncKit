@@ -671,8 +671,51 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         try owner.write("account", day: 2, deleted: true)
         try await owner.adapter.didFinishImport()
         let originalGeneration = try XCTUnwrap(owner.generation())
+        let originalObject = try XCTUnwrap(owner.realm.object(
+            ofType: SyncTimelineSnapshot.self, forPrimaryKey: "document"))
+
+        // This is deliberately corrupt restored journal state, not a valid
+        // cross-account authoritative write or evidence of a second account.
+        // Preserve the real successor generation, identity, binding and clock;
+        // corrupt only its account after the ordinary same-account write.
+        @BigSyncBackgroundActor
+        func injectCorruptRestorationJournalAccountForTesting() throws {
+            let realm = owner.realm
+            let journal = try XCTUnwrap(realm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: owner.recordName))
+            let generation = journal.generation
+            let recordName = journal.recordName
+            let entityType = journal.entityType
+            let objectIdentifier = journal.objectIdentifier
+            let binding = journal.replicaBindingGenerationIdentifier
+            let changedAt = journal.changedAt
+            XCTAssertEqual(journal.accountScopeIdentifier, "account")
+            XCTAssertTrue(owner.adapter.pendingMutationIsEligibleForActiveTransport(journal))
+            XCTAssertNotEqual(generation, originalGeneration)
+            XCTAssertEqual(recordName, owner.recordName)
+            XCTAssertEqual(entityType, SyncTimelineSnapshot.className())
+            XCTAssertEqual(objectIdentifier, "document")
+            XCTAssertEqual(binding, owner.binding)
+            XCTAssertEqual(changedAt, TimelineReplica.date(3))
+            try realm.write {
+                journal.accountScopeIdentifier = "foreign-account"
+            }
+            let restoredJournal = try XCTUnwrap(realm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName))
+            XCTAssertTrue(journal.isSameObject(as: restoredJournal))
+            XCTAssertEqual(restoredJournal.generation, generation)
+            XCTAssertEqual(restoredJournal.recordName, recordName)
+            XCTAssertEqual(restoredJournal.entityType, entityType)
+            XCTAssertEqual(restoredJournal.objectIdentifier, objectIdentifier)
+            XCTAssertEqual(restoredJournal.replicaBindingGenerationIdentifier, binding)
+            XCTAssertEqual(restoredJournal.changedAt, changedAt)
+            XCTAssertEqual(restoredJournal.accountScopeIdentifier, "foreign-account")
+            XCTAssertFalse(owner.adapter.pendingMutationIsEligibleForActiveTransport(restoredJournal))
+        }
+
         owner.adapter._testBeforeRemoteDeletionTargetWrite = {
-            try owner.write("foreign-account", day: 3)
+            try owner.write("account", day: 3)
+            try injectCorruptRestorationJournalAccountForTesting()
         }
         defer { owner.adapter._testBeforeRemoteDeletionTargetWrite = nil }
         _ = try await owner.adapter.deleteRecords(with: [
@@ -681,20 +724,45 @@ final class SyncLongLivedReplicaTests: XCTestCase {
                 zoneID: owner.adapter.recordZoneID),
         ])
         owner.adapter._testBeforeRemoteDeletionTargetWrite = nil
-        let foreignGeneration = try XCTUnwrap(owner.generation())
-        XCTAssertNotEqual(foreignGeneration, originalGeneration)
-        try await owner.adapter.didFinishImport()
+        let corruptSuccessorGeneration = try XCTUnwrap(owner.generation())
+        XCTAssertNotEqual(corruptSuccessorGeneration, originalGeneration)
         let tracking = try XCTUnwrap(owner.adapter.realmProvider?.persistenceRealm)
         let tracked = try XCTUnwrap(tracking.object(
             ofType: SyncedEntity.self, forPrimaryKey: owner.recordName))
+        // Verify deletion finalization itself, then ordinary journal forwarding.
         XCTAssertEqual(tracked.pendingGeneration, originalGeneration)
         XCTAssertEqual(tracked.entityState, .deletedLocally)
+        try await owner.adapter.didFinishImport()
+        XCTAssertEqual(tracked.pendingGeneration, originalGeneration)
+        XCTAssertEqual(tracked.entityState, .deletedLocally)
+        XCTAssertEqual(tracked.pendingReplicaBindingGenerationIdentifier, owner.binding)
         let saves = try await owner.adapter.prepareUploadBatch(limit: 10)
         let deletions = try await owner.adapter.prepareDeletionBatch(limit: 10)
         XCTAssertTrue(saves.records.isEmpty)
         XCTAssertTrue(deletions.recordIDs.isEmpty)
-        XCTAssertEqual(owner.generation(), foreignGeneration)
-        XCTAssertEqual(owner.value(), "foreign-account")
+        XCTAssertEqual(owner.generation(), corruptSuccessorGeneration)
+        // Keep the domain account valid so object-account filtering cannot mask
+        // a failure to fence the wrong-account successor journal.
+        XCTAssertEqual(owner.value(), "account")
+        let currentObject = try XCTUnwrap(owner.realm.object(
+            ofType: SyncTimelineSnapshot.self, forPrimaryKey: "document"))
+        XCTAssertFalse(originalObject.isInvalidated)
+        XCTAssertTrue(originalObject.isSameObject(as: currentObject))
+        XCTAssertFalse(currentObject.isDeleted)
+        XCTAssertEqual(currentObject.modifiedAt, TimelineReplica.date(3))
+        XCTAssertEqual(currentObject.explicitlyModifiedAt, TimelineReplica.date(3))
+        XCTAssertTrue(owner.adapter.objectIsEligibleForActiveAccount(
+            currentObject, entityType: SyncTimelineSnapshot.className()))
+        let currentJournal = try XCTUnwrap(owner.realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: owner.recordName))
+        XCTAssertEqual(currentJournal.accountScopeIdentifier, "foreign-account")
+        XCTAssertEqual(currentJournal.entityType, SyncTimelineSnapshot.className())
+        XCTAssertEqual(currentJournal.objectIdentifier, "document")
+        XCTAssertEqual(currentJournal.replicaBindingGenerationIdentifier, owner.binding)
+        XCTAssertEqual(currentJournal.changedAt, TimelineReplica.date(3))
+        XCTAssertFalse(owner.adapter.pendingMutationIsEligibleForActiveTransport(currentJournal))
+        XCTAssertEqual(tracked.pendingGeneration, originalGeneration)
+        XCTAssertEqual(tracked.entityState, .deletedLocally)
         await owner.stop()
     }
 }
