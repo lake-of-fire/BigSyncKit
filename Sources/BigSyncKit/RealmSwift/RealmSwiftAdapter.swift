@@ -8114,7 +8114,22 @@ public final class RealmSwiftAdapter:
                     .targetReaderRealmPerSchemaName[
                         localWin.deletion.entityType
                     ]
-                let liveTargetMutation = liveTargetRealm?.object(
+                // A local Unmark or Re-Mark may commit while another record's
+                // target write or this tracking write waits. Select mutation
+                // kind and generation from the same committed target cut;
+                // the earlier localWin's kind does not describe a successor.
+                let selectionCancellationGeneration = cancellationGeneration
+                let committedTarget = liveTargetRealm.map {
+                    committedRealmReadSnapshot(in: $0)
+                }
+                // Refresh can deliver a synchronous cancellation callback.
+                try Task.checkCancellation()
+                guard !cancelSync,
+                      cancellationGeneration == selectionCancellationGeneration,
+                      self.realmProvider === realmProvider else {
+                    throw CancellationError()
+                }
+                let liveTargetMutation = committedTarget?.object(
                         ofType: BigSyncPendingMutation.self,
                         forPrimaryKey: localWin.deletion.recordName
                     )
@@ -8149,7 +8164,15 @@ public final class RealmSwiftAdapter:
                                 .replicaBindingGenerationIdentifier
                     )
                 }
-                if localWin.preservesLocalTombstone {
+                let preservesLocalTombstone: Bool
+                if let liveTargetMutation, let committedTarget {
+                    preservesLocalTombstone = pendingMutationTargetsDeletedObject(
+                        liveTargetMutation, in: committedTarget
+                    )
+                } else {
+                    preservesLocalTombstone = localWin.preservesLocalTombstone
+                }
+                if preservesLocalTombstone {
                     // A remote deletion acknowledges neither the local soft
                     // tombstone nor its journal generation. Keep it in the
                     // deletion lane so CloudKit receives a delete (where an

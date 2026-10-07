@@ -160,7 +160,8 @@ private final class TimelineReplica {
     var recordName: String { SyncTimelineSnapshot.className() + ".document" }
 
     init(label: String, directory: URL, transport: TimelineTransport,
-         fixtureOwner: RealmAdapterFixtureOwner) async throws {
+         fixtureOwner: RealmAdapterFixtureOwner,
+         accountScopePropertyByClassName: [String: String] = [:]) async throws {
         binding = "binding-" + label
         var target = Realm.Configuration()
         target.fileURL = directory.appendingPathComponent(label + "-target.realm")
@@ -172,12 +173,15 @@ private final class TimelineReplica {
         let identity = BigSyncMutationJournalIdentity(
             installationIdentifier: label, replicaBindingGenerationIdentifier: binding
         )
-        BigSyncMutationPolicy(excludedClassNames: []).install(
+        BigSyncMutationPolicy(excludedClassNames: [],
+            accountScopePropertyByClassName: accountScopePropertyByClassName).install(
             configurations: [target], mutationJournalIdentityProvider: { identity }
         )
         adapter = RealmSwiftAdapter(
             persistenceRealmConfiguration: tracking, targetRealmConfigurations: [target],
-            excludedClassNames: [], recordZoneID: .init(zoneName: "timeline"),
+            excludedClassNames: [],
+            accountScopePropertyByClassName: accountScopePropertyByClassName,
+            recordZoneID: .init(zoneName: "timeline"),
             logger: Logger(label: "TimelineReplica"), startSetupTask: false,
             assetDirectoryURL: directory.appendingPathComponent(label + "-assets")
         )
@@ -522,5 +526,175 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         read["text"] = "mutated response" as CKRecordValue
         let reread = try await server.record(named: "one")
         XCTAssertEqual(reread?["text"] as? String, "accepted")
+    }
+
+    // Authored for the real adapter/Realm path; not executed in the source-only
+    // review. The existing hook represents an independent local commit while
+    // a different record in the same inbound batch waits for its target write.
+    @BigSyncBackgroundActor
+    private func checkInboundDeletionMutationKind(
+        initiallyDeleted: Bool, successorDeleted: Bool?, keepsJournal: Bool = true
+    ) async throws {
+        let server = TimelineTransport()
+        let owner = try await TimelineReplica(
+            label: "owner", directory: directory(), transport: server,
+            fixtureOwner: realmFixtureOwner
+        )
+        try owner.write("initial", day: 1)
+        try owner.realm.write {
+            let other = owner.realm.create(SyncTimelineSnapshot.self,
+                value: ["id": "other", "text": "other"])
+            other.refreshChangeMetadata(explicitlyModified: true,
+                at: TimelineReplica.date(1))
+        }
+        try await owner.drain()
+        try owner.write("first local intent", day: 2, deleted: initiallyDeleted)
+        try await owner.adapter.didFinishImport()
+        let firstGeneration = try XCTUnwrap(owner.generation())
+        let otherID = CKRecord.ID(
+            recordName: SyncTimelineSnapshot.className() + ".other",
+            zoneID: owner.adapter.recordZoneID
+        )
+        if let successorDeleted {
+            owner.adapter._testBeforeRemoteDeletionTargetWrite = {
+                try owner.write("successor local intent", day: 3,
+                    deleted: successorDeleted)
+            }
+        } else if !keepsJournal {
+            owner.adapter._testBeforeRemoteDeletionTargetWrite = {
+                // Select localWins with G1 present, then exercise its existing
+                // no-current-journal finalization fallback. Removing G1 before
+                // classification would instead select ordinary remote deletion.
+                try owner.realm.write {
+                    owner.realm.delete(try XCTUnwrap(owner.realm.object(
+                        ofType: BigSyncPendingMutation.self, forPrimaryKey: owner.recordName
+                    )))
+                }
+            }
+        }
+        defer { owner.adapter._testBeforeRemoteDeletionTargetWrite = nil }
+        _ = try await owner.adapter.deleteRecords(with: [
+            .init(recordName: owner.recordName, zoneID: owner.adapter.recordZoneID),
+            otherID,
+        ])
+        owner.adapter._testBeforeRemoteDeletionTargetWrite = nil
+        let currentGeneration = owner.generation()
+        if successorDeleted != nil {
+            XCTAssertNotNil(currentGeneration)
+            XCTAssertNotEqual(currentGeneration, firstGeneration)
+        } else if !keepsJournal {
+            XCTAssertNil(currentGeneration)
+        } else {
+            XCTAssertEqual(currentGeneration, firstGeneration)
+        }
+        // Ordinary import completion must preserve the correct kind. Forwarding
+        // cannot fix a wrong state once tracking already owns this generation.
+        try await owner.adapter.didFinishImport()
+        let tracking = try XCTUnwrap(owner.adapter.realmProvider?.persistenceRealm)
+        let tracked = try XCTUnwrap(tracking.object(
+            ofType: SyncedEntity.self, forPrimaryKey: owner.recordName
+        ))
+        let shouldDelete = successorDeleted ?? initiallyDeleted
+        XCTAssertEqual(tracked.pendingGeneration, currentGeneration ?? firstGeneration)
+        XCTAssertEqual(tracked.entityState, shouldDelete ? .deletedLocally : .new)
+        let saves = try await owner.adapter.prepareUploadBatch(limit: 10)
+        let deletions = try await owner.adapter.prepareDeletionBatch(limit: 10)
+        XCTAssertEqual(saves.records.map(\.recordID.recordName),
+            shouldDelete ? [] : [owner.recordName])
+        XCTAssertEqual(deletions.recordIDs.map(\.recordName),
+            shouldDelete ? [owner.recordName] : [])
+        try await owner.drain()
+        let remote = try await server.record(named: owner.recordName)
+        if shouldDelete {
+            XCTAssertNil(remote)
+        } else {
+            XCTAssertEqual(remote?["text"] as? String,
+                successorDeleted == nil ? "first local intent" : "successor local intent")
+            XCTAssertEqual(remote?["isDeleted"] as? Bool, false)
+        }
+        XCTAssertNil(owner.generation())
+        XCTAssertEqual(owner.realm.object(ofType: SyncTimelineSnapshot.self,
+            forPrimaryKey: "document")?.isDeleted, shouldDelete)
+        await owner.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionCannotAttachOldTombstoneKindToResurrectedGeneration() async throws {
+        try await checkInboundDeletionMutationKind(initiallyDeleted: true, successorDeleted: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionCannotAttachOldLiveKindToTombstoneGeneration() async throws {
+        try await checkInboundDeletionMutationKind(initiallyDeleted: false, successorDeleted: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionKeepsUnchangedLocalTombstoneInDeletionLane() async throws {
+        try await checkInboundDeletionMutationKind(initiallyDeleted: true, successorDeleted: nil)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionKeepsUnchangedLocalLiveGenerationInSaveLane() async throws {
+        try await checkInboundDeletionMutationKind(initiallyDeleted: false, successorDeleted: nil)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionRetainsTrackingOnlyLegacyTombstoneKind() async throws {
+        try await checkInboundDeletionMutationKind(
+            initiallyDeleted: true, successorDeleted: nil, keepsJournal: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionRetainsTrackingOnlyLegacyLiveKind() async throws {
+        try await checkInboundDeletionMutationKind(
+            initiallyDeleted: false, successorDeleted: nil, keepsJournal: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionDoesNotAdoptWrongAccountSuccessorJournal() async throws {
+        let server = TimelineTransport()
+        // Reuse the fixture's String field as its configured account property.
+        // Existing unscoped tests retain the default empty scope mapping.
+        let owner = try await TimelineReplica(
+            label: "owner", directory: directory(), transport: server,
+            fixtureOwner: realmFixtureOwner,
+            accountScopePropertyByClassName: [SyncTimelineSnapshot.className(): "text"]
+        )
+        try owner.write("account", day: 1)
+        try owner.realm.write {
+            let other = owner.realm.create(SyncTimelineSnapshot.self,
+                value: ["id": "other", "text": "account"])
+            other.refreshChangeMetadata(explicitlyModified: true,
+                at: TimelineReplica.date(1))
+        }
+        try await owner.drain()
+        try owner.write("account", day: 2, deleted: true)
+        try await owner.adapter.didFinishImport()
+        let originalGeneration = try XCTUnwrap(owner.generation())
+        owner.adapter._testBeforeRemoteDeletionTargetWrite = {
+            try owner.write("foreign-account", day: 3)
+        }
+        defer { owner.adapter._testBeforeRemoteDeletionTargetWrite = nil }
+        _ = try await owner.adapter.deleteRecords(with: [
+            .init(recordName: owner.recordName, zoneID: owner.adapter.recordZoneID),
+            .init(recordName: SyncTimelineSnapshot.className() + ".other",
+                zoneID: owner.adapter.recordZoneID),
+        ])
+        owner.adapter._testBeforeRemoteDeletionTargetWrite = nil
+        let foreignGeneration = try XCTUnwrap(owner.generation())
+        XCTAssertNotEqual(foreignGeneration, originalGeneration)
+        try await owner.adapter.didFinishImport()
+        let tracking = try XCTUnwrap(owner.adapter.realmProvider?.persistenceRealm)
+        let tracked = try XCTUnwrap(tracking.object(
+            ofType: SyncedEntity.self, forPrimaryKey: owner.recordName))
+        XCTAssertEqual(tracked.pendingGeneration, originalGeneration)
+        XCTAssertEqual(tracked.entityState, .deletedLocally)
+        let saves = try await owner.adapter.prepareUploadBatch(limit: 10)
+        let deletions = try await owner.adapter.prepareDeletionBatch(limit: 10)
+        XCTAssertTrue(saves.records.isEmpty)
+        XCTAssertTrue(deletions.recordIDs.isEmpty)
+        XCTAssertEqual(owner.generation(), foreignGeneration)
+        XCTAssertEqual(owner.value(), "foreign-account")
+        await owner.stop()
     }
 }
