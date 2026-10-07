@@ -79,4 +79,21 @@ enum BigSyncStringIdentity {
         }
         return identities(lhs) == identities(rhs)
     }
+
+    /// Non-string scalar values retain their decoded equality (UUID spelling,
+    /// for example, is already normalized by the transport codec). Every map
+    /// key still uses Realm's stored UTF-8 identity. String values use the
+    /// byte-preserving mappedValuesEqual comparison above instead.
+    static func mappedScalarValuesEqual<Left: Sequence, Right: Sequence, Value: Equatable>(
+        _ lhs: Left, _ rhs: Right
+    ) -> Bool where Left.Element == (key: String, value: Value),
+                   Right.Element == (key: String, value: Value) {
+        func identities<Entries: Sequence>(_ entries: Entries) -> [Data: Value]
+            where Entries.Element == (key: String, value: Value) {
+            entries.reduce(into: [:]) { result, entry in
+                result[Data(entry.key.utf8)] = entry.value
+            }
+        }
+        return identities(lhs) == identities(rhs)
+    }
 }

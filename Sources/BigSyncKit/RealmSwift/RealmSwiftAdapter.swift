@@ -3396,15 +3396,31 @@ public final class RealmSwiftAdapter:
             return nil
         }
 
+        // Tracking, journals and comparison evidence use the stored record name
+        // as their identity. A typed key must retain the exact spelling emitted
+        // by getTargetObjectStringIdentifier; accepting an alias would resolve
+        // another record's target while missing its pending generation.
         switch keyType {
         case .int:
-            return Int(stringObjectId)
+            guard let value = Int(stringObjectId),
+                  BigSyncStringIdentity.equal(String(value), stringObjectId) else {
+                return nil
+            }
+            return value
         case .objectId:
-            return try? ObjectId(string: stringObjectId)
+            guard let value = try? ObjectId(string: stringObjectId),
+                  BigSyncStringIdentity.equal(String(describing: value), stringObjectId) else {
+                return nil
+            }
+            return value
         case .string:
             return stringObjectId
         case .UUID:
-            return UUID(uuidString: stringObjectId)
+            guard let value = UUID(uuidString: stringObjectId),
+                  BigSyncStringIdentity.equal(String(describing: value), stringObjectId) else {
+                return nil
+            }
+            return value
         default:
             return stringObjectId
         }
@@ -3718,7 +3734,9 @@ public final class RealmSwiftAdapter:
                     switch property.type {
                     case .int:
                         guard let newValue = result as? [String: Int], let existingValue = existingValue as? RealmSwift.Map<String, Int> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Int]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .string:
                         guard let newValue = result as? [String: String], let existingValue = existingValue as? RealmSwift.Map<String, String> else { return true }
                         return !BigSyncStringIdentity.mappedValuesEqual(
@@ -3726,22 +3744,43 @@ public final class RealmSwiftAdapter:
                         )
                     case .bool:
                         guard let newValue = result as? [String: Bool], let existingValue = existingValue as? RealmSwift.Map<String, Bool> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Bool]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .float:
                         guard let newValue = result as? [String: Float], let existingValue = existingValue as? RealmSwift.Map<String, Float> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Float]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .double:
                         guard let newValue = result as? [String: Double], let existingValue = existingValue as? RealmSwift.Map<String, Double> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Double]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .date:
                         guard let newValue = result as? [String: Date], let existingValue = existingValue as? RealmSwift.Map<String, Date> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Date]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .UUID:
-                        guard let newValue = result as? [String: UUID], let existingValue = existingValue as? RealmSwift.Map<String, UUID> else { return true }
-                        return newValue != existingValue.reduce(into: [String: UUID]()) { $0[$1.key] = $1.value }
+                        guard let newValue = result as? [String: String],
+                              let existingValue = existingValue as? RealmSwift.Map<String, UUID> else { return true }
+                        // UUID map values use strings on the wire, just as the
+                        // download codec does. Compare decoded UUIDs, retaining
+                        // the stored UTF-8 identity of every Realm map key.
+                        var incoming = [String: UUID]()
+                        for (key, value) in newValue {
+                            guard let uuid = UUID(uuidString: value) else { return true }
+                            incoming[key] = uuid
+                        }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            incoming, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .data:
                         guard let newValue = result as? [String: Data], let existingValue = existingValue as? RealmSwift.Map<String, Data> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Data]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     default:
                         break
                     }
