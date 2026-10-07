@@ -145,11 +145,12 @@ enum RealmSwiftAdapterAcknowledgementError: Error, LocalizedError {
 }
 
 /// Records prepared for one upload attempt. The mutation generations are kept
-/// opaque so acknowledgements cannot accidentally sample newer local edits.
+/// captured immutably so acknowledgements cannot accidentally sample newer local edits.
+/// Module-internal receipts also let behavior tests inspect the captured snapshot.
 struct RealmSwiftPreparedUploadBatch: @unchecked Sendable {
     let records: [CKRecord]
-    fileprivate let prepared: [PreparedRecordUpload]
-    fileprivate let matchingGenerations: [String: String]
+    let prepared: [PreparedRecordUpload]
+    let matchingGenerations: [String: String]
     fileprivate let issuerID: UUID
 }
 
@@ -162,11 +163,11 @@ private struct RealmSwiftAcceptedComparisonReceipt: Sendable {
 }
 
 /// Record identifiers prepared for one deletion attempt. The mutation
-/// generations are kept opaque for generation-matched acknowledgement.
+/// generations are captured immutably for generation-matched acknowledgement.
 struct RealmSwiftPreparedDeletionBatch: @unchecked Sendable {
     let recordIDs: [CKRecord.ID]
-    fileprivate let prepared: [PreparedRecordDeletion]
-    fileprivate let matchingGenerations: [String: String]
+    let prepared: [PreparedRecordDeletion]
+    let matchingGenerations: [String: String]
     fileprivate let issuerID: UUID
 }
 import libzstd
