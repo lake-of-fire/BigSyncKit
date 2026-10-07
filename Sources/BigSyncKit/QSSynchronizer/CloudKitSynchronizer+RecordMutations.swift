@@ -594,9 +594,16 @@ extension CloudKitSynchronizer {
                 } catch {
                     try checkSynchronizationAttempt(attemptID)
                     if let context = activeRunContext { try checkRunContext(context) }
+                    // A sibling conflict selected for later import has not
+                    // been repaired when this earlier requeue fails. Keep its
+                    // returned evidence; only this group's IDs receive the
+                    // local reconciliation error.
+                    let siblingFailures = returnedFailures.filter {
+                        !missingRecordIDs.contains($0.key)
+                    }
                     throw preservingSiblingMutationFailures(
                         error, failedRecordIDs: Array(missingRecordIDs),
-                        otherFailures: unresolvedFailures
+                        otherFailures: siblingFailures
                     )
                 }
                 try await revalidateMutationResultContext(

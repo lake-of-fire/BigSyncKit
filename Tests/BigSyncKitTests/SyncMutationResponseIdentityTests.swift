@@ -34,6 +34,8 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     private(set) var persistCount = 0
     var hasChanges: Bool { !pending.isEmpty }
     var acknowledgeFailure: Error?
+    var requeueFailure: Error?
+    private(set) var requeueInvocations = 0
     var preparationAlteration: ResponsePreparationAlteration = .none
 
     private func preparedID(_ name: String) -> CKRecord.ID {
@@ -118,6 +120,8 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     }
     @BigSyncBackgroundActor
     func requeueMissingServerRecords(_ recordIDs: [CKRecord.ID], matchingPreparedGenerations: [String: String]) async throws {
+        requeueInvocations += 1
+        if let requeueFailure { throw requeueFailure }
         requeued.append(contentsOf: recordIDs)
     }
     @BigSyncBackgroundActor
@@ -270,10 +274,12 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
                      conflictRetryAfter: TimeInterval? = nil,
                      repairUnderlyingError: Error? = nil,
                      preparationAlteration: ResponsePreparationAlteration = .none,
-                     failAccountAfterResultCall: Int? = nil) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
+                     failAccountAfterResultCall: Int? = nil,
+                     requeueFailure: Error? = nil) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
         let adapter = ResponseIdentityAdapter(route: route, siblingFailure: sibling != nil)
         adapter.acknowledgeFailure = acknowledgeFailure
         adapter.preparationAlteration = preparationAlteration
+        adapter.requeueFailure = requeueFailure
         let account = ResponseAccountProbe(failsAfterResult: failsAccountAfterResult,
                                            failureAfterResultCall: failAccountAfterResultCall)
         let transport = ResponseIdentityTransport(route: route, alteration: alteration, siblingError: sibling,
@@ -1624,5 +1630,234 @@ extension SyncMutationResponseIdentityTests {
         XCTAssertEqual(adapter.pending, ["target", "success", "other"])
         let calls = await transport.mutationCount
         XCTAssertEqual(calls, 1)
+    }
+}
+
+
+// Classification is not settlement. Returned conflicts remain failures until
+// their local repair actually completes; an earlier stop must preserve them.
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    private func requireUnrepairedSiblingConflict(
+        retryAfter: TimeInterval? = nil,
+        underlying: CKError? = nil,
+        acknowledgementError: Error? = nil,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let zone = CKRecordZone.ID(zoneName: "response-identity")
+        let other = CKRecord.ID(recordName: "other", zoneID: zone)
+        let server = CKRecord(recordType: "IdentityFixture", recordID: other)
+        server["text"] = "unrepaired-server-value" as CKRecordValue
+        let conflict = CKError(.serverRecordChanged,
+            userInfo: [CKRecordChangedErrorServerRecordKey: server])
+        let (adapter, transport, account, failure) = try await run(
+            .deleteMissing, .none, sibling: conflict,
+            acknowledgeFailure: acknowledgementError,
+            conflictRetryAfter: retryAfter, repairUnderlyingError: underlying
+        )
+        let error = try XCTUnwrap(failure, file: file, line: line)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [AnyHashable: Error], file: file, line: line)
+        let unhandled = try XCTUnwrap(items[other] as? NSError,
+            "Selecting a conflict for later repair is not settlement", file: file, line: line)
+        XCTAssertEqual(unhandled.domain, CKErrorDomain, file: file, line: line)
+        XCTAssertEqual(unhandled.code, CKError.serverRecordChanged.rawValue, file: file, line: line)
+        XCTAssertTrue((unhandled.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord) === server,
+            file: file, line: line)
+        let envelope = try XCTUnwrap(items["acknowledgedDeletionConstraints"] as? CKError,
+            file: file, line: line)
+        let causes = try XCTUnwrap(envelope.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError], file: file, line: line)
+        XCTAssertEqual(causes[.init(recordName: "target", zoneID: zone)]?.code,
+            CKError.unknownItem.rawValue, file: file, line: line)
+        XCTAssertNil(items[CKRecord.ID(recordName: "target", zoneID: zone)], file: file, line: line)
+        XCTAssertNil(items[CKRecord.ID(recordName: "success", zoneID: zone)], file: file, line: line)
+        let constraints = CloudKitRetryConstraints(error)
+        XCTAssertTrue(constraints.codes.contains(.serverRecordChanged), file: file, line: line)
+        if let retryAfter { XCTAssertEqual(constraints.serverMinimum, retryAfter, file: file, line: line) }
+        if let underlying { XCTAssertTrue(constraints.codes.contains(underlying.code), file: file, line: line) }
+        if let acknowledgementError {
+            XCTAssertTrue(adapter.deleted.isEmpty, file: file, line: line)
+            XCTAssertEqual(adapter.pending, ["success", "target", "other"], file: file, line: line)
+            XCTAssertTrue(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)
+                === (acknowledgementError as NSError), file: file, line: line)
+        } else {
+            XCTAssertEqual(Set(adapter.deleted.map(\.recordName)), ["success", "target"], file: file, line: line)
+            XCTAssertEqual(adapter.pending, ["other"], file: file, line: line)
+        }
+        XCTAssertTrue(adapter.imported.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.rebased.isEmpty, file: file, line: line)
+        let calls = await transport.mutationCount
+        let probes = await account.callsAfterResult
+        XCTAssertEqual(calls, 1, file: file, line: line)
+        XCTAssertEqual(probes,
+            underlying?.code == .notAuthenticated || underlying?.code == .accountTemporarilyUnavailable ? 0 : 1,
+            file: file, line: line)
+    }
+
+    @BigSyncBackgroundActor
+    func testAcknowledgedDeletionDeadlinePreservesUnrepairedSiblingConflict() async throws {
+        for floor: TimeInterval in [0, 73] {
+            try await requireUnrepairedSiblingConflict(retryAfter: floor)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testAcknowledgedDeletionAccountStopPreservesUnrepairedSiblingConflict() async throws {
+        for code: CKError.Code in [.notAuthenticated, .accountTemporarilyUnavailable] {
+            try await requireUnrepairedSiblingConflict(underlying: CKError(code))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testAcknowledgedDeletionRecoveryStopPreservesUnrepairedSiblingConflict() async throws {
+        for code: CKError.Code in [.changeTokenExpired, .networkFailure, .quotaExceeded] {
+            try await requireUnrepairedSiblingConflict(underlying: CKError(code))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRejectedDeletionAcknowledgementRetainsConflictAndIndependentDeadline() async throws {
+        try await requireUnrepairedSiblingConflict(retryAfter: 73,
+            acknowledgementError: NSError(domain: "AcknowledgementRejected", code: 9))
+    }
+
+    @BigSyncBackgroundActor
+    func testPostAcknowledgementAccountFailurePreservesUnrepairedDeletionConflict() async throws {
+        let (adapter, transport, account, failure) = try await run(
+            .deleteConflict, .none, failAccountAfterResultCall: 2
+        )
+        let error = try XCTUnwrap(failure)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        let target = CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)
+        XCTAssertEqual(items[target]?.domain, CKErrorDomain)
+        XCTAssertEqual(items[target]?.code, CKError.serverRecordChanged.rawValue)
+        XCTAssertEqual((items[target]?.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord)?.recordID,
+            target)
+        XCTAssertNil(items[.init(recordName: "success", zoneID: adapter.recordZoneID)])
+        XCTAssertEqual(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)?.domain,
+            "ResponseAccountFailure")
+        XCTAssertEqual(adapter.deleted.map(\.recordName), ["success"])
+        XCTAssertTrue(adapter.rebased.isEmpty)
+        XCTAssertEqual(adapter.pending, ["target"])
+        let calls = await transport.mutationCount
+        let probes = await account.callsAfterResult
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(probes, 2)
+    }
+
+    @BigSyncBackgroundActor
+    func testPostAcknowledgementAccountFailureStillPreservesMissingDeletionSlot() async throws {
+        let (adapter, _, account, failure) = try await run(
+            .deleteConflict, .missingResult, failAccountAfterResultCall: 2
+        )
+        let error = try XCTUnwrap(failure)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        let missing = CKRecord.ID(recordName: "target", zoneID: adapter.recordZoneID)
+        XCTAssertEqual(items[missing]?.domain, NSCocoaErrorDomain)
+        XCTAssertEqual(items[missing]?.code, CocoaError.coderValueNotFound.rawValue)
+        XCTAssertNil(items[.init(recordName: "success", zoneID: adapter.recordZoneID)])
+        XCTAssertEqual(adapter.deleted.map(\.recordName), ["success"])
+        XCTAssertEqual(adapter.pending, ["target"])
+        let probes = await account.callsAfterResult
+        XCTAssertEqual(probes, 2)
+    }
+
+    @BigSyncBackgroundActor
+    func testPostRepairAccountFailureDoesNotResurrectHandledDeletionConflict() async throws {
+        let (adapter, transport, account, failure) = try await run(
+            .deleteConflict, .none, failAccountAfterResultCall: 3
+        )
+        let error = try XCTUnwrap(failure)
+        XCTAssertEqual((error as NSError).domain, "ResponseAccountFailure")
+        XCTAssertNil((error as NSError).userInfo[CKPartialErrorsByItemIDKey])
+        XCTAssertEqual(adapter.rebased.map { $0.recordID.recordName }, ["target"])
+        XCTAssertEqual(adapter.deleted.map(\.recordName), ["success"])
+        let probes = await account.callsAfterResult
+        let calls = await transport.mutationCount
+        XCTAssertEqual(probes, 3)
+        XCTAssertEqual(calls, 1)
+    }
+}
+
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    func testMissingUploadRepairFailurePreservesUnstartedSiblingConflict() async throws {
+        let zone = CKRecordZone.ID(zoneName: "response-identity")
+        let other = CKRecord.ID(recordName: "other", zoneID: zone)
+        let server = CKRecord(recordType: "IdentityFixture", recordID: other)
+        let conflict = CKError(.serverRecordChanged,
+            userInfo: [CKRecordChangedErrorServerRecordKey: server])
+        let local = NSError(domain: "RequeueRejected", code: 8)
+        let (adapter, transport, _, failure) = try await run(
+            .saveMissing, .none, sibling: conflict, requeueFailure: local
+        )
+        let error = try XCTUnwrap(failure)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        XCTAssertEqual(items[other]?.code, CKError.serverRecordChanged.rawValue)
+        XCTAssertTrue((items[other]?.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord) === server)
+        XCTAssertTrue(items[.init(recordName: "target", zoneID: zone)] === local)
+        XCTAssertTrue(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError) === local)
+        XCTAssertNil(items[.init(recordName: "success", zoneID: zone)])
+        XCTAssertTrue(CloudKitRetryConstraints(error).codes.contains(.serverRecordChanged))
+        XCTAssertEqual(adapter.uploaded.map { $0.recordID.recordName }, ["success"])
+        XCTAssertEqual(adapter.pending, ["target", "other"])
+        XCTAssertEqual(adapter.requeueInvocations, 1)
+        XCTAssertTrue(adapter.requeued.isEmpty)
+        XCTAssertTrue(adapter.imported.isEmpty)
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingUploadRepairFailureStillPreservesIndependentSiblingDeadline() async throws {
+        let local = NSError(domain: "RequeueRejected", code: 8)
+        let (adapter, transport, _, failure) = try await run(
+            .saveMissing, .none,
+            sibling: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]),
+            requeueFailure: local
+        )
+        let error = try XCTUnwrap(failure)
+        XCTAssertEqual(CloudKitRetryConstraints(error).serverMinimum, 137)
+        XCTAssertTrue(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError) === local)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        XCTAssertTrue(items[.init(recordName: "target", zoneID: adapter.recordZoneID)] === local)
+        XCTAssertEqual(items[.init(recordName: "other", zoneID: adapter.recordZoneID)]?.code,
+            CKError.Code.requestRateLimited.rawValue)
+        XCTAssertEqual(adapter.requeueInvocations, 1)
+        XCTAssertEqual(adapter.pending, ["target", "other"])
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 1)
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingUploadRepairWithoutSiblingFailureRetainsIsolatedLocalError() async throws {
+        let local = NSError(domain: "RequeueRejected", code: 8)
+        let (adapter, _, _, failure) = try await run(.saveMissing, .none, requeueFailure: local)
+        XCTAssertTrue((failure as NSError?) === local)
+        XCTAssertNil((failure as NSError?)?.userInfo[CKPartialErrorsByItemIDKey])
+        XCTAssertEqual(adapter.requeueInvocations, 1)
+        XCTAssertEqual(adapter.pending, ["target"])
+        XCTAssertEqual(adapter.uploaded.map { $0.recordID.recordName }, ["success"])
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingUploadRepairCancellationDoesNotBecomeSiblingPartialFailure() async throws {
+        let zone = CKRecordZone.ID(zoneName: "response-identity")
+        let conflict = CKError(.serverRecordChanged, userInfo: [
+            CKRecordChangedErrorServerRecordKey: CKRecord(recordType: "IdentityFixture",
+                recordID: .init(recordName: "other", zoneID: zone)),
+        ])
+        let (adapter, _, _, failure) = try await run(
+            .saveMissing, .none, sibling: conflict, requeueFailure: CancellationError()
+        )
+        XCTAssertTrue(failure is CancellationError)
+        XCTAssertEqual(adapter.requeueInvocations, 1)
+        XCTAssertEqual(adapter.pending, ["target", "other"])
+        XCTAssertTrue(adapter.imported.isEmpty)
     }
 }
