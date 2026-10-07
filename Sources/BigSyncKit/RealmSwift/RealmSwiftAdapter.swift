@@ -6157,7 +6157,19 @@ public final class RealmSwiftAdapter:
                 entityType: syncedEntity.entityType
             )
         }
-        let object = realmProvider?.targetReaderRealmPerSchemaName[objectClass.className()]?.object(ofType: objectClass, forPrimaryKey: objectIdentifier)
+        // Upload materialization observes committed target state. Another
+        // suspended caller may own an open target write; its provisional
+        // fields or missing object must neither become a payload nor turn
+        // committed tracking work into a CloudKit deletion.
+        let targetRealm = realmProvider?
+            .targetReaderRealmPerSchemaName[objectClass.className()]
+        let committedTarget = targetRealm.map {
+            committedRealmReadSnapshot(in: $0)
+        }
+        let object = committedTarget?.object(
+            ofType: objectClass,
+            forPrimaryKey: objectIdentifier
+        )
         let entityState = syncedEntity.state
 
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
@@ -10408,7 +10420,8 @@ extension RealmSwiftAdapter {
               let type = realmObjectClass(name: entityType),
               try recordRebasePolicy(for: type.init()) != .disabled else { return nil }
         let object = try decodedComparisonObject(record, type: type)
-        let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: record.recordID.recordName)
+        let snapshot = committedRealmReadSnapshot(in: realm)
+        let base = snapshot.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: record.recordID.recordName)
         return .init(context: context,
                      revision: base?.revision,
                      fields: try BigSyncRecordFingerprint.fields(of: object),

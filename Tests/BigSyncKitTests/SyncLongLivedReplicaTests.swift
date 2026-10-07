@@ -260,6 +260,89 @@ final class SyncLongLivedReplicaTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testLegacyUploadExcludesHeldTargetValuesAndPreservesOwner() async throws {
+        let owner = try await TimelineReplica(label: "held-value", directory: directory(), transport: TimelineTransport(), fixtureOwner: realmFixtureOwner)
+        try owner.write("committed authoring", day: 1)
+        try await owner.adapter.didFinishImport()
+        let committedGeneration = try XCTUnwrap(owner.generation())
+        let target = owner.realm
+        try target.beginWrite()
+        defer { if target.isInWriteTransaction { target.cancelWrite() } }
+        let object = try XCTUnwrap(target.object(ofType: SyncTimelineSnapshot.self, forPrimaryKey: "document"))
+        object.text = "provisional authoring that will roll back"
+        object.refreshChangeMetadata(explicitlyModified: true, at: TimelineReplica.date(2))
+        let provisionalGeneration = try XCTUnwrap(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: owner.recordName)?.generation)
+        XCTAssertNotEqual(provisionalGeneration, committedGeneration)
+
+        let batch = try await owner.adapter.prepareUploadBatch(limit: 10)
+        let prepared = try XCTUnwrap(batch.prepared.first)
+        XCTAssertEqual(batch.prepared.count, 1)
+        XCTAssertEqual(prepared.record["text"] as? String, "committed authoring")
+        XCTAssertEqual(prepared.generation, committedGeneration)
+        XCTAssertTrue(target.isInWriteTransaction, "Upload observation must not commit or cancel the target owner's write")
+        XCTAssertEqual(object.text, "provisional authoring that will roll back")
+        XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: owner.recordName)?.generation, provisionalGeneration)
+
+        target.cancelWrite()
+        XCTAssertEqual(owner.value(), "committed authoring")
+        XCTAssertEqual(owner.generation(), committedGeneration)
+        try await owner.adapter.acknowledgeUploadedRecords(batch.records, from: batch)
+        XCTAssertNil(owner.generation(), "Only the committed payload's generation may be acknowledged")
+        XCTAssertEqual(owner.value(), "committed authoring")
+        await owner.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testLegacyUploadExcludesHeldTargetAbsenceAndPreservesOwner() async throws {
+        let owner = try await TimelineReplica(label: "held-absence", directory: directory(), transport: TimelineTransport(), fixtureOwner: realmFixtureOwner)
+        try owner.write("committed live record", day: 1)
+        try await owner.adapter.didFinishImport()
+        let generation = try XCTUnwrap(owner.generation())
+        let target = owner.realm
+        let tracking = try XCTUnwrap(owner.adapter.realmProvider?.persistenceRealm)
+        try target.beginWrite()
+        defer { if target.isInWriteTransaction { target.cancelWrite() } }
+        target.delete(try XCTUnwrap(target.object(ofType: SyncTimelineSnapshot.self, forPrimaryKey: "document")))
+
+        let batch = try await owner.adapter.prepareUploadBatch(limit: 10)
+        XCTAssertEqual(batch.records.count, 1)
+        XCTAssertEqual(batch.records.first?["text"] as? String, "committed live record")
+        XCTAssertEqual(batch.prepared.first?.generation, generation)
+        XCTAssertTrue(target.isInWriteTransaction)
+        XCTAssertNil(target.object(ofType: SyncTimelineSnapshot.self, forPrimaryKey: "document"), "Observation must leave the owner's provisional deletion untouched")
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: owner.recordName)?.entityState, .new)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: owner.recordName)?.pendingGeneration, generation)
+
+        target.cancelWrite()
+        XCTAssertEqual(owner.value(), "committed live record")
+        let deletions = try await owner.adapter.prepareDeletionBatch(limit: 10)
+        XCTAssertTrue(deletions.recordIDs.isEmpty, "Rolled-back target absence must not manufacture a server deletion")
+        XCTAssertEqual(owner.generation(), generation)
+        await owner.stop()
+    }
+
+    @BigSyncBackgroundActor
+    func testLegacyUploadStillQueuesCommittedTargetAbsenceForDeletion() async throws {
+        let owner = try await TimelineReplica(label: "committed-absence", directory: directory(), transport: TimelineTransport(), fixtureOwner: realmFixtureOwner)
+        try owner.write("record with committed disappearance", day: 1)
+        try await owner.adapter.didFinishImport()
+        let generation = try XCTUnwrap(owner.generation())
+        let target = owner.realm
+        try target.write {
+            target.delete(try XCTUnwrap(target.object(ofType: SyncTimelineSnapshot.self, forPrimaryKey: "document")))
+        }
+
+        let uploads = try await owner.adapter.prepareUploadBatch(limit: 10)
+        XCTAssertTrue(uploads.records.isEmpty)
+        let deletions = try await owner.adapter.prepareDeletionBatch(limit: 10)
+        XCTAssertEqual(deletions.recordIDs.map(\.recordName), [owner.recordName])
+        XCTAssertEqual(deletions.matchingGenerations[owner.recordName], generation)
+        try await owner.adapter.acknowledgeDeletedRecordIDs(deletions.recordIDs, from: deletions)
+        XCTAssertNil(owner.generation())
+        await owner.stop()
+    }
+
+    @BigSyncBackgroundActor
     func testSevenDaysOfTypingDuringOldUploadPreservesEveryLineAndDrains() async throws {
         let server = TimelineTransport()
         let owner = try await TimelineReplica(label: "owner", directory: directory(), transport: server, fixtureOwner: realmFixtureOwner)
