@@ -138,7 +138,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         var target = Realm.Configuration()
         target.fileURL = directory.appendingPathComponent("target.realm")
         target.objectTypes = [W1ContractNote.self, W1RetainedArticle.self,
-            W1LegacyRetainedArticle.self, BigSyncPendingMutation.self]
+            W1LegacyRetainedArticle.self, W1UploadSnapshotRow.self, BigSyncPendingMutation.self]
         if enableRecordRebasing {
             BigSyncMutationPolicy.enableRecordRebasing(in: &target)
         }
