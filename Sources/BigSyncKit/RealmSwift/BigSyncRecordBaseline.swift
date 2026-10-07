@@ -110,9 +110,18 @@ enum BigSyncRecordRebasePlanner {
                     // Opaque legacy lifetimes retain their literal identity.
                     // Swift's canonical String ordering can tie different UTF-8
                     // IDs, causing each replica to preserve its own bundle.
-                    useRemote = (localLifetime ?? "").utf8.lexicographicallyPrecedes(
-                        (remoteLifetime ?? "").utf8
-                    )
+                    // Presence is also identity: an absent optional epoch and
+                    // a present empty legacy epoch have different fingerprints.
+                    // Do not let both replicas retain their own bundle by
+                    // coalescing those two values to the same empty String.
+                    switch (localLifetime, remoteLifetime) {
+                    case (nil, .some):
+                        useRemote = true
+                    case let (.some(local), .some(remote)):
+                        useRemote = local.utf8.lexicographicallyPrecedes(remote.utf8)
+                    default:
+                        useRemote = false
+                    }
                 }
             } else if bundle.allSatisfy({ local[$0] == base[$0] }) {
                 useRemote = true
