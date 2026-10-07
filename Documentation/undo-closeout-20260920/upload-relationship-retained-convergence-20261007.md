@@ -4,7 +4,8 @@ This candidate composes the committed upload snapshot fix from PR #131 with the
 retained tombstone and opaque legacy lifetime fixes from PR #132 and the committed
 deferred relationship and collection audit fixes from PR #133. The three unique
 legacy upload regression methods from PR #130 are also retained. PR #131's upload
-implementation subsumes the narrower production change in PR #130.
+implementation subsumes the narrower production change in PR #130. The final follow-up also includes PR #135's canonical typed-record
+identity check and all seven of its native regression methods.
 
 ## Reviewed source boundaries
 
@@ -24,6 +25,13 @@ implementation subsumes the narrower production change in PR #130.
   members, and map fingerprints use a byte tie-break without changing established
   ordering for ordinary keys.
 
+- Typed Int, ObjectId and UUID record-name suffixes must round-trip to the exact
+  spelling emitted by the existing writer. An alternate spelling must not resolve
+  the canonical Realm object while bypassing its journal, baseline or tracking
+  identity. Opaque String keys keep their existing behavior. Malformed incoming
+  aliases use the existing failure path without acknowledging or advancing the
+  incoming page; no automatic normalization or quarantine is introduced.
+
 ## Source identity
 
 Parents included in the convergence commit:
@@ -35,15 +43,21 @@ Parents included in the convergence commit:
 Additional retained test source: PR #130 at
 `16bbe87e816708fc0822a9a5c17a8ee48c8482b4`.
 
-The composed adapter blob is `63ce7d95c0df6eadd30fbdb2d862a6ac32bc0ceb`.
+The final follow-up retains this composition as its first parent and also
+includes PR #135 `02d0cf6264bf33d55874d667419c3712a23175b4` as a parent.
+Its scalar map comparison is already subsumed by the retained #133 implementation;
+all seven new canonical identity / UUID map / scalar map tests are preserved.
+
+The final adapter blob is `debc6b0d65fcf7f0857f5a2e4fdbf6c6687ce93b`.
 The composed baseline blob is `ae60a2ce740ac249c9e9e8343edbba3f37cbca66`.
 The record identity blob is `63a4b9e2b6a75c7649d936bce476caff73b13e6b`.
 
 ## Qualification status
 
-There are 22 newly retained native behavior methods across these four fixes:
+There are 29 newly retained native behavior methods across these five fixes:
 four upload snapshot methods, five retained/lifetime methods, ten relationship and
-collection methods, and three legacy upload methods. New private Realm models
+collection methods, three legacy upload methods, and seven canonical record/map
+methods. New private Realm models
 have explicit unique Objective-C names, exclude themselves from the default
 schema, and use explicit fixture objectTypes.
 

@@ -5,7 +5,173 @@ import RealmSwift
 import XCTest
 @testable import BigSyncKit
 
+
+@objc(W1CanonicalIntegerIdentityFixture)
+private final class W1CanonicalIntegerIdentityFixture: Object {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+    @Persisted(primaryKey: true) var id = 0
+}
+
+@objc(W1CanonicalObjectIdIdentityFixture)
+private final class W1CanonicalObjectIdIdentityFixture: Object {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+    @Persisted(primaryKey: true) var id = ObjectId()
+}
+
+@objc(W1OpaqueStringIdentityFixture)
+private final class W1OpaqueStringIdentityFixture: Object {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+    @Persisted(primaryKey: true) var id = ""
+}
 extension SyncUndoCloseoutW1Tests {
+
+    @BigSyncBackgroundActor
+    func testTypedPrimaryKeyParserAcceptsOnlyWriterSpellingAndKeepsStringKeysOpaque() throws {
+        let nonce = UUID().uuidString
+        let target = Realm.Configuration(inMemoryIdentifier: "canonical-identity-target-" + nonce,
+            objectTypes: [W1CanonicalIntegerIdentityFixture.self, W1CanonicalObjectIdIdentityFixture.self,
+                          W1OpaqueStringIdentityFixture.self, W1ContractNote.self, BigSyncPendingMutation.self])
+        var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        tracking.inMemoryIdentifier = "canonical-identity-tracking-" + nonce
+        let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
+            targetRealmConfigurations: [target], excludedClassNames: [],
+            recordZoneID: .init(zoneName: "canonical-identity-" + nonce),
+            logger: Logger(label: "CanonicalRecordIdentityTests"), startSetupTask: false)
+        realmFixtureOwner.own(adapter)
+
+        for value in [Int.min, -1, 0, 1, Int.max] {
+            XCTAssertEqual(adapter.getObjectIdentifier(stringObjectId: String(value),
+                entityType: W1CanonicalIntegerIdentityFixture.className()) as? Int, value)
+        }
+        for alias in ["+1", "01", "-0", "00"] {
+            XCTAssertNil(adapter.getObjectIdentifier(stringObjectId: alias,
+                entityType: W1CanonicalIntegerIdentityFixture.className()), alias)
+        }
+        let objectID = try ObjectId(string: "abcdef1234567890abcdef12")
+        XCTAssertEqual(adapter.getObjectIdentifier(stringObjectId: String(describing: objectID),
+            entityType: W1CanonicalObjectIdIdentityFixture.className()) as? ObjectId, objectID)
+        XCTAssertNil(adapter.getObjectIdentifier(stringObjectId: "ABCDEF1234567890ABCDEF12",
+            entityType: W1CanonicalObjectIdIdentityFixture.className()))
+        XCTAssertEqual(adapter.getObjectIdentifier(stringObjectId: String(describing: noteID),
+            entityType: W1ContractNote.className()) as? UUID, noteID)
+        XCTAssertNil(adapter.getObjectIdentifier(stringObjectId: noteID.uuidString.lowercased(),
+            entityType: W1ContractNote.className()))
+        for identifier in ["+1", "01", "-0", String(describing: objectID).uppercased(), noteID.uuidString.lowercased()] {
+            XCTAssertEqual(adapter.getObjectIdentifier(stringObjectId: identifier,
+                entityType: W1OpaqueStringIdentityFixture.className()) as? String, identifier)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testNoncanonicalUUIDSaveCannotBypassCanonicalPendingMutation() async throws {
+        let (adapter, realm) = try await fixture()
+        let canonical = note(adapter)
+        _ = try await deliver([canonical], to: adapter)
+        let object = try XCTUnwrap(realm.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
+        let generation = try await edit(object, text: "pending local text", time: 30, realm: realm, adapter: adapter)
+        _ = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        let name = canonical.recordID.recordName
+        let aliasName = W1ContractNote.className() + "." + noteID.uuidString.lowercased()
+        XCTAssertNotEqual(aliasName, name)
+        let alias = CKRecord(recordType: canonical.recordType,
+            recordID: .init(recordName: aliasName, zoneID: canonical.recordID.zoneID))
+        let incoming = note(adapter, time: 40)
+        incoming["text"] = "remote alias text" as CKRecordValue
+        for key in incoming.allKeys() { alias[key] = incoming[key] }
+        let base = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name))
+        let revision = base.revision, fields = base.fieldDigests, system = base.acceptedSystemFields
+        let candidate = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let tracked = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+        let trackingRecord = tracked.encodedRecord, trackingState = tracked.entityState
+        let trackingGeneration = tracked.pendingGeneration
+
+        do {
+            _ = try await deliver([alias], to: adapter)
+            XCTFail("A separate CloudKit name must not acquire the canonical UUID target")
+        } catch let error as RealmSwiftAdapterError {
+            guard case let .malformedRecordIdentifier(recordName, entityType) = error else {
+                return XCTFail("Expected malformed identity, got \(error)")
+            }
+            XCTAssertEqual(recordName, aliasName)
+            XCTAssertEqual(entityType, W1ContractNote.className())
+        }
+        realm.refresh()
+        XCTAssertEqual(object.text, "pending local text")
+        XCTAssertFalse(object.isDeleted)
+        XCTAssertEqual(realm.objects(W1ContractNote.self).count, 1)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+        XCTAssertEqual(base.revision, revision)
+        XCTAssertEqual(base.fieldDigests, fields)
+        XCTAssertEqual(base.acceptedSystemFields, system)
+        XCTAssertEqual(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity, candidate)
+        XCTAssertNil(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: aliasName))
+        XCTAssertNil(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: aliasName))
+        XCTAssertNil(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: aliasName))
+        XCTAssertEqual(tracked.encodedRecord, trackingRecord)
+        XCTAssertEqual(tracked.entityState, trackingState)
+        XCTAssertEqual(tracked.pendingGeneration, trackingGeneration)
+
+        // The canonical spelling still reaches the ordinary three-way merge.
+        let valid = note(adapter, time: 20)
+        valid["number"] = 19 as CKRecordValue
+        _ = try await deliver([valid], to: adapter)
+        XCTAssertEqual(object.text, "pending local text")
+        XCTAssertEqual(object.number, 19)
+        XCTAssertNotNil(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+    }
+
+    @BigSyncBackgroundActor
+    func testNoncanonicalUUIDDeletionCannotTombstoneCanonicalPendingMutation() async throws {
+        let (adapter, realm) = try await fixture()
+        let canonical = note(adapter)
+        _ = try await deliver([canonical], to: adapter)
+        let object = try XCTUnwrap(realm.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
+        let generation = try await edit(object, text: "pending live text", time: 30, realm: realm, adapter: adapter)
+        _ = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        let name = canonical.recordID.recordName
+        let aliasName = W1ContractNote.className() + "." + noteID.uuidString.lowercased()
+        XCTAssertNotEqual(aliasName, name)
+        let aliasID = CKRecord.ID(recordName: aliasName, zoneID: canonical.recordID.zoneID)
+        let base = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name))
+        let revision = base.revision, fields = base.fieldDigests, system = base.acceptedSystemFields
+        let candidate = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let tracked = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+        let trackingRecord = tracked.encodedRecord, trackingState = tracked.entityState
+        let trackingGeneration = tracked.pendingGeneration
+
+        do {
+            _ = try await adapter.deleteRecords(with: [aliasID])
+            XCTFail("An alias deletion must not bypass the canonical live journal")
+        } catch let error as RealmSwiftAdapterError {
+            guard case let .malformedRecordIdentifier(recordName, entityType) = error else {
+                return XCTFail("Expected malformed identity, got \(error)")
+            }
+            XCTAssertEqual(recordName, aliasName)
+            XCTAssertEqual(entityType, W1ContractNote.className())
+        }
+        realm.refresh()
+        XCTAssertEqual(object.text, "pending live text")
+        XCTAssertFalse(object.isDeleted)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+        XCTAssertEqual(base.revision, revision)
+        XCTAssertEqual(base.fieldDigests, fields)
+        XCTAssertEqual(base.acceptedSystemFields, system)
+        XCTAssertFalse(base.isComparisonInvalidated)
+        XCTAssertEqual(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity, candidate)
+        XCTAssertNil(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: aliasName))
+        XCTAssertNil(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: aliasName))
+        XCTAssertEqual(tracked.encodedRecord, trackingRecord)
+        XCTAssertEqual(tracked.entityState, trackingState)
+        XCTAssertEqual(tracked.pendingGeneration, trackingGeneration)
+
+        let valid = try await adapter.deleteRecords(with: [canonical.recordID])
+        XCTAssertEqual(valid.first?.disposition, .preservedNewerLive(generation: generation))
+        XCTAssertFalse(object.isDeleted)
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+        XCTAssertTrue(base.isComparisonInvalidated)
+    }
     @BigSyncBackgroundActor
     func testOmissionsClearCollectionsButPreserveIndependentPendingTextAcrossRestart() async throws {
         let (adapter, realm) = try await fixture()

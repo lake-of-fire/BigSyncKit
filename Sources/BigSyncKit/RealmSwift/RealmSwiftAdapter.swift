@@ -3414,15 +3414,31 @@ public final class RealmSwiftAdapter:
             return nil
         }
 
+        // Tracking, journals and comparison evidence use the stored record name
+        // as their identity. A typed key must retain the exact spelling emitted
+        // by getTargetObjectStringIdentifier; accepting an alias would resolve
+        // another record's target while missing its pending generation.
         switch keyType {
         case .int:
-            return Int(stringObjectId)
+            guard let value = Int(stringObjectId),
+                  BigSyncStringIdentity.equal(String(value), stringObjectId) else {
+                return nil
+            }
+            return value
         case .objectId:
-            return try? ObjectId(string: stringObjectId)
+            guard let value = try? ObjectId(string: stringObjectId),
+                  BigSyncStringIdentity.equal(String(describing: value), stringObjectId) else {
+                return nil
+            }
+            return value
         case .string:
             return stringObjectId
         case .UUID:
-            return UUID(uuidString: stringObjectId)
+            guard let value = UUID(uuidString: stringObjectId),
+                  BigSyncStringIdentity.equal(String(describing: value), stringObjectId) else {
+                return nil
+            }
+            return value
         default:
             return stringObjectId
         }
