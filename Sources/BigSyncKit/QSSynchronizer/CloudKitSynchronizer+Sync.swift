@@ -662,6 +662,22 @@ extension CloudKitSynchronizer {
         let constraints = CloudKitRetryConstraints(error)
         guard canContinue() else { return }
 
+        // A coalesced local mutation may wake an ordinary failed local drain,
+        // but cannot create a fresh retry budget for a transport failure or
+        // bypass a recovery prerequisite. Keep this independent of diagnostic
+        // health categories, which do not grant retry authority.
+        let allowsLocalWorkTail: Bool
+        switch error {
+        case let syncError as SyncError:
+            allowsLocalWorkTail = syncError == .inboundBoundaryChanged
+        case is ChangeFeedMigrationError, is BigSyncCloudAccountPortError,
+             is BigSyncHandledMutationRetryError, is BigSyncSemanticUploadConflictError:
+            allowsLocalWorkTail = false
+        default:
+            allowsLocalWorkTail = constraints.codes.isEmpty
+                && (error as? CloudKitChangeFeedError) != .corruptCursor
+        }
+
         if error is RealmSwiftInboundTargetChangedError {
             // A non-journaled local write invalidated an inbound selection.
             // The page cursor did not commit. Replay through ordinary fetch,
@@ -795,11 +811,6 @@ extension CloudKitSynchronizer {
             }
         }
 
-        if error is CancellationError {
-            logger.info("QSCloudKitSynchronizer >> Synchronization canceled, not retrying")
-            shouldRetry = false
-        }
-
         guard canContinue() else { return }
         // Keep the drain owned through the health notification. Its observer
         // may cancel or replace this attempt, and must not coalesce a successor
@@ -854,11 +865,7 @@ extension CloudKitSynchronizer {
             let shouldStartDeferredLocalWorkDrain =
                 synchronizationRequestedWhileRunning &&
                 !cancelSync &&
-                !(error is CancellationError) &&
-                !(error is ChangeFeedMigrationError) &&
-                !(error is BigSyncCloudAccountPortError) &&
-                (error as? SyncError) != .cancelled &&
-                terminalHealthCategory != .accountTemporarilyUnavailable &&
+                allowsLocalWorkTail &&
                 !cancelledDueToUnauthentication
             finishSynchronizationDrain(with: .failure(error))
             // Failure observers may synchronously admit a successor. This
