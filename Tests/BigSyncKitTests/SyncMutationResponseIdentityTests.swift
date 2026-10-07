@@ -10,6 +10,9 @@ private enum ResponseRoute: Sendable {
     var deletes: Bool { self == .deleteConflict || self == .deleteMissing }
     var looksUp: Bool { self == .lookup || self == .lookupMissing }
 }
+private enum ResponsePreparationAlteration: Sendable {
+    case none, duplicateIdentity, conflictingGeneration, zone, owner
+}
 private enum ResponseAlteration: Sendable {
     case none, name, zone, owner, type, siblingIdentity, missingResult, missingConflictRecord
 }
@@ -31,6 +34,19 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     private(set) var persistCount = 0
     var hasChanges: Bool { !pending.isEmpty }
     var acknowledgeFailure: Error?
+    var preparationAlteration: ResponsePreparationAlteration = .none
+
+    private func preparedID(_ name: String) -> CKRecord.ID {
+        let zone: CKRecordZone.ID
+        if name == "target", preparationAlteration == .zone {
+            zone = .init(zoneName: "other-zone", ownerName: recordZoneID.ownerName)
+        } else if name == "target", preparationAlteration == .owner {
+            zone = .init(zoneName: recordZoneID.zoneName, ownerName: "other-owner")
+        } else {
+            zone = recordZoneID
+        }
+        return .init(recordName: name, zoneID: zone)
+    }
 
     init(route: ResponseRoute, siblingFailure: Bool) {
         self.route = route
@@ -55,12 +71,22 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     @BigSyncBackgroundActor
     func preparedRecordsToUpload(limit: Int, restrictedToEntityType: String?) async throws -> [PreparedRecordUpload] {
         guard !route.deletes else { return [] }
-        return pending.sorted().map { name in
-            let record = CKRecord(recordType: "IdentityFixture", recordID: .init(recordName: name, zoneID: recordZoneID))
+        var items: [PreparedRecordUpload] = pending.sorted().map { name in
+            let record = CKRecord(recordType: "IdentityFixture", recordID: preparedID(name))
             record["text"] = "local-" + name as CKRecordValue
             return .init(record: record, generation: "pending-" + name,
                          comparisonBase: nil, requiresAcceptanceCheck: route.looksUp)
         }
+        if let last = items.last {
+            switch preparationAlteration {
+            case .duplicateIdentity: items.append(last)
+            case .conflictingGeneration:
+                items.append(.init(record: last.record, generation: "successor-generation",
+                    comparisonBase: nil, requiresAcceptanceCheck: route.looksUp))
+            default: break
+            }
+        }
+        return items
     }
     @BigSyncBackgroundActor
     func didUpload(savedRecords: [CKRecord], matchingGenerations: [String: String]) async throws {
@@ -71,7 +97,18 @@ private final class ResponseIdentityAdapter: NSObject, ModelAdapter, @unchecked 
     @BigSyncBackgroundActor
     func preparedRecordDeletions(limit: Int, restrictedToEntityType: String?) async throws -> [PreparedRecordDeletion] {
         guard route.deletes else { return [] }
-        return pending.sorted().map { .init(recordID: .init(recordName: $0, zoneID: recordZoneID), generation: "pending-" + $0) }
+        var items: [PreparedRecordDeletion] = pending.sorted().map {
+            .init(recordID: preparedID($0), generation: "pending-" + $0)
+        }
+        if let last = items.last {
+            switch preparationAlteration {
+            case .duplicateIdentity: items.append(last)
+            case .conflictingGeneration:
+                items.append(.init(recordID: last.recordID, generation: "successor-generation"))
+            default: break
+            }
+        }
+        return items
     }
     @BigSyncBackgroundActor
     func didDelete(recordIDs: [CKRecord.ID], matchingGenerations: [String: String]) async throws {
@@ -225,9 +262,11 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
     private func run(_ route: ResponseRoute, _ alteration: ResponseAlteration, sibling: CKError? = nil,
                      acknowledgeFailure: Error? = nil, failsAccountAfterResult: Bool = false,
                      conflictRetryAfter: TimeInterval? = nil,
-                     repairUnderlyingError: Error? = nil) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
+                     repairUnderlyingError: Error? = nil,
+                     preparationAlteration: ResponsePreparationAlteration = .none) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
         let adapter = ResponseIdentityAdapter(route: route, siblingFailure: sibling != nil)
         adapter.acknowledgeFailure = acknowledgeFailure
+        adapter.preparationAlteration = preparationAlteration
         let account = ResponseAccountProbe(failsAfterResult: failsAccountAfterResult)
         let transport = ResponseIdentityTransport(route: route, alteration: alteration, siblingError: sibling,
                                                    account: account, conflictRetryAfter: conflictRetryAfter,
@@ -1325,5 +1364,84 @@ extension SyncMutationResponseIdentityTests {
         let probes = await account.callsAfterResult
         XCTAssertEqual(calls, 1)
         XCTAssertEqual(probes, 0)
+    }
+}
+
+
+// The mutation response dictionary has one slot per ID. Reject ambiguous or
+// out-of-zone preparation before lookup/write rather than after remote effects.
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    private func rejectPreparedBatch(
+        _ route: ResponseRoute,
+        _ alteration: ResponsePreparationAlteration,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let (adapter, transport, _, failure) = try await run(
+            route, .none, preparationAlteration: alteration
+        )
+        let error = try XCTUnwrap(failure, file: file, line: line)
+        let expected = BigSyncRecordRebaseError.inconsistentReceipt("target") as NSError
+        XCTAssertEqual((error as NSError).domain, expected.domain, file: file, line: line)
+        XCTAssertEqual((error as NSError).code, expected.code, file: file, line: line)
+        XCTAssertEqual(adapter.pending, ["target", "success"], file: file, line: line)
+        XCTAssertTrue(adapter.uploaded.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.deleted.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.imported.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.rebased.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.requeued.isEmpty, file: file, line: line)
+        let mutations = await transport.mutationCount
+        let lookups = await transport.lookupCount
+        XCTAssertEqual(mutations, 0, file: file, line: line)
+        XCTAssertEqual(lookups, 0, file: file, line: line)
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadPreparationRejectsDuplicateIdentityBeforeTransport() async throws {
+        try await rejectPreparedBatch(.save, .duplicateIdentity)
+    }
+    @BigSyncBackgroundActor
+    func testUploadPreparationRejectsConflictingGenerationBeforeTransport() async throws {
+        try await rejectPreparedBatch(.save, .conflictingGeneration)
+    }
+    @BigSyncBackgroundActor
+    func testUploadPreparationRejectsForeignZoneBeforeTransport() async throws {
+        try await rejectPreparedBatch(.save, .zone)
+    }
+    @BigSyncBackgroundActor
+    func testUploadPreparationRejectsForeignOwnerBeforeTransport() async throws {
+        try await rejectPreparedBatch(.save, .owner)
+    }
+    @BigSyncBackgroundActor
+    func testUncertainPreparationRejectsDuplicateIdentityBeforeLookup() async throws {
+        try await rejectPreparedBatch(.lookup, .duplicateIdentity)
+    }
+    @BigSyncBackgroundActor
+    func testUncertainPreparationRejectsConflictingGenerationBeforeLookup() async throws {
+        try await rejectPreparedBatch(.lookup, .conflictingGeneration)
+    }
+    @BigSyncBackgroundActor
+    func testUncertainPreparationRejectsForeignZoneBeforeLookup() async throws {
+        try await rejectPreparedBatch(.lookup, .zone)
+    }
+    @BigSyncBackgroundActor
+    func testUncertainPreparationRejectsForeignOwnerBeforeLookup() async throws {
+        try await rejectPreparedBatch(.lookup, .owner)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionPreparationRejectsDuplicateIdentityBeforeTransport() async throws {
+        try await rejectPreparedBatch(.deleteMissing, .duplicateIdentity)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionPreparationRejectsConflictingGenerationBeforeTransport() async throws {
+        try await rejectPreparedBatch(.deleteMissing, .conflictingGeneration)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionPreparationRejectsForeignZoneBeforeTransport() async throws {
+        try await rejectPreparedBatch(.deleteMissing, .zone)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionPreparationRejectsForeignOwnerBeforeTransport() async throws {
+        try await rejectPreparedBatch(.deleteMissing, .owner)
     }
 }

@@ -12,6 +12,22 @@ private func mutationResponseRecordMatches(
     return expectedType.map { $0.utf8.elementsEqual(record.recordType.utf8) } ?? true
 }
 
+/// One result slot must represent exactly one preparation in the adapter's
+/// zone. Reject ambiguous batches before lookup or mutation: receipt validation
+/// after a server write is too late to protect the request boundary.
+private func validatePreparedMutationRecordIDs(
+    _ recordIDs: [CKRecord.ID],
+    in expectedZone: CKRecordZone.ID
+) throws {
+    var seen = Set<CKRecord.ID>()
+    for recordID in recordIDs {
+        guard recordID.zoneID == expectedZone,
+              seen.insert(recordID).inserted else {
+            throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
+        }
+    }
+}
+
 /// Validate before any local acknowledgement/import or account-routed await.
 /// Keep invalid slots as failures rather than abandoning successful siblings.
 /// The original conflict error remains an underlying cause so its retry-after
@@ -351,6 +367,10 @@ extension CloudKitSynchronizer {
             )
             try checkSynchronizationAttempt(attemptID)
             guard !prepared.isEmpty else { return }
+            try validatePreparedMutationRecordIDs(
+                prepared.map { $0.record.recordID }, in: adapter.recordZoneID
+            )
+            try checkSynchronizationAttempt(attemptID)
 
             let uncertain = prepared.filter(\.requiresAcceptanceCheck)
             if !uncertain.isEmpty, let lookup = recordStore as? any CloudKitRecordFetching {
@@ -699,6 +719,8 @@ extension CloudKitSynchronizer {
             guard !prepared.isEmpty else { return }
 
             let recordIDs = prepared.map(\.recordID)
+            try validatePreparedMutationRecordIDs(recordIDs, in: adapter.recordZoneID)
+            try checkSynchronizationAttempt(attemptID)
             let generations = prepared.reduce(into: [String: String]()) {
                 guard let generation = $1.generation else { return }
                 $0[$1.recordID.recordName] = generation
