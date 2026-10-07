@@ -23,7 +23,7 @@ final class ChangeRequestProcessorCancellationTests: XCTestCase, @unchecked Send
             deletedRecordID: .init(recordName: name, zoneID: adapter.recordZoneID), adapter: adapter, runID: run))
     }
 
-    private func assertCancelled(_ result: Result<InboundProcessingOutcomes, Error>,
+    private func assertCancelled<Success>(_ result: Result<Success, Error>,
                                  file: StaticString = #filePath, line: UInt = #line) {
         guard case .failure(let error) = result else {
             return XCTFail("Cancelled processing delivered success", file: file, line: line)
