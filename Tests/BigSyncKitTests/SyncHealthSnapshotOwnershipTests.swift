@@ -309,6 +309,199 @@ final class SyncHealthSnapshotOwnershipTests: XCTestCase, @unchecked Sendable {
         XCTAssertFalse(f.sync.accountScopeAuthorityFence.rejectsAuthority)
     }
 
+    @BigSyncBackgroundActor
+    private func writerContext(_ f: Fixture, bound: Bool = false) throws -> CloudKitSynchronizer.RunContext {
+        let scope = CloudKitSynchronizer.accountScopeIdentifier(for: "health-a")
+        var generation: String?
+        if bound {
+            let key = f.sync.durableStateKey("ReplicaBinding.v1")
+            _ = try BigSyncReplicaBindingStateStore.prepare(
+                store: f.store, key: key, installationIdentifier: UUID().uuidString
+            )
+            generation = try BigSyncReplicaBindingStateStore.bindInitialAccount(
+                scope, store: f.store, key: key
+            ).activeGenerationIdentifier
+        }
+        let context = CloudKitSynchronizer.RunContext(
+            attemptID: f.sync.synchronizationAttemptID, runID: f.sync.synchronizationRunID,
+            accountIdentifier: "health-a", accountScopeIdentifier: scope,
+            replicaBindingGenerationIdentifier: generation
+        )
+        f.sync.activeRunContext = context
+        f.store.resetObservations()
+        return context
+    }
+
+    @BigSyncBackgroundActor
+    private func onStoreRead(_ f: Fixture,
+        _ callback: @escaping @BigSyncBackgroundActor @Sendable () -> Void) {
+        f.store.onRead = {
+            // These tests call the synchronous store only from the sync actor.
+            // Check that executor before erasing the closure's global-actor type
+            // to reenter the actual writer without scheduling a different task.
+            BigSyncBackgroundActor.shared.assumeIsolated { _ in
+                let invoke = unsafeBitCast(callback, to: (@Sendable () -> Void).self)
+                invoke()
+            }
+        }
+    }
+
+    private func writerCancellation(_ operation: () throws -> Void,
+        file: StaticString = #filePath, line: UInt = #line) {
+        do { try operation(); XCTFail("Retired writer retained authority", file: file, line: line) }
+        catch { XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)", file: file, line: line) }
+    }
+
+    @BigSyncBackgroundActor
+    func testWriterRejectsAccountPoisonDuringPriorHealthRead() async throws {
+        let f = try fixture()
+        let context = try writerContext(f)
+        onStoreRead(f) {
+            f.store.onRead = nil
+            f.sync.accountScopeAuthorityFence.poison()
+        }
+        writerCancellation {
+            try f.sync.recordSyncHealth(.failed, context: context, now: f.recordedAt.addingTimeInterval(10))
+        }
+        XCTAssertEqual(f.store.readCount, 1)
+        XCTAssertEqual(f.store.writeCount, 0)
+        let retained = try await f.sync.syncHealthSnapshot()
+        XCTAssertEqual(retained?.category, .succeeded)
+        XCTAssertEqual(retained?.updatedAt, f.recordedAt)
+        XCTAssertEqual(f.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    private func supersededHealthWriter(rotatesAttempt: Bool) async throws {
+        let f = try fixture()
+        let context = try writerContext(f)
+        let newerAt = f.recordedAt.addingTimeInterval(20)
+        onStoreRead(f) {
+            f.store.onRead = nil
+            if rotatesAttempt { f.sync.synchronizationAttemptID = UUID() }
+            else { f.sync.synchronizationRunID = UUID() }
+            let successor = CloudKitSynchronizer.RunContext(
+                attemptID: f.sync.synchronizationAttemptID, runID: f.sync.synchronizationRunID,
+                accountIdentifier: "health-a", accountScopeIdentifier: context.accountScopeIdentifier
+            )
+            f.sync.activeRunContext = successor
+            do { try f.sync.recordSyncHealth(.succeeded, context: successor, now: newerAt) }
+            catch { XCTFail("Successor health writer failed: \(error)") }
+        }
+        writerCancellation {
+            try f.sync.recordSyncHealth(.failed, context: context, now: f.recordedAt.addingTimeInterval(10))
+        }
+        XCTAssertEqual(f.store.writeCount, 1, "Only the successor may persist health")
+        let retained = try await f.sync.syncHealthSnapshot()
+        XCTAssertEqual(retained?.category, .succeeded)
+        XCTAssertEqual(retained?.lastSuccessAt, newerAt)
+        XCTAssertEqual(retained?.updatedAt, newerAt)
+        XCTAssertNil(retained?.lastFailureAt)
+        XCTAssertEqual(f.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testWriterCannotOverwriteSuccessorHealthAfterRunSupersession() async throws {
+        try await supersededHealthWriter(rotatesAttempt: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testWriterCannotOverwriteSuccessorHealthAfterAttemptSupersession() async throws {
+        try await supersededHealthWriter(rotatesAttempt: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testOwnedWriterPreservesHealthFieldsAndSuccessfulTransition() async throws {
+        let f = try fixture()
+        let context = try writerContext(f)
+        let failedAt = f.recordedAt.addingTimeInterval(10)
+        let retryAt = failedAt.addingTimeInterval(30)
+        try f.sync.recordSyncHealth(.transientRetry, context: context, retryNotBefore: retryAt, now: failedAt)
+        let failed = try await f.sync.syncHealthSnapshot()
+        XCTAssertEqual(failed?.category, .transientRetry)
+        XCTAssertEqual(failed?.lastSuccessAt, f.recordedAt)
+        XCTAssertEqual(failed?.lastFailureAt, failedAt)
+        XCTAssertEqual(failed?.retryNotBefore, retryAt)
+        XCTAssertEqual(failed?.updatedAt, failedAt)
+        let succeededAt = retryAt.addingTimeInterval(10)
+        try f.sync.recordSyncHealth(.succeeded, context: context, now: succeededAt)
+        let succeeded = try await f.sync.syncHealthSnapshot()
+        XCTAssertEqual(succeeded?.category, .succeeded)
+        XCTAssertEqual(succeeded?.accountScopeIdentifier, context.accountScopeIdentifier)
+        XCTAssertEqual(succeeded?.lastSuccessAt, succeededAt)
+        XCTAssertEqual(succeeded?.lastFailureAt, failedAt)
+        XCTAssertEqual(succeeded?.updatedAt, succeededAt)
+        XCTAssertNil(succeeded?.retryNotBefore)
+        XCTAssertEqual(f.store.writeCount, 2)
+        XCTAssertEqual(f.transport.operationCount, 0)
+    }
+
+    private enum BindingReadRetirement: Sendable { case poison, run, attempt, account }
+
+    @BigSyncBackgroundActor
+    private func retiredBindingRead(_ retirement: BindingReadRetirement) throws {
+        let f = try fixture()
+        let context = try writerContext(f, bound: true)
+        onStoreRead(f) {
+            f.store.onRead = nil
+            switch retirement {
+            case .poison: f.sync.accountScopeAuthorityFence.poison()
+            case .run: f.sync.synchronizationRunID = UUID()
+            case .attempt: f.sync.synchronizationAttemptID = UUID()
+            case .account:
+                f.sync.activeRunContext = CloudKitSynchronizer.RunContext(
+                    attemptID: context.attemptID, runID: context.runID,
+                    accountIdentifier: "health-b",
+                    accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "health-b"),
+                    replicaBindingGenerationIdentifier: context.replicaBindingGenerationIdentifier
+                )
+            }
+        }
+        // Check directly so the writer's second check cannot hide a broken
+        // checkRunContext post-load boundary.
+        writerCancellation { try f.sync.checkRunContext(context) }
+        XCTAssertEqual(f.store.readCount, 1)
+        XCTAssertEqual(f.store.writeCount, 0)
+        writerCancellation { try f.sync.recordSyncHealth(.failed, context: context) }
+        XCTAssertEqual(f.store.readCount, 1, "Rejected ownership must not start a health read")
+        XCTAssertEqual(f.store.writeCount, 0)
+        XCTAssertEqual(f.transport.operationCount, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testBoundContextRejectsPoisonDuringBindingLoad() throws {
+        try retiredBindingRead(.poison)
+    }
+
+    @BigSyncBackgroundActor
+    func testBoundContextRejectsRunSupersessionDuringBindingLoad() throws {
+        try retiredBindingRead(.run)
+    }
+
+    @BigSyncBackgroundActor
+    func testBoundContextRejectsAttemptSupersessionDuringBindingLoad() throws {
+        try retiredBindingRead(.attempt)
+    }
+
+    @BigSyncBackgroundActor
+    func testBoundContextRejectsAccountReplacementDuringBindingLoad() throws {
+        try retiredBindingRead(.account)
+    }
+
+    @BigSyncBackgroundActor
+    func testStableBoundContextStillWritesHealth() async throws {
+        let f = try fixture()
+        let context = try writerContext(f, bound: true)
+        try f.sync.checkRunContext(context)
+        let updatedAt = f.recordedAt.addingTimeInterval(10)
+        try f.sync.recordSyncHealth(.succeeded, context: context, now: updatedAt)
+        let retained = try await f.sync.syncHealthSnapshot()
+        XCTAssertEqual(retained?.lastSuccessAt, updatedAt)
+        XCTAssertEqual(retained?.updatedAt, updatedAt)
+        XCTAssertEqual(f.store.writeCount, 1)
+        XCTAssertEqual(f.transport.operationCount, 0)
+    }
+
 }
 
 @BigSyncBackgroundActor

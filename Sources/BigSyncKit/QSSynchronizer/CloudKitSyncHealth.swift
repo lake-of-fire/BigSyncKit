@@ -166,6 +166,9 @@ extension CloudKitSynchronizer {
             terminalZoneDeletionKind: terminalZoneDeletionKind,
             updatedAt: now
         )
+        // The prior snapshot read is a synchronous callout that can retire
+        // this run. Recheck its original ownership immediately before writing.
+        try checkRunContext(context)
         try keyValueStore.bigSyncSetDurably(
             value: snapshot.propertyList,
             forKey: syncHealthSnapshotKey

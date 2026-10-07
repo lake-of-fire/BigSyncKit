@@ -2217,6 +2217,13 @@ public class CloudKitSynchronizer: NSObject {
                 == context.accountScopeIdentifier else {
                 throw CancellationError()
             }
+            // Loading the binding calls into the injected store. A valid
+            // buffered binding cannot revive ownership retired by that callout.
+            try checkSynchronizationAttempt(context.attemptID)
+            guard activeRunContext == context,
+                  synchronizationRunID == context.runID else {
+                throw CancellationError()
+            }
         }
     }
 
