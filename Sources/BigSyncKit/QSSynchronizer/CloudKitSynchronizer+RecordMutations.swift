@@ -298,9 +298,14 @@ extension CloudKitSynchronizer {
         do {
             try checkSynchronizationAttempt(attemptID)
             if let context = activeRunContext { try checkRunContext(context) }
-            if !failures.isEmpty,
-               CloudKitRetryConstraints(partialMutationError(failures)).blocksAccountOperations {
-                return
+            if !failures.isEmpty {
+                let constraints = CloudKitRetryConstraints(partialMutationError(failures))
+                // NSError metadata is a synchronous callout. Do not use its
+                // answer after it revoked the original task or account owner.
+                try checkSynchronizationAttempt(attemptID)
+                if constraints.blocksAccountOperations || !constraints.isErrorGraphComplete {
+                    return
+                }
             }
             try await revalidateActiveRunContext(for: attemptID)
         } catch {
@@ -319,9 +324,12 @@ extension CloudKitSynchronizer {
         after error: Error,
         attemptedCount: Int,
         requestedBatchSize: Int,
-        ceiling: inout Int?
-    ) -> Bool {
+        ceiling: inout Int?,
+        for attemptID: UUID
+    ) throws -> Bool {
         let constraints = CloudKitRetryConstraints(error)
+        // Inspection must not resize or schedule work for a successor.
+        try checkSynchronizationAttempt(attemptID)
         guard constraints.codes.contains(.limitExceeded) else { return false }
         let reduced = max(1, min(attemptedCount, requestedBatchSize) / 2)
         batchSize = min(batchSize, reduced)
@@ -496,18 +504,20 @@ extension CloudKitSynchronizer {
                 guard activeRunContext == mutationContext else { throw CancellationError() }
                 if let context = mutationContext {
                     try checkRunContext(context)
-                    // A returned account stop prohibits another account request.
-                    if !CloudKitRetryConstraints(error).blocksAccountOperations {
+                    let constraints = CloudKitRetryConstraints(error)
+                    try checkRunContext(context)
+                    // Unexamined causes cannot authorize another account request.
+                    if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
                         try await revalidateRunContext(context)
                     }
                     try checkSynchronizationAttempt(attemptID)
                     try checkRunContext(context)
                     guard activeRunContext == mutationContext else { throw CancellationError() }
                 }
-                guard retrySmallerMutationBatch(
+                guard try retrySmallerMutationBatch(
                     after: error, attemptedCount: records.count,
                     requestedBatchSize: requestedBatchSize,
-                    ceiling: &sizeLimitCeiling
+                    ceiling: &sizeLimitCeiling, for: attemptID
                 ) else { throw error }
                 // Only pure, reducible limits retry here. Account stops,
                 // server delays and unrelated failures retain the outer path.
@@ -587,6 +597,9 @@ extension CloudKitSynchronizer {
                 }
             }
 
+            // Per-item error inspection may synchronously revoke the caller.
+            // No receipt or repair may start using that retired classification.
+            try checkSynchronizationAttempt(attemptID)
             if !savedRecords.isEmpty {
                 do {
                     try await adapter.didUpload(
@@ -625,8 +638,13 @@ extension CloudKitSynchronizer {
                         otherFailures: siblingFailures
                     )
                 }
+                // Requeue completed. Keep unstarted sibling failures, not the
+                // missing-result error whose local handling just succeeded.
+                let failuresBeforeConflictImport = returnedFailures.filter {
+                    !missingRecordIDs.contains($0.key)
+                }
                 try await revalidateMutationResultContext(
-                    for: attemptID, preserving: returnedFailures
+                    for: attemptID, preserving: failuresBeforeConflictImport
                 )
             }
             if !conflictedRecordsByID.isEmpty {
@@ -679,10 +697,10 @@ extension CloudKitSynchronizer {
 
             guard unresolvedFailures.isEmpty else {
                 let error = partialMutationError(unresolvedFailures)
-                if retrySmallerMutationBatch(
+                if try retrySmallerMutationBatch(
                     after: error, attemptedCount: records.count,
                     requestedBatchSize: requestedBatchSize,
-                    ceiling: &sizeLimitCeiling
+                    ceiling: &sizeLimitCeiling, for: attemptID
                 ) {
                     await Task.yield()
                     continue
@@ -771,18 +789,20 @@ extension CloudKitSynchronizer {
                 guard activeRunContext == mutationContext else { throw CancellationError() }
                 if let context = mutationContext {
                     try checkRunContext(context)
-                    // A returned account stop prohibits another account request.
-                    if !CloudKitRetryConstraints(error).blocksAccountOperations {
+                    let constraints = CloudKitRetryConstraints(error)
+                    try checkRunContext(context)
+                    // Unexamined causes cannot authorize another account request.
+                    if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
                         try await revalidateRunContext(context)
                     }
                     try checkSynchronizationAttempt(attemptID)
                     try checkRunContext(context)
                     guard activeRunContext == mutationContext else { throw CancellationError() }
                 }
-                guard retrySmallerMutationBatch(
+                guard try retrySmallerMutationBatch(
                     after: error, attemptedCount: recordIDs.count,
                     requestedBatchSize: requestedBatchSize,
-                    ceiling: &sizeLimitCeiling
+                    ceiling: &sizeLimitCeiling, for: attemptID
                 ) else { throw error }
                 // Only pure, reducible limits retry here. Account stops,
                 // server delays and unrelated failures retain the outer path.
@@ -861,6 +881,8 @@ extension CloudKitSynchronizer {
                 }
             }
 
+            // Classification is callback-bearing even though it cannot await.
+            try checkSynchronizationAttempt(attemptID)
             if !acknowledged.isEmpty {
                 // Selecting a conflict for repair does not resolve it. Until
                 // metadata rebasing finishes, every unacknowledged result must
@@ -925,10 +947,10 @@ extension CloudKitSynchronizer {
             }
             guard unresolvedFailures.isEmpty else {
                 let error = partialMutationError(unresolvedFailures)
-                if retrySmallerMutationBatch(
+                if try retrySmallerMutationBatch(
                     after: error, attemptedCount: recordIDs.count,
                     requestedBatchSize: requestedBatchSize,
-                    ceiling: &sizeLimitCeiling
+                    ceiling: &sizeLimitCeiling, for: attemptID
                 ) {
                     await Task.yield()
                     continue

@@ -819,6 +819,9 @@ extension CloudKitSynchronizer {
             shouldRetry = false
         }
         guard canContinue() else { return }
+        // Keep known recovery intent and retry floors, but never treat a
+        // bounded, incomplete error scan as permission for another attempt.
+        shouldRetry = shouldRetry && constraints.isErrorGraphComplete
         // Keep the drain owned through the health notification. Its observer
         // may cancel or replace this attempt, and must not coalesce a successor
         // into a drain that has already dropped its running state.
@@ -1179,7 +1182,11 @@ extension CloudKitSynchronizer {
     }
     
     func shouldRetryUpload(for error: NSError) -> Bool {
+        let attemptID = synchronizationAttemptID
         let constraints = CloudKitRetryConstraints(error)
+        let isZoneLoss = isZoneNotFoundOrDeletedError(error)
+        do { try checkSynchronizationAttempt(attemptID) }
+        catch { return false }
         guard constraints.isErrorGraphComplete,
               !constraints.blocksAccountOperations,
               !constraints.requestsTokenRecovery,
@@ -1189,7 +1196,7 @@ extension CloudKitSynchronizer {
             // limits are normally handled inside the bounded shrinking drain.
             return batchSize > 1 && uploadRetries < 5
         }
-        if isZoneNotFoundOrDeletedError(error) {
+        if isZoneLoss {
             return uploadRetries < 5
         }
         // Record conflict budgets belong to the mutation drain, not a fresh
@@ -1293,23 +1300,24 @@ extension CloudKitSynchronizer {
 
             serverChangeToken = token
             if activeSynchronizationMode == .sync {
-                if afterUpload,
-                   !modelAdapters.contains(where: { $0.hasChanges }) {
-                    // A successful upload is not terminal until one more
-                    // change-feed pass advances through the server's response.
-                    // When that pass leaves no durable adapter work, its
-                    // database cursor is the quiescent commit boundary.
-                    try persistDatabaseToken(token)
-                    await changesFinishedSynchronizing()
-                } else {
+                let shouldUpload = !afterUpload || modelAdapters.contains(where: { $0.hasChanges })
+                // The pending-state getter is a synchronous callback boundary.
+                try checkSynchronizationAttempt(attemptID)
+                if shouldUpload {
                     try await uploadChanges()
+                    return
                 }
             } else {
                 try await processFetchedChanges()
                 try await revalidateActiveRunContext(for: attemptID)
-                try persistDatabaseToken(token)
-                await changesFinishedSynchronizing()
             }
+            // Both terminal paths commit their cursor under the original
+            // owner. A persistence callback must not hand an old fetch to a
+            // terminal method that captures a newly installed attempt.
+            try checkSynchronizationAttempt(attemptID)
+            try persistDatabaseToken(token)
+            try checkSynchronizationAttempt(attemptID)
+            await changesFinishedSynchronizing()
         } catch {
             guard synchronizationAttemptID == attemptID else { return }
             await failSynchronization(error: error, for: attemptID)
@@ -1340,10 +1348,15 @@ extension CloudKitSynchronizer {
                 let classification = CloudKitLossClassifier.classify(
                     error: error, defaultZoneID: recordZoneID
                 )
+                let constraints = CloudKitRetryConstraints(error)
+                try checkSynchronizationAttempt(attemptID)
                 if let context = activeRunContext,
                    let disposition = classification.zoneDispositions[recordZoneID],
-                   !CloudKitRetryConstraints(error).blocksAccountOperations {
-                    try await revalidateRunContext(context)
+                   !constraints.blocksAccountOperations {
+                    try checkRunContext(context)
+                    if constraints.isErrorGraphComplete {
+                        try await revalidateRunContext(context)
+                    }
                     if let lifecycleError = applyCloudKitLoss(
                         disposition,
                         zoneID: recordZoneID,
@@ -1494,8 +1507,10 @@ extension CloudKitSynchronizer {
                     )
                 } catch {
                     try validateFetchOwner()
+                    let constraints = CloudKitRetryConstraints(error)
+                    try validateFetchOwner()
                     guard let context = activeRunContext,
-                          !CloudKitRetryConstraints(error).blocksAccountOperations else {
+                          !constraints.blocksAccountOperations else {
                         throw error
                     }
                     let classification = CloudKitLossClassifier.classify(
@@ -1506,7 +1521,10 @@ extension CloudKitSynchronizer {
                         .zoneDispositions[zoneID] else {
                         throw error
                     }
-                    try await revalidateRunContext(context)
+                    try validateFetchOwner()
+                    if constraints.isErrorGraphComplete {
+                        try await revalidateRunContext(context)
+                    }
                     try validateFetchOwner()
                     if let lifecycleError = applyCloudKitLoss(
                         disposition,
@@ -1519,7 +1537,7 @@ extension CloudKitSynchronizer {
                     ) {
                         throw lifecycleError
                     }
-                    let constraints = CloudKitRetryConstraints(error)
+                    try validateFetchOwner()
                     guard isChangeFeedMigrationActive,
                           constraints.isErrorGraphComplete,
                           !constraints.requiresDeferredRetry,
@@ -1751,9 +1769,11 @@ extension CloudKitSynchronizer {
                 try checkSynchronizationAttempt(attemptID)
                 guard activeRunContext == uploadContext else { throw CancellationError() }
                 let constraints = CloudKitRetryConstraints(error)
+                try checkSynchronizationAttempt(attemptID)
+                guard activeRunContext == uploadContext else { throw CancellationError() }
                 if let context = uploadContext {
                     try checkRunContext(context)
-                    if !constraints.blocksAccountOperations {
+                    if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
                         try await revalidateRunContext(context)
                     }
                     try checkSynchronizationAttempt(attemptID)
@@ -1947,11 +1967,13 @@ extension CloudKitSynchronizer {
             // A returned account stop forbids further CloudKit work,
             // including an otherwise routine account revalidation.
             try checkSynchronizationAttempt(attemptID)
-            if !CloudKitRetryConstraints(error).blocksAccountOperations {
+            let constraints = CloudKitRetryConstraints(error)
+            try checkSynchronizationAttempt(attemptID)
+            if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
                 try await revalidateActiveRunContext(for: attemptID)
             }
 
-            guard !CloudKitRetryConstraints(error).blocksAccountOperations,
+            guard !constraints.blocksAccountOperations,
                   let context = activeRunContext else {
                 throw error
             }
@@ -1974,7 +1996,7 @@ extension CloudKitSynchronizer {
                 throw lifecycleError
             }
 
-            let constraints = CloudKitRetryConstraints(error)
+            try checkRunContext(context)
             guard constraints.isErrorGraphComplete,
                   !constraints.requiresDeferredRetry,
                   !constraints.requestsTokenRecovery else { throw error }
@@ -1995,10 +2017,12 @@ extension CloudKitSynchronizer {
                 )
             } catch {
                 try checkSynchronizationAttempt(attemptID)
-                if !CloudKitRetryConstraints(error).blocksAccountOperations {
+                let constraints = CloudKitRetryConstraints(error)
+                try checkRunContext(context)
+                if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
                     try await revalidateRunContext(context)
                 }
-                if !CloudKitRetryConstraints(error).blocksAccountOperations,
+                if !constraints.blocksAccountOperations,
                    let lifecycleError = applyCloudKitLoss(
                     error: error,
                     defaultZoneID: zoneID,
