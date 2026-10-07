@@ -12297,6 +12297,203 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    private enum DeferredRelationshipProvisionalTrackingChange: Sendable {
+        case deletedLocally
+        case deletedRemotely
+        case pendingGeneration
+        case replaceIntent
+        case insertIntent
+    }
+
+    /// The adapter may share its tracking handle with an independently owned
+    /// transaction. Neither provisional parent state nor provisional intent is
+    /// proof that a durable deferred edge is stale or ready to apply.
+    @BigSyncBackgroundActor
+    private func assertDeferredRelationshipUsesCommittedTracking(
+        _ change: DeferredRelationshipProvisionalTrackingChange
+    ) async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let originalChild = BigSyncRelationshipChild()
+        originalChild.id = "committed-original"
+        let remoteChild = BigSyncRelationshipChild()
+        remoteChild.id = "committed-remote"
+        let provisionalChild = BigSyncRelationshipChild()
+        provisionalChild.id = "provisional-intent"
+        let parent = BigSyncRelationshipParent()
+        parent.id = "committed-tracking-parent"
+        parent.children.append(originalChild)
+        try await fixture.targetRealm.asyncWritePreservingOwnership {
+            fixture.targetRealm.add([
+                originalChild, remoteChild, provisionalChild, parent,
+            ])
+        }
+
+        let recordName = BigSyncRelationshipParent.className() + "." + parent.id
+        // The inbound decoder strips the CloudKit record type prefix before
+        // persisting deferred targets; application resolves the raw primary key.
+        let remoteTarget = remoteChild.id
+        let provisionalTarget = provisionalChild.id
+        let hasDurableIntent: Bool
+        if case .insertIntent = change {
+            hasDurableIntent = false
+        } else {
+            hasDurableIntent = true
+        }
+        // Stage exactly one collection group. Downloading a complete parent
+        // also stages absent set/scalar properties, whose unspecified grouping
+        // order would make rollback after the first target phase ambiguous.
+        try await fixture.persistenceRealm.asyncWritePreservingOwnership {
+            let entity = SyncedEntity(
+                entityType: BigSyncRelationshipParent.className(),
+                identifier: recordName,
+                state: SyncedEntityState.synced.rawValue
+            )
+            fixture.persistenceRealm.add(entity)
+            if hasDurableIntent {
+                let relationship = PendingRelationship()
+                relationship.relationshipName = "children"
+                relationship.forSyncedEntity = entity
+                relationship.targetIdentifier = remoteTarget
+                relationship.position = 0
+                relationship.expectedModifiedAt = parent.modifiedAt
+                relationship.expectedExplicitlyModifiedAt = parent.explicitlyModifiedAt
+                fixture.persistenceRealm.add(relationship)
+            }
+        }
+        XCTAssertEqual(
+            fixture.persistenceRealm.objects(PendingRelationship.self).count,
+            hasDurableIntent ? 1 : 0
+        )
+
+        let entered = AsyncGate()
+        let release = AsyncGate()
+        let targetPhaseReached = AsyncGate()
+        let trackingRealm = fixture.persistenceRealm
+        let owner = Task { @BigSyncBackgroundActor in
+            do {
+                try trackingRealm.beginWrite()
+                // This task alone owns this transaction and never commits it.
+                // Roll it back before returning, including on fixture failure.
+                defer { trackingRealm.cancelWrite() }
+                let entity = try XCTUnwrap(trackingRealm.object(
+                    ofType: SyncedEntity.self, forPrimaryKey: recordName
+                ))
+                switch change {
+                case .deletedLocally:
+                    entity.entityState = .deletedLocally
+                case .deletedRemotely:
+                    entity.entityState = .deletedRemotely
+                case .pendingGeneration:
+                    entity.setPendingMutation(
+                        generation: "provisional-generation",
+                        replicaBindingGenerationIdentifier: "provisional-binding"
+                    )
+                case .replaceIntent:
+                    let relationship = try XCTUnwrap(
+                        trackingRealm.objects(PendingRelationship.self).first
+                    )
+                    relationship.targetIdentifier = provisionalTarget
+                case .insertIntent:
+                    let relationship = PendingRelationship()
+                    relationship.relationshipName = "children"
+                    relationship.forSyncedEntity = entity
+                    relationship.targetIdentifier = provisionalTarget
+                    relationship.position = 0
+                    relationship.expectedModifiedAt = parent.modifiedAt
+                    relationship.expectedExplicitlyModifiedAt = parent.explicitlyModifiedAt
+                    trackingRealm.add(relationship)
+                }
+                await entered.open()
+                await release.wait()
+            } catch {
+                // A failed begin or setup must wake the caller instead of
+                // leaving it waiting for an owner which will never enter.
+                await entered.open()
+                throw error
+            }
+        }
+        await entered.wait()
+        do {
+            guard trackingRealm.isInWriteTransaction else {
+                try await owner.value
+                throw NSError(
+                    domain: "BigSyncKitTests.DeferredRelationshipOwner",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Tracking owner did not enter its transaction"]
+                )
+            }
+            // Rollback between target classification and tracking cleanup.
+            // The original implementation called provisional deletion/pending
+            // state stale, then deleted this unchanged durable edge after the
+            // provisional parent mutation had already disappeared.
+            fixture.adapter._testAfterPendingRelationshipTargetWrite = {
+                await targetPhaseReached.open()
+                await release.open()
+                try await owner.value
+            }
+            try await fixture.adapter.persistImportedChanges()
+            fixture.adapter._testAfterPendingRelationshipTargetWrite = nil
+            // The committed store is empty for insertIntent, so the fixed
+            // reader returns before a target phase can release the owner.
+            await release.open()
+            try await owner.value
+        } catch {
+            fixture.adapter._testAfterPendingRelationshipTargetWrite = nil
+            owner.cancel()
+            await release.open()
+            _ = await owner.result
+            throw error
+        }
+
+        XCTAssertFalse(trackingRealm.isInWriteTransaction)
+        let reachedTargetPhase = await targetPhaseReached.hasOpened()
+        XCTAssertEqual(reachedTargetPhase, hasDurableIntent)
+        let committedEntity = try XCTUnwrap(trackingRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: recordName
+        ))
+        XCTAssertEqual(committedEntity.entityState, .synced)
+        XCTAssertNil(committedEntity.pendingGeneration)
+        XCTAssertNil(committedEntity.pendingReplicaBindingGenerationIdentifier)
+        XCTAssertEqual(
+            parent.children.map(\.id),
+            hasDurableIntent ? ["committed-remote"] : ["committed-original"]
+        )
+        XCTAssertTrue(trackingRealm.objects(PendingRelationship.self).isEmpty)
+        // A later import cannot recover a discarded durable edge or legitimize
+        // an edge whose only staging transaction rolled back.
+        try await fixture.adapter.persistImportedChanges()
+        XCTAssertEqual(
+            parent.children.map(\.id),
+            hasDurableIntent ? ["committed-remote"] : ["committed-original"]
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipIgnoresProvisionalLocalDeletion() async throws {
+        try await assertDeferredRelationshipUsesCommittedTracking(.deletedLocally)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipIgnoresProvisionalRemoteDeletion() async throws {
+        try await assertDeferredRelationshipUsesCommittedTracking(.deletedRemotely)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipIgnoresProvisionalPendingGeneration() async throws {
+        try await assertDeferredRelationshipUsesCommittedTracking(.pendingGeneration)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipUsesCommittedIntentDuringProvisionalReplacement() async throws {
+        try await assertDeferredRelationshipUsesCommittedTracking(.replaceIntent)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipDoesNotApplyProvisionalOnlyIntent() async throws {
+        try await assertDeferredRelationshipUsesCommittedTracking(.insertIntent)
+    }
+
     @BigSyncBackgroundActor
     func testCleanupRemovesDeferredRelationshipsWithRetiredRemoteDeletion()
     async throws {

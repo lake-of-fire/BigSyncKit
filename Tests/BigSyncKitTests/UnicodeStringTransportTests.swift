@@ -18,6 +18,15 @@ private final class UnicodeStringTransportRow: Object, ChangeMetadataRecordable,
     @Persisted var tags: MutableSet<String>
     @Persisted var urls: List<URL>
     @Persisted var translations: Map<String, String>
+    @Persisted var counts: Map<String, Int>
+    @Persisted var flags: Map<String, Bool>
+    @Persisted var floatWeights: Map<String, Float>
+    @Persisted var doubleWeights: Map<String, Double>
+    @Persisted var dates: Map<String, Date>
+    @Persisted var blobs: Map<String, Data>
+    @Persisted var identifiersByKey: Map<String, UUID>
+    @Persisted var identifiers: List<UUID>
+    @Persisted var identifierSet: MutableSet<UUID>
     @Persisted var number = 7
     @Persisted var enabled = true
     @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 10)
@@ -100,6 +109,111 @@ final class UnicodeStringTransportTests: XCTestCase {
 
     private static func encodedMap(_ entries: [String: String]) throws -> CKRecordValue {
         try PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0) as CKRecordValue
+    }
+
+    private static func encodedScalarMap(_ entries: [String: Any]) throws -> CKRecordValue {
+        try PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0) as CKRecordValue
+    }
+
+    @BigSyncBackgroundActor
+    func testScalarMapKeyByteReplacementIsVisibleToAuditAcrossValueTypes() async throws {
+        try await withFixture { adapter, _ in
+            let row = UnicodeStringTransportRow()
+            let (composed, decomposed) = Self.pairs[0]
+            let date = Date(timeIntervalSinceReferenceDate: 42)
+            let data = Data([0, 1, 255])
+            let identifier = UUID(uuidString: "12345678-90AB-CDEF-1234-567890ABCDEF")!
+            row.counts[composed] = 7
+            row.flags[composed] = true
+            row.floatWeights[composed] = 1.5
+            row.doubleWeights[composed] = 2.5
+            row.dates[composed] = date
+            row.blobs[composed] = data
+            row.identifiersByKey[composed] = identifier
+            let values: [(String, Any)] = [
+                ("counts", 7), ("flags", true), ("floatWeights", Float(1.5)),
+                ("doubleWeights", 2.5), ("dates", date), ("blobs", data),
+                ("identifiersByKey", identifier.uuidString),
+            ]
+            for (property, value) in values {
+                let replay = try Self.record(row, adapter)
+                XCTAssertFalse(adapter.serverDifferencePropertyNames(record: replay, object: row)
+                    .contains(property), "Exact replay must agree for \(property)")
+                replay[property] = try Self.encodedScalarMap([decomposed: value])
+                XCTAssertTrue(adapter.serverDifferencePropertyNames(record: replay, object: row)
+                    .contains(property), "The stored key bytes changed for \(property)")
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testScalarMapComparisonRetainsEveryStoredKeyIdentity() async throws {
+        try await withFixture { adapter, _ in
+            let row = UnicodeStringTransportRow()
+            let (composed, decomposed) = Self.pairs[0]
+            row.counts[composed] = 7
+            let record = try Self.record(row, adapter)
+            row.counts[decomposed] = 7
+            XCTAssertEqual(row.counts.count, 2)
+            XCTAssertTrue(adapter.serverDifferencePropertyNames(record: record, object: row)
+                .contains("counts"), "A Swift dictionary must not collapse the second stored key")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUUIDCollectionsCompareDecodedIdentityAndRejectMalformedValues() async throws {
+        try await withFixture { adapter, _ in
+            let row = UnicodeStringTransportRow()
+            let first = UUID(uuidString: "12345678-90AB-CDEF-1234-567890ABCDEF")!
+            let second = UUID(uuidString: "FEDCBA09-8765-4321-FEDC-BA0987654321")!
+            row.identifiers.append(objectsIn: [first, second])
+            row.identifierSet.insert(objectsIn: [first, second])
+            row.identifiersByKey["first"] = first
+            let record = try Self.record(row, adapter)
+            record["identifiers"] = [first.uuidString.lowercased(), second.uuidString.lowercased()] as CKRecordValue
+            record["identifierSet"] = [second.uuidString.lowercased(), first.uuidString.lowercased()] as CKRecordValue
+            record["identifiersByKey"] = try Self.encodedScalarMap(["first": first.uuidString.lowercased()])
+            XCTAssertTrue(adapter.serverDifferencePropertyNames(record: record, object: row).isEmpty,
+                          "The transport decoder accepts both UUID spellings as the same stored UUID")
+
+            record["identifiers"] = [second.uuidString, first.uuidString] as CKRecordValue
+            XCTAssertTrue(adapter.serverDifferencePropertyNames(record: record, object: row).contains("identifiers"))
+            record["identifiers"] = [first.uuidString, second.uuidString, "not-a-uuid"] as CKRecordValue
+            record["identifierSet"] = [first.uuidString, second.uuidString, "not-a-uuid"] as CKRecordValue
+            record["identifiersByKey"] = try Self.encodedScalarMap(["first": "not-a-uuid"])
+            let malformed = Set(adapter.serverDifferencePropertyNames(record: record, object: row))
+            XCTAssertTrue(Set(["identifiers", "identifierSet", "identifiersByKey"]).isSubset(of: malformed),
+                          "Invalid members cannot disappear through compact UUID decoding")
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCanonicalEquivalentMapKeysHaveDeterministicFingerprintOrder() async throws {
+        try await withFixture { _, _ in
+            for (composed, decomposed) in Self.pairs {
+                let forward = [composed, decomposed].sorted(by: BigSyncStringIdentity.mapKeyPrecedes)
+                let reversed = [decomposed, composed].sorted(by: BigSyncStringIdentity.mapKeyPrecedes)
+                XCTAssertEqual(Self.bytes(forward), Self.bytes(reversed))
+                XCTAssertEqual(Self.bytes(forward), [Data(composed.utf8), Data(decomposed.utf8)]
+                    .sorted { $0.lexicographicallyPrecedes($1) })
+                let first = UnicodeStringTransportRow()
+                let second = UnicodeStringTransportRow()
+                first.counts[composed] = 1
+                first.counts[decomposed] = 2
+                second.counts[decomposed] = 2
+                second.counts[composed] = 1
+                XCTAssertEqual(first.counts.count, 2)
+                XCTAssertEqual(second.counts.count, 2)
+                XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: first)["counts"],
+                               try BigSyncRecordFingerprint.fields(of: second)["counts"])
+            }
+        }
+    }
+
+    func testMapKeyOrderingPreservesExistingNonEquivalentOrder() {
+        let keys = ["a", "z", "\u{00E9}", "e", "\u{03B1}", "\u{3042}"]
+        XCTAssertEqual(Self.bytes(keys.sorted(by: BigSyncStringIdentity.mapKeyPrecedes)),
+                       Self.bytes(keys.sorted()))
     }
 
     @BigSyncBackgroundActor
