@@ -1635,7 +1635,9 @@ extension SyncPhaseAttemptOwnershipTests {
         let store = SyncPhaseStore()
         try await withFixture(store: store) { sync, adapter, probe, transport in
             let writesBefore = store.databaseTokenWrites
-            sync.activeSynchronizationMode = downloadOnly ? .downloadOnly : .sync
+            let mode: CloudKitSynchronizer.SynchronizeMode = downloadOnly ? .downloadOnly : .sync
+            sync.syncMode = mode
+            XCTAssertEqual(sync.activeSynchronizationMode, mode)
             if let cancelFromPending {
                 adapter.pendingStateRead = {
                     withUnsafeCurrentTask { $0?.cancel() }
