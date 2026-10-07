@@ -2717,7 +2717,17 @@ public final class RealmSwiftAdapter:
                         forPrimaryKey: mutation.recordName
                     ), tracked.pendingGeneration == mutation.generation,
                     tracked.pendingReplicaBindingGenerationIdentifier
-                        == mutation.replicaBindingGenerationIdentifier {
+                        == mutation.replicaBindingGenerationIdentifier,
+                       (mutation.isDeletion
+                            ? tracked.entityState == .deletedLocally
+                            : tracked.entityState == .new
+                                || tracked.entityState == .changed) {
+                        // A model may adopt retained tombstones while this
+                        // exact journal generation is already in the physical
+                        // deletion lane. Generation equality proves ownership,
+                        // not that the cached transport kind is still current.
+                        // Forward the existing generation through updateTracking
+                        // when its lane changed; never manufacture a new edit.
                         continue
                     }
                     updateTracking(
