@@ -27,6 +27,9 @@ enum CloudKitLossClassifier {
         var affectedRecordIDs = Set<CKRecord.ID>()
         var transientCodes = Set<CKError.Code>()
         var accountCodes = Set<CKError.Code>()
+        /// Partial observation can preserve a known terminal loss, but cannot
+        /// prove that recreating or rebuilding a zone is safe.
+        private(set) var isErrorGraphComplete = true
 
         var hasEncryptedDataReset: Bool {
             zoneDispositions.values.contains(.encryptedDataReset)
@@ -43,9 +46,13 @@ enum CloudKitLossClassifier {
             for (zoneID, disposition) in other.zoneDispositions {
                 set(disposition, for: zoneID)
             }
+            if !other.isErrorGraphComplete { markIncomplete() }
         }
 
         mutating func set(_ disposition: ZoneDisposition, for zoneID: CKRecordZone.ID) {
+            if !isErrorGraphComplete {
+                guard case .terminal = disposition else { return }
+            }
             guard let existing = zoneDispositions[zoneID] else {
                 zoneDispositions[zoneID] = disposition
                 return
@@ -55,6 +62,17 @@ enum CloudKitLossClassifier {
             // normal missing-zone error for the same zone.
             if priority(of: disposition) > priority(of: existing) {
                 zoneDispositions[zoneID] = disposition
+            }
+        }
+
+        mutating func markIncomplete() {
+            guard isErrorGraphComplete else { return }
+            isErrorGraphComplete = false
+            // Missing/reset observations may have an unseen terminal sibling.
+            // Do not turn that uncertainty into permission to recreate a zone.
+            zoneDispositions = zoneDispositions.filter {
+                if case .terminal = $0.value { return true }
+                return false
             }
         }
 
@@ -77,7 +95,54 @@ enum CloudKitLossClassifier {
         defaultZoneID: CKRecordZone.ID? = nil
     ) -> Classification {
         var classification = Classification()
-        visit(error, inheritedZoneID: defaultZoneID, into: &classification)
+        // A shared NSError may be attached to two different record zones. Its
+        // identity alone is not the identity of a classification observation.
+        var visited = Set<ErrorScope>()
+        var queue: [(error: NSError, zone: CKRecordZone.ID?, depth: Int)] = [
+            (error as NSError, defaultZoneID, 0)
+        ]
+        var offset = 0
+        while offset < queue.count {
+            let item = queue[offset]
+            offset += 1
+            let scope = ErrorScope(error: ObjectIdentifier(item.error), zone: item.zone)
+            guard !visited.contains(scope) else { continue }
+            // The queue retains each NSError, including bridged Swift errors.
+            // Check aliases first: an already inspected shallow observation
+            // remains complete when another path reaches it at the limit.
+            guard item.depth < 32 else {
+                classification.markIncomplete()
+                continue
+            }
+            visited.insert(scope)
+            let info = item.error.userInfo
+            if item.error.domain == CKErrorDomain {
+                classifyCode(item.error.code, userInfo: info, zoneID: item.zone,
+                             into: &classification)
+                if item.error.code == CKError.partialFailure.rawValue {
+                    let partial = cloudKitPartialErrors(in: info)
+                    if !partial.isComplete { classification.markIncomplete() }
+                    for (key, nested) in partial.entries {
+                        var zone = item.zone
+                        let identity = (key as? AnyHashable)?.base ?? key
+                        if let recordID = identity as? CKRecord.ID {
+                            classification.affectedRecordIDs.insert(recordID)
+                            zone = recordID.zoneID
+                        } else if let zoneID = identity as? CKRecordZone.ID {
+                            zone = zoneID
+                        }
+                        queue.append((nested as NSError, zone, item.depth + 1))
+                    }
+                }
+            }
+            // Underlying causes are not limited to CloudKit-domain wrappers,
+            // and partial-item errors do not replace a wrapper's other causes.
+            let underlying = cloudKitUnderlyingErrors(in: info)
+            if !underlying.isComplete { classification.markIncomplete() }
+            for nested in underlying.errors {
+                queue.append((nested as NSError, item.zone, item.depth + 1))
+            }
+        }
         return classification
     }
 
@@ -96,45 +161,28 @@ enum CloudKitLossClassifier {
         return classification
     }
 
-    private static func visit(
-        _ error: Error,
-        inheritedZoneID: CKRecordZone.ID?,
+    private struct ErrorScope: Hashable {
+        let error: ObjectIdentifier
+        let zone: CKRecordZone.ID?
+    }
+
+    private static func classifyCode(
+        _ rawCode: Int,
+        userInfo: [String: Any],
+        zoneID: CKRecordZone.ID?,
         into classification: inout Classification
     ) {
-        let nsError = error as NSError
-        guard nsError.domain == CKErrorDomain else { return }
-
-        let itemErrors = partialErrors(in: nsError)
-        if nsError.code == CKError.partialFailure.rawValue, !itemErrors.isEmpty {
-            for (item, nestedError) in itemErrors {
-                var zoneID = inheritedZoneID
-                if let recordID = item as? CKRecord.ID {
-                    classification.affectedRecordIDs.insert(recordID)
-                    zoneID = recordID.zoneID
-                } else if let nestedRecordID = (item as? AnyHashable)?.base as? CKRecord.ID {
-                    classification.affectedRecordIDs.insert(nestedRecordID)
-                    zoneID = nestedRecordID.zoneID
-                } else if let itemZoneID = item as? CKRecordZone.ID {
-                    zoneID = itemZoneID
-                } else if let nestedZoneID = (item as? AnyHashable)?.base as? CKRecordZone.ID {
-                    zoneID = nestedZoneID
-                }
-                visit(nestedError, inheritedZoneID: zoneID, into: &classification)
-            }
-            return
-        }
-
-        guard let code = CKError.Code(rawValue: nsError.code) else { return }
+        guard let code = CKError.Code(rawValue: rawCode) else { return }
         switch code {
         case .zoneNotFound:
-            guard let zoneID = inheritedZoneID else { return }
-            if didResetEncryptedDataKey(nsError) {
+            guard let zoneID else { return }
+            if didResetEncryptedDataKey(userInfo) {
                 classification.set(.encryptedDataReset, for: zoneID)
             } else {
                 classification.set(.missing, for: zoneID)
             }
         case .userDeletedZone:
-            if let zoneID = inheritedZoneID {
+            if let zoneID {
                 classification.set(.terminal(.deleted), for: zoneID)
             }
         case .accountTemporarilyUnavailable, .notAuthenticated:
@@ -147,20 +195,10 @@ enum CloudKitLossClassifier {
         }
     }
 
-    private static func partialErrors(in error: NSError) -> [(Any, Error)] {
-        guard let dictionary = error.userInfo[CKPartialErrorsByItemIDKey] as? NSDictionary else {
-            return []
-        }
-        return dictionary.compactMap { key, value in
-            guard let nestedError = value as? Error else { return nil }
-            return (key, nestedError)
-        }
-    }
-
-    private static func didResetEncryptedDataKey(_ error: NSError) -> Bool {
-        if let value = error.userInfo[CKErrorUserDidResetEncryptedDataKey] as? NSNumber {
+    private static func didResetEncryptedDataKey(_ userInfo: [String: Any]) -> Bool {
+        if let value = userInfo[CKErrorUserDidResetEncryptedDataKey] as? NSNumber {
             return value.boolValue
         }
-        return error.userInfo[CKErrorUserDidResetEncryptedDataKey] as? Bool == true
+        return userInfo[CKErrorUserDidResetEncryptedDataKey] as? Bool == true
     }
 }

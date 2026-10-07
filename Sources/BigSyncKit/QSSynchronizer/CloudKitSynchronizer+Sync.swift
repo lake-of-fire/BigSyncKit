@@ -674,7 +674,7 @@ extension CloudKitSynchronizer {
              is BigSyncHandledMutationRetryError, is BigSyncSemanticUploadConflictError:
             allowsLocalWorkTail = false
         default:
-            allowsLocalWorkTail = constraints.codes.isEmpty
+            allowsLocalWorkTail = constraints.isErrorGraphComplete && constraints.codes.isEmpty
                 && (error as? CloudKitChangeFeedError) != .corruptCursor
         }
 
@@ -685,7 +685,11 @@ extension CloudKitSynchronizer {
             shouldRetry = true
             retryDelay = 1
         } else if let migrationError = error as? ChangeFeedMigrationError,
-           migrationError.deletionKind == .encryptedDataReset {
+           migrationError.deletionKind == .encryptedDataReset,
+           constraints.isErrorGraphComplete,
+           !constraints.blocksAccountOperations,
+           !constraints.requestsTokenRecovery,
+           !constraints.requiresDeferredRetry {
             // The database-history event already persisted a dedicated
             // recovery request. Retry immediately; the next attempt performs
             // the account-fenced journal rebuild before any upload.
@@ -711,7 +715,7 @@ extension CloudKitSynchronizer {
         } else if !constraints.codes.isEmpty {
             let codes = constraints.codes
             var recoveryRequestIsDurable = !constraints.requestsTokenRecovery
-            if constraints.requestsTokenRecovery {
+            if constraints.requestsTokenRecovery && constraints.isErrorGraphComplete {
                 logger.info("QSCloudKitSynchronizer >> Change token expired, requesting a fenced server-first tracking rebuild...")
                 guard canContinue() else { return }
                 if let context = failureContext {
@@ -769,7 +773,7 @@ extension CloudKitSynchronizer {
                 logger.warning("QSCloudKitSynchronizer >> CloudKit retry constrained to \(retryDelay.rounded()) seconds or later.")
                 guard canContinue() else { return }
                 reduceBatchSize()
-                shouldRetry = recoveryRequestIsDurable
+                shouldRetry = recoveryRequestIsDurable && constraints.isErrorGraphComplete
             } else if !constraints.requestsTokenRecovery {
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
             }
@@ -811,6 +815,9 @@ extension CloudKitSynchronizer {
             }
         }
 
+        if let kind = terminalZoneDeletionKind, kind != .encryptedDataReset {
+            shouldRetry = false
+        }
         guard canContinue() else { return }
         // Keep the drain owned through the health notification. Its observer
         // may cancel or replace this attempt, and must not coalesce a successor
@@ -1002,8 +1009,13 @@ extension CloudKitSynchronizer {
         _ disposition: CloudKitLossClassifier.ZoneDisposition,
         zoneID: CKRecordZone.ID,
         context: RunContext,
-        allowsEncryptedBootstrapAbsence: Bool = false
+        allowsEncryptedBootstrapAbsence: Bool = false,
+        operationError: Error? = nil
     ) -> Error? {
+        func lifecycleFailure(_ kind: CloudKitZoneDeletionKind) -> Error {
+            let failure = ChangeFeedMigrationError.establishedZoneUnavailable(zoneID, kind)
+            return operationError.map { failure.preservingOperationError($0) } ?? failure
+        }
         // All callers must revalidate account-routed awaits before reaching
         // this local write. Also reject obsolete captured contexts here so a
         // late failure can never mutate either a replacement or old scope.
@@ -1041,10 +1053,7 @@ extension CloudKitSynchronizer {
             if recoveryWasActive && allowsEncryptedBootstrapAbsence {
                 return nil
             }
-            return ChangeFeedMigrationError.establishedZoneUnavailable(
-                zoneID,
-                .encryptedDataReset
-            )
+            return lifecycleFailure(.encryptedDataReset)
 
         case .terminal(let kind):
             do {
@@ -1056,10 +1065,7 @@ extension CloudKitSynchronizer {
             } catch {
                 return error
             }
-            return ChangeFeedMigrationError.establishedZoneUnavailable(
-                zoneID,
-                kind
-            )
+            return lifecycleFailure(kind)
 
         case .missing:
             if allowsEncryptedBootstrapAbsence {
@@ -1080,10 +1086,7 @@ extension CloudKitSynchronizer {
             } catch {
                 return error
             }
-            return ChangeFeedMigrationError.establishedZoneUnavailable(
-                zoneID,
-                .unknown
-            )
+            return lifecycleFailure(.unknown)
         }
     }
 
@@ -1107,7 +1110,8 @@ extension CloudKitSynchronizer {
             zoneID: defaultZoneID,
             context: context,
             allowsEncryptedBootstrapAbsence:
-                allowsEncryptedBootstrapAbsence
+                allowsEncryptedBootstrapAbsence,
+            operationError: error
         )
     }
 
@@ -1176,7 +1180,8 @@ extension CloudKitSynchronizer {
     
     func shouldRetryUpload(for error: NSError) -> Bool {
         let constraints = CloudKitRetryConstraints(error)
-        guard !constraints.blocksAccountOperations,
+        guard constraints.isErrorGraphComplete,
+              !constraints.blocksAccountOperations,
               !constraints.requestsTokenRecovery,
               !constraints.requiresDeferredRetry else { return false }
         if constraints.containsOnlySizeLimitFailures {
@@ -1344,7 +1349,8 @@ extension CloudKitSynchronizer {
                         zoneID: recordZoneID,
                         context: context,
                         allowsEncryptedBootstrapAbsence:
-                            isEncryptedDataResetRecoveryActive
+                            isEncryptedDataResetRecoveryActive,
+                        operationError: error
                     ) {
                         throw lifecycleError
                     }
@@ -1508,11 +1514,16 @@ extension CloudKitSynchronizer {
                         context: context,
                         allowsEncryptedBootstrapAbsence:
                             isChangeFeedMigrationActive
-                                && isEncryptedDataResetRecoveryActive
+                                && isEncryptedDataResetRecoveryActive,
+                        operationError: error
                     ) {
                         throw lifecycleError
                     }
-                    guard isChangeFeedMigrationActive else { throw error }
+                    let constraints = CloudKitRetryConstraints(error)
+                    guard isChangeFeedMigrationActive,
+                          constraints.isErrorGraphComplete,
+                          !constraints.requiresDeferredRetry,
+                          !constraints.requestsTokenRecovery else { throw error }
                     // A never-established zone is an empty authoritative
                     // bootstrap. Reconcile local journal work, then let the
                     // ordinary upload path create the zone.
@@ -1722,6 +1733,7 @@ extension CloudKitSynchronizer {
     func uploadChanges() async throws {
         let attemptID = synchronizationAttemptID
         try checkSynchronizationAttempt(attemptID)
+        let uploadContext = activeRunContext
         logger.info("QSCloudKitSynchronizer >> Upload changes...")
         reportProgress("upload-start")
         //        debugPrint("# uploadChanges()")
@@ -1733,10 +1745,22 @@ extension CloudKitSynchronizer {
         try await uploadChanges() { [weak self] (error) in
             try Task.checkCancellation()
             guard let self,
-                  synchronizationAttemptID == attemptID else { return }
+                  synchronizationAttemptID == attemptID else { throw CancellationError() }
             
             if let error {
-                if let context = activeRunContext,
+                try checkSynchronizationAttempt(attemptID)
+                guard activeRunContext == uploadContext else { throw CancellationError() }
+                let constraints = CloudKitRetryConstraints(error)
+                if let context = uploadContext {
+                    try checkRunContext(context)
+                    if !constraints.blocksAccountOperations {
+                        try await revalidateRunContext(context)
+                    }
+                    try checkSynchronizationAttempt(attemptID)
+                    try checkRunContext(context)
+                    guard activeRunContext == uploadContext else { throw CancellationError() }
+                }
+                if let context = uploadContext,
                    let lifecycleError = applyCloudKitLoss(
                     error: error,
                     defaultZoneID: recordZoneID,
@@ -1745,7 +1769,11 @@ extension CloudKitSynchronizer {
                     await failSynchronization(error: lifecycleError, for: attemptID)
                     return
                 }
-                if isZoneNotFoundOrDeletedError(error) {
+                if constraints.isErrorGraphComplete,
+                   !constraints.blocksAccountOperations,
+                   !constraints.requiresDeferredRetry,
+                   !constraints.requestsTokenRecovery,
+                   isZoneNotFoundOrDeletedError(error) {
                     for adapter in modelAdapters {
                         try await revalidateActiveRunContext(for: attemptID)
                         activeZoneTokens[adapter.recordZoneID] = nil
@@ -1940,11 +1968,16 @@ extension CloudKitSynchronizer {
                 zoneID: zoneID,
                 context: context,
                 allowsEncryptedBootstrapAbsence:
-                    isEncryptedDataResetRecoveryActive
+                    isEncryptedDataResetRecoveryActive,
+                operationError: error
             ) {
                 throw lifecycleError
             }
 
+            let constraints = CloudKitRetryConstraints(error)
+            guard constraints.isErrorGraphComplete,
+                  !constraints.requiresDeferredRetry,
+                  !constraints.requestsTokenRecovery else { throw error }
             let newZone = CKRecordZone(zoneID: zoneID)
             do {
                 try await revalidateActiveRunContext(for: attemptID)

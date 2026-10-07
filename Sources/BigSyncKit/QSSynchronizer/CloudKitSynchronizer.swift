@@ -196,22 +196,51 @@ internal enum ChangeFeedMigrationPersistenceError: Error, Equatable {
 /// A production migration must never recreate a zone that CloudKit reports as
 /// deleted, purged, or reset.  The target Realm and durable journal remain
 /// intact so a future, explicitly supported recovery can classify the state.
-public enum ChangeFeedMigrationError: LocalizedError {
+public enum ChangeFeedMigrationError: LocalizedError, CustomNSError {
     case establishedZoneUnavailable(
         CKRecordZone.ID,
         CloudKitZoneDeletionKind
     )
 
+    /// The lifecycle outcome retains the failed operation's independent
+    /// constraints. Database-history deletions have no operation error.
+    case constrainedZoneUnavailable(CKRecordZone.ID, CloudKitZoneDeletionKind, Error)
+
+    public static var errorDomain: String { "BigSyncKit.ChangeFeedMigrationError" }
+    public var errorCode: Int { 1 }
+    public var errorUserInfo: [String: Any] {
+        var info: [String: Any] = [NSLocalizedDescriptionKey: errorDescription ?? "Zone unavailable"]
+        if case .constrainedZoneUnavailable(_, _, let cause) = self {
+            info[NSUnderlyingErrorKey] = cause
+        }
+        return info
+    }
+
+    internal func preservingOperationError(_ cause: Error) -> ChangeFeedMigrationError {
+        let constraints = CloudKitRetryConstraints(cause)
+        guard !constraints.isErrorGraphComplete || constraints.blocksAccountOperations
+                || constraints.requiresDeferredRetry || constraints.requestsTokenRecovery
+        else { return self }
+        switch self {
+        case .establishedZoneUnavailable(let zone, let kind):
+            return .constrainedZoneUnavailable(zone, kind, cause)
+        case .constrainedZoneUnavailable:
+            return self
+        }
+    }
+
     public var deletionKind: CloudKitZoneDeletionKind {
         switch self {
-        case .establishedZoneUnavailable(_, let kind):
+        case .establishedZoneUnavailable(_, let kind),
+             .constrainedZoneUnavailable(_, let kind, _):
             return kind
         }
     }
 
     public var errorDescription: String? {
         switch self {
-        case .establishedZoneUnavailable(let zoneID, let kind):
+        case .establishedZoneUnavailable(let zoneID, let kind),
+             .constrainedZoneUnavailable(let zoneID, let kind, _):
             return "The established CloudKit zone \(zoneID.zoneName) is unavailable (\(kind.rawValue)); local data was preserved and upload is blocked"
         }
     }
