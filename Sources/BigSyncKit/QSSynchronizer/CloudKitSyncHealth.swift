@@ -105,12 +105,33 @@ extension CloudKitSynchronizer {
     }
 
     /// Returns health only after proving it belongs to the currently active
-    /// iCloud account.  A snapshot from a previous account is never exposed.
+    /// iCloud account without crossing an account-invalidation boundary. This
+    /// read does not require or open mutation authority; a stopped account can
+    /// still display its diagnostic state after a fresh, stable identity read.
     @BigSyncBackgroundActor
     public func syncHealthSnapshot() async throws -> CloudKitSyncHealthSnapshot? {
-        let accountIdentifier = try await accountIdentifierProvider()
+        try Task.checkCancellation()
+        let generation = accountScopeAuthorityFence.invalidationGenerationSnapshot
+        func validateRead() throws {
+            try Task.checkCancellation()
+            guard accountScopeAuthorityFence.invalidationGenerationSnapshot == generation else {
+                throw CancellationError()
+            }
+        }
+        let accountIdentifier: String
+        do {
+            accountIdentifier = try await accountIdentifierProvider()
+        } catch {
+            try validateRead()
+            throw error
+        }
+        try validateRead()
         let accountScopeIdentifier = Self.accountScopeIdentifier(for: accountIdentifier)
-        guard let snapshot = persistedSyncHealthSnapshot(),
+        let snapshot = persistedSyncHealthSnapshot()
+        // A synchronous store read can also reenter account invalidation.
+        // Do not deliver the old account's bytes after either boundary.
+        try validateRead()
+        guard let snapshot,
               snapshot.accountScopeIdentifier == accountScopeIdentifier else {
             return nil
         }
