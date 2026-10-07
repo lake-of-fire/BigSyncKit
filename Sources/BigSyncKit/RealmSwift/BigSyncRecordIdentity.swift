@@ -69,14 +69,35 @@ enum BigSyncStringIdentity {
         _ lhs: Left, _ rhs: Right
     ) -> Bool where Left.Element == (key: String, value: String),
                    Right.Element == (key: String, value: String) {
-        // Do not first collect Realm entries in a String-keyed dictionary:
-        // that would collapse canonically equivalent, byte-distinct keys.
-        func identities<Entries: Sequence>(_ entries: Entries) -> [Data: Data]
-            where Entries.Element == (key: String, value: String) {
-            entries.reduce(into: [:]) { result, entry in
-                result[Data(entry.key.utf8)] = Data(entry.value.utf8)
+        mappedValuesEqual(lhs, rhs, by: equal)
+    }
+
+    /// Key identity is independent of the value's scalar type. Keep the
+    /// existing value comparison policy supplied by the caller, without ever
+    /// collecting a Realm map into a canonically-equivalent String dictionary.
+    static func mappedValuesEqual<Left: Sequence, Right: Sequence, Value>(
+        _ lhs: Left, _ rhs: Right, by valuesEqual: (Value, Value) -> Bool
+    ) -> Bool where Left.Element == (key: String, value: Value),
+                   Right.Element == (key: String, value: Value) {
+        var remaining = [Data: Value]()
+        for entry in rhs {
+            if case .some = remaining.updateValue(entry.value, forKey: Data(entry.key.utf8)) {
+                return false
             }
         }
-        return identities(lhs) == identities(rhs)
+        for entry in lhs {
+            guard let value = remaining.removeValue(forKey: Data(entry.key.utf8)),
+                  valuesEqual(entry.value, value) else { return false }
+        }
+        return remaining.isEmpty
+    }
+
+    /// Preserve the old ordering for non-equivalent keys. Break only Swift's
+    /// canonical-equivalence ties, so an unordered map has one fingerprint
+    /// without changing the established order of ordinary transported maps.
+    static func less(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs < rhs { return true }
+        if rhs < lhs { return false }
+        return lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
     }
 }
