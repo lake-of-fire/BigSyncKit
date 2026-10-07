@@ -809,8 +809,17 @@ extension SyncPhaseAttemptOwnershipTests {
                 case .failure(let error):
                     if interruption == .none
                         || (interruption == .callerCancellation && index == 1) {
-                        XCTAssertTrue((error as NSError) === original,
-                            "Waiter error type=\(String(reflecting: type(of: error))) actual=\(error as NSError) original=\(original) equal=\((error as NSError).isEqual(original))")
+                        // Darwin's throwing continuation may copy the NSError
+                        // wrapper. Preserve the entire error value and cause,
+                        // rather than requiring that wrapper's object address.
+                        let delivered = error as NSError
+                        XCTAssertEqual(delivered.domain, original.domain)
+                        XCTAssertEqual(delivered.code, original.code)
+                        XCTAssertTrue(NSDictionary(dictionary: delivered.userInfo)
+                            .isEqual(to: original.userInfo))
+                        if let cause = original.userInfo[NSUnderlyingErrorKey] as? NSError {
+                            XCTAssertTrue((delivered.userInfo[NSUnderlyingErrorKey] as? NSError) === cause)
+                        }
                     } else {
                         XCTAssertTrue(error is CancellationError)
                     }
