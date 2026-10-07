@@ -1531,3 +1531,97 @@ extension SyncRetainedRecordContractTests {
         try await exerciseRetainedAcknowledgementRefresh(mode: .live)
     }
 }
+
+extension SyncRetainedRecordContractTests {
+    @BigSyncBackgroundActor
+    private func exerciseConcurrentLegacyLifetimeBundles(
+        winningEpoch: String, losingEpoch: String
+    ) async throws {
+        let (leftAdapter, leftRealm) = try await fixture()
+        let (rightAdapter, rightRealm) = try await fixture()
+        // Both real adapters establish the same comparison ancestor before
+        // either authors its independent legacy lifetime transition.
+        _ = try await deliver([record(leftAdapter, epoch: "shared-base", count: 7)], to: leftAdapter)
+        _ = try await deliver([record(rightAdapter, epoch: "shared-base", count: 7)], to: rightAdapter)
+        let left = try value(leftRealm), right = try value(rightRealm)
+        let timestamp = Date(timeIntervalSinceReferenceDate: 50)
+        try leftRealm.write {
+            left.epoch = winningEpoch
+            left.count = 0
+            left.isDeleted = true
+            left.refreshChangeMetadata(explicitlyModified: true, at: timestamp)
+        }
+        try rightRealm.write {
+            right.epoch = losingEpoch
+            right.count = 9
+            right.isDeleted = false
+            right.refreshChangeMetadata(explicitlyModified: true, at: timestamp)
+        }
+        try await leftAdapter.didFinishImport()
+        try await rightAdapter.didFinishImport()
+        let leftPrepared = try await leftAdapter.prepareUploadBatch(limit: 10)
+        let rightPrepared = try await rightAdapter.prepareUploadBatch(limit: 10)
+        XCTAssertEqual(leftPrepared.records.count, 1)
+        XCTAssertEqual(rightPrepared.records.count, 1)
+        func retained(_ record: CKRecord) throws -> CKRecord {
+            let bytes = try NSKeyedArchiver.archivedData(withRootObject: record,
+                                                       requiringSecureCoding: true)
+            let copy = try XCTUnwrap(NSKeyedUnarchiver.unarchivedObject(ofClass: CKRecord.self,
+                                                                      from: bytes))
+            for key in copy.allKeys() {
+                if let asset = copy[key] as? CKAsset {
+                    copy[key] = try Data(contentsOf: XCTUnwrap(asset.fileURL)) as NSData
+                }
+            }
+            return copy
+        }
+        // Preserve exact adapter payloads before the subsequent imports retire
+        // their operation-owned asset files. No tags or evidence rows are made.
+        let leftIncoming = try retained(XCTUnwrap(leftPrepared.records.first))
+        let rightIncoming = try retained(XCTUnwrap(rightPrepared.records.first))
+        _ = try await deliver([rightIncoming], to: leftAdapter)
+        _ = try await deliver([leftIncoming], to: rightAdapter)
+        for object in [left, right] {
+            XCTAssertEqual(Data(object.epoch.utf8), Data(winningEpoch.utf8),
+                           "Both replicas must select the same literal legacy lifetime")
+            XCTAssertTrue(object.isDeleted)
+            XCTAssertEqual(object.count, 0, "Deletion and its read-count bundle cannot split across lifetimes")
+        }
+        let leftCurrent = try await leftAdapter.prepareUploadBatch(limit: 10)
+        let rightCurrent = try await rightAdapter.prepareUploadBatch(limit: 10)
+        XCTAssertEqual(leftCurrent.records.count, 1,
+                       "The winning local bundle must still be retransmitted over the accepted losing base")
+        XCTAssertLessThanOrEqual(rightCurrent.records.count, 1)
+        for batch in [leftCurrent, rightCurrent] {
+            for record in batch.records {
+                XCTAssertEqual(Data(try XCTUnwrap(record["epoch"] as? String).utf8), Data(winningEpoch.utf8))
+                XCTAssertEqual((record["isDeleted"] as? NSNumber)?.boolValue, true)
+            }
+        }
+        try await leftAdapter.acknowledgeUploadedRecords(leftCurrent.records, from: leftCurrent)
+        try await rightAdapter.acknowledgeUploadedRecords(rightCurrent.records, from: rightCurrent)
+        try await leftAdapter.cleanUp()
+        try await rightAdapter.cleanUp()
+        try await requireQuiet(leftAdapter)
+        try await requireQuiet(rightAdapter)
+        XCTAssertTrue(try value(leftRealm).isDeleted)
+        XCTAssertTrue(try value(rightRealm).isDeleted)
+    }
+
+    @BigSyncBackgroundActor
+    func testConcurrentCanonicallyEquivalentLegacyLifetimesConvergeOnOneByteExactDeletionBundle()
+    async throws {
+        let winning = "legacy-\u{00E9}"
+        let losing = "legacy-e\u{0301}"
+        XCTAssertEqual(winning, losing)
+        XCTAssertNotEqual(Data(winning.utf8), Data(losing.utf8))
+        try BigSyncLifetimeID.validate(winning)
+        try BigSyncLifetimeID.validate(losing)
+        try await exerciseConcurrentLegacyLifetimeBundles(winningEpoch: winning, losingEpoch: losing)
+    }
+
+    @BigSyncBackgroundActor
+    func testConcurrentASCIILegacyLifetimesKeepExistingDeterministicArbitration() async throws {
+        try await exerciseConcurrentLegacyLifetimeBundles(winningEpoch: "legacy-z", losingEpoch: "legacy-a")
+    }
+}

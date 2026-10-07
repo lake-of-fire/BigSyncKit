@@ -586,6 +586,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterPendingRelationshipTargetWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterDeletionMetadataTrackingAdmission:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testAfterAcceptedRetainedDeletionTrackingAdmission:
@@ -2723,7 +2725,17 @@ public final class RealmSwiftAdapter:
                         forPrimaryKey: mutation.recordName
                     ), tracked.pendingGeneration == mutation.generation,
                     tracked.pendingReplicaBindingGenerationIdentifier
-                        == mutation.replicaBindingGenerationIdentifier {
+                        == mutation.replicaBindingGenerationIdentifier,
+                       (mutation.isDeletion
+                            ? tracked.entityState == .deletedLocally
+                            : tracked.entityState == .new
+                                || tracked.entityState == .changed) {
+                        // A model may adopt retained tombstones while this
+                        // exact journal generation is already in the physical
+                        // deletion lane. Generation equality proves ownership,
+                        // not that the cached transport kind is still current.
+                        // Forward the existing generation through updateTracking
+                        // when its lane changed; never manufacture a new edit.
                         continue
                     }
                     updateTracking(
@@ -3657,7 +3669,9 @@ public final class RealmSwiftAdapter:
                         return Set(newValue) != Set(existingValue)
                     case .UUID:
                         guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.MutableSet<UUID> else { return true }
-                        return Set(newValue) != Set(Array(existingValue).map { $0.uuidString })
+                        let decoded = newValue.compactMap(UUID.init(uuidString:))
+                        guard decoded.count == newValue.count else { return true }
+                        return Set(decoded) != Set(existingValue)
                     default:
                         break
                     }
@@ -3712,7 +3726,9 @@ public final class RealmSwiftAdapter:
                         return newValue != Array(existingValue)
                     case .UUID:
                         guard let newValue = newValue as? [String], let existingValue = existingValue as? RealmSwift.List<UUID> else { return true }
-                        return newValue != Array(existingValue).map { $0.uuidString }
+                        let decoded = newValue.compactMap(UUID.init(uuidString:))
+                        guard decoded.count == newValue.count else { return true }
+                        return decoded != Array(existingValue)
                     default:
                         break
                     }
@@ -3724,7 +3740,9 @@ public final class RealmSwiftAdapter:
                     switch property.type {
                     case .int:
                         guard let newValue = result as? [String: Int], let existingValue = existingValue as? RealmSwift.Map<String, Int> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Int]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .string:
                         guard let newValue = result as? [String: String], let existingValue = existingValue as? RealmSwift.Map<String, String> else { return true }
                         return !BigSyncStringIdentity.mappedValuesEqual(
@@ -3732,22 +3750,39 @@ public final class RealmSwiftAdapter:
                         )
                     case .bool:
                         guard let newValue = result as? [String: Bool], let existingValue = existingValue as? RealmSwift.Map<String, Bool> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Bool]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .float:
                         guard let newValue = result as? [String: Float], let existingValue = existingValue as? RealmSwift.Map<String, Float> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Float]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .double:
                         guard let newValue = result as? [String: Double], let existingValue = existingValue as? RealmSwift.Map<String, Double> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Double]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .date:
                         guard let newValue = result as? [String: Date], let existingValue = existingValue as? RealmSwift.Map<String, Date> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Date]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .UUID:
-                        guard let newValue = result as? [String: UUID], let existingValue = existingValue as? RealmSwift.Map<String, UUID> else { return true }
-                        return newValue != existingValue.reduce(into: [String: UUID]()) { $0[$1.key] = $1.value }
+                        guard let newValue = result as? [String: String], let existingValue = existingValue as? RealmSwift.Map<String, UUID> else { return true }
+                        var decoded = [String: UUID]()
+                        for (key, value) in newValue {
+                            guard let uuid = UUID(uuidString: value) else { return true }
+                            decoded[key] = uuid
+                        }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            decoded, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     case .data:
                         guard let newValue = result as? [String: Data], let existingValue = existingValue as? RealmSwift.Map<String, Data> else { return true }
-                        return newValue != existingValue.reduce(into: [String: Data]()) { $0[$1.key] = $1.value }
+                        return !BigSyncStringIdentity.mappedScalarValuesEqual(
+                            newValue, existingValue.lazy.map { (key: $0.key, value: $0.value) }
+                        )
                     default:
                         break
                     }
@@ -4680,8 +4715,6 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     func applyPendingRelationships(realmProvider: RealmProvider) async throws {
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
-        let pendingRelationships = persistenceRealm.objects(PendingRelationship.self)
-        guard !pendingRelationships.isEmpty else { return }
 
         struct RelationshipGroupKey: Hashable, Sendable {
             let syncedEntityID: String
@@ -4718,9 +4751,12 @@ public final class RealmSwiftAdapter:
             }
         }
 
-        func currentRelationships(for group: RelationshipGroup) -> [PendingRelationship]? {
+        func currentRelationships(
+            for group: RelationshipGroup,
+            in trackingRealm: Realm
+        ) -> [PendingRelationship]? {
             let current = Array(
-                persistenceRealm.objects(PendingRelationship.self).filter(
+                trackingRealm.objects(PendingRelationship.self).filter(
                     "relationshipName == %@ AND forSyncedEntity.identifier == %@",
                     group.key.relationshipName,
                     group.key.syncedEntityID
@@ -4741,39 +4777,46 @@ public final class RealmSwiftAdapter:
             return currentElements == group.elements ? current : nil
         }
 
-        let groupedRelationships = Dictionary(
-            grouping: Array(pendingRelationships)
-        ) { relationship in
-            RelationshipGroupKey(
-                syncedEntityID: relationship.forSyncedEntity?.identifier ?? "",
-                relationshipName: relationship.relationshipName ?? ""
-            )
-        }
-        let groups = groupedRelationships.compactMap {
-            key, relationships -> RelationshipGroup? in
-            guard !key.syncedEntityID.isEmpty,
-                  !key.relationshipName.isEmpty,
-                  let entityType = relationships.first?.forSyncedEntity?
-                    .entityType else {
-                return nil
+        // Only committed deferred intents may reach a target transaction.
+        // A different owner can leave the shared tracking handle in a write
+        // while this actor resumes; its provisional rows are not import work.
+        // Keep this snapshot lexical so no frozen Realm survives a suspension.
+        let groups: [RelationshipGroup] = {
+            let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+            let groupedRelationships = Dictionary(
+                grouping: Array(snapshot.objects(PendingRelationship.self))
+            ) { relationship in
+                RelationshipGroupKey(
+                    syncedEntityID: relationship.forSyncedEntity?.identifier ?? "",
+                    relationshipName: relationship.relationshipName ?? ""
+                )
             }
-            return RelationshipGroup(
-                key: key,
-                entityType: entityType,
-                elements: relationships.map {
-                    RelationshipElement(
-                        position: $0.position,
-                        targetIdentifier: $0.targetIdentifier,
-                        sourceRecordChangeTag: $0.sourceRecordChangeTag,
-                        expectedModifiedAt: $0.expectedModifiedAt,
-                        expectedExplicitlyModifiedAt:
-                            $0.expectedExplicitlyModifiedAt
-                    )
-                }.sorted { lhs, rhs in
-                    lhs.position < rhs.position
+            return groupedRelationships.compactMap {
+                key, relationships -> RelationshipGroup? in
+                guard !key.syncedEntityID.isEmpty,
+                      !key.relationshipName.isEmpty,
+                      let entityType = relationships.first?.forSyncedEntity?
+                        .entityType else {
+                    return nil
                 }
-            )
-        }
+                return RelationshipGroup(
+                    key: key,
+                    entityType: entityType,
+                    elements: relationships.map {
+                        RelationshipElement(
+                            position: $0.position,
+                            targetIdentifier: $0.targetIdentifier,
+                            sourceRecordChangeTag: $0.sourceRecordChangeTag,
+                            expectedModifiedAt: $0.expectedModifiedAt,
+                            expectedExplicitlyModifiedAt:
+                                $0.expectedExplicitlyModifiedAt
+                        )
+                    }.sorted { lhs, rhs in
+                        lhs.position < rhs.position
+                    }
+                )
+            }
+        }()
 
         func datesMatch(_ lhs: Date?, _ rhs: Date?) -> Bool {
             switch (lhs, rhs) {
@@ -4823,11 +4866,19 @@ public final class RealmSwiftAdapter:
             try await targetRealm.asyncWritePreservingOwnership {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-                guard currentRelationships(for: group) != nil else {
+                // The target transaction owns its current local fields, but
+                // owns no tracking write. Re-sample the committed tracking
+                // intent and parent together after target admission: an
+                // uncommitted deletion/generation must not retire a durable
+                // relationship when its owner later rolls back.
+                let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
+                try Task.checkCancellation()
+                guard !cancelSync else { throw CancellationError() }
+                guard currentRelationships(for: group, in: trackingSnapshot) != nil else {
                     applicationOutcome = .superseded
                     return
                 }
-                guard let syncedEntity = persistenceRealm.object(
+                guard let syncedEntity = trackingSnapshot.object(
                     ofType: SyncedEntity.self,
                     forPrimaryKey: group.key.syncedEntityID
                 ), syncedEntity.entityType == group.entityType,
@@ -4927,6 +4978,9 @@ public final class RealmSwiftAdapter:
                 }
             }
 
+#if DEBUG
+            try await _testAfterPendingRelationshipTargetWrite?()
+#endif
             if case .unsupportedCollectionBridge = applicationOutcome {
                 logger.error(
                     "QSCloudKitSynchronizer >> Retaining deferred relationship \(group.key.relationshipName) for \(group.key.syncedEntityID) because its Realm collection bridge was unavailable"
@@ -4942,7 +4996,7 @@ public final class RealmSwiftAdapter:
             try await persistenceRealm.asyncWritePreservingOwnership {
                 try Task.checkCancellation()
                 guard !cancelSync else { throw CancellationError() }
-                guard let relationships = currentRelationships(for: group)
+                guard let relationships = currentRelationships(for: group, in: persistenceRealm)
                 else { return }
                 persistenceRealm.delete(relationships)
             }
