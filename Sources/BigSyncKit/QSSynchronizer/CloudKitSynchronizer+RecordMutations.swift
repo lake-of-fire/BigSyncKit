@@ -1,6 +1,126 @@
 import CloudKit
 import Foundation
 
+/// Bind each returned record to the request whose result slot contained it.
+/// A batch member is not interchangeable with a different member of that batch.
+private func mutationResponseRecordMatches(
+    _ record: CKRecord,
+    expectedID: CKRecord.ID,
+    expectedType: String?
+) -> Bool {
+    guard record.recordID == expectedID else { return false }
+    return expectedType.map { $0.utf8.elementsEqual(record.recordType.utf8) } ?? true
+}
+
+/// One result slot must represent exactly one preparation in the adapter's
+/// zone. Reject ambiguous batches before lookup or mutation: receipt validation
+/// after a server write is too late to protect the request boundary.
+private func validatePreparedMutationRecordIDs(
+    _ recordIDs: [CKRecord.ID],
+    in expectedZone: CKRecordZone.ID
+) throws {
+    var seen = Set<CKRecord.ID>()
+    for recordID in recordIDs {
+        guard recordID.zoneID == expectedZone,
+              seen.insert(recordID).inserted else {
+            throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
+        }
+    }
+}
+
+/// Validate before any local acknowledgement/import or account-routed await.
+/// Keep invalid slots as failures rather than abandoning successful siblings.
+/// The original conflict error remains an underlying cause so its retry-after
+/// and account constraints survive rejection of the malformed record payload.
+private func validatedMutationResults<Value>(
+    _ results: [CKRecord.ID: Result<Value, Error>],
+    expected: [(recordID: CKRecord.ID, recordType: String?)],
+    successRecord: (Value) -> CKRecord?
+) -> [CKRecord.ID: Result<Value, Error>] {
+    var validated = [CKRecord.ID: Result<Value, Error>]()
+    for identity in expected {
+        let id = identity.recordID
+        guard let result = results[id] else {
+            validated[id] = .failure(CocoaError(.coderValueNotFound))
+            continue
+        }
+        let record: CKRecord?
+        let originalFailure: NSError?
+        switch result {
+        case let .success(value):
+            record = successRecord(value)
+            originalFailure = nil
+        case let .failure(error):
+            let failure = error as NSError
+            record = failure.domain == CKErrorDomain
+                && failure.code == CKError.serverRecordChanged.rawValue
+                ? failure.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord
+                : nil
+            originalFailure = failure
+        }
+        if let record, !mutationResponseRecordMatches(
+            record, expectedID: id, expectedType: identity.recordType
+        ) {
+            let invalid = BigSyncRecordRebaseError.inconsistentReceipt(id.recordName) as NSError
+            if let originalFailure {
+                var info = invalid.userInfo
+                info[NSUnderlyingErrorKey] = originalFailure
+                validated[id] = .failure(NSError(
+                    domain: invalid.domain, code: invalid.code, userInfo: info
+                ))
+            } else {
+                validated[id] = .failure(invalid)
+            }
+        } else {
+            validated[id] = result
+        }
+    }
+    return validated
+}
+
+/// A repairable record outcome is not permission to ignore operation-level
+/// recovery. Preserve constrained failures for the outer synchronization
+/// lifecycle instead of consuming them in an immediate repair/retry loop.
+/// An incomplete bounded scan cannot prove the absence of deeper constraints.
+/// Only ordinary miss/conflict codes may be handled here. Other recognized
+/// CloudKit failures must not disappear merely because the outer code is one
+/// of those two; internal non-CloudKit SDK details retain their existing path.
+private func mutationFailureAllowsImmediateRepair(_ error: Error) -> Bool {
+    let constraints = CloudKitRetryConstraints(error)
+    return constraints.isErrorGraphComplete
+        && !constraints.requiresDeferredRetry
+        && constraints.codes.isSubset(of: [.unknownItem, .serverRecordChanged])
+}
+
+/// Absence is a valid deletion receipt, but independent conditions attached to
+/// that receipt still constrain the operation. Keep those causes in a named
+/// envelope, separate from the dictionary of records whose deletion failed.
+private func preservingAcknowledgedDeletionConstraints(
+    _ error: Error?,
+    constraints: [CKRecord.ID: NSError]
+) -> Error? {
+    guard !constraints.isEmpty else { return error }
+    if let error, error is CancellationError { return error }
+    var failures = [AnyHashable: Error]()
+    var info = [String: Any]()
+    if let error {
+        let original = error as NSError
+        if original.domain == CKErrorDomain,
+           original.code == CKError.partialFailure.rawValue,
+           let items = original.userInfo[CKPartialErrorsByItemIDKey] as? [AnyHashable: Error] {
+            failures = items
+            info = original.userInfo
+        } else {
+            info[NSUnderlyingErrorKey] = original
+        }
+    }
+    failures["acknowledgedDeletionConstraints"] = CKError(
+        .partialFailure, userInfo: [CKPartialErrorsByItemIDKey: constraints]
+    )
+    info[CKPartialErrorsByItemIDKey] = failures
+    return CKError(.partialFailure, userInfo: info)
+}
+
 struct PreparedMutationRetryKey: Hashable, Sendable {
     let recordID: CKRecord.ID
     let generation: String?
@@ -190,21 +310,24 @@ extension CloudKitSynchronizer {
         }
     }
 
-    /// Every immediate retry strictly reduces the attempted multi-item size.
-    /// Keep that ceiling for this drain so successful pieces do not regrow
+    /// Every immediate retry strictly reduces the requested batch limit.
+    /// An adapter may return too many records; that must not keep a drain
+    /// retrying forever at the same limit. Successful pieces cannot regrow
     /// into the rejected request. No journal generation is acknowledged here.
     @BigSyncBackgroundActor
     private func retrySmallerMutationBatch(
         after error: Error,
         attemptedCount: Int,
+        requestedBatchSize: Int,
         ceiling: inout Int?
     ) -> Bool {
         let constraints = CloudKitRetryConstraints(error)
         guard constraints.codes.contains(.limitExceeded) else { return false }
-        let reduced = max(1, attemptedCount / 2)
+        let reduced = max(1, min(attemptedCount, requestedBatchSize) / 2)
         batchSize = min(batchSize, reduced)
         ceiling = min(ceiling ?? batchSize, batchSize)
         return attemptedCount > 1
+            && batchSize < requestedBatchSize
             && constraints.containsOnlySizeLimitFailures
             && !constraints.requiresDeferredRetry
     }
@@ -223,6 +346,8 @@ extension CloudKitSynchronizer {
                 restrictedToEntityType: restrictedToEntityType,
                 attemptID: attemptID
             )
+            // A final synchronous adapter observation can revoke this caller.
+            try checkSynchronizationAttempt(attemptID)
             operationError = nil
         } catch {
             operationError = error
@@ -249,12 +374,23 @@ extension CloudKitSynchronizer {
             )
             try checkSynchronizationAttempt(attemptID)
             guard !prepared.isEmpty else { return }
+            try validatePreparedMutationRecordIDs(
+                prepared.map { $0.record.recordID }, in: adapter.recordZoneID
+            )
+            try checkSynchronizationAttempt(attemptID)
 
             let uncertain = prepared.filter(\.requiresAcceptanceCheck)
             if !uncertain.isEmpty, let lookup = recordStore as? any CloudKitRecordFetching {
                 let fetched = try await lookup.fetchRecords(with: uncertain.map { $0.record.recordID })
+                // Collect missing/malformed slots before the account await,
+                // while retaining the existing fail-fast lookup import policy.
+                let validatedFetched = validatedMutationResults(
+                    fetched,
+                    expected: uncertain.map { ($0.record.recordID, $0.record.recordType) },
+                    successRecord: { $0 }
+                )
                 let returnedFailures = returnedMutationFailures(
-                    in: fetched, for: uncertain.map { $0.record.recordID }
+                    in: validatedFetched, for: uncertain.map { $0.record.recordID }
                 )
                 try await revalidateMutationResultContext(
                     for: attemptID, preserving: returnedFailures
@@ -269,7 +405,9 @@ extension CloudKitSynchronizer {
                     }
                     switch result {
                     case let .success(record):
-                        guard record.recordID == id, record.recordType == candidate.record.recordType else {
+                        guard mutationResponseRecordMatches(
+                            record, expectedID: id, expectedType: candidate.record.recordType
+                        ) else {
                             throw preservingSiblingMutationFailures(
                                 BigSyncRecordRebaseError.inconsistentReceipt(id.recordName),
                                 failedRecordIDs: [id], otherFailures: returnedFailures
@@ -278,11 +416,13 @@ extension CloudKitSynchronizer {
                         observations.append(record)
                     case let .failure(error):
                         let ns = error as NSError
-                        if ns.domain != CKErrorDomain || ns.code != CKError.unknownItem.rawValue {
+                        if ns.domain != CKErrorDomain || ns.code != CKError.unknownItem.rawValue
+                            || !mutationFailureAllowsImmediateRepair(ns) {
                             lookupFailures[id] = ns
                         }
-                        // Not found does not prove the earlier request never
-                        // ran; retry the same candidate with its save fence.
+                        // An unconstrained miss may retry the same candidate
+                        // with its save fence. A miss carrying a delay, account
+                        // stop or token recovery must retain that constraint.
                     }
                 }
                 if !observations.isEmpty {
@@ -355,6 +495,7 @@ extension CloudKitSynchronizer {
                 if let context = activeRunContext { try checkRunContext(context) }
                 guard retrySmallerMutationBatch(
                     after: error, attemptedCount: records.count,
+                    requestedBatchSize: requestedBatchSize,
                     ceiling: &sizeLimitCeiling
                 ) else { throw error }
                 // Only pure, reducible limits retry here. Account stops,
@@ -363,8 +504,13 @@ extension CloudKitSynchronizer {
                 continue
             }
             try Task.checkCancellation()
+            let saveResults = validatedMutationResults(
+                mutationResults.saveResults,
+                expected: records.map { ($0.recordID, $0.recordType) },
+                successRecord: { $0 }
+            )
             let returnedFailures = returnedMutationFailures(
-                in: mutationResults.saveResults, for: records.map(\.recordID)
+                in: saveResults, for: records.map(\.recordID)
             )
             try await revalidateMutationResultContext(
                 for: attemptID, preserving: returnedFailures
@@ -380,7 +526,7 @@ extension CloudKitSynchronizer {
                     recordID: record.recordID,
                     generation: generations[record.recordID.recordName]
                 )
-                guard let result = mutationResults.saveResults[record.recordID] else {
+                guard let result = saveResults[record.recordID] else {
                     unresolvedFailures[record.recordID] = CocoaError(
                         .coderValueNotFound
                     ) as NSError
@@ -397,7 +543,8 @@ extension CloudKitSynchronizer {
                         continue
                     }
                     let code = CKError.Code(rawValue: nsError.code)
-                    guard code == .unknownItem || code == .serverRecordChanged else {
+                    guard code == .unknownItem || code == .serverRecordChanged,
+                          mutationFailureAllowsImmediateRepair(nsError) else {
                         unresolvedFailures[record.recordID] = nsError
                         continue
                     }
@@ -455,9 +602,16 @@ extension CloudKitSynchronizer {
                 } catch {
                     try checkSynchronizationAttempt(attemptID)
                     if let context = activeRunContext { try checkRunContext(context) }
+                    // A sibling conflict selected for later import has not
+                    // been repaired when this earlier requeue fails. Keep its
+                    // returned evidence; only this group's IDs receive the
+                    // local reconciliation error.
+                    let siblingFailures = returnedFailures.filter {
+                        !missingRecordIDs.contains($0.key)
+                    }
                     throw preservingSiblingMutationFailures(
                         error, failedRecordIDs: Array(missingRecordIDs),
-                        otherFailures: unresolvedFailures
+                        otherFailures: siblingFailures
                     )
                 }
                 try await revalidateMutationResultContext(
@@ -475,6 +629,8 @@ extension CloudKitSynchronizer {
                         in: conflictedRecords,
                         forceSave: true
                     )
+                    // Reject revoked callers before interpreting their outcome.
+                    try checkSynchronizationAttempt(attemptID)
                     try ChangeRequestProcessor.validateInboundLiveResults(
                         results,
                         records: conflictedRecords
@@ -514,6 +670,7 @@ extension CloudKitSynchronizer {
                 let error = partialMutationError(unresolvedFailures)
                 if retrySmallerMutationBatch(
                     after: error, attemptedCount: records.count,
+                    requestedBatchSize: requestedBatchSize,
                     ceiling: &sizeLimitCeiling
                 ) {
                     await Task.yield()
@@ -552,6 +709,8 @@ extension CloudKitSynchronizer {
                 restrictedToEntityType: restrictedToEntityType,
                 attemptID: attemptID
             )
+            // A final synchronous adapter observation can revoke this caller.
+            try checkSynchronizationAttempt(attemptID)
             operationError = nil
         } catch {
             operationError = error
@@ -580,6 +739,8 @@ extension CloudKitSynchronizer {
             guard !prepared.isEmpty else { return }
 
             let recordIDs = prepared.map(\.recordID)
+            try validatePreparedMutationRecordIDs(recordIDs, in: adapter.recordZoneID)
+            try checkSynchronizationAttempt(attemptID)
             let generations = prepared.reduce(into: [String: String]()) {
                 guard let generation = $1.generation else { return }
                 $0[$1.recordID.recordName] = generation
@@ -598,6 +759,7 @@ extension CloudKitSynchronizer {
                 if let context = activeRunContext { try checkRunContext(context) }
                 guard retrySmallerMutationBatch(
                     after: error, attemptedCount: recordIDs.count,
+                    requestedBatchSize: requestedBatchSize,
                     ceiling: &sizeLimitCeiling
                 ) else { throw error }
                 // Only pure, reducible limits retry here. Account stops,
@@ -606,14 +768,23 @@ extension CloudKitSynchronizer {
                 continue
             }
             try Task.checkCancellation()
+            // Generic deletion preparation carries no record type. The
+            // adapter retains that model-specific check; ID and zone must
+            // already match before any metadata-rebase call is dispatched.
+            let deleteResults = validatedMutationResults(
+                mutationResults.deleteResults,
+                expected: recordIDs.map { ($0, nil) },
+                successRecord: { _ in nil }
+            )
             let returnedFailures = returnedMutationFailures(
-                in: mutationResults.deleteResults, for: recordIDs
+                in: deleteResults, for: recordIDs
             )
             try await revalidateMutationResultContext(
                 for: attemptID, preserving: returnedFailures
             )
 
             var acknowledged = [CKRecord.ID]()
+            var acknowledgedConstraints = [CKRecord.ID: NSError]()
             var conflictedRecordsByID = [CKRecord.ID: CKRecord]()
             var unresolvedFailures = [CKRecord.ID: NSError]()
             for recordID in recordIDs {
@@ -621,7 +792,7 @@ extension CloudKitSynchronizer {
                     recordID: recordID,
                     generation: generations[recordID.recordName]
                 )
-                guard let result = mutationResults.deleteResults[recordID] else {
+                guard let result = deleteResults[recordID] else {
                     unresolvedFailures[recordID] = CocoaError(
                         .coderValueNotFound
                     ) as NSError
@@ -637,8 +808,12 @@ extension CloudKitSynchronizer {
                        nsError.code == CKError.unknownItem.rawValue {
                         retryBudget.retire(retryKey)
                         acknowledged.append(recordID)
+                        if !mutationFailureAllowsImmediateRepair(nsError) {
+                            acknowledgedConstraints[recordID] = nsError
+                        }
                     } else if nsError.domain == CKErrorDomain,
                               nsError.code == CKError.serverRecordChanged.rawValue,
+                              mutationFailureAllowsImmediateRepair(nsError),
                               let serverRecord = nsError.userInfo[
                                   CKRecordChangedErrorServerRecordKey
                               ] as? CKRecord {
@@ -665,6 +840,13 @@ extension CloudKitSynchronizer {
             }
 
             if !acknowledged.isEmpty {
+                // Selecting a conflict for repair does not resolve it. Until
+                // metadata rebasing finishes, every unacknowledged result must
+                // survive a sibling receipt constraint or account-check failure.
+                let acknowledgedIDs = Set(acknowledged)
+                let failuresBeforeRepair = returnedFailures.filter {
+                    !acknowledgedIDs.contains($0.key)
+                }
                 do {
                     try await adapter.didDelete(
                         recordIDs: acknowledged,
@@ -675,13 +857,26 @@ extension CloudKitSynchronizer {
                     if let context = activeRunContext { try checkRunContext(context) }
                     // unknownItem is an idempotent success for deletion; do not
                     // put those IDs back into the failed-item dictionary.
-                    let failed = returnedFailures.filter { !acknowledged.contains($0.key) }
-                    throw preservingSiblingMutationFailures(
-                        error, failedRecordIDs: [], otherFailures: failed
+                    let failure = preservingSiblingMutationFailures(
+                        error, failedRecordIDs: [], otherFailures: failuresBeforeRepair
                     )
+                    throw preservingAcknowledgedDeletionConstraints(
+                        failure, constraints: acknowledgedConstraints
+                    ) ?? failure
+                }
+                try checkSynchronizationAttempt(attemptID)
+                if let context = activeRunContext { try checkRunContext(context) }
+                // Stop before any extra account request or metadata repair.
+                // These IDs were acknowledged, so they are not failed items.
+                if !acknowledgedConstraints.isEmpty,
+                   let failure = preservingAcknowledgedDeletionConstraints(
+                    failuresBeforeRepair.isEmpty ? nil : partialMutationError(failuresBeforeRepair),
+                    constraints: acknowledgedConstraints
+                ) {
+                    throw failure
                 }
                 try await revalidateMutationResultContext(
-                    for: attemptID, preserving: unresolvedFailures
+                    for: attemptID, preserving: failuresBeforeRepair
                 )
             }
             if !conflictedRecordsByID.isEmpty {
@@ -710,6 +905,7 @@ extension CloudKitSynchronizer {
                 let error = partialMutationError(unresolvedFailures)
                 if retrySmallerMutationBatch(
                     after: error, attemptedCount: recordIDs.count,
+                    requestedBatchSize: requestedBatchSize,
                     ceiling: &sizeLimitCeiling
                 ) {
                     await Task.yield()

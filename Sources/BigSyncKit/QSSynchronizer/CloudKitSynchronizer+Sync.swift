@@ -612,7 +612,24 @@ extension CloudKitSynchronizer {
             settleCancellationIfCurrentAttempt(attemptID)
             return
         }
+        // Failure cleanup may itself deliver synchronous callbacks or suspend.
+        // Reuse the existing attempt fence; revoked authority is a reason to
+        // settle this caller, never permission to mutate a successor's state.
+        func canContinue() -> Bool {
+            do {
+                try checkSynchronizationAttempt(attemptID)
+                return true
+            } catch {
+                settleCancellationIfCurrentAttempt(attemptID)
+                return false
+            }
+        }
+        guard canContinue() else { return }
+        let failureContext = activeRunContext
+        let failureAuthorityGeneration =
+            accountScopeAuthorityFence.invalidationGenerationSnapshot
         logger.info("QSCloudKitSynchronizer >> Failing or backing off synchronization...")
+        guard canContinue() else { return }
         
         resetActiveTokens()
         
@@ -624,18 +641,42 @@ extension CloudKitSynchronizer {
             } catch {
                 logger.error("QSCloudKitSynchronizer >> Failed final import forwarding: \(error)")
             }
-            guard synchronizationAttemptID == attemptID else { return }
+            guard canContinue() else { return }
         }
         
+        // One delivery cannot switch delegates midway through its notification.
+        let failureDelegate = delegate
         self.postNotification(.SynchronizerDidFailToSynchronize, userInfo: [cloudKitSynchronizerErrorKey: error])
-        self.delegate?.synchronizerDidfailToSync(self, error: error)
-        guard synchronizationAttemptID == attemptID else { return }
+        guard canContinue() else { return }
+        failureDelegate?.synchronizerDidfailToSync(self, error: error)
+        guard canContinue() else { return }
         
         var shouldRetry = false
+        var stopsAccount = false
         var retryDelay: TimeInterval = 0
         var terminalHealthCategory = syncHealthCategory(for: error)
         let terminalZoneDeletionKind = (error as? ChangeFeedMigrationError)?
             .deletionKind
+        // The original error can be a local/Foundation wrapper. Its nested
+        // CloudKit constraints still govern this existing recovery policy.
+        let constraints = CloudKitRetryConstraints(error)
+        guard canContinue() else { return }
+
+        // A coalesced local mutation may wake an ordinary failed local drain,
+        // but cannot create a fresh retry budget for a transport failure or
+        // bypass a recovery prerequisite. Keep this independent of diagnostic
+        // health categories, which do not grant retry authority.
+        let allowsLocalWorkTail: Bool
+        switch error {
+        case let syncError as SyncError:
+            allowsLocalWorkTail = syncError == .inboundBoundaryChanged
+        case is ChangeFeedMigrationError, is BigSyncCloudAccountPortError,
+             is BigSyncHandledMutationRetryError, is BigSyncSemanticUploadConflictError:
+            allowsLocalWorkTail = false
+        default:
+            allowsLocalWorkTail = constraints.codes.isEmpty
+                && (error as? CloudKitChangeFeedError) != .corruptCursor
+        }
 
         if error is RealmSwiftInboundTargetChangedError {
             // A non-journaled local write invalidated an inbound selection.
@@ -667,20 +708,23 @@ extension CloudKitSynchronizer {
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
                 //                print("# ")
             }
-        } else if let topLevelError = error as? CKError {
-            let constraints = CloudKitRetryConstraints(topLevelError)
+        } else if !constraints.codes.isEmpty {
             let codes = constraints.codes
             var recoveryRequestIsDurable = !constraints.requestsTokenRecovery
             if constraints.requestsTokenRecovery {
                 logger.info("QSCloudKitSynchronizer >> Change token expired, requesting a fenced server-first tracking rebuild...")
-                if let context = activeRunContext {
+                guard canContinue() else { return }
+                if let context = failureContext {
                     do {
                         try checkRunContext(context)
                         try requestChangeFeedRecovery(context: context)
+                        guard canContinue() else { return }
                         try resetDatabaseToken()
+                        guard canContinue() else { return }
                         for adapter in modelAdapters {
                             try checkRunContext(context)
                             try await adapter.saveToken(nil)
+                            guard canContinue() else { return }
                             try checkRunContext(context)
                         }
                         recoveryRequestIsDurable = true
@@ -689,27 +733,23 @@ extension CloudKitSynchronizer {
                         settleCancellationIfCurrentAttempt(attemptID)
                         return
                     } catch {
-                        guard synchronizationAttemptID == attemptID else { return }
+                        guard canContinue() else { return }
                         logger.error("QSCloudKitSynchronizer >> Could not durably prepare token recovery: \(error)")
                     }
                 }
             }
 
+            guard canContinue() else { return }
             // Account stops take precedence over *retrying*, not over recording
             // a local recovery request. Do not issue another account/CloudKit
             // request here; CKAccountChanged reopens the availability gate.
             if codes.contains(.notAuthenticated) {
                 shouldRetry = false
-                changeRequestProcessor.reset()
-                cancelledDueToUnauthentication = true
-                accountValidationRequired = true
-                accountScopeAuthorityFence.poison(requiresGenerationRotation: false)
+                stopsAccount = true
                 terminalHealthCategory = .notAuthenticated
             } else if codes.contains(.accountTemporarilyUnavailable) {
                 shouldRetry = false
-                changeRequestProcessor.reset()
-                accountValidationRequired = true
-                accountScopeAuthorityFence.poison(requiresGenerationRotation: false)
+                stopsAccount = true
                 clearPersistedTransientRetryState()
                 terminalHealthCategory = .accountTemporarilyUnavailable
             } else if constraints.requiresDeferredRetry {
@@ -718,27 +758,31 @@ extension CloudKitSynchronizer {
                     serverMinimum: constraints.serverMinimum,
                     consecutiveFailures: consecutiveTransientCloudKitFailures
                 )
-                if let context = activeRunContext {
+                if let context = failureContext {
                     persistTransientRetryState(
                         context: context,
                         notBefore: Date().addingTimeInterval(retryDelay),
                         consecutiveFailures: consecutiveTransientCloudKitFailures
                     )
                 }
+                guard canContinue() else { return }
                 logger.warning("QSCloudKitSynchronizer >> CloudKit retry constrained to \(retryDelay.rounded()) seconds or later.")
+                guard canContinue() else { return }
                 reduceBatchSize()
                 shouldRetry = recoveryRequestIsDurable
             } else if !constraints.requestsTokenRecovery {
-                logger.error("QSCloudKitSynchronizer >> Error: \(topLevelError)")
+                logger.error("QSCloudKitSynchronizer >> Error: \(error)")
             }
         } else if error as? CloudKitChangeFeedError == .corruptCursor {
             logger.warning(
                 "QSCloudKitSynchronizer >> Persisted CloudKit cursor was corrupt; requesting a fenced server-first tracking rebuild."
             )
+            guard canContinue() else { return }
             var recoveryRequestIsDurable = false
-            if let context = activeRunContext {
+            if let context = failureContext {
                 do {
                     try requestChangeFeedRecovery(context: context)
+                    guard canContinue() else { return }
                     recoveryRequestIsDurable = true
                 } catch {
                     logger.error(
@@ -746,17 +790,20 @@ extension CloudKitSynchronizer {
                     )
                 }
             }
+            guard canContinue() else { return }
             if recoveryRequestIsDurable {
                 do {
                     try resetDatabaseToken()
+                    guard canContinue() else { return }
                     for adapter in modelAdapters {
                         try checkSynchronizationAttempt(attemptID)
                         try await adapter.saveToken(nil)
+                        guard canContinue() else { return }
                         try checkSynchronizationAttempt(attemptID)
                     }
                     shouldRetry = true
                 } catch {
-                    guard synchronizationAttemptID == attemptID else { return }
+                    guard canContinue() else { return }
                     logger.error(
                         "QSCloudKitSynchronizer >> Failed to clear corrupt adapter cursor: \(error)"
                     )
@@ -764,15 +811,16 @@ extension CloudKitSynchronizer {
             }
         }
 
-        if error is CancellationError {
-            logger.info("QSCloudKitSynchronizer >> Synchronization canceled, not retrying")
-            shouldRetry = false
+        guard canContinue() else { return }
+        // Keep the drain owned through the health notification. Its observer
+        // may cancel or replace this attempt, and must not coalesce a successor
+        // into a drain that has already dropped its running state.
+        if !stopsAccount {
+            syncing = shouldRetry && !cancelSync
+            synchronizationTask = nil
         }
 
-        syncing = shouldRetry && !cancelSync
-        synchronizationTask = nil
-
-        if let context = activeRunContext {
+        if let context = failureContext {
             do {
                 if shouldRetry, !cancelSync {
                     try recordSyncHealth(
@@ -798,7 +846,15 @@ extension CloudKitSynchronizer {
             }
         }
 
-        guard synchronizationAttemptID == attemptID else { return }
+        guard canContinue() else { return }
+        if stopsAccount {
+            finishAccountStoppedSynchronization(
+                error: error, attemptID: attemptID, context: failureContext,
+                authorityGeneration: failureAuthorityGeneration,
+                category: terminalHealthCategory
+            )
+            return
+        }
         guard shouldRetry, !cancelSync else {
             // A final journal drain can discover a local mutation while this
             // failed attempt is still marked as running. Its delegate wakeup
@@ -809,16 +865,12 @@ extension CloudKitSynchronizer {
             let shouldStartDeferredLocalWorkDrain =
                 synchronizationRequestedWhileRunning &&
                 !cancelSync &&
-                !(error is CancellationError) &&
-                !(error is ChangeFeedMigrationError) &&
-                !(error is BigSyncCloudAccountPortError) &&
-                (error as? SyncError) != .cancelled &&
-                terminalHealthCategory != .accountTemporarilyUnavailable &&
+                allowsLocalWorkTail &&
                 !cancelledDueToUnauthentication
             finishSynchronizationDrain(with: .failure(error))
             // Failure observers may synchronously admit a successor. This
             // terminal tail owns only the attempt whose waiters it settled.
-            guard synchronizationAttemptID == attemptID else { return }
+            guard canContinue() else { return }
             // Preserve terminal ownership until the failed drain has released
             // its waiters, for the same reason as the successful terminal
             // paths above.
@@ -832,7 +884,8 @@ extension CloudKitSynchronizer {
 
         retrySleepUntil = Date().addingTimeInterval(retryDelay)
         synchronizationTask = Task(priority: .utility) { @BigSyncBackgroundActor [weak self] in
-            guard let self else { return }
+            // Do not retain the synchronizer during a potentially long sleep.
+            // This closure must not capture the local canContinue function.
             if retryDelay > 0 {
                 do {
                     try await BigSyncRetrySleep.sleep(for: retryDelay)
@@ -840,16 +893,19 @@ extension CloudKitSynchronizer {
                     return
                 }
             }
-            guard !cancelSync,
+            guard let self, !Task.isCancelled, !cancelSync,
                   synchronizationAttemptID == attemptID else { return }
             retrySleepUntil = nil
             synchronizationTask = nil
             syncing = false
             synchronizationRequestedWhileRunning = false
             logger.info("QSCloudKitSynchronizer >> Retrying synchronization...")
+            guard !Task.isCancelled, !cancelSync,
+                  synchronizationAttemptID == attemptID else { return }
             beginSynchronization()
         }
     }
+
 }
 
 /// Computes retry delays without ever retrying earlier than a delay explicitly

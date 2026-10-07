@@ -2192,6 +2192,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             notBefore: Date().addingTimeInterval(600),
             consecutiveFailures: 2
         )
+        first.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         try first._test_recordSyncHealth(
             .failed,
             accountIdentifier: "account-a",
@@ -2379,6 +2380,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             accountIdentifier: "account-a",
             accountScopeIdentifier: accountScope
         )
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         synchronizer.activeRunContext = active
 
         XCTAssertNoThrow(try synchronizer.validateBoundaryContext(
@@ -2423,6 +2425,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             accountScopeIdentifier: CloudKitSynchronizer
                 .accountScopeIdentifier(for: "account-a")
         )
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         synchronizer.activeRunContext = active
         let current = CloudKitSynchronizer.PrepublicationBoundaryContext(
             context: active,
@@ -2459,6 +2462,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             accountScopeIdentifier: CloudKitSynchronizer
                 .accountScopeIdentifier(for: "account-a")
         )
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         synchronizer.activeRunContext = active
         let boundary = CloudKitSynchronizer.SynchronizationBoundaryContext(
             context: active
@@ -2496,6 +2500,7 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             accountScopeIdentifier: CloudKitSynchronizer
                 .accountScopeIdentifier(for: "account-a")
         )
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         synchronizer.activeRunContext = active
         let boundary = CloudKitSynchronizer.PrepublicationBoundaryContext(
             context: active,
@@ -3591,6 +3596,7 @@ extension CloudKitSynchronizerAccountFencingTests {
         )
         let adapter = AccountFencingModelAdapter(zoneID: sync.recordZoneID)
         sync.addModelAdapter(adapter)
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = .init(
             attemptID: sync.synchronizationAttemptID,
             runID: sync.synchronizationRunID,
@@ -3802,6 +3808,7 @@ extension CloudKitSynchronizerAccountFencingTests {
         sync.addModelAdapter(adapter)
         let runID = await sync.changeRequestProcessor.beginRun()
         sync.synchronizationRunID = runID
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = .init(
             attemptID: sync.synchronizationAttemptID, runID: runID,
             accountIdentifier: "account-a",

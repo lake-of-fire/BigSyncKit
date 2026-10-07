@@ -8,6 +8,9 @@ struct CloudKitRetryConstraints {
     let codes: Set<CKError.Code>
     let serverMinimum: TimeInterval?
     let containsOnlySizeLimitFailures: Bool
+    /// False when the bounded scan left a previously unseen cause unexamined.
+    /// Absence of a discovered constraint then cannot authorize local repair.
+    let isErrorGraphComplete: Bool
 
     var blocksAccountOperations: Bool {
         !codes.isDisjoint(with: [.notAuthenticated, .accountTemporarilyUnavailable])
@@ -23,7 +26,9 @@ struct CloudKitRetryConstraints {
     }
 
     init(_ error: Error) {
-        let errors = cloudKitErrors(in: error)
+        let inspection = inspectCloudKitErrors(in: error)
+        let errors = inspection.errors
+        isErrorGraphComplete = inspection.isComplete
         codes = Set(errors.map(\.code))
         serverMinimum = errors.compactMap {
             ($0.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
@@ -61,10 +66,10 @@ struct CloudKitRetryConstraints {
                 memo[id] = (error, .complete(height: nil))
                 return nil
             }
-            var children = [Error]()
-            if let underlying = error.userInfo[NSUnderlyingErrorKey] as? Error {
-                children.append(underlying)
-            }
+            // Foundation combines NSUnderlyingErrorKey and
+            // NSMultipleUnderlyingErrorsKey. A size-only proof must not
+            // discard a local failure or constraint carried by either form.
+            var children = cloudKitUnderlyingErrors(in: error)
             switch cloudError.code {
             case .limitExceeded, .batchRequestFailed:
                 break
@@ -96,7 +101,13 @@ struct CloudKitRetryConstraints {
 }
 
 func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {
-    guard depth < 32 else { return [] }
+    inspectCloudKitErrors(in: error, depth: depth).errors
+}
+
+private func inspectCloudKitErrors(
+    in error: Error, depth: Int = 0
+) -> (errors: [CKError], isComplete: Bool) {
+    guard depth < 32 else { return ([], false) }
     // Breadth-first visitation finds each identity at its shallowest depth,
     // avoiding both repeated DAG fanout and a deep first path hiding evidence
     // that is also reachable by a shorter path. Keep identity objects alive.
@@ -104,12 +115,18 @@ func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {
     var queue = [(error: error as NSError, depth: depth)]
     var offset = 0
     var errors = [CKError]()
+    var isComplete = true
     while offset < queue.count {
         let item = queue[offset]
         offset += 1
-        guard item.depth < 32 else { continue }
         let id = ObjectIdentifier(item.error)
         guard visited[id] == nil else { continue }
+        // A deep alias already inspected on a shallower path is not missing
+        // evidence. Only unseen nodes beyond the ceiling make the scan partial.
+        guard item.depth < 32 else {
+            isComplete = false
+            continue
+        }
         visited[id] = item.error
         if let cloudError = item.error as? CKError {
             errors.append(cloudError)
@@ -121,9 +138,29 @@ func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {
                 }
             }
         }
-        if let underlying = item.error.userInfo[NSUnderlyingErrorKey] as? Error {
+        // Match the same Foundation edge set used by size-only validation.
+        // Existing identity/depth guards also bound aggregate cycles and DAGs.
+        for underlying in cloudKitUnderlyingErrors(in: item.error) {
             queue.append((underlying as NSError, item.depth + 1))
         }
+    }
+    return (errors, isComplete)
+}
+
+/// Read each wrapper through its supplied userInfo, including subclass overrides.
+private func cloudKitUnderlyingErrors(in error: NSError) -> [Error] {
+    cloudKitUnderlyingErrors(in: error.userInfo)
+}
+
+/// Shared Foundation cause edges for retry and zone-loss classification.
+/// Callers may retain one metadata snapshot for both item and underlying causes.
+func cloudKitUnderlyingErrors(in info: [String: Any]) -> [Error] {
+    var errors = [Error]()
+    if let underlying = info[NSUnderlyingErrorKey] as? Error {
+        errors.append(underlying)
+    }
+    if let multiple = info[NSMultipleUnderlyingErrorsKey] as? [Error] {
+        errors.append(contentsOf: multiple)
     }
     return errors
 }

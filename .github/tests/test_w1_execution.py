@@ -267,7 +267,12 @@ class W1InventoryTests(unittest.TestCase):
 
     def test_each_new_callback_and_preflight_identity_is_critical(self):
         # Test runtime admission of a missing declared class, not source text.
-        for suite in ("CloudKitCallbackAdmissionTests", "CloudKitAccountAvailabilityDeadlineTests"):
+        for suite in (
+            "CloudKitCallbackAdmissionTests",
+            "CloudKitAccountAvailabilityDeadlineTests",
+            "ChangeRequestProcessorCancellationTests",
+            "SynchronizationProcessorStartupTests",
+        ):
             remaining = [n for n in verifier.REQUIRED if not n.startswith(suite + "/")]
             result = verifier.validate(self.listing(remaining), [0, 0, 0],
                                        "".join(self.events(n) for n in remaining))
@@ -308,6 +313,8 @@ class W1InventoryTests(unittest.TestCase):
             "SyncUndoCloseoutW1RepresentationTests/testNewRepresentation",
             "OtherTests/testCloudKitCallbackAdmissionTestsIsOnlyInMethodName",
             "CloudKitCallbackAdmissionTestsExtra/testNeighbor",
+            "ChangeRequestProcessorCancellationTestsExtra/testNeighbor",
+            "SynchronizationProcessorStartupTestsExtra/testNeighbor",
             self.extra,
         ]
         expected = [n for n in names if pattern.search("BigSyncKitTests." + n)]
@@ -318,7 +325,11 @@ class W1InventoryTests(unittest.TestCase):
             self.assertIn(required, expected)
         self.assertNotIn(self.extra, expected)
         self.assertNotIn("CloudKitCallbackAdmissionTestsExtra/testNeighbor", expected)
+        self.assertNotIn("ChangeRequestProcessorCancellationTestsExtra/testNeighbor", expected)
+        self.assertNotIn("SynchronizationProcessorStartupTestsExtra/testNeighbor", expected)
         self.assertFalse(pattern.search("OtherTests.CloudKitCallbackAdmissionTests/testNew"))
+        self.assertFalse(pattern.search("OtherTests.ChangeRequestProcessorCancellationTests/testNew"))
+        self.assertFalse(pattern.search("OtherTests.SynchronizationProcessorStartupTests/testNew"))
 
     def test_interleaving_preserves_per_method_terminal_order(self):
         import random

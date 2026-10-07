@@ -351,13 +351,31 @@ internal class ChangeRequestProcessor {
         changeRequests.append(request)
     }
 
+    private func activateNewRun() -> UUID {
+        activeRunID = UUID()
+        cancelSync = false
+        return activeRunID
+    }
+
     @discardableResult
     func beginRun() async -> UUID {
         reset()
         await waitForProcessingToStop()
-        activeRunID = UUID()
-        cancelSync = false
-        return activeRunID
+        return activateNewRun()
+    }
+
+    /// Starts a replacement run only while the caller's external authority
+    /// remains valid across the old-child join. A rejection after reset leaves
+    /// this processor stopped rather than reopening work for a retired owner.
+    @discardableResult
+    func beginRun(
+        validating validate: @BigSyncBackgroundActor @Sendable () throws -> Void
+    ) async throws -> UUID {
+        try validate()
+        reset()
+        await waitForProcessingToStop()
+        try validate()
+        return activateNewRun()
     }
 
     private func checkProcessingRun(_ runID: UUID) throws {
@@ -715,12 +733,18 @@ final class AccountScopeAuthorityFence: @unchecked Sendable {
         return try body()
     }
 
-    func poison(requiresGenerationRotation: Bool = true) {
+    @discardableResult
+    func poison(
+        requiresGenerationRotation: Bool = true,
+        ifInvalidationGenerationMatches expected: UInt64? = nil
+    ) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
+        if let expected, invalidationGeneration != expected { return false }
         invalidationGeneration += 1
         isPoisoned = true
         rotatesGeneration = rotatesGeneration || requiresGenerationRotation
-        lock.unlock()
+        return true
     }
 
     func clear() {
@@ -1906,15 +1930,12 @@ public class CloudKitSynchronizer: NSObject {
                         for: accountIdentifier
                     )
                 )
-                let runID = await changeRequestProcessor.beginRun()
-                // Joining the prior processor can suspend after account
-                // validation. Do not publish a run or activate an adapter for
-                // a cancelled, replaced, or newly invalidated startup owner.
-                try checkAccountValidationAttempt(
-                    attemptID,
-                    fenceGeneration: accountValidationFenceGeneration
-                )
-                synchronizationRunID = runID
+                let runID = try await changeRequestProcessor.beginRun {
+                    try checkAccountValidationAttempt(
+                        attemptID,
+                        fenceGeneration: accountValidationFenceGeneration
+                    )
+                }
                 let context = RunContext(
                     attemptID: attemptID,
                     runID: runID,
@@ -1925,8 +1946,27 @@ public class CloudKitSynchronizer: NSObject {
                     replicaBindingGenerationIdentifier:
                         replicaBindingGenerationIdentifier
                 )
-                activeRunContext = context
+                // Account-change notifications can poison authority from
+                // outside this actor. Publish the processor run and context
+                // under the same synchronous fence that protects writer commits.
+                let didPublishContext =
+                    accountScopeAuthorityFence.withAuthorizedInvalidationGeneration(
+                        accountValidationFenceGeneration
+                    ) {
+                        guard synchronizationAttemptID == attemptID,
+                              !Task.isCancelled else { return false }
+                        synchronizationRunID = runID
+                        activeRunContext = context
+                        return true
+                    } ?? false
+                guard didPublishContext else {
+                    changeRequestProcessor.reset()
+                    throw CancellationError()
+                }
                 for adapter in modelAdapters {
+                    // Cancellation or an actor-owned replacement after context
+                    // publication must still fail before adapter activation.
+                    try checkRunContext(context)
                     try await adapter.activateTransportNamespace(
                         containerIdentifier: containerIdentifier,
                         databaseScope: database.databaseScope
@@ -2076,6 +2116,47 @@ public class CloudKitSynchronizer: NSObject {
         cancelSynchronization(category: .attemptCancellation)
     }
 
+    /// Final settlement owns only its classified account revocation. Health
+    /// persistence and its notification must finish before entering this region.
+    internal func finishAccountStoppedSynchronization(
+        error: Error, attemptID: UUID, context: RunContext?,
+        authorityGeneration: UInt64,
+        category: CloudKitSyncHealthSnapshot.Category
+    ) {
+        guard synchronizationAttemptID == attemptID else { return }
+        // External poison wins even if it crossed the caller's last check.
+        guard !Task.isCancelled, !cancelSync,
+              accountScopeAuthorityFence.poison(
+                requiresGenerationRotation: false,
+                ifInvalidationGenerationMatches: authorityGeneration
+              ) else {
+            settleCancellationIfCurrentAttempt(attemptID)
+            return
+        }
+        // No suspension or application callout occurs between revocation and
+        // retirement. The drain captures its waiters before delivering handlers;
+        // a handler-admitted successor owns every subsequent state mutation.
+        // Rotate the existing attempt fence before clearing its context: an
+        // old callback must not regain prevalidation admission through nil.
+        synchronizationAttemptID = UUID()
+        cancelAttemptCallbacks(for: attemptID)
+        changeRequestProcessor.reset()
+        cancelledDueToUnauthentication = category == .notAuthenticated
+        accountValidationRequired = true
+        activeRunContext = nil
+        activeAccountValidationAuthority = nil
+        activeReceiptAuthorizationID = nil
+        reservedReceiptAuthorizationID = nil
+        syncing = false
+        synchronizationTask = nil
+        retrySleepUntil = nil
+        finishSynchronizationDrain(
+            with: .failure(error),
+            failureAttemptIdentifier: attemptID,
+            failureRunIdentifier: context?.runID
+        )
+    }
+
     private func cancelSynchronizationRequest(_ requestID: UUID) {
         guard let waiter = synchronizationWaiters.removeValue(forKey: requestID) else { return }
         let handler = synchronizationFailureHandlers.removeValue(forKey: requestID)
@@ -2108,14 +2189,21 @@ public class CloudKitSynchronizer: NSObject {
         guard synchronizationAttemptID == attemptID, !cancelSync else {
             throw CancellationError()
         }
+        // Before account validation there is deliberately no active RunContext:
+        // a poisoned fence is exactly why the attempt must validate/reconcile.
+        // Once a context has been published, synchronous account poison revokes
+        // every continuation immediately, before actor-isolated cancellation
+        // can rotate the attempt or set cancelSync.
+        if activeRunContext?.attemptID == attemptID,
+           accountScopeAuthorityFence.rejectsAuthority {
+            throw CancellationError()
+        }
     }
 
     internal func checkRunContext(_ context: RunContext) throws {
-        try Task.checkCancellation()
+        try checkSynchronizationAttempt(context.attemptID)
         guard activeRunContext == context,
-              synchronizationAttemptID == context.attemptID,
-              synchronizationRunID == context.runID,
-              !cancelSync else {
+              synchronizationRunID == context.runID else {
             throw CancellationError()
         }
         if let expectedBinding =
@@ -2127,6 +2215,13 @@ public class CloudKitSynchronizer: NSObject {
             binding.activeGenerationIdentifier == expectedBinding,
             binding.activeAccountScopeIdentifier
                 == context.accountScopeIdentifier else {
+                throw CancellationError()
+            }
+            // Loading the binding calls into the injected store. A valid
+            // buffered binding cannot revive ownership retired by that callout.
+            try checkSynchronizationAttempt(context.attemptID)
+            guard activeRunContext == context,
+                  synchronizationRunID == context.runID else {
                 throw CancellationError()
             }
         }

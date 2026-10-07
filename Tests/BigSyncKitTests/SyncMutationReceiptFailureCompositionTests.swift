@@ -235,6 +235,7 @@ final class SyncMutationReceiptFailureCompositionTests: XCTestCase {
             accountIdentifierProvider: { try await account.identity() }, accountStatusProvider: { .available },
             changeFeed: transport, subscriptionStore: transport, zoneStore: transport,
             recordStore: transport, backupDetectionBaseURL: directory, logger: Logger(label: "ReceiptFailureComposition"))
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = .init(attemptID: sync.synchronizationAttemptID,
             runID: sync.synchronizationRunID, accountIdentifier: "receipt-account",
             accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "receipt-account"))
@@ -473,6 +474,7 @@ extension SyncMutationReceiptFailureCompositionTests {
             changeFeed: transport, subscriptionStore: transport, zoneStore: zone,
             recordStore: transport, backupDetectionBaseURL: directory,
             logger: Logger(label: "CompletionDelivery"))
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = .init(attemptID: sync.synchronizationAttemptID,
             runID: sync.synchronizationRunID, accountIdentifier: "completion-account",
             accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "completion-account"))
@@ -681,6 +683,7 @@ extension SyncMutationReceiptFailureCompositionTests {
         // controlled adapter without claiming it implements Realm reset migration.
         sync._allowRecordZoneRebindingForTesting()
         sync.addModelAdapter(adapter)
+        sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         sync.activeRunContext = .init(attemptID: sync.synchronizationAttemptID,
             runID: sync.synchronizationRunID, accountIdentifier: "completion-account",
             accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "completion-account"))

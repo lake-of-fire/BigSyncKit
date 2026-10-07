@@ -26,6 +26,7 @@ extension SyncUndoCloseoutW1Tests {
     ) async throws {
         let runID = await synchronizer.changeRequestProcessor.beginRun()
         synchronizer.synchronizationRunID = runID
+        synchronizer.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
         synchronizer.activeRunContext = .init(
             attemptID: synchronizer.synchronizationAttemptID,
             runID: runID,
