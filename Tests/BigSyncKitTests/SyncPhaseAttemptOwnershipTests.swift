@@ -748,3 +748,139 @@ extension SyncPhaseAttemptOwnershipTests {
         }
     }
 }
+
+// Append to the existing file so these histories use its private, isolated
+// synchronizer/transport fixtures. No production hook or standalone source.
+extension SyncPhaseAttemptOwnershipTests {
+    @BigSyncBackgroundActor
+    private func requireNoCoalescedFailureRetry(
+        _ error: Error,
+        withoutRunContext: Bool = false,
+        failAdapterTokenReset: Bool = false,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        try await withFixture { sync, _, probe, transport in
+            sync.syncing = true
+            sync.synchronizationDrainIsActive = true
+            sync.synchronizationRequestedWhileRunning = true
+            let attempt = sync.synchronizationAttemptID
+            let delegate = SyncPhaseFailureDelegate()
+            sync.delegate = delegate
+            if withoutRunContext { sync.activeRunContext = nil }
+            if failAdapterTokenReset {
+                probe.onSave = {
+                    throw NSError(domain: "RejectedRecoveryTokenWrite", code: 1)
+                }
+            }
+
+            await sync.failSynchronization(error: error, for: attempt)
+
+            if failAdapterTokenReset {
+                XCTAssertEqual(probe.savedTokens.count, 1,
+                    "Must exercise the actual failing adapter reset", file: file, line: line)
+                if let savedToken = probe.savedTokens.first {
+                    XCTAssertNil(savedToken, file: file, line: line)
+                }
+            }
+            XCTAssertEqual(sync.synchronizationAttemptID, attempt,
+                "A coalesced wakeup cannot grant a fresh transport/recovery attempt",
+                file: file, line: line)
+            XCTAssertNil(sync.synchronizationTask, file: file, line: line)
+            XCTAssertFalse(sync.syncing, file: file, line: line)
+            XCTAssertFalse(sync.synchronizationDrainIsActive, file: file, line: line)
+            let delivered = try XCTUnwrap(delegate.captured, file: file, line: line)
+            XCTAssertEqual((delivered as NSError).domain, (error as NSError).domain,
+                file: file, line: line)
+            XCTAssertEqual((delivered as NSError).code, (error as NSError).code,
+                file: file, line: line)
+            // An original-source regression may have admitted a retry. Cancel
+            // it before this test first yields to the transport probe, rather
+            // than letting a failed assertion launch unrelated fixture work.
+            if sync.synchronizationAttemptID != attempt || sync.synchronizationTask != nil {
+                sync.cancelSynchronization()
+            }
+            let requests = await transport.databaseFetchCount
+            XCTAssertEqual(requests, 0, file: file, line: line)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testFailedTokenResetCannotRestartCoalescedLocalWork() async throws {
+        try await requireNoCoalescedFailureRetry(
+            CKError(.changeTokenExpired), failAdapterTokenReset: true
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testFailedCorruptCursorResetCannotRestartCoalescedLocalWork() async throws {
+        try await requireNoCoalescedFailureRetry(
+            CloudKitChangeFeedError.corruptCursor, failAdapterTokenReset: true
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingRecoveryContextCannotRestartCoalescedLocalWork() async throws {
+        for error: Error in [CKError(.changeTokenExpired), CloudKitChangeFeedError.corruptCursor] {
+            try await requireNoCoalescedFailureRetry(error, withoutRunContext: true)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalTransportFailuresCannotRestartCoalescedLocalWork() async throws {
+        for code: CKError.Code in [.unknownItem, .serverRecordChanged, .limitExceeded, .quotaExceeded] {
+            try await requireNoCoalescedFailureRetry(CKError(code))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testAuthenticationAndModelVersionFailuresCannotRestartCoalescedLocalWork() async throws {
+        for error: CloudKitSynchronizer.SyncError in [.notAuthenticated, .higherModelVersionFound] {
+            try await requireNoCoalescedFailureRetry(error)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMutationBudgetAndSemanticStopsCannotRestartCoalescedLocalWork() async throws {
+        let failures: [Error] = [
+            BigSyncHandledMutationRetryError.generationBudgetExceeded(.init(
+                recordID: .init(recordName: "pending"), generation: "g1"
+            )),
+            BigSyncHandledMutationRetryError.drainBudgetExceeded,
+            BigSyncSemanticUploadConflictError(recordNames: ["pending"]),
+        ]
+        for error in failures {
+            try await requireNoCoalescedFailureRetry(error)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testOrdinaryLocalFailureRetainsCoalescedFollowupAttempt() async throws {
+        try await withFixture { sync, _, _, _ in
+            sync.syncing = true
+            sync.synchronizationDrainIsActive = true
+            sync.synchronizationRequestedWhileRunning = true
+            let attempt = sync.synchronizationAttemptID
+            await sync.failSynchronization(error: SyncPhaseSwiftFailure.rejected, for: attempt)
+            XCTAssertNotEqual(sync.synchronizationAttemptID, attempt)
+            XCTAssertTrue(sync.syncing)
+            XCTAssertNotNil(sync.synchronizationTask)
+            // withFixture cancels and joins this newly admitted attempt.
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundBoundaryChangeRetainsCoalescedFollowupAttempt() async throws {
+        try await withFixture { sync, _, _, _ in
+            sync.syncing = true
+            sync.synchronizationDrainIsActive = true
+            sync.synchronizationRequestedWhileRunning = true
+            let attempt = sync.synchronizationAttemptID
+            await sync.failSynchronization(error: CloudKitSynchronizer.SyncError.inboundBoundaryChanged,
+                for: attempt)
+            XCTAssertNotEqual(sync.synchronizationAttemptID, attempt)
+            XCTAssertTrue(sync.syncing)
+            XCTAssertNotNil(sync.synchronizationTask)
+        }
+    }
+}
