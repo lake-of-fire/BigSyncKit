@@ -159,7 +159,10 @@ private actor ResponseAccountProbe {
     private(set) var callsAfterResult = 0
     let failsAfterResult: Bool
     let failureAfterResultCall: Int?
-    init(failsAfterResult: Bool, failureAfterResultCall: Int? = nil) {
+    let inspectionProbe: ResponseErrorInspectionProbe?
+    init(failsAfterResult: Bool, failureAfterResultCall: Int? = nil,
+         inspectionProbe: ResponseErrorInspectionProbe? = nil) {
+        self.inspectionProbe = inspectionProbe
         self.failsAfterResult = failsAfterResult
         self.failureAfterResultCall = failureAfterResultCall
     }
@@ -171,6 +174,7 @@ private actor ResponseAccountProbe {
                 throw NSError(domain: "ResponseAccountFailure", code: 41)
             }
         }
+        if received { inspectionProbe?.arm() }
         return "identity-account"
     }
 }
@@ -326,7 +330,8 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
                      cancelAfterConflictImport: Bool = false,
                      quarantineImportedRecords: Bool = false,
                      sizeLimit: ResponseSizeLimit? = nil,
-                     respectsPreparationLimit: Bool = false) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
+                     respectsPreparationLimit: Bool = false,
+                     inspectionProbe: ResponseErrorInspectionProbe? = nil) async throws -> (ResponseIdentityAdapter, ResponseIdentityTransport, ResponseAccountProbe, Error?) {
         let adapter = ResponseIdentityAdapter(route: route, siblingFailure: sibling != nil)
         adapter.acknowledgeFailure = acknowledgeFailure
         adapter.preparationAlteration = preparationAlteration
@@ -336,7 +341,8 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
         adapter.quarantineImportedRecords = quarantineImportedRecords
         adapter.respectsPreparationLimit = respectsPreparationLimit
         let account = ResponseAccountProbe(failsAfterResult: failsAccountAfterResult,
-                                           failureAfterResultCall: failAccountAfterResultCall)
+                                           failureAfterResultCall: failAccountAfterResultCall,
+                                           inspectionProbe: inspectionProbe)
         let transport = ResponseIdentityTransport(route: route, alteration: alteration, siblingError: sibling,
                                                    account: account, conflictRetryAfter: conflictRetryAfter,
                                                    repairUnderlyingError: repairUnderlyingError,
@@ -362,6 +368,7 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
                 attemptID: sync.synchronizationAttemptID) { result.calls += 1; result.error = $0 }
         }
         XCTAssertEqual(result.calls, 1)
+        inspectionProbe?.recordBatchSize(sync.batchSize)
         return (adapter, transport, account, result.error)
     }
     @BigSyncBackgroundActor
@@ -2253,5 +2260,187 @@ extension SyncMutationResponseIdentityTests {
         XCTAssertTrue(adapter.pending.isEmpty)
         let requests = await transport.mutationCount
         XCTAssertEqual(requests, 2)
+    }
+}
+
+// The error supplied by an API is a callback boundary, not inert metadata.
+// Keep the trigger outside its lock and arm it only at the intended phase.
+private final class ResponseErrorInspectionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    private var triggered = false
+    private var batchSize: Int?
+    var didTrigger: Bool { lock.withLock { triggered } }
+    var finalBatchSize: Int? { lock.withLock { batchSize } }
+    func arm() { lock.withLock { if !triggered { armed = true } } }
+    func recordBatchSize(_ value: Int) { lock.withLock { batchSize = value } }
+    func inspect() {
+        let cancel = lock.withLock {
+            guard armed, !triggered else { return false }
+            triggered = true
+            return true
+        }
+        if cancel { withUnsafeCurrentTask { $0?.cancel() } }
+    }
+}
+
+private final class ResponseCallbackError: NSError, @unchecked Sendable {
+    private let probe: ResponseErrorInspectionProbe
+    private let info: [String: Any]
+    init(probe: ResponseErrorInspectionProbe, cause: Error? = nil) {
+        self.probe = probe
+        info = cause.map { [NSUnderlyingErrorKey: $0] } ?? [:]
+        super.init(domain: "ControlledMetadataCallback", code: 1, userInfo: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("Test-only error is not archived") }
+    override var userInfo: [String: Any] {
+        probe.inspect()
+        return info
+    }
+}
+
+extension SyncMutationResponseIdentityTests {
+    @BigSyncBackgroundActor
+    private func requireInspectionCancellation(
+        _ route: ResponseRoute, duringAccountStop: Bool = false,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let probe = ResponseErrorInspectionProbe()
+        if duringAccountStop { probe.arm() }
+        let detail = ResponseCallbackError(probe: probe,
+            cause: duringAccountStop ? CKError(.notAuthenticated) : nil)
+        // A separate task isolates its intentional cancellation from XCTest.
+        let caller = Task { @BigSyncBackgroundActor in
+            try await run(route, .none, repairUnderlyingError: detail, inspectionProbe: probe)
+        }
+        let (adapter, transport, account, failure) = try await caller.value
+        XCTAssertTrue(probe.didTrigger, "The production metadata read must execute", file: file, line: line)
+        XCTAssertTrue(failure is CancellationError, file: file, line: line)
+        XCTAssertTrue(adapter.uploaded.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.deleted.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.imported.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.rebased.isEmpty, file: file, line: line)
+        XCTAssertEqual(adapter.requeueInvocations, 0, file: file, line: line)
+        XCTAssertEqual(adapter.pending, ["success", "target"], file: file, line: line)
+        let calls = await transport.mutationCount
+        let probes = await account.callsAfterResult
+        XCTAssertEqual(calls, 1, file: file, line: line)
+        XCTAssertEqual(probes, duringAccountStop ? 0 : 1, file: file, line: line)
+    }
+    @BigSyncBackgroundActor
+    func testUploadAccountStopInspectionCannotAcknowledgeAfterCancellation() async throws {
+        try await requireInspectionCancellation(.saveMissing, duringAccountStop: true)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionAccountStopInspectionCannotAcknowledgeAfterCancellation() async throws {
+        try await requireInspectionCancellation(.deleteMissing, duringAccountStop: true)
+    }
+    @BigSyncBackgroundActor
+    func testUploadConflictInspectionCannotStartReceiptOrRepairAfterCancellation() async throws {
+        try await requireInspectionCancellation(.saveConflict)
+    }
+    @BigSyncBackgroundActor
+    func testUploadMissInspectionCannotStartReceiptOrRepairAfterCancellation() async throws {
+        try await requireInspectionCancellation(.saveMissing)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionConflictInspectionCannotStartReceiptOrRepairAfterCancellation() async throws {
+        try await requireInspectionCancellation(.deleteConflict)
+    }
+    @BigSyncBackgroundActor
+    func testDeletionMissInspectionCannotStartReceiptOrRepairAfterCancellation() async throws {
+        try await requireInspectionCancellation(.deleteMissing)
+    }
+    @BigSyncBackgroundActor
+    private func requireSizeInspectionCancellation(
+        _ route: ResponseRoute, response: ResponseSizeLimit,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let probe = ResponseErrorInspectionProbe()
+        // Thrown operation errors enter the size classifier without the
+        // returned-result/account phase. Per-item errors arm after that phase.
+        if response == .thrown { probe.arm() }
+        let detail = ResponseCallbackError(probe: probe)
+        let caller = Task { @BigSyncBackgroundActor in
+            try await run(route, .none, repairUnderlyingError: detail,
+                          sizeLimit: response, inspectionProbe: probe)
+        }
+        let (adapter, transport, _, failure) = try await caller.value
+        XCTAssertTrue(probe.didTrigger, file: file, line: line)
+        XCTAssertTrue(failure is CancellationError, file: file, line: line)
+        XCTAssertEqual(probe.finalBatchSize, 200, "Cancelled inspection cannot resize live state", file: file, line: line)
+        XCTAssertEqual(adapter.preparationLimits, [200], file: file, line: line)
+        XCTAssertTrue(adapter.uploaded.isEmpty, file: file, line: line)
+        XCTAssertTrue(adapter.deleted.isEmpty, file: file, line: line)
+        let calls = await transport.mutationCount
+        XCTAssertEqual(calls, 1, file: file, line: line)
+    }
+    @BigSyncBackgroundActor
+    func testThrownUploadSizeInspectionCannotResizeCancelledAttempt() async throws {
+        try await requireSizeInspectionCancellation(.save, response: .thrown)
+    }
+    @BigSyncBackgroundActor
+    func testThrownDeletionSizeInspectionCannotResizeCancelledAttempt() async throws {
+        try await requireSizeInspectionCancellation(.deleteMissing, response: .thrown)
+    }
+    @BigSyncBackgroundActor
+    func testReturnedUploadSizeInspectionCannotResizeCancelledAttempt() async throws {
+        try await requireSizeInspectionCancellation(.save, response: .perItem)
+    }
+    @BigSyncBackgroundActor
+    func testReturnedDeletionSizeInspectionCannotResizeCancelledAttempt() async throws {
+        try await requireSizeInspectionCancellation(.deleteMissing, response: .perItem)
+    }
+    @BigSyncBackgroundActor
+    func testIncompleteResponseGraphDoesNotIssueAccountRevalidation() async throws {
+        var deep: NSError = CKError(.notAuthenticated) as NSError
+        for _ in 0..<40 { deep = NSError(domain: "OpaqueWrapper", code: 1,
+            userInfo: [NSUnderlyingErrorKey: deep]) }
+        for route: ResponseRoute in [.saveConflict, .saveMissing, .deleteConflict, .deleteMissing, .lookupMissing] {
+            let (_, transport, account, failure) = try await run(route, .none,
+                failsAccountAfterResult: true, repairUnderlyingError: deep)
+            let error = try XCTUnwrap(failure)
+            let constraints = CloudKitRetryConstraints(error)
+            XCTAssertFalse(constraints.isErrorGraphComplete)
+            XCTAssertFalse(constraints.codes.contains(.notAuthenticated), "Do not invent an unseen account stop")
+            XCTAssertNotEqual((error as NSError).domain, "ResponseAccountFailure")
+            let probes = await account.callsAfterResult
+            let calls = await transport.mutationCount
+            XCTAssertEqual(probes, 0)
+            XCTAssertEqual(calls, route.looksUp ? 0 : 1)
+        }
+    }
+    @BigSyncBackgroundActor
+    func testSuccessfulRequeueDoesNotResurfaceMissingErrorAtNextAccountFailure() async throws {
+        let (adapter, _, account, failure) = try await run(.saveMissing, .none,
+            failAccountAfterResultCall: 3)
+        let error = try XCTUnwrap(failure)
+        XCTAssertEqual((error as NSError).domain, "ResponseAccountFailure")
+        XCTAssertNil((error as NSError).userInfo[CKPartialErrorsByItemIDKey])
+        XCTAssertEqual(adapter.requeued.map(\.recordName), ["target"])
+        XCTAssertEqual(adapter.uploaded.map { $0.recordID.recordName }, ["success"])
+        let probes = await account.callsAfterResult
+        XCTAssertEqual(probes, 3)
+    }
+    @BigSyncBackgroundActor
+    func testSuccessfulRequeueKeepsUnstartedConflictButNotHandledMissingError() async throws {
+        let zone = CKRecordZone.ID(zoneName: "response-identity")
+        let other = CKRecord.ID(recordName: "other", zoneID: zone)
+        let conflict = CKError(.serverRecordChanged, userInfo: [
+            CKRecordChangedErrorServerRecordKey: CKRecord(recordType: "IdentityFixture", recordID: other)
+        ])
+        let (adapter, _, account, failure) = try await run(.saveMissing, .none,
+            sibling: conflict, failAccountAfterResultCall: 3)
+        let error = try XCTUnwrap(failure)
+        let items = try XCTUnwrap((error as? CKError)?.userInfo[CKPartialErrorsByItemIDKey]
+            as? [CKRecord.ID: NSError])
+        XCTAssertEqual(items[other]?.code, CKError.serverRecordChanged.rawValue)
+        XCTAssertNil(items[.init(recordName: "target", zoneID: zone)])
+        XCTAssertNil(items[.init(recordName: "success", zoneID: zone)])
+        XCTAssertEqual(adapter.requeued.map(\.recordName), ["target"])
+        XCTAssertTrue(adapter.imported.isEmpty)
+        XCTAssertEqual(((error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError)?.domain, "ResponseAccountFailure")
+        let probes = await account.callsAfterResult
+        XCTAssertEqual(probes, 3)
     }
 }

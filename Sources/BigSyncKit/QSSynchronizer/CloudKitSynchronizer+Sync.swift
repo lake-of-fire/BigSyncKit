@@ -674,7 +674,7 @@ extension CloudKitSynchronizer {
              is BigSyncHandledMutationRetryError, is BigSyncSemanticUploadConflictError:
             allowsLocalWorkTail = false
         default:
-            allowsLocalWorkTail = constraints.codes.isEmpty
+            allowsLocalWorkTail = constraints.isErrorGraphComplete && constraints.codes.isEmpty
                 && (error as? CloudKitChangeFeedError) != .corruptCursor
         }
 
@@ -812,6 +812,9 @@ extension CloudKitSynchronizer {
         }
 
         guard canContinue() else { return }
+        // Keep known recovery intent and retry floors, but never treat a
+        // bounded, incomplete error scan as permission for another attempt.
+        shouldRetry = shouldRetry && constraints.isErrorGraphComplete
         // Keep the drain owned through the health notification. Its observer
         // may cancel or replace this attempt, and must not coalesce a successor
         // into a drain that has already dropped its running state.
@@ -1175,8 +1178,13 @@ extension CloudKitSynchronizer {
     }
     
     func shouldRetryUpload(for error: NSError) -> Bool {
+        let attemptID = synchronizationAttemptID
         let constraints = CloudKitRetryConstraints(error)
-        guard !constraints.blocksAccountOperations,
+        let isZoneLoss = isZoneNotFoundOrDeletedError(error)
+        do { try checkSynchronizationAttempt(attemptID) }
+        catch { return false }
+        guard constraints.isErrorGraphComplete,
+              !constraints.blocksAccountOperations,
               !constraints.requestsTokenRecovery,
               !constraints.requiresDeferredRetry else { return false }
         if constraints.containsOnlySizeLimitFailures {
@@ -1184,7 +1192,7 @@ extension CloudKitSynchronizer {
             // limits are normally handled inside the bounded shrinking drain.
             return batchSize > 1 && uploadRetries < 5
         }
-        if isZoneNotFoundOrDeletedError(error) {
+        if isZoneLoss {
             return uploadRetries < 5
         }
         // Record conflict budgets belong to the mutation drain, not a fresh
@@ -1288,23 +1296,24 @@ extension CloudKitSynchronizer {
 
             serverChangeToken = token
             if activeSynchronizationMode == .sync {
-                if afterUpload,
-                   !modelAdapters.contains(where: { $0.hasChanges }) {
-                    // A successful upload is not terminal until one more
-                    // change-feed pass advances through the server's response.
-                    // When that pass leaves no durable adapter work, its
-                    // database cursor is the quiescent commit boundary.
-                    try persistDatabaseToken(token)
-                    await changesFinishedSynchronizing()
-                } else {
+                let shouldUpload = !afterUpload || modelAdapters.contains(where: { $0.hasChanges })
+                // The pending-state getter is a synchronous callback boundary.
+                try checkSynchronizationAttempt(attemptID)
+                if shouldUpload {
                     try await uploadChanges()
+                    return
                 }
             } else {
                 try await processFetchedChanges()
                 try await revalidateActiveRunContext(for: attemptID)
-                try persistDatabaseToken(token)
-                await changesFinishedSynchronizing()
             }
+            // Both terminal paths commit their cursor under the original
+            // owner. A persistence callback must not hand an old fetch to a
+            // terminal method that captures a newly installed attempt.
+            try checkSynchronizationAttempt(attemptID)
+            try persistDatabaseToken(token)
+            try checkSynchronizationAttempt(attemptID)
+            await changesFinishedSynchronizing()
         } catch {
             guard synchronizationAttemptID == attemptID else { return }
             await failSynchronization(error: error, for: attemptID)

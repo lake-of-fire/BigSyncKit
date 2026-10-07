@@ -28,6 +28,7 @@ private final class SyncPhaseProbe {
     var accountIdentifierCalls = 0
     var accountStatusCalls = 0
     var phaseFinished = false
+    var terminalBoundaryEntries = 0
     var importCount = 0
     var cleanupCount = 0
     var persistenceCount = 0
@@ -71,7 +72,8 @@ private final class SyncPhaseAdapter: NSObject, ModelAdapter, @unchecked Sendabl
     let probe: SyncPhaseProbe
     weak var modelAdapterDelegate: ModelAdapterDelegate?
     var mergePolicy: MergePolicy = .server
-    var hasChanges: Bool { false }
+    var pendingStateRead: (@Sendable () -> Bool)?
+    var hasChanges: Bool { pendingStateRead?() ?? false }
     init(zoneID: CKRecordZone.ID, probe: SyncPhaseProbe, priorities: [String] = []) {
         recordZoneID = zoneID
         self.probe = probe
@@ -121,12 +123,22 @@ private final class SyncPhaseAdapter: NSObject, ModelAdapter, @unchecked Sendabl
 
 private final class SyncPhaseStore: NSObject, KeyValueStore {
     private var values = [String: Any]()
+    var onDatabaseTokenWrite: (@Sendable () -> Void)?
+    private(set) var databaseTokenWrites = 0
     var persistedPropertyLists: [[String: Any]] {
         values.values.compactMap { $0 as? [String: Any] }
     }
     func object(forKey key: String) -> Any? { values[key] }
     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
-    func set(value: Any?, forKey key: String) { values[key] = value }
+    func set(value: Any?, forKey key: String) {
+        values[key] = value
+        if key.contains("QSDatabaseServerChangeTokenKey") {
+            databaseTokenWrites += 1
+            let callback = onDatabaseTokenWrite
+            onDatabaseTokenWrite = nil
+            callback?()
+        }
+    }
     func set(boolValue: Bool, forKey key: String) { values[key] = boolValue }
     func removeObject(forKey key: String) { values.removeValue(forKey: key) }
     func synchronize() -> Bool { true }
@@ -213,7 +225,7 @@ private final class SyncPhaseFailureDelegate: NSObject, CloudKitSynchronizerDele
 
 final class SyncPhaseAttemptOwnershipTests: XCTestCase {
     @BigSyncBackgroundActor
-    private func withFixture(priorities: [String] = [],
+    private func withFixture(priorities: [String] = [], store: SyncPhaseStore? = nil,
         _ body: @BigSyncBackgroundActor (CloudKitSynchronizer, SyncPhaseAdapter, SyncPhaseProbe, SyncPhaseTransport) async throws -> Void
     ) async throws {
         let probe = SyncPhaseProbe()
@@ -224,7 +236,7 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let sync = CloudKitSynchronizer(identifier: UUID().uuidString,
             containerIdentifier: "iCloud.test.phase-ownership", database: SyncPhaseDatabase(),
-            recordZoneID: zone, keyValueStore: SyncPhaseStore(),
+            recordZoneID: zone, keyValueStore: store ?? SyncPhaseStore(),
             accountIdentifierProvider: { await probe.accountIdentifier() }, accountStatusProvider: { await probe.accountStatus() },
             progressHandler: { probe.onProgress?($0) },
             changeFeed: transport, subscriptionStore: transport, zoneStore: transport,
@@ -1161,6 +1173,160 @@ extension SyncPhaseAttemptOwnershipTests {
             XCTAssertNotEqual(sync.synchronizationAttemptID, attempt)
             XCTAssertTrue(sync.syncing)
             XCTAssertNotNil(sync.synchronizationTask)
+        }
+    }
+}
+
+// Fetch-to-terminal and bounded-error follow-up. These use the existing
+// validated phase fixture; no production admission hook or Realm model is added.
+private final class SyncPhaseInspectionCancellationError: NSError, @unchecked Sendable {
+    init() { super.init(domain: CKErrorDomain, code: CKError.Code.zoneNotFound.rawValue, userInfo: nil) }
+    required init?(coder: NSCoder) { fatalError("Fixture is not archived") }
+    override var userInfo: [String: Any] {
+        withUnsafeCurrentTask { $0?.cancel() }
+        return [:]
+    }
+}
+
+extension SyncPhaseAttemptOwnershipTests {
+    private static func unexaminedPhaseError(_ cause: Error) -> NSError {
+        var error = cause as NSError
+        for _ in 0..<40 {
+            error = NSError(domain: "UnexaminedPhaseCause", code: 1,
+                userInfo: [NSUnderlyingErrorKey: error])
+        }
+        return error
+    }
+
+    @BigSyncBackgroundActor
+    private func exerciseFetchCursorBoundary(
+        downloadOnly: Bool = false, cancelFromPending: Bool? = nil,
+        cancelFromCursorWrite: Bool = false
+    ) async throws {
+        let store = SyncPhaseStore()
+        try await withFixture(store: store) { sync, adapter, probe, transport in
+            let writesBefore = store.databaseTokenWrites
+            sync.activeSynchronizationMode = downloadOnly ? .downloadOnly : .sync
+            if let cancelFromPending {
+                adapter.pendingStateRead = {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    return cancelFromPending
+                }
+            }
+            if cancelFromCursorWrite {
+                store.onDatabaseTokenWrite = { withUnsafeCurrentTask { $0?.cancel() } }
+            }
+            // Bound an original-source regression before it performs the
+            // unrelated full terminal publication protocol.
+            probe.onProgress = { event in
+                if event == "terminal-tail-start" {
+                    probe.terminalBoundaryEntries += 1
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+            }
+            let caller = Task { @BigSyncBackgroundActor in
+                await sync.fetchChanges(afterUpload: true)
+            }
+            await caller.value
+            adapter.pendingStateRead = nil
+            store.onDatabaseTokenWrite = nil
+            XCTAssertEqual(store.databaseTokenWrites - writesBefore, cancelFromPending == nil ? 1 : 0)
+            XCTAssertEqual(probe.terminalBoundaryEntries, cancelFromPending == nil && !cancelFromCursorWrite ? 1 : 0)
+            XCTAssertEqual(probe.uploadPreparationCount, 0)
+            XCTAssertEqual(probe.deletionPreparationCount, 0)
+            let mutations = await transport.recordMutationCount
+            XCTAssertEqual(mutations, 0)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPostUploadPendingFalseCancellationCannotCommitDatabaseCursor() async throws {
+        try await exerciseFetchCursorBoundary(cancelFromPending: false)
+    }
+    @BigSyncBackgroundActor
+    func testPostUploadPendingTrueCancellationCannotStartUploadPhase() async throws {
+        try await exerciseFetchCursorBoundary(cancelFromPending: true)
+    }
+    @BigSyncBackgroundActor
+    func testPostUploadCursorWriteCancellationCannotEnterTerminalPhase() async throws {
+        try await exerciseFetchCursorBoundary(cancelFromCursorWrite: true)
+    }
+    @BigSyncBackgroundActor
+    func testDownloadOnlyCursorWriteCancellationCannotEnterTerminalPhase() async throws {
+        try await exerciseFetchCursorBoundary(downloadOnly: true, cancelFromCursorWrite: true)
+    }
+    @BigSyncBackgroundActor
+    func testHealthyPostUploadCursorStillReachesTerminalBoundary() async throws {
+        try await exerciseFetchCursorBoundary()
+    }
+    @BigSyncBackgroundActor
+    func testHealthyDownloadOnlyCursorStillReachesTerminalBoundary() async throws {
+        try await exerciseFetchCursorBoundary(downloadOnly: true)
+    }
+    @BigSyncBackgroundActor
+    func testIncompleteZoneFailureCannotAuthorizeOuterUploadRetry() async throws {
+        try await withFixture { sync, _, _, _ in
+            for code: CKError.Code in [.zoneNotFound, .userDeletedZone] {
+                let error = CKError(code, userInfo: [
+                    NSUnderlyingErrorKey: Self.unexaminedPhaseError(CKError(.notAuthenticated))
+                ])
+                XCTAssertFalse(CloudKitRetryConstraints(error).isErrorGraphComplete)
+                XCTAssertFalse(sync.shouldRetryUpload(for: error as NSError))
+            }
+        }
+    }
+    @BigSyncBackgroundActor
+    func testCompleteZoneFailureRetainsExistingOuterUploadRetryBudget() async throws {
+        try await withFixture { sync, _, _, _ in
+            sync.uploadRetries = 4
+            XCTAssertTrue(sync.shouldRetryUpload(for: CKError(.zoneNotFound) as NSError))
+            sync.uploadRetries = 5
+            XCTAssertFalse(sync.shouldRetryUpload(for: CKError(.zoneNotFound) as NSError))
+        }
+    }
+    @BigSyncBackgroundActor
+    func testOuterRetryErrorInspectionCannotAuthorizeCancelledCaller() async throws {
+        try await withFixture { sync, _, _, _ in
+            let caller = Task { @BigSyncBackgroundActor in
+                sync.shouldRetryUpload(for: SyncPhaseInspectionCancellationError())
+            }
+            let permitted = await caller.value
+            XCTAssertFalse(permitted)
+        }
+    }
+    @BigSyncBackgroundActor
+    func testUnexaminedLocalErrorCannotRestartCoalescedSynchronization() async throws {
+        try await withFixture { sync, _, _, transport in
+            sync.synchronizationRequestedWhileRunning = true
+            let error = Self.unexaminedPhaseError(CKError(.notAuthenticated))
+            await sync.failSynchronization(error: error, for: sync.synchronizationAttemptID)
+            let unexpectedRetry = sync.synchronizationTask
+            unexpectedRetry?.cancel()
+            XCTAssertNil(unexpectedRetry)
+            XCTAssertFalse(sync.cancelledDueToUnauthentication, "Do not invent a hidden authentication stop")
+            await unexpectedRetry?.value
+            let calls = await transport.databaseFetchCount
+            XCTAssertEqual(calls, 0)
+        }
+    }
+    @BigSyncBackgroundActor
+    func testKnownRetryFloorDoesNotGrantRetryForIncompleteErrorGraph() async throws {
+        try await withFixture { sync, _, _, transport in
+            let delegate = SyncPhaseFailureDelegate()
+            sync.delegate = delegate
+            let error = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137,
+                NSUnderlyingErrorKey: Self.unexaminedPhaseError(CKError(.notAuthenticated))]) as NSError
+            await sync.failSynchronization(error: error, for: sync.synchronizationAttemptID)
+            let unexpectedRetry = sync.synchronizationTask
+            unexpectedRetry?.cancel()
+            XCTAssertNil(unexpectedRetry)
+            let delivered = try XCTUnwrap(delegate.captured)
+            XCTAssertTrue((delivered as NSError) === error)
+            XCTAssertEqual(CloudKitRetryConstraints(delivered).serverMinimum, 137)
+            XCTAssertFalse(sync.cancelledDueToUnauthentication)
+            await unexpectedRetry?.value
+            let calls = await transport.databaseFetchCount
+            XCTAssertEqual(calls, 0)
         }
     }
 }
