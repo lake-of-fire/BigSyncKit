@@ -5024,6 +5024,9 @@ public final class RealmSwiftAdapter:
                         forKey: group.key.relationshipName
                     )
                 }
+                // Realm KVO can synchronously reenter the adapter during
+                // assignment. Reject a retired owner before this write commits.
+                try validatePreparationOwner()
             }
 
 #if DEBUG
@@ -5050,6 +5053,8 @@ public final class RealmSwiftAdapter:
                 guard let relationships = currentRelationships(for: group, in: persistenceRealm)
                 else { return }
                 persistenceRealm.delete(relationships)
+                // Deletion emits synchronous invalidation KVO as well.
+                try validatePreparationOwner()
             }
             if case .stale = applicationOutcome {
                 logger.info(

@@ -7,15 +7,29 @@ import XCTest
 
 
 @objc(W1CanonicalIntegerIdentityFixture)
-private final class W1CanonicalIntegerIdentityFixture: Object {
+private final class W1CanonicalIntegerIdentityFixture: Object, ChangeMetadataRecordable,
+    BigSyncRecordContractProviding {
+    static let bigSyncRecordContract = BigSyncRecordContract(policy: .atomicRecord)
     override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted(primaryKey: true) var id = 0
+    @Persisted var text = ""
+    @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 1)
+    @Persisted var modifiedAt = Date(timeIntervalSinceReferenceDate: 10)
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
 }
 
 @objc(W1CanonicalObjectIdIdentityFixture)
-private final class W1CanonicalObjectIdIdentityFixture: Object {
+private final class W1CanonicalObjectIdIdentityFixture: Object, ChangeMetadataRecordable,
+    BigSyncRecordContractProviding {
+    static let bigSyncRecordContract = BigSyncRecordContract(policy: .atomicRecord)
     override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted(primaryKey: true) var id = ObjectId()
+    @Persisted var text = ""
+    @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 1)
+    @Persisted var modifiedAt = Date(timeIntervalSinceReferenceDate: 10)
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
 }
 
 @objc(W1OpaqueStringIdentityFixture)
@@ -60,6 +74,100 @@ extension SyncUndoCloseoutW1Tests {
             XCTAssertEqual(adapter.getObjectIdentifier(stringObjectId: identifier,
                 entityType: W1OpaqueStringIdentityFixture.className()) as? String, identifier)
         }
+    }
+
+    @BigSyncBackgroundActor
+    private func assertTypedAliasesRejectPublicSaveAndDeletion(
+        type: Object.Type, canonicalSuffix: String, aliases: [String]
+    ) async throws {
+        let nonce = UUID().uuidString
+        var target = Realm.Configuration(inMemoryIdentifier: "public-typed-alias-target-" + nonce,
+            objectTypes: [type, BigSyncPendingMutation.self])
+        BigSyncMutationPolicy.enableRecordRebasing(in: &target)
+        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [target],
+            mutationJournalIdentityProvider: { .init(installationIdentifier: "typed-alias",
+                replicaBindingGenerationIdentifier: "typed-alias-binding") })
+        var tracking = RealmSwiftAdapter.defaultPersistenceConfiguration()
+        tracking.inMemoryIdentifier = "public-typed-alias-tracking-" + nonce
+        let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
+            targetRealmConfigurations: [target], excludedClassNames: [],
+            recordZoneID: .init(zoneName: "public-typed-alias-" + nonce),
+            logger: Logger(label: "PublicTypedAliasTests"), startSetupTask: false)
+        realmFixtureOwner.own(adapter)
+        try await adapter.resetSyncCaches()
+        adapter.invalidateTokens()
+        try await adapter.activateReplicaBinding(accountScopeIdentifier: "typed-alias-account",
+            replicaBindingGenerationIdentifier: "typed-alias-binding")
+        try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.test.typed-alias",
+            databaseScope: .private)
+        let name = type.className() + "." + canonicalSuffix
+        let canonical = CKRecord(recordType: type.className(),
+            recordID: .init(recordName: name, zoneID: adapter.recordZoneID))
+        canonical["text"] = "accepted" as CKRecordValue
+        canonical["createdAt"] = Date(timeIntervalSinceReferenceDate: 1) as CKRecordValue
+        canonical["modifiedAt"] = Date(timeIntervalSinceReferenceDate: 10) as CKRecordValue
+        canonical["explicitlyModifiedAt"] = Date(timeIntervalSinceReferenceDate: 10) as CKRecordValue
+        canonical["isDeleted"] = false as CKRecordValue
+        _ = try await deliver([canonical], to: adapter)
+        let realm = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        let object = try XCTUnwrap(realm.objects(type).first)
+        try realm.write {
+            object.setValue("pending", forKey: "text")
+            (object as! ChangeMetadataRecordable).refreshChangeMetadata(explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 30))
+        }
+        _ = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: type.className())
+        let generation = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation)
+        let base = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name))
+        let revision = base.revision, fields = base.fieldDigests
+        let candidate = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity)
+        for suffix in aliases {
+            let aliasName = type.className() + "." + suffix
+            let alias = CKRecord(recordType: type.className(),
+                recordID: .init(recordName: aliasName, zoneID: adapter.recordZoneID))
+            for key in canonical.allKeys() { alias[key] = canonical[key] }
+            alias["text"] = "alias overwrite" as CKRecordValue
+            alias["modifiedAt"] = Date(timeIntervalSinceReferenceDate: 40) as CKRecordValue
+            alias["explicitlyModifiedAt"] = Date(timeIntervalSinceReferenceDate: 40) as CKRecordValue
+            for deleting in [false, true] {
+                do {
+                    if deleting { _ = try await adapter.deleteRecords(with: [alias.recordID]) }
+                    else { _ = try await adapter.saveChanges(in: [alias], forceSave: false) }
+                    XCTFail("Public alias operation must reject \(aliasName)")
+                } catch let error as RealmSwiftAdapterError {
+                    guard case .malformedRecordIdentifier(let rejected, let entityType) = error else {
+                        return XCTFail("Unexpected error: \(error)")
+                    }
+                    XCTAssertEqual(rejected, aliasName)
+                    XCTAssertEqual(entityType, type.className())
+                }
+                realm.refresh()
+                XCTAssertEqual(object["text"] as? String, "pending")
+                XCTAssertEqual(object["isDeleted"] as? Bool, false)
+                XCTAssertEqual(realm.objects(type).count, 1)
+                XCTAssertEqual(base.revision, revision)
+                XCTAssertEqual(base.fieldDigests, fields)
+                XCTAssertEqual(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity, candidate)
+                XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+                XCTAssertNil(adapter.realmProvider?.persistenceRealm?.object(ofType: SyncedEntity.self, forPrimaryKey: aliasName))
+            }
+        }
+        // The writer spelling still reaches the normal pending-record path.
+        _ = try await deliver([canonical], to: adapter)
+        XCTAssertEqual(object["text"] as? String, "pending")
+        XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testIntegerAliasesRejectPublicSaveAndDeletionWithPendingCanonicalRecord() async throws {
+        try await assertTypedAliasesRejectPublicSaveAndDeletion(type: W1CanonicalIntegerIdentityFixture.self,
+            canonicalSuffix: "1", aliases: ["+1", "01"])
+    }
+
+    @BigSyncBackgroundActor
+    func testObjectIdAliasRejectsPublicSaveAndDeletionWithPendingCanonicalRecord() async throws {
+        try await assertTypedAliasesRejectPublicSaveAndDeletion(type: W1CanonicalObjectIdIdentityFixture.self,
+            canonicalSuffix: "abcdef1234567890abcdef12", aliases: ["ABCDEF1234567890ABCDEF12"])
     }
 
     @BigSyncBackgroundActor
@@ -172,6 +280,94 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, generation)
         XCTAssertTrue(base.isComparisonInvalidated)
     }
+    @BigSyncBackgroundActor
+    func testPendingUUIDMapReplayAndAbsentDefaultsThroughPublicAdapter() async throws {
+        let (adapter, realm) = try await fixture()
+        let first = UUID(uuidString: "ABCDEF00-0000-0000-0000-000000000001")!
+        let second = UUID(uuidString: "ABCDEF00-0000-0000-0000-000000000002")!
+        func map(_ entries: [String: String]) throws -> CKRecordValue {
+            try PropertyListSerialization.data(fromPropertyList: entries,
+                format: .binary, options: 0) as CKRecordValue
+        }
+        let accepted = note(adapter)
+        accepted["uuidMap"] = try map(["first": first.uuidString])
+        _ = try await deliver([accepted], to: adapter)
+        let object = try XCTUnwrap(realm.object(ofType: W1ContractNote.self, forPrimaryKey: noteID))
+        let name = accepted.recordID.recordName
+        _ = try await edit(object, text: "pending text", time: 30,
+            realm: realm, adapter: adapter)
+        _ = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        let incoming = note(adapter, time: 20)
+        incoming["uuidMap"] = try map(["first": first.uuidString.lowercased(), "second": second.uuidString])
+        incoming["map"] = try PropertyListSerialization.data(fromPropertyList: ["remote": 4],
+            format: .binary, options: 0) as CKRecordValue
+        incoming["number"] = nil
+        incoming["flag"] = nil
+        _ = try await deliver([incoming], to: adapter)
+        XCTAssertEqual(object.text, "pending text")
+        XCTAssertEqual(object.uuidMap["first"], first)
+        XCTAssertEqual(object.uuidMap["second"], second)
+        XCTAssertEqual(object.map["remote"], 4)
+        XCTAssertEqual(object.number, 0)
+        XCTAssertFalse(object.flag)
+        let base = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name))
+        let revision = base.revision, fields = base.fieldDigests
+        let pending = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+        // Import may forward a new generation when the merged payload changes.
+        // Replay must preserve that exact durable generation, not recreate it.
+        let mergedGeneration = pending.generation
+        XCTAssertFalse(mergedGeneration.isEmpty)
+        _ = try await deliver([incoming], to: adapter)
+        XCTAssertEqual(base.revision, revision)
+        XCTAssertEqual(pending.generation, mergedGeneration)
+        let explicit = note(adapter, time: 20)
+        explicit["number"] = 0 as CKRecordValue
+        explicit["flag"] = false as CKRecordValue
+        explicit["uuidMap"] = try map(["second": second.uuidString.lowercased(), "first": first.uuidString])
+        explicit["map"] = incoming["map"]
+        _ = try await deliver([explicit], to: adapter)
+        XCTAssertEqual(base.revision, revision)
+        XCTAssertEqual(base.fieldDigests, fields)
+        XCTAssertEqual(pending.generation, mergedGeneration)
+        let malformed = note(adapter, time: 40)
+        malformed["uuidMap"] = try map(["first": "not-a-uuid"])
+        do {
+            _ = try await deliver([malformed], to: adapter)
+            XCTFail("Malformed UUID map must abort public import")
+        } catch {
+            XCTAssertTrue(error is RealmSwiftRemoteRecordDecodingError, "Unexpected error: \(error)")
+        }
+        XCTAssertEqual(object.text, "pending text")
+        XCTAssertEqual(object.uuidMap["first"], first)
+        XCTAssertEqual(object.uuidMap["second"], second)
+        XCTAssertEqual(base.revision, revision)
+        XCTAssertEqual(pending.generation, mergedGeneration)
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        XCTAssertEqual(prepared.count, 1)
+        XCTAssertEqual(prepared.first?.record["text"] as? String, "pending text")
+        try await adapter.didUpload(savedRecords: prepared.map(\.record), matchingPreparedUploads: prepared)
+        try await quiet(adapter, realm: realm)
+        let audit = try await adapter.auditSynchronizationState(serverRecords: prepared.map(\.record))
+        XCTAssertTrue(audit.isClean, audit.issues.joined(separator: ","))
+
+        // Absence and an explicitly empty map are the same cleared server field.
+        let absent = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(try XCTUnwrap(prepared.first?.record)))
+        absent["uuidMap"] = nil
+        absent["map"] = nil
+        _ = try await deliver([absent], to: adapter)
+        XCTAssertEqual(object.uuidMap.count, 0)
+        XCTAssertEqual(object.map.count, 0)
+        let clearedRevision = base.revision
+        absent["uuidMap"] = try map([:])
+        absent["map"] = try PropertyListSerialization.data(fromPropertyList: [String: Int](),
+            format: .binary, options: 0) as CKRecordValue
+        _ = try await deliver([absent], to: adapter)
+        XCTAssertEqual(base.revision, clearedRevision)
+        try await quiet(adapter, realm: realm)
+        let clearedAudit = try await adapter.auditSynchronizationState(serverRecords: [absent])
+        XCTAssertTrue(clearedAudit.isClean, clearedAudit.issues.joined(separator: ","))
+    }
+
     @BigSyncBackgroundActor
     func testOmissionsClearCollectionsButPreserveIndependentPendingTextAcrossRestart() async throws {
         let (adapter, realm) = try await fixture()

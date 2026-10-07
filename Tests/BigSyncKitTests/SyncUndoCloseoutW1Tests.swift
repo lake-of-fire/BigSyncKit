@@ -24,6 +24,7 @@ final class W1ContractNote: Object, ChangeMetadataRecordable,
     @Persisted var list: List<Int>
     @Persisted var members: MutableSet<String>
     @Persisted var map: Map<String, Int>
+    @Persisted var uuidMap: Map<String, UUID>
     @Persisted var createdAt = Date()
     @Persisted var modifiedAt = Date()
     @Persisted var explicitlyModifiedAt: Date?
