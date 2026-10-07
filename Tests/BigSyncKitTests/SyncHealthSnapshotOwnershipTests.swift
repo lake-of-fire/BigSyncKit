@@ -469,22 +469,22 @@ final class SyncHealthSnapshotOwnershipTests: XCTestCase, @unchecked Sendable {
     }
 
     @BigSyncBackgroundActor
-    func testBoundContextRejectsPoisonDuringBindingLoad() throws {
+    func testBoundContextRejectsPoisonDuringBindingLoad() async throws {
         try retiredBindingRead(.poison)
     }
 
     @BigSyncBackgroundActor
-    func testBoundContextRejectsRunSupersessionDuringBindingLoad() throws {
+    func testBoundContextRejectsRunSupersessionDuringBindingLoad() async throws {
         try retiredBindingRead(.run)
     }
 
     @BigSyncBackgroundActor
-    func testBoundContextRejectsAttemptSupersessionDuringBindingLoad() throws {
+    func testBoundContextRejectsAttemptSupersessionDuringBindingLoad() async throws {
         try retiredBindingRead(.attempt)
     }
 
     @BigSyncBackgroundActor
-    func testBoundContextRejectsAccountReplacementDuringBindingLoad() throws {
+    func testBoundContextRejectsAccountReplacementDuringBindingLoad() async throws {
         try retiredBindingRead(.account)
     }
 

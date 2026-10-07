@@ -809,7 +809,8 @@ extension SyncPhaseAttemptOwnershipTests {
                 case .failure(let error):
                     if interruption == .none
                         || (interruption == .callerCancellation && index == 1) {
-                        XCTAssertTrue((error as NSError) === original)
+                        XCTAssertTrue((error as NSError) === original,
+                            "Waiter error type=\(String(reflecting: type(of: error))) actual=\(error as NSError) original=\(original) equal=\((error as NSError).isEqual(original))")
                     } else {
                         XCTAssertTrue(error is CancellationError)
                     }
