@@ -147,11 +147,14 @@ private func inspectCloudKitErrors(
     return (errors, isComplete)
 }
 
-/// Use one interpretation of Foundation's singular and aggregate causes in both
-/// graph walks. Read userInfo once, preserving custom NSError subclasses and
-/// retaining every cause independently of the wrapper's error domain.
+/// Read each wrapper through its supplied userInfo, including subclass overrides.
 private func cloudKitUnderlyingErrors(in error: NSError) -> [Error] {
-    let info = error.userInfo
+    cloudKitUnderlyingErrors(in: error.userInfo)
+}
+
+/// Shared Foundation cause edges for retry and zone-loss classification.
+/// Callers may retain one metadata snapshot for both item and underlying causes.
+func cloudKitUnderlyingErrors(in info: [String: Any]) -> [Error] {
     var errors = [Error]()
     if let underlying = info[NSUnderlyingErrorKey] as? Error {
         errors.append(underlying)
