@@ -120,7 +120,9 @@ enum CloudKitLossClassifier {
                 classifyCode(item.error.code, userInfo: info, zoneID: item.zone,
                              into: &classification)
                 if item.error.code == CKError.partialFailure.rawValue {
-                    for (key, nested) in partialErrors(in: info) {
+                    let partial = cloudKitPartialErrors(in: info)
+                    if !partial.isComplete { classification.markIncomplete() }
+                    for (key, nested) in partial.entries {
                         var zone = item.zone
                         let identity = (key as? AnyHashable)?.base ?? key
                         if let recordID = identity as? CKRecord.ID {
@@ -135,7 +137,9 @@ enum CloudKitLossClassifier {
             }
             // Underlying causes are not limited to CloudKit-domain wrappers,
             // and partial-item errors do not replace a wrapper's other causes.
-            for nested in cloudKitUnderlyingErrors(in: info) {
+            let underlying = cloudKitUnderlyingErrors(in: info)
+            if !underlying.isComplete { classification.markIncomplete() }
+            for nested in underlying.errors {
                 queue.append((nested as NSError, item.zone, item.depth + 1))
             }
         }
@@ -188,16 +192,6 @@ enum CloudKitLossClassifier {
             classification.transientCodes.insert(code)
         default:
             break
-        }
-    }
-
-    private static func partialErrors(in userInfo: [String: Any]) -> [(Any, Error)] {
-        guard let dictionary = userInfo[CKPartialErrorsByItemIDKey] as? NSDictionary else {
-            return []
-        }
-        return dictionary.compactMap { key, value in
-            guard let nestedError = value as? Error else { return nil }
-            return (key, nestedError)
         }
     }
 

@@ -341,3 +341,99 @@ final class CloudKitLossClassifierGraphTests: XCTestCase {
         XCTAssertTrue(result.affectedRecordIDs.isEmpty)
     }
 }
+
+
+// These cases exercise supplied runtime containers, including malformed values.
+// They make no assertion about native CloudKit responses or Realm durability.
+extension CloudKitLossClassifierGraphTests {
+    private func malformedGraph(partial: Bool, observed: CKError.Code,
+                                valid: NSError, reset: Bool = false) -> NSError {
+        let info: [String: Any] = partial
+            ? [CKPartialErrorsByItemIDKey: ["valid": valid, "bad": "malformed"] as [String: Any]]
+            : [NSMultipleUnderlyingErrorsKey: [valid, "malformed"] as [Any]]
+        var observationInfo = info
+        if reset { observationInfo[CKErrorUserDidResetEncryptedDataKey] = true }
+        return loss(observed, info: observationInfo)
+    }
+
+    private func assertMalformed(partial: Bool, code: CKError.Code,
+                                 file: StaticString = #filePath, line: UInt = #line) {
+        let child = loss(code, info: code == .requestRateLimited ? [CKErrorRetryAfterKey: 137] : [:])
+        let error = malformedGraph(partial: partial,
+            observed: partial ? .partialFailure : .zoneNotFound, valid: child)
+        let result = classify(error, zone: zoneA)
+        let constraints = CloudKitRetryConstraints(error)
+        XCTAssertFalse(result.isErrorGraphComplete, file: file, line: line)
+        XCTAssertFalse(constraints.isErrorGraphComplete, file: file, line: line)
+        XCTAssertTrue(constraints.codes.contains(code), file: file, line: line)
+        XCTAssertFalse(constraints.containsOnlySizeLimitFailures, file: file, line: line)
+        if code == .userDeletedZone {
+            XCTAssertEqual(result.zoneDispositions[zoneA], .terminal(.deleted), file: file, line: line)
+        } else {
+            XCTAssertNil(result.zoneDispositions[zoneA], file: file, line: line)
+        }
+        if code == .notAuthenticated || code == .accountTemporarilyUnavailable {
+            XCTAssertTrue(constraints.blocksAccountOperations, file: file, line: line)
+            XCTAssertTrue(result.accountCodes.contains(code), file: file, line: line)
+        }
+        if code == .requestRateLimited {
+            XCTAssertEqual(constraints.serverMinimum, 137, file: file, line: line)
+            XCTAssertTrue(constraints.requiresDeferredRetry, file: file, line: line)
+        }
+    }
+
+    func testMalformedAggregateRetainsTerminalSibling() { assertMalformed(partial: false, code: .userDeletedZone) }
+    func testMalformedAggregateRetainsAuthenticationStop() { assertMalformed(partial: false, code: .notAuthenticated) }
+    func testMalformedAggregateRetainsTemporaryAccountStop() { assertMalformed(partial: false, code: .accountTemporarilyUnavailable) }
+    func testMalformedAggregateRetainsDeadline() { assertMalformed(partial: false, code: .requestRateLimited) }
+    func testMalformedPartialRetainsTerminalSibling() { assertMalformed(partial: true, code: .userDeletedZone) }
+    func testMalformedPartialRetainsAuthenticationStop() { assertMalformed(partial: true, code: .notAuthenticated) }
+    func testMalformedPartialRetainsTemporaryAccountStop() { assertMalformed(partial: true, code: .accountTemporarilyUnavailable) }
+    func testMalformedPartialRetainsDeadline() { assertMalformed(partial: true, code: .requestRateLimited) }
+
+    func testMalformedAggregateRevokesEncryptedResetPermission() {
+        let error = malformedGraph(partial: false, observed: .zoneNotFound,
+            valid: loss(.changeTokenExpired), reset: true)
+        XCTAssertNil(classify(error, zone: zoneA).zoneDispositions[zoneA])
+        XCTAssertTrue(CloudKitRetryConstraints(error).requestsTokenRecovery)
+        XCTAssertFalse(CloudKitRetryConstraints(error).isErrorGraphComplete)
+    }
+
+    func testMalformedPartialRevokesScopedResetPermission() {
+        let reset = loss(.zoneNotFound, info: [CKErrorUserDidResetEncryptedDataKey: true])
+        let error = loss(.partialFailure, info: [CKPartialErrorsByItemIDKey:
+            [AnyHashable(zoneA): reset, AnyHashable(zoneB): "bad"] as [AnyHashable: Any]])
+        XCTAssertNil(classify(error).zoneDispositions[zoneA])
+        XCTAssertFalse(classify(error).isErrorGraphComplete)
+    }
+
+    func testMalformedSingleUnderlyingPreventsSizeOnlyRetry() {
+        let error = loss(.limitExceeded, info: [NSUnderlyingErrorKey: "bad"])
+        XCTAssertFalse(CloudKitRetryConstraints(error).isErrorGraphComplete)
+        XCTAssertFalse(CloudKitRetryConstraints(error).containsOnlySizeLimitFailures)
+    }
+    func testMalformedAggregatePreventsSizeOnlyRetry() {
+        let error = malformedGraph(partial: false, observed: .limitExceeded, valid: loss(.limitExceeded))
+        XCTAssertFalse(CloudKitRetryConstraints(error).containsOnlySizeLimitFailures)
+    }
+    func testMalformedPartialPreventsSizeOnlyRetry() {
+        let error = malformedGraph(partial: true, observed: .partialFailure, valid: loss(.limitExceeded))
+        XCTAssertFalse(CloudKitRetryConstraints(error).containsOnlySizeLimitFailures)
+    }
+    func testWrongCauseContainerTypesAreIncomplete() {
+        for info: [String: Any] in [
+            [NSMultipleUnderlyingErrorsKey: "bad"], [NSUnderlyingErrorKey: 1],
+            [CKPartialErrorsByItemIDKey: "bad"], [:]
+        ] {
+            let error = loss(.partialFailure, info: info)
+            XCTAssertFalse(classify(error, zone: zoneA).isErrorGraphComplete)
+            XCTAssertFalse(CloudKitRetryConstraints(error).isErrorGraphComplete)
+        }
+    }
+    func testMalformedKnowledgeCannotBeReauthorizedByMerge() {
+        var result = classify(loss(.zoneNotFound, info: [NSUnderlyingErrorKey: "bad"]), zone: zoneA)
+        result.merge(classify(loss(.zoneNotFound), zone: zoneA))
+        XCTAssertNil(result.zoneDispositions[zoneA])
+        XCTAssertFalse(result.isErrorGraphComplete)
+    }
+}

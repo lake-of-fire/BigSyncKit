@@ -33,7 +33,7 @@ struct CloudKitRetryConstraints {
         serverMinimum = errors.compactMap {
             ($0.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
         }.filter { $0.isFinite && $0 >= 0 }.max()
-        containsOnlySizeLimitFailures = codes.contains(.limitExceeded)
+        containsOnlySizeLimitFailures = isErrorGraphComplete && codes.contains(.limitExceeded)
             && Self.isSizeLimitFailureTree(error)
     }
 
@@ -69,17 +69,23 @@ struct CloudKitRetryConstraints {
             // Foundation combines NSUnderlyingErrorKey and
             // NSMultipleUnderlyingErrorsKey. A size-only proof must not
             // discard a local failure or constraint carried by either form.
-            var children = cloudKitUnderlyingErrors(in: error)
+            let info = error.userInfo
+            let underlying = cloudKitUnderlyingErrors(in: info)
+            guard underlying.isComplete else {
+                memo[id] = (error, .complete(height: nil))
+                return nil
+            }
+            var children = underlying.errors
             switch cloudError.code {
             case .limitExceeded, .batchRequestFailed:
                 break
             case .partialFailure:
-                guard let partial = error.userInfo[CKPartialErrorsByItemIDKey]
-                    as? [AnyHashable: Error], !partial.isEmpty else {
+                let partial = cloudKitPartialErrors(in: info)
+                guard partial.isComplete, !partial.entries.isEmpty else {
                     memo[id] = (error, .complete(height: nil))
                     return nil
                 }
-                children.append(contentsOf: partial.values)
+                children.append(contentsOf: partial.entries.map { $0.error })
             default:
                 memo[id] = (error, .complete(height: nil))
                 return nil
@@ -128,39 +134,60 @@ private func inspectCloudKitErrors(
             continue
         }
         visited[id] = item.error
+        let info = item.error.userInfo
         if let cloudError = item.error as? CKError {
             errors.append(cloudError)
-            if cloudError.code == .partialFailure,
-               let children = item.error.userInfo[CKPartialErrorsByItemIDKey]
-                as? [AnyHashable: Error] {
-                for child in children.values {
-                    queue.append((child as NSError, item.depth + 1))
+            if cloudError.code == .partialFailure {
+                let partial = cloudKitPartialErrors(in: info)
+                isComplete = isComplete && partial.isComplete
+                for child in partial.entries {
+                    queue.append((child.error as NSError, item.depth + 1))
                 }
             }
         }
         // Match the same Foundation edge set used by size-only validation.
         // Existing identity/depth guards also bound aggregate cycles and DAGs.
-        for underlying in cloudKitUnderlyingErrors(in: item.error) {
+        let underlyingCauses = cloudKitUnderlyingErrors(in: info)
+        isComplete = isComplete && underlyingCauses.isComplete
+        for underlying in underlyingCauses.errors {
             queue.append((underlying as NSError, item.depth + 1))
         }
     }
     return (errors, isComplete)
 }
 
-/// Read each wrapper through its supplied userInfo, including subclass overrides.
-private func cloudKitUnderlyingErrors(in error: NSError) -> [Error] {
-    cloudKitUnderlyingErrors(in: error.userInfo)
+/// Read containers entry by entry: a malformed sibling must not erase a known
+/// stop/deadline, and valid children do not prove the unseen evidence safe.
+func cloudKitUnderlyingErrors(in info: [String: Any])
+    -> (errors: [Error], isComplete: Bool) {
+    var errors = [Error]()
+    var isComplete = true
+    if let value = info[NSUnderlyingErrorKey] {
+        if let error = value as? Error { errors.append(error) }
+        else { isComplete = false }
+    }
+    if let value = info[NSMultipleUnderlyingErrorsKey] {
+        if let values = value as? [Any] {
+            for value in values {
+                if let error = value as? Error { errors.append(error) }
+                else { isComplete = false }
+            }
+        } else { isComplete = false }
+    }
+    return (errors, isComplete)
 }
 
-/// Shared Foundation cause edges for retry and zone-loss classification.
-/// Callers may retain one metadata snapshot for both item and underlying causes.
-func cloudKitUnderlyingErrors(in info: [String: Any]) -> [Error] {
-    var errors = [Error]()
-    if let underlying = info[NSUnderlyingErrorKey] as? Error {
-        errors.append(underlying)
+/// Keep item scope alongside each valid cause. A malformed dictionary or value
+/// is incomplete knowledge, not an empty authoritative set of failures.
+func cloudKitPartialErrors(in info: [String: Any])
+    -> (entries: [(key: Any, error: Error)], isComplete: Bool) {
+    guard let dictionary = info[CKPartialErrorsByItemIDKey] as? NSDictionary,
+          dictionary.count > 0 else { return ([], false) }
+    var entries = [(key: Any, error: Error)]()
+    var isComplete = true
+    for (key, value) in dictionary {
+        if let error = value as? Error { entries.append((key, error)) }
+        else { isComplete = false }
     }
-    if let multiple = info[NSMultipleUnderlyingErrorsKey] as? [Error] {
-        errors.append(contentsOf: multiple)
-    }
-    return errors
+    return (entries, isComplete)
 }

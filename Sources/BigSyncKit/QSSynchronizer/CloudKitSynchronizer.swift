@@ -196,22 +196,51 @@ internal enum ChangeFeedMigrationPersistenceError: Error, Equatable {
 /// A production migration must never recreate a zone that CloudKit reports as
 /// deleted, purged, or reset.  The target Realm and durable journal remain
 /// intact so a future, explicitly supported recovery can classify the state.
-public enum ChangeFeedMigrationError: LocalizedError {
+public enum ChangeFeedMigrationError: LocalizedError, CustomNSError {
     case establishedZoneUnavailable(
         CKRecordZone.ID,
         CloudKitZoneDeletionKind
     )
 
+    /// The lifecycle outcome retains the failed operation's independent
+    /// constraints. Database-history deletions have no operation error.
+    case constrainedZoneUnavailable(CKRecordZone.ID, CloudKitZoneDeletionKind, Error)
+
+    public static var errorDomain: String { "BigSyncKit.ChangeFeedMigrationError" }
+    public var errorCode: Int { 1 }
+    public var errorUserInfo: [String: Any] {
+        var info: [String: Any] = [NSLocalizedDescriptionKey: errorDescription ?? "Zone unavailable"]
+        if case .constrainedZoneUnavailable(_, _, let cause) = self {
+            info[NSUnderlyingErrorKey] = cause
+        }
+        return info
+    }
+
+    internal func preservingOperationError(_ cause: Error) -> ChangeFeedMigrationError {
+        let constraints = CloudKitRetryConstraints(cause)
+        guard !constraints.isErrorGraphComplete || constraints.blocksAccountOperations
+                || constraints.requiresDeferredRetry || constraints.requestsTokenRecovery
+        else { return self }
+        switch self {
+        case .establishedZoneUnavailable(let zone, let kind):
+            return .constrainedZoneUnavailable(zone, kind, cause)
+        case .constrainedZoneUnavailable:
+            return self
+        }
+    }
+
     public var deletionKind: CloudKitZoneDeletionKind {
         switch self {
-        case .establishedZoneUnavailable(_, let kind):
+        case .establishedZoneUnavailable(_, let kind),
+             .constrainedZoneUnavailable(_, let kind, _):
             return kind
         }
     }
 
     public var errorDescription: String? {
         switch self {
-        case .establishedZoneUnavailable(let zoneID, let kind):
+        case .establishedZoneUnavailable(let zoneID, let kind),
+             .constrainedZoneUnavailable(let zoneID, let kind, _):
             return "The established CloudKit zone \(zoneID.zoneName) is unavailable (\(kind.rawValue)); local data was preserved and upload is blocked"
         }
     }
@@ -2396,7 +2425,7 @@ public class CloudKitSynchronizer: NSObject {
     /// callback API fails to invoke its completion handler.
     internal func awaitAttemptCallback(
         for attemptID: UUID,
-        _ start: (@escaping @Sendable (Result<Void, Error>) -> Void) -> Void
+        _ start: (@escaping @Sendable (Result<Void, Error>) -> Void) -> Task<Void, Never>
     ) async throws {
         try checkSynchronizationAttempt(attemptID)
         let callbackID = UUID()
@@ -2404,7 +2433,7 @@ public class CloudKitSynchronizer: NSObject {
             AsyncThrowingStream<Void, Error>.makeStream()
         attemptCallbackContinuations[attemptID, default: [:]][callbackID] =
             continuation
-        start { [weak self] result in
+        let callbackTask = start { [weak self] result in
             Task { @BigSyncBackgroundActor [weak self] in
                 guard let self else {
                     continuation.finish(throwing: CancellationError())
@@ -2433,9 +2462,18 @@ public class CloudKitSynchronizer: NSObject {
             }
             continuation.finish()
         }
-        var iterator = stream.makeAsyncIterator()
-        guard try await iterator.next() != nil else {
-            throw CancellationError()
+        // The stream settles its waiter on cancellation, but the task started
+        // by the bridge is unstructured. Cancel that captured task immediately
+        // so its suspended transport cannot resume with live account authority.
+        // Keep the stream's existing attempt-cancellation settlement unchanged.
+        defer { callbackTask.cancel() }
+        try await withTaskCancellationHandler {
+            var iterator = stream.makeAsyncIterator()
+            guard try await iterator.next() != nil else {
+                throw CancellationError()
+            }
+        } onCancel: {
+            callbackTask.cancel()
         }
         try checkSynchronizationAttempt(attemptID)
     }
