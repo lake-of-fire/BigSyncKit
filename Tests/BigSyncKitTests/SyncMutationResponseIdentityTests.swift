@@ -2421,8 +2421,9 @@ extension SyncMutationResponseIdentityTests {
         let (adapter, transport, _, failure) = try await caller.value
         XCTAssertTrue(probe.didTrigger, file: file, line: line)
         XCTAssertTrue(failure is CancellationError, file: file, line: line)
-        XCTAssertEqual(probe.finalBatchSize, 200, "Cancelled inspection cannot resize live state", file: file, line: line)
-        XCTAssertEqual(adapter.preparationLimits, [200], file: file, line: line)
+        let initialBatchSize = CloudKitSynchronizer.defaultInitialBatchSize
+        XCTAssertEqual(probe.finalBatchSize, initialBatchSize, "Cancelled inspection cannot resize live state", file: file, line: line)
+        XCTAssertEqual(adapter.preparationLimits, [initialBatchSize], file: file, line: line)
         XCTAssertTrue(adapter.uploaded.isEmpty, file: file, line: line)
         XCTAssertTrue(adapter.deleted.isEmpty, file: file, line: line)
         let calls = await transport.mutationCount

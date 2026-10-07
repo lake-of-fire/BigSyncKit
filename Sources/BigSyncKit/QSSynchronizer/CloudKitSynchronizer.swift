@@ -2425,7 +2425,7 @@ public class CloudKitSynchronizer: NSObject {
     /// callback API fails to invoke its completion handler.
     internal func awaitAttemptCallback(
         for attemptID: UUID,
-        _ start: (@escaping @Sendable (Result<Void, Error>) -> Void) -> Void
+        _ start: (@escaping @Sendable (Result<Void, Error>) -> Void) -> Task<Void, Never>
     ) async throws {
         try checkSynchronizationAttempt(attemptID)
         let callbackID = UUID()
@@ -2433,7 +2433,7 @@ public class CloudKitSynchronizer: NSObject {
             AsyncThrowingStream<Void, Error>.makeStream()
         attemptCallbackContinuations[attemptID, default: [:]][callbackID] =
             continuation
-        start { [weak self] result in
+        let callbackTask = start { [weak self] result in
             Task { @BigSyncBackgroundActor [weak self] in
                 guard let self else {
                     continuation.finish(throwing: CancellationError())
@@ -2462,9 +2462,18 @@ public class CloudKitSynchronizer: NSObject {
             }
             continuation.finish()
         }
-        var iterator = stream.makeAsyncIterator()
-        guard try await iterator.next() != nil else {
-            throw CancellationError()
+        // The stream settles its waiter on cancellation, but the task started
+        // by the bridge is unstructured. Cancel that captured task immediately
+        // so its suspended transport cannot resume with live account authority.
+        // Keep the stream's existing attempt-cancellation settlement unchanged.
+        defer { callbackTask.cancel() }
+        try await withTaskCancellationHandler {
+            var iterator = stream.makeAsyncIterator()
+            guard try await iterator.next() != nil else {
+                throw CancellationError()
+            }
+        } onCancel: {
+            callbackTask.cancel()
         }
         try checkSynchronizationAttempt(attemptID)
     }

@@ -1380,6 +1380,10 @@ extension SyncPhaseAttemptOwnershipTests {
             let outcome = await operation.value
             if interruption != .none {
                 XCTAssertNotNil(outcome)
+                if interruption == .cancellation {
+                    XCTAssertTrue(outcome is CancellationError,
+                        "Caller cancellation must cancel the captured mutation task")
+                }
                 XCTAssertEqual(NSArray(array: store.persistedPropertyLists), persistedBefore,
                     "Neither originating nor replacement account may acquire lifecycle evidence")
                 XCTAssertNil(sync.configuredZoneTerminalState(adapter.recordZoneID))
