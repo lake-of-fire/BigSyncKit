@@ -292,10 +292,9 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         XCTAssertNotEqual(provisionalGeneration, committedGeneration)
 
         let batch = try await owner.adapter.prepareUploadBatch(limit: 10)
-        let prepared = try XCTUnwrap(batch.prepared.first)
-        XCTAssertEqual(batch.prepared.count, 1)
-        XCTAssertEqual(prepared.record["text"] as? String, "committed authoring")
-        XCTAssertEqual(prepared.generation, committedGeneration)
+        let record = try XCTUnwrap(batch.records.first)
+        XCTAssertEqual(batch.records.count, 1)
+        XCTAssertEqual(record["text"] as? String, "committed authoring")
         XCTAssertTrue(target.isInWriteTransaction, "Upload observation must not commit or cancel the target owner's write")
         XCTAssertEqual(object.text, "provisional authoring that will roll back")
         XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: owner.recordName)?.generation, provisionalGeneration)
@@ -324,7 +323,6 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         let batch = try await owner.adapter.prepareUploadBatch(limit: 10)
         XCTAssertEqual(batch.records.count, 1)
         XCTAssertEqual(batch.records.first?["text"] as? String, "committed live record")
-        XCTAssertEqual(batch.prepared.first?.generation, generation)
         XCTAssertTrue(target.isInWriteTransaction)
         XCTAssertNil(target.object(ofType: SyncTimelineSnapshot.self, forPrimaryKey: "document"), "Observation must leave the owner's provisional deletion untouched")
         XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: owner.recordName)?.entityState, .new)
@@ -335,6 +333,11 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         let deletions = try await owner.adapter.prepareDeletionBatch(limit: 10)
         XCTAssertTrue(deletions.recordIDs.isEmpty, "Rolled-back target absence must not manufacture a server deletion")
         XCTAssertEqual(owner.generation(), generation)
+        // The batch keeps its captured generation opaque. Successful
+        // acknowledgement after rollback proves it selected the committed work.
+        try await owner.adapter.acknowledgeUploadedRecords(batch.records, from: batch)
+        XCTAssertNil(owner.generation())
+        XCTAssertEqual(owner.value(), "committed live record")
         await owner.stop()
     }
 
@@ -353,7 +356,9 @@ final class SyncLongLivedReplicaTests: XCTestCase {
         XCTAssertTrue(uploads.records.isEmpty)
         let deletions = try await owner.adapter.prepareDeletionBatch(limit: 10)
         XCTAssertEqual(deletions.recordIDs.map(\.recordName), [owner.recordName])
-        XCTAssertEqual(deletions.matchingGenerations[owner.recordName], generation)
+        XCTAssertEqual(owner.generation(), generation)
+        // Clearing the unchanged generation proves the opaque deletion batch
+        // retained the committed disappearance's acknowledgement evidence.
         try await owner.adapter.acknowledgeDeletedRecordIDs(deletions.recordIDs, from: deletions)
         XCTAssertNil(owner.generation())
         await owner.stop()
