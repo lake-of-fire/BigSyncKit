@@ -1,10 +1,13 @@
-name: Native CloudKit asset decoding
+name: Native sync release boundaries
 on:
   pull_request:
-    branches: [main]
     paths:
       - Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
       - Tests/BigSyncKitTests/HotfixCollectionSafetyTests.swift
+      - Tests/BigSyncKitTests/SyncRetainedRecordContractTests.swift
+      - Tests/BigSyncKitTests/SyncSplitOperationOwnershipTests.swift
+      - Tests/BigSyncKitTests/ChangeFeedMigrationResumeTests.swift
+      - Tests/BigSyncKitTests/SyncPhaseAttemptOwnershipTests.swift
       - .github/test-asset-decoding.sh
       - .github/workflows/asset-decoding.yml
   workflow_dispatch:
@@ -17,6 +20,8 @@ jobs:
   native:
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,6 +39,8 @@ jobs:
           ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
+      - name: Install output parser
+        run: brew install xcsift
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: '6.2.1'
@@ -46,7 +53,7 @@ jobs:
           git -C SwiftUtilities rev-parse HEAD > evidence/swift-utilities-commit.txt
           test "$(cat evidence/realm-gaps-commit.txt)" = 1ffbedbb3d8dd90f44f651f618128e7806ce39dd
           test "$(cat evidence/swift-utilities-commit.txt)" = f437c7d06fc631cd7a67731279411c417cdf8077
-      - name: Execute native collection and asset regressions
+      - name: Execute complete native release-boundary regressions
         shell: bash
         run: |
           export BIGSYNC_ASSET_EVIDENCE_DIRECTORY="$PWD/evidence"
