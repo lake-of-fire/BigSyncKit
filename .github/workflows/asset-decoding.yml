@@ -1,0 +1,60 @@
+name: Native CloudKit asset decoding
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift
+      - Tests/BigSyncKitTests/HotfixCollectionSafetyTests.swift
+      - .github/test-asset-decoding.sh
+      - .github/workflows/asset-decoding.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: asset-decoding-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 1ffbedbb3d8dd90f44f651f618128e7806ce39dd
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '6.2.1'
+      - name: Record dependency identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git -C RealmSwiftGaps rev-parse HEAD > evidence/realm-gaps-commit.txt
+          git -C SwiftUtilities rev-parse HEAD > evidence/swift-utilities-commit.txt
+          test "$(cat evidence/realm-gaps-commit.txt)" = 1ffbedbb3d8dd90f44f651f618128e7806ce39dd
+          test "$(cat evidence/swift-utilities-commit.txt)" = f437c7d06fc631cd7a67731279411c417cdf8077
+      - name: Execute native collection and asset regressions
+        shell: bash
+        run: |
+          export BIGSYNC_ASSET_EVIDENCE_DIRECTORY="$PWD/evidence"
+          /bin/bash "$PWD/BigSyncKit/.github/test-asset-decoding.sh"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: asset-decoding-${{ github.run_attempt }}
+          path: evidence
+          retention-days: 14
+          if-no-files-found: error

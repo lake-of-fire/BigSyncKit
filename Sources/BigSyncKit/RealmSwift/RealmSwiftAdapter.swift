@@ -4561,6 +4561,13 @@ public final class RealmSwiftAdapter:
                 object.setValue(nil, forKey: key)
             }
         } else if let asset = value as? CKAsset {
+            // Assets encode only scalar Data. Reject an incompatible field
+            // before reading bytes or asking Realm's KVC setter to accept
+            // NSData for a string/number/date, which raises an Objective-C
+            // exception instead of rolling back through the decoding error.
+            guard property.type == .data else {
+                throw malformed("a scalar matching the Realm property type")
+            }
             if let fileURL = asset.fileURL,
                let data = NSData(contentsOf: fileURL) {
                 try Task.checkCancellation()
