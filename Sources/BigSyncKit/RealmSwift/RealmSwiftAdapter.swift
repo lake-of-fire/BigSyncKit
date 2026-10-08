@@ -572,6 +572,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeImportedRecordPersistenceWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforeAuthoritativeOwnUploadQuarantineWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterComparisonApplication: (@Sendable (Object) throws -> Void)?
     var _testAfterDisappearanceTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
@@ -7025,7 +7027,31 @@ public final class RealmSwiftAdapter:
     public func validateAuthoritativeOwnUploadRecords(
         _ records: [CKRecord]
     ) async throws -> [InboundLiveResult] {
+        // Setup can legitimately publish a provider. Preserve scalar ownership
+        // before that await, then keep the resulting provider for this operation.
+        let setupGeneration = cancellationGeneration
+        let setupAccount = activeAccountScopeIdentifier
+        let setupBinding = activeReplicaBindingGenerationIdentifier
+        let setupContext = recordRebaseContext
+        let setupContainer = activeContainerIdentifier
+        let setupDatabaseScope = activeDatabaseScopeRawValue
+        func validateSetupOwner() throws {
+            try Task.checkCancellation()
+            guard !cancelSync,
+                  cancellationGeneration == setupGeneration,
+                  activeAccountScopeIdentifier == setupAccount,
+                  activeReplicaBindingGenerationIdentifier == setupBinding,
+                  recordRebaseContext == setupContext,
+                  activeContainerIdentifier == setupContainer,
+                  activeDatabaseScopeRawValue == setupDatabaseScope else {
+                throw CancellationError()
+            }
+        }
+        try validateSetupOwner()
         try await ensureSetup()
+        try validateSetupOwner()
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
@@ -7049,11 +7075,11 @@ public final class RealmSwiftAdapter:
             }
             for targetReaderRealm in readerRealmsForChunk.values {
                 await targetReaderRealm.asyncRefresh()
+                try validateOwner()
             }
 
             for record in chunk {
-                try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                try validateOwner()
                 guard !excludedClassNames.contains(record.recordType) else {
                     dispositionsByRecordName[record.recordID.recordName] =
                         .ignoredExplicitAuthority
@@ -7114,9 +7140,11 @@ public final class RealmSwiftAdapter:
                             pendingGeneration: pendingGeneration
                         )
                     }
+                    try validateOwner()
                     dispositionsByRecordName[record.recordID.recordName] =
                         .validatedAuthoritativeOwnUpload
                 } catch {
+                    try validateOwner()
                     try BigSyncInboundValidationErrors.rethrowNonSemantic(error)
                     let quarantine = try inboundSemanticQuarantine(
                         for: record,
@@ -7135,12 +7163,20 @@ public final class RealmSwiftAdapter:
         }
 
         if !semanticQuarantines.isEmpty {
+#if DEBUG
+            try await _testBeforeAuthoritativeOwnUploadQuarantineWrite?()
+#endif
             try await persistenceRealm.asyncWritePreservingOwnership {
+                try validateOwner()
                 for quarantine in semanticQuarantines {
+                    try validateOwner()
                     persistenceRealm.add(quarantine, update: .modified)
                 }
+                try validateOwner()
             }
+            try validateOwner()
         }
+        try validateOwner()
         return records.enumerated().map { ordinal, record in
             InboundLiveResult(
                 event: InboundEventIdentity(
