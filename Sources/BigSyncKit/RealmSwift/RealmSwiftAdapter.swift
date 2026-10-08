@@ -2477,9 +2477,8 @@ public final class RealmSwiftAdapter:
     /// attempt remains obsolete even when a successor clears cancelSync again.
     /// Legacy models need this fence too, without opting into record rebasing.
     @BigSyncBackgroundActor
-    func operationOwnerValidator() -> (@BigSyncBackgroundActor @Sendable () throws -> Void) {
+    private func operationLifecycleValidator() -> (@BigSyncBackgroundActor @Sendable () throws -> Void) {
         let generation = cancellationGeneration
-        let provider = realmProvider
         let account = activeAccountScopeIdentifier
         let binding = activeReplicaBindingGenerationIdentifier
         let context = recordRebaseContext
@@ -2488,12 +2487,26 @@ public final class RealmSwiftAdapter:
         return {
             try Task.checkCancellation()
             guard !self.cancelSync, self.cancellationGeneration == generation,
-                  self.realmProvider === provider,
                   self.activeAccountScopeIdentifier == account,
                   self.activeReplicaBindingGenerationIdentifier == binding,
                   self.recordRebaseContext == context,
                   self.activeContainerIdentifier == container,
                   self.activeDatabaseScopeRawValue == scope else {
+                throw CancellationError()
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func operationOwnerValidator(
+        allowProviderInitialization: Bool = false
+    ) -> (@BigSyncBackgroundActor @Sendable () throws -> Void) {
+        let validateLifecycle = operationLifecycleValidator()
+        let provider = realmProvider
+        return {
+            try validateLifecycle()
+            guard self.realmProvider === provider
+                || (allowProviderInitialization && provider == nil) else {
                 throw CancellationError()
             }
         }
@@ -7237,6 +7250,10 @@ public final class RealmSwiftAdapter:
         in records: [CKRecord],
         forceSave: Bool
     ) async throws -> [InboundLiveResult] {
+        // Incoming work belongs to the attempt that selected it, including
+        // after cancellation has been cleared by a successor using this adapter.
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let realmProvider = realmProvider else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
@@ -7663,6 +7680,7 @@ public final class RealmSwiftAdapter:
                                 try await targetReaderRealm.asyncWritePreservingOwnership { [weak self] in
                                     try validateOwner()
                                     guard let self else { return }
+                                    try validateOwner()
                                     for candidate in group.candidates {
                                         try validateOwner()
 
@@ -7931,6 +7949,7 @@ public final class RealmSwiftAdapter:
                     try await persistenceRealm.asyncWritePreservingOwnership { [weak self] in
                         try validateOwner()
                         guard let self else { return }
+                        try validateOwner()
                         for entity in newEntitiesForChunk {
                             // A journal forwarder can create or update this
                             // record after selection but before this write.
@@ -8149,7 +8168,6 @@ public final class RealmSwiftAdapter:
             try validateOwner()
         }
         try validateOwner()
-        guard !cancelSync else { throw CancellationError() }
 
         var deletions = [RemoteDeletionSnapshot]()
         var semanticQuarantines = [BigSyncInboundSemanticQuarantine]()
@@ -8362,7 +8380,6 @@ public final class RealmSwiftAdapter:
                 try validateOwner()
                 for deletion in entityDeletions {
                     try validateOwner()
-                    guard !cancelSync else { throw CancellationError() }
                     if targetRealm.schema.objectSchema.contains(where: {
                         $0.className == BigSyncPendingMutation.className()
                     }), let mutation = targetRealm.object(
@@ -8426,7 +8443,6 @@ public final class RealmSwiftAdapter:
             }
             await targetRealm.asyncRefresh()
             try validateOwner()
-            guard !cancelSync else { throw CancellationError() }
             if let mutation = targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: deletion.recordName
@@ -8475,8 +8491,7 @@ public final class RealmSwiftAdapter:
                 }
                 // Refresh can deliver a synchronous cancellation callback.
                 try validateOwner()
-                guard !cancelSync,
-                      cancellationGeneration == selectionCancellationGeneration,
+                guard cancellationGeneration == selectionCancellationGeneration,
                       self.realmProvider === realmProvider else {
                     throw CancellationError()
                 }
@@ -9163,26 +9178,9 @@ public final class RealmSwiftAdapter:
         // normal setup/forwarding resumes through unsetCancellation only
         // after the owning run completes preparation successfully.
         guard !isPreparingFencedMigration else { return }
-        // Lazy setup may legitimately publish a provider, so freeze the
-        // scalar owner first and capture the provider fence only after setup.
-        let importCancellationGeneration = cancellationGeneration
-        let importAccount = activeAccountScopeIdentifier
-        let importBinding = activeReplicaBindingGenerationIdentifier
-        let importContext = recordRebaseContext
-        let importContainer = activeContainerIdentifier
-        let importDatabaseScope = activeDatabaseScopeRawValue
-        func validateSetupOwner() throws {
-            try Task.checkCancellation()
-            guard !cancelSync,
-                  cancellationGeneration == importCancellationGeneration,
-                  activeAccountScopeIdentifier == importAccount,
-                  activeReplicaBindingGenerationIdentifier == importBinding,
-                  recordRebaseContext == importContext,
-                  activeContainerIdentifier == importContainer,
-                  activeDatabaseScopeRawValue == importDatabaseScope else {
-                throw CancellationError()
-            }
-        }
+        // Lazy setup may legitimately replace an interrupted provider.
+        // Retain the entry lifecycle before setup, then bind the ready provider.
+        let validateSetupOwner = operationLifecycleValidator()
         try validateSetupOwner()
         progress("adapter-import-setup-started")
         try validateSetupOwner()
