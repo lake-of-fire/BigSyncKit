@@ -5,7 +5,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 evidence="${BIGSYNC_ASSET_EVIDENCE_DIRECTORY:?Set a fresh absolute evidence directory}"
 [[ "$evidence" = /* ]] || { echo 'Evidence directory must be absolute' >&2; exit 1; }
 mkdir "$evidence"
-scratch="$evidence/build"
+scratch="${evidence}-build"
+[[ ! -e "$scratch" ]] || { echo 'Build scratch directory must be fresh' >&2; exit 1; }
 export BIGSYNC_RUN_MUTATION_BENCHMARK=0
 finish() {
   local status=$?
@@ -55,6 +56,23 @@ statuses=("${PIPESTATUS[@]}")
 set -e
 printf '%s\n' "${statuses[*]}" > "$evidence/pipeline-statuses.txt"
 if [[ "${statuses[0]}" != 0 || "${statuses[1]}" != 0 || "${statuses[2]}" != 0 ]]; then
+  python3 - "$evidence/native.formatted.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+raw = path.read_bytes() if path.exists() else b"No xcsift output was retained."
+try:
+    formatted = json.loads(raw)
+    if isinstance(formatted, dict) and formatted.get("errors"):
+        formatted = {"errors": formatted["errors"], "summary": formatted.get("summary")}
+    raw = json.dumps(formatted, indent=2, ensure_ascii=False).encode()
+except (ValueError, UnicodeError):
+    pass
+prefix = b"Bounded xcsift failure summary (full formatted output retained in evidence):\n"
+sys.stdout.buffer.write((prefix + raw)[:16000] + b"\n")
+PY
   exit 1
 fi
 
