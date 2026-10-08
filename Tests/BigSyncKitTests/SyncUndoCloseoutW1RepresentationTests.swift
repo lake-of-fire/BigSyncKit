@@ -116,7 +116,12 @@ extension SyncUndoCloseoutW1Tests {
             (object as! ChangeMetadataRecordable).refreshChangeMetadata(explicitlyModified: true,
                 at: Date(timeIntervalSinceReferenceDate: 30))
         }
-        _ = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: type.className())
+        // This fixture deliberately disables setup observers. Drain the local
+        // journal before preparing the candidate whose preservation we assert.
+        try await adapter.didFinishImport()
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: type.className())
+        XCTAssertEqual(prepared.count, 1)
+        XCTAssertEqual(prepared.first?.record.recordID.recordName, name)
         let generation = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation)
         let base = try XCTUnwrap(realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name))
         let revision = base.revision, fields = base.fieldDigests
