@@ -622,6 +622,148 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    private static func replaceInboundOwner(
+        _ adapter: RealmSwiftAdapter, schedule: Int
+    ) async throws {
+        switch schedule {
+        case 0:
+            adapter.cancelSynchronization()
+            try adapter.prepareForFencedMigrationAfterCancellation()
+        case 1:
+            try await adapter.activateAccountScope("replacement-account")
+        case 2:
+            try await adapter.activateReplicaBinding(
+                accountScopeIdentifier: "split-owner-account",
+                replicaBindingGenerationIdentifier: "replacement-binding"
+            )
+        default:
+            try await adapter.activateTransportNamespace(
+                containerIdentifier: "iCloud.test.replacement", databaseScope: .public
+            )
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private static func restoreInboundOwner(_ adapter: RealmSwiftAdapter) async throws {
+        try await adapter.activateReplicaBinding(
+            accountScopeIdentifier: "split-owner-account",
+            replicaBindingGenerationIdentifier: "split-owner-binding"
+        )
+        try await adapter.activateTransportNamespace(
+            containerIdentifier: "iCloud.test.split-owner", databaseScope: .private
+        )
+        try await adapter.unsetCancellation()
+    }
+
+    @BigSyncBackgroundActor
+    private func inboundReplacement(
+        for candidate: (row: SplitOwnerRow, recordID: CKRecord.ID, encodedRecord: Data)
+    ) -> CKRecord {
+        let record = CKRecord(recordType: SplitOwnerRow.className(), recordID: candidate.recordID)
+        record["text"] = "incoming" as NSString
+        record["isDeleted"] = false as NSNumber
+        record["createdAt"] = candidate.row.createdAt as NSDate
+        let remoteDate = candidate.row.modifiedAt.addingTimeInterval(60)
+        record["modifiedAt"] = remoteDate as NSDate
+        record["explicitlyModifiedAt"] = remoteDate as NSDate
+        let setter = NSSelectorFromString("setRecordChangeTag:")
+        guard record.responds(to: setter) else {
+            XCTFail("CloudKit SDK cannot construct tagged system-field fixture")
+            return record
+        }
+        _ = record.perform(setter, with: "inbound-live-owner-accepted" as NSString)
+        XCTAssertEqual(record.recordChangeTag, "inbound-live-owner-accepted")
+        return record
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundLiveRejectsCancellationResetAccountBindingAndTransportReplacementBeforeTarget() async throws {
+        for schedule in 0..<4 {
+            let fixture = try await fixture()
+            let candidate = try await syncedDeletionCandidate(fixture)
+            let record = inboundReplacement(for: candidate)
+            let originalText = candidate.row.text
+            let originalModifiedAt = candidate.row.modifiedAt
+            fixture.adapter._testBeforeImportedRecordTargetWrite = {
+                try await Self.replaceInboundOwner(fixture.adapter, schedule: schedule)
+            }
+            defer { fixture.adapter._testBeforeImportedRecordTargetWrite = nil }
+            do {
+                _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+                XCTFail("A replaced owner admitted the old live response, schedule \(schedule)")
+            } catch is CancellationError { }
+            XCTAssertEqual(candidate.row.text, originalText)
+            XCTAssertEqual(candidate.row.modifiedAt, originalModifiedAt)
+            let entity = try XCTUnwrap(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: candidate.recordID.recordName))
+            XCTAssertEqual(entity.entityState, .synced)
+            XCTAssertEqual(entity.encodedRecord, candidate.encodedRecord)
+            XCTAssertNil(entity.pendingGeneration)
+            XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: candidate.recordID.recordName))
+
+            fixture.adapter._testBeforeImportedRecordTargetWrite = nil
+            try await Self.restoreInboundOwner(fixture.adapter)
+            let fresh = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTAssertEqual(fresh.first?.disposition, .applied)
+            XCTAssertEqual(candidate.row.text, "incoming")
+            XCTAssertEqual(fixture.adapter.getRecord(for: entity)?.recordChangeTag,
+                "inbound-live-owner-accepted")
+            XCTAssertEqual(entity.entityState, .synced)
+            XCTAssertNil(entity.pendingGeneration)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundLiveRetainsCommittedTargetAfterOwnerReplacementAndFreshRetry() async throws {
+        for schedule in 0..<4 {
+            let fixture = try await fixture()
+            let candidate = try await syncedDeletionCandidate(fixture)
+            let record = inboundReplacement(for: candidate)
+            fixture.adapter._testBeforeImportedRecordPersistenceWrite = {
+                XCTAssertEqual(candidate.row.text, "incoming")
+                try await Self.replaceInboundOwner(fixture.adapter, schedule: schedule)
+            }
+            defer { fixture.adapter._testBeforeImportedRecordPersistenceWrite = nil }
+            do {
+                _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+                XCTFail("A retired live response published tracking, schedule \(schedule)")
+            } catch is CancellationError { }
+            XCTAssertEqual(candidate.row.text, "incoming")
+            let entity = try XCTUnwrap(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: candidate.recordID.recordName))
+            XCTAssertEqual(entity.entityState, .synced)
+            XCTAssertEqual(entity.encodedRecord, candidate.encodedRecord)
+            XCTAssertNil(entity.pendingGeneration)
+            XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: candidate.recordID.recordName))
+
+            fixture.adapter._testBeforeImportedRecordPersistenceWrite = nil
+            try await Self.restoreInboundOwner(fixture.adapter)
+            let fresh = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTAssertEqual(fresh.first?.disposition, .applied)
+            XCTAssertEqual(candidate.row.text, "incoming")
+            XCTAssertEqual(fixture.adapter.getRecord(for: entity)?.recordChangeTag,
+                "inbound-live-owner-accepted")
+            XCTAssertEqual(entity.entityState, .synced)
+            XCTAssertNil(entity.pendingGeneration)
+            try fixture.target.write {
+                candidate.row.text = "later local edit"
+                candidate.row.refreshChangeMetadata(explicitlyModified: true)
+            }
+            let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: candidate.recordID.recordName)?.generation)
+            try await fixture.adapter.didFinishImport()
+            let replay = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTAssertEqual(replay.first?.disposition, .preservedPendingLocal(generation: generation))
+            XCTAssertEqual(candidate.row.text, "later local edit")
+            XCTAssertEqual(entity.pendingGeneration, generation)
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: candidate.recordID.recordName)?.generation, generation)
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testInboundDeletionRejectsCancellationResetAccountBindingAndTransportReplacement() async throws {
         for replacement in 0..<4 {
             let fixture = try await fixture()
