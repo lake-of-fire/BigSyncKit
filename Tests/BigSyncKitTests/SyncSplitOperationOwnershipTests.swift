@@ -148,6 +148,108 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    private func changedLegacyUpload(
+        _ fixture: (adapter: RealmSwiftAdapter, target: Realm, tracking: Realm)
+    ) async throws -> (prepared: [PreparedRecordUpload], generation: String, encodedRecord: Data) {
+        let (row, name, _) = try await pendingRow(fixture)
+        let initial = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        try await fixture.adapter.acknowledgeUploadedRecords(initial.records, from: initial)
+        try fixture.target.write {
+            row.text = "changed after accepted upload"
+            row.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await fixture.adapter.didFinishImport()
+        let prepared = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 10, restrictedToEntityType: nil
+        )
+        XCTAssertEqual(prepared.count, 1)
+        let generation = try XCTUnwrap(prepared.first?.generation)
+        let entity = try XCTUnwrap(fixture.tracking.object(
+            ofType: SyncedEntity.self, forPrimaryKey: name
+        ))
+        XCTAssertEqual(entity.entityState, .changed)
+        return (prepared, generation, try XCTUnwrap(entity.encodedRecord))
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingServerRetryRejectsCancellationResetBeforeTrackingAdmission() async throws {
+        for usesPreparedEnvelope in [false, true] {
+            let fixture = try await fixture()
+            let upload = try await changedLegacyUpload(fixture)
+            let recordID = try XCTUnwrap(upload.prepared.first?.record.recordID)
+            let entity = try XCTUnwrap(fixture.tracking.object(
+                ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName
+            ))
+            fixture.adapter._testBeforeMissingServerTrackingWrite = {
+                fixture.adapter.cancelSynchronization()
+                try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+            }
+            defer { fixture.adapter._testBeforeMissingServerTrackingWrite = nil }
+            do {
+                if usesPreparedEnvelope {
+                    try await fixture.adapter.requeueMissingServerRecords(
+                        [recordID], matchingPreparedUploads: upload.prepared
+                    )
+                } else {
+                    try await fixture.adapter.requeueMissingServerRecords(
+                        [recordID], matchingPreparedGenerations: [recordID.recordName: upload.generation]
+                    )
+                }
+                XCTFail("The old missing-record response reset a successor's tracking value")
+            } catch is CancellationError { }
+            XCTAssertEqual(entity.entityState, .changed)
+            XCTAssertEqual(entity.encodedRecord, upload.encodedRecord)
+            XCTAssertEqual(entity.pendingGeneration, upload.generation)
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordID.recordName)?.generation, upload.generation)
+
+            fixture.adapter._testBeforeMissingServerTrackingWrite = nil
+            try await fixture.adapter.unsetCancellation()
+            try await fixture.adapter.requeueMissingServerRecords(
+                [recordID], matchingPreparedUploads: upload.prepared
+            )
+            XCTAssertEqual(entity.entityState, .new)
+            XCTAssertNil(entity.encodedRecord)
+            XCTAssertEqual(entity.pendingGeneration, upload.generation)
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordID.recordName)?.generation, upload.generation)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingServerRetryRejectsAccountAndTransportReplacementBeforeTrackingAdmission() async throws {
+        for replacesTransport in [false, true] {
+            let fixture = try await fixture()
+            let upload = try await changedLegacyUpload(fixture)
+            let recordID = try XCTUnwrap(upload.prepared.first?.record.recordID)
+            let entity = try XCTUnwrap(fixture.tracking.object(
+                ofType: SyncedEntity.self, forPrimaryKey: recordID.recordName
+            ))
+            fixture.adapter._testBeforeMissingServerTrackingWrite = {
+                if replacesTransport {
+                    try await fixture.adapter.activateTransportNamespace(
+                        containerIdentifier: "iCloud.test.missing-response-successor", databaseScope: .public
+                    )
+                } else {
+                    try await fixture.adapter.activateAccountScope("missing-response-successor-account")
+                }
+            }
+            defer { fixture.adapter._testBeforeMissingServerTrackingWrite = nil }
+            do {
+                try await fixture.adapter.requeueMissingServerRecords(
+                    [recordID], matchingPreparedUploads: upload.prepared
+                )
+                XCTFail("The old missing-record response crossed the active operation's identity")
+            } catch is CancellationError { }
+            XCTAssertEqual(entity.entityState, .changed)
+            XCTAssertEqual(entity.encodedRecord, upload.encodedRecord)
+            XCTAssertEqual(entity.pendingGeneration, upload.generation)
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: recordID.recordName)?.generation, upload.generation)
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testRelationshipCleanupRejectsAccountBindingAndTransportReplacement() async throws {
         for replacement in 0..<3 {
             let fixture = try await fixture()
