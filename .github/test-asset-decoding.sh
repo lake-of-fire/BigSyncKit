@@ -43,11 +43,11 @@ fi
 
 set +e
 # Use a clean package scratch and retain every pipeline status.
-# PR143 run 37814850792 stopped in Realm Core 20.1.5 geospatial.cpp before
-# executing tests. Compile its C++ headers textually for this package runner;
-# this does not change the Reader app's build configuration.
+# Realm Core 20.1.5 uses C++20; disable both Clang modules and the C++20
+# frontend module default so explicit S2 module maps remain textual includes.
+# The -Xclang pair must reach cc1. This is scoped to this package runner.
 "${swift_test[@]}" --configuration debug \
-  -Xcxx -fno-modules \
+  -Xcxx -fno-modules -Xcxx -Xclang -Xcxx -fno-cxx-modules \
   --filter HotfixCollectionSafetyTests \
   --parallel --num-workers 1 --disable-swift-testing \
   --xunit-output "$evidence/native.junit.xml" 2>&1 | tee "$evidence/native.log" \
