@@ -572,6 +572,23 @@ extension SyncUndoCloseoutW1Tests {
                 }
             }
             let expectedNames = Set(names)
+            var originalGenerations = [String: String]()
+            for name in names {
+                let pending = try XCTUnwrap(realm.object(
+                    ofType: BigSyncPendingMutation.self, forPrimaryKey: name
+                ))
+                XCTAssertEqual(pending.accountScopeIdentifier, "w1-account")
+                originalGenerations[name] = pending.generation
+            }
+            func assertOriginalJournalIsUnchanged() throws {
+                for name in names {
+                    let pending = try XCTUnwrap(realm.object(
+                        ofType: BigSyncPendingMutation.self, forPrimaryKey: name
+                    ))
+                    XCTAssertEqual(pending.accountScopeIdentifier, "w1-account")
+                    XCTAssertEqual(pending.generation, originalGenerations[name])
+                }
+            }
             XCTAssertEqual(Set(try adapter.serverRecordEvidence(
                 entityTypes: Set(types)
             ).map(\.recordName)), expectedNames)
@@ -579,10 +596,11 @@ extension SyncUndoCloseoutW1Tests {
             defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
             row.title = "another-account"
             article.title = "another-account"
-            row.refreshChangeMetadata(explicitlyModified: true,
-                at: Date(timeIntervalSinceReferenceDate: 40))
-            article.refreshChangeMetadata(explicitlyModified: true,
-                at: Date(timeIntervalSinceReferenceDate: 40))
+            // Inject foreign-owner scope facts solely to exercise evidence's
+            // committed read cut. This is not a local-authoritative edit:
+            // explicitly refreshing this same record under another account
+            // must trap at the immutable journal scope guard.
+            try assertOriginalJournalIsUnchanged()
             for (type, name) in zip(types, names) {
                 XCTAssertNotNil(try adapter.serverRecordEvidence(
                     recordName: name, expectedEntityType: type
@@ -595,6 +613,7 @@ extension SyncUndoCloseoutW1Tests {
             XCTAssertEqual(row.title, "another-account")
             XCTAssertEqual(article.title, "another-account")
             if commits { try realm.commitWrite() } else { realm.cancelWrite() }
+            try assertOriginalJournalIsUnchanged()
             XCTAssertEqual(Set(try adapter.serverRecordEvidence(
                 entityTypes: Set(types)
             ).map(\.recordName)), commits ? [] : expectedNames)
