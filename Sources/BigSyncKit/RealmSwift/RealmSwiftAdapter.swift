@@ -623,6 +623,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testBeforeCursorTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
+    var _testBeforeInboundIdentityAcknowledgementTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     @BigSyncBackgroundActor
     var _testJournalForwardingTrace: (@BigSyncBackgroundActor @Sendable (String) -> Void)?
     @BigSyncBackgroundActor
@@ -2475,6 +2477,8 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     private func processObservedRealmChanges() async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let targetReaderRealms = realmProvider?.targetReaderRealms else {
 #if DEBUG
             traceJournalForwarding("observed-process-no-realms taskCancelled=\(Task.isCancelled)")
@@ -2492,25 +2496,21 @@ public final class RealmSwiftAdapter:
 #endif
 
         do {
-            try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateOwner()
             for (idx, recordNames) in observed
             where idx < targetReaderRealms.count {
+                try validateOwner()
                 let realm = targetReaderRealms[idx]
-                try await forwardPendingMutations(
-                    pendingMutationSnapshots(
-                        for: recordNames,
-                        in: realm
-                    ),
-                    in: realm
-                )
+                let pending = pendingMutationSnapshots(for: recordNames, in: realm)
+                try validateOwner()
+                try await forwardPendingMutations(pending, in: realm)
+                try validateOwner()
             }
             // Forwarding can suspend after a durable tracking write (for
             // example while waking the synchronizer). Do not acknowledge this
             // batch as complete after a reset has cancelled it: the catch below
             // requeues its durable journal identities for the resumed adapter.
-            try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateOwner()
         } catch {
 #if DEBUG
             traceJournalForwarding(
@@ -2733,6 +2733,7 @@ public final class RealmSwiftAdapter:
             progress?("adapter-import-delegate-completed")
             try validateOwner()
         }
+        try validateOwner()
         return forwardedCount
     }
 
@@ -2819,6 +2820,7 @@ public final class RealmSwiftAdapter:
                     + "inTransaction=\(persistenceRealm.isInWriteTransaction) chunk=\(chunk.count)"
             )
 #endif
+            try validateOwner()
             try await persistenceRealm.asyncWritePreservingOwnership {
                 try validateOwner()
 #if DEBUG
@@ -2856,6 +2858,7 @@ public final class RealmSwiftAdapter:
                     "tracking-live-snapshot operation=\(traceOperation) count=\(currentMutations.count)"
                 )
 #endif
+                try validateOwner()
                 for mutation in currentMutations {
                     try validateOwner()
                     // The account can change while this task is suspended
@@ -2901,6 +2904,7 @@ public final class RealmSwiftAdapter:
                 }
                 try validateOwner()
             }
+            try validateOwner()
 #if DEBUG
             traceJournalForwarding("tracking-write-returned operation=\(traceOperation)")
             traceJournalForwarding(
@@ -2918,6 +2922,7 @@ public final class RealmSwiftAdapter:
             try await targetReaderRealm.asyncWritePreservingOwnership {
                 try validateOwner()
                 for (recordName, ignoredGeneration) in ignoredGenerationsByRecordName {
+                    try validateOwner()
                     if let mutation = targetReaderRealm.object(
                         ofType: BigSyncPendingMutation.self,
                         forPrimaryKey: recordName
@@ -2930,6 +2935,7 @@ public final class RealmSwiftAdapter:
             try validateOwner()
         }
 
+        try validateOwner()
         if forwardedCount > 0, updateStatus {
             updateHasChanges(realm: persistenceRealm)
             try validateOwner()
@@ -2938,6 +2944,7 @@ public final class RealmSwiftAdapter:
                 try validateOwner()
             }
         }
+        try validateOwner()
         return forwardedCount
     }
 
@@ -9850,8 +9857,14 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     public func pendingCommittedInboundIdentityBatch() throws
         -> CommittedInboundIdentityBatch? {
-        guard let persistenceRealm = realmProvider?.persistenceRealm,
-              let delivery = persistenceRealm.object(
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
+        // The domain callback consumes durable page identities. A different
+        // tracking writer may have provisional replacement bytes or removal.
+        let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        try validateOwner()
+        guard let delivery = snapshot.object(
                 ofType: BigSyncPendingInboundIdentityDelivery.self,
                 forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
               ), !delivery.deliveryID.isEmpty else { return nil }
@@ -9886,21 +9899,25 @@ public final class RealmSwiftAdapter:
     public func acknowledgeCommittedInboundIdentityBatch(
         deliveryID: String
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let persistenceRealm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
-        let expectedCancellationGeneration = cancellationGeneration
+#if DEBUG
+        try await _testBeforeInboundIdentityAcknowledgementTrackingWrite?()
+#endif
+        try validateOwner()
         try await persistenceRealm.asyncWritePreservingOwnership {
-            try Task.checkCancellation()
-            guard !cancelSync,
-                  cancellationGeneration == expectedCancellationGeneration
-            else { throw CancellationError() }
+            try validateOwner()
             guard let delivery = persistenceRealm.object(
                 ofType: BigSyncPendingInboundIdentityDelivery.self,
                 forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
             ), delivery.deliveryID == deliveryID else { return }
             persistenceRealm.delete(delivery)
+            try validateOwner()
         }
+        try validateOwner()
     }
 
     private struct InboundPageNamespace {
