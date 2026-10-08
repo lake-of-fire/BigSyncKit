@@ -186,7 +186,7 @@ final class IncomingRepresentationSemanticRecordTests: XCTestCase {
                       "Decoding alone does not accept a transactional baseline")
     }
 
-    @RealmBackgroundActor
+    @BigSyncBackgroundActor
     private func assertOrdinaryAndComparisonParity(
         adapter: RealmSwiftAdapter, record: CKRecord,
         expectedCount: Int, expectedEnabled: Bool, expectedOptionalText: String?

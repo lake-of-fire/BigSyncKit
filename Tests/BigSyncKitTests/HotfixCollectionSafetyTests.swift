@@ -308,7 +308,7 @@ final class HotfixCollectionSafetyTests: XCTestCase {
         try await assertTransportExclusionsAndDeferredClears(adapter: fixture.adapter)
     }
 
-    @RealmBackgroundActor
+    @BigSyncBackgroundActor
     private func assertTransportExclusionsAndDeferredClears(adapter: RealmSwiftAdapter) throws {
         func record(for type: Object.Type) -> CKRecord {
             let record = CKRecord(recordType: type.className(), recordID: .init(
