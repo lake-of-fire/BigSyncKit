@@ -454,5 +454,18 @@ class W1MergedNativeContractTests(unittest.TestCase):
                         self.assertFalse(report["passed"])
 
 
+class W1CommittedEvidenceContractTests(W1MergedNativeContractTests):
+    """Apply the independent missing/skip/duplicate contract to the new cases."""
+    merged_cases = (
+        "SyncUndoCloseoutW1Tests/testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval",
+        "SyncUndoCloseoutW1Tests/testSemanticQuarantineUsesCommittedFeedEpoch",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceIgnoresProvisionalAcknowledgement",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement",
+        "SyncUndoCloseoutW1Tests/testServerEvidencePreservesExactAndCatalogStatePolicies",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm",
+        "SyncUndoCloseoutW1Tests/testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership",
+    )
+
+
 if __name__ == "__main__":
     unittest.main()
