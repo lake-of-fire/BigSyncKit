@@ -121,6 +121,87 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    private func pendingInboundDelivery(in tracking: Realm) throws
+        -> (delivery: BigSyncPendingInboundIdentityDelivery, identity: CommittedInboundIdentity) {
+        let identity = CommittedInboundIdentity(entityType: SplitOwnerRow.className(),
+            recordName: SplitOwnerRow.className() + ".row", disposition: .upsert)
+        let delivery = BigSyncPendingInboundIdentityDelivery()
+        delivery.deliveryID = "committed-delivery"
+        delivery.encodedIdentityPageBatches.append(try JSONEncoder().encode([identity]))
+        try tracking.write { tracking.add(delivery) }
+        return (delivery, identity)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundIdentityInspectionIgnoresProvisionalReplacementAndRemoval() async throws {
+        for removesDelivery in [false, true] {
+            for commits in [false, true] {
+                let fixture = try await fixture()
+                let (delivery, identity) = try pendingInboundDelivery(in: fixture.tracking)
+                let successor = CommittedInboundIdentity(entityType: SplitOwnerRow.className(),
+                    recordName: SplitOwnerRow.className() + ".successor", disposition: .delete)
+                fixture.tracking.beginWrite()
+                defer { if fixture.tracking.isInWriteTransaction { fixture.tracking.cancelWrite() } }
+                if removesDelivery {
+                    fixture.tracking.delete(delivery)
+                } else {
+                    delivery.deliveryID = "provisional-successor"
+                    delivery.encodedIdentityPageBatches.removeAll()
+                    delivery.encodedIdentityPageBatches.append(try JSONEncoder().encode([successor]))
+                }
+                let batch = try XCTUnwrap(fixture.adapter.pendingCommittedInboundIdentityBatch())
+                XCTAssertEqual(batch.deliveryID, "committed-delivery")
+                XCTAssertEqual(batch.identities, [identity])
+                XCTAssertTrue(fixture.tracking.isInWriteTransaction,
+                    "Inspection must leave the independent writer's transaction open")
+
+                if commits { try fixture.tracking.commitWrite() }
+                else { fixture.tracking.cancelWrite() }
+                let settled = try fixture.adapter.pendingCommittedInboundIdentityBatch()
+                if !commits {
+                    XCTAssertEqual(settled?.deliveryID, batch.deliveryID)
+                    XCTAssertEqual(settled?.identities, [identity])
+                } else if removesDelivery {
+                    XCTAssertNil(settled)
+                } else {
+                    XCTAssertEqual(settled?.deliveryID, "provisional-successor")
+                    XCTAssertEqual(settled?.identities, [successor])
+                }
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundIdentityAcknowledgementRejectsAccountAndTransportReplacement() async throws {
+        for replacesTransport in [false, true] {
+            let fixture = try await fixture()
+            let (delivery, identity) = try pendingInboundDelivery(in: fixture.tracking)
+            let deliveryID = delivery.deliveryID
+            fixture.adapter._testBeforeInboundIdentityAcknowledgementTrackingWrite = {
+                if replacesTransport {
+                    try await fixture.adapter.activateTransportNamespace(
+                        containerIdentifier: "iCloud.test.inbound-successor", databaseScope: .public
+                    )
+                } else {
+                    try await fixture.adapter.activateAccountScope("inbound-successor-account")
+                }
+            }
+            defer { fixture.adapter._testBeforeInboundIdentityAcknowledgementTrackingWrite = nil }
+            do {
+                try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(deliveryID: deliveryID)
+                XCTFail("The prior domain callback consumed repair input after ownership replacement")
+            } catch is CancellationError { }
+            let pending = try XCTUnwrap(fixture.adapter.pendingCommittedInboundIdentityBatch())
+            XCTAssertEqual(pending.deliveryID, deliveryID)
+            XCTAssertEqual(pending.identities, [identity])
+
+            fixture.adapter._testBeforeInboundIdentityAcknowledgementTrackingWrite = nil
+            try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(deliveryID: deliveryID)
+            XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testPublicImportRejectsCancellationResetFromProgressBeforeForwarding() async throws {
         for checkpoint in ["adapter-import-setup-started", "adapter-import-forwarding-started"] {
             let fixture = try await fixture()

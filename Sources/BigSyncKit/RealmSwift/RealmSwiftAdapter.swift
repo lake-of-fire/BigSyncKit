@@ -617,6 +617,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testBeforeCursorTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
+    var _testBeforeInboundIdentityAcknowledgementTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     @BigSyncBackgroundActor
     var _testJournalForwardingTrace: (@BigSyncBackgroundActor @Sendable (String) -> Void)?
     @BigSyncBackgroundActor
@@ -9554,8 +9556,14 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     public func pendingCommittedInboundIdentityBatch() throws
         -> CommittedInboundIdentityBatch? {
-        guard let persistenceRealm = realmProvider?.persistenceRealm,
-              let delivery = persistenceRealm.object(
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
+        guard let persistenceRealm = realmProvider?.persistenceRealm else { return nil }
+        // The domain callback consumes durable page identities. A different
+        // tracking writer may have provisional replacement bytes or removal.
+        let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        try validateOwner()
+        guard let delivery = snapshot.object(
                 ofType: BigSyncPendingInboundIdentityDelivery.self,
                 forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
               ), !delivery.deliveryID.isEmpty else { return nil }
@@ -9590,21 +9598,25 @@ public final class RealmSwiftAdapter:
     public func acknowledgeCommittedInboundIdentityBatch(
         deliveryID: String
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let persistenceRealm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
-        let expectedCancellationGeneration = cancellationGeneration
+#if DEBUG
+        try await _testBeforeInboundIdentityAcknowledgementTrackingWrite?()
+#endif
+        try validateOwner()
         try await persistenceRealm.asyncWritePreservingOwnership {
-            try Task.checkCancellation()
-            guard !cancelSync,
-                  cancellationGeneration == expectedCancellationGeneration
-            else { throw CancellationError() }
+            try validateOwner()
             guard let delivery = persistenceRealm.object(
                 ofType: BigSyncPendingInboundIdentityDelivery.self,
                 forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
             ), delivery.deliveryID == deliveryID else { return }
             persistenceRealm.delete(delivery)
+            try validateOwner()
         }
+        try validateOwner()
     }
 
     private struct InboundPageNamespace {
