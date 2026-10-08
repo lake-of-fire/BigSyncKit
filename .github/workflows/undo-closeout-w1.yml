@@ -43,7 +43,7 @@ jobs:
         with:
           repository: lake-of-fire/RealmSwiftGaps
           # Match the Realm ownership helper selected by Reader PR #286.
-          ref: fb1af9b1375463d79997c42ac306dc27a6e623b3
+          ref: 1ffbedbb3d8dd90f44f651f618128e7806ce39dd
           path: RealmSwiftGaps
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
