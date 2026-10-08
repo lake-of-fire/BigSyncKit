@@ -11710,7 +11710,7 @@ extension RealmSwiftAdapter {
     /// independent; this callback must not suspend or acquire a session lock.
     public func resolveRecordConflict(
         id: String, expectedGeneration: String, choice: BigSyncRecordConflictChoice,
-        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+        validateAuthority: @escaping @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
         let validateOwner = operationOwnerValidator()
         let validateConflictAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {
@@ -12000,7 +12000,7 @@ extension RealmSwiftAdapter {
     @BigSyncBackgroundActor
     public func refreshRecordConflict(
         _ conflictID: String,
-        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+        validateAuthority: @escaping @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
         // Preserve setup authority while allowing legitimate provider creation.
         let validateSetupOwner = operationLifecycleValidator()
@@ -12084,7 +12084,7 @@ public extension RealmSwiftAdapter {
     /// room, and no pending submission or mutation generation is touched.
     @BigSyncBackgroundActor
     func discardResolvedRecordConflictArchives(
-        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+        validateAuthority: @escaping @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
         let validateOwner = operationOwnerValidator()
         let validateConflictAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {
