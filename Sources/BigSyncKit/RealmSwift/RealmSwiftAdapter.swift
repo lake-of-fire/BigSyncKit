@@ -575,6 +575,8 @@ public final class RealmSwiftAdapter:
     var _testBeforeAuthoritativeOwnUploadQuarantineWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterComparisonApplication: (@Sendable (Object) throws -> Void)?
+    var _testAfterConflictRecoveryEvidenceMutation:
+        (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testAfterDisappearanceTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterDisappearanceTrackingWrite:
@@ -12024,6 +12026,13 @@ extension RealmSwiftAdapter {
                     revision: realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)?.revision,
                     signature: contract.signature, context: context, in: realm)
                 if nextID != conflictID { previous.isResolved = true }
+#if DEBUG
+                try _testAfterConflictRecoveryEvidenceMutation?()
+#endif
+                // Account notifications revoke the caller's captured lease
+                // before the actor-owned namespace update can run. Check while
+                // replacement/retirement of review evidence can still roll back.
+                try validateAuthority()
             }
             // Old quarantine remains until an explicit record decision; no
             // successful publication may be inferred from refreshing a view.
@@ -12076,6 +12085,10 @@ public extension RealmSwiftAdapter {
                     .filter("id IN %@", Array(retiredConflictIDs)).where {
                         $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
                     })
+#if DEBUG
+                try _testAfterConflictRecoveryEvidenceMutation?()
+#endif
+                try validateAuthority()
             }
         }
     }
