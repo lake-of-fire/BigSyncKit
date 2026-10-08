@@ -5,8 +5,47 @@ import RealmSwift
 import XCTest
 @testable import BigSyncKit
 
+#if DEBUG
+private final class ConflictDecisionAuthorityStore: NSObject, KeyValueStore {
+    private var values: [String: Any] = [:]
+    func object(forKey key: String) -> Any? { values[key] }
+    func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
+    func set(value: Any?, forKey key: String) { values[key] = value }
+    func set(boolValue: Bool, forKey key: String) { values[key] = boolValue }
+    func removeObject(forKey key: String) { values.removeValue(forKey: key) }
+    func synchronize() -> Bool { true }
+}
+
+/// Account validation needs identity providers only. Any accidental transport
+/// request fails rather than contacting CloudKit or claiming server acceptance.
+private final class ConflictDecisionAuthorityTransport: NSObject,
+    CloudKitDatabaseAdapter, CloudKitChangeFeed, CloudKitSubscriptionStore,
+    CloudKitZoneStore, CloudKitRecordStore, @unchecked Sendable {
+    private enum Failure: Error { case unexpectedTransport }
+    var databaseScope: CKDatabase.Scope { .private }
+    func databaseChanges(since cursor: DatabaseChangeCursor?, resultsLimit: Int?)
+        async throws -> CloudKitDatabaseChangePage { throw Failure.unexpectedTransport }
+    func recordZoneChanges(in zoneID: CKRecordZone.ID, since cursor: RecordZoneChangeCursor?,
+        desiredKeys: [CKRecord.FieldKey]?, resultsLimit: Int?)
+        async throws -> CloudKitRecordZoneChangePage { throw Failure.unexpectedTransport }
+    func subscription(withID identifier: CKSubscription.ID) async throws -> CKSubscription? {
+        throw Failure.unexpectedTransport
+    }
+    func save(subscription: CKSubscription) async throws -> CKSubscription { throw Failure.unexpectedTransport }
+    func deleteSubscription(withID identifier: CKSubscription.ID) async throws { throw Failure.unexpectedTransport }
+    func recordZone(withID identifier: CKRecordZone.ID) async throws -> CKRecordZone { throw Failure.unexpectedTransport }
+    func save(recordZone: CKRecordZone) async throws -> CKRecordZone { throw Failure.unexpectedTransport }
+    func deleteRecordZone(withID identifier: CKRecordZone.ID) async throws { throw Failure.unexpectedTransport }
+    func modifyRecords(saving records: [CKRecord], deleting recordIDs: [CKRecord.ID],
+        savePolicy: CKModifyRecordsOperation.RecordSavePolicy, atomically: Bool)
+        async throws -> CloudKitRecordMutationResults { throw Failure.unexpectedTransport }
+}
+#endif
+
 @objc(RetainedContractRow)
 private final class RetainedContractRow: Object, ChangeMetadataRecordable, BigSyncRecordContractProviding {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+
     static let bigSyncRecordContract = BigSyncRecordContract(
         policy: .lifetimeBundle(lifetimeField: "epoch", independentFields: ["title"]),
         deletion: .retained, semanticMetadataFields: ["createdAt"],
@@ -26,6 +65,8 @@ private final class RetainedContractRow: Object, ChangeMetadataRecordable, BigSy
 
 @objc(ContractRecoveryNote)
 private final class ContractRecoveryNote: Object, ChangeMetadataRecordable, BigSyncRecordContractProviding {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+
     static let bigSyncRecordContract = BigSyncRecordContract(
         policy: .independentFields, preserveConflictingFields: ["text"])
     @Persisted(primaryKey: true) var id = UUID()
@@ -39,6 +80,8 @@ private final class ContractRecoveryNote: Object, ChangeMetadataRecordable, BigS
 
 @objc(UnadoptedContractRow)
 private final class UnadoptedContractRow: Object, ChangeMetadataRecordable {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+
     @Persisted(primaryKey: true) var id = "plain"
     @Persisted var text = "local"
     @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 1)
@@ -51,6 +94,8 @@ private final class UnadoptedContractRow: Object, ChangeMetadataRecordable {
 private final class BoundContractControl: Object, ChangeMetadataRecordable,
     BigSyncRecordContractProviding, BigSyncInboundSemanticReplacementValidating,
     BigSyncInboundPendingSemanticReplacementValidating {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+
     static let bigSyncRecordContract = BigSyncRecordContract(
         policy: .lifetimeBundle(lifetimeField: "epoch", independentFields: []), deletion: .retained)
     @Persisted(primaryKey: true) var id = "control"
@@ -702,13 +747,19 @@ final class SyncRetainedRecordContractTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    private func unbasedRecoveryFixture(commitPage: Bool = false) async throws -> (RealmSwiftAdapter, Realm, RetainedContractRow, BigSyncRecordConflictSnapshot) {
+    private func unbasedRecoveryFixture(commitPage: Bool = false, stagedCandidate: Bool = false) async throws -> (RealmSwiftAdapter, Realm, RetainedContractRow, BigSyncRecordConflictSnapshot) {
         let (adapter, realm) = try await fixture()
         let object = RetainedContractRow()
         try realm.write {
             realm.add(object)
             object.title = "mine"
             object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        if stagedCandidate {
+            try await adapter.didFinishImport()
+            let batch = try await adapter.prepareUploadBatch(limit: 10)
+            XCTAssertEqual(batch.records.count, 1)
+            XCTAssertEqual(realm.objects(BigSyncRecordSubmission.self).count, 1)
         }
         let results = try await deliver([record(adapter, title: "theirs")], to: adapter)
         if commitPage {
@@ -723,6 +774,75 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         }
         return (adapter, realm, object, try XCTUnwrap(try adapter.unresolvedRecordConflicts().first))
     }
+
+#if DEBUG
+    @BigSyncBackgroundActor
+    func testConflictDecisionRollsBackAfterSynchronousAccountFencePoison() async throws {
+        for choice: BigSyncRecordConflictChoice in [.keepLocal, .useIncoming] {
+            let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture(
+                commitPage: true, stagedCandidate: true)
+            let transport = ConflictDecisionAuthorityTransport()
+            let synchronizer = CloudKitSynchronizer(
+                identifier: "conflict-final-authority-" + UUID().uuidString,
+                containerIdentifier: "iCloud.test.conflict-final-authority",
+                database: transport, recordZoneID: adapter.recordZoneID,
+                keyValueStore: ConflictDecisionAuthorityStore(),
+                accountIdentifierProvider: { "account" },
+                accountStatusProvider: { .available },
+                logger: Logger(label: "ConflictDecisionAuthorityTests"))
+            addTeardownBlock { @BigSyncBackgroundActor in
+                adapter._testAfterComparisonApplication = nil
+                await synchronizer.cancelSynchronizationAndWait()
+            }
+            try await synchronizer._test_validateSynchronizationAccount()
+            let lease = try XCTUnwrap(synchronizer.accountScopeLease())
+            try synchronizer.validateAccountScopeLease(lease)
+            let fence = synchronizer.accountScopeAuthorityFence
+            let context = try XCTUnwrap(adapter.recordRebaseContext)
+            let originalFields = try BigSyncRecordFingerprint.fields(of: object)
+            let originalModifiedAt = object.modifiedAt
+            let originalExplicitlyModifiedAt = object.explicitlyModifiedAt
+            let pendingGeneration = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first).generation
+            let candidateIdentity = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first).candidateIdentity
+            let unresolvedIDs = try adapter.unresolvedRecordConflicts().map(\.id)
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            let quarantine = try XCTUnwrap(tracking.objects(BigSyncInboundSemanticQuarantine.self).first)
+            let lineageID = quarantine.lineageID
+            let pageReceiptID = quarantine.committedPageReceiptID
+            XCTAssertFalse(pageReceiptID.isEmpty)
+            XCTAssertTrue(realm.objects(BigSyncRecordBaseline.self).isEmpty)
+
+            // Use the very fence poisoned by the production CKAccountChanged
+            // observer. Avoid a global notification that would revoke unrelated
+            // synchronizers in the composed test process. No observer task is
+            // scheduled; adapter binding remains unchanged during this write.
+            adapter._testAfterComparisonApplication = { _ in fence.poison() }
+            do {
+                try await adapter.resolveRecordConflict(id: conflict.id,
+                    expectedGeneration: conflict.generation, choice: choice,
+                    validateAuthority: { try synchronizer.validateAccountScopeLease(lease) })
+                XCTFail("The account lease was revoked while the complete decision was provisional")
+            } catch BigSyncAccountScopeLeaseError.unavailable { }
+            adapter._testAfterComparisonApplication = nil
+
+            XCTAssertTrue(fence.rejectsAuthority)
+            XCTAssertEqual(adapter.recordRebaseContext, context)
+            try context.validate(in: realm)
+            XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: object), originalFields)
+            XCTAssertEqual(object.modifiedAt, originalModifiedAt)
+            XCTAssertEqual(object.explicitlyModifiedAt, originalExplicitlyModifiedAt)
+            XCTAssertTrue(realm.objects(BigSyncRecordBaseline.self).isEmpty)
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pendingGeneration)
+            XCTAssertEqual(try adapter.unresolvedRecordConflicts().map(\.id), unresolvedIDs)
+            XCTAssertEqual(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity, candidateIdentity)
+            XCTAssertEqual(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+                forPrimaryKey: lineageID)?.committedPageReceiptID, pageReceiptID)
+            XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+                forPrimaryKey: pageReceiptID))
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+    }
+#endif
 
     @BigSyncBackgroundActor
     func testRevokedResolutionAuthorityCannotCommitEitherChoice() async throws {
@@ -832,11 +952,18 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture()
         let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
         let lineage = try XCTUnwrap(tracking.objects(BigSyncInboundSemanticQuarantine.self).first).lineageID
-        let authority = RecoveryAuthority(revokeOnValidation: 3)
         do {
             try await adapter.resolveRecordConflict(id: conflict.id,
                 expectedGeneration: conflict.generation, choice: .keepLocal,
-                validateAuthority: { try authority.validate() })
+                validateAuthority: {
+                    // Revoke only after the durable target decision. Additional
+                    // checks while that decision is provisional retain authority.
+                    if !realm.isInWriteTransaction,
+                       realm.object(ofType: BigSyncRecordConflict.self,
+                                    forPrimaryKey: conflict.id)?.isResolved == true {
+                        throw RecoveryAuthority.Failure.revoked
+                    }
+                })
             XCTFail("A later tracking write must not reuse the target write's authority check")
         } catch RecoveryAuthority.Failure.revoked { }
         XCTAssertEqual(object.title, "mine")

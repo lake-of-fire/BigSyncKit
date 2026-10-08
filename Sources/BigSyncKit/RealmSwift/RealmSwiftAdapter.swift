@@ -11347,6 +11347,10 @@ extension RealmSwiftAdapter {
                 if let submission = matchingSubmission(recordName: name, context: context, in: realm) {
                     realm.delete(submission)
                 }
+                // Account notifications revoke the caller's lease synchronously,
+                // before actor-isolated adapter identity catches up. Reject that
+                // revocation while this complete decision can still roll back.
+                try validateAuthority()
             }
             // A crash here keeps the target decision durable. The next normal
             // import/own echo retires page quarantine; no cursor is fabricated.
