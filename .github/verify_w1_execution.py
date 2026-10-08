@@ -37,6 +37,13 @@ EXPECTED = {
         "testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline",
         "testTerminalLocalDeleteRetiresItsSupersededStagedSave",
         "testFetchedDeletionPageReplaysAfterTargetFirstInterruptionWithoutDeletingAgain",
+        "testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval",
+        "testSemanticQuarantineUsesCommittedFeedEpoch",
+        "testServerEvidenceIgnoresProvisionalAcknowledgement",
+        "testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement",
+        "testServerEvidencePreservesExactAndCatalogStatePolicies",
+        "testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm",
+        "testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership",
     ),
     "CloudKitSynchronizerAccountFencingTests": (
         "testCancelledWorkerPreflightDoesNotScheduleRetry",

@@ -1080,9 +1080,13 @@ public final class RealmSwiftAdapter:
         guard activeAccountScopeIdentifier == accountScopeIdentifier else {
             return false
         }
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
+        let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        try validateOwner()
         let matchingAccount = activeInboundSemanticQuarantines(
             accountScopeIdentifier: accountScopeIdentifier,
-            in: persistenceRealm
+            in: snapshot
         ).where { $0.entityType == entityType }
         guard let semanticScopeIdentifier else {
             return !matchingAccount.isEmpty
@@ -1131,33 +1135,23 @@ public final class RealmSwiftAdapter:
         guard let persistenceRealm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
-        guard let entity = persistenceRealm.object(
+        guard activeAccountScopeIdentifier != nil else { return nil }
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
+        let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        try validateOwner()
+        guard let entity = snapshot.object(
             ofType: SyncedEntity.self,
             forPrimaryKey: recordName
         ), entity.entityType == expectedEntityType,
            entity.entityState == .synced,
-           entity.pendingGeneration == nil,
-           let record = getRecord(for: entity),
-           record.recordID.recordName == recordName,
-           record.recordType == expectedEntityType,
-           let changeTag = record.recordChangeTag,
-           !changeTag.isEmpty,
-           let modifiedAt = record.modificationDate else {
-            return nil
-        }
-        if accountScopePropertyByClassName[expectedEntityType] != nil {
-            guard syncedEntityIsEligibleForActiveAccount(entity) else {
-                return nil
-            }
-        } else if activeAccountScopeIdentifier == nil {
-            return nil
-        }
-        return BigSyncServerRecordEvidence(
-            recordName: recordName,
-            entityType: expectedEntityType,
-            recordChangeTag: changeTag,
-            serverModifiedAt: modifiedAt
+           entity.pendingGeneration == nil else { return nil }
+        var targetSnapshots = [String: Realm]()
+        let evidence = serverRecordEvidence(
+            for: entity, targetSnapshots: &targetSnapshots
         )
+        try validateOwner()
+        return evidence
     }
 
     /// Enumerates current-account server membership known at the adapter's
@@ -1182,9 +1176,13 @@ public final class RealmSwiftAdapter:
         guard let persistenceRealm = realmProvider?.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
-
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
+        let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        try validateOwner()
+        var targetSnapshots = [String: Realm]()
         var evidence = [BigSyncServerRecordEvidence]()
-        for entity in persistenceRealm.objects(SyncedEntity.self).filter(
+        for entity in snapshot.objects(SyncedEntity.self).filter(
             "entityType IN %@",
             Array(entityTypes)
         ) {
@@ -1195,31 +1193,58 @@ public final class RealmSwiftAdapter:
                  .awaitingServerEvidence:
                 continue
             }
-            if accountScopePropertyByClassName[entity.entityType] != nil,
-               !syncedEntityIsEligibleForActiveAccount(entity) {
-                continue
+            if let item = serverRecordEvidence(
+                for: entity, targetSnapshots: &targetSnapshots
+            ) {
+                evidence.append(item)
             }
-            guard let record = getRecord(for: entity),
-                  record.recordID.recordName == entity.identifier,
-                  record.recordType == entity.entityType,
-                  let changeTag = record.recordChangeTag,
-                  !changeTag.isEmpty,
-                  let modifiedAt = record.modificationDate else {
-                continue
-            }
-            evidence.append(BigSyncServerRecordEvidence(
-                recordName: entity.identifier,
-                entityType: entity.entityType,
-                recordChangeTag: changeTag,
-                serverModifiedAt: modifiedAt
-            ))
         }
+        try validateOwner()
         return evidence.sorted { lhs, rhs in
             if lhs.entityType != rhs.entityType {
                 return lhs.entityType < rhs.entityType
             }
             return lhs.recordName < rhs.recordName
         }
+    }
+
+    /// Both public evidence queries use the same committed account and record
+    /// identity checks. A provisional target reassignment or tracking receipt
+    /// must not become durable publication or membership evidence.
+    @BigSyncBackgroundActor
+    private func serverRecordEvidence(
+        for entity: SyncedEntity,
+        targetSnapshots: inout [String: Realm]
+    ) -> BigSyncServerRecordEvidence? {
+        if accountScopePropertyByClassName[entity.entityType] != nil {
+            guard let target = realmProvider?
+                .targetReaderRealmPerSchemaName[entity.entityType] else {
+                return nil
+            }
+            let targetIdentity = BigSyncMutationTrackingRegistry.identity(
+                for: target.configuration
+            )
+            if targetSnapshots[targetIdentity] == nil {
+                targetSnapshots[targetIdentity] =
+                    committedRealmReadSnapshot(in: target)
+            }
+            guard let snapshot = targetSnapshots[targetIdentity],
+                  syncedEntityIsEligibleForActiveAccount(
+                    entity, targetReadSnapshot: snapshot
+                  ) else { return nil }
+        }
+        guard let record = getRecord(for: entity),
+              record.recordID.recordName == entity.identifier,
+              record.recordID.zoneID == recordZoneID,
+              record.recordType == entity.entityType,
+              let changeTag = record.recordChangeTag, !changeTag.isEmpty,
+              let modifiedAt = record.modificationDate else { return nil }
+        return BigSyncServerRecordEvidence(
+            recordName: entity.identifier,
+            entityType: entity.entityType,
+            recordChangeTag: changeTag,
+            serverModifiedAt: modifiedAt
+        )
     }
 
     /// Captures inspection configurations without opening the operational
