@@ -11,6 +11,9 @@ finish() {
   if [[ -f "$root/Package.resolved" ]]; then
     cp "$root/Package.resolved" "$evidence/Package.resolved" || status=1
   fi
+  if [[ -f "$root/.build/debug.yaml" ]]; then
+    cp "$root/.build/debug.yaml" "$evidence/clang-build-plan.yaml" || status=1
+  fi
   printf '%s\n' "$status" > "$evidence/overall-status.txt"
   exit "$status"
 }
@@ -23,7 +26,7 @@ printf '%s\n' '-Xcxx -fno-modules' > "$evidence/cxx-build-flags.txt"
 set +e
 # Realm Core's C++ headers are compiled textually: SwiftPM 6.2.1 otherwise
 # rejects its s2geometry dependency as an unavailable implicit Clang module.
-swift test --package-path "$root" --configuration debug -Xcxx -fno-modules \
+swift test --verbose --package-path "$root" --configuration debug -Xcxx -fno-modules \
   --filter HotfixCollectionSafetyTests \
   --parallel --num-workers 1 --disable-swift-testing \
   --xunit-output "$evidence/native.junit.xml" 2>&1 | tee "$evidence/native.log"
