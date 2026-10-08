@@ -1034,9 +1034,12 @@ public final class RealmSwiftAdapter:
         guard activeAccountScopeIdentifier == accountScopeIdentifier else {
             return false
         }
+        let committedPersistence = committedRealmReadSnapshot(
+            in: persistenceRealm
+        )
         let matchingAccount = activeInboundSemanticQuarantines(
             accountScopeIdentifier: accountScopeIdentifier,
-            in: persistenceRealm
+            in: committedPersistence
         ).where { $0.entityType == entityType }
         guard let semanticScopeIdentifier else {
             return !matchingAccount.isEmpty
@@ -9502,8 +9505,14 @@ public final class RealmSwiftAdapter:
     @BigSyncBackgroundActor
     public func pendingCommittedInboundIdentityBatch() throws
         -> CommittedInboundIdentityBatch? {
-        guard let persistenceRealm = realmProvider?.persistenceRealm,
-              let delivery = persistenceRealm.object(
+        guard let persistenceRealm = realmProvider?.persistenceRealm else {
+            return nil
+        }
+        // Domain reconciliation consumes only identities whose page and cursor
+        // committed together. A different owner may hold a suspended write on
+        // this handle; its provisional delivery is not a committed page.
+        let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        guard let delivery = snapshot.object(
                 ofType: BigSyncPendingInboundIdentityDelivery.self,
                 forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
               ), !delivery.deliveryID.isEmpty else { return nil }
