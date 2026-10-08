@@ -42,7 +42,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/RealmSwiftGaps
-          ref: 2d4fa2bfd8b1c856b45aca2c7a97c301d37204e2
+          # Match the Realm ownership helper selected by Reader PR #286.
+          ref: fb1af9b1375463d79997c42ac306dc27a6e623b3
           path: RealmSwiftGaps
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -89,6 +90,7 @@ jobs:
         working-directory: BigSyncKit
         env:
           SWIFT_BACKTRACE: enable=yes,interactive=no
+          BIGSYNC_RUN_MUTATION_BENCHMARK: "0"
         run: |
           set -euo pipefail
           # Never reuse a previous run's build or case logs. Later phases reuse
