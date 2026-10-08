@@ -286,6 +286,8 @@ extension RealmSwiftAdapter {
     public func requeueMissingServerRecords(
         _ recordIDs: [CKRecord.ID], matchingPreparedUploads prepared: [PreparedRecordUpload]
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         let provider = realmProvider
         var byID = [CKRecord.ID: PreparedRecordUpload]()
         for item in prepared {
@@ -308,6 +310,7 @@ extension RealmSwiftAdapter {
         var legacyIDs = [CKRecord.ID]()
         var legacyGenerations = [String: String]()
         for recordID in recordIDs {
+            try validateOwner()
             guard let item = byID[recordID], let type = realmObjectClass(name: item.record.recordType) else {
                 throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
             }
@@ -371,9 +374,13 @@ extension RealmSwiftAdapter {
                     revision: committedRevision, in: target, provider: provider)
             }
         }
+        // The legacy tail belongs to the response's original operation too.
+        // A last proof-backed publication may suspend after its target phase.
+        try validateOwner()
         if !legacyIDs.isEmpty {
             try await requeueMissingServerRecords(legacyIDs, matchingPreparedGenerations: legacyGenerations)
         }
+        try validateOwner()
     }
 }
 
