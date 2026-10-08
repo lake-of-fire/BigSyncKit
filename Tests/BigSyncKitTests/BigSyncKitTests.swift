@@ -7,6 +7,36 @@ import Logging
 import RealmSwift
 import RealmSwiftGaps
 
+/// Realm exposes persisted properties through KVC, but a Swift @Persisted
+/// key path has no Objective-C key-path string for NSObject.observe to extract.
+/// Use the actual persisted column and preserve the synchronous KVO call stack.
+private final class RelationshipColumnObservation: NSObject {
+    private var observedObject: NSObject?
+    private let keyPath: String
+    private let onChange: @Sendable () -> Void
+
+    init(object: NSObject, keyPath: String, onChange: @escaping @Sendable () -> Void) {
+        observedObject = object
+        self.keyPath = keyPath
+        self.onChange = onChange
+        super.init()
+        object.addObserver(self, forKeyPath: keyPath, options: [.new], context: nil)
+    }
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
+                               change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
+        onChange()
+    }
+
+    func invalidate() {
+        guard let object = observedObject else { return }
+        observedObject = nil
+        object.removeObserver(self, forKeyPath: keyPath)
+    }
+
+    deinit { invalidate() }
+}
+
 private final class DictionaryKeyValueStore: NSObject, KeyValueStore {
     private var storage = [String: Any]()
     var synchronizesDurably = true
@@ -12548,22 +12578,25 @@ final class BigSyncKitTests: XCTestCase {
                 callback()
             }
         }
-        let observation: NSKeyValueObservation
+        let invalidateObservation: () -> Void
         if duringCleanup {
-            observation = intent.observe(\.isInvalidated, options: [.new]) { _, change in
+            let observation = intent.observe(\.isInvalidated, options: [.new]) { _, change in
                 if change.newValue == true { invoke() }
             }
+            invalidateObservation = { observation.invalidate() }
         } else {
-            observation = parent.observe(\.favoriteChild, options: [.new]) { _, _ in invoke() }
+            let observation = RelationshipColumnObservation(
+                object: parent, keyPath: "favoriteChild", onChange: invoke)
+            invalidateObservation = { observation.invalidate() }
         }
-        defer { observation.invalidate() }
+        defer { invalidateObservation() }
         do {
             try await fixture.adapter.persistImportedChanges()
             XCTFail("Synchronous KVO retired the relationship writer")
         } catch {
             XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)")
         }
-        observation.invalidate()
+        invalidateObservation()
         XCTAssertEqual(capture.callbackCount, 1, "The real mutation must invoke synchronous KVO")
         XCTAssertTrue(capture.sawOwningWrite)
         XCTAssertFalse(fixture.targetRealm.isInWriteTransaction)
