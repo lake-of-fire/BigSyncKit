@@ -133,7 +133,8 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     @BigSyncBackgroundActor
     func fixture(
         enableRecordRebasing: Bool = true,
-        replicaBindingGenerationIdentifier: String? = "w1-binding"
+        replicaBindingGenerationIdentifier: String? = "w1-binding",
+        accountScopePropertyByClassName: [String: String] = [:]
     ) async throws -> (RealmSwiftAdapter, Realm) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("w1-realms-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -145,7 +146,9 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         if enableRecordRebasing {
             BigSyncMutationPolicy.enableRecordRebasing(in: &target)
         }
-        BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [target],
+        BigSyncMutationPolicy(excludedClassNames: [],
+            accountScopePropertyByClassName: accountScopePropertyByClassName
+        ).install(configurations: [target],
             mutationJournalIdentityProvider: {
                 .init(installationIdentifier: "w1-local",
                     replicaBindingGenerationIdentifier: replicaBindingGenerationIdentifier)
@@ -154,6 +157,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         tracking.fileURL = directory.appendingPathComponent("tracking.realm")
         let adapter = RealmSwiftAdapter(persistenceRealmConfiguration: tracking,
             targetRealmConfigurations: [target], excludedClassNames: [],
+            accountScopePropertyByClassName: accountScopePropertyByClassName,
             recordZoneID: .init(zoneName: "w1-closeout"),
             logger: Logger(label: "W1Closeout"), startSetupTask: false)
         realmFixtureOwner.own(adapter)
