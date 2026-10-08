@@ -873,6 +873,118 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         await synchronizer.cancelSynchronizationAndWait()
     }
 
+
+
+    @BigSyncBackgroundActor
+    func testDefaultConflictResolutionRejectsCancellationResetAndFreshRetry() async throws {
+        for choice: BigSyncRecordConflictChoice in [.keepLocal, .useIncoming] {
+            let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture(
+                commitPage: true, stagedCandidate: true)
+            let originalFields = try BigSyncRecordFingerprint.fields(of: object)
+            let pending = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first).generation
+            let submission = try XCTUnwrap(realm.objects(BigSyncRecordSubmission.self).first).candidateIdentity
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            let quarantine = try XCTUnwrap(tracking.objects(BigSyncInboundSemanticQuarantine.self).first)
+            let lineageID = quarantine.lineageID
+            let receiptID = quarantine.committedPageReceiptID
+            adapter._testBeforeRecordConflictDecisionWrite = {
+                adapter.cancelSynchronization()
+                try adapter.prepareForFencedMigrationAfterCancellation()
+            }
+            defer { adapter._testBeforeRecordConflictDecisionWrite = nil }
+            do {
+                try await adapter.resolveRecordConflict(id: conflict.id,
+                    expectedGeneration: conflict.generation, choice: choice)
+                XCTFail("Default conflict authority adopted a successor cancellation generation")
+            } catch is CancellationError { }
+            XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: object), originalFields)
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+            XCTAssertEqual(realm.objects(BigSyncRecordSubmission.self).first?.candidateIdentity, submission)
+            XCTAssertTrue(realm.objects(BigSyncRecordBaseline.self).isEmpty)
+            XCTAssertEqual(try adapter.unresolvedRecordConflicts().map(\.id), [conflict.id])
+            XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineageID))
+            XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: receiptID))
+
+            adapter._testBeforeRecordConflictDecisionWrite = nil
+            try await adapter.unsetCancellation()
+            try await adapter.resolveRecordConflict(id: conflict.id,
+                expectedGeneration: conflict.generation, choice: choice)
+            XCTAssertEqual(object.title, choice == .keepLocal ? "mine" : "theirs")
+            XCTAssertTrue(try adapter.unresolvedRecordConflicts().isEmpty)
+            XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineageID))
+            XCTAssertNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: receiptID))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDefaultConflictRefreshRejectsCancellationResetAndFreshRetry() async throws {
+        let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture()
+        try realm.write {
+            object.title = "new typing"
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let pending = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first).generation
+        adapter._testAfterConflictRecoveryEvidenceMutation = {
+            XCTAssertEqual(realm.object(ofType: BigSyncRecordConflict.self,
+                forPrimaryKey: conflict.id)?.isResolved, true)
+            adapter.cancelSynchronization()
+            try adapter.prepareForFencedMigrationAfterCancellation()
+        }
+        defer { adapter._testAfterConflictRecoveryEvidenceMutation = nil }
+        do {
+            try await adapter.refreshRecordConflict(conflict.id)
+            XCTFail("Default refresh authority adopted a successor cancellation generation")
+        } catch is CancellationError { }
+        XCTAssertEqual(try adapter.unresolvedRecordConflicts().map(\.id), [conflict.id])
+        XCTAssertEqual(try adapter.unresolvedRecordConflicts().first?.generation, conflict.generation)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+        XCTAssertEqual(object.title, "new typing")
+
+        adapter._testAfterConflictRecoveryEvidenceMutation = nil
+        try await adapter.unsetCancellation()
+        try await adapter.refreshRecordConflict(conflict.id)
+        let fresh = try XCTUnwrap(try adapter.unresolvedRecordConflicts().first)
+        XCTAssertEqual(fresh.generation, pending)
+        XCTAssertEqual(object.title, "new typing")
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+    }
+
+    @BigSyncBackgroundActor
+    func testDefaultConflictArchiveCleanupRejectsCancellationResetAndFreshRetry() async throws {
+        let (adapter, realm, _, conflict) = try await unbasedRecoveryFixture()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let quarantine = try XCTUnwrap(tracking.objects(BigSyncInboundSemanticQuarantine.self).first)
+        let residual = BigSyncInboundSemanticQuarantine(value: quarantine)
+        let lineageID = residual.lineageID
+        try await adapter.resolveRecordConflict(id: conflict.id,
+            expectedGeneration: conflict.generation, choice: .keepLocal)
+        try tracking.write { tracking.add(residual, update: .modified) }
+        let archive = try XCTUnwrap(realm.objects(BigSyncRecordConflict.self).first).localPayload
+        let pending = realm.objects(BigSyncPendingMutation.self).first?.generation
+        adapter._testAfterConflictRecoveryEvidenceMutation = {
+            XCTAssertTrue(realm.objects(BigSyncRecordConflict.self).isEmpty,
+                "Archive deletion must be provisional before owner retirement")
+            adapter.cancelSynchronization()
+            try adapter.prepareForFencedMigrationAfterCancellation()
+        }
+        defer { adapter._testAfterConflictRecoveryEvidenceMutation = nil }
+        do {
+            try await adapter.discardResolvedRecordConflictArchives()
+            XCTFail("Default archive authority retired old evidence under a successor owner")
+        } catch is CancellationError { }
+        // Tracking retired under valid authority before this target write.
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineageID))
+        XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).first?.localPayload, archive)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+
+        adapter._testAfterConflictRecoveryEvidenceMutation = nil
+        try await adapter.unsetCancellation()
+        try await adapter.discardResolvedRecordConflictArchives()
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineageID))
+        XCTAssertTrue(realm.objects(BigSyncRecordConflict.self).isEmpty)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, pending)
+    }
+
     @BigSyncBackgroundActor
     func testConflictDecisionRollsBackAfterSynchronousAccountFencePoison() async throws {
         for choice: BigSyncRecordConflictChoice in [.keepLocal, .useIncoming] {

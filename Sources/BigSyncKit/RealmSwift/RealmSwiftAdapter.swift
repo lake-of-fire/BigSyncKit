@@ -574,6 +574,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeAuthoritativeOwnUploadQuarantineWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforeRecordConflictDecisionWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterComparisonApplication: (@Sendable (Object) throws -> Void)?
     var _testAfterConflictRecoveryEvidenceMutation:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
@@ -11736,22 +11738,32 @@ extension RealmSwiftAdapter {
     /// independent; this callback must not suspend or acquire a session lock.
     public func resolveRecordConflict(
         id: String, expectedGeneration: String, choice: BigSyncRecordConflictChoice,
-        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+        validateAuthority: @escaping @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
-        try validateAuthority()
+        let validateOwner = operationOwnerValidator()
+        let validateConflictAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {
+            try validateOwner()
+            try validateAuthority()
+            try validateOwner()
+        }
+        try validateConflictAuthority()
         guard let context = recordRebaseContext else { throw CancellationError() }
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else {
                 continue
             }
             realm.refresh()
+            try validateOwner()
             guard let selected = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: id),
                   selected.namespace == context.namespace, !selected.isResolved else { continue }
             let name = selected.recordName, typeName = selected.entityType
             let incoming = try BigSyncRecordPayload.decode(selected.incomingPayload,
                                                            assetManager: persistentAssetManager)
+#if DEBUG
+            try await _testBeforeRecordConflictDecisionWrite?()
+#endif
             try await realm.asyncWritePreservingOwnership {
-                try validateAuthority()
+                try validateConflictAuthority()
                 try context.validate(in: realm)
                 guard recordRebaseContext == context,
                       let conflict = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: id),
@@ -11794,12 +11806,17 @@ extension RealmSwiftAdapter {
                 // Account notifications revoke the caller's lease synchronously,
                 // before actor-isolated adapter identity catches up. Reject that
                 // revocation while this complete decision can still roll back.
-                try validateAuthority()
+                try validateConflictAuthority()
             }
+            try validateConflictAuthority()
             // A crash here keeps the target decision durable. The next normal
             // import/own echo retires page quarantine; no cursor is fabricated.
-            try await forwardPendingMutations(pendingMutationSnapshots(for: [name], in: realm), in: realm)
-            try await retireResolvedRecordConflictQuarantines(validateAuthority: validateAuthority)
+            let pending = pendingMutationSnapshots(for: [name], in: realm)
+            try validateConflictAuthority()
+            try await forwardPendingMutations(pending, in: realm)
+            try validateConflictAuthority()
+            try await retireResolvedRecordConflictQuarantines(validateAuthority: validateConflictAuthority)
+            try validateConflictAuthority()
             return
         }
         throw BigSyncRecordContractError.staleConflict
@@ -12011,10 +12028,22 @@ extension RealmSwiftAdapter {
     @BigSyncBackgroundActor
     public func refreshRecordConflict(
         _ conflictID: String,
-        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+        validateAuthority: @escaping @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
+        // Preserve setup authority while allowing legitimate provider creation.
+        let validateSetupOwner = operationLifecycleValidator()
+        try validateSetupOwner()
         try validateAuthority()
+        try validateSetupOwner()
         try await ensureSetup()
+        try validateSetupOwner()
+        let validateOwner = operationOwnerValidator()
+        let validateConflictAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {
+            try validateOwner()
+            try validateAuthority()
+            try validateOwner()
+        }
+        try validateOwner()
         guard let context = recordRebaseContext, let provider = realmProvider else {
             throw BigSyncRecordContractError.staleConflict
         }
@@ -12025,7 +12054,7 @@ extension RealmSwiftAdapter {
             let name = snapshot.recordName, typeName = snapshot.entityType
             let record = try BigSyncRecordPayload.decode(snapshot.incomingPayload)
             try await realm.asyncWritePreservingOwnership {
-                try validateAuthority()
+                try validateConflictAuthority()
                 guard recordRebaseContext == context else { throw CancellationError() }
                 try context.validate(in: realm)
                 guard let previous = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: conflictID),
@@ -12046,11 +12075,9 @@ extension RealmSwiftAdapter {
 #if DEBUG
                 try _testAfterConflictRecoveryEvidenceMutation?()
 #endif
-                // Account notifications revoke the caller's captured lease
-                // before the actor-owned namespace update can run. Check while
-                // replacement/retirement of review evidence can still roll back.
-                try validateAuthority()
+                try validateConflictAuthority()
             }
+            try validateConflictAuthority()
             // Old quarantine remains until an explicit record decision; no
             // successful publication may be inferred from refreshing a view.
             return
@@ -12085,17 +12112,25 @@ public extension RealmSwiftAdapter {
     /// room, and no pending submission or mutation generation is touched.
     @BigSyncBackgroundActor
     func discardResolvedRecordConflictArchives(
-        validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
+        validateAuthority: @escaping @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
-        try validateAuthority()
+        let validateOwner = operationOwnerValidator()
+        let validateConflictAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {
+            try validateOwner()
+            try validateAuthority()
+            try validateOwner()
+        }
+        try validateConflictAuthority()
         guard let context = recordRebaseContext else { throw CancellationError() }
+        try validateOwner()
         let retiredConflictIDs = try await retireResolvedRecordConflictQuarantines(
-            validateAuthority: validateAuthority)
+            validateAuthority: validateConflictAuthority)
+        try validateConflictAuthority()
         guard !retiredConflictIDs.isEmpty else { return }
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
             try await realm.asyncWritePreservingOwnership {
-                try validateAuthority()
+                try validateConflictAuthority()
                 guard recordRebaseContext == context else { throw CancellationError() }
                 try context.validate(in: realm)
                 realm.delete(realm.objects(BigSyncRecordConflict.self)
@@ -12105,8 +12140,9 @@ public extension RealmSwiftAdapter {
 #if DEBUG
                 try _testAfterConflictRecoveryEvidenceMutation?()
 #endif
-                try validateAuthority()
+                try validateConflictAuthority()
             }
+            try validateConflictAuthority()
         }
     }
 }

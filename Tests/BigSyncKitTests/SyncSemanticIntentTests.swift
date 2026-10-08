@@ -67,7 +67,7 @@ final class SyncSemanticIntentTests: XCTestCase {
     private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 
     @BigSyncBackgroundActor
-    private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
+    private func fixture(initializingLazily: Bool = false) async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString
         var target = Realm.Configuration()
         target.inMemoryIdentifier = "semantic-intent-target-" + nonce
@@ -91,8 +91,10 @@ final class SyncSemanticIntentTests: XCTestCase {
             startSetupTask: false
         )
         realmFixtureOwner.own(adapter)
-        try await adapter.resetSyncCaches()
-        adapter.invalidateTokens()
+        if !initializingLazily {
+            try await adapter.resetSyncCaches()
+            adapter.invalidateTokens()
+        }
         adapter.mergePolicy = .custom
         try await adapter.activateReplicaBinding(
             accountScopeIdentifier: "account",
@@ -101,6 +103,11 @@ final class SyncSemanticIntentTests: XCTestCase {
         try await adapter.activateTransportNamespace(
             containerIdentifier: "iCloud.test.intent", databaseScope: .private
         )
+        if initializingLazily {
+            XCTAssertNil(adapter.realmProvider)
+            let outcomes = try await adapter.validateAuthoritativeOwnUploadRecords([])
+            XCTAssertTrue(outcomes.isEmpty)
+        }
         return (adapter, try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first))
     }
 
@@ -395,6 +402,57 @@ extension SyncSemanticIntentTests {
         XCTAssertEqual(realm.object(ofType: SyncIntentSnapshot.self, forPrimaryKey: "one")?.payload, "valid")
         XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
     }
+
+#if DEBUG
+    @BigSyncBackgroundActor
+    func testOwnUploadAllowsInitialProviderSetupUnderOriginalLifecycle() async throws {
+        let (adapter, realm) = try await fixture(initializingLazily: true)
+        XCTAssertNotNil(adapter.realmProvider)
+        XCTAssertTrue(realm.objects(SyncIntentSnapshot.self).isEmpty)
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        XCTAssertTrue(tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testOwnUploadRetriesInterruptedNonnullProviderUnderOriginalLifecycle() async throws {
+        let (adapter, realm) = try await fixture()
+        let value = SyncIntentMutable()
+        value.id = "interrupted-setup"
+        try realm.write {
+            realm.add(value)
+            value.payload = "local recovery"
+            value.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let name = SyncIntentMutable.className() + ".interrupted-setup"
+        let generation = try XCTUnwrap(realm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation)
+        let originalProvider = try XCTUnwrap(adapter.realmProvider)
+        adapter._testBeforePendingMutationTrackingWrite = { throw IntentValidationError.invalid }
+        defer { adapter._testBeforePendingMutationTrackingWrite = nil }
+        do {
+            try await adapter._test_setup()
+            XCTFail("The fixture must stop setup after publishing its replacement provider")
+        } catch IntentValidationError.invalid { }
+        let interruptedProvider = try XCTUnwrap(adapter.realmProvider)
+        XCTAssertFalse(interruptedProvider === originalProvider)
+
+        adapter._testBeforePendingMutationTrackingWrite = nil
+        let result = try await adapter.validateAuthoritativeOwnUploadRecords([])
+        XCTAssertTrue(result.isEmpty)
+        XCTAssertFalse(adapter.realmProvider === interruptedProvider,
+            "Interrupted non-nil setup must be allowed to publish its ready replacement")
+        let readyRealm = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        XCTAssertEqual(readyRealm.object(ofType: SyncIntentMutable.self,
+            forPrimaryKey: "interrupted-setup")?.payload, "local recovery")
+        XCTAssertEqual(readyRealm.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation, generation)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: name)?.pendingGeneration, generation)
+    }
+#endif
+
 
 #if DEBUG
     @BigSyncBackgroundActor

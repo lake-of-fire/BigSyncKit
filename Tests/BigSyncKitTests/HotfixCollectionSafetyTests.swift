@@ -9,6 +9,7 @@ import XCTest
 @objc(HotfixCollectionReviewChild)
 private final class HotfixCollectionReviewChild: Object,
     ChangeMetadataRecordable, SoftDeletable {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted(primaryKey: true) var id = ""
     @Persisted var createdAt = Date()
     @Persisted var modifiedAt = Date()
@@ -21,6 +22,7 @@ private final class HotfixCollectionReviewChild: Object,
 @objc(HotfixCollectionReviewSupported)
 private final class HotfixCollectionReviewSupported: Object,
     ChangeMetadataRecordable {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted(primaryKey: true) var id = ""
     @Persisted var createdAt = Date()
     @Persisted var modifiedAt = Date()
@@ -36,6 +38,7 @@ private final class HotfixCollectionReviewSupported: Object,
 @objc(HotfixCollectionReviewObjectMap)
 private final class HotfixCollectionReviewObjectMap: Object,
     ChangeMetadataRecordable {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted(primaryKey: true) var id = ""
     @Persisted var createdAt = Date()
     @Persisted var modifiedAt = Date()
@@ -61,12 +64,14 @@ private final class HotfixCollectionReviewAssets: Object,
 
 @objc(HotfixCollectionReviewUnkeyed)
 private final class HotfixCollectionReviewUnkeyed: Object {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted var payload = "retained-local-value"
 }
 
 @objc(HotfixCollectionReviewUnsupported)
 private final class HotfixCollectionReviewUnsupported: Object,
     ChangeMetadataRecordable, SyncSkippablePropertiesModel {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
     @Persisted(primaryKey: true) var id = ""
     @Persisted var createdAt = Date()
     @Persisted var modifiedAt = Date()

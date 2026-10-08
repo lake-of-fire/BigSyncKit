@@ -32,6 +32,37 @@ EXPECTED = {
     ),
     "SyncRetainedRecordContractTests": (
         "testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence",
+        "testConflictRefreshRollsBackAfterSynchronousAccountFencePoison",
+        "testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison",
+    ),
+    "ChangeFeedMigrationResumeTests": (
+        "testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit",
+        "testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation",
+        "testBackupRestorePreservesCurrentMutationCommittedAfterSnapshot",
+        "testResetPreparationRejectsProvisionalPreparedMarkerAfterRollback",
+        "testBootstrapCannotSkipItsWriteForProvisionalCompletion",
+        "testFinishCannotSkipItsWriteForProvisionalCompletion",
+        "testReconciliationCannotAcceptProvisionalCompletionWithoutBootstrap",
+        "testEncryptedResetReuploadsRetainedLiveObjectBehindRolledBackDeletion",
+        "testEncryptedResetPreservesDeletionCommittedAfterRetainedCandidateSnapshot",
+        "testEstablishedServerEvidenceExcludesProvisionalMembershipUntilCommit",
+        "testResetTrackingPublicationUsesCommittedJournalBehindRolledBackSuccessor",
+        "testQueuedPreparationPreservesCommittedPreparedSuccessorAndProvenance",
+        "testQueuedPreparationPreservesCommittedCompleteSuccessorAndProvenance",
+        "testQueuedBootstrapTreatsCommittedCompletionAsNoOpWithoutRetiringProof",
+        "testQueuedFinishTreatsCommittedCompletionAsNoOpWithoutRetiringProof",
+        "testBootstrapRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker",
+        "testReconciliationRejectsCancellationAfterTrackingCommitSubmission",
+        "testFinishRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker",
+        "testFencedResetCancellationAfterTrackingCommitPreservesProviderAndDurableReset",
+        "testFencedResetPreservesPreparedSuccessorAtOwnedResetAdmission",
+        "testFencedResetPreservesCompleteSuccessorAtOwnedResetAdmission",
+    ),
+    "HotfixCollectionSafetyTests": (
+        "testAssetInScalarFieldRejectsNewReceiverBeforeRealmAssignment",
+        "testAssetInScalarFieldRollsBackExistingValueAndTracking",
+        "testComparisonDecoderRejectsAssetInScalarField",
+        "testReadableDataAssetsDecodeAndMissingFilesRollBack",
     ),
     "SyncUndoCloseoutW1Tests": (
         "testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline",
@@ -135,7 +166,9 @@ FOCUSED_FILTER = (
     r"BigSyncWorkerRequestCancellationTests|ChangeRequestProcessorCancellationTests|"
     r"SynchronizationProcessorStartupTests|BigSyncScheduledRetryTests|"
     r"BigSyncDeadlineRaceTests|SyncSplitOperationOwnershipTests|SyncPhaseAttemptOwnershipTests)/"
-    r"|SyncRetainedRecordContractTests/testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence$)"
+    r"|SyncRetainedRecordContractTests/(?:testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence|testConflictRefreshRollsBackAfterSynchronousAccountFencePoison|testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison)$"
+    r"|HotfixCollectionSafetyTests/(?:testAssetInScalarFieldRejectsNewReceiverBeforeRealmAssignment|testAssetInScalarFieldRollsBackExistingValueAndTracking|testComparisonDecoderRejectsAssetInScalarField|testReadableDataAssetsDecodeAndMissingFilesRollBack)$"
+    r"|ChangeFeedMigrationResumeTests/(?:testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit|testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation|testBackupRestorePreservesCurrentMutationCommittedAfterSnapshot|testResetPreparationRejectsProvisionalPreparedMarkerAfterRollback|testBootstrapCannotSkipItsWriteForProvisionalCompletion|testFinishCannotSkipItsWriteForProvisionalCompletion|testReconciliationCannotAcceptProvisionalCompletionWithoutBootstrap|testEncryptedResetReuploadsRetainedLiveObjectBehindRolledBackDeletion|testEncryptedResetPreservesDeletionCommittedAfterRetainedCandidateSnapshot|testEstablishedServerEvidenceExcludesProvisionalMembershipUntilCommit|testResetTrackingPublicationUsesCommittedJournalBehindRolledBackSuccessor|testQueuedPreparationPreservesCommittedPreparedSuccessorAndProvenance|testQueuedPreparationPreservesCommittedCompleteSuccessorAndProvenance|testQueuedBootstrapTreatsCommittedCompletionAsNoOpWithoutRetiringProof|testQueuedFinishTreatsCommittedCompletionAsNoOpWithoutRetiringProof|testBootstrapRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker|testReconciliationRejectsCancellationAfterTrackingCommitSubmission|testFinishRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker|testFencedResetCancellationAfterTrackingCommitPreservesProviderAndDurableReset|testFencedResetPreservesPreparedSuccessorAtOwnedResetAdmission|testFencedResetPreservesCompleteSuccessorAtOwnedResetAdmission)$)"
 )
 FOCUSED = re.compile(FOCUSED_FILTER)
 
