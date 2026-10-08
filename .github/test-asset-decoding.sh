@@ -33,9 +33,39 @@ export CC="$(xcrun -f clang)"
 printf '%s\n' "$CC" > "$evidence/selected-clang-path.txt"
 "$CC" --version > "$evidence/selected-clang-version.txt"
 
+python3 - "$root" "$evidence" <<'PY'
+import json, re, sys
+from collections import Counter
+from pathlib import Path
+root, evidence = map(Path, sys.argv[1:])
+configuration = {'complete': ['HotfixCollectionSafetyTests', 'SyncRetainedRecordContractTests', 'SyncSplitOperationOwnershipTests', 'ChangeFeedMigrationResumeTests', 'SyncPhaseAttemptOwnershipTests'], 'focused': {'SyncUndoCloseoutW1Tests': {'source': 'SyncUndoCloseoutW1UploadSnapshotTests.swift', 'methods': ['testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval', 'testSemanticQuarantineUsesCommittedFeedEpoch', 'testServerEvidenceIgnoresProvisionalAcknowledgement', 'testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement', 'testServerEvidencePreservesExactAndCatalogStatePolicies', 'testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm', 'testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership']}, 'BigSyncKitTests': {'source': 'BigSyncKitTests.swift', 'methods': ['testInboundIdentityDeliveryIgnoresProvisionalInsert', 'testInboundIdentityDeliveryRetainsCommittedBatchDuringProvisionalChanges', 'testInboundSemanticQuarantineInspectionRetainsCommittedBlocker']}}}
+expected = Counter()
+def methods(source):
+    # Authored selector accounting, not an assertion about production source.
+    source = re.sub(r'(?P<raw>#+)(?:"""[\s\S]*?"""|"[\s\S]*?")(?P=raw)|/\*[\s\S]*?\*/|//[^\n]*|"""[\s\S]*?"""|"(?:\\.|[^"\\])*"',
+                    lambda m: ' ' * len(m.group()), source)
+    return Counter(re.findall(r'\bfunc\s+(test\w+)\s*\(', source))
+for classname in configuration['complete']:
+    source = root / 'Tests/BigSyncKitTests' / (classname + '.swift')
+    authored = methods(source.read_text())
+    assert authored and all(n == 1 for n in authored.values()), classname
+    expected.update({(classname, method): 1 for method in authored})
+for classname, selection in configuration['focused'].items():
+    source = root / 'Tests/BigSyncKitTests' / selection['source']
+    authored = methods(source.read_text())
+    assert all(authored[method] == 1 for method in selection['methods']), classname
+    expected.update({(classname, method): 1 for method in selection['methods']})
+assert expected and all(n == 1 for n in expected.values()), 'Ambiguous native roster'
+identities = sorted('BigSyncKitTests.' + classname + '/' + method for classname, method in expected)
+(evidence / 'expected-methods.json').write_text(json.dumps(identities, indent=2) + '\n')
+(evidence / 'selection-scope.json').write_text(json.dumps(configuration, indent=2) + '\n')
+(evidence / 'native-filter.txt').write_text('^(?:' + '|'.join(re.escape(identity) for identity in identities) + ')$\n')
+print(f'Requires {len(expected)} native methods: five complete classes and ten additional focused methods')
+PY
+
 set +e
-swift test --verbose --package-path "$root" --configuration debug \
-  --filter 'BigSyncKitTests\.(HotfixCollectionSafetyTests|SyncRetainedRecordContractTests|SyncSplitOperationOwnershipTests|ChangeFeedMigrationResumeTests|SyncPhaseAttemptOwnershipTests)/' \
+swift test --package-path "$root" --configuration debug \
+  --filter "$(cat "$evidence/native-filter.txt")" \
   --parallel --num-workers 1 --disable-swift-testing \
   --xunit-output "$evidence/native.junit.xml" 2>&1 | tee "$evidence/native.log" | xcsift
 statuses=("${PIPESTATUS[@]}")
@@ -45,37 +75,25 @@ if [[ "${statuses[0]}" != 0 || "${statuses[1]}" != 0 || "${statuses[2]}" != 0 ]]
   exit 1
 fi
 
-python3 - "$root" "$evidence" <<'PY'
-import json
-import re
-import sys
+python3 - "$evidence" <<'PY'
+import json, sys
 import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
-
-root, evidence = map(Path, sys.argv[1:])
-expected = Counter()
-classes = ("HotfixCollectionSafetyTests", "SyncRetainedRecordContractTests",
-           "SyncSplitOperationOwnershipTests", "ChangeFeedMigrationResumeTests",
-           "SyncPhaseAttemptOwnershipTests")
-for classname in classes:
-    source = (root / "Tests/BigSyncKitTests" / (classname + ".swift")).read_text()
-    # This inventories authored selectors for comparison to actual XCTest XML;
-    # it does not assert on production implementation or replace discovery.
-    source = re.sub(r'/\*[\s\S]*?\*/|//[^\n]*|"""[\s\S]*?"""|"(?:\\.|[^"\\])*"',
-                    lambda match: " " * len(match.group()), source)
-    for method in re.findall(r'\bfunc\s+(test\w+)\s*\(', source):
-        expected[(classname, method)] += 1
-assert expected and all(count == 1 for count in expected.values()), "Ambiguous authored roster"
-(evidence / "expected-methods.json").write_text(json.dumps(sorted("/".join(key) for key in expected), indent=2) + "\n")
-
-document = ET.parse(evidence / "native.junit.xml")
-cases = list(document.iter("testcase"))
-actual = Counter((case.attrib.get("classname", "").rsplit(".", 1)[-1],
-                  case.attrib.get("name", "").removesuffix("()").rsplit("/", 1)[-1].rsplit(".", 1)[-1])
+evidence = Path(sys.argv[1])
+expected = Counter(tuple(identity.removeprefix('BigSyncKitTests.').split('/'))
+                   for identity in json.loads((evidence / 'expected-methods.json').read_text()))
+document = ET.parse(evidence / 'native.junit.xml')
+cases = list(document.iter('testcase'))
+actual = Counter((case.attrib.get('classname', '').rsplit('.', 1)[-1],
+                  case.attrib.get('name', '').removesuffix('()').rsplit('/', 1)[-1].rsplit('.', 1)[-1])
                  for case in cases)
-assert actual == expected, {"missing": list((expected - actual).elements()), "unexpected": list((actual - expected).elements())}
-assert not any(case.find(tag) is not None for case in cases for tag in ("failure", "error", "skipped")), "Native selection did not pass without skips"
-assert all(int(suite.attrib.get(key, "0")) == 0 for suite in document.iter("testsuite") for key in ("errors", "failures", "skipped")), "JUnit aggregate failure or skip"
-print(f"Passed all {len(cases)} authored native methods across {len(classes)} complete release-boundary classes")
+assert actual == expected, {'missing': list((expected - actual).elements()), 'unexpected': list((actual - expected).elements())}
+assert not any(case.find(tag) is not None for case in cases for tag in ('failure', 'error', 'skipped')), 'Native selection did not pass without skips'
+assert all(int(suite.attrib.get(key, '0')) == 0 for suite in document.iter('testsuite') for key in ('errors', 'failures', 'skipped')), 'JUnit aggregate failure or skip'
+summary = {'passed': len(cases), 'failed': 0, 'errors': 0, 'skipped': 0,
+           'classes': dict(Counter(classname for classname, method in actual)),
+           'scope': 'Five complete classes plus ten focused committed-evidence methods'}
+(evidence / 'native-result-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+print(json.dumps(summary))
 PY

@@ -50,6 +50,22 @@ private final class SplitOwnerParent: Object, ChangeMetadataRecordable {
     @Persisted var explicitlyModifiedAt: Date?
 }
 
+
+@objc(BigSyncSplitOwnerInvalidEcho)
+private final class SplitOwnerInvalidEcho: Object, ChangeMetadataRecordable,
+    BigSyncInboundSemanticRecordValidating {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+    @Persisted(primaryKey: true) var id = "invalid-echo"
+    @Persisted var isDeleted = false
+    @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 1)
+    @Persisted var modifiedAt = Date(timeIntervalSinceReferenceDate: 1)
+    @Persisted var explicitlyModifiedAt: Date?
+
+    static func validateInboundSemanticRecord(_ record: CKRecord) throws {
+        throw CocoaError(.coderInvalidValue)
+    }
+}
+
 /// Runs real target/tracking commits through the cancellation-generation ABA:
 /// a successor makes cancelSync false but cannot authorize the old continuation.
 @BigSyncBackgroundActor
@@ -64,14 +80,16 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
     private lazy var fixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 
     @BigSyncBackgroundActor
-    private func fixture(comparison: Bool = false, contract: Bool = false) async throws
+    private func fixture(comparison: Bool = false, contract: Bool = false,
+                         initializeThroughEcho: Bool = false, defersSetup: Bool = false) async throws
         -> (adapter: RealmSwiftAdapter, target: Realm, tracking: Realm) {
         let nonce = UUID().uuidString
         var config = Realm.Configuration()
         config.fileURL = nil
         config.inMemoryIdentifier = "split-owner-target-" + nonce
         config.objectTypes = [SplitOwnerRow.self, SplitOwnerChild.self,
-                              SplitOwnerParent.self, BigSyncPendingMutation.self]
+                              SplitOwnerParent.self, SplitOwnerInvalidEcho.self,
+                              BigSyncPendingMutation.self]
         if contract { config.objectTypes?.append(SplitOwnerContractRow.self) }
         if comparison || contract { BigSyncMutationPolicy.enableRecordRebasing(in: &config) }
         BigSyncMutationPolicy(excludedClassNames: [SplitOwnerChild.className()])
@@ -92,12 +110,23 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
             startSetupTask: false, assetDirectoryURL: directory)
         fixtureOwner.own(adapter)
         adapter.forceDataTypeInsteadOfAsset = true
-        try await adapter.resetSyncCaches()
-        adapter.invalidateTokens()
+        if !initializeThroughEcho && !defersSetup {
+            try await adapter.resetSyncCaches()
+            adapter.invalidateTokens()
+        }
         try await adapter.activateReplicaBinding(accountScopeIdentifier: "split-owner-account",
             replicaBindingGenerationIdentifier: "split-owner-binding")
         try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.test.split-owner",
             databaseScope: .private)
+        if defersSetup {
+            return (adapter,
+                try await Realm(configuration: config, actor: BigSyncBackgroundActor.shared),
+                try await Realm(configuration: tracking, actor: BigSyncBackgroundActor.shared))
+        }
+        if initializeThroughEcho {
+            let outcomes = try await adapter.validateAuthoritativeOwnUploadRecords([])
+            XCTAssertTrue(outcomes.isEmpty)
+        }
         return (adapter,
                 try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first),
                 try XCTUnwrap(adapter.realmProvider?.persistenceRealm))
@@ -116,6 +145,205 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
         let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
             forPrimaryKey: name)?.generation)
         return (row, name, generation)
+    }
+
+    @BigSyncBackgroundActor
+    private func pendingInboundDelivery(in tracking: Realm) throws
+        -> (delivery: BigSyncPendingInboundIdentityDelivery, identity: CommittedInboundIdentity) {
+        let identity = CommittedInboundIdentity(entityType: SplitOwnerRow.className(),
+            recordName: SplitOwnerRow.className() + ".row", disposition: .upsert)
+        let delivery = BigSyncPendingInboundIdentityDelivery()
+        delivery.deliveryID = "committed-delivery"
+        delivery.encodedIdentityPageBatches.append(try JSONEncoder().encode([identity]))
+        try tracking.write { tracking.add(delivery) }
+        return (delivery, identity)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundIdentityInspectionIgnoresProvisionalReplacementAndRemoval() async throws {
+        for removesDelivery in [false, true] {
+            for commits in [false, true] {
+                let fixture = try await fixture()
+                let (delivery, identity) = try pendingInboundDelivery(in: fixture.tracking)
+                let successor = CommittedInboundIdentity(entityType: SplitOwnerRow.className(),
+                    recordName: SplitOwnerRow.className() + ".successor", disposition: .delete)
+                fixture.tracking.beginWrite()
+                defer { if fixture.tracking.isInWriteTransaction { fixture.tracking.cancelWrite() } }
+                if removesDelivery {
+                    fixture.tracking.delete(delivery)
+                } else {
+                    delivery.deliveryID = "provisional-successor"
+                    delivery.encodedIdentityPageBatches.removeAll()
+                    delivery.encodedIdentityPageBatches.append(try JSONEncoder().encode([successor]))
+                }
+                let batch = try XCTUnwrap(fixture.adapter.pendingCommittedInboundIdentityBatch())
+                XCTAssertEqual(batch.deliveryID, "committed-delivery")
+                XCTAssertEqual(batch.identities, [identity])
+                XCTAssertTrue(fixture.tracking.isInWriteTransaction,
+                    "Inspection must leave the independent writer's transaction open")
+
+                if commits { try fixture.tracking.commitWrite() }
+                else { fixture.tracking.cancelWrite() }
+                let settled = try fixture.adapter.pendingCommittedInboundIdentityBatch()
+                if !commits {
+                    XCTAssertEqual(settled?.deliveryID, batch.deliveryID)
+                    XCTAssertEqual(settled?.identities, [identity])
+                } else if removesDelivery {
+                    XCTAssertNil(settled)
+                } else {
+                    XCTAssertEqual(settled?.deliveryID, "provisional-successor")
+                    XCTAssertEqual(settled?.identities, [successor])
+                }
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundIdentityAcknowledgementRejectsAccountAndTransportReplacement() async throws {
+        for replacesTransport in [false, true] {
+            let fixture = try await fixture()
+            let (delivery, identity) = try pendingInboundDelivery(in: fixture.tracking)
+            let deliveryID = delivery.deliveryID
+            fixture.adapter._testBeforeInboundIdentityAcknowledgementTrackingWrite = {
+                if replacesTransport {
+                    try await fixture.adapter.activateTransportNamespace(
+                        containerIdentifier: "iCloud.test.inbound-successor", databaseScope: .public
+                    )
+                } else {
+                    try await fixture.adapter.activateAccountScope("inbound-successor-account")
+                }
+            }
+            defer { fixture.adapter._testBeforeInboundIdentityAcknowledgementTrackingWrite = nil }
+            do {
+                try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(deliveryID: deliveryID)
+                XCTFail("The prior domain callback consumed repair input after ownership replacement")
+            } catch is CancellationError { }
+            let pending = try XCTUnwrap(fixture.adapter.pendingCommittedInboundIdentityBatch())
+            XCTAssertEqual(pending.deliveryID, deliveryID)
+            XCTAssertEqual(pending.identities, [identity])
+
+            fixture.adapter._testBeforeInboundIdentityAcknowledgementTrackingWrite = nil
+            try await fixture.adapter.acknowledgeCommittedInboundIdentityBatch(deliveryID: deliveryID)
+            XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPublicImportRejectsCancellationResetFromProgressBeforeForwarding() async throws {
+        for checkpoint in ["adapter-import-setup-started", "adapter-import-forwarding-started"] {
+            let fixture = try await fixture()
+            let row = SplitOwnerRow()
+            try fixture.target.write {
+                fixture.target.add(row)
+                row.refreshChangeMetadata(explicitlyModified: true)
+            }
+            let name = SplitOwnerRow.className() + ".row"
+            let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation)
+            do {
+                try await fixture.adapter.didFinishImport { current in
+                    guard current == checkpoint else { return }
+                    fixture.adapter.cancelSynchronization()
+                    do { try fixture.adapter.prepareForFencedMigrationAfterCancellation() }
+                    catch { XCTFail("Unable to prepare the successor: \(error)") }
+                }
+                XCTFail("The public import adopted ownership replaced by its progress callback")
+            } catch is CancellationError { }
+            XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, generation)
+            try await fixture.adapter.unsetCancellation()
+            try await fixture.adapter.didFinishImport()
+            XCTAssertEqual(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: name)?.pendingGeneration, generation)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPublicImportMayInitializeItsProviderWithoutReplacingOperationOwnership() async throws {
+        let fixture = try await fixture(defersSetup: true)
+        XCTAssertNil(fixture.adapter.realmProvider)
+        let row = SplitOwnerRow()
+        try fixture.target.write {
+            fixture.target.add(row)
+            row.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let name = SplitOwnerRow.className() + ".row"
+        let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation)
+        try await fixture.adapter.didFinishImport()
+        let tracking = try XCTUnwrap(fixture.adapter.realmProvider?.persistenceRealm)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: name)?.pendingGeneration, generation)
+        XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation, generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testJournalForwardingRejectsCancellationResetBeforeTrackingAdmission() async throws {
+        let fixture = try await fixture()
+        let row = SplitOwnerRow()
+        try fixture.target.write {
+            fixture.target.add(row)
+            row.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let name = SplitOwnerRow.className() + ".row"
+        let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation)
+        fixture.adapter._testBeforePendingMutationTrackingWrite = {
+            fixture.adapter.cancelSynchronization()
+            try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+        }
+        defer { fixture.adapter._testBeforePendingMutationTrackingWrite = nil }
+        do {
+            _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.target)
+            XCTFail("The retired journal forwarder published tracking for a successor")
+        } catch is CancellationError { }
+        XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+        XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation, generation)
+
+        fixture.adapter._testBeforePendingMutationTrackingWrite = nil
+        try await fixture.adapter.unsetCancellation()
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.target)
+        XCTAssertEqual(fixture.tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: name)?.pendingGeneration, generation)
+        let retry = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        XCTAssertEqual(retry.records.first?["text"] as? String, row.text)
+        try await fixture.adapter.acknowledgeUploadedRecords(retry.records, from: retry)
+        XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+    }
+
+    @BigSyncBackgroundActor
+    func testJournalForwardingRejectsAccountAndTransportReplacementBeforeTrackingAdmission() async throws {
+        for replacesTransport in [false, true] {
+            let fixture = try await fixture()
+            let row = SplitOwnerRow()
+            try fixture.target.write {
+                fixture.target.add(row)
+                row.refreshChangeMetadata(explicitlyModified: true)
+            }
+            let name = SplitOwnerRow.className() + ".row"
+            let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation)
+            fixture.adapter._testBeforePendingMutationTrackingWrite = {
+                if replacesTransport {
+                    try await fixture.adapter.activateTransportNamespace(
+                        containerIdentifier: "iCloud.test.journal-successor", databaseScope: .public
+                    )
+                } else {
+                    try await fixture.adapter.activateAccountScope("journal-successor-account")
+                }
+            }
+            defer { fixture.adapter._testBeforePendingMutationTrackingWrite = nil }
+            do {
+                _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.target)
+                XCTFail("The old journal forwarder crossed the active operation's identity")
+            } catch is CancellationError { }
+            XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, generation)
+        }
     }
 
     @BigSyncBackgroundActor
@@ -821,5 +1049,162 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
         try await fixture.adapter.cleanUp()
         XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
     }
+
+    @BigSyncBackgroundActor
+    private func incomingOwnerRecord(
+        _ fixture: (adapter: RealmSwiftAdapter, target: Realm, tracking: Realm),
+        contract: Bool
+    ) -> CKRecord {
+        let type: Object.Type = contract ? SplitOwnerContractRow.self : SplitOwnerRow.self
+        let record = CKRecord(recordType: type.className(), recordID: .init(
+            recordName: type.className() + (contract ? ".contract" : ".row"),
+            zoneID: fixture.adapter.recordZoneID))
+        record["text"] = "admitted incoming" as CKRecordValue
+        record["isDeleted"] = false as CKRecordValue
+        record["createdAt"] = Date(timeIntervalSinceReferenceDate: 1) as CKRecordValue
+        record["modifiedAt"] = Date(timeIntervalSinceReferenceDate: 20) as CKRecordValue
+        record["explicitlyModifiedAt"] = Date(timeIntervalSinceReferenceDate: 20) as CKRecordValue
+        return record
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledIncomingImportCannotApplyTargetAfterSuccessorResumes() async throws {
+        for contract in [false, true] {
+            let fixture = try await fixture(contract: contract)
+            let record = incomingOwnerRecord(fixture, contract: contract)
+            fixture.adapter._testBeforeImportedRecordTargetWrite = {
+                fixture.adapter.cancelSynchronization()
+                try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+            }
+            defer { fixture.adapter._testBeforeImportedRecordTargetWrite = nil }
+            do {
+                _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+                XCTFail("An obsolete import applied its target in the successor attempt")
+            } catch is CancellationError {}
+            fixture.target.refresh()
+            let type: Object.Type = contract ? SplitOwnerContractRow.self : SplitOwnerRow.self
+            XCTAssertTrue(fixture.target.objects(type).isEmpty)
+            XCTAssertTrue(fixture.target.objects(BigSyncPendingMutation.self).isEmpty)
+            XCTAssertTrue(fixture.tracking.objects(SyncedEntity.self)
+                .filter("entityType == %@", type.className()).isEmpty)
+            if contract {
+                XCTAssertNil(fixture.target.object(ofType: BigSyncRecordBaseline.self,
+                    forPrimaryKey: record.recordID.recordName))
+            }
+
+            fixture.adapter._testBeforeImportedRecordTargetWrite = nil
+            try await fixture.adapter.unsetCancellation()
+            let retry = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTAssertEqual(retry.count, 1)
+            fixture.target.refresh()
+            XCTAssertEqual(fixture.target.objects(type).first?["text"] as? String, "admitted incoming")
+            XCTAssertNotNil(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName)?.encodedRecord)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledIncomingImportRetainsTargetCommitWithoutPublishingTracking() async throws {
+        for contract in [false, true] {
+            let fixture = try await fixture(contract: contract)
+            let record = incomingOwnerRecord(fixture, contract: contract)
+            fixture.adapter._testBeforeImportedRecordPersistenceWrite = {
+                fixture.adapter.cancelSynchronization()
+                try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+            }
+            defer { fixture.adapter._testBeforeImportedRecordPersistenceWrite = nil }
+            do {
+                _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+                XCTFail("An obsolete import published tracking after its target phase")
+            } catch is CancellationError {}
+            fixture.target.refresh()
+            let type: Object.Type = contract ? SplitOwnerContractRow.self : SplitOwnerRow.self
+            XCTAssertEqual(fixture.target.objects(type).first?["text"] as? String, "admitted incoming",
+                "The target phase was already durable before ownership changed")
+            XCTAssertTrue(fixture.target.objects(BigSyncPendingMutation.self).isEmpty)
+            XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName))
+            let revision: String?
+            if contract {
+                revision = try XCTUnwrap(fixture.target.object(ofType: BigSyncRecordBaseline.self,
+                    forPrimaryKey: record.recordID.recordName)).revision
+            } else { revision = nil }
+
+            fixture.adapter._testBeforeImportedRecordPersistenceWrite = nil
+            try await fixture.adapter.unsetCancellation()
+            _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+            XCTAssertNotNil(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName)?.encodedRecord)
+            if contract {
+                XCTAssertEqual(fixture.target.object(ofType: BigSyncRecordBaseline.self,
+                    forPrimaryKey: record.recordID.recordName)?.revision, revision,
+                    "Redelivery completes tracking without manufacturing a new accepted ancestor")
+            }
+            XCTAssertTrue(fixture.target.objects(BigSyncPendingMutation.self).isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testIncomingImportRejectsAccountAndTransportReplacementBeforeTargetAdmission() async throws {
+        for replacesTransport in [false, true] {
+            let fixture = try await fixture()
+            let record = incomingOwnerRecord(fixture, contract: false)
+            fixture.adapter._testBeforeImportedRecordTargetWrite = {
+                if replacesTransport {
+                    try await fixture.adapter.activateTransportNamespace(
+                        containerIdentifier: "iCloud.test.incoming-successor", databaseScope: .public)
+                } else {
+                    try await fixture.adapter.activateAccountScope("incoming-successor-account")
+                }
+            }
+            defer { fixture.adapter._testBeforeImportedRecordTargetWrite = nil }
+            do {
+                _ = try await fixture.adapter.saveChanges(in: [record], forceSave: true)
+                XCTFail("An obsolete incoming payload crossed its account or transport namespace")
+            } catch is CancellationError {}
+            fixture.target.refresh()
+            XCTAssertTrue(fixture.target.objects(SplitOwnerRow.self).isEmpty)
+            XCTAssertTrue(fixture.target.objects(BigSyncPendingMutation.self).isEmpty)
+            XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: record.recordID.recordName))
+        }
+    }
+
+
+    @BigSyncBackgroundActor
+    func testAuthoritativeOwnEchoAllowsInitialProviderSetup() async throws {
+        let fixture = try await fixture(initializeThroughEcho: true)
+        XCTAssertNotNil(fixture.adapter.realmProvider)
+        XCTAssertTrue(fixture.target.objects(SplitOwnerRow.self).isEmpty)
+        XCTAssertTrue(fixture.tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledAuthoritativeOwnEchoCannotPublishSuccessorQuarantine() async throws {
+        let fixture = try await fixture()
+        let name = SplitOwnerInvalidEcho.className() + ".invalid-echo"
+        let record = CKRecord(recordType: SplitOwnerInvalidEcho.className(),
+            recordID: .init(recordName: name, zoneID: fixture.adapter.recordZoneID))
+        fixture.adapter._testBeforeAuthoritativeOwnUploadQuarantineWrite = {
+            fixture.adapter.cancelSynchronization()
+            try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+        }
+        defer { fixture.adapter._testBeforeAuthoritativeOwnUploadQuarantineWrite = nil }
+        do {
+            _ = try await fixture.adapter.validateAuthoritativeOwnUploadRecords([record])
+            XCTFail("An obsolete own echo published quarantine into the successor attempt")
+        } catch is CancellationError {}
+        XCTAssertTrue(fixture.tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        XCTAssertTrue(fixture.target.objects(SplitOwnerInvalidEcho.self).isEmpty)
+
+        fixture.adapter._testBeforeAuthoritativeOwnUploadQuarantineWrite = nil
+        try await fixture.adapter.unsetCancellation()
+        let retry = try await fixture.adapter.validateAuthoritativeOwnUploadRecords([record])
+        XCTAssertEqual(retry.count, 1)
+        XCTAssertEqual(fixture.tracking.objects(BigSyncInboundSemanticQuarantine.self).count, 1)
+        XCTAssertEqual(fixture.tracking.objects(BigSyncInboundSemanticQuarantine.self).first?.recordName, name)
+        XCTAssertTrue(fixture.target.objects(SplitOwnerInvalidEcho.self).isEmpty)
+    }
+
 }
 #endif

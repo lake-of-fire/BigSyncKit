@@ -8,6 +8,9 @@ on:
       - Tests/BigSyncKitTests/SyncSplitOperationOwnershipTests.swift
       - Tests/BigSyncKitTests/ChangeFeedMigrationResumeTests.swift
       - Tests/BigSyncKitTests/SyncPhaseAttemptOwnershipTests.swift
+      - Tests/BigSyncKitTests/SyncUndoCloseoutW1Tests.swift
+      - Tests/BigSyncKitTests/SyncUndoCloseoutW1UploadSnapshotTests.swift
+      - Tests/BigSyncKitTests/BigSyncKitTests.swift
       - .github/test-asset-decoding.sh
       - .github/workflows/asset-decoding.yml
   workflow_dispatch:
