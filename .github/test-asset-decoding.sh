@@ -21,13 +21,16 @@ trap finish EXIT
 git -C "$root" rev-parse HEAD > "$evidence/source-commit.txt"
 git -C "$root" ls-tree -r HEAD > "$evidence/source-tree.txt"
 swift --version > "$evidence/swift-version.txt"
+"$(dirname "$(command -v swift)")/clang" --version > "$evidence/swift-toolchain-clang-version.txt"
 xcrun clang --version > "$evidence/apple-clang-version.txt"
 xcrun --show-sdk-path > "$evidence/sdk-path.txt"
 
 set +e
-# Keep compiler invocations in the evidence packet so dependency setup failures
-# can be diagnosed without changing the production dependency source.
+# Realm Core is C++20 and SwiftPM supplies its dependency module maps explicitly.
+# Permit those required modules to be built without enabling implicit map search.
+# https://clang.llvm.org/docs/StandardCPlusPlusModules.html#clang-module-map-background
 swift test --verbose --package-path "$root" --configuration debug \
+  -Xcxx -fimplicit-modules \
   --filter HotfixCollectionSafetyTests \
   --parallel --num-workers 1 --disable-swift-testing \
   --xunit-output "$evidence/native.junit.xml" 2>&1 | tee "$evidence/native.log"
