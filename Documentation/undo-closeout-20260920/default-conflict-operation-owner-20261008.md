@@ -104,7 +104,7 @@ their selected union must be checked at the final #144 head.
 | `cancelSynchronization`, `waitForCancellation` | Retire generation and cancel/join owned Tasks | Lifecycle control; no incoming work adoption |
 | `activateAccountScope`, `activateReplicaBinding`, `activateTransportNamespace` | Actor-serialized authority replacement; original capabilities reject changed fields | Synchronous identity control; status work has #139 owner |
 | `resetSyncCaches`, `unsetCancellation` | Destructive reset generation, setup readiness and reset transport ownership | Parent's bounded reset/#142 review; not blanket-qualified here |
-| `prepareChangeFeedReset`, `beginChangeFeedServerBootstrap`, `reconcileAfterChangeFeedServerBootstrap`, `finishChangeFeedReset` | Account/epoch/reset mode plus supplied authority and original reset capability | Parent's reset review and final composed source |
+| `prepareChangeFeedReset`, `beginChangeFeedServerBootstrap`, `reconcileAfterChangeFeedServerBootstrap`, `finishChangeFeedReset` | Account/epoch/reset mode, captured transport/cancellation generation and exact reset phase/provenance | Parent's reset review and final composed source |
 | `cleanUp` | Original immutable owner across target/tracking admissions | Existing guarded split operation |
 | `saveChanges` | Original full owner across selection, five main writes, inherited tracking insertion and publication | Reviewed same-actor live repair, two four-schedule tests |
 | `validateAuthoritativeOwnUploadRecords` | Original scalar lifecycle across setup, then full provider owner across validation/quarantine/return | Reviewed echo repair plus four schedules and setup positives |

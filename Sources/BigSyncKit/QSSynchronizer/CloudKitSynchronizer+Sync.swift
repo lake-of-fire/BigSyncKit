@@ -678,10 +678,12 @@ extension CloudKitSynchronizer {
                 && (error as? CloudKitChangeFeedError) != .corruptCursor
         }
 
-        if error is RealmSwiftInboundTargetChangedError {
-            // A non-journaled local write invalidated an inbound selection.
-            // The page cursor did not commit. Replay through ordinary fetch,
-            // with a delay so sustained cache writers cannot spin the drain.
+        if error is RealmSwiftInboundTargetChangedError
+            || error is BigSyncLocalDomainAdmissionDeferredError {
+            // An inbound selection changed, or initial domain admission could
+            // not inspect a locally owned store. Neither committed its decision.
+            // Replay through the existing attempt scheduler, with a delay so
+            // sustained local writers cannot spin the drain.
             shouldRetry = true
             retryDelay = 1
         } else if let migrationError = error as? ChangeFeedMigrationError,

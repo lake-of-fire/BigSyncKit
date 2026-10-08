@@ -1940,6 +1940,57 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testInboundSemanticQuarantineInspectionRetainsCommittedBlocker()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let account = "committed-quarantine-account"
+        try await fixture.adapter.activateAccountScope(account)
+        let tracking = fixture.persistenceRealm
+        let quarantine = BigSyncInboundSemanticQuarantine()
+        quarantine.lineageID = "committed-quarantine"
+        quarantine.recordName = "committed-quarantine-record"
+        quarantine.entityType = BigSyncSemanticallyValidatedObject.className()
+        quarantine.accountScopeIdentifier = account
+        quarantine.containerIdentifier = ""
+        quarantine.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        quarantine.zoneOwnerName = fixture.adapter.recordZoneID.ownerName
+        quarantine.zoneName = fixture.adapter.recordZoneID.zoneName
+        quarantine.replicaActivationIdentifier = "unbound-replica"
+        quarantine.changeFeedEpoch = 0
+        quarantine.semanticScopeIdentifier = "committed-scope"
+        try tracking.write { tracking.add(quarantine) }
+
+        for removesQuarantine in [false, true] {
+            try tracking.beginWrite()
+            defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+            let currentQuarantine = try XCTUnwrap(tracking.object(
+                ofType: BigSyncInboundSemanticQuarantine.self,
+                forPrimaryKey: "committed-quarantine"
+            ))
+            if removesQuarantine {
+                tracking.delete(currentQuarantine)
+            } else {
+                currentQuarantine.semanticScopeIdentifier = "provisional-scope"
+                let provenance = RebuildProvenanceState()
+                provenance.epoch = 1
+                tracking.add(provenance, update: .modified)
+            }
+            XCTAssertTrue(try fixture.adapter.hasInboundSemanticQuarantine(
+                entityType: BigSyncSemanticallyValidatedObject.className(),
+                accountScopeIdentifier: account,
+                semanticScopeIdentifier: "committed-scope"
+            ))
+            XCTAssertFalse(try fixture.adapter.hasInboundSemanticQuarantine(
+                entityType: BigSyncSemanticallyValidatedObject.className(),
+                accountScopeIdentifier: account,
+                semanticScopeIdentifier: "provisional-scope"
+            ))
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            tracking.cancelWrite()
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testInboundSemanticFailureIsQuarantinedWithoutBlockingValidRecord()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
@@ -16450,6 +16501,86 @@ final class BigSyncKitTests: XCTestCase {
             record["favoriteChild"] = childRecordNames[0] as CKRecordValue
         }
         return record
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundIdentityDeliveryIgnoresProvisionalInsert() async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            committedInboundIdentityDeliveryEnabled: true
+        )
+        let tracking = fixture.persistenceRealm
+        try tracking.beginWrite()
+        defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+        let delivery = BigSyncPendingInboundIdentityDelivery()
+        delivery.deliveryID = "uncommitted-delivery"
+        delivery.encodedIdentityPageBatches.append(try JSONEncoder().encode([
+            CommittedInboundIdentity(
+                entityType: BigSyncTrackedObject.className(),
+                recordName: BigSyncTrackedObject.className() + ".provisional",
+                disposition: .upsert
+            ),
+        ]))
+        tracking.add(delivery)
+
+        XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+        XCTAssertTrue(tracking.isInWriteTransaction,
+                      "Inspection must not settle another owner's transaction")
+        tracking.cancelWrite()
+        XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundIdentityDeliveryRetainsCommittedBatchDuringProvisionalChanges()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            committedInboundIdentityDeliveryEnabled: true
+        )
+        let tracking = fixture.persistenceRealm
+        let committedIdentity = CommittedInboundIdentity(
+            entityType: BigSyncTrackedObject.className(),
+            recordName: BigSyncTrackedObject.className() + ".committed",
+            disposition: .upsert
+        )
+        try tracking.write {
+            let delivery = BigSyncPendingInboundIdentityDelivery()
+            delivery.deliveryID = "committed-delivery"
+            delivery.encodedIdentityPageBatches.append(
+                try JSONEncoder().encode([committedIdentity])
+            )
+            tracking.add(delivery)
+        }
+        for removesDelivery in [false, true] {
+            try tracking.beginWrite()
+            defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+            let delivery = try XCTUnwrap(tracking.object(
+                ofType: BigSyncPendingInboundIdentityDelivery.self,
+                forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+            ))
+            if removesDelivery {
+                tracking.delete(delivery)
+            } else {
+                delivery.deliveryID = "provisional-successor"
+                delivery.encodedIdentityPageBatches.append(
+                    try JSONEncoder().encode([CommittedInboundIdentity(
+                        entityType: committedIdentity.entityType,
+                        recordName: committedIdentity.recordName,
+                        disposition: .delete
+                    )])
+                )
+            }
+            let batch = try XCTUnwrap(
+                try fixture.adapter.pendingCommittedInboundIdentityBatch()
+            )
+            XCTAssertEqual(batch.deliveryID, "committed-delivery")
+            XCTAssertEqual(batch.identities, [committedIdentity])
+            XCTAssertTrue(tracking.isInWriteTransaction,
+                          "Inspection must not settle another owner's transaction")
+            tracking.cancelWrite()
+            XCTAssertEqual(
+                try fixture.adapter.pendingCommittedInboundIdentityBatch()?.identities,
+                [committedIdentity]
+            )
+        }
     }
 
     @BigSyncBackgroundActor

@@ -1,0 +1,70 @@
+name: Native full-sync operation-owner qualification
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - Sources/BigSyncKit/**
+      - Tests/BigSyncKitTests/**
+      - Package.swift
+      - Package.resolved
+      - .github/verify_w1_execution.py
+      - .github/tests/test_w1_execution.py
+      - .github/tests/test_native_lane_verifier.py
+      - .github/test-asset-decoding.sh
+      - .github/workflows/asset-decoding.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: asset-decoding-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
+      PYTHONDONTWRITEBYTECODE: '1'
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      BIGSYNC_RUN_MUTATION_BENCHMARK: '0'
+      SWIFT_BACKTRACE: enable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 1ffbedbb3d8dd90f44f651f618128e7806ce39dd
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Install xcsift
+        shell: bash
+        run: brew install xcsift
+      - name: Run existing W1 verifier behavior suite
+        shell: bash
+        working-directory: BigSyncKit
+        run: python3 -m unittest discover -s .github/tests -p 'test_w1_execution.py' -v
+      - name: Run native qualification verifier tests
+        shell: bash
+        working-directory: BigSyncKit
+        run: python3 -m unittest discover -s .github/tests -p 'test_native_lane_verifier.py' -v
+      - name: Execute native collection and asset qualification
+        shell: bash
+        env:
+          BIGSYNC_ASSET_EVIDENCE_DIRECTORY: ${{ runner.temp }}/BigSyncKit-full-sync-owner-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+        run: /bin/bash "$GITHUB_WORKSPACE/BigSyncKit/.github/test-asset-decoding.sh"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-sync-owner-qualification-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/BigSyncKit-full-sync-owner-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
