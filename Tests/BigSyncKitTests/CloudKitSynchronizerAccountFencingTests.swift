@@ -770,6 +770,64 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         XCTAssertNotNil(try resumed.accountScopeLease())
     }
 
+
+    @BigSyncBackgroundActor
+    private final class DeferredInitialAdmission {
+        let transport: AccountFencingTransport
+        var synchronizer: CloudKitSynchronizer?
+        private(set) var contexts: [BigSyncInitialReplicaBindingContext] = []
+        private(set) var cloudKitOperationsBeforeAdmission = [Int]()
+
+        init(transport: AccountFencingTransport) { self.transport = transport }
+
+        func admit(_ context: BigSyncInitialReplicaBindingContext) throws {
+            contexts.append(context)
+            cloudKitOperationsBeforeAdmission.append(transport.operationCount)
+            if contexts.count == 1 {
+                XCTAssertNil(try synchronizer?.accountScopeLease())
+                throw BigSyncLocalDomainAdmissionDeferredError()
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testTemporaryLocalInitialAdmissionRetriesExistingDrainAndAdmitsCurrentBinding() async throws {
+        let transport = AccountFencingTransport()
+        let sequence = DeferredInitialAdmission(transport: transport)
+        let zoneID = makeZoneID()
+        let sync = makeSynchronizer(
+            transport: transport, store: AccountFencingStore(),
+            identifier: "local-admission-deferred-\(UUID().uuidString)",
+            recordZoneID: zoneID,
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { context in try sequence.admit(context) }
+        )
+        sequence.synchronizer = sync
+        sync.addModelAdapter(AccountFencingModelAdapter(zoneID: zoneID))
+        addTeardownBlock { @BigSyncBackgroundActor in
+            sequence.synchronizer = nil
+            await sync.cancelSynchronizationAndWait()
+        }
+
+        // This is one real synchronize request. The first admission throws
+        // before a local dataset decision or CloudKit operation; the existing
+        // delayed attempt scheduler must retain this caller and admit again.
+        _ = try await sync.synchronize()
+        XCTAssertEqual(sequence.contexts.count, 2)
+        XCTAssertEqual(sequence.cloudKitOperationsBeforeAdmission, [0, 0])
+        XCTAssertEqual(sequence.contexts.first?.accountScopeIdentifier,
+                       sequence.contexts.last?.accountScopeIdentifier)
+        XCTAssertEqual(sequence.contexts.first?.replicaBindingGenerationIdentifier,
+                       sequence.contexts.last?.replicaBindingGenerationIdentifier)
+        let activeLease = try XCTUnwrap(sync.accountScopeLease())
+        XCTAssertEqual(activeLease.accountScopeIdentifier,
+                       sequence.contexts.last?.accountScopeIdentifier)
+        XCTAssertGreaterThan(transport.operationCount, 0)
+        XCTAssertFalse(sync.syncing)
+        XCTAssertFalse(sync.synchronizationDrainIsActive)
+        XCTAssertNil(sync.retrySleepUntil)
+    }
+
     @BigSyncBackgroundActor
     func testRejectedInitialBindingCannotActivateAdapterOrTouchCloudKit()
     async throws {
