@@ -1,0 +1,32 @@
+{
+  "repository": "lake-of-fire/BigSyncKit",
+  "base_commit": "abf3d465113c6bd332d06bc72f144ca25529dac9",
+  "copied_predecessor": "1ded43c0baf2b203604e8780ec0f4bb0ea0f4b06",
+  "hydrated_upstream_blobs": {
+    "Sources/BigSyncKit/RealmSwift/BigSyncRecordBaseline.swift": "ed04f427d7d6e18659d3f815e8db881b40cdd5b2",
+    "Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift": "40bc759c1cf232f69ccd8ba6a73f3751caa39450",
+    "Tests/BigSyncKitTests/LegacyOptionalLifetimeOrderingTests.swift": "5c5571b2f0be4a0821ee71c2ac9182ce977f7548",
+    "Tests/BigSyncKitTests/LegacyOptionalLifetimeRealmTests.swift": "17303758aa890e42014e7f85d1ad6c87abf6dbdd",
+    "Tests/BigSyncKitTests/LegacyOptionalLifetimeReconciliationTests.swift": "1409aab5a9e78c10f09d968506943f80b0c78388"
+  },
+  "new_fix_files": {
+    "Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift": {
+      "baseline_git_blob_sha": "40bc759c1cf232f69ccd8ba6a73f3751caa39450",
+      "candidate_sha256": "3d44a72f1f5edf45b8e59daa73cf4d4f79332ce3cc99059ffc925a414595acb5"
+    },
+    "Sources/BigSyncKit/RealmSwift/BigSyncRecordDisappearance.swift": {
+      "baseline_git_blob_sha": "b7df184c56b97fc1ecb329946d9f0eb4020a7121",
+      "candidate_sha256": "8cf414d4661cb99445709f73b3a52b2030e0b4de95503dfbde64cc547028dacb"
+    },
+    "Tests/BigSyncKitTests/SyncSplitOperationOwnershipTests.swift": {
+      "baseline_git_blob_sha": null,
+      "candidate_sha256": "0347716ff0c8e6630d6bf18779bed49c669bbd039e396d48f0e51772752ab91b"
+    }
+  },
+  "review_artifacts": [
+    "Documentation/second-pass-review/README.md",
+    "Documentation/second-pass-review/manifest.json",
+    "Documentation/second-pass-review/abf3-to-candidate.patch"
+  ],
+  "native_execution": "not executed; dedicated Luna qualification required"
+}
