@@ -57,7 +57,9 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
     private lazy var fixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 
     @BigSyncBackgroundActor
-    private func fixture(comparison: Bool = false, contract: Bool = false) async throws
+    private func fixture(
+        comparison: Bool = false, contract: Bool = false, defersSetup: Bool = false
+    ) async throws
         -> (adapter: RealmSwiftAdapter, target: Realm, tracking: Realm) {
         let nonce = UUID().uuidString
         var config = Realm.Configuration()
@@ -85,12 +87,19 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
             startSetupTask: false, assetDirectoryURL: directory)
         fixtureOwner.own(adapter)
         adapter.forceDataTypeInsteadOfAsset = true
-        try await adapter.resetSyncCaches()
-        adapter.invalidateTokens()
+        if !defersSetup {
+            try await adapter.resetSyncCaches()
+            adapter.invalidateTokens()
+        }
         try await adapter.activateReplicaBinding(accountScopeIdentifier: "split-owner-account",
             replicaBindingGenerationIdentifier: "split-owner-binding")
         try await adapter.activateTransportNamespace(containerIdentifier: "iCloud.test.split-owner",
             databaseScope: .private)
+        if defersSetup {
+            return (adapter,
+                try await Realm(configuration: config, actor: BigSyncBackgroundActor.shared),
+                try await Realm(configuration: tracking, actor: BigSyncBackgroundActor.shared))
+        }
         return (adapter,
                 try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first),
                 try XCTUnwrap(adapter.realmProvider?.persistenceRealm))
@@ -109,6 +118,124 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
         let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
             forPrimaryKey: name)?.generation)
         return (row, name, generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testPublicImportRejectsCancellationResetFromProgressBeforeForwarding() async throws {
+        for checkpoint in ["adapter-import-setup-started", "adapter-import-forwarding-started"] {
+            let fixture = try await fixture()
+            let row = SplitOwnerRow()
+            try fixture.target.write {
+                fixture.target.add(row)
+                row.refreshChangeMetadata(explicitlyModified: true)
+            }
+            let name = SplitOwnerRow.className() + ".row"
+            let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation)
+            do {
+                try await fixture.adapter.didFinishImport { current in
+                    guard current == checkpoint else { return }
+                    fixture.adapter.cancelSynchronization()
+                    do { try fixture.adapter.prepareForFencedMigrationAfterCancellation() }
+                    catch { XCTFail("Unable to prepare the successor: \(error)") }
+                }
+                XCTFail("The public import adopted ownership replaced by its progress callback")
+            } catch is CancellationError { }
+            XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, generation)
+            try await fixture.adapter.unsetCancellation()
+            try await fixture.adapter.didFinishImport()
+            XCTAssertEqual(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: name)?.pendingGeneration, generation)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPublicImportMayInitializeItsProviderWithoutReplacingOperationOwnership() async throws {
+        let fixture = try await fixture(defersSetup: true)
+        XCTAssertNil(fixture.adapter.realmProvider)
+        let row = SplitOwnerRow()
+        try fixture.target.write {
+            fixture.target.add(row)
+            row.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let name = SplitOwnerRow.className() + ".row"
+        let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation)
+        try await fixture.adapter.didFinishImport()
+        let tracking = try XCTUnwrap(fixture.adapter.realmProvider?.persistenceRealm)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: name)?.pendingGeneration, generation)
+        XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation, generation)
+    }
+
+    @BigSyncBackgroundActor
+    func testJournalForwardingRejectsCancellationResetBeforeTrackingAdmission() async throws {
+        let fixture = try await fixture()
+        let row = SplitOwnerRow()
+        try fixture.target.write {
+            fixture.target.add(row)
+            row.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let name = SplitOwnerRow.className() + ".row"
+        let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation)
+        fixture.adapter._testBeforePendingMutationTrackingWrite = {
+            fixture.adapter.cancelSynchronization()
+            try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+        }
+        defer { fixture.adapter._testBeforePendingMutationTrackingWrite = nil }
+        do {
+            _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.target)
+            XCTFail("The retired journal forwarder published tracking for a successor")
+        } catch is CancellationError { }
+        XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+        XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name)?.generation, generation)
+
+        fixture.adapter._testBeforePendingMutationTrackingWrite = nil
+        try await fixture.adapter.unsetCancellation()
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.target)
+        XCTAssertEqual(fixture.tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: name)?.pendingGeneration, generation)
+        let retry = try await fixture.adapter.prepareUploadBatch(limit: 10)
+        XCTAssertEqual(retry.records.first?["text"] as? String, row.text)
+        try await fixture.adapter.acknowledgeUploadedRecords(retry.records, from: retry)
+        XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+    }
+
+    @BigSyncBackgroundActor
+    func testJournalForwardingRejectsAccountAndTransportReplacementBeforeTrackingAdmission() async throws {
+        for replacesTransport in [false, true] {
+            let fixture = try await fixture()
+            let row = SplitOwnerRow()
+            try fixture.target.write {
+                fixture.target.add(row)
+                row.refreshChangeMetadata(explicitlyModified: true)
+            }
+            let name = SplitOwnerRow.className() + ".row"
+            let generation = try XCTUnwrap(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation)
+            fixture.adapter._testBeforePendingMutationTrackingWrite = {
+                if replacesTransport {
+                    try await fixture.adapter.activateTransportNamespace(
+                        containerIdentifier: "iCloud.test.journal-successor", databaseScope: .public
+                    )
+                } else {
+                    try await fixture.adapter.activateAccountScope("journal-successor-account")
+                }
+            }
+            defer { fixture.adapter._testBeforePendingMutationTrackingWrite = nil }
+            do {
+                _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.target)
+                XCTFail("The old journal forwarder crossed the active operation's identity")
+            } catch is CancellationError { }
+            XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, generation)
+        }
     }
 
     @BigSyncBackgroundActor
