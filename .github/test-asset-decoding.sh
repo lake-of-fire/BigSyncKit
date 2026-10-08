@@ -11,6 +11,9 @@ finish() {
   if [[ -f "$root/Package.resolved" ]]; then
     cp "$root/Package.resolved" "$evidence/Package.resolved" || status=1
   fi
+  if [[ -f "$root/.build/debug.yaml" ]]; then
+    cp "$root/.build/debug.yaml" "$evidence/build-plan.yaml" || status=1
+  fi
   printf '%s\n' "$status" > "$evidence/overall-status.txt"
   exit "$status"
 }
@@ -18,12 +21,13 @@ trap finish EXIT
 git -C "$root" rev-parse HEAD > "$evidence/source-commit.txt"
 git -C "$root" ls-tree -r HEAD > "$evidence/source-tree.txt"
 swift --version > "$evidence/swift-version.txt"
-printf '%s\n' '-Xcxx -fno-modules' > "$evidence/cxx-build-flags.txt"
+xcrun clang --version > "$evidence/apple-clang-version.txt"
+xcrun --show-sdk-path > "$evidence/sdk-path.txt"
 
 set +e
-# Realm Core's C++ headers are compiled textually: SwiftPM 6.2.1 otherwise
-# rejects its s2geometry dependency as an unavailable implicit Clang module.
-swift test --package-path "$root" --configuration debug -Xcxx -fno-modules \
+# Keep compiler invocations in the evidence packet so dependency setup failures
+# can be diagnosed without changing the production dependency source.
+swift test --verbose --package-path "$root" --configuration debug \
   --filter HotfixCollectionSafetyTests \
   --parallel --num-workers 1 --disable-swift-testing \
   --xunit-output "$evidence/native.junit.xml" 2>&1 | tee "$evidence/native.log"
