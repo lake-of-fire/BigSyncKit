@@ -17,6 +17,22 @@ import re
 from typing import Sequence
 
 EXPECTED = {
+    "SyncSplitOperationOwnershipTests": (
+        "testCancelledJournalForwardingCannotPublishToSuccessorTracking",
+        "testImportProgressCannotReacquireSuccessorJournalOwnership",
+        "testCancelledImportCannotClearSuccessorAssetsAfterProgressCallout",
+        "testCancelledQueuedRemainingCountDoesNotNotifySuccessor",
+        "testJournalForwardingRejectsTransportReplacementBeforeTrackingAdmission",
+        "testInboundDeletionRejectsCancellationResetAccountBindingAndTransportReplacement",
+        "testCancelledIncomingImportCannotApplyTargetAfterSuccessorResumes",
+        "testCancelledIncomingImportRetainsTargetCommitWithoutPublishingTracking",
+        "testIncomingImportRejectsAccountAndTransportReplacementBeforeTargetAdmission",
+        "testAuthoritativeOwnEchoAllowsInitialProviderSetup",
+        "testCancelledAuthoritativeOwnEchoCannotPublishSuccessorQuarantine",
+    ),
+    "SyncRetainedRecordContractTests": (
+        "testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence",
+    ),
     "SyncUndoCloseoutW1Tests": (
         "testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline",
         "testTerminalLocalDeleteRetiresItsSupersededStagedSave",
@@ -107,11 +123,12 @@ EVENT = re.compile(
 # The workflow requests this exact pattern from `focused-filter`; keeping it
 # here prevents executed and verified selections from drifting independently.
 FOCUSED_FILTER = (
-    r"^BigSyncKitTests\.(?:SyncUndoCloseoutW1[^/]*|CloudKitAccountAvailability[^/]*|"
+    r"^BigSyncKitTests\.(?:(?:SyncUndoCloseoutW1[^/]*|CloudKitAccountAvailability[^/]*|"
     r"CloudKitCallbackAdmissionTests|CloudKitSynchronizerAccountFencingTests|"
     r"BigSyncWorkerRequestCancellationTests|ChangeRequestProcessorCancellationTests|"
     r"SynchronizationProcessorStartupTests|BigSyncScheduledRetryTests|"
-    r"BigSyncDeadlineRaceTests)/"
+    r"BigSyncDeadlineRaceTests|SyncSplitOperationOwnershipTests|SyncPhaseAttemptOwnershipTests)/"
+    r"|SyncRetainedRecordContractTests/testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence$)"
 )
 FOCUSED = re.compile(FOCUSED_FILTER)
 
