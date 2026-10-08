@@ -11168,9 +11168,29 @@ extension RealmSwiftAdapter {
             acknowledgedGenerations[$0.recordName] != nil
         }
         guard !candidates.isEmpty else { return }
-        // Refresh all target views before resolving mutable tracking rows.
+        // Model contracts and journal identity providers are caller-owned
+        // code. They can commit a successor without replacing this adapter's
+        // owner or comparison revision. Finish those callouts before freezing
+        // the target value/journal used to authorize quarantine retirement.
+        var validatedRecords = [String: (type: Object.Type, objectID: Any)]()
+        for name in Set(candidates.map(\.recordName)) {
+            guard let saved = cleanup.receipts[name],
+                  let type = realmObjectClass(name: saved.recordType),
+                  BigSyncRecordLifecycle.retainsTombstone(type),
+                  let objectID = getObjectIdentifier(recordName: name, entityType: saved.recordType),
+                  let target = provider.targetReaderRealmPerSchemaName[saved.recordType] else { continue }
+            if type is BigSyncRecordContractProviding.Type {
+                guard BigSyncRecordBaseline.isEnabled(in: target),
+                      let comparison = comparisonReceipts[name],
+                      comparison.context == context,
+                      try comparisonReceiptIsCurrent(comparison, recordName: name, in: target) else { continue }
+            }
+            validatedRecords[name] = (type, objectID)
+        }
+        try validateCleanupOwner()
+        // Select committed target views after the identity/model callouts.
         // Each original Realm is frozen once, so aliases share one version.
-        // These are committed per-file reads, not a cross-file transaction.
+        // These are per-file reads, not a cross-file atomic transaction.
         var snapshotsByRealm = [ObjectIdentifier: Realm]()
         var targets = [String: Realm]()
         for entityType in Set(candidates.map(\.entityType)) {
@@ -11184,18 +11204,14 @@ extension RealmSwiftAdapter {
         // Refresh and registry/model callbacks must not let a cancelled
         // attempt borrow a resumed run with identical namespace strings.
         try validateCleanupOwner()
-        // Complete model/registry validation before resolving any live
-        // tracking row. A synchronous provider callback can replace earlier
-        // evidence just as a refresh callback can open another transaction.
+        // Only non-callout predicates run against these final committed cuts.
         var eligibleRecordNames = Set<String>()
         for name in Set(candidates.map(\.recordName)) {
             guard let sentGeneration = acknowledgedGenerations[name],
                   let saved = cleanup.receipts[name],
-                  let type = realmObjectClass(name: saved.recordType),
-                  BigSyncRecordLifecycle.retainsTombstone(type),
+                  let validated = validatedRecords[name],
                   let target = targets[saved.recordType],
-                  let objectID = getObjectIdentifier(recordName: name, entityType: saved.recordType),
-                  let object = target.object(ofType: type, forPrimaryKey: objectID),
+                  let object = target.object(ofType: validated.type, forPrimaryKey: validated.objectID),
                   objectIsEligibleForActiveAccount(object, entityType: saved.recordType),
                   let tombstone = object as? SoftDeletable, tombstone.isDeleted else { continue }
 
@@ -11208,15 +11224,15 @@ extension RealmSwiftAdapter {
                                             forPrimaryKey: name),
                (pending.generation != sentGeneration
                 || !pendingMutationIsEligibleForActiveTransport(pending)) { continue }
-            if type is BigSyncRecordContractProviding.Type {
+            if validated.type is BigSyncRecordContractProviding.Type {
                 guard BigSyncRecordBaseline.isEnabled(in: target),
                       let comparison = comparisonReceipts[name],
                       comparison.context == context,
-                      let receiptTarget = provider.targetReaderRealmPerSchemaName[saved.recordType],
-                      try comparisonReceiptIsCurrent(comparison, recordName: name, in: receiptTarget),
-                      target.object(ofType: BigSyncRecordBaseline.self,
-                                    forPrimaryKey: name)?.serverChangeTag
-                        == saved.changeTag else { continue }
+                      let base = target.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name),
+                      !base.isComparisonInvalidated,
+                      base.namespace == context.namespace,
+                      base.revision == comparison.revision,
+                      base.serverChangeTag == saved.changeTag else { continue }
             }
             eligibleRecordNames.insert(name)
         }
@@ -11744,3 +11760,4 @@ extension RealmSwiftAdapter {
         }
     }
 }
+
