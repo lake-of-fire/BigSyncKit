@@ -389,6 +389,24 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    private func syncedDeletionCandidate(
+        _ fixture: (adapter: RealmSwiftAdapter, target: Realm, tracking: Realm)
+    ) async throws -> (row: SplitOwnerRow, recordID: CKRecord.ID, encodedRecord: Data) {
+        let (row, name, _) = try await pendingRow(fixture)
+        let batch = try await fixture.adapter.prepareUploadBatch(limit: 0)
+        try await fixture.adapter.acknowledgeUploadedRecords(batch.records, from: batch)
+        let entity = try XCTUnwrap(fixture.tracking.object(
+            ofType: SyncedEntity.self, forPrimaryKey: name
+        ))
+        XCTAssertEqual(entity.entityState, .synced)
+        XCTAssertNil(entity.pendingGeneration)
+        XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: name))
+        return (row, try XCTUnwrap(batch.records.first?.recordID),
+                try XCTUnwrap(entity.encodedRecord))
+    }
+
+    @BigSyncBackgroundActor
     func testInboundDeletionRejectsCancellationResetAccountBindingAndTransportReplacement() async throws {
         for replacement in 0..<4 {
             let fixture = try await fixture()
@@ -441,6 +459,63 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
                              "Inbound tombstones must not manufacture a local edit")
             }
         }
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionRetainsCommittedTombstoneAfterOwnerRetirementAndFreshRetry() async throws {
+        let fixture = try await fixture()
+        let candidate = try await syncedDeletionCandidate(fixture)
+        let originalModifiedAt = candidate.row.modifiedAt
+        fixture.adapter._testAfterRemoteDeletionTargetWrite = {
+            XCTAssertTrue(candidate.row.isDeleted)
+            fixture.adapter.cancelSynchronization()
+            try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+        }
+        defer { fixture.adapter._testAfterRemoteDeletionTargetWrite = nil }
+        do {
+            _ = try await fixture.adapter.deleteRecords(with: [candidate.recordID])
+            XCTFail("The old deletion published tracking after its target transaction retired the owner")
+        } catch is CancellationError { }
+        XCTAssertTrue(candidate.row.isDeleted)
+        XCTAssertEqual(candidate.row.modifiedAt, originalModifiedAt)
+        let entity = try XCTUnwrap(fixture.tracking.object(ofType: SyncedEntity.self,
+            forPrimaryKey: candidate.recordID.recordName))
+        XCTAssertEqual(entity.entityState, .synced)
+        XCTAssertEqual(entity.encodedRecord, candidate.encodedRecord)
+        XCTAssertNil(entity.pendingGeneration)
+        XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: candidate.recordID.recordName))
+
+        fixture.adapter._testAfterRemoteDeletionTargetWrite = nil
+        try await fixture.adapter.unsetCancellation()
+        let results = try await fixture.adapter.deleteRecords(with: [candidate.recordID])
+        XCTAssertEqual(results.first?.disposition, .appliedTombstone)
+        XCTAssertTrue(candidate.row.isDeleted)
+        XCTAssertEqual(candidate.row.modifiedAt, originalModifiedAt)
+        XCTAssertEqual(entity.entityState, .deletedRemotely)
+        XCTAssertNil(entity.pendingGeneration)
+        XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: candidate.recordID.recordName))
+
+        // Redelivery must also preserve a later local Unmark and its exact
+        // durable generation after the interrupted deletion has recovered.
+        try fixture.target.write {
+            candidate.row.isDeleted = false
+            candidate.row.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let successorGeneration = try XCTUnwrap(fixture.target.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: candidate.recordID.recordName)?.generation)
+        try await fixture.adapter.didFinishImport()
+        let replay = try await fixture.adapter.deleteRecords(with: [candidate.recordID])
+        XCTAssertEqual(replay.first?.disposition,
+            .preservedNewerLive(generation: successorGeneration))
+        XCTAssertFalse(candidate.row.isDeleted)
+        XCTAssertEqual(entity.entityState, .new)
+        XCTAssertNil(entity.encodedRecord)
+        XCTAssertEqual(entity.pendingGeneration, successorGeneration)
+        XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: candidate.recordID.recordName)?.generation, successorGeneration)
     }
 
     @BigSyncBackgroundActor

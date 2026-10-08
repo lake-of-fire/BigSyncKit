@@ -583,6 +583,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeRemoteDeletionTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterRemoteDeletionTargetWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeCleanupTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeCleanupTargetWrite:
@@ -8306,6 +8308,9 @@ public final class RealmSwiftAdapter:
                 }
                 try validateOwner()
             }
+#if DEBUG
+            try await _testAfterRemoteDeletionTargetWrite?()
+#endif
             try validateOwner()
         }
 
