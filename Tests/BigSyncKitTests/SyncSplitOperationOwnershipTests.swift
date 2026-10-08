@@ -389,6 +389,61 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testInboundDeletionRejectsCancellationResetAccountBindingAndTransportReplacement() async throws {
+        for replacement in 0..<4 {
+            let fixture = try await fixture()
+            let (row, name, _) = try await pendingRow(fixture)
+            let accepted = try await fixture.adapter.prepareUploadBatch(limit: 10)
+            try await fixture.adapter.acknowledgeUploadedRecords(accepted.records, from: accepted)
+            let entity = try XCTUnwrap(fixture.tracking.object(
+                ofType: SyncedEntity.self, forPrimaryKey: name
+            ))
+            XCTAssertEqual(entity.entityState, .synced)
+            XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+            let recordID = CKRecord.ID(recordName: name, zoneID: fixture.adapter.recordZoneID)
+            fixture.adapter._testBeforeRemoteDeletionTargetWrite = {
+                switch replacement {
+                case 0:
+                    fixture.adapter.cancelSynchronization()
+                    try fixture.adapter.prepareForFencedMigrationAfterCancellation()
+                case 1:
+                    try await fixture.adapter.activateAccountScope("inbound-deletion-successor-account")
+                case 2:
+                    try await fixture.adapter.activateReplicaBinding(
+                        accountScopeIdentifier: "split-owner-account",
+                        replicaBindingGenerationIdentifier: "inbound-deletion-successor-binding"
+                    )
+                default:
+                    try await fixture.adapter.activateTransportNamespace(
+                        containerIdentifier: "iCloud.test.inbound-deletion-successor", databaseScope: .public
+                    )
+                }
+            }
+            defer { fixture.adapter._testBeforeRemoteDeletionTargetWrite = nil }
+            do {
+                _ = try await fixture.adapter.deleteRecords(with: [recordID])
+                XCTFail("An obsolete inbound deletion crossed the operation's original identity")
+            } catch is CancellationError { }
+            XCTAssertFalse(row.isDeleted, "Rejected deletion must leave the live target unchanged")
+            XCTAssertEqual(row.text, "local")
+            XCTAssertEqual(entity.entityState, .synced, "Rejected deletion must leave tracking unchanged")
+            XCTAssertNil(entity.pendingGeneration)
+            XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+
+            if replacement == 0 {
+                fixture.adapter._testBeforeRemoteDeletionTargetWrite = nil
+                try await fixture.adapter.unsetCancellation()
+                let retry = try await fixture.adapter.deleteRecords(with: [recordID])
+                XCTAssertEqual(retry.count, 1)
+                XCTAssertTrue(row.isDeleted, "A fresh operation may apply the same server deletion")
+                XCTAssertEqual(entity.entityState, .deletedRemotely)
+                XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name),
+                             "Inbound tombstones must not manufacture a local edit")
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testCancelledPhysicalDeleteJournalCleanupRetainsTombstoneForSuccessor() async throws {
         let fixture = try await fixture()
         let (row, name, _) = try await pendingRow(fixture)

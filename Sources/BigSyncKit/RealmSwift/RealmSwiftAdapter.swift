@@ -8031,6 +8031,8 @@ public final class RealmSwiftAdapter:
     public func deleteRecords(
         with recordIDs: [CKRecord.ID]
     ) async throws -> [InboundDeletionResult] {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else {
             throw RealmSwiftAdapterError.setupUnavailable
@@ -8038,10 +8040,12 @@ public final class RealmSwiftAdapter:
         guard !recordIDs.isEmpty else { return [] }
 
         await persistenceRealm.asyncRefresh()
+        try validateOwner()
         for targetRealm in realmProvider.targetReaderRealms ?? [] {
             await targetRealm.asyncRefresh()
+            try validateOwner()
         }
-        try Task.checkCancellation()
+        try validateOwner()
         guard !cancelSync else { throw CancellationError() }
 
         var deletions = [RemoteDeletionSnapshot]()
@@ -8075,7 +8079,7 @@ public final class RealmSwiftAdapter:
         }
         deletions.reserveCapacity(recordIDs.count)
         for recordID in recordIDs {
-            try Task.checkCancellation()
+            try validateOwner()
             guard recordID.zoneID == recordZoneID else {
                 throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
             }
@@ -8196,6 +8200,7 @@ public final class RealmSwiftAdapter:
                let targetRealm, BigSyncRecordBaseline.isEnabled(in: targetRealm) {
                 dispositionsByRecordName[recordID.recordName] = try await reconcilePhysicalDeletion(
                     recordID: recordID, type: objectClass, in: targetRealm)
+                try validateOwner()
                 continue
             }
             let pendingMutation = targetRealm?.object(
@@ -8242,7 +8247,7 @@ public final class RealmSwiftAdapter:
         let deletionsByEntityType = Dictionary(grouping: deletions, by: \.entityType)
         var committedRemoteDeletions = [RemoteDeletionSnapshot]()
         for (entityType, entityDeletions) in deletionsByEntityType where entityType != "CKShare" {
-            try Task.checkCancellation()
+            try validateOwner()
             guard let objectClass = realmObjectClass(name: entityType),
                   let targetRealm = realmProvider.targetReaderRealmPerSchemaName[entityType] else {
                 continue
@@ -8251,8 +8256,9 @@ public final class RealmSwiftAdapter:
             try await _testBeforeRemoteDeletionTargetWrite?()
 #endif
             try await targetRealm.asyncWritePreservingOwnership {
+                try validateOwner()
                 for deletion in entityDeletions {
-                    try Task.checkCancellation()
+                    try validateOwner()
                     guard !cancelSync else { throw CancellationError() }
                     if targetRealm.schema.objectSchema.contains(where: {
                         $0.className == BigSyncPendingMutation.className()
@@ -8298,7 +8304,9 @@ public final class RealmSwiftAdapter:
                     dispositionsByRecordName[deletion.recordName] =
                         .appliedTombstone
                 }
+                try validateOwner()
             }
+            try validateOwner()
         }
 
         // A local mutation can commit immediately after the inbound-deletion
@@ -8311,7 +8319,7 @@ public final class RealmSwiftAdapter:
                 continue
             }
             await targetRealm.asyncRefresh()
-            try Task.checkCancellation()
+            try validateOwner()
             guard !cancelSync else { throw CancellationError() }
             if let mutation = targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
@@ -8333,11 +8341,12 @@ public final class RealmSwiftAdapter:
         }
 
         try await persistenceRealm.asyncWritePreservingOwnership {
+            try validateOwner()
             for quarantine in semanticQuarantines {
                 persistenceRealm.add(quarantine, update: .modified)
             }
             for localWin in localWins {
-                try Task.checkCancellation()
+                try validateOwner()
                 let syncedEntity = Self.getSyncedEntity(
                     objectIdentifier: localWin.deletion.recordName,
                     realm: persistenceRealm
@@ -8359,7 +8368,7 @@ public final class RealmSwiftAdapter:
                     committedRealmReadSnapshot(in: $0)
                 }
                 // Refresh can deliver a synchronous cancellation callback.
-                try Task.checkCancellation()
+                try validateOwner()
                 guard !cancelSync,
                       cancellationGeneration == selectionCancellationGeneration,
                       self.realmProvider === realmProvider else {
@@ -8433,7 +8442,7 @@ public final class RealmSwiftAdapter:
                 }
             }
             for deletion in committedRemoteDeletions {
-                try Task.checkCancellation()
+                try validateOwner()
                 let syncedEntity = Self.getSyncedEntity(
                     objectIdentifier: deletion.recordName,
                     realm: persistenceRealm
@@ -8451,7 +8460,9 @@ public final class RealmSwiftAdapter:
                 }
                 syncedEntity.state = SyncedEntityState.deletedRemotely.rawValue
             }
+            try validateOwner()
         }
+        try validateOwner()
         updateHasChanges(realm: persistenceRealm)
         logger.info(
             "Deleted \(committedRemoteDeletions.count) local records which were previously deleted from iCloud"
@@ -8466,6 +8477,7 @@ public final class RealmSwiftAdapter:
                 "Quarantined \(semanticQuarantines.count) unauthorized semantic record deletions"
             )
         }
+        try validateOwner()
         return try recordIDs.enumerated().map { ordinal, recordID in
             guard let entityType = entityTypesByRecordName[
                 recordID.recordName
