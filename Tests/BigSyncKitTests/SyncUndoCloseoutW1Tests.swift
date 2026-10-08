@@ -8,6 +8,7 @@ import XCTest
 @objc(W1ContractNote)
 final class W1ContractNote: Object, ChangeMetadataRecordable,
     BigSyncRecordContractProviding {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
     static let bigSyncRecordContract = BigSyncRecordContract(
         policy: .independentFields, preserveConflictingFields: ["text"],
         incomingRepresentation: .init(identity: "w1-note-released", fields: [
@@ -24,6 +25,7 @@ final class W1ContractNote: Object, ChangeMetadataRecordable,
     @Persisted var list: List<Int>
     @Persisted var members: MutableSet<String>
     @Persisted var map: Map<String, Int>
+    @Persisted var uuidMap: Map<String, UUID>
     @Persisted var createdAt = Date()
     @Persisted var modifiedAt = Date()
     @Persisted var explicitlyModifiedAt: Date?
@@ -33,6 +35,7 @@ final class W1ContractNote: Object, ChangeMetadataRecordable,
 @objc(W1RetainedArticle)
 final class W1RetainedArticle: Object, ChangeMetadataRecordable,
     BigSyncRecordContractProviding {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
     static let bigSyncRecordContract = BigSyncRecordContract(
         policy: .lifetimeBundle(lifetimeField: "epoch", independentFields: ["title"]),
         deletion: .retained, semanticMetadataFields: ["createdAt"],

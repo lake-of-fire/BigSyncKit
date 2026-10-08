@@ -7,6 +7,36 @@ import Logging
 import RealmSwift
 import RealmSwiftGaps
 
+/// Realm exposes persisted properties through KVC, but a Swift @Persisted
+/// key path has no Objective-C key-path string for NSObject.observe to extract.
+/// Use the actual persisted column and preserve the synchronous KVO call stack.
+private final class RelationshipColumnObservation: NSObject {
+    private var observedObject: NSObject?
+    private let keyPath: String
+    private let onChange: @Sendable () -> Void
+
+    init(object: NSObject, keyPath: String, onChange: @escaping @Sendable () -> Void) {
+        observedObject = object
+        self.keyPath = keyPath
+        self.onChange = onChange
+        super.init()
+        object.addObserver(self, forKeyPath: keyPath, options: [.new], context: nil)
+    }
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
+                               change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
+        onChange()
+    }
+
+    func invalidate() {
+        guard let object = observedObject else { return }
+        observedObject = nil
+        object.removeObserver(self, forKeyPath: keyPath)
+    }
+
+    deinit { invalidate() }
+}
+
 private final class DictionaryKeyValueStore: NSObject, KeyValueStore {
     private var storage = [String: Any]()
     var synchronizesDurably = true
@@ -12492,6 +12522,223 @@ final class BigSyncKitTests: XCTestCase {
     @BigSyncBackgroundActor
     func testDeferredRelationshipDoesNotApplyProvisionalOnlyIntent() async throws {
         try await assertDeferredRelationshipUsesCommittedTracking(.insertIntent)
+    }
+
+    @BigSyncBackgroundActor
+    private final class RelationshipReentryCapture {
+        var callbackCount = 0
+        var sawOwningWrite = false
+    }
+
+    @BigSyncBackgroundActor
+    private func assertDeferredRelationshipRejectsSynchronousReentry(
+        duringCleanup: Bool, revokesProvider: Bool
+    ) async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let parent = BigSyncRelationshipParent()
+        parent.id = "reentrant-parent"
+        let original = BigSyncRelationshipChild()
+        original.id = "original-child"
+        let imported = BigSyncRelationshipChild()
+        imported.id = "imported-child"
+        parent.favoriteChild = original
+        try fixture.targetRealm.write { fixture.targetRealm.add([original, imported, parent]) }
+        let name = BigSyncRelationshipParent.className() + "." + parent.id
+        let intent = PendingRelationship()
+        try fixture.persistenceRealm.write {
+            let entity = SyncedEntity(entityType: BigSyncRelationshipParent.className(),
+                identifier: name, state: SyncedEntityState.synced.rawValue)
+            fixture.persistenceRealm.add(entity)
+            intent.relationshipName = "favoriteChild"
+            intent.forSyncedEntity = entity
+            intent.targetIdentifier = imported.id
+            intent.position = 0
+            intent.expectedModifiedAt = parent.modifiedAt
+            intent.expectedExplicitlyModifiedAt = parent.explicitlyModifiedAt
+            fixture.persistenceRealm.add(intent)
+        }
+        let provider = fixture.adapter.realmProvider
+        defer { fixture.adapter.realmProvider = provider }
+        let capture = RelationshipReentryCapture()
+        let reenter: @BigSyncBackgroundActor @Sendable () -> Void = {
+            // Rollback may emit another KVO event. Retire the owner only once.
+            guard capture.callbackCount == 0 else { return }
+            capture.callbackCount += 1
+            capture.sawOwningWrite = duringCleanup
+                ? fixture.persistenceRealm.isInWriteTransaction
+                : fixture.targetRealm.isInWriteTransaction
+            if revokesProvider { fixture.adapter.realmProvider = nil }
+            else { fixture.adapter.cancelSynchronization() }
+        }
+        let invoke: @Sendable () -> Void = {
+            // Realm emits this KVO synchronously from this actor's mutation;
+            // preserve that call stack instead of scheduling a later Task.
+            BigSyncBackgroundActor.shared.assumeIsolated { _ in
+                let callback = unsafeBitCast(reenter, to: (@Sendable () -> Void).self)
+                callback()
+            }
+        }
+        let invalidateObservation: () -> Void
+        if duringCleanup {
+            let observation = intent.observe(\.isInvalidated, options: [.new]) { _, change in
+                if change.newValue == true { invoke() }
+            }
+            invalidateObservation = { observation.invalidate() }
+        } else {
+            let observation = RelationshipColumnObservation(
+                object: parent, keyPath: "favoriteChild", onChange: invoke)
+            invalidateObservation = { observation.invalidate() }
+        }
+        defer { invalidateObservation() }
+        do {
+            try await fixture.adapter.persistImportedChanges()
+            XCTFail("Synchronous KVO retired the relationship writer")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)")
+        }
+        invalidateObservation()
+        XCTAssertEqual(capture.callbackCount, 1, "The real mutation must invoke synchronous KVO")
+        XCTAssertTrue(capture.sawOwningWrite)
+        XCTAssertFalse(fixture.targetRealm.isInWriteTransaction)
+        XCTAssertFalse(fixture.persistenceRealm.isInWriteTransaction)
+        XCTAssertEqual(parent.favoriteChild?.id, duringCleanup ? imported.id : original.id)
+        XCTAssertEqual(fixture.persistenceRealm.objects(PendingRelationship.self).count, 1,
+                       "A retired cleanup must roll back its intent deletion")
+        fixture.adapter.realmProvider = provider
+        try await fixture.adapter.unsetCancellation()
+        try await fixture.adapter.persistImportedChanges()
+        XCTAssertEqual(parent.favoriteChild?.id, imported.id)
+        XCTAssertTrue(fixture.persistenceRealm.objects(PendingRelationship.self).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipAssignmentRejectsSynchronousKVOReentry() async throws {
+        for revokesProvider in [false, true] {
+            try await assertDeferredRelationshipRejectsSynchronousReentry(
+                duringCleanup: false, revokesProvider: revokesProvider)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipCleanupRejectsSynchronousInvalidationReentry() async throws {
+        for revokesProvider in [false, true] {
+            try await assertDeferredRelationshipRejectsSynchronousReentry(
+                duringCleanup: true, revokesProvider: revokesProvider)
+        }
+    }
+
+    private enum DeferredRelationshipOwnerChange: CaseIterable, Equatable, Sendable {
+        case unchanged, cancelUnset, account, binding, namespace, provider
+    }
+
+    @BigSyncBackgroundActor
+    private func assertDeferredRelationshipRejectsSuccessorOwner(waitingForTracking: Bool) async throws {
+        for change in DeferredRelationshipOwnerChange.allCases {
+            let fixture = try await makeRealmAdapterFixture()
+            let parent = BigSyncRelationshipParent()
+            parent.id = "fenced-parent"
+            let original = BigSyncRelationshipChild()
+            original.id = "original-child"
+            let imported = BigSyncRelationshipChild()
+            imported.id = "imported-child"
+            parent.children.append(original)
+            try fixture.targetRealm.write { fixture.targetRealm.add([original, imported, parent]) }
+            let name = BigSyncRelationshipParent.className() + "." + parent.id
+            try fixture.persistenceRealm.write {
+                let entity = SyncedEntity(entityType: BigSyncRelationshipParent.className(),
+                    identifier: name, state: SyncedEntityState.synced.rawValue)
+                fixture.persistenceRealm.add(entity)
+                let intent = PendingRelationship()
+                intent.relationshipName = "children"
+                intent.forSyncedEntity = entity
+                intent.targetIdentifier = imported.id
+                intent.position = 0
+                intent.expectedModifiedAt = parent.modifiedAt
+                intent.expectedExplicitlyModifiedAt = parent.explicitlyModifiedAt
+                fixture.persistenceRealm.add(intent)
+            }
+            let entered = AsyncGate()
+            let owner = waitingForTracking ? fixture.persistenceRealm : fixture.targetRealm
+            let provider = fixture.adapter.realmProvider
+            let admissionHook: @BigSyncBackgroundActor @Sendable () async throws -> Void = {
+                // Start an independent owner after refresh, before the writer
+                // seeks admission. The operation must wait for this owner.
+                owner.beginWrite()
+                await entered.open()
+            }
+            if waitingForTracking {
+                fixture.adapter._testBeforePendingRelationshipTrackingWrite = admissionHook
+            } else {
+                fixture.adapter._testBeforePendingRelationshipTargetWrite = admissionHook
+            }
+            defer {
+                fixture.adapter._testBeforePendingRelationshipTargetWrite = nil
+                fixture.adapter._testBeforePendingRelationshipTrackingWrite = nil
+                fixture.adapter.realmProvider = provider
+                if owner.isInWriteTransaction { owner.cancelWrite() }
+            }
+            let operation = Task { @BigSyncBackgroundActor in
+                // Always wake the caller, even if setup fails before admission.
+                do { try await fixture.adapter.persistImportedChanges() }
+                catch { await entered.open(); throw error }
+            }
+            await entered.wait()
+            guard owner.isInWriteTransaction else {
+                try await operation.value
+                XCTFail("The independent writer did not enter")
+                continue
+            }
+            switch change {
+            case .unchanged: break
+            case .cancelUnset:
+                fixture.adapter.cancelSynchronization()
+                try await fixture.adapter.unsetCancellation()
+            case .account:
+                try await fixture.adapter.activateAccountScope("successor-account")
+            case .binding:
+                try await fixture.adapter.activateReplicaBinding(accountScopeIdentifier: "successor-account",
+                    replicaBindingGenerationIdentifier: "successor-binding")
+            case .namespace:
+                try await fixture.adapter.activateTransportNamespace(containerIdentifier: "iCloud.successor",
+                    databaseScope: .public)
+            case .provider:
+                fixture.adapter.realmProvider = nil
+            }
+            owner.cancelWrite()
+            let outcome = await operation.result
+            fixture.adapter._testBeforePendingRelationshipTargetWrite = nil
+            fixture.adapter._testBeforePendingRelationshipTrackingWrite = nil
+            fixture.adapter.realmProvider = provider
+            switch outcome {
+            case .success:
+                XCTAssertEqual(change, .unchanged)
+            case .failure(let error):
+                XCTAssertNotEqual(change, .unchanged)
+                XCTAssertTrue(error is CancellationError, "Unexpected failure: \(error)")
+            }
+            XCTAssertEqual(parent.children.map(\.id),
+                waitingForTracking || change == .unchanged ? [imported.id] : [original.id])
+            XCTAssertEqual(fixture.persistenceRealm.objects(PendingRelationship.self).count,
+                change == .unchanged ? 0 : 1,
+                "Obsolete cleanup must retain the committed deferred intent")
+            if change != .unchanged {
+                // A fresh call belongs to the successor and can recover a target
+                // phase that committed before the obsolete cleanup was rejected.
+                try await fixture.adapter.persistImportedChanges()
+                XCTAssertEqual(parent.children.map(\.id), [imported.id])
+                XCTAssertTrue(fixture.persistenceRealm.objects(PendingRelationship.self).isEmpty)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipTargetAdmissionRejectsSuccessorOwner() async throws {
+        try await assertDeferredRelationshipRejectsSuccessorOwner(waitingForTracking: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeferredRelationshipTrackingAdmissionRejectsSuccessorOwner() async throws {
+        try await assertDeferredRelationshipRejectsSuccessorOwner(waitingForTracking: true)
     }
 
     @BigSyncBackgroundActor

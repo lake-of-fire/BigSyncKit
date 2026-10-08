@@ -827,8 +827,11 @@ final class SyncRetainedRecordContractTests: XCTestCase {
 
             XCTAssertTrue(fence.rejectsAuthority)
             XCTAssertEqual(adapter.recordRebaseContext, context)
-            // Journal identity validation requires the caller's owned transaction.
-            try realm.write { try context.validate(in: realm) }
+            XCTAssertFalse(realm.isInWriteTransaction, "The poisoned decision must release its writer")
+            // This assertion is a read-only observation after rollback. The
+            // transaction-only journal verifier deliberately preconditions on
+            // an owning write; use the adapter's supported committed-read cut.
+            try adapter.validateRecordEvidenceCut(adapter.currentRecordEvidenceCut(), in: realm)
             XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: object), originalFields)
             XCTAssertEqual(object.modifiedAt, originalModifiedAt)
             XCTAssertEqual(object.explicitlyModifiedAt, originalExplicitlyModifiedAt)

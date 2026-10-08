@@ -172,4 +172,118 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(retry.first?.record["title"] as? String, restored.title)
     }
 
+    @BigSyncBackgroundActor
+    func testPhysicalDeletionIgnoresProvisionalTrackingStateAndInsertion() async throws {
+        for insertsRow in [false, true] {
+            for commits in [false, true] {
+                let (adapter, _, _, name, generation) = try await uploadSnapshotFixture()
+                let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+                if insertsRow {
+                    try tracking.write {
+                        tracking.delete(try XCTUnwrap(tracking.object(ofType: SyncedEntity.self,
+                            forPrimaryKey: name)))
+                    }
+                }
+                tracking.beginWrite()
+                defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+                let entity: SyncedEntity
+                if insertsRow {
+                    entity = SyncedEntity(entityType: W1UploadSnapshotRow.className(),
+                        identifier: name, state: SyncedEntityState.deletedLocally.rawValue)
+                    entity.setPendingMutation(generation: generation,
+                        replicaBindingGenerationIdentifier: "w1-binding")
+                    tracking.add(entity)
+                } else {
+                    entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self,
+                        forPrimaryKey: name))
+                    entity.entityState = .deletedLocally
+                }
+                let model: any ModelAdapter = adapter
+                let during = try await model.preparedRecordDeletions(limit: 10,
+                    restrictedToEntityType: W1UploadSnapshotRow.className())
+                XCTAssertTrue(during.isEmpty, "A provisional delete must never become a transport request")
+                let transport = W1ScriptedTransport()
+                let provisionalRequest = try await transport.modifyRecords(saving: [],
+                    deleting: during.map(\.recordID), savePolicy: .ifServerRecordUnchanged,
+                    atomically: false)
+                XCTAssertTrue(provisionalRequest.deleteResults.isEmpty)
+                XCTAssertTrue(tracking.isInWriteTransaction)
+                if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+                let after = try await model.preparedRecordDeletions(limit: 10,
+                    restrictedToEntityType: W1UploadSnapshotRow.className())
+                XCTAssertEqual(after.count, commits ? 1 : 0)
+                let committedRequest = try await transport.modifyRecords(saving: [],
+                    deleting: after.map(\.recordID), savePolicy: .ifServerRecordUnchanged,
+                    atomically: false)
+                XCTAssertEqual(committedRequest.deleteResults.count, commits ? 1 : 0,
+                    "The mutation fake must never receive a rollback-only deletion")
+                if commits { XCTAssertEqual(after.first?.generation, generation) }
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPhysicalDeletionUsesCommittedGenerationDuringProvisionalReplacementOrRemoval() async throws {
+        for removesRow in [false, true] {
+            for commits in [false, true] {
+                let (adapter, realm, target, name, generation) = try await uploadSnapshotFixture()
+                try realm.write { realm.delete(target) }
+                _ = try await adapter.preparedRecordsToUpload(limit: 10,
+                    restrictedToEntityType: W1UploadSnapshotRow.className())
+                let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+                let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+                XCTAssertEqual(entity.entityState, .deletedLocally)
+                tracking.beginWrite()
+                defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+                if removesRow { tracking.delete(entity) }
+                else { entity.pendingGeneration = "successor-deletion" }
+                let model: any ModelAdapter = adapter
+                let during = try await model.preparedRecordDeletions(limit: 10,
+                    restrictedToEntityType: W1UploadSnapshotRow.className())
+                XCTAssertEqual(during.first?.generation, generation)
+                XCTAssertEqual(during.first?.recordID.recordName, name)
+                XCTAssertTrue(tracking.isInWriteTransaction)
+                if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+                let after = try await model.preparedRecordDeletions(limit: 10,
+                    restrictedToEntityType: W1UploadSnapshotRow.className())
+                if removesRow && commits { XCTAssertTrue(after.isEmpty) }
+                else {
+                    XCTAssertEqual(after.first?.generation, commits ? "successor-deletion" : generation)
+                    try await model.didDelete(recordIDs: during.map(\.recordID),
+                        matchingGenerations: [name: generation])
+                    let remaining = tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name)
+                    if commits { XCTAssertEqual(remaining?.pendingGeneration, "successor-deletion") }
+                    else {
+                        XCTAssertEqual(remaining?.entityState, .deletedRemotely,
+                            "The exact committed disappearance remains acknowledgeable")
+                        XCTAssertNil(remaining?.pendingGeneration)
+                    }
+                }
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPhysicalDeletionIgnoresProvisionalTransportBinding() async throws {
+        for commits in [false, true] {
+            let (adapter, realm, target, name, generation) = try await uploadSnapshotFixture()
+            try realm.write { realm.delete(target) }
+            _ = try await adapter.preparedRecordsToUpload(limit: 10,
+                restrictedToEntityType: W1UploadSnapshotRow.className())
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+            tracking.beginWrite()
+            defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+            entity.pendingReplicaBindingGenerationIdentifier = "foreign-binding"
+            let during = try await adapter.preparedRecordDeletions(limit: 10,
+                restrictedToEntityType: W1UploadSnapshotRow.className())
+            XCTAssertEqual(during.first?.generation, generation)
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+            let after = try await adapter.preparedRecordDeletions(limit: 10,
+                restrictedToEntityType: W1UploadSnapshotRow.className())
+            XCTAssertEqual(after.count, commits ? 0 : 1)
+        }
+    }
+
 }
