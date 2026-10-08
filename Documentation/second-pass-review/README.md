@@ -93,6 +93,47 @@ candidate is not left durably staged for the successor.
 
 ## Native behavior coverage
 
+### Final conflict-decision account authority
+
+The follow-up review of `resolveRecordConflict` established a separate final
+account boundary. Core supplies its original synchronizer account-scope lease.
+The production account-change observer poisons that lease synchronously on the
+posting thread before its actor-owned cancellation and durable invalidation
+run. A conflict decision previously validated the lease at writer entry, then
+changed target fields, accepted comparison evidence, journal rows, sibling
+conflict resolution and its staged submission without a final account check.
+The comparison context's binding check cannot detect that synchronous poison.
+
+The same original `validateAuthority` closure now runs after all provisional
+target changes, inside the owned transaction before commit submission. A
+revoked lease rolls the complete target decision back. The change adds no new
+authority, lock or post-durable rejection. Existing tracking cleanup and
+idempotent recovery still handle a decision that committed successfully.
+
+`testConflictDecisionRollsBackAfterSynchronousAccountFencePoison` in the existing
+`SyncRetainedRecordContractTests` class exercises both Keep Local and Use
+Incoming. Its existing comparison hook poisons the actual fixture synchronizer
+fence directly, avoiding a global account notification. It checks preserved
+target fields and metadata, baseline absence, pending generation, unresolved
+conflicts, the exact staged candidate and tracking page/quarantine evidence.
+Identity/status providers and a throwing no-service transport avoid CloudKit
+requests. Synchronizer cancellation is joined and the adapter fixture owner
+handles teardown.
+
+The existing post-target-commit revocation regression now checks actual durable
+conflict state outside a write instead of depending on validation-call count.
+The four existing Realm fixture classes in this file now explicitly opt out of
+the default schema; its configurations already list their object types. No
+method is added by that fixture correction. The two preexisting legacy lifetime
+tail methods are preserved and are not counted as additions.
+
+This follow-up is additional to the initial `abf3-to-candidate.patch` and its
+initial manifest. The final cumulative publication manifest and selected Git
+tree identify all current bytes. Independent source review found no additional
+actionable issue in this repair; the native method remains unexecuted.
+
+### Split-operation coverage
+
 New class: `SyncSplitOperationOwnershipTests` in
 `Tests/BigSyncKitTests/SyncSplitOperationOwnershipTests.swift`. The complete file
 is `#if DEBUG`, matching its source seams.
@@ -140,8 +181,13 @@ If physical target cleanup already committed, its remaining tracking row can be
 retired by a fresh cleanup operation. Newer local generations remain protected
 by the pre-existing exact-generation checks.
 
-Owned implementation files are precisely the adapter, disappearance source and
-new test file listed in `manifest.json`; review documentation is listed separately.
+The initial owned implementation files are the adapter, disappearance source
+and new split-operation test file listed in `manifest.json`. The final authority
+follow-up additionally changes the existing retained-contract tests as described
+above. Reader registration adds 35 native source identities: eight new split
+methods, this one final-authority method, and 26 inherited legacy optional-
+lifetime methods that were absent from its previous inventory. Registration is
+not native discovery or a behavior pass.
 No additional substantive defect was established in the inspected latest legacy
 lifetime ordering, retained tombstone lane upgrade, committed upload-selection,
 accepted-baseline or scalar fingerprint paths during this pass.
