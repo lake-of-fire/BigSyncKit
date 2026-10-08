@@ -305,10 +305,10 @@ final class HotfixCollectionSafetyTests: XCTestCase {
     func testSharedTraversalSkipsUnsupportedFieldsAndBacklinksAndRetainsDeferredClears() async throws {
         let fixture = try await fixture()
         defer { fixture.adapter.invalidateTokens() }
-        try await assertTransportExclusionsAndDeferredClears(adapter: fixture.adapter)
+        try assertTransportExclusionsAndDeferredClears(adapter: fixture.adapter)
     }
 
-    @RealmBackgroundActor
+    @BigSyncBackgroundActor
     private func assertTransportExclusionsAndDeferredClears(adapter: RealmSwiftAdapter) throws {
         func record(for type: Object.Type) -> CKRecord {
             let record = CKRecord(recordType: type.className(), recordID: .init(

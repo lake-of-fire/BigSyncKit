@@ -37,7 +37,7 @@ printf '%s\n' 'Package Debug collection/asset selection only.' \
   > "$evidence/scope.txt"
 swift test --help > "$evidence/swift-test-help.txt"
 swift_test=(swift test --package-path "$root" --scratch-path "$scratch")
-if rg -q -- '--disable-experimental-prebuilts' "$evidence/swift-test-help.txt"; then
+if [[ "$(< "$evidence/swift-test-help.txt")" == *--disable-experimental-prebuilts* ]]; then
   swift_test+=(--disable-experimental-prebuilts)
 fi
 
