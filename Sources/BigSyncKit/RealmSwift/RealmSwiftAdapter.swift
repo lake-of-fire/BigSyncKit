@@ -581,11 +581,21 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeRemoteDeletionTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforeCleanupTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeCleanupTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforePendingMutationTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingMutationTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterUploadPreparationIdentityValidation:
+        (@BigSyncBackgroundActor @Sendable () throws -> Void)?
+    var _testAfterUploadComparisonWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterUploadTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterDeletionTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingRelationshipTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
@@ -2451,6 +2461,32 @@ public final class RealmSwiftAdapter:
             realm.refresh()
         }
         return realm.freeze()
+    }
+
+    /// Immutable ownership of a split target/tracking operation. A cancelled
+    /// attempt remains obsolete even when a successor clears cancelSync again.
+    /// Legacy models need this fence too, without opting into record rebasing.
+    @BigSyncBackgroundActor
+    func operationOwnerValidator() -> (@BigSyncBackgroundActor () throws -> Void) {
+        let generation = cancellationGeneration
+        let provider = realmProvider
+        let account = activeAccountScopeIdentifier
+        let binding = activeReplicaBindingGenerationIdentifier
+        let context = recordRebaseContext
+        let container = activeContainerIdentifier
+        let scope = activeDatabaseScopeRawValue
+        return {
+            try Task.checkCancellation()
+            guard !self.cancelSync, self.cancellationGeneration == generation,
+                  self.realmProvider === provider,
+                  self.activeAccountScopeIdentifier == account,
+                  self.activeReplicaBindingGenerationIdentifier == binding,
+                  self.recordRebaseContext == context,
+                  self.activeContainerIdentifier == container,
+                  self.activeDatabaseScopeRawValue == scope else {
+                throw CancellationError()
+            }
+        }
     }
 
     @BigSyncBackgroundActor
@@ -4731,6 +4767,8 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     func applyPendingRelationships(realmProvider: RealmProvider) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let persistenceRealm = realmProvider.persistenceRealm else { return }
 
         struct RelationshipGroupKey: Hashable, Sendable {
@@ -4835,6 +4873,8 @@ public final class RealmSwiftAdapter:
             }
         }()
 
+        try validateOwner()
+
         func datesMatch(_ lhs: Date?, _ rhs: Date?) -> Bool {
             switch (lhs, rhs) {
             case (.none, .none):
@@ -4850,7 +4890,7 @@ public final class RealmSwiftAdapter:
 
         for group in groups {
             try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateOwner()
             guard let originObjectClass = self.realmObjectClass(
                 name: group.entityType
             ) else {
@@ -4870,7 +4910,7 @@ public final class RealmSwiftAdapter:
             ] else { continue }
             await targetRealm.asyncRefresh()
             try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateOwner()
 
             enum RelationshipApplicationOutcome {
                 case applied
@@ -4881,8 +4921,9 @@ public final class RealmSwiftAdapter:
             }
             var applicationOutcome = RelationshipApplicationOutcome.applied
             try await targetRealm.asyncWritePreservingOwnership {
+                try validateOwner()
                 try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                try validateOwner()
                 // The target transaction owns its current local fields, but
                 // owns no tracking write. Re-sample the committed tracking
                 // intent and parent together after target admission: an
@@ -4890,7 +4931,7 @@ public final class RealmSwiftAdapter:
                 // relationship when its owner later rolls back.
                 let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
                 try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                try validateOwner()
                 guard currentRelationships(for: group, in: trackingSnapshot) != nil else {
                     applicationOutcome = .superseded
                     return
@@ -4993,11 +5034,13 @@ public final class RealmSwiftAdapter:
                         forKey: group.key.relationshipName
                     )
                 }
+                try validateOwner()
             }
 
 #if DEBUG
             try await _testAfterPendingRelationshipTargetWrite?()
 #endif
+            try validateOwner()
             if case .unsupportedCollectionBridge = applicationOutcome {
                 logger.error(
                     "QSCloudKitSynchronizer >> Retaining deferred relationship \(group.key.relationshipName) for \(group.key.syncedEntityID) because its Realm collection bridge was unavailable"
@@ -5011,11 +5054,13 @@ public final class RealmSwiftAdapter:
                 continue
             }
             try await persistenceRealm.asyncWritePreservingOwnership {
+                try validateOwner()
                 try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                try validateOwner()
                 guard let relationships = currentRelationships(for: group, in: persistenceRealm)
                 else { return }
                 persistenceRealm.delete(relationships)
+                try validateOwner()
             }
             if case .stale = applicationOutcome {
                 logger.info(
@@ -5024,7 +5069,7 @@ public final class RealmSwiftAdapter:
             }
 
             await Task.yield()
-            try Task.checkCancellation()
+            try validateOwner()
         }
     }
 
@@ -6759,24 +6804,30 @@ public final class RealmSwiftAdapter:
     /// Deletes soft-deleted objects.
     @BigSyncBackgroundActor
     public func cleanUp() async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else {
             logger.warning("QSCloudKitSynchronizer >> Cleanup requested before Realm setup completed")
             return
         }
 
-        let remotelyDeleted = persistenceRealm.objects(SyncedEntity.self)
-            .where { $0.state == SyncedEntityState.deletedRemotely.rawValue }
-            .compactMap { entity -> RemoteDeletionSnapshot? in
-                guard !self.excludedClassNames.contains(entity.entityType) else { return nil }
-                let prefix = entity.entityType + "."
-                guard entity.identifier.hasPrefix(prefix) else { return nil }
-                return RemoteDeletionSnapshot(
-                    recordName: entity.identifier,
-                    entityType: entity.entityType,
-                    objectIdentifier: String(entity.identifier.dropFirst(prefix.count))
-                )
-            }
+        let remotelyDeleted: [RemoteDeletionSnapshot] = {
+            let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
+            return trackingSnapshot.objects(SyncedEntity.self)
+                .where { $0.state == SyncedEntityState.deletedRemotely.rawValue }
+                .compactMap { entity -> RemoteDeletionSnapshot? in
+                    guard !self.excludedClassNames.contains(entity.entityType) else { return nil }
+                    let prefix = entity.entityType + "."
+                    guard entity.identifier.hasPrefix(prefix) else { return nil }
+                    return RemoteDeletionSnapshot(
+                        recordName: entity.identifier,
+                        entityType: entity.entityType,
+                        objectIdentifier: String(entity.identifier.dropFirst(prefix.count))
+                    )
+                }
+        }()
+        try validateOwner()
 
         let deletionsByRealm = Dictionary(grouping: remotelyDeleted) { deletion in
             realmProvider.targetReaderRealmPerSchemaName[deletion.entityType]
@@ -6795,10 +6846,12 @@ public final class RealmSwiftAdapter:
             try await _testBeforeCleanupTargetWrite?()
 #endif
             try await targetRealm.asyncWritePreservingOwnership {
+                let committedTracking = committedRealmReadSnapshot(in: persistenceRealm)
+                try validateOwner()
                 for deletion in deletions {
                     try Task.checkCancellation()
-                    guard !cancelSync else { throw CancellationError() }
-                    guard persistenceRealm.object(
+                    try validateOwner()
+                    guard committedTracking.object(
                         ofType: SyncedEntity.self,
                         forPrimaryKey: deletion.recordName
                     )?.entityState == .deletedRemotely else {
@@ -6827,6 +6880,9 @@ public final class RealmSwiftAdapter:
                         committedRecordNames.insert(deletion.recordName)
                         continue
                     }
+                    guard objectIsEligibleForActiveAccount(
+                        object, entityType: deletion.entityType
+                    ) else { continue }
                     if let softDeletable = object as? SoftDeletable,
                        !softDeletable.isDeleted {
                         continue
@@ -6839,14 +6895,19 @@ public final class RealmSwiftAdapter:
                     targetRealm.delete(object)
                     committedRecordNames.insert(deletion.recordName)
                 }
+                try validateOwner()
             }
         }
 
+#if DEBUG
+        try await _testBeforeCleanupTrackingWrite?()
+#endif
         try await persistenceRealm.asyncWritePreservingOwnership {
+            try validateOwner()
             var entitiesToDelete = [SyncedEntity]()
             for recordName in committedRecordNames {
                 try Task.checkCancellation()
-                guard !cancelSync else { throw CancellationError() }
+                try validateOwner()
                 if let entity = persistenceRealm.object(
                     ofType: SyncedEntity.self,
                     forPrimaryKey: recordName
@@ -6868,7 +6929,9 @@ public final class RealmSwiftAdapter:
             }
             persistenceRealm.delete(obsoleteRelationships)
             persistenceRealm.delete(entitiesToDelete)
+            try validateOwner()
         }
+        try validateOwner()
     }
 
     // MARK: - QSModelAdapter
@@ -8480,11 +8543,13 @@ public final class RealmSwiftAdapter:
         _ savedRecords: [CKRecord],
         from batch: RealmSwiftPreparedUploadBatch
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         // Give a caller which cancelled the acknowledgement immediately after
         // spawning it a deterministic boundary before any journal-consuming
         // Realm transaction can begin.
         await Task.yield()
-        try Task.checkCancellation()
+        try validateOwner()
         guard batch.issuerID == acknowledgementIssuerID else {
             throw RealmSwiftAdapterAcknowledgementError.batchBelongsToAnotherAdapter
         }
@@ -8496,6 +8561,7 @@ public final class RealmSwiftAdapter:
             savedRecords: savedRecords,
             matchingPreparedUploads: batch.prepared
         )
+        try validateOwner()
     }
 
     @BigSyncBackgroundActor
@@ -8503,6 +8569,8 @@ public final class RealmSwiftAdapter:
         savedRecords: [CKRecord],
         matchingGenerations: [String: String]
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         // Comparison-enabled records must retain their preparation evidence all
         // the way through acknowledgement. A legacy call cannot manufacture it
         // from current values (which may already contain a newer local edit).
@@ -8515,10 +8583,12 @@ public final class RealmSwiftAdapter:
                 throw BigSyncRecordRebaseError.inconsistentReceipt(record.recordID.recordName)
             }
         }
+        try validateOwner()
         try await acknowledgeUploadReceipts(
             savedRecords: savedRecords, matchingGenerations: matchingGenerations,
             comparisonReceipts: [:]
         )
+        try validateOwner()
     }
 
     @BigSyncBackgroundActor
@@ -8528,6 +8598,8 @@ public final class RealmSwiftAdapter:
         comparisonReceipts: [String: RealmSwiftAcceptedComparisonReceipt],
         retainedDeletionCleanup: RetainedDeletionQuarantineCleanup? = nil
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else { return }
         var acknowledgedGenerations = [String: String]()
@@ -8535,14 +8607,15 @@ public final class RealmSwiftAdapter:
 
         for chunk in savedRecords.chunks(ofCount: 500) {
             try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateOwner()
 
             try await persistenceRealm.asyncWritePreservingOwnership {
+                try validateOwner()
                 var acknowledgedInThisWrite = [String: String]()
                 var acknowledgedEntityTypesInThisWrite = [String: String]()
                 for record in chunk {
                     try Task.checkCancellation()
-                    guard !cancelSync else { throw CancellationError() }
+                    try validateOwner()
 
                     guard let syncedEntity = persistenceRealm.object(
                         ofType: SyncedEntity.self,
@@ -8589,7 +8662,12 @@ public final class RealmSwiftAdapter:
                         in: persistenceRealm
                     )
                 }
+                try validateOwner()
             }
+#if DEBUG
+            try await _testAfterUploadTrackingWrite?()
+#endif
+            try validateOwner()
             await Task.yield()
         }
 
@@ -8617,9 +8695,10 @@ public final class RealmSwiftAdapter:
                     let targetReaderRealm = group.realm
                     let generations = group.generations
                     try await targetReaderRealm.asyncWritePreservingOwnership {
+                        try validateOwner()
                         for (recordName, generation) in generations {
                             try Task.checkCancellation()
-                            guard !cancelSync else { throw CancellationError() }
+                            try validateOwner()
                         guard let mutation = targetReaderRealm.object(
                             ofType: BigSyncPendingMutation.self,
                             forPrimaryKey: recordName
@@ -8634,7 +8713,9 @@ public final class RealmSwiftAdapter:
                             }
                             targetReaderRealm.delete(mutation)
                         }
+                        try validateOwner()
                     }
+                    try validateOwner()
                     let newerMutations = pendingMutationSnapshots(
                         for: generations.keys,
                         in: targetReaderRealm
@@ -8647,6 +8728,7 @@ public final class RealmSwiftAdapter:
             }
         }
 
+        try validateOwner()
         updateHasChanges(realm: persistenceRealm)
     }
     @BigSyncBackgroundActor
@@ -8754,10 +8836,12 @@ public final class RealmSwiftAdapter:
         _ recordIDs: [CKRecord.ID],
         from batch: RealmSwiftPreparedDeletionBatch
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         // Deletion acknowledgements consume tombstones, so cancellation must
         // be observed before entering the first persistence transaction.
         await Task.yield()
-        try Task.checkCancellation()
+        try validateOwner()
         guard batch.issuerID == acknowledgementIssuerID else {
             throw RealmSwiftAdapterAcknowledgementError.batchBelongsToAnotherAdapter
         }
@@ -8769,6 +8853,7 @@ public final class RealmSwiftAdapter:
             recordIDs: recordIDs,
             matchingPreparedDeletions: batch.prepared
         )
+        try validateOwner()
     }
 
     @BigSyncBackgroundActor
@@ -8776,6 +8861,8 @@ public final class RealmSwiftAdapter:
         recordIDs deletedRecordIDs: [CKRecord.ID],
         matchingGenerations: [String: String]
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let realmProvider,
               let persistenceRealm = realmProvider.persistenceRealm else { return }
         guard Set(deletedRecordIDs).count == deletedRecordIDs.count,
@@ -8796,11 +8883,12 @@ public final class RealmSwiftAdapter:
 
         for chunk in deletedRecordIDs.chunks(ofCount: 1000) {
             try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateOwner()
             try await persistenceRealm.asyncWritePreservingOwnership {
+                try validateOwner()
                 for recordID in chunk {
                     try Task.checkCancellation()
-                    guard !cancelSync else { throw CancellationError() }
+                    try validateOwner()
                     guard let syncedEntity = persistenceRealm.object(
                         ofType: SyncedEntity.self,
                         forPrimaryKey: recordID.recordName
@@ -8823,7 +8911,12 @@ public final class RealmSwiftAdapter:
                     acknowledgedEntityTypes[recordID.recordName] =
                         syncedEntity.entityType
                 }
+                try validateOwner()
             }
+#if DEBUG
+            try await _testAfterDeletionTrackingWrite?()
+#endif
+            try validateOwner()
         }
 
         if !acknowledgedGenerations.isEmpty,
@@ -8850,9 +8943,10 @@ public final class RealmSwiftAdapter:
                 let targetReaderRealm = group.realm
                 let generations = group.generations
                 try await targetReaderRealm.asyncWritePreservingOwnership {
+                    try validateOwner()
                     for (recordName, generation) in generations {
                         try Task.checkCancellation()
-                        guard !cancelSync else { throw CancellationError() }
+                        try validateOwner()
                     guard let mutation = targetReaderRealm.object(
                         ofType: BigSyncPendingMutation.self,
                         forPrimaryKey: recordName
@@ -8862,7 +8956,9 @@ public final class RealmSwiftAdapter:
                         ) else { continue }
                         targetReaderRealm.delete(mutation)
                     }
+                    try validateOwner()
                 }
+                try validateOwner()
                 let newerMutations = pendingMutationSnapshots(
                     for: generations.keys,
                     in: targetReaderRealm
@@ -8874,6 +8970,7 @@ public final class RealmSwiftAdapter:
             }
         }
 
+        try validateOwner()
         updateHasChanges(realm: persistenceRealm)
     }
 
@@ -10643,6 +10740,8 @@ extension RealmSwiftAdapter {
 
     @BigSyncBackgroundActor
     public func didUpload(savedRecords: [CKRecord], matchingPreparedUploads prepared: [PreparedRecordUpload]) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         // Validate the complete response before any target/tracking mutation.
         // Name alone is not identity: zone and record type must also match.
         var preparedByID = [CKRecord.ID: PreparedRecordUpload]()
@@ -10702,12 +10801,14 @@ extension RealmSwiftAdapter {
             let realm = group.realm
             for chunk in group.items.chunks(ofCount: 500) {
                 try await realm.asyncWritePreservingOwnership {
+                    try validateOwner()
                     for item in chunk {
                         try Task.checkCancellation()
                         let proof = item.proof, saved = item.saved
                         let name = saved.recordID.recordName
                         guard !cancelSync, recordRebaseContext == proof.context else { throw CancellationError() }
                         try proof.context.validate(in: realm)
+                        try validateOwner()
                         let base = realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)
                         // Resume the exact accepted receipt if the target base
                         // committed before tracking acknowledgement. Tag and
@@ -10745,9 +10846,15 @@ extension RealmSwiftAdapter {
                         generations[name] = preparedByID[saved.recordID]?.generation
                         admittedRecords.append(saved)
                     }
+                    try validateOwner()
                 }
+#if DEBUG
+                try await _testAfterUploadComparisonWrite?()
+#endif
+                try validateOwner()
             }
         }
+        try validateOwner()
         // Acknowledgement and its bound quarantine cleanup commit together.
         // Spent uploads cannot replay cleanup against a later server deletion.
         try await acknowledgeUploadReceipts(
@@ -10755,6 +10862,7 @@ extension RealmSwiftAdapter {
             comparisonReceipts: accepted,
             retainedDeletionCleanup: retainedDeletionCleanup
         )
+        try validateOwner()
     }
 
 }
@@ -11258,6 +11366,8 @@ extension RealmSwiftAdapter {
     private func prepareContractUpload(
         record: CKRecord, generation: String?, comparisonBase: BigSyncPreparedRecordBase?
     ) async throws -> PreparedRecordUpload {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let proof = comparisonBase, !proof.schemaSignature.isEmpty else {
             return .init(record: record, generation: generation, comparisonBase: comparisonBase)
         }
@@ -11271,10 +11381,15 @@ extension RealmSwiftAdapter {
         var result: PreparedRecordUpload?
         let preparationCancellationGeneration = cancellationGeneration
         try await realm.asyncWritePreservingOwnership {
+            try validateOwner()
             try Task.checkCancellation()
             guard !cancelSync, cancellationGeneration == preparationCancellationGeneration,
                   recordRebaseContext == proof.context else { throw CancellationError() }
             try proof.context.validate(in: realm)
+#if DEBUG
+            try _testAfterUploadPreparationIdentityValidation?()
+#endif
+            try validateOwner()
             let name = record.recordID.recordName
             guard let pending = realm.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name),
                   pendingMutationIsEligibleForActiveTransport(pending),
@@ -11302,6 +11417,7 @@ extension RealmSwiftAdapter {
                                               fields: fields, schemaSignature: submitted.schemaSignature,
                                               submissionIdentity: submitted.candidateIdentity),
                         requiresAcceptanceCheck: true)
+                    try validateOwner()
                     return
                 }
                 // An accepted newer observation has superseded this proof. A
@@ -11320,7 +11436,9 @@ extension RealmSwiftAdapter {
             result = .init(record: record, generation: generation, comparisonBase:
                 .init(context: proof.context, revision: proof.revision, fields: proof.fields,
                       schemaSignature: proof.schemaSignature, submissionIdentity: submitted.candidateIdentity))
+            try validateOwner()
         }
+        try validateOwner()
         guard let result else { throw BigSyncRecordRebaseError.inconsistentReceipt(record.recordID.recordName) }
         return result
     }

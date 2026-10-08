@@ -461,6 +461,8 @@ extension RealmSwiftAdapter {
     public func didDelete(
         recordIDs: [CKRecord.ID], matchingPreparedDeletions prepared: [PreparedRecordDeletion]
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         let provider = realmProvider
         var byID = [CKRecord.ID: PreparedRecordDeletion]()
         for item in prepared {
@@ -476,6 +478,7 @@ extension RealmSwiftAdapter {
         var legacyIDs = [CKRecord.ID]()
         var legacyGenerations = [String: String]()
         for recordID in recordIDs {
+            try validateOwner()
             guard let item = byID[recordID] else {
                 throw RealmSwiftAdapterAcknowledgementError.recordWasNotPrepared
             }
@@ -524,9 +527,11 @@ extension RealmSwiftAdapter {
                     cut: proof.cut, revision: committedRevision, in: target, provider: provider)
             }
         }
+        try validateOwner()
         if !legacyIDs.isEmpty {
             try await didDelete(recordIDs: legacyIDs, matchingGenerations: legacyGenerations)
         }
+        try validateOwner()
         if let tracking = realmProvider?.persistenceRealm { updateHasChanges(realm: tracking) }
     }
 }
