@@ -1,0 +1,71 @@
+name: Frozen BigSync source with owned-read publication graph
+on:
+  push:
+    branches: [qualification/frozen-sync-gaps-20261008-astra]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: frozen-sync-gaps-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
+      PYTHONDONTWRITEBYTECODE: '1'
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      BIGSYNC_RUN_MUTATION_BENCHMARK: '0'
+      SWIFT_BACKTRACE: enable
+    steps:
+      - name: Check out reviewed execution harness
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: QualificationHarness
+          persist-credentials: false
+      - name: Check out unchanged qualified BigSync source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/BigSyncKit
+          ref: 416a749e3f3c22e31361cad35495b0227eddbb8d
+          path: BigSyncKit
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/RealmSwiftGaps
+          ref: 395e3f005b0e178440b3c8e8be8c8b749c58b32c
+          path: RealmSwiftGaps
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: lake-of-fire/SwiftUtilities
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
+          path: SwiftUtilities
+          persist-credentials: false
+      - name: Install xcsift
+        shell: bash
+        run: brew install xcsift
+      - name: Record harness identity
+        shell: bash
+        working-directory: QualificationHarness
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git rev-parse HEAD^{tree}
+          git diff --exit-code
+      - name: Execute full and focused native Debug qualification
+        shell: bash
+        env:
+          BIGSYNC_FROZEN_SOURCE_ROOT: ${{ github.workspace }}/BigSyncKit
+          BIGSYNC_ASSET_EVIDENCE_DIRECTORY: ${{ runner.temp }}/frozen-sync-gaps-${{ github.run_id }}-${{ github.run_attempt }}
+        run: /bin/bash "$GITHUB_WORKSPACE/QualificationHarness/.github/test-frozen-sync-gaps.sh"
+      - name: Retain exact source and execution evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: frozen-sync-gaps-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/frozen-sync-gaps-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
