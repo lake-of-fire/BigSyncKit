@@ -741,16 +741,18 @@ final class UnicodeStringTransportTests: XCTestCase {
     @BigSyncBackgroundActor
     func testComparisonDecoderAndIncomingApplyShareExactSetMembers() async throws {
         try await withFixture { adapter, _ in
-            let row = UnicodeStringTransportRow(); let (a, b) = Self.pairs[0]
-            let record = try Self.record(row, adapter); record["tags"] = [a, b, a] as CKRecordValue
-            let pending = try adapter.applyChanges(in: record, to: row,
-                syncedEntityID: record.recordID.recordName, syncedEntityState: .synced,
-                entityType: record.recordType, isNewlyCreatedReceiver: true)
-            let compared = try XCTUnwrap(adapter.decodedComparisonObject(record, type: UnicodeStringTransportRow.self) as? UnicodeStringTransportRow)
-            XCTAssertTrue(pending.isEmpty)
-            XCTAssertEqual(row.tags.count, 2); XCTAssertEqual(compared.tags.count, 2)
-            XCTAssertEqual(Set(Self.bytes(row.tags)), Set(Self.bytes([a, b])))
-            XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: row), try BigSyncRecordFingerprint.fields(of: compared))
+            try await { @BigSyncBackgroundActor in
+                let row = UnicodeStringTransportRow(); let (a, b) = Self.pairs[0]
+                let record = try Self.record(row, adapter); record["tags"] = [a, b, a] as CKRecordValue
+                let pending = try adapter.applyChanges(in: record, to: row,
+                    syncedEntityID: record.recordID.recordName, syncedEntityState: .synced,
+                    entityType: record.recordType, isNewlyCreatedReceiver: true)
+                let compared = try XCTUnwrap(adapter.decodedComparisonObject(record, type: UnicodeStringTransportRow.self) as? UnicodeStringTransportRow)
+                XCTAssertTrue(pending.isEmpty)
+                XCTAssertEqual(row.tags.count, 2); XCTAssertEqual(compared.tags.count, 2)
+                XCTAssertEqual(Set(Self.bytes(row.tags)), Set(Self.bytes([a, b])))
+                XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: row), try BigSyncRecordFingerprint.fields(of: compared))
+            }()
         }
     }
 
