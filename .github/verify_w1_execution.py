@@ -17,6 +17,13 @@ import re
 from typing import Sequence
 
 EXPECTED = {
+    "SyncSplitOperationOwnershipTests": (
+        "testCancelledJournalForwardingCannotPublishToSuccessorTracking",
+        "testImportProgressCannotReacquireSuccessorJournalOwnership",
+        "testCancelledImportCannotClearSuccessorAssetsAfterProgressCallout",
+        "testCancelledQueuedRemainingCountDoesNotNotifySuccessor",
+        "testJournalForwardingRejectsTransportReplacementBeforeTrackingAdmission",
+    ),
     "SyncUndoCloseoutW1Tests": (
         "testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline",
         "testTerminalLocalDeleteRetiresItsSupersededStagedSave",
@@ -111,7 +118,7 @@ FOCUSED_FILTER = (
     r"CloudKitCallbackAdmissionTests|CloudKitSynchronizerAccountFencingTests|"
     r"BigSyncWorkerRequestCancellationTests|ChangeRequestProcessorCancellationTests|"
     r"SynchronizationProcessorStartupTests|BigSyncScheduledRetryTests|"
-    r"BigSyncDeadlineRaceTests)/"
+    r"BigSyncDeadlineRaceTests|SyncSplitOperationOwnershipTests|SyncPhaseAttemptOwnershipTests)/"
 )
 FOCUSED = re.compile(FOCUSED_FILTER)
 
