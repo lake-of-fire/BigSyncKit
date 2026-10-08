@@ -3,14 +3,29 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 evidence="${BIGSYNC_ASSET_EVIDENCE_DIRECTORY:?Set a fresh absolute evidence directory}"
+[[ "$evidence" = /* ]] || { echo 'Evidence directory must be absolute' >&2; exit 1; }
 mkdir -p "$evidence"
+finish() {
+  local status=$?
+  trap - EXIT
+  if [[ -f "$root/Package.resolved" ]]; then
+    cp "$root/Package.resolved" "$evidence/Package.resolved" || status=1
+  fi
+  printf '%s\n' "$status" > "$evidence/overall-status.txt"
+  exit "$status"
+}
+trap finish EXIT
 git -C "$root" rev-parse HEAD > "$evidence/source-commit.txt"
 git -C "$root" ls-tree -r HEAD > "$evidence/source-tree.txt"
 swift --version > "$evidence/swift-version.txt"
+printf '%s\n' '-Xcxx -fno-modules' > "$evidence/cxx-build-flags.txt"
 
 set +e
-swift test --package-path "$root" --configuration debug \
+# Realm Core's C++ headers are compiled textually: SwiftPM 6.2.1 otherwise
+# rejects its s2geometry dependency as an unavailable implicit Clang module.
+swift test --package-path "$root" --configuration debug -Xcxx -fno-modules \
   --filter HotfixCollectionSafetyTests \
+  --parallel --num-workers 1 --disable-swift-testing \
   --xunit-output "$evidence/native.junit.xml" 2>&1 | tee "$evidence/native.log"
 statuses=("${PIPESTATUS[@]}")
 set -e
