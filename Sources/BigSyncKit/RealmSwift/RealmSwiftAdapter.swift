@@ -578,6 +578,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeMissingServerTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforeMissingServerTrackingWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeRemoteDeletionTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeCleanupTrackingWrite:
@@ -9142,15 +9144,19 @@ public final class RealmSwiftAdapter:
         _ recordIDs: [CKRecord.ID],
         matchingPreparedGenerations: [String: String]
     ) async throws {
+        let validateOwner = operationOwnerValidator()
+        try validateOwner()
         guard let persistenceRealm = realmProvider?.persistenceRealm else { return }
 
         for chunk in recordIDs.chunks(ofCount: 1000) {
-            try Task.checkCancellation()
-            guard !cancelSync else { throw CancellationError() }
+            try validateOwner()
+#if DEBUG
+            try await _testBeforeMissingServerTrackingWrite?()
+#endif
             try await persistenceRealm.asyncWritePreservingOwnership {
+                try validateOwner()
                 for recordID in chunk {
-                    try Task.checkCancellation()
-                    guard !cancelSync else { throw CancellationError() }
+                    try validateOwner()
                     let recordName = recordID.recordName
                     guard recordID.zoneID == recordZoneID else {
                         throw BigSyncRecordRebaseError.inconsistentReceipt(recordName)
@@ -9178,8 +9184,10 @@ public final class RealmSwiftAdapter:
                     // Keep the prepared generation. The matching journal row
                     // remains the authority for retrying this exact mutation.
                 }
+                try validateOwner()
             }
         }
+        try validateOwner()
         updateHasChanges(realm: persistenceRealm)
     }
 
