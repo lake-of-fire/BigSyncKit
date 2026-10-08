@@ -11760,4 +11760,3 @@ extension RealmSwiftAdapter {
         }
     }
 }
-

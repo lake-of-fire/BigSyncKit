@@ -1841,4 +1841,3 @@ extension SyncRetainedRecordContractTests {
         try await exerciseConcurrentLegacyLifetimeBundles(winningEpoch: "legacy-z", losingEpoch: "legacy-a")
     }
 }
-
