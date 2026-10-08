@@ -383,11 +383,55 @@ class W1InventoryTests(unittest.TestCase):
 
 class W1MergedNativeContractTests(unittest.TestCase):
     # Independent acceptance contract, not inferred from verifier.REQUIRED.
-    # These are the runtime identities introduced by merged #83 and #84.
+    # Retain merged #83/#84 and the 43 named regressions in the fixed Oct 8
+    # component set (#142/#143/#144/#145/#146/#147).
     merged_cases = (
         "CloudKitSynchronizerAccountFencingTests/testReentrantFailureObserversPreserveOneSettlementSnapshot",
         "CloudKitSynchronizerAccountFencingTests/testFailureObserverSuccessorRetainsAttemptAndTask",
         "SyncUndoCloseoutW1Tests/testFetchedDeletionPageReplaysAfterTargetFirstInterruptionWithoutDeletingAgain",
+        "SyncRetainedRecordContractTests/testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence",
+        "SyncRetainedRecordContractTests/testConflictRefreshRollsBackAfterSynchronousAccountFencePoison",
+        "SyncRetainedRecordContractTests/testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison",
+        "SyncSplitOperationOwnershipTests/testCancelledJournalForwardingCannotPublishToSuccessorTracking",
+        "SyncSplitOperationOwnershipTests/testImportProgressCannotReacquireSuccessorJournalOwnership",
+        "SyncSplitOperationOwnershipTests/testCancelledImportCannotClearSuccessorAssetsAfterProgressCallout",
+        "SyncSplitOperationOwnershipTests/testCancelledQueuedRemainingCountDoesNotNotifySuccessor",
+        "SyncSplitOperationOwnershipTests/testJournalForwardingRejectsTransportReplacementBeforeTrackingAdmission",
+        "SyncSplitOperationOwnershipTests/testInboundDeletionRejectsCancellationResetAccountBindingAndTransportReplacement",
+        "SyncSplitOperationOwnershipTests/testInboundDeletionRetainsCommittedTombstoneAfterOwnerRetirementAndFreshRetry",
+        "ChangeFeedMigrationResumeTests/testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit",
+        "ChangeFeedMigrationResumeTests/testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation",
+        "ChangeFeedMigrationResumeTests/testBackupRestorePreservesCurrentMutationCommittedAfterSnapshot",
+        "ChangeFeedMigrationResumeTests/testResetPreparationRejectsProvisionalPreparedMarkerAfterRollback",
+        "ChangeFeedMigrationResumeTests/testBootstrapCannotSkipItsWriteForProvisionalCompletion",
+        "ChangeFeedMigrationResumeTests/testFinishCannotSkipItsWriteForProvisionalCompletion",
+        "ChangeFeedMigrationResumeTests/testReconciliationCannotAcceptProvisionalCompletionWithoutBootstrap",
+        "ChangeFeedMigrationResumeTests/testEncryptedResetReuploadsRetainedLiveObjectBehindRolledBackDeletion",
+        "ChangeFeedMigrationResumeTests/testEncryptedResetPreservesDeletionCommittedAfterRetainedCandidateSnapshot",
+        "ChangeFeedMigrationResumeTests/testEstablishedServerEvidenceExcludesProvisionalMembershipUntilCommit",
+        "ChangeFeedMigrationResumeTests/testResetTrackingPublicationUsesCommittedJournalBehindRolledBackSuccessor",
+        "ChangeFeedMigrationResumeTests/testQueuedPreparationPreservesCommittedPreparedSuccessorAndProvenance",
+        "ChangeFeedMigrationResumeTests/testQueuedPreparationPreservesCommittedCompleteSuccessorAndProvenance",
+        "ChangeFeedMigrationResumeTests/testQueuedBootstrapTreatsCommittedCompletionAsNoOpWithoutRetiringProof",
+        "ChangeFeedMigrationResumeTests/testQueuedFinishTreatsCommittedCompletionAsNoOpWithoutRetiringProof",
+        "ChangeFeedMigrationResumeTests/testBootstrapRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker",
+        "ChangeFeedMigrationResumeTests/testReconciliationRejectsCancellationAfterTrackingCommitSubmission",
+        "ChangeFeedMigrationResumeTests/testFinishRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker",
+        "ChangeFeedMigrationResumeTests/testFencedResetCancellationAfterTrackingCommitPreservesProviderAndDurableReset",
+        "ChangeFeedMigrationResumeTests/testFencedResetPreservesPreparedSuccessorAtOwnedResetAdmission",
+        "ChangeFeedMigrationResumeTests/testFencedResetPreservesCompleteSuccessorAtOwnedResetAdmission",
+        "HotfixCollectionSafetyTests/testAssetInScalarFieldRejectsNewReceiverBeforeRealmAssignment",
+        "HotfixCollectionSafetyTests/testAssetInScalarFieldRollsBackExistingValueAndTracking",
+        "HotfixCollectionSafetyTests/testComparisonDecoderRejectsAssetInScalarField",
+        "HotfixCollectionSafetyTests/testReadableDataAssetsDecodeAndMissingFilesRollBack",
+        "SyncUndoCloseoutW1Tests/testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval",
+        "SyncUndoCloseoutW1Tests/testSemanticQuarantineUsesCommittedFeedEpoch",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceIgnoresProvisionalAcknowledgement",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement",
+        "SyncUndoCloseoutW1Tests/testServerEvidencePreservesExactAndCatalogStatePolicies",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm",
+        "SyncUndoCloseoutW1Tests/testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership",
+        "CloudKitSynchronizerAccountFencingTests/testTemporaryLocalInitialAdmissionRetriesExistingDrainAndAdmitsCurrentBinding",
     )
 
     def inventory(self):

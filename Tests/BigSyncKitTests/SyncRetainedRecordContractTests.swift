@@ -777,6 +777,103 @@ final class SyncRetainedRecordContractTests: XCTestCase {
 
 #if DEBUG
     @BigSyncBackgroundActor
+    func testConflictRefreshRollsBackAfterSynchronousAccountFencePoison() async throws {
+        try await assertRecoveryEvidenceRollsBackAfterAccountFencePoison(discarding: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison() async throws {
+        try await assertRecoveryEvidenceRollsBackAfterAccountFencePoison(discarding: true)
+    }
+
+    @BigSyncBackgroundActor
+    private func assertRecoveryEvidenceRollsBackAfterAccountFencePoison(discarding: Bool) async throws {
+        let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture()
+        if discarding {
+            try await adapter.resolveRecordConflict(id: conflict.id,
+                expectedGeneration: conflict.generation, choice: .keepLocal)
+        } else {
+            try realm.write {
+                object.title = "new typing"
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        let transport = ConflictDecisionAuthorityTransport()
+        let synchronizer = CloudKitSynchronizer(
+            identifier: "recovery-evidence-final-authority-" + UUID().uuidString,
+            containerIdentifier: "iCloud.test.recovery-evidence-final-authority",
+            database: transport, recordZoneID: adapter.recordZoneID,
+            keyValueStore: ConflictDecisionAuthorityStore(),
+            accountIdentifierProvider: { "account" },
+            accountStatusProvider: { .available },
+            logger: Logger(label: "RecoveryEvidenceAuthorityTests"))
+        addTeardownBlock { @BigSyncBackgroundActor in
+            adapter._testAfterConflictRecoveryEvidenceMutation = nil
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+        try await synchronizer._test_validateSynchronizationAccount()
+        let lease = try XCTUnwrap(synchronizer.accountScopeLease())
+        let fence = synchronizer.accountScopeAuthorityFence
+        let context = try XCTUnwrap(adapter.recordRebaseContext)
+        let archive = try XCTUnwrap(realm.object(ofType: BigSyncRecordConflict.self,
+            forPrimaryKey: conflict.id))
+        let originalLocal = archive.localPayload
+        let originalIncoming = archive.incomingPayload
+        let originalResolved = archive.isResolved
+        let originalFields = try BigSyncRecordFingerprint.fields(of: object)
+        let generation = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first).generation
+        let baselineCount = realm.objects(BigSyncRecordBaseline.self).count
+        let submissionCount = realm.objects(BigSyncRecordSubmission.self).count
+        var reachedProvisionalMutation = false
+        adapter._testAfterConflictRecoveryEvidenceMutation = {
+            if discarding {
+                XCTAssertNil(realm.object(ofType: BigSyncRecordConflict.self,
+                    forPrimaryKey: conflict.id), "The retained archive is provisionally deleted")
+            } else {
+                XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).count, 2)
+                XCTAssertEqual(realm.object(ofType: BigSyncRecordConflict.self,
+                    forPrimaryKey: conflict.id)?.isResolved, true)
+                XCTAssertEqual(realm.objects(BigSyncRecordConflict.self)
+                    .where { !$0.isResolved }.first?.generation, generation,
+                    "The replacement review archives the current successor edit")
+            }
+            // This is the fence poisoned synchronously by CKAccountChanged.
+            // The actor-owned adapter namespace intentionally remains current.
+            fence.poison()
+        }
+        do {
+            if discarding {
+                try await adapter.discardResolvedRecordConflictArchives(validateAuthority: {
+                    try synchronizer.validateAccountScopeLease(lease)
+                })
+            } else {
+                try await adapter.refreshRecordConflict(conflict.id, validateAuthority: {
+                    try synchronizer.validateAccountScopeLease(lease)
+                })
+            }
+            XCTFail("Revoked account authority must roll back the provisional evidence mutation")
+        } catch BigSyncAccountScopeLeaseError.unavailable {
+            reachedProvisionalMutation = true
+        }
+        adapter._testAfterConflictRecoveryEvidenceMutation = nil
+        XCTAssertTrue(reachedProvisionalMutation)
+        XCTAssertTrue(fence.rejectsAuthority)
+        XCTAssertEqual(adapter.recordRebaseContext, context)
+        XCTAssertFalse(realm.isInWriteTransaction)
+        let retained = try XCTUnwrap(realm.object(ofType: BigSyncRecordConflict.self,
+            forPrimaryKey: conflict.id))
+        XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).count, 1)
+        XCTAssertEqual(retained.localPayload, originalLocal)
+        XCTAssertEqual(retained.incomingPayload, originalIncoming)
+        XCTAssertEqual(retained.isResolved, originalResolved)
+        XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: object), originalFields)
+        XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, generation)
+        XCTAssertEqual(realm.objects(BigSyncRecordBaseline.self).count, baselineCount)
+        XCTAssertEqual(realm.objects(BigSyncRecordSubmission.self).count, submissionCount)
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     func testConflictDecisionRollsBackAfterSynchronousAccountFencePoison() async throws {
         for choice: BigSyncRecordConflictChoice in [.keepLocal, .useIncoming] {
             let (adapter, realm, object, conflict) = try await unbasedRecoveryFixture(
@@ -1425,6 +1522,91 @@ extension SyncRetainedRecordContractTests {
 
 extension SyncRetainedRecordContractTests {
     private enum RetainedAcknowledgementRetryGuard { case wrongTag, wrongContext, newerGeneration }
+
+    @BigSyncBackgroundActor
+    func testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence() async throws {
+        let (adapter, target) = try await fixture()
+        _ = try await deliver([record(adapter)], to: adapter)
+        let object = try value(target)
+        try target.write {
+            object.epoch = try BigSyncLifetimeID.next(after: object.epoch, nonce: nonce)
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let name = RetainedContractRow.className() + ".article"
+        let recordID = CKRecord.ID(recordName: name, zoneID: adapter.recordZoneID)
+        let deletionResults = try await adapter.deleteRecords(with: [recordID])
+        guard case .quarantined(let lineage) = try XCTUnwrap(deletionResults.first).disposition else {
+            return XCTFail("A retained physical deletion must supply quarantine evidence")
+        }
+        let cursor = RecordZoneChangeCursor(serializedData: Data("identity-callback-deletion".utf8))
+        try await adapter.commitInboundPage(.init(previousCursor: nil, nextCursor: cursor,
+            liveResults: [], deletionResults: deletionResults))
+        try await adapter.commitInboundPage(.init(previousCursor: cursor,
+            nextCursor: .init(serializedData: Data("identity-callback-successor".utf8)),
+            liveResults: [], deletionResults: []))
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let receiptID = try XCTUnwrap(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self,
+            forPrimaryKey: lineage)).committedPageReceiptID
+        let prepared = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        let sentGeneration = try XCTUnwrap(prepared.first?.generation)
+        let saved = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(XCTUnwrap(prepared.first).record))
+        guard saved.responds(to: NSSelectorFromString("setRecordChangeTag:")) else {
+            return XCTFail("CloudKit SDK cannot construct tagged system-field fixture")
+        }
+        _ = saved.perform(NSSelectorFromString("setRecordChangeTag:"), with: "identity-callback-accepted" as NSString)
+        var armed = false
+        var successorGeneration: String?
+        adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = { armed = true }
+        adapter._testAfterComparisonReceiptIdentityValidation = {
+            guard armed else { return }
+            armed = false
+            // The registry's identity provider is an equivalent synchronous
+            // callout. It changes local intent without replacing this owner or
+            // the comparison revision already accepted by the target phase.
+            try target.write {
+                object.title = "successor committed during identity validation"
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+            successorGeneration = target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation
+        }
+        defer {
+            adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil
+            adapter._testAfterComparisonReceiptIdentityValidation = nil
+        }
+        do {
+            try await adapter.didUpload(savedRecords: [saved], matchingPreparedUploads: prepared)
+            XCTFail("A stale target cut retired evidence belonging to a successor")
+        } catch let error as RealmSwiftAdapter.RetainedDeletionQuarantineNeedsFreshPreparation {
+            XCTAssertEqual(error.recordNames, [name])
+        }
+        let successor = try XCTUnwrap(successorGeneration)
+        XCTAssertNotEqual(successor, sentGeneration)
+        XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation, successor)
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name)?.pendingGeneration, sentGeneration,
+            "Rejected quarantine cleanup rolls back its tracking acknowledgement")
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: receiptID))
+        adapter._testAfterAcceptedRetainedDeletionTrackingAdmission = nil
+        adapter._testAfterComparisonReceiptIdentityValidation = nil
+        try await adapter.didFinishImport()
+        XCTAssertEqual(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name)?.pendingGeneration, successor)
+        XCTAssertEqual(object.title, "successor committed during identity validation")
+        let current = try await adapter.preparedRecordsToUpload(limit: 10, restrictedToEntityType: nil)
+        XCTAssertEqual(current.first?.generation, successor)
+        let fresh = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(XCTUnwrap(current.first).record))
+        _ = fresh.perform(NSSelectorFromString("setRecordChangeTag:"), with: "identity-callback-successor-accepted" as NSString)
+        try await adapter.didUpload(savedRecords: [fresh], matchingPreparedUploads: current)
+        XCTAssertTrue(target.objects(BigSyncPendingMutation.self).isEmpty)
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
+        XCTAssertNil(tracking.object(ofType: BigSyncInboundPageReceipt.self, forPrimaryKey: receiptID))
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundPageReceipt.self,
+            forPrimaryKey: BigSyncInboundPageReceipt.canonicalID))
+        XCTAssertEqual(object.title, "successor committed during identity validation")
+        try await requireQuiet(adapter)
+    }
 
     @BigSyncBackgroundActor
     private func exerciseRetainedAcknowledgementRefresh(

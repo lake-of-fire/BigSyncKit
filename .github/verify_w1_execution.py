@@ -17,15 +17,66 @@ import re
 from typing import Sequence
 
 EXPECTED = {
+    "HotfixCollectionSafetyTests": (
+        "testAssetInScalarFieldRejectsNewReceiverBeforeRealmAssignment",
+        "testAssetInScalarFieldRollsBackExistingValueAndTracking",
+        "testComparisonDecoderRejectsAssetInScalarField",
+        "testReadableDataAssetsDecodeAndMissingFilesRollBack",
+    ),
+    "ChangeFeedMigrationResumeTests": (
+        "testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit",
+        "testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation",
+        "testBackupRestorePreservesCurrentMutationCommittedAfterSnapshot",
+        "testResetPreparationRejectsProvisionalPreparedMarkerAfterRollback",
+        "testBootstrapCannotSkipItsWriteForProvisionalCompletion",
+        "testFinishCannotSkipItsWriteForProvisionalCompletion",
+        "testReconciliationCannotAcceptProvisionalCompletionWithoutBootstrap",
+        "testEncryptedResetReuploadsRetainedLiveObjectBehindRolledBackDeletion",
+        "testEncryptedResetPreservesDeletionCommittedAfterRetainedCandidateSnapshot",
+        "testEstablishedServerEvidenceExcludesProvisionalMembershipUntilCommit",
+        "testResetTrackingPublicationUsesCommittedJournalBehindRolledBackSuccessor",
+        "testQueuedPreparationPreservesCommittedPreparedSuccessorAndProvenance",
+        "testQueuedPreparationPreservesCommittedCompleteSuccessorAndProvenance",
+        "testQueuedBootstrapTreatsCommittedCompletionAsNoOpWithoutRetiringProof",
+        "testQueuedFinishTreatsCommittedCompletionAsNoOpWithoutRetiringProof",
+        "testBootstrapRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker",
+        "testReconciliationRejectsCancellationAfterTrackingCommitSubmission",
+        "testFinishRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker",
+        "testFencedResetCancellationAfterTrackingCommitPreservesProviderAndDurableReset",
+        "testFencedResetPreservesPreparedSuccessorAtOwnedResetAdmission",
+        "testFencedResetPreservesCompleteSuccessorAtOwnedResetAdmission",
+    ),
+    "SyncRetainedRecordContractTests": (
+        "testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence",
+        "testConflictRefreshRollsBackAfterSynchronousAccountFencePoison",
+        "testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison",
+    ),
+    "SyncSplitOperationOwnershipTests": (
+        "testCancelledJournalForwardingCannotPublishToSuccessorTracking",
+        "testImportProgressCannotReacquireSuccessorJournalOwnership",
+        "testCancelledImportCannotClearSuccessorAssetsAfterProgressCallout",
+        "testCancelledQueuedRemainingCountDoesNotNotifySuccessor",
+        "testJournalForwardingRejectsTransportReplacementBeforeTrackingAdmission",
+        "testInboundDeletionRejectsCancellationResetAccountBindingAndTransportReplacement",
+        "testInboundDeletionRetainsCommittedTombstoneAfterOwnerRetirementAndFreshRetry",
+    ),
     "SyncUndoCloseoutW1Tests": (
         "testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline",
         "testTerminalLocalDeleteRetiresItsSupersededStagedSave",
         "testFetchedDeletionPageReplaysAfterTargetFirstInterruptionWithoutDeletingAgain",
+        "testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval",
+        "testSemanticQuarantineUsesCommittedFeedEpoch",
+        "testServerEvidenceIgnoresProvisionalAcknowledgement",
+        "testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement",
+        "testServerEvidencePreservesExactAndCatalogStatePolicies",
+        "testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm",
+        "testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership",
     ),
     "CloudKitSynchronizerAccountFencingTests": (
         "testCancelledWorkerPreflightDoesNotScheduleRetry",
         "testReentrantFailureObserversPreserveOneSettlementSnapshot",
         "testFailureObserverSuccessorRetainsAttemptAndTask",
+        "testTemporaryLocalInitialAdmissionRetriesExistingDrainAndAdmitsCurrentBinding",
     ),
     "CloudKitAccountAvailabilityCancellationTests": (
         "testAlreadyCancelledRequestDoesNotInvokeStatusProvider",
@@ -111,7 +162,8 @@ FOCUSED_FILTER = (
     r"CloudKitCallbackAdmissionTests|CloudKitSynchronizerAccountFencingTests|"
     r"BigSyncWorkerRequestCancellationTests|ChangeRequestProcessorCancellationTests|"
     r"SynchronizationProcessorStartupTests|BigSyncScheduledRetryTests|"
-    r"BigSyncDeadlineRaceTests)/"
+    r"BigSyncDeadlineRaceTests|SyncSplitOperationOwnershipTests|SyncPhaseAttemptOwnershipTests|"
+    r"ChangeFeedMigrationResumeTests|HotfixCollectionSafetyTests|SyncRetainedRecordContractTests)/"
 )
 FOCUSED = re.compile(FOCUSED_FILTER)
 
