@@ -1,10 +1,11 @@
 name: MR-UNDO-CLOSEOUT-20260920 W1 native qualification
 on:
   push:
-    branches: [codex/undo-closeout-w1-sync-20260920]
+    branches: [codex/undo-closeout-w1-sync-20260920, fix/incoming-operation-convergence-20261008]
     paths:
       - .github/workflows/undo-closeout-w1.yml
       - .github/verify_w1_execution.py
+      - .github/test-undo-closeout-w1.sh
       - .github/tests/test_w1_execution.py
       - Documentation/undo-closeout-20260920/session-1.md
       - Sources/BigSyncKit/**
@@ -12,12 +13,13 @@ on:
       - Package.swift
       - Package.resolved
   # Package PRs must not wait for a push to an obsolete qualification branch.
-  # Historical branch pushes remain supported; ordinary PRs run only this event.
+  # The task branch also has a direct push trigger; unrelated branches are unchanged.
   pull_request:
     branches: [main]
     paths:
       - .github/workflows/undo-closeout-w1.yml
       - .github/verify_w1_execution.py
+      - .github/test-undo-closeout-w1.sh
       - .github/tests/test_w1_execution.py
       - Sources/BigSyncKit/**
       - Tests/BigSyncKitTests/**
@@ -31,8 +33,16 @@ concurrency:
   cancel-in-progress: false
 jobs:
   native:
+    # The owned task branch runs on push; keep other PRs and manual runs unchanged.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      github.event.pull_request.head.ref != 'fix/incoming-operation-convergence-20261008'
     runs-on: macos-15
     timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -83,8 +93,12 @@ jobs:
           xcode-select -p >> qualification-w1/toolchain.txt
           xcrun --show-sdk-version >> qualification-w1/toolchain.txt
           xcsift --version >> qualification-w1/toolchain.txt
-          set -o pipefail
+          set +e
           xcodebuild -version 2>&1 | tee -a qualification-w1/toolchain.txt | xcsift -f json > qualification-w1/xcode-version.json
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf '[%s, %s, %s]\n' "${statuses[0]}" "${statuses[1]}" "${statuses[2]}" > qualification-w1/xcode-version.status.json
+          for status in "${statuses[@]}"; do test "$status" -eq 0; done
           git archive --format=tar.gz -o qualification-w1/source.tar.gz HEAD
       - name: Discover and execute native Realm tests
         working-directory: BigSyncKit
@@ -93,37 +107,9 @@ jobs:
           BIGSYNC_RUN_MUTATION_BENCHMARK: "0"
         run: |
           set -euo pipefail
-          # Never reuse a previous run's build or case logs. Later phases reuse
-          # only the binary just built for discovery in this same checkout.
-          test ! -e .build-w1
-          extra=()
-          swift test --help > qualification-w1/swift-test-help.txt
-          if grep -q -- '--disable-experimental-prebuilts' qualification-w1/swift-test-help.txt; then
-            extra+=(--disable-experimental-prebuilts)
-          fi
-          run_logged() {
-            local name="$1"
-            shift
-            local statuses
-            set +e
-            "$@" 2>&1 | tee "qualification-w1/$name.log" | xcsift -f json --exit-on-failure > "qualification-w1/$name.formatted.json"
-            statuses=("${PIPESTATUS[@]}")
-            set -e
-            printf '[%s, %s, %s]\n' "${statuses[0]}" "${statuses[1]}" "${statuses[2]}" > "qualification-w1/$name.status.json"
-          }
-          run_logged discovery swift test --scratch-path .build-w1 "${extra[@]}" list
-          python3 .github/verify_w1_execution.py discovery
-          full_status=0
-          run_logged full swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --xunit-output qualification-w1/full.xml
-          python3 .github/verify_w1_execution.py full || full_status=$?
-          focused_status=0
-          focused_filter="$(python3 .github/verify_w1_execution.py focused-filter)"
-          printf '%s\n' "$focused_filter" > qualification-w1/focused-filter.txt
-          run_logged focused swift test --scratch-path .build-w1 "${extra[@]}" --skip-build --filter "$focused_filter" --xunit-output qualification-w1/focused.xml
-          python3 .github/verify_w1_execution.py focused || focused_status=$?
-          printf 'full=%s\nfocused=%s\n' "$full_status" "$focused_status" > qualification-w1/status.txt
-          git diff --exit-code
-          test "$full_status" -eq 0 && test "$focused_status" -eq 0
+          export BIGSYNC_W1_EVIDENCE_DIRECTORY="$PWD/qualification-w1"
+          export BIGSYNC_W1_SCRATCH_DIRECTORY="$RUNNER_TEMP/bigsync-w1-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          /bin/bash "$PWD/.github/test-undo-closeout-w1.sh"
       - name: Retain resolved graph even after a build failure
         if: always()
         working-directory: BigSyncKit
@@ -136,15 +122,6 @@ jobs:
             fi
           done
           git diff --exit-code
-      - name: Diagnose native delete-restart crash
-        if: failure()
-        continue-on-error: true
-        working-directory: BigSyncKit
-        run: |
-          set -o pipefail
-          bundle="$(find "$PWD/.build-w1" -name BigSyncKitPackageTests.xctest -type d -print -quit)"
-          test -n "$bundle"
-          xcrun lldb --batch -o run -k 'thread backtrace all' -- "$(xcrun -f xctest)" -XCTest 'BigSyncKitTests.SyncUndoCloseoutW1Tests/testDeleteTargetFirstCrashFinishesTrackingWithoutAnotherServerDelete' "$bundle" 2>&1 | tee qualification-w1/delete-restart-backtrace.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
