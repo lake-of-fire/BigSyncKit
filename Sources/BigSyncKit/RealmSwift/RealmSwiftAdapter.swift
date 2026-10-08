@@ -7454,19 +7454,14 @@ public final class RealmSwiftAdapter:
         in records: [CKRecord],
         forceSave: Bool
     ) async throws -> [InboundLiveResult] {
-        // Incoming work belongs to the attempt that selected it, including
-        // after cancellation has been cleared by a successor using this adapter.
+        // Selection, target writes and tracking publication belong to the
+        // attempt that selected them, even after a successor clears cancellation.
         let validateOwner = operationOwnerValidator()
         try validateOwner()
         guard let realmProvider = realmProvider else {
             throw RealmSwiftAdapterError.setupUnavailable
         }
         guard !records.isEmpty else { return [] }
-
-        // Selection, target writes and tracking publication belong to one
-        // immutable owner, including legacy models without record rebasing.
-        let validateOwner = operationOwnerValidator()
-        try validateOwner()
 
         // A retained backup value is not fresh user intent. Apply validated
         // server values without allowing the ordinary timestamp fallback to
