@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/RealmSwiftGaps
-          ref: 1ffbedbb3d8dd90f44f651f618128e7806ce39dd
+          ref: 543e21247160dce10b9c9241a7e8b1ffb94cee3b
           path: RealmSwiftGaps
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -57,7 +57,7 @@ jobs:
           git hash-object .github/verify_w1_execution.py > qualification-reader-main/verifier-blob.txt
           git -C ../RealmSwiftGaps rev-parse HEAD > qualification-reader-main/RealmSwiftGaps.txt
           git -C ../SwiftUtilities rev-parse HEAD > qualification-reader-main/SwiftUtilities.txt
-          test "$(cat qualification-reader-main/RealmSwiftGaps.txt)" = "1ffbedbb3d8dd90f44f651f618128e7806ce39dd"
+          test "$(cat qualification-reader-main/RealmSwiftGaps.txt)" = "543e21247160dce10b9c9241a7e8b1ffb94cee3b"
           test "$(cat qualification-reader-main/SwiftUtilities.txt)" = "f437c7d06fc631cd7a67731279411c417cdf8077"
           printf 'release-gate=%s\n' "$RELEASE_GATE" > qualification-reader-main/deferred-scope.txt
           printf '%s\n' 'Owner-deferred: Mac UI, performance, signed macOS CloudKit and Release.' >> qualification-reader-main/deferred-scope.txt
