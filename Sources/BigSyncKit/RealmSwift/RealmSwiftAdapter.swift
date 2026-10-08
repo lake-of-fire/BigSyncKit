@@ -574,6 +574,10 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testBeforeAuthoritativeOwnUploadQuarantineWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testBeforeRecordConflictDecisionWrite:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterConflictRecoveryEvidenceMutation:
+        (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testAfterComparisonApplication: (@Sendable (Object) throws -> Void)?
     var _testAfterDisappearanceTargetWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
@@ -2473,13 +2477,12 @@ public final class RealmSwiftAdapter:
         return realm.freeze()
     }
 
-    /// Immutable ownership of a split target/tracking operation. A cancelled
-    /// attempt remains obsolete even when a successor clears cancelSync again.
-    /// Legacy models need this fence too, without opting into record rebasing.
+    /// Immutable lifecycle ownership, including legacy models. Setup can
+    /// legitimately replace an interrupted provider while these scalars stay
+    /// current; a cancelled attempt cannot borrow a resumed generation.
     @BigSyncBackgroundActor
-    func operationOwnerValidator() -> (@BigSyncBackgroundActor @Sendable () throws -> Void) {
+    private func operationLifecycleValidator() -> (@BigSyncBackgroundActor @Sendable () throws -> Void) {
         let generation = cancellationGeneration
-        let provider = realmProvider
         let account = activeAccountScopeIdentifier
         let binding = activeReplicaBindingGenerationIdentifier
         let context = recordRebaseContext
@@ -2488,7 +2491,6 @@ public final class RealmSwiftAdapter:
         return {
             try Task.checkCancellation()
             guard !self.cancelSync, self.cancellationGeneration == generation,
-                  self.realmProvider === provider,
                   self.activeAccountScopeIdentifier == account,
                   self.activeReplicaBindingGenerationIdentifier == binding,
                   self.recordRebaseContext == context,
@@ -2496,6 +2498,17 @@ public final class RealmSwiftAdapter:
                   self.activeDatabaseScopeRawValue == scope else {
                 throw CancellationError()
             }
+        }
+    }
+
+    /// Adds strict provider ownership to the original lifecycle capability.
+    @BigSyncBackgroundActor
+    func operationOwnerValidator() -> (@BigSyncBackgroundActor @Sendable () throws -> Void) {
+        let validateLifecycle = operationLifecycleValidator()
+        let provider = realmProvider
+        return {
+            try validateLifecycle()
+            guard self.realmProvider === provider else { throw CancellationError() }
         }
     }
 
@@ -7029,24 +7042,7 @@ public final class RealmSwiftAdapter:
     ) async throws -> [InboundLiveResult] {
         // Setup can legitimately publish a provider. Preserve scalar ownership
         // before that await, then keep the resulting provider for this operation.
-        let setupGeneration = cancellationGeneration
-        let setupAccount = activeAccountScopeIdentifier
-        let setupBinding = activeReplicaBindingGenerationIdentifier
-        let setupContext = recordRebaseContext
-        let setupContainer = activeContainerIdentifier
-        let setupDatabaseScope = activeDatabaseScopeRawValue
-        func validateSetupOwner() throws {
-            try Task.checkCancellation()
-            guard !cancelSync,
-                  cancellationGeneration == setupGeneration,
-                  activeAccountScopeIdentifier == setupAccount,
-                  activeReplicaBindingGenerationIdentifier == setupBinding,
-                  recordRebaseContext == setupContext,
-                  activeContainerIdentifier == setupContainer,
-                  activeDatabaseScopeRawValue == setupDatabaseScope else {
-                throw CancellationError()
-            }
-        }
+        let validateSetupOwner = operationLifecycleValidator()
         try validateSetupOwner()
         try await ensureSetup()
         try validateSetupOwner()
@@ -8090,7 +8086,9 @@ public final class RealmSwiftAdapter:
             for group in namesByRealm.values {
                 await group.realm.asyncRefresh()
                 try validateOwner()
-                try await forwardPendingMutations(pendingMutationSnapshots(for: group.names, in: group.realm), in: group.realm)
+                let pending = pendingMutationSnapshots(for: group.names, in: group.realm)
+                try validateOwner()
+                try await forwardPendingMutations(pending, in: group.realm)
                 try validateOwner()
             }
         }
@@ -9165,24 +9163,7 @@ public final class RealmSwiftAdapter:
         guard !isPreparingFencedMigration else { return }
         // Lazy setup may legitimately publish a provider, so freeze the
         // scalar owner first and capture the provider fence only after setup.
-        let importCancellationGeneration = cancellationGeneration
-        let importAccount = activeAccountScopeIdentifier
-        let importBinding = activeReplicaBindingGenerationIdentifier
-        let importContext = recordRebaseContext
-        let importContainer = activeContainerIdentifier
-        let importDatabaseScope = activeDatabaseScopeRawValue
-        func validateSetupOwner() throws {
-            try Task.checkCancellation()
-            guard !cancelSync,
-                  cancellationGeneration == importCancellationGeneration,
-                  activeAccountScopeIdentifier == importAccount,
-                  activeReplicaBindingGenerationIdentifier == importBinding,
-                  recordRebaseContext == importContext,
-                  activeContainerIdentifier == importContainer,
-                  activeDatabaseScopeRawValue == importDatabaseScope else {
-                throw CancellationError()
-            }
-        }
+        let validateSetupOwner = operationLifecycleValidator()
         try validateSetupOwner()
         progress("adapter-import-setup-started")
         try validateSetupOwner()
@@ -11528,20 +11509,30 @@ extension RealmSwiftAdapter {
         id: String, expectedGeneration: String, choice: BigSyncRecordConflictChoice,
         validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
-        try validateAuthority()
+        let validateOwner = operationOwnerValidator()
+        let validateConflictAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {
+            try validateOwner()
+            try validateAuthority()
+            try validateOwner()
+        }
+        try validateConflictAuthority()
         guard let context = recordRebaseContext else { throw CancellationError() }
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else {
                 continue
             }
             realm.refresh()
+            try validateOwner()
             guard let selected = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: id),
                   selected.namespace == context.namespace, !selected.isResolved else { continue }
             let name = selected.recordName, typeName = selected.entityType
             let incoming = try BigSyncRecordPayload.decode(selected.incomingPayload,
                                                            assetManager: persistentAssetManager)
+#if DEBUG
+            try await _testBeforeRecordConflictDecisionWrite?()
+#endif
             try await realm.asyncWritePreservingOwnership {
-                try validateAuthority()
+                try validateConflictAuthority()
                 try context.validate(in: realm)
                 guard recordRebaseContext == context,
                       let conflict = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: id),
@@ -11584,12 +11575,17 @@ extension RealmSwiftAdapter {
                 // Account notifications revoke the caller's lease synchronously,
                 // before actor-isolated adapter identity catches up. Reject that
                 // revocation while this complete decision can still roll back.
-                try validateAuthority()
+                try validateConflictAuthority()
             }
+            try validateConflictAuthority()
             // A crash here keeps the target decision durable. The next normal
             // import/own echo retires page quarantine; no cursor is fabricated.
-            try await forwardPendingMutations(pendingMutationSnapshots(for: [name], in: realm), in: realm)
-            try await retireResolvedRecordConflictQuarantines(validateAuthority: validateAuthority)
+            let pending = pendingMutationSnapshots(for: [name], in: realm)
+            try validateConflictAuthority()
+            try await forwardPendingMutations(pending, in: realm)
+            try validateConflictAuthority()
+            try await retireResolvedRecordConflictQuarantines(validateAuthority: validateConflictAuthority)
+            try validateConflictAuthority()
             return
         }
         throw BigSyncRecordContractError.staleConflict
@@ -11803,8 +11799,20 @@ extension RealmSwiftAdapter {
         _ conflictID: String,
         validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
+        // Preserve setup authority while allowing legitimate provider creation.
+        let validateSetupOwner = operationLifecycleValidator()
+        try validateSetupOwner()
         try validateAuthority()
+        try validateSetupOwner()
         try await ensureSetup()
+        try validateSetupOwner()
+        let validateOwner = operationOwnerValidator()
+        let validateConflictAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {
+            try validateOwner()
+            try validateAuthority()
+            try validateOwner()
+        }
+        try validateOwner()
         guard let context = recordRebaseContext, let provider = realmProvider else {
             throw BigSyncRecordContractError.staleConflict
         }
@@ -11815,7 +11823,7 @@ extension RealmSwiftAdapter {
             let name = snapshot.recordName, typeName = snapshot.entityType
             let record = try BigSyncRecordPayload.decode(snapshot.incomingPayload)
             try await realm.asyncWritePreservingOwnership {
-                try validateAuthority()
+                try validateConflictAuthority()
                 guard recordRebaseContext == context else { throw CancellationError() }
                 try context.validate(in: realm)
                 guard let previous = realm.object(ofType: BigSyncRecordConflict.self, forPrimaryKey: conflictID),
@@ -11833,7 +11841,12 @@ extension RealmSwiftAdapter {
                     revision: realm.object(ofType: BigSyncRecordBaseline.self, forPrimaryKey: name)?.revision,
                     signature: contract.signature, context: context, in: realm)
                 if nextID != conflictID { previous.isResolved = true }
+#if DEBUG
+                try _testAfterConflictRecoveryEvidenceMutation?()
+#endif
+                try validateConflictAuthority()
             }
+            try validateConflictAuthority()
             // Old quarantine remains until an explicit record decision; no
             // successful publication may be inferred from refreshing a view.
             return
@@ -11870,22 +11883,35 @@ public extension RealmSwiftAdapter {
     func discardResolvedRecordConflictArchives(
         validateAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {}
     ) async throws {
-        try validateAuthority()
+        let validateOwner = operationOwnerValidator()
+        let validateConflictAuthority: @BigSyncBackgroundActor @Sendable () throws -> Void = {
+            try validateOwner()
+            try validateAuthority()
+            try validateOwner()
+        }
+        try validateConflictAuthority()
         guard let context = recordRebaseContext else { throw CancellationError() }
+        try validateOwner()
         let retiredConflictIDs = try await retireResolvedRecordConflictQuarantines(
-            validateAuthority: validateAuthority)
+            validateAuthority: validateConflictAuthority)
+        try validateConflictAuthority()
         guard !retiredConflictIDs.isEmpty else { return }
         for realm in realmProvider?.targetReaderRealms ?? [] {
             guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else { continue }
             try await realm.asyncWritePreservingOwnership {
-                try validateAuthority()
+                try validateConflictAuthority()
                 guard recordRebaseContext == context else { throw CancellationError() }
                 try context.validate(in: realm)
                 realm.delete(realm.objects(BigSyncRecordConflict.self)
                     .filter("id IN %@", Array(retiredConflictIDs)).where {
                         $0.namespace == context.namespace && $0.isResolved && !$0.isPreservationReceipt
                     })
+#if DEBUG
+                try _testAfterConflictRecoveryEvidenceMutation?()
+#endif
+                try validateConflictAuthority()
             }
+            try validateConflictAuthority()
         }
     }
 }
