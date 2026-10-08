@@ -286,4 +286,353 @@ extension SyncUndoCloseoutW1Tests {
         }
     }
 
+    /// Synthetic native CKRecord system fields, not signed cloud delivery.
+    /// Verify both the SDK setter and the resulting archive round trip.
+    @BigSyncBackgroundActor
+    private func serverEvidenceRecord(
+        entityType: String,
+        recordName: String,
+        zoneID: CKRecordZone.ID,
+        tag: String = "evidence-accepted"
+    ) throws -> CKRecord {
+        let modifiedAt = Date(timeIntervalSinceReferenceDate: 30)
+        let record = try tagged(CKRecord(
+            recordType: entityType,
+            recordID: .init(recordName: recordName, zoneID: zoneID)
+        ), tag)
+        let setter = NSSelectorFromString("setModificationDate:")
+        guard record.responds(to: setter) else {
+            throw NSError(domain: "W1NativeFixture", code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "This CloudKit SDK cannot construct the server-date fixture"])
+        }
+        _ = record.perform(setter, with: modifiedAt as NSDate)
+        XCTAssertEqual(record.modificationDate, modifiedAt)
+        let decoded = try BigSyncRecordPayload.decode(BigSyncRecordPayload.encode(record))
+        XCTAssertEqual(decoded.recordChangeTag, tag)
+        XCTAssertEqual(decoded.modificationDate, modifiedAt)
+        return decoded
+    }
+
+    @BigSyncBackgroundActor
+    private func semanticQuarantine(
+        adapter: RealmSwiftAdapter
+    ) -> BigSyncInboundSemanticQuarantine {
+        let row = BigSyncInboundSemanticQuarantine()
+        row.lineageID = "snapshot-quarantine"
+        row.recordName = W1UploadSnapshotRow.className() + ".quarantined"
+        row.entityType = W1UploadSnapshotRow.className()
+        row.accountScopeIdentifier = "w1-account"
+        row.semanticScopeIdentifier = "scope-a"
+        row.containerIdentifier = "iCloud.test.w1-closeout"
+        row.databaseScopeRawValue = CKDatabase.Scope.private.rawValue
+        row.zoneOwnerName = adapter.recordZoneID.ownerName
+        row.zoneName = adapter.recordZoneID.zoneName
+        row.replicaActivationIdentifier = "w1-binding"
+        row.changeFeedEpoch = 0
+        row.validationCode = "snapshot-fixture"
+        return row
+    }
+
+    @BigSyncBackgroundActor
+    func testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval() async throws {
+        for initiallyPresent in [false, true] {
+            for commits in [false, true] {
+                let (adapter, _) = try await fixture()
+                let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+                let row = semanticQuarantine(adapter: adapter)
+                if initiallyPresent { try tracking.write { tracking.add(row) } }
+                func blocks(_ scope: String = "scope-a") throws -> Bool {
+                    try adapter.hasInboundSemanticQuarantine(
+                        entityType: W1UploadSnapshotRow.className(),
+                        accountScopeIdentifier: "w1-account",
+                        semanticScopeIdentifier: scope
+                    )
+                }
+                XCTAssertEqual(try blocks(), initiallyPresent)
+                tracking.beginWrite()
+                defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+                if initiallyPresent { tracking.delete(row) }
+                else { tracking.add(row) }
+                XCTAssertEqual(try blocks(), initiallyPresent,
+                    "A provisional quarantine change cannot grant or revoke durable admission")
+                XCTAssertFalse(try blocks("scope-b"))
+                XCTAssertFalse(try adapter.hasInboundSemanticQuarantine(
+                    entityType: W1UploadSnapshotRow.className(),
+                    accountScopeIdentifier: "another-account",
+                    semanticScopeIdentifier: "scope-a"
+                ))
+                XCTAssertTrue(tracking.isInWriteTransaction)
+                XCTAssertEqual(tracking.objects(BigSyncInboundSemanticQuarantine.self).count,
+                    initiallyPresent ? 0 : 1, "Inspection must leave the owner's write intact")
+                if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+                XCTAssertEqual(try blocks(), commits ? !initiallyPresent : initiallyPresent)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testSemanticQuarantineUsesCommittedFeedEpoch() async throws {
+        for commits in [false, true] {
+            let (adapter, _) = try await fixture()
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            let row = semanticQuarantine(adapter: adapter)
+            row.semanticScopeIdentifier = nil
+            let state = RebuildProvenanceState()
+            state.accountScopeIdentifier = "w1-account"
+            try tracking.write {
+                tracking.add(row)
+                tracking.add(state, update: .modified)
+            }
+            tracking.beginWrite()
+            defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+            state.epoch = 1
+            XCTAssertTrue(try adapter.hasInboundSemanticQuarantine(
+                entityType: W1UploadSnapshotRow.className(),
+                accountScopeIdentifier: "w1-account",
+                semanticScopeIdentifier: "any-scope"
+            ), "A provisional feed reset must not hide a committed unscoped quarantine")
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+            XCTAssertEqual(try adapter.hasInboundSemanticQuarantine(
+                entityType: W1UploadSnapshotRow.className(),
+                accountScopeIdentifier: "w1-account",
+                semanticScopeIdentifier: "any-scope"
+            ), !commits)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testServerEvidenceIgnoresProvisionalAcknowledgement() async throws {
+        for commits in [false, true] {
+            let (adapter, realm, _, name, generation) = try await uploadSnapshotFixture()
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            let entity = try XCTUnwrap(tracking.object(
+                ofType: SyncedEntity.self, forPrimaryKey: name
+            ))
+            let type = W1UploadSnapshotRow.className()
+            let record = try serverEvidenceRecord(
+                entityType: type, recordName: name, zoneID: adapter.recordZoneID
+            )
+            let expected = BigSyncServerRecordEvidence(
+                recordName: name, entityType: type,
+                recordChangeTag: "evidence-accepted",
+                serverModifiedAt: Date(timeIntervalSinceReferenceDate: 30)
+            )
+            tracking.beginWrite()
+            defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+            try adapter.save(record: record, for: entity)
+            entity.entityState = .synced
+            entity.clearPendingMutation()
+            XCTAssertNil(try adapter.serverRecordEvidence(
+                recordName: name, expectedEntityType: type
+            ))
+            XCTAssertTrue(try adapter.serverRecordEvidence(entityTypes: [type]).isEmpty,
+                "Uncommitted system fields must not prove current-account server membership")
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            XCTAssertEqual(entity.entityState, .synced)
+            XCTAssertNil(entity.pendingGeneration)
+            XCTAssertEqual(realm.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, generation)
+            if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+            XCTAssertEqual(try adapter.serverRecordEvidence(
+                recordName: name, expectedEntityType: type
+            ), commits ? expected : nil)
+            XCTAssertEqual(try adapter.serverRecordEvidence(entityTypes: [type]),
+                commits ? [expected] : [])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement() async throws {
+        for removesRow in [false, true] {
+            for commits in [false, true] {
+                let (adapter, _, _, name, _) = try await uploadSnapshotFixture()
+                let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+                let entity = try XCTUnwrap(tracking.object(
+                    ofType: SyncedEntity.self, forPrimaryKey: name
+                ))
+                let type = W1UploadSnapshotRow.className()
+                let accepted = try serverEvidenceRecord(
+                    entityType: type, recordName: name, zoneID: adapter.recordZoneID
+                )
+                let foreign = try serverEvidenceRecord(
+                    entityType: type, recordName: name,
+                    zoneID: .init(zoneName: "foreign-zone"), tag: "foreign-zone-tag"
+                )
+                try tracking.write {
+                    try adapter.save(record: accepted, for: entity)
+                    entity.entityState = .synced
+                    entity.clearPendingMutation()
+                }
+                let expected = BigSyncServerRecordEvidence(
+                    recordName: name, entityType: type,
+                    recordChangeTag: "evidence-accepted",
+                    serverModifiedAt: Date(timeIntervalSinceReferenceDate: 30)
+                )
+                XCTAssertEqual(try adapter.serverRecordEvidence(
+                    recordName: name, expectedEntityType: type
+                ), expected)
+                tracking.beginWrite()
+                defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+                if removesRow { tracking.delete(entity) }
+                else { try adapter.save(record: foreign, for: entity) }
+                XCTAssertEqual(try adapter.serverRecordEvidence(
+                    recordName: name, expectedEntityType: type
+                ), expected)
+                XCTAssertEqual(try adapter.serverRecordEvidence(entityTypes: [type]), [expected])
+                XCTAssertTrue(tracking.isInWriteTransaction)
+                if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+                XCTAssertEqual(try adapter.serverRecordEvidence(
+                    recordName: name, expectedEntityType: type
+                ), commits ? nil : expected)
+                XCTAssertEqual(try adapter.serverRecordEvidence(entityTypes: [type]),
+                    commits ? [] : [expected],
+                    "A committed cache from another zone must not prove membership in this zone")
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testServerEvidencePreservesExactAndCatalogStatePolicies() async throws {
+        let (adapter, _, _, name, _) = try await uploadSnapshotFixture()
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let entity = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+        let type = W1UploadSnapshotRow.className()
+        let accepted = try serverEvidenceRecord(
+            entityType: type, recordName: name, zoneID: adapter.recordZoneID
+        )
+        let expected = BigSyncServerRecordEvidence(
+            recordName: name, entityType: type,
+            recordChangeTag: "evidence-accepted",
+            serverModifiedAt: Date(timeIntervalSinceReferenceDate: 30)
+        )
+        let states: [SyncedEntityState] = [
+            .new, .synced, .changed, .deletedLocally, .deletedRemotely,
+            .recreatingRemotely, .awaitingServerEvidence
+        ]
+        for state in states {
+            for hasPendingGeneration in [false, true] {
+                try tracking.write {
+                    try adapter.save(record: accepted, for: entity)
+                    entity.entityState = state
+                    if hasPendingGeneration {
+                        entity.setPendingMutation(generation: "pending-proof",
+                            replicaBindingGenerationIdentifier: "w1-binding")
+                    } else { entity.clearPendingMutation() }
+                }
+                XCTAssertEqual(try adapter.serverRecordEvidence(
+                    recordName: name, expectedEntityType: type
+                ), state == .synced && !hasPendingGeneration ? expected : nil)
+                let membershipStates: [SyncedEntityState] = [.synced, .changed, .deletedLocally]
+                XCTAssertEqual(try adapter.serverRecordEvidence(entityTypes: [type]),
+                    membershipStates.contains(state) ? [expected] : [])
+            }
+        }
+        XCTAssertNil(try adapter.serverRecordEvidence(
+            recordName: name, expectedEntityType: W1RetainedArticle.className()
+        ))
+        XCTAssertTrue(try adapter.serverRecordEvidence(entityTypes: []).isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm() async throws {
+        for commits in [false, true] {
+            let types = [W1UploadSnapshotRow.className(), W1RetainedArticle.className()]
+            let (adapter, realm) = try await fixture(
+                accountScopePropertyByClassName: Dictionary(
+                    uniqueKeysWithValues: types.map { ($0, "title") }
+                )
+            )
+            let row = W1UploadSnapshotRow()
+            row.title = "w1-account"
+            let article = W1RetainedArticle()
+            article.title = "w1-account"
+            try realm.write {
+                realm.add([row, article])
+                row.refreshChangeMetadata(explicitlyModified: true,
+                    at: Date(timeIntervalSinceReferenceDate: 10))
+                article.refreshChangeMetadata(explicitlyModified: true,
+                    at: Date(timeIntervalSinceReferenceDate: 10))
+            }
+            _ = try await adapter._test_forwardPendingMutations(in: realm)
+            let names = [types[0] + "." + row.id, types[1] + "." + article.id]
+            let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+            for (type, name) in zip(types, names) {
+                let entity = try XCTUnwrap(tracking.object(
+                    ofType: SyncedEntity.self, forPrimaryKey: name
+                ))
+                let record = try serverEvidenceRecord(
+                    entityType: type, recordName: name, zoneID: adapter.recordZoneID
+                )
+                try tracking.write {
+                    try adapter.save(record: record, for: entity)
+                    entity.entityState = .synced
+                    entity.clearPendingMutation()
+                }
+            }
+            let expectedNames = Set(names)
+            XCTAssertEqual(Set(try adapter.serverRecordEvidence(
+                entityTypes: Set(types)
+            ).map(\.recordName)), expectedNames)
+            realm.beginWrite()
+            defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
+            row.title = "another-account"
+            article.title = "another-account"
+            row.refreshChangeMetadata(explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 40))
+            article.refreshChangeMetadata(explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 40))
+            for (type, name) in zip(types, names) {
+                XCTAssertNotNil(try adapter.serverRecordEvidence(
+                    recordName: name, expectedEntityType: type
+                ))
+            }
+            XCTAssertEqual(Set(try adapter.serverRecordEvidence(
+                entityTypes: Set(types)
+            ).map(\.recordName)), expectedNames)
+            XCTAssertTrue(realm.isInWriteTransaction)
+            XCTAssertEqual(row.title, "another-account")
+            XCTAssertEqual(article.title, "another-account")
+            if commits { try realm.commitWrite() } else { realm.cancelWrite() }
+            XCTAssertEqual(Set(try adapter.serverRecordEvidence(
+                entityTypes: Set(types)
+            ).map(\.recordName)), commits ? [] : expectedNames)
+            for (type, name) in zip(types, names) {
+                XCTAssertEqual(try adapter.serverRecordEvidence(
+                    recordName: name, expectedEntityType: type
+                ) != nil, !commits)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership() async throws {
+        for initiallyEstablished in [false, true] {
+            for commits in [false, true] {
+                let (adapter, _) = try await fixture()
+                let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+                let entity = SyncedEntity(
+                    entityType: W1UploadSnapshotRow.className(),
+                    identifier: W1UploadSnapshotRow.className() + ".bootstrap",
+                    state: (initiallyEstablished
+                        ? SyncedEntityState.synced : SyncedEntityState.new).rawValue
+                )
+                try tracking.write { tracking.add(entity) }
+                let before = try await adapter.hasChangeFeedEstablishedServerEvidence()
+                XCTAssertEqual(before, initiallyEstablished)
+                tracking.beginWrite()
+                defer { if tracking.isInWriteTransaction { tracking.cancelWrite() } }
+                if initiallyEstablished { tracking.delete(entity) }
+                else { entity.entityState = .synced }
+                let during = try await adapter.hasChangeFeedEstablishedServerEvidence()
+                XCTAssertEqual(during, initiallyEstablished)
+                XCTAssertTrue(tracking.isInWriteTransaction)
+                if commits { try tracking.commitWrite() } else { tracking.cancelWrite() }
+                let after = try await adapter.hasChangeFeedEstablishedServerEvidence()
+                XCTAssertEqual(after, commits ? !initiallyEstablished : initiallyEstablished)
+            }
+        }
+    }
+
 }

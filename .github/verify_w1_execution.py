@@ -21,6 +21,13 @@ EXPECTED = {
         "testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline",
         "testTerminalLocalDeleteRetiresItsSupersededStagedSave",
         "testFetchedDeletionPageReplaysAfterTargetFirstInterruptionWithoutDeletingAgain",
+        "testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval",
+        "testSemanticQuarantineUsesCommittedFeedEpoch",
+        "testServerEvidenceIgnoresProvisionalAcknowledgement",
+        "testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement",
+        "testServerEvidencePreservesExactAndCatalogStatePolicies",
+        "testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm",
+        "testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership",
     ),
     "CloudKitSynchronizerAccountFencingTests": (
         "testCancelledWorkerPreflightDoesNotScheduleRetry",
@@ -76,6 +83,14 @@ EXPECTED = {
         "testValidatedBeginRunCancellationDuringJoinLeavesProcessorStopped",
         "testValidatedBeginRunAuthorityFailureAfterJoinLeavesProcessorStopped",
     ),
+    "SyncSplitOperationOwnershipTests": (
+        "testCancelledJournalForwardingCannotPublishToSuccessorTracking",
+        "testImportProgressCannotReacquireSuccessorJournalOwnership",
+        "testCancelledImportCannotClearSuccessorAssetsAfterProgressCallout",
+        "testCancelledQueuedRemainingCountDoesNotNotifySuccessor",
+        "testJournalForwardingRejectsTransportReplacementBeforeTrackingAdmission",
+        "testInboundDeletionRejectsCancellationResetAccountBindingAndTransportReplacement",
+    ),
     "SyncPhaseAttemptOwnershipTests": (
         "testDirectAuthenticationStopSettlesTwoWaitersWithOriginalError",
         "testWrappedAuthenticationStopSettlesTwoWaitersWithOriginalError",
@@ -110,7 +125,7 @@ FOCUSED_FILTER = (
     r"^BigSyncKitTests\.(?:SyncUndoCloseoutW1[^/]*|CloudKitAccountAvailability[^/]*|"
     r"CloudKitCallbackAdmissionTests|CloudKitSynchronizerAccountFencingTests|"
     r"BigSyncWorkerRequestCancellationTests|ChangeRequestProcessorCancellationTests|"
-    r"SynchronizationProcessorStartupTests|BigSyncScheduledRetryTests|"
+    r"SynchronizationProcessorStartupTests|SyncPhaseAttemptOwnershipTests|SyncSplitOperationOwnershipTests|BigSyncScheduledRetryTests|"
     r"BigSyncDeadlineRaceTests)/"
 )
 FOCUSED = re.compile(FOCUSED_FILTER)
