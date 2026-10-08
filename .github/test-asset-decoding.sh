@@ -21,12 +21,14 @@ trap finish EXIT
 git -C "$root" rev-parse HEAD > "$evidence/source-commit.txt"
 git -C "$root" ls-tree -r HEAD > "$evidence/source-tree.txt"
 swift --version > "$evidence/swift-version.txt"
-printf '%s\n' '-Xcxx -fno-modules' > "$evidence/cxx-build-flags.txt"
+printf '%s\n' '-Xcxx -fno-modules -Xcxx -Xclang -Xcxx -fno-cxx-modules' > "$evidence/cxx-build-flags.txt"
 
 set +e
-# Realm Core's C++ headers are compiled textually: SwiftPM 6.2.1 otherwise
-# rejects its s2geometry dependency as an unavailable implicit Clang module.
+# Realm uses textual headers. Clang's C++20 module mode is separate from
+# -fmodules: disable both module modes while retaining the C++20 language level.
+# Pass the C++ module option directly to cc1 through the supported -Xclang bridge.
 swift test --verbose --package-path "$root" --configuration debug -Xcxx -fno-modules \
+  -Xcxx -Xclang -Xcxx -fno-cxx-modules \
   --filter HotfixCollectionSafetyTests \
   --parallel --num-workers 1 --disable-swift-testing \
   --xunit-output "$evidence/native.junit.xml" 2>&1 | tee "$evidence/native.log"
