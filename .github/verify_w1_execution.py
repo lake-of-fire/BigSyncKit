@@ -21,6 +21,13 @@ EXPECTED = {
         "testOmittedScalarsApplyDeclaredDefaultsAndAgreeWithBaseline",
         "testTerminalLocalDeleteRetiresItsSupersededStagedSave",
         "testFetchedDeletionPageReplaysAfterTargetFirstInterruptionWithoutDeletingAgain",
+        "testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval",
+        "testSemanticQuarantineUsesCommittedFeedEpoch",
+        "testServerEvidenceIgnoresProvisionalAcknowledgement",
+        "testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement",
+        "testServerEvidencePreservesExactAndCatalogStatePolicies",
+        "testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm",
+        "testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership",
     ),
     "CloudKitSynchronizerAccountFencingTests": (
         "testCancelledWorkerPreflightDoesNotScheduleRetry",
@@ -110,7 +117,7 @@ FOCUSED_FILTER = (
     r"^BigSyncKitTests\.(?:SyncUndoCloseoutW1[^/]*|CloudKitAccountAvailability[^/]*|"
     r"CloudKitCallbackAdmissionTests|CloudKitSynchronizerAccountFencingTests|"
     r"BigSyncWorkerRequestCancellationTests|ChangeRequestProcessorCancellationTests|"
-    r"SynchronizationProcessorStartupTests|BigSyncScheduledRetryTests|"
+    r"SynchronizationProcessorStartupTests|SyncPhaseAttemptOwnershipTests|BigSyncScheduledRetryTests|"
     r"BigSyncDeadlineRaceTests)/"
 )
 FOCUSED = re.compile(FOCUSED_FILTER)
