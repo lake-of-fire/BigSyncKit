@@ -827,7 +827,8 @@ final class SyncRetainedRecordContractTests: XCTestCase {
 
             XCTAssertTrue(fence.rejectsAuthority)
             XCTAssertEqual(adapter.recordRebaseContext, context)
-            try context.validate(in: realm)
+            // Journal identity validation requires the caller's owned transaction.
+            try realm.write { try context.validate(in: realm) }
             XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: object), originalFields)
             XCTAssertEqual(object.modifiedAt, originalModifiedAt)
             XCTAssertEqual(object.explicitlyModifiedAt, originalExplicitlyModifiedAt)
