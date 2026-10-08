@@ -13094,11 +13094,13 @@ final class BigSyncKitTests: XCTestCase {
             try await fixture.adapter.activateAccountScope("account-b")
         }
 
-        let forwarded = try await fixture.adapter
-            ._test_forwardPendingMutations(in: fixture.targetRealm)
+        defer { fixture.adapter._testBeforePendingMutationTrackingWrite = nil }
+        do {
+            _ = try await fixture.adapter
+                ._test_forwardPendingMutations(in: fixture.targetRealm)
+            XCTFail("A retired account must reject the old journal operation")
+        } catch is CancellationError { }
         fixture.adapter._testBeforePendingMutationTrackingWrite = nil
-
-        XCTAssertEqual(forwarded, 0)
         XCTAssertNil(fixture.persistenceRealm.object(
             ofType: SyncedEntity.self,
             forPrimaryKey: recordName

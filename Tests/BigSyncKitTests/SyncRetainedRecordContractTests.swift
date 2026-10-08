@@ -1182,10 +1182,17 @@ final class SyncRetainedRecordContractTests: XCTestCase {
         XCTAssertEqual(object.title, "mine")
         XCTAssertEqual(realm.objects(BigSyncRecordConflict.self).first?.isResolved, true)
         XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
-        XCTAssertFalse(realm.objects(BigSyncPendingMutation.self).isEmpty)
+        let committedMutation = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first)
+        let committedGeneration = committedMutation.generation
+        let committedRecordName = committedMutation.recordName
         try await adapter.discardResolvedRecordConflictArchives()
         XCTAssertNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineage))
+        // Fresh normal import replays the durable target journal after the
+        // retired caller was rejected before tracking publication.
+        try await adapter.didFinishImport()
         let batch = try await adapter.prepareUploadBatch(limit: 10)
+        XCTAssertEqual(batch.records.count, 1)
+        XCTAssertEqual(batch.matchingGenerations[committedRecordName], committedGeneration)
         try await adapter.acknowledgeUploadedRecords(batch.records, from: batch)
         try await requireQuiet(adapter)
     }

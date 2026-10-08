@@ -579,10 +579,8 @@ extension SyncUndoCloseoutW1Tests {
             defer { if realm.isInWriteTransaction { realm.cancelWrite() } }
             row.title = "another-account"
             article.title = "another-account"
-            row.refreshChangeMetadata(explicitlyModified: true,
-                at: Date(timeIntervalSinceReferenceDate: 40))
-            article.refreshChangeMetadata(explicitlyModified: true,
-                at: Date(timeIntervalSinceReferenceDate: 40))
+            // Deliberately model malformed provisional storage without invoking
+            // the public mutation hook, which rejects immutable scope changes.
             for (type, name) in zip(types, names) {
                 XCTAssertNotNil(try adapter.serverRecordEvidence(
                     recordName: name, expectedEntityType: type
