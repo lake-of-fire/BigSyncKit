@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+root="${BIGSYNC_FROZEN_SOURCE_ROOT:?Set the absolute reviewed BigSyncKit checkout path}"
+[[ "$root" = /* ]] || { echo 'Reviewed source root must be absolute' >&2; exit 2; }
+test "$(git -C "$root" rev-parse HEAD)" = b2fe723274a84cd98a2f4fb545252eb5abbeff54
+test "$(git -C "$root" rev-parse HEAD^{tree})" = 427034ccb042d47e74fadc86f37e65ae47c249a5
 evidence="${BIGSYNC_ASSET_EVIDENCE_DIRECTORY:?Set a fresh absolute evidence directory}"
 [[ "$evidence" = /* ]] || { echo 'Evidence directory must be absolute' >&2; exit 2; }
 [[ ! -e "$evidence" ]] || { echo "Evidence directory must be fresh: $evidence" >&2; exit 2; }
 mkdir -p "$evidence"
+cp "$0" "$evidence/executed-native-lane.sh"
+shasum -a 256 "$evidence/executed-native-lane.sh" > "$evidence/executed-native-lane.sh.sha256"
 scratch="$root/.build-owner-qualification"
 scratch_created=0
 finalize() {
@@ -48,7 +53,7 @@ for repo in "$root"/../RealmSwiftGaps "$root"/../SwiftUtilities; do
 done
 git -C "$root/../RealmSwiftGaps" rev-parse HEAD > "$evidence/realm-gaps-commit.txt"
 git -C "$root/../SwiftUtilities" rev-parse HEAD > "$evidence/swift-utilities-commit.txt"
-test "$(cat "$evidence/realm-gaps-commit.txt")" = 1ffbedbb3d8dd90f44f651f618128e7806ce39dd
+test "$(cat "$evidence/realm-gaps-commit.txt")" = 395e3f005b0e178440b3c8e8be8c8b749c58b32c
 test "$(cat "$evidence/swift-utilities-commit.txt")" = f437c7d06fc631cd7a67731279411c417cdf8077
 for spec in "$root:BigSyncKit" "$root/../RealmSwiftGaps:RealmSwiftGaps" "$root/../SwiftUtilities:SwiftUtilities"; do
   repo="${spec%%:*}"; label="${spec#*:}"
