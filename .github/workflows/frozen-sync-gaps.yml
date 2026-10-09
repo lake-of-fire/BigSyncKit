@@ -1,7 +1,7 @@
 name: Frozen BigSync source with owned-read publication graph
 on:
   push:
-    branches: [qualification/frozen-sync-gaps-20261008-astra, codex/oct8-local-admission-retry-20261008]
+    branches: [qualification/frozen-sync-gaps-20261008-astra, codex/oct8-local-admission-retry-20261008, qualification/committed-backup-authority-20261009-astra]
   workflow_dispatch:
 permissions:
   contents: read
@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/BigSyncKit
-          ref: 7658320bf1b26090f471afe0481012197dbbc0ed
+          ref: 66fb67c3eb2735ccaa384fe07b70743274ef72bc
           path: BigSyncKit
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -55,7 +55,7 @@ jobs:
           git rev-parse HEAD
           git rev-parse HEAD^{tree}
           git diff --exit-code
-      - name: Execute full and focused native Debug qualification
+      - name: Execute focused then full native Debug qualification
         shell: bash
         env:
           BIGSYNC_FROZEN_SOURCE_ROOT: ${{ github.workspace }}/BigSyncKit

@@ -3,8 +3,8 @@ set -euo pipefail
 
 root="${BIGSYNC_FROZEN_SOURCE_ROOT:?Set the absolute frozen BigSyncKit checkout path}"
 [[ "$root" = /* ]] || { echo 'Frozen source root must be absolute' >&2; exit 2; }
-test "$(git -C "$root" rev-parse HEAD)" = 7658320bf1b26090f471afe0481012197dbbc0ed
-test "$(git -C "$root" rev-parse HEAD^{tree})" = 33006860211d522f05e640595df5347d380c5d6b
+test "$(git -C "$root" rev-parse HEAD)" = 66fb67c3eb2735ccaa384fe07b70743274ef72bc
+test "$(git -C "$root" rev-parse HEAD^{tree})" = f0bc5d1bdbd553c7e5331990f729a0e31d5fad4d
 evidence="${BIGSYNC_ASSET_EVIDENCE_DIRECTORY:?Set a fresh absolute evidence directory}"
 [[ "$evidence" = /* ]] || { echo 'Evidence directory must be absolute' >&2; exit 2; }
 [[ ! -e "$evidence" ]] || { echo "Evidence directory must be fresh: $evidence" >&2; exit 2; }
@@ -108,6 +108,7 @@ statuses=("${PIPESTATUS[@]}")
 set -e
 printf '[%s,%s,%s]\n' "${statuses[0]}" "${statuses[1]}" "${statuses[2]}" > "$evidence/discovery.status.json"
 if python3 "$root/.github/verify_w1_execution.py" discovery --directory "$evidence"; then discovery_result=0; else discovery_result=$?; fi
+if [[ "$discovery_result" != 0 ]]; then exit "$discovery_result"; fi
 
 focused_filter="$(python3 "$root/.github/verify_w1_execution.py" focused-filter)"
 printf '%s\n' "$focused_filter" > "$evidence/focused-filter.txt"
@@ -124,10 +125,8 @@ run_phase() {
   printf '[%s,%s,%s]\n' "${statuses[0]}" "${statuses[1]}" "${statuses[2]}" > "$evidence/$phase.status.json"
   if python3 "$root/.github/verify_w1_execution.py" "$phase" --directory "$evidence"; then return 0; else return $?; fi
 }
-if run_phase full; then full_result=0; else full_result=$?; fi
-if run_phase focused --filter "$focused_filter"; then focused_result=0; else focused_result=$?; fi
-
-if [[ "$discovery_result" != 0 || "$full_result" != 0 || "$focused_result" != 0 ]]; then
-  exit 1
-fi
+# Exercise the two backup-authority regressions and retained journal assertions
+# first. Broaden only after that focused phase passes, completing the existing gate.
+run_phase focused --filter "$focused_filter"
+run_phase full
 exit 0
