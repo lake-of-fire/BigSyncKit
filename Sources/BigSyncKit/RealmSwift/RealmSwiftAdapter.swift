@@ -7412,7 +7412,14 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     private var isRestoringBackupServerSnapshot: Bool {
-        guard let state = realmProvider?.persistenceRealm?.object(
+        guard let persistenceRealm = realmProvider?.persistenceRealm else {
+            return false
+        }
+        // This grants authority to replace retained local values. A different
+        // writer's provisional bootstrap/completion marker cannot grant or
+        // suppress that authority after its transaction rolls back.
+        let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        guard let state = snapshot.object(
             ofType: RebuildProvenanceState.self,
             forPrimaryKey: RebuildProvenanceState.primaryKeyValue
         ) else { return false }
