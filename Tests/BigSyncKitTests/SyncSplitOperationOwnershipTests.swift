@@ -66,6 +66,42 @@ private final class SplitOwnerInvalidEcho: Object, ChangeMetadataRecordable,
     }
 }
 
+@objc(BigSyncSplitOwnerSemanticEcho)
+private final class SplitOwnerSemanticEcho: Object, ChangeMetadataRecordable,
+    BigSyncInboundSemanticReplacementValidating {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+    @Persisted(primaryKey: true) var id = "semantic-echo"
+    @Persisted var text = "committed predecessor"
+    @Persisted var isDeleted = false
+    @Persisted var createdAt = Date(timeIntervalSinceReferenceDate: 1)
+    @Persisted var modifiedAt = Date(timeIntervalSinceReferenceDate: 1)
+    @Persisted var explicitlyModifiedAt: Date?
+
+    static func validateInboundSemanticReplacement(
+        _ record: CKRecord, existingObject: Object?
+    ) throws {
+        guard let existing = existingObject as? Self,
+              record["text"] as? String == existing.text else {
+            throw CocoaError(.coderInvalidValue)
+        }
+    }
+}
+
+// The semaphore joins the native writer before the refresh callback continues.
+// No Realm handle or managed value leaves its owning thread.
+private final class SplitRefreshWriterResult: @unchecked Sendable {
+    var result: Result<String, Error>?
+}
+
+@BigSyncBackgroundActor
+private final class SplitRefreshCapture {
+    var stagedGeneration: String?
+    var error: Error?
+    var refreshRetirementCount = 0
+    var sawOwningWrite = false
+    var forwardedCount = 0
+}
+
 /// Runs real target/tracking commits through the cancellation-generation ABA:
 /// a successor makes cancelSync false but cannot authorize the old continuation.
 @BigSyncBackgroundActor
@@ -91,6 +127,7 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
         config.inMemoryIdentifier = "split-owner-target-" + nonce
         config.objectTypes = [SplitOwnerRow.self, SplitOwnerChild.self,
                               SplitOwnerParent.self, SplitOwnerInvalidEcho.self,
+                              SplitOwnerSemanticEcho.self,
                               BigSyncPendingMutation.self]
         if contract { config.objectTypes?.append(SplitOwnerContractRow.self) }
         if comparison || contract { BigSyncMutationPolicy.enableRecordRebasing(in: &config) }
@@ -1314,6 +1351,165 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
         }
     }
 
+
+    @BigSyncBackgroundActor
+    func testAuthoritativeOwnEchoIgnoresForeignProvisionalPredecessorAndJournal() async throws {
+        for hasCommittedJournal in [false, true] {
+            let fixture = try await fixture()
+            let row = SplitOwnerSemanticEcho()
+            let name = SplitOwnerSemanticEcho.className() + "." + row.id
+            // This seeds server-known state; only the optional local edit is authoritative.
+            try fixture.target.write {
+                fixture.target.add(row)
+                if hasCommittedJournal {
+                    row.refreshChangeMetadata(explicitlyModified: true,
+                        at: Date(timeIntervalSinceReferenceDate: 10))
+                }
+            }
+            let committedGeneration = fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation
+            let committedModifiedAt = row.modifiedAt
+            let record = CKRecord(recordType: SplitOwnerSemanticEcho.className(),
+                recordID: .init(recordName: name, zoneID: fixture.adapter.recordZoneID))
+            record["text"] = row.text as CKRecordValue
+            fixture.target.beginWrite()
+            defer { if fixture.target.isInWriteTransaction { fixture.target.cancelWrite() } }
+            row.text = "foreign provisional predecessor"
+            row.refreshChangeMetadata(explicitlyModified: true,
+                at: Date(timeIntervalSinceReferenceDate: 100))
+            let provisionalGeneration = try XCTUnwrap(fixture.target.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: name)?.generation)
+            XCTAssertNotEqual(provisionalGeneration, committedGeneration)
+
+            let outcomes = try await fixture.adapter.validateAuthoritativeOwnUploadRecords([record])
+            XCTAssertEqual(outcomes.count, 1)
+            XCTAssertEqual(outcomes.first?.disposition, .validatedAuthoritativeOwnUpload,
+                "Semantic validation must use the committed predecessor behind the foreign write")
+            XCTAssertTrue(fixture.target.isInWriteTransaction)
+            XCTAssertEqual(row.text, "foreign provisional predecessor")
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, provisionalGeneration)
+            XCTAssertTrue(fixture.tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+            XCTAssertNil(fixture.tracking.object(ofType: SyncedEntity.self, forPrimaryKey: name))
+
+            fixture.target.cancelWrite()
+            XCTAssertEqual(row.text, "committed predecessor")
+            XCTAssertEqual(row.modifiedAt, committedModifiedAt)
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, committedGeneration)
+            let retry = try await fixture.adapter.validateAuthoritativeOwnUploadRecords([record])
+            XCTAssertEqual(retry.first?.disposition, .validatedAuthoritativeOwnUpload)
+            XCTAssertTrue(fixture.tracking.objects(BigSyncInboundSemanticQuarantine.self).isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUploadAcknowledgementRejectsOwnerRetiredBySynchronousJournalRefresh() async throws {
+        for replacesProvider in [false, true] {
+            let fixture = try await fixture()
+            let (row, name, sentGeneration) = try await pendingRow(fixture)
+            let batch = try await fixture.adapter.prepareUploadBatch(limit: 0)
+            let originalProvider = try XCTUnwrap(fixture.adapter.realmProvider)
+            let capture = SplitRefreshCapture()
+            let configuration = fixture.target.configuration
+            fixture.target.autorefresh = false
+            fixture.adapter._testBeforePendingMutationTrackingWrite = { capture.forwardedCount += 1 }
+
+            let onChange: @BigSyncBackgroundActor @Sendable () -> Void = {
+                guard capture.error == nil, capture.refreshRetirementCount == 0 else { return }
+                if capture.stagedGeneration == nil {
+                    // The acknowledgement has committed its target journal retirement.
+                    // Commit a successor on a separate native Realm thread while this
+                    // reader remains pinned to that retirement version.
+                    guard fixture.target.object(ofType: BigSyncPendingMutation.self,
+                        forPrimaryKey: name) == nil else { return }
+                    let joined = DispatchSemaphore(value: 0)
+                    let result = SplitRefreshWriterResult()
+                    Thread.detachNewThread {
+                        defer { joined.signal() }
+                        result.result = Result {
+                            let writer = try Realm(configuration: configuration)
+                            let current = try XCTUnwrap(writer.object(ofType: SplitOwnerRow.self,
+                                forPrimaryKey: "row"))
+                            try writer.write {
+                                current.text = "committed refresh successor"
+                                current.refreshChangeMetadata(explicitlyModified: true,
+                                    at: Date(timeIntervalSinceReferenceDate: 300))
+                            }
+                            return try XCTUnwrap(writer.object(ofType: BigSyncPendingMutation.self,
+                                forPrimaryKey: name)?.generation)
+                        }
+                    }
+                    guard joined.wait(timeout: .now() + 5) == .success else {
+                        capture.error = NSError(
+                            domain: "SplitOwnerJournalRefreshHistory", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "Native successor writer did not finish within the bounded refresh history"]
+                        )
+                        return
+                    }
+                    do { capture.stagedGeneration = try result.result?.get() }
+                    catch { capture.error = error }
+                    return
+                }
+                guard fixture.target.object(ofType: BigSyncPendingMutation.self,
+                    forPrimaryKey: name)?.generation == capture.stagedGeneration else { return }
+                capture.refreshRetirementCount += 1
+                capture.sawOwningWrite = fixture.target.isInWriteTransaction
+                if replacesProvider { fixture.adapter.realmProvider = nil }
+                else {
+                    fixture.adapter.cancelSynchronization()
+                    do { try fixture.adapter.prepareForFencedMigrationAfterCancellation() }
+                    catch { capture.error = error }
+                }
+            }
+            let token = fixture.target.observe { notification, _ in
+                guard notification == .didChange else { return }
+                // Realm invokes this notification synchronously on the target actor.
+                BigSyncBackgroundActor.shared.assumeIsolated { _ in
+                    let callback = unsafeBitCast(onChange, to: (@Sendable () -> Void).self)
+                    callback()
+                }
+            }
+            defer {
+                token.invalidate()
+                fixture.target.autorefresh = true
+                fixture.adapter.realmProvider = originalProvider
+                fixture.adapter._testBeforePendingMutationTrackingWrite = nil
+            }
+            do {
+                try await fixture.adapter.acknowledgeUploadedRecords(batch.records, from: batch)
+                XCTFail("The original acknowledgement borrowed the refresh successor's owner")
+            } catch is CancellationError {}
+            token.invalidate()
+            if let error = capture.error { throw error }
+            XCTAssertEqual(capture.refreshRetirementCount, 1,
+                "The real committed journal refresh must synchronously retire the original owner")
+            XCTAssertFalse(capture.sawOwningWrite,
+                "Retirement belongs to read refresh after target commit, not the owned write")
+            XCTAssertEqual(capture.forwardedCount, 0,
+                "The original owner must be checked before forwarding can capture a successor")
+            let successor = try XCTUnwrap(capture.stagedGeneration)
+            XCTAssertNotEqual(successor, sentGeneration)
+            XCTAssertEqual(row.text, "committed refresh successor")
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, successor)
+            let tracked = try XCTUnwrap(fixture.tracking.object(ofType: SyncedEntity.self,
+                forPrimaryKey: name))
+            XCTAssertEqual(tracked.entityState, .synced)
+            XCTAssertNil(tracked.pendingGeneration,
+                "Only the already committed acknowledgement may publish tracking")
+
+            fixture.adapter.realmProvider = originalProvider
+            fixture.adapter._testBeforePendingMutationTrackingWrite = nil
+            fixture.target.autorefresh = true
+            try await fixture.adapter.unsetCancellation()
+            try await fixture.adapter.didFinishImport()
+            XCTAssertEqual(tracked.pendingGeneration, successor)
+            XCTAssertEqual(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                forPrimaryKey: name)?.generation, successor)
+        }
+    }
 
     @BigSyncBackgroundActor
     func testAuthoritativeOwnEchoAllowsInitialProviderSetup() async throws {

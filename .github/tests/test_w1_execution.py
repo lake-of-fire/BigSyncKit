@@ -470,6 +470,13 @@ class W1CommittedEvidenceContractTests(W1MergedNativeContractTests):
 class W1OperationOwnerUnionContractTests(W1MergedNativeContractTests):
     """Keep the other union regressions independently required at runtime."""
     merged_cases = (
+        "ChangeFeedMigrationResumeTests/testInboundImportIgnoresRolledBackTargetJournalDuringAdmission",
+        "ChangeFeedMigrationResumeTests/testInboundDeletionIgnoresRolledBackTargetAndTrackingIntent",
+        "ChangeFeedMigrationResumeTests/testInboundImportIgnoresRolledBackTrackingDeletionDuringAdmission",
+        "ChangeFeedMigrationResumeTests/testInboundImportRejectsProvisionalBackupBootstrapAuthority",
+        "ChangeFeedMigrationResumeTests/testInboundImportRetainsCommittedBackupAuthorityBehindProvisionalCompletion",
+        "ChangeFeedMigrationResumeTests/testInboundBackupImportPreservesJournalCommittedBeforeSelection",
+        "ChangeFeedMigrationResumeTests/testInboundBackupImportPreservesTombstoneCommittedBeforeTargetAdmission",
         "SyncSplitOperationOwnershipTests/testCancelledJournalForwardingCannotPublishToSuccessorTracking",
         "SyncSplitOperationOwnershipTests/testImportProgressCannotReacquireSuccessorJournalOwnership",
         "SyncSplitOperationOwnershipTests/testCancelledImportCannotClearSuccessorAssetsAfterProgressCallout",
@@ -481,6 +488,8 @@ class W1OperationOwnerUnionContractTests(W1MergedNativeContractTests):
         "SyncSplitOperationOwnershipTests/testIncomingImportRejectsAccountAndTransportReplacementBeforeTargetAdmission",
         "SyncSplitOperationOwnershipTests/testAuthoritativeOwnEchoAllowsInitialProviderSetup",
         "SyncSplitOperationOwnershipTests/testCancelledAuthoritativeOwnEchoCannotPublishSuccessorQuarantine",
+        "SyncSplitOperationOwnershipTests/testAuthoritativeOwnEchoIgnoresForeignProvisionalPredecessorAndJournal",
+        "SyncSplitOperationOwnershipTests/testUploadAcknowledgementRejectsOwnerRetiredBySynchronousJournalRefresh",
         "SyncRetainedRecordContractTests/testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence",
         "ChangeFeedMigrationResumeTests/testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit",
         "ChangeFeedMigrationResumeTests/testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation",

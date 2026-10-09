@@ -29,6 +29,8 @@ EXPECTED = {
         "testIncomingImportRejectsAccountAndTransportReplacementBeforeTargetAdmission",
         "testAuthoritativeOwnEchoAllowsInitialProviderSetup",
         "testCancelledAuthoritativeOwnEchoCannotPublishSuccessorQuarantine",
+        "testAuthoritativeOwnEchoIgnoresForeignProvisionalPredecessorAndJournal",
+        "testUploadAcknowledgementRejectsOwnerRetiredBySynchronousJournalRefresh",
     ),
     "SyncRetainedRecordContractTests": (
         "testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence",
@@ -36,6 +38,13 @@ EXPECTED = {
         "testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison",
     ),
     "ChangeFeedMigrationResumeTests": (
+        "testInboundImportIgnoresRolledBackTargetJournalDuringAdmission",
+        "testInboundDeletionIgnoresRolledBackTargetAndTrackingIntent",
+        "testInboundImportIgnoresRolledBackTrackingDeletionDuringAdmission",
+        "testInboundImportRejectsProvisionalBackupBootstrapAuthority",
+        "testInboundImportRetainsCommittedBackupAuthorityBehindProvisionalCompletion",
+        "testInboundBackupImportPreservesJournalCommittedBeforeSelection",
+        "testInboundBackupImportPreservesTombstoneCommittedBeforeTargetAdmission",
         "testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit",
         "testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation",
         "testBackupRestorePreservesCurrentMutationCommittedAfterSnapshot",

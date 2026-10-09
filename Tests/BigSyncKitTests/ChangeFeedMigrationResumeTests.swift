@@ -472,6 +472,281 @@ extension MigrationPeerObject: @unchecked Sendable { }
 
 extension ChangeFeedMigrationResumeTests {
     @BigSyncBackgroundActor
+    func testInboundImportRejectsProvisionalBackupBootstrapAuthority() async throws {
+        try await exerciseInboundBackupMarkerSnapshot(committedBootstrap: false)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundImportRetainsCommittedBackupAuthorityBehindProvisionalCompletion() async throws {
+        try await exerciseInboundBackupMarkerSnapshot(committedBootstrap: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundBackupImportPreservesJournalCommittedBeforeSelection() async throws {
+        try await exerciseInboundBackupMarkerSnapshot(
+            committedBootstrap: true, localMutationTiming: .beforeSelection)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundBackupImportPreservesTombstoneCommittedBeforeTargetAdmission() async throws {
+        try await exerciseInboundBackupMarkerSnapshot(
+            committedBootstrap: true, localMutationTiming: .atTargetAdmission)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundImportIgnoresRolledBackTrackingDeletionDuringAdmission() async throws {
+        try await exerciseInboundBackupMarkerSnapshot(
+            committedBootstrap: false, provisionalTrackingDeletion: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundImportIgnoresRolledBackTargetJournalDuringAdmission() async throws {
+        try await exerciseInboundBackupMarkerSnapshot(
+            committedBootstrap: false, provisionalTargetMutation: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionIgnoresRolledBackTargetAndTrackingIntent() async throws {
+        let adapter = try makeAdapter(label: "inbound-deletion-committed-admission")
+        try await adapter.resetSyncCaches()
+        adapter.invalidateTokens()
+        try await activateChangeFeedNamespace(adapter, account: "inbound-deletion-account")
+        let target = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let object = MigrationPeerObject()
+        object.id = "remote-deletion"
+        let recordName = MigrationPeerObject.className() + "." + object.id
+        let timestamp = Date(timeIntervalSinceReferenceDate: 200)
+        try target.write {
+            object.createdAt = timestamp
+            object.modifiedAt = timestamp
+            object.explicitlyModifiedAt = timestamp
+            target.add(object)
+        }
+        let entity = SyncedEntity(entityType: MigrationPeerObject.className(),
+                                  identifier: recordName,
+                                  state: SyncedEntityState.synced.rawValue)
+        try tracking.write { tracking.add(entity) }
+        target.beginWrite()
+        object.refreshChangeMetadata(explicitlyModified: true,
+                                     at: Date(timeIntervalSinceReferenceDate: 300))
+        tracking.beginWrite()
+        entity.state = SyncedEntityState.changed.rawValue
+        entity.pendingGeneration = "uncommitted-local-intent"
+        let targetAdmission = expectation(description: "committed remote deletion reaches target writer")
+        adapter._testBeforeRemoteDeletionTargetWrite = {
+            XCTAssertTrue(target.isInWriteTransaction)
+            XCTAssertTrue(tracking.isInWriteTransaction)
+            target.cancelWrite()
+            tracking.cancelWrite()
+            targetAdmission.fulfill()
+        }
+        defer {
+            adapter._testBeforeRemoteDeletionTargetWrite = nil
+            if target.isInWriteTransaction { target.cancelWrite() }
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        }
+        let recordID = CKRecord.ID(recordName: recordName, zoneID: adapter.recordZoneID)
+        let task = Task { @BigSyncBackgroundActor in
+            try await adapter.deleteRecords(with: [recordID])
+        }
+        await fulfillment(of: [targetAdmission], timeout: 2)
+        // Release foreign writers even if a broken selector skipped the hook,
+        // so the failing history joins its operation rather than hanging.
+        if target.isInWriteTransaction { target.cancelWrite() }
+        if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        let results = try await task.value
+        XCTAssertEqual(results.count, 1)
+        XCTAssertTrue(object.isDeleted)
+        XCTAssertEqual(object.modifiedAt, timestamp)
+        XCTAssertNil(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName))
+        XCTAssertEqual(entity.entityState, .deletedRemotely)
+        XCTAssertNil(entity.pendingGeneration)
+    }
+
+    private enum InboundBackupLocalMutationTiming {
+        case none, beforeSelection, atTargetAdmission
+    }
+
+    @BigSyncBackgroundActor
+    private final class InboundBackupMutationCapture {
+        var generation: String?
+        var changedAt: Date?
+        var account: String?
+        var binding: String?
+
+        func record(_ mutation: BigSyncPendingMutation) {
+            generation = mutation.generation
+            changedAt = mutation.changedAt
+            account = mutation.accountScopeIdentifier
+            binding = mutation.replicaBindingGenerationIdentifier
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func exerciseInboundBackupMarkerSnapshot(
+        committedBootstrap: Bool,
+        localMutationTiming: InboundBackupLocalMutationTiming = .none,
+        provisionalTrackingDeletion: Bool = false,
+        provisionalTargetMutation: Bool = false
+    ) async throws {
+        let account = "inbound-backup-marker-account"
+        let adapter = try makeAdapter(label: "inbound-backup-marker-\(committedBootstrap)")
+        try await adapter.resetSyncCaches()
+        adapter.invalidateTokens()
+        try await activateChangeFeedNamespace(adapter, account: account)
+        let target = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let object = MigrationPeerObject()
+        object.id = "retained-value"
+        let localTimestamp = Date(timeIntervalSinceReferenceDate: 200)
+        let serverTimestamp = Date(timeIntervalSinceReferenceDate: 100)
+        let recordName = MigrationPeerObject.className() + "." + object.id
+        // Seed an acknowledged/retained value, with no fresh user journal.
+        try target.write {
+            object.createdAt = localTimestamp
+            object.modifiedAt = localTimestamp
+            object.explicitlyModifiedAt = localTimestamp
+            target.add(object)
+        }
+        let state = RebuildProvenanceState()
+        try tracking.write {
+            tracking.add(SyncedEntity(entityType: MigrationPeerObject.className(),
+                                     identifier: recordName,
+                                     state: SyncedEntityState.synced.rawValue))
+            state.accountScopeIdentifier = account
+            state.epoch = 107
+            state.mode = ChangeFeedResetMode.backupRestore.rawValue
+            state.isActive = committedBootstrap
+            state.serverBootstrapStarted = committedBootstrap
+            state.phase = committedBootstrap ? "serverBootstrap" : "complete"
+            tracking.add(state)
+        }
+        XCTAssertNil(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName))
+
+        let record = CKRecord(recordType: MigrationPeerObject.className(),
+                              recordID: .init(recordName: recordName, zoneID: adapter.recordZoneID))
+        record["createdAt"] = serverTimestamp as NSDate
+        record["modifiedAt"] = serverTimestamp as NSDate
+        record["explicitlyModifiedAt"] = serverTimestamp as NSDate
+        record["isDeleted"] = false as NSNumber
+
+        let mutationTimestamp = Date(timeIntervalSinceReferenceDate: 300)
+        let authored = InboundBackupMutationCapture()
+        @BigSyncBackgroundActor
+        func commitLocalMutation() throws {
+            try target.write {
+                if localMutationTiming == .atTargetAdmission {
+                    object.isDeleted = true
+                }
+                object.refreshChangeMetadata(explicitlyModified: true, at: mutationTimestamp)
+            }
+            authored.record(try XCTUnwrap(target.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName)))
+        }
+        if localMutationTiming == .beforeSelection {
+            try commitLocalMutation()
+        }
+
+        let provisional = InboundBackupMutationCapture()
+        if provisionalTargetMutation {
+            target.beginWrite()
+            object.refreshChangeMetadata(explicitlyModified: true, at: serverTimestamp)
+            provisional.record(try XCTUnwrap(target.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName)))
+        }
+        let selectedEntity = try XCTUnwrap(tracking.object(
+            ofType: SyncedEntity.self, forPrimaryKey: recordName))
+        tracking.beginWrite()
+        if provisionalTrackingDeletion {
+            selectedEntity.state = SyncedEntityState.deletedLocally.rawValue
+            selectedEntity.pendingGeneration = "uncommitted-deletion"
+        }
+        state.isActive = !committedBootstrap
+        state.serverBootstrapStarted = !committedBootstrap
+        state.phase = committedBootstrap ? "complete" : "serverBootstrap"
+        let targetAdmission = expectation(description: "inbound backup marker sampled")
+        adapter._testBeforeImportedRecordTargetWrite = {
+            XCTAssertTrue(tracking.isInWriteTransaction,
+                          "Import selection must leave the independent tracking writer open")
+            XCTAssertEqual(state.isActive, !committedBootstrap)
+            if provisionalTrackingDeletion {
+                XCTAssertEqual(selectedEntity.entityState, .deletedLocally)
+                XCTAssertEqual(selectedEntity.pendingGeneration, "uncommitted-deletion")
+            }
+            // Roll back before target or tracking admission. No import write
+            // nests in, commits, or borrows either provisional transaction.
+            if provisionalTargetMutation {
+                XCTAssertTrue(target.isInWriteTransaction)
+                target.cancelWrite()
+            }
+            tracking.cancelWrite()
+            if localMutationTiming == .atTargetAdmission {
+                try commitLocalMutation()
+            }
+            targetAdmission.fulfill()
+        }
+        defer {
+            adapter._testBeforeImportedRecordTargetWrite = nil
+            if target.isInWriteTransaction { target.cancelWrite() }
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        }
+        let results = try await adapter.saveChanges(in: [record], forceSave: true)
+        await fulfillment(of: [targetAdmission], timeout: 1)
+        XCTAssertEqual(results.count, 1)
+        XCTAssertFalse(tracking.isInWriteTransaction)
+        // A failed admission assertion must still release the independent
+        // writer before import completion queues its own tracking transaction.
+        if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        XCTAssertEqual(state.isActive, committedBootstrap)
+        XCTAssertEqual(state.serverBootstrapStarted, committedBootstrap)
+        XCTAssertEqual(state.phase, committedBootstrap ? "serverBootstrap" : "complete")
+
+        let hasAuthoredMutation = localMutationTiming != .none
+        let expectedCreatedAt = committedBootstrap && !hasAuthoredMutation
+            ? serverTimestamp : localTimestamp
+        let expectedTimestamp = hasAuthoredMutation ? mutationTimestamp : expectedCreatedAt
+        XCTAssertEqual(object.createdAt, expectedCreatedAt)
+        XCTAssertEqual(object.modifiedAt, expectedTimestamp)
+        XCTAssertEqual(object.explicitlyModifiedAt, expectedTimestamp)
+        XCTAssertEqual(object.isDeleted, localMutationTiming == .atTargetAdmission)
+        let pending = target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName)
+        if hasAuthoredMutation {
+            XCTAssertEqual(pending?.generation, try XCTUnwrap(authored.generation))
+            XCTAssertEqual(pending?.changedAt, authored.changedAt)
+            XCTAssertEqual(pending?.accountScopeIdentifier, authored.account)
+            XCTAssertEqual(pending?.replicaBindingGenerationIdentifier, authored.binding)
+            XCTAssertEqual(pending?.recordName, recordName)
+            XCTAssertEqual(pending?.entityType, MigrationPeerObject.className())
+            XCTAssertEqual(pending?.objectIdentifier, object.id)
+        } else if committedBootstrap {
+            XCTAssertNil(pending, "A provisional completion cannot republish retained backup data as new intent")
+        } else {
+            XCTAssertNotNil(pending, "A provisional bootstrap cannot discard the newer local conflict winner")
+        }
+        if provisionalTargetMutation {
+            XCTAssertNotEqual(pending?.generation, try XCTUnwrap(provisional.generation),
+                              "A rolled-back generation cannot become durable import intent")
+        }
+        let generation = pending?.generation
+        try await adapter.didFinishImport()
+        let tracked = try XCTUnwrap(tracking.object(ofType: SyncedEntity.self, forPrimaryKey: recordName))
+        XCTAssertEqual(tracked.pendingGeneration, generation)
+        let expectedState: SyncedEntityState = localMutationTiming == .atTargetAdmission
+            ? .deletedLocally : (hasAuthoredMutation || !committedBootstrap ? .changed : .synced)
+        XCTAssertEqual(tracked.entityState, expectedState)
+        if hasAuthoredMutation {
+            XCTAssertEqual(target.object(ofType: BigSyncPendingMutation.self,
+                                         forPrimaryKey: recordName)?.generation,
+                           authored.generation,
+                           "Import completion must not consume or relabel genuine local intent")
+        }
+        let cached = try XCTUnwrap(adapter.getRecord(for: tracked))
+        XCTAssertEqual(cached.recordID, record.recordID,
+                       "Both decisions still finish durable incoming system-field publication")
+    }
+
+    @BigSyncBackgroundActor
     func testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit() async throws {
         let account = "completion-snapshot-account"
         let epoch = 85

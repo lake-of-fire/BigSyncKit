@@ -5983,8 +5983,16 @@ public final class RealmSwiftAdapter:
                     }
                     try comparisonContext.validate(in: targetRealm)
                 }
+                let pending = pendingMutationSnapshots(for: journalRecordNames, in: targetRealm)
+                try requireCurrentTransport(
+                    namespace, cancellationGeneration: expectedCancellationGeneration
+                )
+                guard self.realmProvider === realmProvider,
+                      recordRebaseContext == comparisonContext else {
+                    throw CancellationError()
+                }
                 try await forwardPendingMutations(
-                    pendingMutationSnapshots(for: journalRecordNames, in: targetRealm),
+                    pending,
                     in: targetRealm,
                     notifyDelegate: false
                 )
@@ -7338,18 +7346,16 @@ public final class RealmSwiftAdapter:
                                     entityType: record.recordType
                                 )
                         }
-                        let existingObject = realmProvider
-                            .targetReaderRealmPerSchemaName[record.recordType]?
-                            .object(
-                                ofType: objectClass,
-                                forPrimaryKey: objectIdentifier
-                            )
-                        let pendingGeneration = realmProvider
-                            .targetReaderRealmPerSchemaName[record.recordType]?
-                            .object(
-                                ofType: BigSyncPendingMutation.self,
-                                forPrimaryKey: record.recordID.recordName
-                            )?.generation
+                        let targetSnapshot = realmProvider
+                            .targetReaderRealmPerSchemaName[record.recordType].map {
+                                committedRealmReadSnapshot(in: $0)
+                            }
+                        try validateOwner()
+                        let existingObject = targetSnapshot?.object(
+                            ofType: objectClass, forPrimaryKey: objectIdentifier)
+                        let pendingGeneration = targetSnapshot?.object(
+                            ofType: BigSyncPendingMutation.self,
+                            forPrimaryKey: record.recordID.recordName)?.generation
                         _ = try self.semanticReplacementDisposition(
                             for: record,
                             objectClass: objectClass,
@@ -7440,7 +7446,14 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     private var isRestoringBackupServerSnapshot: Bool {
-        guard let state = realmProvider?.persistenceRealm?.object(
+        guard let persistenceRealm = realmProvider?.persistenceRealm else {
+            return false
+        }
+        // This grants authority to replace retained local values. A different
+        // writer's provisional bootstrap/completion marker cannot grant or
+        // suppress that authority after its transaction rolls back.
+        let snapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        guard let state = snapshot.object(
             ofType: RebuildProvenanceState.self,
             forPrimaryKey: RebuildProvenanceState.primaryKeyValue
         ) else { return false }
@@ -7571,7 +7584,14 @@ public final class RealmSwiftAdapter:
                 guard let persistenceRealm = realmProvider.persistenceRealm else {
                     throw RealmSwiftAdapterError.setupUnavailable
                 }
-                var syncedEntity: SyncedEntity? = Self.getSyncedEntity(objectIdentifier: record.recordID.recordName, realm: persistenceRealm)
+                // Tracking state can suppress target admission entirely. Read
+                // its committed version so a foreign provisional deletion or
+                // change tag cannot turn an unapplied inbound record into a
+                // preserved/unchanged result and advance the page cursor.
+                let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
+                try validateOwner()
+                var syncedEntity: SyncedEntity? = Self.getSyncedEntity(
+                    objectIdentifier: record.recordID.recordName, realm: trackingSnapshot)
                 if syncedEntity == nil {
                     let newSyncedEntity = SyncedEntity(entityType: record.recordType, identifier: record.recordID.recordName, state: SyncedEntityState.synced.rawValue)
                     syncedEntitiesToCreate[newSyncedEntity.identifier] = newSyncedEntity
@@ -7619,18 +7639,22 @@ public final class RealmSwiftAdapter:
 
                         let targetReaderRealm = realmProvider
                             .targetReaderRealmPerSchemaName[objectClass.className()]
+                        let targetSnapshot = targetReaderRealm.map {
+                            committedRealmReadSnapshot(in: $0)
+                        }
+                        try validateOwner()
                         let expectedMutationGeneration: String?
                         if targetReaderRealm?.schema.objectSchema.contains(where: {
                             $0.className == BigSyncPendingMutation.className()
                         }) == true {
-                            expectedMutationGeneration = targetReaderRealm?.object(
+                            expectedMutationGeneration = targetSnapshot?.object(
                                 ofType: BigSyncPendingMutation.self,
                                 forPrimaryKey: syncedEntity.identifier
                             )?.generation
                         } else {
                             expectedMutationGeneration = nil
                         }
-                        let existingObject = targetReaderRealm?.object(
+                        let existingObject = targetSnapshot?.object(
                             ofType: objectClass,
                             forPrimaryKey: objectIdentifier
                         )
@@ -8308,7 +8332,9 @@ public final class RealmSwiftAdapter:
             for group in namesByRealm.values {
                 await group.realm.asyncRefresh()
                 try validateOwner()
-                try await forwardPendingMutations(pendingMutationSnapshots(for: group.names, in: group.realm), in: group.realm)
+                let pending = pendingMutationSnapshots(for: group.names, in: group.realm)
+                try validateOwner()
+                try await forwardPendingMutations(pending, in: group.realm)
                 try validateOwner()
             }
         }
@@ -8403,9 +8429,11 @@ public final class RealmSwiftAdapter:
             guard recordID.zoneID == recordZoneID else {
                 throw BigSyncRecordRebaseError.inconsistentReceipt(recordID.recordName)
             }
+            let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
+            try validateOwner()
             let syncedEntity = Self.getSyncedEntity(
                 objectIdentifier: recordID.recordName,
-                realm: persistenceRealm
+                realm: trackingSnapshot
             )
             let parsedEntityType = recordID.recordName
                 .split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
@@ -8456,7 +8484,9 @@ public final class RealmSwiftAdapter:
             )
             let targetRealm =
                 realmProvider.targetReaderRealmPerSchemaName[entityType]
-            let localObject = targetRealm?.object(
+            let targetSnapshot = targetRealm.map { committedRealmReadSnapshot(in: $0) }
+            try validateOwner()
+            let localObject = targetSnapshot?.object(
                 ofType: objectClass,
                 forPrimaryKey: primaryKey
             )
@@ -8523,7 +8553,7 @@ public final class RealmSwiftAdapter:
                 try validateOwner()
                 continue
             }
-            let pendingMutation = targetRealm?.object(
+            let pendingMutation = targetSnapshot?.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordID.recordName
             )
@@ -8539,7 +8569,7 @@ public final class RealmSwiftAdapter:
             }
             let preservesLocalTombstone =
                 syncedEntity?.entityState == .deletedLocally
-                || targetHasSoftTombstone(deletion)
+                || (localObject as? SoftDeletable)?.isDeleted == true
             if pendingMutation != nil
                 || syncedEntity?.entityState == .new
                 || syncedEntity?.entityState == .changed {
@@ -8642,7 +8672,9 @@ public final class RealmSwiftAdapter:
             }
             await targetRealm.asyncRefresh()
             try validateOwner()
-            if let mutation = targetRealm.object(
+            let committedTarget = committedRealmReadSnapshot(in: targetRealm)
+            try validateOwner()
+            if let mutation = committedTarget.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: deletion.recordName
             ) {
@@ -8651,7 +8683,7 @@ public final class RealmSwiftAdapter:
                     deletion,
                     mutation.generation,
                     mutation.replicaBindingGenerationIdentifier,
-                    targetHasSoftTombstone(deletion)
+                    pendingMutationTargetsDeletedObject(mutation, in: committedTarget)
                 ))
                 dispositionsByRecordName[deletion.recordName] =
                     .preservedNewerLive(generation: mutation.generation)
@@ -9095,6 +9127,7 @@ public final class RealmSwiftAdapter:
                         for: generations.keys,
                         in: targetReaderRealm
                     )
+                    try validateOwner()
                     try await forwardPendingMutations(
                         newerMutations,
                         in: targetReaderRealm
@@ -9185,8 +9218,10 @@ public final class RealmSwiftAdapter:
                 } else {
                     try validatePreparationOwner()
                     // Keep existing owned recovery and exact journal forwarding.
+                    let pending = pendingMutationSnapshots(for: [recordID.recordName], in: target)
+                    try validatePreparationOwner()
                     try await forwardPendingMutations(
-                        pendingMutationSnapshots(for: [recordID.recordName], in: target),
+                        pending,
                         in: target, notifyDelegate: false)
                     try validatePreparationOwner()
                 }
@@ -9352,6 +9387,7 @@ public final class RealmSwiftAdapter:
                     for: generations.keys,
                     in: targetReaderRealm
                 )
+                try validateOwner()
                 try await forwardPendingMutations(
                     newerMutations,
                     in: targetReaderRealm
@@ -10745,13 +10781,14 @@ extension RealmSwiftAdapter {
         guard entity.entityState == .deletedLocally,
               recordRebaseContext != nil,
               let realm = realmProvider?.targetReaderRealmPerSchemaName[entity.entityType],
-              BigSyncRecordBaseline.isEnabled(in: realm),
-              let mutation = realm.object(ofType: BigSyncPendingMutation.self,
+              BigSyncRecordBaseline.isEnabled(in: realm) else { return false }
+        let snapshot = committedRealmReadSnapshot(in: realm)
+        guard let mutation = snapshot.object(ofType: BigSyncPendingMutation.self,
                                           forPrimaryKey: entity.identifier),
               pendingMutationIsEligibleForActiveTransport(mutation),
               let type = realmObjectClass(name: entity.entityType),
               let identifier = getObjectIdentifier(for: entity),
-              let object = realm.object(ofType: type, forPrimaryKey: identifier),
+              let object = snapshot.object(ofType: type, forPrimaryKey: identifier),
               case .lifetimeBundle = try recordRebasePolicy(for: object) else { return false }
         // Admission does not choose the winner. applyRecordRebase re-resolves
         // current values, binding and generation inside the target transaction.
