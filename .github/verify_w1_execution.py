@@ -141,6 +141,8 @@ EXPECTED = {
         'testReadableDataAssetsDecodeAndMissingFilesRollBack',
     ),
     'ChangeFeedMigrationResumeTests': (
+        'testInboundImportRejectsProvisionalBackupBootstrapAuthority',
+        'testInboundImportRetainsCommittedBackupAuthorityBehindProvisionalCompletion',
         'testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit',
         'testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation',
         'testBackupRestorePreservesCurrentMutationCommittedAfterSnapshot',
