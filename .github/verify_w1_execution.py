@@ -18,6 +18,9 @@ from typing import Sequence
 
 EXPECTED = {
     'SyncSplitOperationOwnershipTests': (
+        'testCancelledIncomingImportCannotApplyTargetAfterSuccessorResumes',
+        'testCancelledIncomingImportRetainsTargetCommitWithoutPublishingTracking',
+        'testIncomingImportRejectsAccountAndTransportReplacementBeforeTargetAdmission',
         'testCancelledJournalForwardingCannotPublishToSuccessorTracking',
         'testImportProgressCannotReacquireSuccessorJournalOwnership',
         'testCancelledImportCannotClearSuccessorAssetsAfterProgressCallout',
