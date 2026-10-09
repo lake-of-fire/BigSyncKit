@@ -8,6 +8,8 @@ import XCTest
 
 @objc(GroupingFirstObject)
 private final class GroupingFirstObject: Object, ChangeMetadataRecordable {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+
     @Persisted(primaryKey: true) var id = ""
     @Persisted var payload = ""
     @Persisted var createdAt = Date()
@@ -18,6 +20,8 @@ private final class GroupingFirstObject: Object, ChangeMetadataRecordable {
 
 @objc(GroupingSecondObject)
 private final class GroupingSecondObject: Object, ChangeMetadataRecordable {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+
     @Persisted(primaryKey: true) var id = ""
     @Persisted var payload = ""
     @Persisted var createdAt = Date()
