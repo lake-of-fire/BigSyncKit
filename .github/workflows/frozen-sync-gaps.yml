@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/BigSyncKit
-          ref: b2fe723274a84cd98a2f4fb545252eb5abbeff54
+          ref: 66fb67c3eb2735ccaa384fe07b70743274ef72bc
           path: BigSyncKit
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

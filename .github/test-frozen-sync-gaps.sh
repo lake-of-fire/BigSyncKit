@@ -3,8 +3,8 @@ set -euo pipefail
 
 root="${BIGSYNC_FROZEN_SOURCE_ROOT:?Set the absolute frozen BigSyncKit checkout path}"
 [[ "$root" = /* ]] || { echo 'Frozen source root must be absolute' >&2; exit 2; }
-test "$(git -C "$root" rev-parse HEAD)" = b2fe723274a84cd98a2f4fb545252eb5abbeff54
-test "$(git -C "$root" rev-parse HEAD^{tree})" = 427034ccb042d47e74fadc86f37e65ae47c249a5
+test "$(git -C "$root" rev-parse HEAD)" = 66fb67c3eb2735ccaa384fe07b70743274ef72bc
+test "$(git -C "$root" rev-parse HEAD^{tree})" = f0bc5d1bdbd553c7e5331990f729a0e31d5fad4d
 evidence="${BIGSYNC_ASSET_EVIDENCE_DIRECTORY:?Set a fresh absolute evidence directory}"
 [[ "$evidence" = /* ]] || { echo 'Evidence directory must be absolute' >&2; exit 2; }
 [[ ! -e "$evidence" ]] || { echo "Evidence directory must be fresh: $evidence" >&2; exit 2; }
