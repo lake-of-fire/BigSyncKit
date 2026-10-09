@@ -572,6 +572,23 @@ extension SyncUndoCloseoutW1Tests {
                 }
             }
             let expectedNames = Set(names)
+            var originalGenerations = [String: String]()
+            for name in names {
+                let pending = try XCTUnwrap(realm.object(
+                    ofType: BigSyncPendingMutation.self, forPrimaryKey: name
+                ))
+                XCTAssertEqual(pending.accountScopeIdentifier, "w1-account")
+                originalGenerations[name] = pending.generation
+            }
+            func assertOriginalJournalIsUnchanged() throws {
+                for name in names {
+                    let pending = try XCTUnwrap(realm.object(
+                        ofType: BigSyncPendingMutation.self, forPrimaryKey: name
+                    ))
+                    XCTAssertEqual(pending.accountScopeIdentifier, "w1-account")
+                    XCTAssertEqual(pending.generation, originalGenerations[name])
+                }
+            }
             XCTAssertEqual(Set(try adapter.serverRecordEvidence(
                 entityTypes: Set(types)
             ).map(\.recordName)), expectedNames)
@@ -581,6 +598,7 @@ extension SyncUndoCloseoutW1Tests {
             article.title = "another-account"
             // Deliberately model malformed provisional storage without invoking
             // the public mutation hook, which rejects immutable scope changes.
+            try assertOriginalJournalIsUnchanged()
             for (type, name) in zip(types, names) {
                 XCTAssertNotNil(try adapter.serverRecordEvidence(
                     recordName: name, expectedEntityType: type
@@ -589,10 +607,12 @@ extension SyncUndoCloseoutW1Tests {
             XCTAssertEqual(Set(try adapter.serverRecordEvidence(
                 entityTypes: Set(types)
             ).map(\.recordName)), expectedNames)
+            try assertOriginalJournalIsUnchanged()
             XCTAssertTrue(realm.isInWriteTransaction)
             XCTAssertEqual(row.title, "another-account")
             XCTAssertEqual(article.title, "another-account")
             if commits { try realm.commitWrite() } else { realm.cancelWrite() }
+            try assertOriginalJournalIsUnchanged()
             XCTAssertEqual(Set(try adapter.serverRecordEvidence(
                 entityTypes: Set(types)
             ).map(\.recordName)), commits ? [] : expectedNames)
@@ -601,6 +621,7 @@ extension SyncUndoCloseoutW1Tests {
                     recordName: name, expectedEntityType: type
                 ) != nil, !commits)
             }
+            try assertOriginalJournalIsUnchanged()
         }
     }
 
