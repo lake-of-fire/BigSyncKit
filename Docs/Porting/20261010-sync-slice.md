@@ -2,7 +2,7 @@
 
 This is a bounded source audit, not native qualification. No build, test,
 benchmark, package installation, native app launch, generated test harness or
-CI dispatch was performed. All changes remain local pending workflow review.
+CI dispatch was performed. Publication review found only push/pull-request/manual workflow triggers; head commits use supported `[skip ci]`. Draft publication is parent-controlled; no workflow dispatch occurred.
 
 ## Compared identities and finite inventory
 
@@ -134,3 +134,83 @@ verification uses current targets/test plans and actual native discovery/results
 not manually maintained method inventories or copied-source packages. A signed
 macOS CloudKit release gate, authentic migration/account replacement, and native
 runtime execution remain deferred under the source-only instruction.
+
+## Exact changed-path remainder
+
+Immutable source heads and exact date bounds define the complete commit corpus above. Reproduce commit IDs with `git log --since=2025-10-10T00:00:00Z --until=2026-10-10T23:59:59Z --format=%H <source-sha>`; reproduce changed paths by adding `--format= --name-only -m`. This appendix records every runtime source path. Boundary-reviewed paths still need full behavior closure; other paths remain semantic-review work. All non-source paths remain unreviewed except the named historical-doc correction.
+
+### BigSyncKit (63 runtime paths)
+
+- `Sources/BigSyncKit/QSSynchronizer/BackupDetection.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncAccountScopeLease.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor+DomainFollowUp.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor+DomainTransitionReadiness.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncBackgroundActor.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncClientIdentity+InjectedStore.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncClientIdentity.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncDeadlineRace.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncDurablePublicationEvidence.swift`
+- `Sources/BigSyncKit/QSSynchronizer/BigSyncLocalStateConfiguration.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CancellableCloudKitCallback.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitAccountAvailabilityGate.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitChangeFeed.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitDatabase.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitLossClassifier.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitRecordStore.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitRetryConstraints.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSubscriptionStore.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSyncHealth.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Cancellation.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Private.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+PublicationRestoration.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+RecordMutations.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Subscriptions.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer+Sync.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitSynchronizer.swift`
+- `Sources/BigSyncKit/QSSynchronizer/CloudKitZoneStore.swift`
+- `Sources/BigSyncKit/QSSynchronizer/KeyValueStore.swift`
+- `Sources/BigSyncKit/QSSynchronizer/ModelAdapter.swift`
+- `Sources/BigSyncKit/QSSynchronizer/Operations/CloudKitSynchronizerOperation.swift`
+- `Sources/BigSyncKit/QSSynchronizer/Operations/FetchDatabaseChangesOperation.swift`
+- `Sources/BigSyncKit/QSSynchronizer/Operations/FetchZoneChangesOperation.swift`
+- `Sources/BigSyncKit/QSSynchronizer/Operations/ModifyRecordsOperation.swift`
+- `Sources/BigSyncKit/QSSynchronizer/PersistentAssetManager.swift`
+- `Sources/BigSyncKit/QSSynchronizer/SyncedEntityState.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncInboundSemanticValidation.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncIncomingRepresentation.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncLegacyTrackingEvidence.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncLifetimeID.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncPendingMutation.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncPendingMutationInventory.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncRecordBaseline.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncRecordContract.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncRecordDisappearance.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncRecordEvidence.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncRecordEvidenceInspection.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncRecordIdentity.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncRecordReconciliation.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncServerRecordEvidence.swift`
+- `Sources/BigSyncKit/RealmSwift/BigSyncSynchronizationAudit.swift`
+- `Sources/BigSyncKit/RealmSwift/DefaultRealmSwiftAdapterProvider.swift`
+- `Sources/BigSyncKit/RealmSwift/PendingRelationship.swift`
+- `Sources/BigSyncKit/RealmSwift/QSCloudKitSynchronizer+RealmSwift.swift`
+- `Sources/BigSyncKit/RealmSwift/RealmSwiftAdapter.swift`
+- `Sources/BigSyncKit/RealmSwift/RebuildProvenance.swift`
+- `Sources/BigSyncKit/RealmSwift/SyncedEntity.swift`
+- `Sources/BigSyncKit/RealmSwift/SyncedEntityProtocol.swift`
+- `Sources/BigSyncKit/RealmSwift/SyncedEntityType.swift`
+- `Sources/BigSyncKit/SyncStatusViewModel.swift`
+- `Sources/BigSyncKit/Unused Archive/CloudKitSynchronizer+Sharing.swift`
+- `Sources/BigSyncKit/Unused Archive/DefaultRealmProvider.swift`
+- `Sources/BigSyncKit/Unused Archive/MultiRealmResultsController.swift`
+- `Sources/BigSyncKit/Unused Archive/QSCloudKitSynchronizer+MultiRealmResultsController.swift`
+
+### RealmSwiftGaps (7 runtime paths)
+
+- `Sources/RealmSwiftGaps/CachedRealmsActor.swift`
+- `Sources/RealmSwiftGaps/RealmBackgroundActor.swift`
+- `Sources/RealmSwiftGaps/RealmCSVTextField.swift`
+- `Sources/RealmSwiftGaps/RealmExtensions.swift`
+- `Sources/RealmSwiftGaps/RealmOwnedWrite.swift`
+- `Sources/RealmSwiftGaps/RealmTextField.swift`
+- `Sources/RealmSwiftGaps/RealmWriteAdmissionSignal.swift`
