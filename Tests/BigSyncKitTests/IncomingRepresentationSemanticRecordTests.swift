@@ -171,14 +171,14 @@ final class IncomingRepresentationSemanticRecordTests: XCTestCase {
         let omitted = record(fixture)
         // Transport must never overwrite the receiver's already-admitted PK.
         omitted["id"] = "untrusted-wire-id" as CKRecordValue
-        try await assertOrdinaryAndComparisonParity(adapter: fixture.adapter, record: omitted,
+        try assertOrdinaryAndComparisonParity(adapter: fixture.adapter, record: omitted,
                                                     expectedCount: 0, expectedEnabled: false,
                                                     expectedOptionalText: nil)
         let present = record(fixture, time: 20)
         present["count"] = 12 as CKRecordValue
         present["enabled"] = true as CKRecordValue
         present["optionalText"] = "remote-text" as CKRecordValue
-        try await assertOrdinaryAndComparisonParity(adapter: fixture.adapter, record: present,
+        try assertOrdinaryAndComparisonParity(adapter: fixture.adapter, record: present,
                                                     expectedCount: 12, expectedEnabled: true,
                                                     expectedOptionalText: "remote-text")
         XCTAssertTrue(fixture.realm.objects(BigSyncPendingMutation.self).isEmpty)
@@ -186,7 +186,7 @@ final class IncomingRepresentationSemanticRecordTests: XCTestCase {
                       "Decoding alone does not accept a transactional baseline")
     }
 
-    @RealmBackgroundActor
+    @BigSyncBackgroundActor
     private func assertOrdinaryAndComparisonParity(
         adapter: RealmSwiftAdapter, record: CKRecord,
         expectedCount: Int, expectedEnabled: Bool, expectedOptionalText: String?

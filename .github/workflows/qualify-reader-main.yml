@@ -4,11 +4,18 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/qualify-reader-main.yml'
+      - '.github/verify_w1_execution.py'
       - 'Package.swift'
       - 'Package.resolved'
       - 'Sources/**'
       - 'Tests/**'
   workflow_dispatch:
+    inputs:
+      run_release:
+        description: Run the owner-deferred Release production build
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
 jobs:
@@ -16,31 +23,110 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ github.sha }}
           path: BigSyncKit
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/RealmSwiftGaps
-          ref: 3c0ccf00d734cae997bd34654a4f2efd01397531
+          ref: 543e21247160dce10b9c9241a7e8b1ffb94cee3b
           path: RealmSwiftGaps
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: lake-of-fire/SwiftUtilities
-          ref: 475973026ca1e953d016ff78e65c0be5bb4885d5
+          ref: f437c7d06fc631cd7a67731279411c417cdf8077
           path: SwiftUtilities
           persist-credentials: false
-      - name: Record exact source and toolchain
+      - name: Install structured build output
+        run: brew install xcsift
+      - name: Record exact source, toolchain and deferred scope
+        working-directory: BigSyncKit
+        env:
+          RELEASE_GATE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_release }}
         run: |
           set -euo pipefail
-          git -C BigSyncKit rev-parse HEAD
-          test "$(git -C RealmSwiftGaps rev-parse HEAD)" = "3c0ccf00d734cae997bd34654a4f2efd01397531"
-          test "$(git -C SwiftUtilities rev-parse HEAD)" = "475973026ca1e953d016ff78e65c0be5bb4885d5"
-          swift --version
-          grep -F '.package(url: "https://github.com/realm/realm-swift.git", from: "20.0.5")' BigSyncKit/Package.swift
-      - name: Debug tests
-        run: swift test --package-path BigSyncKit -c debug
-      - name: Release production build
-        run: swift build --package-path BigSyncKit -c release
+          test ! -e qualification-reader-main
+          mkdir qualification-reader-main
+          git diff --exit-code
+          git rev-parse HEAD > qualification-reader-main/commit.txt
+          git rev-parse HEAD:Sources > qualification-reader-main/source-tree.txt
+          git rev-parse HEAD:Tests > qualification-reader-main/test-tree.txt
+          git hash-object .github/verify_w1_execution.py > qualification-reader-main/verifier-blob.txt
+          git -C ../RealmSwiftGaps rev-parse HEAD > qualification-reader-main/RealmSwiftGaps.txt
+          git -C ../SwiftUtilities rev-parse HEAD > qualification-reader-main/SwiftUtilities.txt
+          test "$(cat qualification-reader-main/RealmSwiftGaps.txt)" = "543e21247160dce10b9c9241a7e8b1ffb94cee3b"
+          test "$(cat qualification-reader-main/SwiftUtilities.txt)" = "f437c7d06fc631cd7a67731279411c417cdf8077"
+          printf 'release-gate=%s\n' "$RELEASE_GATE" > qualification-reader-main/deferred-scope.txt
+          printf '%s\n' 'Owner-deferred: Mac UI, performance, signed macOS CloudKit and Release.' >> qualification-reader-main/deferred-scope.txt
+          printf '%s\n' 'Package correctness excludes the opt-in mutation identity performance benchmark (BIGSYNC_RUN_MUTATION_BENCHMARK=0); no additional skip is accepted.' >> qualification-reader-main/deferred-scope.txt
+          swift --version > qualification-reader-main/toolchain.txt
+          sw_vers >> qualification-reader-main/toolchain.txt
+          xcrun --show-sdk-version >> qualification-reader-main/toolchain.txt
+          xcodebuild -version 2>&1 | xcsift -f json > qualification-reader-main/xcode-version.json
+          git archive --format=tar.gz -o qualification-reader-main/source.tar.gz HEAD
+      - name: Discover and execute Debug package tests
+        working-directory: BigSyncKit
+        env:
+          SWIFT_BACKTRACE: enable=yes,interactive=no
+          BIGSYNC_RUN_MUTATION_BENCHMARK: "0"
+        run: |
+          set -euo pipefail
+          test ! -e .build-reader-main
+          extra=()
+          swift test --help > qualification-reader-main/swift-test-help.txt
+          if grep -q -- '--disable-experimental-prebuilts' qualification-reader-main/swift-test-help.txt; then
+            extra+=(--disable-experimental-prebuilts)
+          fi
+          run_logged() {
+            local name="$1"
+            shift
+            local statuses
+            set +e
+            "$@" 2>&1 | tee "qualification-reader-main/$name.log" | xcsift -f json --exit-on-failure > "qualification-reader-main/$name.formatted.json"
+            statuses=("${PIPESTATUS[@]}")
+            set -e
+            printf '[%s, %s, %s]\n' "${statuses[0]}" "${statuses[1]}" "${statuses[2]}" > "qualification-reader-main/$name.status.json"
+          }
+          run_logged discovery swift test --scratch-path .build-reader-main "${extra[@]}" list
+          python3 .github/verify_w1_execution.py discovery --directory qualification-reader-main
+          run_logged full swift test --scratch-path .build-reader-main "${extra[@]}" --skip-build --xunit-output qualification-reader-main/full.xml
+          python3 .github/verify_w1_execution.py full --directory qualification-reader-main
+          git diff --exit-code
+      - name: Release production build (explicit owner opt-in)
+        if: github.event_name == 'workflow_dispatch' && inputs.run_release
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          test ! -e .build-reader-main-release
+          extra=()
+          if grep -q -- '--disable-experimental-prebuilts' qualification-reader-main/swift-test-help.txt; then
+            extra+=(--disable-experimental-prebuilts)
+          fi
+          set +e
+          swift build --scratch-path .build-reader-main-release "${extra[@]}" -c release 2>&1 | tee qualification-reader-main/release-build.log | xcsift -f json --exit-on-failure > qualification-reader-main/release-build.formatted.json
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf '[%s, %s, %s]\n' "${statuses[0]}" "${statuses[1]}" "${statuses[2]}" > qualification-reader-main/release-build.status.json
+          for status in "${statuses[@]}"; do test "$status" -eq 0; done
+          git diff --exit-code
+      - name: Retain resolved package inputs
+        if: always()
+        working-directory: BigSyncKit
+        run: |
+          set -euo pipefail
+          test -d qualification-reader-main || exit 0
+          for package in BigSyncKit RealmSwiftGaps SwiftUtilities; do
+            if [ -f "../$package/Package.resolved" ]; then
+              cp "../$package/Package.resolved" "qualification-reader-main/$package-Package.resolved"
+            fi
+          done
+          git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: reader-main-package
+          path: BigSyncKit/qualification-reader-main
+          retention-days: 14

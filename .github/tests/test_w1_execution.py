@@ -454,5 +454,73 @@ class W1MergedNativeContractTests(unittest.TestCase):
                         self.assertFalse(report["passed"])
 
 
+class W1CommittedEvidenceContractTests(W1MergedNativeContractTests):
+    """Apply the independent missing/skip/duplicate contract to the new cases."""
+    merged_cases = (
+        "SyncUndoCloseoutW1Tests/testSemanticQuarantineIgnoresProvisionalInsertionAndRemoval",
+        "SyncUndoCloseoutW1Tests/testSemanticQuarantineUsesCommittedFeedEpoch",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceIgnoresProvisionalAcknowledgement",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceIgnoresProvisionalRemovalAndForeignZoneReplacement",
+        "SyncUndoCloseoutW1Tests/testServerEvidencePreservesExactAndCatalogStatePolicies",
+        "SyncUndoCloseoutW1Tests/testServerEvidenceUsesCommittedAccountScopeAcrossSharedTargetRealm",
+        "SyncUndoCloseoutW1Tests/testBootstrapServerEvidenceIgnoresProvisionalTrackingMembership",
+    )
+
+
+class W1OperationOwnerUnionContractTests(W1MergedNativeContractTests):
+    """Keep the other union regressions independently required at runtime."""
+    merged_cases = (
+        "ChangeFeedMigrationResumeTests/testInboundImportIgnoresRolledBackTargetJournalDuringAdmission",
+        "ChangeFeedMigrationResumeTests/testInboundDeletionIgnoresRolledBackTargetAndTrackingIntent",
+        "ChangeFeedMigrationResumeTests/testInboundImportIgnoresRolledBackTrackingDeletionDuringAdmission",
+        "ChangeFeedMigrationResumeTests/testInboundImportRejectsProvisionalBackupBootstrapAuthority",
+        "ChangeFeedMigrationResumeTests/testInboundImportRetainsCommittedBackupAuthorityBehindProvisionalCompletion",
+        "ChangeFeedMigrationResumeTests/testInboundBackupImportPreservesJournalCommittedBeforeSelection",
+        "ChangeFeedMigrationResumeTests/testInboundBackupImportPreservesTombstoneCommittedBeforeTargetAdmission",
+        "SyncSplitOperationOwnershipTests/testCancelledJournalForwardingCannotPublishToSuccessorTracking",
+        "SyncSplitOperationOwnershipTests/testImportProgressCannotReacquireSuccessorJournalOwnership",
+        "SyncSplitOperationOwnershipTests/testCancelledImportCannotClearSuccessorAssetsAfterProgressCallout",
+        "SyncSplitOperationOwnershipTests/testCancelledQueuedRemainingCountDoesNotNotifySuccessor",
+        "SyncSplitOperationOwnershipTests/testJournalForwardingRejectsTransportReplacementBeforeTrackingAdmission",
+        "SyncSplitOperationOwnershipTests/testInboundDeletionRejectsCancellationResetAccountBindingAndTransportReplacement",
+        "SyncSplitOperationOwnershipTests/testCancelledIncomingImportCannotApplyTargetAfterSuccessorResumes",
+        "SyncSplitOperationOwnershipTests/testCancelledIncomingImportRetainsTargetCommitWithoutPublishingTracking",
+        "SyncSplitOperationOwnershipTests/testIncomingImportRejectsAccountAndTransportReplacementBeforeTargetAdmission",
+        "SyncSplitOperationOwnershipTests/testAuthoritativeOwnEchoAllowsInitialProviderSetup",
+        "SyncSplitOperationOwnershipTests/testCancelledAuthoritativeOwnEchoCannotPublishSuccessorQuarantine",
+        "SyncSplitOperationOwnershipTests/testAuthoritativeOwnEchoIgnoresForeignProvisionalPredecessorAndJournal",
+        "SyncSplitOperationOwnershipTests/testUploadAcknowledgementRejectsOwnerRetiredBySynchronousJournalRefresh",
+        "SyncRetainedRecordContractTests/testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence",
+        "ChangeFeedMigrationResumeTests/testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit",
+        "ChangeFeedMigrationResumeTests/testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation",
+        "ChangeFeedMigrationResumeTests/testBackupRestorePreservesCurrentMutationCommittedAfterSnapshot",
+        "ChangeFeedMigrationResumeTests/testResetPreparationRejectsProvisionalPreparedMarkerAfterRollback",
+        "ChangeFeedMigrationResumeTests/testBootstrapCannotSkipItsWriteForProvisionalCompletion",
+        "ChangeFeedMigrationResumeTests/testFinishCannotSkipItsWriteForProvisionalCompletion",
+        "ChangeFeedMigrationResumeTests/testReconciliationCannotAcceptProvisionalCompletionWithoutBootstrap",
+        "ChangeFeedMigrationResumeTests/testEncryptedResetReuploadsRetainedLiveObjectBehindRolledBackDeletion",
+        "ChangeFeedMigrationResumeTests/testEncryptedResetPreservesDeletionCommittedAfterRetainedCandidateSnapshot",
+        "ChangeFeedMigrationResumeTests/testEstablishedServerEvidenceExcludesProvisionalMembershipUntilCommit",
+        "ChangeFeedMigrationResumeTests/testResetTrackingPublicationUsesCommittedJournalBehindRolledBackSuccessor",
+        "ChangeFeedMigrationResumeTests/testQueuedPreparationPreservesCommittedPreparedSuccessorAndProvenance",
+        "ChangeFeedMigrationResumeTests/testQueuedPreparationPreservesCommittedCompleteSuccessorAndProvenance",
+        "ChangeFeedMigrationResumeTests/testQueuedBootstrapTreatsCommittedCompletionAsNoOpWithoutRetiringProof",
+        "ChangeFeedMigrationResumeTests/testQueuedFinishTreatsCommittedCompletionAsNoOpWithoutRetiringProof",
+        "ChangeFeedMigrationResumeTests/testBootstrapRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker",
+        "ChangeFeedMigrationResumeTests/testReconciliationRejectsCancellationAfterTrackingCommitSubmission",
+        "ChangeFeedMigrationResumeTests/testFinishRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker",
+        "ChangeFeedMigrationResumeTests/testFencedResetCancellationAfterTrackingCommitPreservesProviderAndDurableReset",
+        "ChangeFeedMigrationResumeTests/testFencedResetPreservesPreparedSuccessorAtOwnedResetAdmission",
+        "ChangeFeedMigrationResumeTests/testFencedResetPreservesCompleteSuccessorAtOwnedResetAdmission",
+        "HotfixCollectionSafetyTests/testAssetInScalarFieldRejectsNewReceiverBeforeRealmAssignment",
+        "HotfixCollectionSafetyTests/testAssetInScalarFieldRollsBackExistingValueAndTracking",
+        "HotfixCollectionSafetyTests/testComparisonDecoderRejectsAssetInScalarField",
+        "HotfixCollectionSafetyTests/testReadableDataAssetsDecodeAndMissingFilesRollBack",
+        "SyncRetainedRecordContractTests/testConflictRefreshRollsBackAfterSynchronousAccountFencePoison",
+        "SyncRetainedRecordContractTests/testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison",
+    )
+
+
+
 if __name__ == "__main__":
     unittest.main()
