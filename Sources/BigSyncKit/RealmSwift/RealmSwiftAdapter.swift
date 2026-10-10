@@ -609,6 +609,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterUploadTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
+    var _testAfterUploadJournalRetirement:
+        (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterDeletionTrackingWrite:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterPendingRelationshipTargetWrite:
@@ -9123,6 +9125,10 @@ public final class RealmSwiftAdapter:
                         try validateOwner()
                     }
                     try validateOwner()
+#if DEBUG
+                    try await _testAfterUploadJournalRetirement?()
+                    try validateOwner()
+#endif
                     let newerMutations = pendingMutationSnapshots(
                         for: generations.keys,
                         in: targetReaderRealm

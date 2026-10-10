@@ -87,12 +87,6 @@ private final class SplitOwnerSemanticEcho: Object, ChangeMetadataRecordable,
     }
 }
 
-// The semaphore joins the native writer before the refresh callback continues.
-// No Realm handle or managed value leaves its owning thread.
-private final class SplitRefreshWriterResult: @unchecked Sendable {
-    var result: Result<String, Error>?
-}
-
 @BigSyncBackgroundActor
 private final class SplitRefreshCapture {
     var stagedGeneration: String?
@@ -1414,20 +1408,16 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
             let configuration = fixture.target.configuration
             fixture.target.autorefresh = false
             fixture.adapter._testBeforePendingMutationTrackingWrite = { capture.forwardedCount += 1 }
-
-            let onChange: @BigSyncBackgroundActor @Sendable () -> Void = {
-                guard capture.error == nil, capture.refreshRetirementCount == 0 else { return }
-                if capture.stagedGeneration == nil {
-                    // The acknowledgement has committed its target journal retirement.
-                    // Commit a successor on a separate native Realm thread while this
-                    // reader remains pinned to that retirement version.
-                    guard fixture.target.object(ofType: BigSyncPendingMutation.self,
-                        forPrimaryKey: name) == nil else { return }
-                    let joined = DispatchSemaphore(value: 0)
-                    let result = SplitRefreshWriterResult()
+            fixture.adapter._testAfterUploadJournalRetirement = {
+                XCTAssertNil(fixture.target.object(ofType: BigSyncPendingMutation.self,
+                    forPrimaryKey: name))
+                // Commit after target retirement has released its writer lock.
+                // Blocking inside didChange can retain that lock and deadlock
+                // the independent writer instead of exercising read refresh.
+                capture.stagedGeneration = try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<String, Error>) in
                     Thread.detachNewThread {
-                        defer { joined.signal() }
-                        result.result = Result {
+                        continuation.resume(with: Result {
                             let writer = try Realm(configuration: configuration)
                             let current = try XCTUnwrap(writer.object(ofType: SplitOwnerRow.self,
                                 forPrimaryKey: "row"))
@@ -1438,20 +1428,14 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
                             }
                             return try XCTUnwrap(writer.object(ofType: BigSyncPendingMutation.self,
                                 forPrimaryKey: name)?.generation)
-                        }
+                        })
                     }
-                    guard joined.wait(timeout: .now() + 5) == .success else {
-                        capture.error = NSError(
-                            domain: "SplitOwnerJournalRefreshHistory", code: 1,
-                            userInfo: [NSLocalizedDescriptionKey:
-                                "Native successor writer did not finish within the bounded refresh history"]
-                        )
-                        return
-                    }
-                    do { capture.stagedGeneration = try result.result?.get() }
-                    catch { capture.error = error }
-                    return
                 }
+            }
+
+            let onChange: @BigSyncBackgroundActor @Sendable () -> Void = {
+                guard capture.error == nil, capture.refreshRetirementCount == 0 else { return }
+                guard capture.stagedGeneration != nil else { return }
                 guard fixture.target.object(ofType: BigSyncPendingMutation.self,
                     forPrimaryKey: name)?.generation == capture.stagedGeneration else { return }
                 capture.refreshRetirementCount += 1
@@ -1476,10 +1460,11 @@ final class SyncSplitOperationOwnershipTests: XCTestCase {
                 fixture.target.autorefresh = true
                 fixture.adapter.realmProvider = originalProvider
                 fixture.adapter._testBeforePendingMutationTrackingWrite = nil
+                fixture.adapter._testAfterUploadJournalRetirement = nil
             }
             do {
                 try await fixture.adapter.acknowledgeUploadedRecords(batch.records, from: batch)
-                XCTFail("The original acknowledgement borrowed the refresh successor's owner")
+                XCTFail("The original acknowledgement borrowed the refresh successor's owner: providerReplacement=\(replacesProvider), retirements=\(capture.refreshRetirementCount), forwarded=\(capture.forwardedCount), stagedGeneration=\(String(describing: capture.stagedGeneration)), callbackError=\(String(describing: capture.error))")
             } catch is CancellationError {}
             token.invalidate()
             if let error = capture.error { throw error }
