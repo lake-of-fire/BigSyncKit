@@ -31,11 +31,33 @@ EXPECTED = {
         "testCancelledAuthoritativeOwnEchoCannotPublishSuccessorQuarantine",
         "testAuthoritativeOwnEchoIgnoresForeignProvisionalPredecessorAndJournal",
         "testUploadAcknowledgementRejectsOwnerRetiredBySynchronousJournalRefresh",
+        "testInboundDeletionRetainsCommittedTombstoneAfterOwnerRetirementAndFreshRetry",
+        "testInboundIdentityAcknowledgementRejectsAccountAndTransportReplacement",
+        "testInboundIdentityInspectionIgnoresProvisionalReplacementAndRemoval",
+        "testInboundLiveRejectsCancellationResetAccountBindingAndTransportReplacementBeforeTarget",
+        "testInboundLiveRetainsCommittedTargetAfterOwnerReplacementAndFreshRetry",
+        "testJournalForwardingRejectsAccountAndTransportReplacementBeforeTrackingAdmission",
+        "testJournalForwardingRejectsCancellationResetBeforeTrackingAdmission",
+        "testPublicImportMayInitializeItsProviderWithoutReplacingOperationOwnership",
+        "testPublicImportRejectsCancellationResetFromProgressBeforeForwarding",
     ),
     "SyncRetainedRecordContractTests": (
         "testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence",
         "testConflictRefreshRollsBackAfterSynchronousAccountFencePoison",
         "testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison",
+        "testDefaultConflictArchiveCleanupRejectsCancellationResetAndFreshRetry",
+        "testDefaultConflictRefreshRejectsCancellationResetAndFreshRetry",
+        "testDefaultConflictResolutionRejectsCancellationResetAndFreshRetry",
+    ),
+    "SyncSemanticIntentTests": (
+        "testOwnUploadAllowsInitialProviderSetupUnderOriginalLifecycle",
+        "testOwnUploadQuarantineRejectsRetiredOwnerAndStableOwnerRetries",
+        "testOwnUploadRetriesInterruptedNonnullProviderUnderOriginalLifecycle",
+    ),
+    "BigSyncKitTests": (
+        "testInboundIdentityDeliveryIgnoresProvisionalInsert",
+        "testInboundIdentityDeliveryRetainsCommittedBatchDuringProvisionalChanges",
+        "testInboundSemanticQuarantineInspectionRetainsCommittedBlocker",
     ),
     "ChangeFeedMigrationResumeTests": (
         "testInboundImportIgnoresRolledBackTargetJournalDuringAdmission",
@@ -89,6 +111,7 @@ EXPECTED = {
         "testCancelledWorkerPreflightDoesNotScheduleRetry",
         "testReentrantFailureObserversPreserveOneSettlementSnapshot",
         "testFailureObserverSuccessorRetainsAttemptAndTask",
+        "testTemporaryLocalInitialAdmissionRetriesExistingDrainAndAdmitsCurrentBinding",
     ),
     "CloudKitAccountAvailabilityCancellationTests": (
         "testAlreadyCancelledRequestDoesNotInvokeStatusProvider",
@@ -169,15 +192,15 @@ EVENT = re.compile(
 
 # The workflow requests this exact pattern from `focused-filter`; keeping it
 # here prevents executed and verified selections from drifting independently.
+# Preserve the existing broad suites and include every critical identity exactly,
+# so local discovery/full/focused packets share the same maintained obligations.
 FOCUSED_FILTER = (
     r"^BigSyncKitTests\.(?:(?:SyncUndoCloseoutW1[^/]*|CloudKitAccountAvailability[^/]*|"
     r"CloudKitCallbackAdmissionTests|CloudKitSynchronizerAccountFencingTests|"
     r"BigSyncWorkerRequestCancellationTests|ChangeRequestProcessorCancellationTests|"
     r"SynchronizationProcessorStartupTests|BigSyncScheduledRetryTests|"
     r"BigSyncDeadlineRaceTests|SyncSplitOperationOwnershipTests|SyncPhaseAttemptOwnershipTests)/"
-    r"|SyncRetainedRecordContractTests/(?:testRetainedCleanupIdentityCallbackPreservesSuccessorJournalAndPageEvidence|testConflictRefreshRollsBackAfterSynchronousAccountFencePoison|testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison)$"
-    r"|HotfixCollectionSafetyTests/(?:testAssetInScalarFieldRejectsNewReceiverBeforeRealmAssignment|testAssetInScalarFieldRollsBackExistingValueAndTracking|testComparisonDecoderRejectsAssetInScalarField|testReadableDataAssetsDecodeAndMissingFilesRollBack)$"
-    r"|ChangeFeedMigrationResumeTests/(?:testDurableCompletionExcludesProvisionalTerminalMarkerUntilCommit|testBackupRestoreRetiresCommittedJournalBehindRolledBackCurrentMutation|testBackupRestorePreservesCurrentMutationCommittedAfterSnapshot|testResetPreparationRejectsProvisionalPreparedMarkerAfterRollback|testBootstrapCannotSkipItsWriteForProvisionalCompletion|testFinishCannotSkipItsWriteForProvisionalCompletion|testReconciliationCannotAcceptProvisionalCompletionWithoutBootstrap|testEncryptedResetReuploadsRetainedLiveObjectBehindRolledBackDeletion|testEncryptedResetPreservesDeletionCommittedAfterRetainedCandidateSnapshot|testEstablishedServerEvidenceExcludesProvisionalMembershipUntilCommit|testResetTrackingPublicationUsesCommittedJournalBehindRolledBackSuccessor|testQueuedPreparationPreservesCommittedPreparedSuccessorAndProvenance|testQueuedPreparationPreservesCommittedCompleteSuccessorAndProvenance|testQueuedBootstrapTreatsCommittedCompletionAsNoOpWithoutRetiringProof|testQueuedFinishTreatsCommittedCompletionAsNoOpWithoutRetiringProof|testBootstrapRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker|testReconciliationRejectsCancellationAfterTrackingCommitSubmission|testFinishRejectsCancellationAfterCommitSubmissionAndKeepsDurableMarker|testFencedResetCancellationAfterTrackingCommitPreservesProviderAndDurableReset|testFencedResetPreservesPreparedSuccessorAtOwnedResetAdmission|testFencedResetPreservesCompleteSuccessorAtOwnedResetAdmission)$)"
+    r"|(?:" + "|".join(re.escape(name) for name in REQUIRED) + r")$)"
 )
 FOCUSED = re.compile(FOCUSED_FILTER)
 
