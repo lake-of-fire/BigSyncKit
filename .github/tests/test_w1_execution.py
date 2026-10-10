@@ -2,11 +2,13 @@
 import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "verify_w1_execution.py"
 spec = importlib.util.spec_from_file_location("verify_w1_execution", SCRIPT)
@@ -520,6 +522,66 @@ class W1OperationOwnerUnionContractTests(W1MergedNativeContractTests):
         "SyncRetainedRecordContractTests/testConflictArchiveDiscardRollsBackAfterSynchronousAccountFencePoison",
     )
 
+
+
+class W1LocalAdmissionOwnerContractTests(W1MergedNativeContractTests):
+    """Independent retained obligations from PR145, not verifier-derived input."""
+    merged_cases = (
+        "BigSyncKitTests/testInboundIdentityDeliveryIgnoresProvisionalInsert",
+        "BigSyncKitTests/testInboundIdentityDeliveryRetainsCommittedBatchDuringProvisionalChanges",
+        "BigSyncKitTests/testInboundSemanticQuarantineInspectionRetainsCommittedBlocker",
+        "CloudKitSynchronizerAccountFencingTests/testTemporaryLocalInitialAdmissionRetriesExistingDrainAndAdmitsCurrentBinding",
+        "SyncRetainedRecordContractTests/testDefaultConflictArchiveCleanupRejectsCancellationResetAndFreshRetry",
+        "SyncRetainedRecordContractTests/testDefaultConflictRefreshRejectsCancellationResetAndFreshRetry",
+        "SyncRetainedRecordContractTests/testDefaultConflictResolutionRejectsCancellationResetAndFreshRetry",
+        "SyncSemanticIntentTests/testOwnUploadAllowsInitialProviderSetupUnderOriginalLifecycle",
+        "SyncSemanticIntentTests/testOwnUploadQuarantineRejectsRetiredOwnerAndStableOwnerRetries",
+        "SyncSemanticIntentTests/testOwnUploadRetriesInterruptedNonnullProviderUnderOriginalLifecycle",
+        "SyncSplitOperationOwnershipTests/testInboundDeletionRetainsCommittedTombstoneAfterOwnerRetirementAndFreshRetry",
+        "SyncSplitOperationOwnershipTests/testInboundIdentityAcknowledgementRejectsAccountAndTransportReplacement",
+        "SyncSplitOperationOwnershipTests/testInboundIdentityInspectionIgnoresProvisionalReplacementAndRemoval",
+        "SyncSplitOperationOwnershipTests/testInboundLiveRejectsCancellationResetAccountBindingAndTransportReplacementBeforeTarget",
+        "SyncSplitOperationOwnershipTests/testInboundLiveRetainsCommittedTargetAfterOwnerReplacementAndFreshRetry",
+        "SyncSplitOperationOwnershipTests/testJournalForwardingRejectsAccountAndTransportReplacementBeforeTrackingAdmission",
+        "SyncSplitOperationOwnershipTests/testJournalForwardingRejectsCancellationResetBeforeTrackingAdmission",
+        "SyncSplitOperationOwnershipTests/testPublicImportMayInitializeItsProviderWithoutReplacingOperationOwnership",
+        "SyncSplitOperationOwnershipTests/testPublicImportRejectsCancellationResetFromProgressBeforeForwarding",
+    )
+
+    def test_emitted_filter_covers_complete_local_contract(self):
+        completed = subprocess.run([sys.executable, str(SCRIPT), "focused-filter"],
+                                   capture_output=True, text=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        pattern = re.compile(completed.stdout.strip())
+        names = self.inventory()
+        self.assertEqual(len(names), 130)
+        self.assertEqual(len(set(verifier.REQUIRED)), 130)
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIsNotNone(pattern.match("BigSyncKitTests." + name))
+        for name in self.merged_cases:
+            if name.split("/")[0] in (
+                "BigSyncKitTests", "SyncRetainedRecordContractTests", "SyncSemanticIntentTests"
+            ):
+                self.assertIsNone(pattern.match("BigSyncKitTests." + name + "Suffix"))
+            self.assertIsNone(pattern.match("OtherModule." + name))
+
+    def test_focused_packet_rejects_each_critical_filter_omission(self):
+        names = self.inventory()
+        listing, _ = self.packet_strings(names)
+        for omitted in names:
+            # Change only execution selection: discovery still includes the case.
+            remaining = [name for name in names if name != omitted]
+            _, log = self.packet_strings(remaining)
+            pattern = re.compile(r"^(?!" + re.escape("BigSyncKitTests." + omitted)
+                                 + r"$).*")
+            with self.subTest(omitted=omitted), patch.object(verifier, "FOCUSED", pattern):
+                report = verifier.validate(listing, [0, 0, 0], log, phase="focused")
+                self.assertFalse(report["passed"])
+                self.assertIn(omitted + ": critical case absent from focused selection",
+                              report["errors"])
+                self.assertEqual(report["missing_cases"], [])
+                self.assertEqual(report["unexpected_cases"], [])
 
 
 if __name__ == "__main__":
