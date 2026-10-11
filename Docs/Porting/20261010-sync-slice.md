@@ -412,3 +412,11 @@ Source equivalence closes port classification for the remaining paths; it
 does not prove all historical runtime behaviors or external consumer correctness.
 The earlier 55-path semantic re-review limitation remains accurate as a
 qualification limitation, not as an unidentified missing-source backlog.
+
+### Advanced-main read-only review — 2026-10-10 local continuation
+
+Fresh isolated fetch confirmed main `2eea7591140f4a599f80f71e07f8e6d77b71daee`, descending from the recorded runtime baseline `012d54e431e8a49da922f2fe3791b3976e38fa0f`. The intervening implementation commit is `2ec9fe1` (deletion migration fixture write ownership), joined by merge `eb1c3f7` and #161 merge `2eea759`. Exact tree comparison changes only `Tests/BigSyncKitTests/ChangeFeedMigrationResumeTests.swift` (106 additions, 6 removals); the Sources delta is empty.
+
+Source review inspected the original foreign-writer fixture's shared one-shot `InboundDeletionProvisionalWrites.cancelIfOwned`, which consumes ownership before rollback and is reused by admission, timeout fallback and deferred cleanup. Two authored tests cover admitted successor preservation and pre-admission failure release. This newer test-fixture work is preserved on main and is not copied or reverted in this documentation draft. No production code or dependency pin changes are needed to retain it.
+
+This confirms runtime-source equivalence to the previously recorded baseline, not independent semantic qualification of every runtime path or execution of #161's tests. No builds, tests, compiler checks, benchmarks or CI ran in this continuation. Queued-write native qualification, #7 captured-store composition, cross-owner caller contracts and historical/non-source coverage remain explicit gaps. The task-17 checkpoint `62f0d706e112c339a6e039569c1a4c35fc5c7550` is unchanged.
