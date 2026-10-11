@@ -533,18 +533,17 @@ extension ChangeFeedMigrationResumeTests {
         tracking.beginWrite()
         entity.state = SyncedEntityState.changed.rawValue
         entity.pendingGeneration = "uncommitted-local-intent"
+        let provisionalWrites = InboundDeletionProvisionalWrites(target: target, tracking: tracking)
         let targetAdmission = expectation(description: "committed remote deletion reaches target writer")
         adapter._testBeforeRemoteDeletionTargetWrite = {
             XCTAssertTrue(target.isInWriteTransaction)
             XCTAssertTrue(tracking.isInWriteTransaction)
-            target.cancelWrite()
-            tracking.cancelWrite()
+            provisionalWrites.cancelIfOwned()
             targetAdmission.fulfill()
         }
         defer {
             adapter._testBeforeRemoteDeletionTargetWrite = nil
-            if target.isInWriteTransaction { target.cancelWrite() }
-            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+            provisionalWrites.cancelIfOwned()
         }
         let recordID = CKRecord.ID(recordName: recordName, zoneID: adapter.recordZoneID)
         let task = Task { @BigSyncBackgroundActor in
@@ -553,14 +552,115 @@ extension ChangeFeedMigrationResumeTests {
         await fulfillment(of: [targetAdmission], timeout: 2)
         // Release foreign writers even if a broken selector skipped the hook,
         // so the failing history joins its operation rather than hanging.
-        if target.isInWriteTransaction { target.cancelWrite() }
-        if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        provisionalWrites.cancelIfOwned()
         let results = try await task.value
         XCTAssertEqual(results.count, 1)
         XCTAssertTrue(object.isDeleted)
         XCTAssertEqual(object.modifiedAt, timestamp)
         XCTAssertNil(target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName))
         XCTAssertEqual(entity.entityState, .deletedRemotely)
+        XCTAssertNil(entity.pendingGeneration)
+    }
+
+    // This fixture owns only the two original foreign transactions. Consume
+    // that ownership before rollback, without an actor suspension. Admission,
+    // timeout fallback and deferred failure cleanup all share this one release.
+    @BigSyncBackgroundActor
+    private final class InboundDeletionProvisionalWrites {
+        private let target: Realm
+        private let tracking: Realm
+        private var ownsWrites = true
+
+        init(target: Realm, tracking: Realm) {
+            self.target = target
+            self.tracking = tracking
+        }
+
+        func cancelIfOwned() {
+            guard ownsWrites else { return }
+            ownsWrites = false
+            if target.isInWriteTransaction { target.cancelWrite() }
+            if tracking.isInWriteTransaction { tracking.cancelWrite() }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionFixtureCleanupPreservesAdmittedSuccessorWrites() async throws {
+        let adapter = try makeAdapter(label: "deletion-fixture-successor-ownership")
+        try await adapter.resetSyncCaches()
+        adapter.invalidateTokens()
+        let target = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let object = MigrationPeerObject()
+        object.id = "fixture-successor"
+        let recordName = MigrationPeerObject.className() + "." + object.id
+        let entity = SyncedEntity(entityType: MigrationPeerObject.className(),
+                                  identifier: recordName,
+                                  state: SyncedEntityState.synced.rawValue)
+        try target.write { target.add(object) }
+        try tracking.write { tracking.add(entity) }
+        target.beginWrite()
+        tracking.beginWrite()
+        let provisionalWrites = InboundDeletionProvisionalWrites(target: target, tracking: tracking)
+        defer { provisionalWrites.cancelIfOwned() }
+        provisionalWrites.cancelIfOwned()
+        XCTAssertFalse(target.isInWriteTransaction)
+        XCTAssertFalse(tracking.isInWriteTransaction)
+
+        // Force fallback and deferred cleanup to run inside actual SDK-admitted
+        // successors, instead of hoping actor scheduling exposes the old race.
+        try await target.asyncWritePreservingOwnership {
+            defer { provisionalWrites.cancelIfOwned() }
+            object.isDeleted = true
+            provisionalWrites.cancelIfOwned()
+            XCTAssertTrue(target.isInWriteTransaction)
+        }
+        try await tracking.asyncWritePreservingOwnership {
+            defer { provisionalWrites.cancelIfOwned() }
+            entity.pendingGeneration = "successor-intent"
+            provisionalWrites.cancelIfOwned()
+            XCTAssertTrue(tracking.isInWriteTransaction)
+        }
+        XCTAssertTrue(object.isDeleted)
+        XCTAssertEqual(entity.pendingGeneration, "successor-intent")
+        XCTAssertFalse(target.isInWriteTransaction)
+        XCTAssertFalse(tracking.isInWriteTransaction)
+    }
+
+    private enum InboundDeletionFixtureError: Error { case beforeAdmission }
+
+    @BigSyncBackgroundActor
+    func testInboundDeletionFixtureFailureCleanupReleasesOriginalWriters() async throws {
+        let adapter = try makeAdapter(label: "deletion-fixture-failure-cleanup")
+        try await adapter.resetSyncCaches()
+        adapter.invalidateTokens()
+        let target = try XCTUnwrap(adapter.realmProvider?.targetReaderRealms?.first)
+        let tracking = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let object = MigrationPeerObject()
+        object.id = "fixture-failure"
+        let recordName = MigrationPeerObject.className() + "." + object.id
+        let entity = SyncedEntity(entityType: MigrationPeerObject.className(),
+                                  identifier: recordName,
+                                  state: SyncedEntityState.synced.rawValue)
+        try target.write { target.add(object) }
+        try tracking.write { tracking.add(entity) }
+        @BigSyncBackgroundActor
+        func failBeforeAdmission() throws {
+            target.beginWrite()
+            tracking.beginWrite()
+            let provisionalWrites = InboundDeletionProvisionalWrites(target: target, tracking: tracking)
+            defer { provisionalWrites.cancelIfOwned() }
+            object.isDeleted = true
+            entity.pendingGeneration = "rolled-back-intent"
+            throw InboundDeletionFixtureError.beforeAdmission
+        }
+        do {
+            try failBeforeAdmission()
+            XCTFail("Fixture failure must propagate")
+        } catch InboundDeletionFixtureError.beforeAdmission { }
+        XCTAssertFalse(target.isInWriteTransaction)
+        XCTAssertFalse(tracking.isInWriteTransaction)
+        XCTAssertFalse(object.isDeleted)
         XCTAssertNil(entity.pendingGeneration)
     }
 
