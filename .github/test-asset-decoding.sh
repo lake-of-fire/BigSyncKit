@@ -28,6 +28,7 @@ set +e
 # Keep compiler invocations in the evidence packet so dependency setup failures
 # can be diagnosed without changing the production dependency source.
 swift test --verbose --package-path "$root" --configuration debug \
+  -Xcxx -Xclang -Xcxx -fno-cxx-modules \
   --filter HotfixCollectionSafetyTests \
   --parallel --num-workers 1 --disable-swift-testing \
   --xunit-output "$evidence/native.junit.xml" 2>&1 | tee "$evidence/native.log"
