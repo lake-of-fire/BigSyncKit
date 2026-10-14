@@ -9,6 +9,10 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# Cancel only obsolete PR evidence. Each manual qualification retains its run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   source-boundary:
     runs-on: macos-15
