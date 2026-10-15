@@ -75,10 +75,10 @@ public struct BigSyncBackgroundWorkerConfiguration {
 }
 
 public enum BigSyncManualRebuildOutcome: Sendable, Equatable {
-    /// The current synchronizer reset its local caches and finished a new drain.
-    case succeeded
-    /// The worker was not configured, iCloud was unavailable, or configuration
-    /// superseded the request before it could safely drain.
+    /// The current synchronizer reset its local caches and completed a new drain.
+    case succeeded(accountScopeIdentifier: String)
+    /// No synchronizer was configured, availability deferred the work, or a
+    /// newer configuration superseded the request.
     case deferred
     /// Resetting the current synchronizer's local caches failed.
     case failed(String)
@@ -363,6 +363,21 @@ public actor BigSyncBackgroundActor {
               realmSynchronizer === expectedSynchronizer else {
             return .deferred
         }
+        let expectedAccountScopeIdentifier: String
+        do {
+            expectedAccountScopeIdentifier = try await expectedSynchronizer
+                .cloudKitAccountScopeIdentifier()
+        } catch {
+            logger?.notice(
+                "QSCloudKitSynchronizer >> Manual rebuild deferred before reset because account scope is unavailable: \(error)"
+            )
+            return .deferred
+        }
+        guard !Task.isCancelled,
+              manualRebuildID == rebuildID,
+              realmSynchronizer === expectedSynchronizer else {
+            return .deferred
+        }
         do {
             try await expectedSynchronizer.resetSyncCaches(
                 cancelSynchronization: true
@@ -379,9 +394,46 @@ public actor BigSyncBackgroundActor {
               realmSynchronizer === expectedSynchronizer else {
             return .deferred
         }
-        return await synchronizeCloudKit(expectedSynchronizer: expectedSynchronizer) == nil
-            ? .deferred
-            : .succeeded
+        let result = await synchronizeCloudKit(
+            expectedSynchronizer: expectedSynchronizer
+        )
+        guard !Task.isCancelled,
+              manualRebuildID == rebuildID,
+              realmSynchronizer === expectedSynchronizer else {
+            return .deferred
+        }
+        do {
+            guard try await expectedSynchronizer.cloudKitAccountScopeIdentifier()
+                == expectedAccountScopeIdentifier else {
+                return .deferred
+            }
+        } catch {
+            return .deferred
+        }
+        guard !Task.isCancelled,
+              manualRebuildID == rebuildID,
+              realmSynchronizer === expectedSynchronizer else {
+            return .deferred
+        }
+        return Self.manualRebuildOutcome(
+            for: result,
+            expectedAccountScopeIdentifier: expectedAccountScopeIdentifier
+        )
+    }
+
+    @BigSyncBackgroundActor
+    static func manualRebuildOutcome(
+        for result: CloudKitSynchronizer.SynchronizationResult?,
+        expectedAccountScopeIdentifier: String
+    ) -> BigSyncManualRebuildOutcome {
+        // A blocked or download-only result terminates a drain without proving
+        // that the replacement upload completed. A receipt for a replacement
+        // account cannot acknowledge the original account's restore marker.
+        guard let receipt = result?.receipt,
+              receipt.accountScopeIdentifier == expectedAccountScopeIdentifier else {
+            return .deferred
+        }
+        return .succeeded(accountScopeIdentifier: expectedAccountScopeIdentifier)
     }
 
 #if DEBUG
