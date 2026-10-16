@@ -2772,7 +2772,16 @@ public class CloudKitSynchronizer: NSObject {
                     )
                     requiresLocalDatasetRebootstrap = true
                 } else {
-                    throw BigSyncCloudAccountPortError.required(pending)
+                    // Automatic rebootstrap may outlive a failed admission to
+                    // an account the user has since left. Retire only that
+                    // unactivated transfer; the dataset owner below must still
+                    // admit the current account with a fresh binding and the
+                    // ordinary attempt/account revalidation around its awaits.
+                    binding = try BigSyncReplicaBindingStateStore.cancelPort(
+                        pending,
+                        store: keyValueStore,
+                        key: replicaBindingStateKey
+                    )
                 }
             }
 
