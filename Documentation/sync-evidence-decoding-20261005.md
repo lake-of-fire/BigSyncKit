@@ -57,6 +57,16 @@ Evidence paths must not exist. The driver reads local source only, selects compl
 
 ## Integration and qualification still required
 
+### 2026-10-10 current verification correction
+
+The inventory requirement below is historical. Current hotfix `AGENTS.md`
+retires the manually maintained native inventories and receipt/log validators.
+Register regression sources in the current target and test plan; check native
+discovery and actual `.xcresult` execution on a future authorized run through
+the maintained runner. Do not recreate inventories or copy Swift declarations
+into temporary packages to qualify behavior. No native run was authorized for
+the 2026-10-10 source audit, and historical execution does not qualify its edits.
+
 New native source files / XCTest owners:
 
 - `Tests/BigSyncKitTests/SyncAuditArtifactDecodingTests.swift` — 16 methods.
