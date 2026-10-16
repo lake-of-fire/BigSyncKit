@@ -2079,6 +2079,140 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testLocalDatasetRebootstrapAdmitsThirdAccountAfterFailedDestination()
+    async throws {
+        try await requireThirdAccountRebootstrap(
+            reopenBeforeAdmission: false,
+            rejectThirdAccount: false
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testLocalDatasetRebootstrapAdmitsThirdAccountAfterReopeningFailedDestination()
+    async throws {
+        try await requireThirdAccountRebootstrap(
+            reopenBeforeAdmission: true,
+            rejectThirdAccount: false
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testLocalDatasetRebootstrapRejectedThirdAccountRetainsRecoverableBinding()
+    async throws {
+        try await requireThirdAccountRebootstrap(
+            reopenBeforeAdmission: false,
+            rejectThirdAccount: true
+        )
+    }
+
+    @BigSyncBackgroundActor
+    private func requireThirdAccountRebootstrap(
+        reopenBeforeAdmission: Bool,
+        rejectThirdAccount: Bool
+    ) async throws {
+        let store = AccountFencingStore()
+        let identity = AccountFencingAccountIdentity("account-a")
+        let admissions = InitialBindingAdmissionRecorder()
+        let identifier = "third-account-rebootstrap-\(UUID().uuidString)"
+        let zoneID = makeZoneID()
+        let sourceScope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-a")
+        let abandonedScope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-b")
+        let destinationScope = CloudKitSynchronizer.accountScopeIdentifier(for: "account-c")
+
+        @BigSyncBackgroundActor
+        func makeCandidate(rejectThird: Bool) -> CloudKitSynchronizer {
+            makeSynchronizer(
+                transport: AccountFencingTransport(),
+                store: store,
+                identifier: identifier,
+                recordZoneID: zoneID,
+                accountIdentifierProvider: { await identity.current() },
+                accountReplacementPolicy: .localDatasetRebootstrap,
+                initialReplicaBindingAdmissionHandler: { context in
+                    await admissions.record(context)
+                    if context.accountScopeIdentifier == abandonedScope
+                        || (rejectThird && context.accountScopeIdentifier == destinationScope) {
+                        throw InitialBindingAdmissionTestError.rejected
+                    }
+                }
+            )
+        }
+
+        let first = makeCandidate(rejectThird: rejectThirdAccount)
+        try await first._test_validateSynchronizationAccount()
+        let bindingKey = first.durableStateKey("ReplicaBinding.v1")
+        let originalBinding = try XCTUnwrap(
+            BigSyncReplicaBindingStateStore.load(store: store, key: bindingKey)
+        )
+        await identity.replace(with: "account-b")
+        do {
+            try await first._test_validateSynchronizationAccount()
+            XCTFail("Expected the abandoned destination admission to fail")
+        } catch InitialBindingAdmissionTestError.rejected {}
+        let abandoned = try XCTUnwrap(try first.pendingCloudAccountPortRequirement())
+        XCTAssertEqual(abandoned.sourceAccountScopeIdentifier, sourceScope)
+        XCTAssertEqual(abandoned.destinationAccountScopeIdentifier, abandonedScope)
+
+        await identity.replace(with: "account-c")
+        var candidate = reopenBeforeAdmission
+            ? makeCandidate(rejectThird: rejectThirdAccount) : first
+        if rejectThirdAccount {
+            do {
+                try await candidate._test_validateSynchronizationAccount()
+                XCTFail("Expected the third account's fresh admission to fail")
+            } catch InitialBindingAdmissionTestError.rejected {}
+            let pending = try XCTUnwrap(try candidate.pendingCloudAccountPortRequirement())
+            XCTAssertEqual(pending.sourceAccountScopeIdentifier, sourceScope)
+            XCTAssertEqual(pending.destinationAccountScopeIdentifier, destinationScope)
+            XCTAssertNotEqual(pending.transitionID, abandoned.transitionID)
+            XCTAssertNotEqual(pending.bindingGenerationIdentifier, abandoned.bindingGenerationIdentifier)
+            let retained = try XCTUnwrap(
+                BigSyncReplicaBindingStateStore.load(store: store, key: bindingKey)
+            )
+            XCTAssertEqual(retained.activeGenerationIdentifier, originalBinding.activeGenerationIdentifier)
+            XCTAssertEqual(retained.datasetOwnerAccountScopeIdentifier, sourceScope)
+            XCTAssertEqual(
+                store.value(forKey: candidate.durableStateKey("CloudKitAccountIdentifier")) as? String,
+                "account-a"
+            )
+            // A restart must resume C's exact pending generation rather than
+            // revive B's transfer or publish a new one over C's failed attempt.
+            candidate = makeCandidate(rejectThird: false)
+            try await candidate._test_validateSynchronizationAccount()
+            let recovered = try XCTUnwrap(
+                BigSyncReplicaBindingStateStore.load(store: store, key: bindingKey)
+            )
+            XCTAssertEqual(recovered.activeGenerationIdentifier, pending.bindingGenerationIdentifier)
+        } else {
+            try await candidate._test_validateSynchronizationAccount()
+        }
+
+        let activated = try XCTUnwrap(
+            BigSyncReplicaBindingStateStore.load(store: store, key: bindingKey)
+        )
+        XCTAssertEqual(activated.activeAccountScopeIdentifier, destinationScope)
+        XCTAssertNil(activated.pendingPort)
+        XCTAssertNotEqual(activated.activeGenerationIdentifier, abandoned.bindingGenerationIdentifier)
+        XCTAssertEqual(
+            store.value(forKey: candidate.durableStateKey("CloudKitAccountIdentifier")) as? String,
+            "account-c"
+        )
+        let contexts = await admissions.contexts
+        XCTAssertEqual(contexts.map(\.accountScopeIdentifier),
+                       rejectThirdAccount
+                           ? [sourceScope, abandonedScope, destinationScope, destinationScope]
+                           : [sourceScope, abandonedScope, destinationScope])
+        XCTAssertEqual(contexts.last?.replicaBindingGenerationIdentifier,
+                       activated.activeGenerationIdentifier)
+
+        let adapter = AccountFencingModelAdapter(zoneID: zoneID)
+        candidate.addModelAdapter(adapter)
+        let result = try await candidate.synchronize()
+        XCTAssertNotNil(result.receipt)
+        XCTAssertEqual(adapter.preparedResetModes, [.localDatasetRebootstrap])
+    }
+
+    @BigSyncBackgroundActor
     func testLocalDatasetRebootstrapRecoversActivationBeforeAccountPublication()
     async throws {
         let store = AccountFencingStore()
