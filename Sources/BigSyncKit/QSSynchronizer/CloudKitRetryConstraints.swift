@@ -34,26 +34,29 @@ struct CloudKitRetryConstraints {
             ($0.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
         }.filter { $0.isFinite && $0 >= 0 }.max()
         containsOnlySizeLimitFailures = isErrorGraphComplete && codes.contains(.limitExceeded)
-            && Self.isSizeLimitFailureTree(error)
+            && Self.isFailureTree(error, allowing: [.limitExceeded, .batchRequestFailed])
     }
 
-    private enum SizeLimitVisit {
+    private enum FailureTreeVisit {
         case visiting
         case complete(height: Int?)
     }
 
-    private static func isSizeLimitFailureTree(_ error: Error) -> Bool {
+    fileprivate static func isFailureTree(
+        _ error: Error,
+        allowing leafCodes: Set<CKError.Code>
+    ) -> Bool {
         // Retain the NSError whose address is memoized. Bridging a Swift Error
         // may create a temporary wrapper; a bare ObjectIdentifier set could
         // otherwise confuse a later wrapper reusing a released address.
-        var memo = [ObjectIdentifier: (error: NSError, visit: SizeLimitVisit)]()
+        var memo = [ObjectIdentifier: (error: NSError, visit: FailureTreeVisit)]()
         func height(of error: NSError, depth: Int) -> Int? {
             guard depth < 32 else { return nil }
             let id = ObjectIdentifier(error)
             if let entry = memo[id] {
                 switch entry.visit {
                 case .visiting:
-                    return nil // A cycle is not proof of a pure size failure.
+                    return nil // A cycle is not proof of a pure failure tree.
                 case .complete(let height):
                     // Shared DAG nodes are safe to reuse, but a longer path to
                     // the same node must still obey the depth ceiling.
@@ -67,7 +70,7 @@ struct CloudKitRetryConstraints {
                 return nil
             }
             // Foundation combines NSUnderlyingErrorKey and
-            // NSMultipleUnderlyingErrorsKey. A size-only proof must not
+            // NSMultipleUnderlyingErrorsKey. A pure failure proof must not
             // discard a local failure or constraint carried by either form.
             let info = error.userInfo
             let underlying = cloudKitUnderlyingErrors(in: info)
@@ -77,8 +80,6 @@ struct CloudKitRetryConstraints {
             }
             var children = underlying.errors
             switch cloudError.code {
-            case .limitExceeded, .batchRequestFailed:
-                break
             case .partialFailure:
                 let partial = cloudKitPartialErrors(in: info)
                 guard partial.isComplete, !partial.entries.isEmpty else {
@@ -87,8 +88,10 @@ struct CloudKitRetryConstraints {
                 }
                 children.append(contentsOf: partial.entries.map { $0.error })
             default:
-                memo[id] = (error, .complete(height: nil))
-                return nil
+                guard leafCodes.contains(cloudError.code) else {
+                    memo[id] = (error, .complete(height: nil))
+                    return nil
+                }
             }
             var maximumChildHeight = 0
             for child in children {
@@ -103,6 +106,34 @@ struct CloudKitRetryConstraints {
             return result
         }
         return height(of: error as NSError, depth: 0) != nil
+    }
+}
+
+/// Read-only failure admission for domain-owned CloudKit operations.
+/// Constrained failures must reach the synchronizer's existing account,
+/// recovery and backoff policy without another immediate CloudKit request.
+public enum BigSyncCloudKitRetryPolicy {
+    public static func allowsImmediateRecordConflictRetry(_ error: Error) -> Bool {
+        let constraints = CloudKitRetryConstraints(error)
+        return constraints.isErrorGraphComplete
+            && !constraints.requiresDeferredRetry
+            && !constraints.blocksAccountOperations
+            && !constraints.requestsTokenRecovery
+            && constraints.codes.contains(.serverRecordChanged)
+            && CloudKitRetryConstraints.isFailureTree(error, allowing: [.serverRecordChanged])
+    }
+
+    /// A single requested record may be treated as absent only when its own
+    /// top-level unknownItem result has no independent failure or constraint.
+    /// A partial batch is not record-bound proof of this record's absence.
+    public static func allowsMissingRecordAsAbsence(_ error: Error) -> Bool {
+        guard let cloudError = error as? CKError, cloudError.code == .unknownItem else { return false }
+        let constraints = CloudKitRetryConstraints(error)
+        return constraints.isErrorGraphComplete
+            && !constraints.requiresDeferredRetry
+            && !constraints.blocksAccountOperations
+            && !constraints.requestsTokenRecovery
+            && CloudKitRetryConstraints.isFailureTree(error, allowing: [.unknownItem])
     }
 }
 
