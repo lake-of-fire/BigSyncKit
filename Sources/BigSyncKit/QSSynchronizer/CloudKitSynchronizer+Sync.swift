@@ -1357,7 +1357,7 @@ extension CloudKitSynchronizer {
                    !constraints.blocksAccountOperations {
                     try checkRunContext(context)
                     if constraints.isErrorGraphComplete {
-                        try await revalidateRunContext(context)
+                        try await revalidateRunContext(context, preserving: error)
                     }
                     if let lifecycleError = applyCloudKitLoss(
                         disposition,
@@ -1525,7 +1525,7 @@ extension CloudKitSynchronizer {
                     }
                     try validateFetchOwner()
                     if constraints.isErrorGraphComplete {
-                        try await revalidateRunContext(context)
+                        try await revalidateRunContext(context, preserving: error)
                     }
                     try validateFetchOwner()
                     if let lifecycleError = applyCloudKitLoss(
@@ -1776,7 +1776,7 @@ extension CloudKitSynchronizer {
                 if let context = uploadContext {
                     try checkRunContext(context)
                     if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
-                        try await revalidateRunContext(context)
+                        try await revalidateRunContext(context, preserving: error)
                     }
                     try checkSynchronizationAttempt(attemptID)
                     try checkRunContext(context)
@@ -1797,10 +1797,10 @@ extension CloudKitSynchronizer {
                    !constraints.requestsTokenRecovery,
                    isZoneNotFoundOrDeletedError(error) {
                     for adapter in modelAdapters {
-                        try await revalidateActiveRunContext(for: attemptID)
+                        try await revalidateActiveRunContext(for: attemptID, preserving: error)
                         activeZoneTokens[adapter.recordZoneID] = nil
                         try await adapter.saveToken(nil)
-                        try await revalidateActiveRunContext(for: attemptID)
+                        try await revalidateActiveRunContext(for: attemptID, preserving: error)
                     }
                 }
                 if shouldRetryUpload(for: error as NSError) {
@@ -1972,7 +1972,7 @@ extension CloudKitSynchronizer {
             let constraints = CloudKitRetryConstraints(error)
             try checkSynchronizationAttempt(attemptID)
             if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateActiveRunContext(for: attemptID, preserving: error)
             }
 
             guard !constraints.blocksAccountOperations,
@@ -2022,7 +2022,7 @@ extension CloudKitSynchronizer {
                 let constraints = CloudKitRetryConstraints(error)
                 try checkRunContext(context)
                 if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
-                    try await revalidateRunContext(context)
+                    try await revalidateRunContext(context, preserving: error)
                 }
                 if !constraints.blocksAccountOperations,
                    let lifecycleError = applyCloudKitLoss(

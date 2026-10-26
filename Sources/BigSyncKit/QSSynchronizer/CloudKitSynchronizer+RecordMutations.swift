@@ -508,7 +508,7 @@ extension CloudKitSynchronizer {
                     try checkRunContext(context)
                     // Unexamined causes cannot authorize another account request.
                     if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
-                        try await revalidateRunContext(context)
+                        try await revalidateRunContext(context, preserving: error)
                     }
                     try checkSynchronizationAttempt(attemptID)
                     try checkRunContext(context)
@@ -521,7 +521,7 @@ extension CloudKitSynchronizer {
                 ) else { throw error }
                 // Only pure, reducible limits retry here. Account stops,
                 // server delays and unrelated failures retain the outer path.
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateActiveRunContext(for: attemptID, preserving: error)
                 continue
             }
             try Task.checkCancellation()
@@ -793,7 +793,7 @@ extension CloudKitSynchronizer {
                     try checkRunContext(context)
                     // Unexamined causes cannot authorize another account request.
                     if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
-                        try await revalidateRunContext(context)
+                        try await revalidateRunContext(context, preserving: error)
                     }
                     try checkSynchronizationAttempt(attemptID)
                     try checkRunContext(context)
@@ -806,7 +806,7 @@ extension CloudKitSynchronizer {
                 ) else { throw error }
                 // Only pure, reducible limits retry here. Account stops,
                 // server delays and unrelated failures retain the outer path.
-                try await revalidateActiveRunContext(for: attemptID)
+                try await revalidateActiveRunContext(for: attemptID, preserving: error)
                 continue
             }
             try Task.checkCancellation()
