@@ -121,6 +121,71 @@ private actor ConflictFailureTransport: CloudKitRecordStore, CloudKitChangeFeed,
 }
 
 final class SyncConflictFailureCompositionTests: XCTestCase {
+    func testPublicConflictRetryPolicyAdmitsOnlyUnconstrainedConflictTrees() {
+        let conflict = CKError(.serverRecordChanged)
+        let id = CKRecord.ID(recordName: "conflict")
+        let partial = CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [id: conflict]])
+        XCTAssertTrue(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(conflict))
+        XCTAssertTrue(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(partial))
+        for floor in [0, 137] {
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+                CKError(.serverRecordChanged, userInfo: [CKErrorRetryAfterKey: floor])))
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+                CKError(.partialFailure, userInfo: [CKErrorRetryAfterKey: floor,
+                    CKPartialErrorsByItemIDKey: [id: conflict]])))
+        }
+        for code in [CKError.Code.notAuthenticated, .accountTemporarilyUnavailable,
+                     .changeTokenExpired, .networkFailure, .requestRateLimited, .batchRequestFailed] {
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+                CKError(.serverRecordChanged, userInfo: [NSUnderlyingErrorKey: CKError(code)])))
+        }
+        let local = NSError(domain: "IndependentLocalFailure", code: 1)
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+            CKError(.serverRecordChanged, userInfo: [NSMultipleUnderlyingErrorsKey: [local]])))
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+            CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: ["malformed": "value"]])))
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+            CKError(.serverRecordChanged, userInfo: [NSUnderlyingErrorKey: "malformed"])))
+    }
+
+    func testConflictRetryPolicyRetainsBoundedPureTreeProofAndSizePolicy() {
+        var nested = CKError(.serverRecordChanged) as NSError
+        for _ in 0..<40 {
+            nested = NSError(domain: CKErrorDomain, code: CKError.partialFailure.rawValue,
+                userInfo: [CKPartialErrorsByItemIDKey: ["child": nested]])
+        }
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(nested))
+        let size = CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [
+            "limit": CKError(.limitExceeded), "batch": CKError(.batchRequestFailed),
+        ]])
+        XCTAssertTrue(CloudKitRetryConstraints(size).containsOnlySizeLimitFailures,
+            "Generalizing the tree proof preserves existing size/batch structural policy")
+        XCTAssertFalse(CloudKitRetryConstraints(CKError(.serverRecordChanged)).containsOnlySizeLimitFailures)
+    }
+
+    func testMissingRecordPolicyRequiresDirectUnconstrainedAbsence() {
+        let missing = CKError(.unknownItem)
+        XCTAssertTrue(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(missing))
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+            CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: ["other-record": missing]])),
+            "A partial result for an unrelated identity is not the requested record's absence")
+        for floor in [0, 137] {
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+                CKError(.unknownItem, userInfo: [CKErrorRetryAfterKey: floor])))
+        }
+        for code in [CKError.Code.notAuthenticated, .accountTemporarilyUnavailable,
+                     .changeTokenExpired, .networkFailure, .requestRateLimited] {
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+                CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: CKError(code)])))
+        }
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+            CKError(.unknownItem, userInfo: [NSMultipleUnderlyingErrorsKey: [
+                NSError(domain: "IndependentLocalFailure", code: 1),
+            ]])))
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+            CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: "malformed"])))
+    }
+
     @BigSyncBackgroundActor
     private func check(_ phase: ConflictProcessingPhase, sibling: CKError?) async throws {
         let adapter = ConflictFailureAdapter(phase)
