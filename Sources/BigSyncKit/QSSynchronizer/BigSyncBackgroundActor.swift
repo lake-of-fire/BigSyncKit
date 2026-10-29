@@ -1008,6 +1008,20 @@ public actor BigSyncBackgroundActor {
             .revalidateInitialReplicaBindingContext(context)
     }
 
+    /// Own only the local Realm/file work of initial admission. Network
+    /// requests must remain outside the operation so suspension does not wait
+    /// for a CloudKit completion that ignores cooperative cancellation.
+    @BigSyncBackgroundActor
+    public func withInitialReplicaBindingStorageOperation<Value: Sendable>(
+        _ context: BigSyncInitialReplicaBindingContext,
+        operation: @BigSyncBackgroundActor @Sendable () async throws -> Value
+    ) async throws -> Value {
+        guard let realmSynchronizer else { throw CancellationError() }
+        return try await realmSynchronizer.withInitialReplicaBindingStorageOperation(
+            context, operation: operation
+        )
+    }
+
 #if DEBUG
     @BigSyncBackgroundActor
     var _test_hasScheduledInitialSynchronization: Bool {

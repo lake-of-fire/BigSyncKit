@@ -498,7 +498,8 @@ enum BackupDetection {
         namespace: String,
         transactionIdentifier: UUID,
         sharedSentinelBaseURL: URL? = nil,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        allowsUninitializedCancellation: Bool = false
     ) throws -> ManualRestorePreflight {
         let sentinelURL = defaultSentinelURL(
             namespace: namespace,
@@ -511,7 +512,8 @@ enum BackupDetection {
             try manualRestorePreflightLocked(
                 transactionIdentifier: transactionIdentifier,
                 sentinelURL: sentinelURL,
-                fileManager: fileManager
+                fileManager: fileManager,
+                allowsUninitializedCancellation: allowsUninitializedCancellation
             )
         }
     }
@@ -519,7 +521,8 @@ enum BackupDetection {
     private static func manualRestorePreflightLocked(
         transactionIdentifier: UUID,
         sentinelURL: URL,
-        fileManager: FileManager
+        fileManager: FileManager,
+        allowsUninitializedCancellation: Bool = false
     ) throws -> ManualRestorePreflight {
         let intentURL = manualRestoreIntentURL(sentinelURL: sentinelURL)
         let eventURL = restoreEventURL(sentinelURL: sentinelURL)
@@ -529,6 +532,18 @@ enum BackupDetection {
             sentinelURL: sentinelURL
         )
         let completedExists = fileManager.fileExists(atPath: completedURL.path)
+        // Rejecting a prepared app archive can precede the first installation.
+        // Cancelling an absent intent is then a no-op, not identity creation.
+        // Existing (even malformed) sentinel/restore state still follows the
+        // strict preflight below; restore/replacement callers never opt in.
+        if allowsUninitializedCancellation,
+           !completedExists, !intentExists, !eventExists {
+            do {
+                _ = try fileManager.attributesOfItem(atPath: sentinelURL.path)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                return .newTransaction
+            }
+        }
         let completed = completedExists ? manualRestoreReceipt(at: completedURL) : nil
         let intent = intentExists ? manualRestoreReceipt(at: intentURL) : nil
         let event = eventExists ? manualRestoreReceipt(at: eventURL) : nil

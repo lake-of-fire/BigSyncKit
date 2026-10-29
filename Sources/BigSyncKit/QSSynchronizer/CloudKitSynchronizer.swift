@@ -2206,6 +2206,30 @@ public class CloudKitSynchronizer: NSObject {
         }
     }
 
+    /// Local storage steps in initial admission precede adapter activation.
+    /// Keep them inside the existing callback drain so cancellation cannot
+    /// release the host's execution assertion while Realm is still opening or
+    /// committing. CloudKit fetch/save awaits belong outside this scope.
+    internal func withInitialReplicaBindingStorageOperation<Value: Sendable>(
+        _ context: BigSyncInitialReplicaBindingContext,
+        operation: @BigSyncBackgroundActor @Sendable () async throws -> Value
+    ) async throws -> Value {
+        try await revalidateInitialReplicaBindingContext(context)
+        guard let attemptID = context.validationAttemptID,
+              let authority = activeAccountValidationAuthority,
+              authority.attemptID == attemptID,
+              beginRunCallback(for: attemptID) else {
+            throw CancellationError()
+        }
+        defer { endRunCallback() }
+        let value = try await operation()
+        try checkAccountValidationAttempt(
+            attemptID, fenceGeneration: authority.fenceGeneration
+        )
+        try validatePendingReplicaBinding(context)
+        return value
+    }
+
     private func validatePendingReplicaBinding(
         _ context: BigSyncInitialReplicaBindingContext
     ) throws {

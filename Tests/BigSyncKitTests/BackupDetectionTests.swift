@@ -399,6 +399,50 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertEqual(resumed, first)
     }
 
+    func testCancellingAbsentIntentBeforeFirstInstallationDoesNotPublishIdentity() throws {
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "cancel-before-first-installation",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+            sharedStateBaseURL: temporaryRoot()
+        )
+        XCTAssertNil(identity.currentInstallationIdentifier())
+        let transaction = UUID()
+        try identity.cancelManualBackupRestoreIntent(transactionIdentifier: transaction)
+        try identity.cancelManualBackupRestoreIntent(transactionIdentifier: transaction)
+        XCTAssertNil(identity.currentInstallationIdentifier())
+        let installed = try identity.prepareInstallation()
+        XCTAssertEqual(identity.currentInstallationIdentifier(), installed)
+    }
+
+    func testCancellingBeforeFirstInstallationRejectsMalformedRestoreState() throws {
+        for kind in ["sentinel", "intent", "event", "completed"] {
+            let base = temporaryRoot()
+            let identity = BigSyncClientIdentity(
+                synchronizerName: "cancel-malformed-" + kind,
+                containerName: "container",
+                recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+                sharedStateBaseURL: base
+            )
+            let sentinel = BackupDetection.defaultSentinelURL(
+                namespace: identity.durableStateNamespace, sharedBaseURL: base)
+            let target: URL
+            switch kind {
+            case "intent": target = BackupDetection.manualRestoreIntentURL(sentinelURL: sentinel)
+            case "event": target = BackupDetection.restoreEventURL(sentinelURL: sentinel)
+            case "completed": target = BackupDetection.completedManualRestoreReceiptURL(sentinelURL: sentinel)
+            default: target = sentinel
+            }
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let bytes = Data("malformed".utf8)
+            try bytes.write(to: target)
+            XCTAssertThrowsError(try identity.cancelManualBackupRestoreIntent(transactionIdentifier: UUID())) {
+                XCTAssertEqual($0 as? BigSyncManualBackupRestoreError, .stateAmbiguous, kind)
+            }
+            XCTAssertEqual(try Data(contentsOf: target), bytes)
+        }
+    }
+
     func testManualRestoreReturnsSameReceiptAfterPeerAcknowledgesEventBeforeCallerJournal()
     throws {
         let base = temporaryRoot()
@@ -1134,8 +1178,8 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(exclusiveProbeDescriptor, 0)
         XCTAssertEqual(
             flock(exclusiveProbeDescriptor, LOCK_EX | LOCK_NB),
-            -1,
-            "A failed upgrade must immediately restore this process's shared lease"
+            0,
+            "A rejected restore must leave no process-lifetime kernel lock"
         )
         Darwin.close(exclusiveProbeDescriptor)
 

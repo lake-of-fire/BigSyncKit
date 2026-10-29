@@ -5,7 +5,7 @@ import CryptoKit
 import Logging
 @_spi(CloudKitE2E) @testable import BigSyncKit
 import RealmSwift
-import RealmSwiftGaps
+@testable import RealmSwiftGaps
 
 private final class DictionaryKeyValueStore: NSObject, KeyValueStore {
     private var storage = [String: Any]()
@@ -479,20 +479,21 @@ private final class FakeModelAdapterDelegate: ModelAdapterDelegate {
 }
 
 private actor AsyncGate {
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var continuations = [CheckedContinuation<Void, Never>]()
     private var isOpen = false
 
     func wait() async {
         guard !isOpen else { return }
         await withCheckedContinuation {
-            continuation = $0
+            continuations.append($0)
         }
     }
 
     func open() {
         isOpen = true
-        continuation?.resume()
-        continuation = nil
+        let waiting = continuations
+        continuations.removeAll()
+        for continuation in waiting { continuation.resume() }
     }
 
     func hasOpened() -> Bool {
@@ -12838,6 +12839,43 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testCancelledTokenWritePreservesExistingTrackingTransaction() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        try await fixture.adapter.ensureSetup()
+        let realm = try XCTUnwrap(fixture.adapter.realmProvider?.persistenceRealm)
+        try realm.beginWrite()
+        let marker = SyncedEntity(
+            entityType: BigSyncTrackedObject.className(),
+            identifier: "token-write-other-owner",
+            state: SyncedEntityState.new.rawValue
+        )
+        realm.add(marker)
+        defer {
+            fixture.adapter._testBeforeTokenWriteSubmission = nil
+            if realm.isInWriteTransaction { realm.cancelWrite() }
+        }
+        let submitted = expectation(description: "token begin ticket submitted")
+        fixture.adapter._testBeforeTokenWriteSubmission = { submitted.fulfill() }
+        let task = Task { @BigSyncBackgroundActor in
+            try await fixture.adapter.saveToken(nil)
+        }
+        await fulfillment(of: [submitted], timeout: 3)
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("Expected queued token write cancellation")
+        } catch is CancellationError { }
+        XCTAssertTrue(
+            realm.isInWriteTransaction,
+            "Cancelling token persistence must preserve another caller's open transaction"
+        )
+        XCTAssertNotNil(
+            realm.object(ofType: SyncedEntity.self, forPrimaryKey: "token-write-other-owner"),
+            "The unrelated owner's uncommitted mutation must survive"
+        )
+    }
+
+    @BigSyncBackgroundActor
     func testBeginBarrierRestartsQueuedInitialSetup() async throws {
         let identifier = UUID().uuidString
         var persistenceConfiguration = RealmSwiftAdapter
@@ -14562,6 +14600,12 @@ final class BigSyncKitTests: XCTestCase {
     func testResetRecoversJournalForwardedBeforeCancellationFromDurableState()
     async throws {
         let fixture = try await makeRealmAdapterFixture()
+        let enteredPostWrite = AsyncGate()
+        let releasePostWrite = AsyncGate()
+        fixture.adapter._testAfterPendingMutationTrackingWrite = {
+            await enteredPostWrite.open()
+            await releasePostWrite.wait()
+        }
         let object = BigSyncTrackedObject(
             id: "reset-after-forward-journal",
             createdAt: Date(),
@@ -14579,15 +14623,23 @@ final class BigSyncKitTests: XCTestCase {
                 forPrimaryKey: recordName
             )
         )
-        let enteredPostWrite = AsyncGate()
-        let releasePostWrite = AsyncGate()
-        fixture.adapter._testAfterPendingMutationTrackingWrite = {
-            await enteredPostWrite.open()
-            await releasePostWrite.wait()
-        }
         fixture.adapter._test_enqueueObservedJournalRecordNames([recordName])
         fixture.adapter._test_startObservedRealmChangesTaskIfNeeded()
-        await enteredPostWrite.wait()
+        let entered = expectation(description: "journal forwarding reached post-write gate")
+        let enteredTask = Task {
+            await enteredPostWrite.wait()
+            entered.fulfill()
+        }
+        await fulfillment(of: [entered], timeout: 10)
+        guard await enteredPostWrite.hasOpened() else {
+            await releasePostWrite.open()
+            // Release the fixture waiter as well on a failed readiness check.
+            await enteredPostWrite.open()
+            await enteredTask.value
+            throw NSError(domain: "BigSyncKitTests", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Journal forwarding did not reach its post-write gate"])
+        }
+        await enteredTask.value
 
         let reset = Task { @BigSyncBackgroundActor in
             fixture.adapter.cancelSynchronization()
@@ -16304,6 +16356,37 @@ final class BigSyncKitTests: XCTestCase {
             let reopened = try await Realm(configuration: configuration, actor: actor)
             XCTAssertNil(reopened.object(ofType: BigSyncTrackedObject.self, forPrimaryKey: "owned-fixture"))
         }.value
+    }
+
+    @BigSyncBackgroundActor
+    func testMissingUploadTargetRejectsBusyTrackingTransactionAndRetries() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let recordName = BigSyncTrackedObject.className() + ".missing-queued-target"
+        try fixture.persistenceRealm.write {
+            fixture.persistenceRealm.add(SyncedEntity(
+                entityType: BigSyncTrackedObject.className(), identifier: recordName,
+                state: SyncedEntityState.new.rawValue))
+        }
+        try fixture.persistenceRealm.beginWrite()
+        defer { if fixture.persistenceRealm.isInWriteTransaction { fixture.persistenceRealm.cancelWrite() } }
+        let tracking = try XCTUnwrap(fixture.persistenceRealm.object(
+            ofType: SyncedEntity.self, forPrimaryKey: recordName))
+        let otherOwnerDate = Date(timeIntervalSince1970: 1_700_000_000)
+        tracking.updated = otherOwnerDate
+        do {
+            _ = try await fixture.adapter.recordsToUpload(withState: .new, limit: 10)
+            XCTFail("Synchronous materialization must reject another owner's transaction")
+        } catch {
+            XCTAssertEqual(error as? RealmWriteOwnershipError, .transactionAlreadyOpen)
+        }
+        XCTAssertTrue(fixture.persistenceRealm.isInWriteTransaction)
+        XCTAssertEqual(tracking.updated, otherOwnerDate)
+        XCTAssertEqual(tracking.entityState, .new)
+        fixture.persistenceRealm.cancelWrite()
+        let prepared = try await fixture.adapter.recordsToUpload(withState: .new, limit: 10)
+        XCTAssertTrue(prepared.isEmpty)
+        XCTAssertEqual(tracking.entityState, .deletedLocally)
+        XCTAssertNil(tracking.updated)
     }
 
     @BigSyncBackgroundActor

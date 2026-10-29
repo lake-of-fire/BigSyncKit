@@ -97,11 +97,10 @@ enum BigSyncRecordLifecycle {
     }
 }
 
-struct BigSyncCompiledRecordContract: Sendable {
-    let declaration: BigSyncRecordContract
-    let signature: String
-
-    static func compile(_ object: Object) throws -> Self? {
+extension BigSyncRecordContract {
+    /// Keep canonical startup admission and runtime compilation on the same
+    /// declaration checks. Validation alone does not need a schema signature.
+    static func validatedDeclaration(for object: Object) throws -> Self? {
         guard let provider = type(of: object) as? BigSyncRecordContractProviding.Type else {
             return nil
         }
@@ -143,6 +142,19 @@ struct BigSyncCompiledRecordContract: Sendable {
                 throw BigSyncRecordContractError.invalidDeclaration(name)
             }
         }
+        return contract
+    }
+}
+
+struct BigSyncCompiledRecordContract: Sendable {
+    let declaration: BigSyncRecordContract
+    let signature: String
+
+    static func compile(_ object: Object) throws -> Self? {
+        guard let contract = try BigSyncRecordContract.validatedDeclaration(for: object) else {
+            return nil
+        }
+        let name = object.objectSchema.className
         var parts = ["bigsync-record-contract-v2", name, contract.deletion.rawValue]
         parts += contract.incomingRepresentation.signatureParts
         switch contract.policy {
@@ -197,7 +209,7 @@ public extension BigSyncRecordContract {
             guard BigSyncRecordFingerprint.supports(object) else {
                 throw BigSyncRecordContractError.invalidDeclaration(type.className())
             }
-            _ = try BigSyncCompiledRecordContract.compile(object)
+            _ = try validatedDeclaration(for: object)
         }
     }
 }

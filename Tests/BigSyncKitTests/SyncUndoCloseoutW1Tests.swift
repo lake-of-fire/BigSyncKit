@@ -308,13 +308,22 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
         unrelatedCopy.changeFeedEpoch = unrelated.changeFeedEpoch
         try tracking.write { tracking.add(unrelatedCopy) }
 
-        // The prepared retained tombstone is the exact server-restoring
-        // disposition. Its acknowledgement may retire only this record's
-        // quarantine; unrelated evidence must remain an audit blocker.
-        try await adapter.didUpload(
-            savedRecords: prepared.map(\.record),
-            matchingPreparedUploads: prepared
-        )
+        // An acknowledgement prepared before observing the physical deletion
+        // cannot retire its later quarantine, even with a server acceptance tag.
+        let staleAccepted = try prepared.map { try tagged($0.record, "accepted-stale") }
+        do {
+            try await adapter.didUpload(savedRecords: staleAccepted, matchingPreparedUploads: prepared)
+            XCTFail("Old preparation retired new deletion evidence")
+        } catch let error as RealmSwiftAdapter.RetainedDeletionQuarantineNeedsFreshPreparation {
+            XCTAssertEqual(error.recordNames, [record.recordID.recordName])
+        }
+        XCTAssertNotNil(tracking.object(ofType: BigSyncInboundSemanticQuarantine.self, forPrimaryKey: lineageID))
+        let freshPrepared = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        XCTAssertEqual(freshPrepared.count, 1)
+        let accepted = try freshPrepared.map { try tagged($0.record, "accepted-restoration") }
+        // Only the newly prepared, server-accepted restoring upload can retire
+        // this record's captured quarantine; unrelated evidence remains.
+        try await adapter.didUpload(savedRecords: accepted, matchingPreparedUploads: freshPrepared)
         try await adapter.cleanUp()
         XCTAssertNil(
             tracking.object(
@@ -329,7 +338,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
             )
         )
         let audit = try await adapter.auditSynchronizationState(
-            serverRecords: prepared.map(\.record)
+            serverRecords: accepted
         )
         XCTAssertFalse(audit.isClean)
         XCTAssertTrue(

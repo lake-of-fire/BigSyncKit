@@ -54,6 +54,37 @@ private final class RebaseControl: Object, ChangeMetadataRecordable,
 }
 
 final class SyncRecordRebaseTests: XCTestCase {
+    func testRecordEvidenceSchemaCompletionPreservesExistingTypesAndIsIdempotent() throws {
+        let evidenceTypes = BigSyncLocalRecordEvidence.objectTypes
+        for existingEvidence in [[], Array(evidenceTypes.prefix(1)), evidenceTypes] {
+            var configuration = Realm.Configuration(
+                inMemoryIdentifier: "record-evidence-schema-\(UUID().uuidString)",
+                objectTypes: [RebaseRow.self, BigSyncPendingMutation.self] + existingEvidence
+            )
+            let existingNames = try XCTUnwrap(configuration.objectTypes).map { $0.className() }
+            let expectedNames = Set(existingNames + evidenceTypes.map { $0.className() })
+            let composed = BigSyncMutationPolicy.recordRebasingObjectTypes(
+                try XCTUnwrap(configuration.objectTypes)
+            )
+            let composedNames = composed.map { $0.className() }
+            XCTAssertEqual(Array(composedNames.prefix(existingNames.count)), existingNames)
+            XCTAssertEqual(
+                BigSyncMutationPolicy.recordRebasingObjectTypes(composed).map { $0.className() },
+                composedNames
+            )
+            BigSyncMutationPolicy.enableRecordRebasing(in: &configuration)
+            let completedNames = try XCTUnwrap(configuration.objectTypes).map { $0.className() }
+            XCTAssertEqual(Set(completedNames), expectedNames)
+            XCTAssertEqual(completedNames.count, expectedNames.count)
+            // Realm may reorder schema types when resolving relationships.
+            XCTAssertEqual(Set(composedNames), Set(completedNames))
+            BigSyncMutationPolicy.enableRecordRebasing(in: &configuration)
+            XCTAssertEqual(configuration.objectTypes?.map { $0.className() }, completedNames)
+            let realm = try Realm(configuration: configuration)
+            XCTAssertEqual(Set(realm.schema.objectSchema.map(\.className)), expectedNames)
+        }
+    }
+
     @BigSyncBackgroundActor
     private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 

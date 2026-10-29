@@ -76,7 +76,102 @@ private final class BoundContractControl: Object, ChangeMetadataRecordable,
     }
 }
 
+@objc(StartupContractInvalidDeclarationRow)
+private final class StartupContractInvalidDeclarationRow: Object, BigSyncRecordContractProviding {
+    static let bigSyncRecordContract = BigSyncRecordContract(
+        policy: .independentFields, deletion: .retained)
+    @Persisted(primaryKey: true) var id = "invalid"
+    @Persisted var value = "text"
+
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+}
+
+@objc(StartupContractUnclassifiedFieldsRow)
+private final class StartupContractUnclassifiedFieldsRow: Object, BigSyncRecordContractProviding {
+    static let bigSyncRecordContract = BigSyncRecordContract(
+        policy: .independentFields, expectedFields: ["previousField"])
+    @Persisted(primaryKey: true) var id = "unclassified"
+    @Persisted var value = "text"
+
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+}
+
+@objc(StartupContractLinkedValue)
+private final class StartupContractLinkedValue: Object {
+    @Persisted var value = "linked"
+
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+}
+
+@objc(StartupContractUnsupportedPropertyRow)
+private final class StartupContractUnsupportedPropertyRow: Object, BigSyncRecordContractProviding {
+    static let bigSyncRecordContract = BigSyncRecordContract(policy: .independentFields)
+    @Persisted(primaryKey: true) var id = "unsupported"
+    @Persisted var linkedValue: StartupContractLinkedValue?
+
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+}
+
 final class SyncRetainedRecordContractTests: XCTestCase {
+    private func contractConfiguration(_ objectTypes: [ObjectBase.Type]) -> Realm.Configuration {
+        Realm.Configuration(
+            inMemoryIdentifier: "startup-contract-validation-" + UUID().uuidString,
+            objectTypes: objectTypes + [BigSyncPendingMutation.self]
+                + BigSyncLocalRecordEvidence.objectTypes)
+    }
+
+    func testCanonicalValidationAndCompilationRejectInvalidDeclarationIdentically() {
+        let object = StartupContractInvalidDeclarationRow()
+        let expected = BigSyncRecordContractError.invalidDeclaration(type(of: object).className())
+        let configuration = contractConfiguration([StartupContractInvalidDeclarationRow.self])
+        XCTAssertThrowsError(try BigSyncRecordContract.validate(configuration: configuration)) {
+            XCTAssertEqual($0 as? BigSyncRecordContractError, expected)
+        }
+        XCTAssertThrowsError(try BigSyncCompiledRecordContract.compile(object)) {
+            XCTAssertEqual($0 as? BigSyncRecordContractError, expected)
+        }
+    }
+
+    func testCanonicalValidationAndCompilationRejectUnclassifiedFieldsIdentically() {
+        let object = StartupContractUnclassifiedFieldsRow()
+        let expected = BigSyncRecordContractError.unclassifiedFields(type(of: object).className())
+        let configuration = contractConfiguration([StartupContractUnclassifiedFieldsRow.self])
+        XCTAssertThrowsError(try BigSyncRecordContract.validate(configuration: configuration)) {
+            XCTAssertEqual($0 as? BigSyncRecordContractError, expected)
+        }
+        XCTAssertThrowsError(try BigSyncCompiledRecordContract.compile(object)) {
+            XCTAssertEqual($0 as? BigSyncRecordContractError, expected)
+        }
+    }
+
+    func testCanonicalValidationStillRejectsUnsupportedProperties() throws {
+        let object = StartupContractUnsupportedPropertyRow()
+        let configuration = contractConfiguration([
+            StartupContractUnsupportedPropertyRow.self, StartupContractLinkedValue.self])
+        XCTAssertThrowsError(try BigSyncRecordContract.validate(configuration: configuration)) {
+            XCTAssertEqual($0 as? BigSyncRecordContractError,
+                           .invalidDeclaration(StartupContractUnsupportedPropertyRow.className()))
+        }
+        // Runtime compilation historically validates the declaration itself;
+        // scalar transport support is a separate canonical-admission check.
+        XCTAssertNotNil(try BigSyncCompiledRecordContract.compile(object))
+    }
+
+    func testCanonicalValidationPreservesCompiledContractAndSchemaSignature() throws {
+        let object = RetainedContractRow()
+        let configuration = contractConfiguration([RetainedContractRow.self, ContractRecoveryNote.self])
+        let before = try XCTUnwrap(BigSyncCompiledRecordContract.compile(object))
+        try BigSyncRecordContract.validate(configuration: configuration)
+        object.title = "changed instance value"
+        object.count = 19
+        let after = try XCTUnwrap(BigSyncCompiledRecordContract.compile(object))
+        XCTAssertEqual(before.declaration, RetainedContractRow.bigSyncRecordContract)
+        XCTAssertEqual(after.declaration, before.declaration)
+        XCTAssertEqual(after.signature, before.signature)
+        XCTAssertEqual(after.signature.count, 64)
+        XCTAssertNil(try BigSyncCompiledRecordContract.compile(UnadoptedContractRow()))
+    }
+
     @BigSyncBackgroundActor
     private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 

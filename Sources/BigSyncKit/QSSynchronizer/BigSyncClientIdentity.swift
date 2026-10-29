@@ -3,10 +3,10 @@ import Darwin
 import Foundation
 
 /// A manual restore could otherwise replace an app-group Realm while an
-/// extension has a write transaction in flight.  Every configured client
-/// process retains a shared advisory lock for its lifetime; restore briefly
-/// upgrades its own holder to an exclusive nonblocking lock before it touches
-/// either the Realm files or the installation identity.
+/// extension still has open Realm handles. Configured processes publish a
+/// presence file for their lifetime; restore checks those files under a short
+/// exclusive lock before touching Realm files or installation identity.
+/// No advisory lock remains held while a configured process is idle/suspended.
 public enum BigSyncClientIdentityLeaseError: Error, Equatable, Sendable {
     case restoreInProgress
     case leaseUnavailable(Int32)
@@ -57,139 +57,201 @@ public enum BigSyncManualBackupRestoreError: Error, Equatable, Sendable {
 }
 
 enum BigSyncClientIdentityLeaseRegistry {
-    private enum Mode {
-        case shared
-        case exclusive
+    /// A presence file is a conservative veto, not an expiring lease. A
+    /// suspended process is alive and must continue to prevent replacement.
+    /// PID reuse and unavailable liveness probes retain the veto. Only ESRCH
+    /// or a proven different boot permits collecting another process's file.
+    struct ProcessOwner: Codable {
+        let identifier: UUID
+        let pid: Int32
+        let bootSession: UUID?
+
+        func isDefinitelyExited(
+            currentBootSession: UUID?,
+            isProcessAlive: (Int32) -> Bool
+        ) -> Bool {
+            guard pid > 0 else { return false }
+            if let bootSession, let currentBootSession,
+               bootSession != currentBootSession { return true }
+            return !isProcessAlive(pid)
+        }
     }
+
+    private enum Mode { case registered, exclusive }
 
     private final class Lease {
         let descriptor: Int32
-        var mode: Mode
+        var mode = Mode.registered
         var cachedInstallationIdentifier: String?
 
-        init(descriptor: Int32, mode: Mode) {
-            self.descriptor = descriptor
-            self.mode = mode
-        }
-
-        deinit {
-            Darwin.close(descriptor)
-        }
+        init(descriptor: Int32) { self.descriptor = descriptor }
+        deinit { Darwin.close(descriptor) }
     }
 
-    // Identity validation may be queried by a replacement/rollback closure
-    // while `withExclusive` owns this registry on the same thread. Recursive
-    // locking keeps that fail-closed probe from deadlocking; cross-thread
-    // callers still wait until the restore boundary finishes.
+    // Replacement/rollback can synchronously reenter identity validation.
+    // Reentry may inspect the cache, but cannot release the outer restore fence.
     private static let lock = NSRecursiveLock()
     private static var leases = [String: Lease]()
+    private static let processOwner = ProcessOwner(
+        identifier: UUID(), pid: getpid(), bootSession: currentBootSession()
+    )
 
-    static func retainShared(at url: URL) throws {
+    static func retainProcessPresence(at url: URL) throws {
         lock.lock()
         defer { lock.unlock() }
-        // An existing exclusive holder already satisfies this minimum lease.
-        // Identity setup can reenter from a replacement/rollback callback;
-        // only the outer restore owner may downgrade its exclusive lock.
         _ = try lease(at: url)
     }
 
     static func cachedInstallationIdentifier(at url: URL) -> String? {
         lock.lock()
         defer { lock.unlock() }
-        return leases[url.standardizedFileURL.path]?
-            .cachedInstallationIdentifier
+        return leases[url.standardizedFileURL.path]?.cachedInstallationIdentifier
     }
 
-    static func publishInstallationIdentifier(
-        _ identifier: String,
-        at url: URL
-    ) {
+    static func publishInstallationIdentifier(_ identifier: String, at url: URL) {
         guard !identifier.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
-        leases[url.standardizedFileURL.path]?
-            .cachedInstallationIdentifier = identifier
+        leases[url.standardizedFileURL.path]?.cachedInstallationIdentifier = identifier
     }
 
     static func invalidateInstallationIdentifier(at url: URL) {
         lock.lock()
         defer { lock.unlock() }
-        leases[url.standardizedFileURL.path]?
-            .cachedInstallationIdentifier = nil
+        leases[url.standardizedFileURL.path]?.cachedInstallationIdentifier = nil
     }
 
-    static func withExclusive<T>(
-        at url: URL,
-        _ operation: () throws -> T
-    ) throws -> T {
+    static func withExclusive<T>(at url: URL, _ operation: () throws -> T) throws -> T {
         lock.lock()
         defer { lock.unlock() }
-        let lease = try lease(at: url)
-        // A recursive registry lock permits read-only identity probes, not
-        // another restore of this client. Its nested defer would otherwise
-        // release the outer operation's cross-process exclusion too early.
-        guard lease.mode == .shared else {
-            throw BigSyncClientIdentityLeaseError.restoreInProgress
-        }
-        guard bigSyncFlock(lease.descriptor, LOCK_UN) == 0 else {
-            throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
-        }
-        guard bigSyncFlock(lease.descriptor, LOCK_EX | LOCK_NB) == 0 else {
-            let lockError = Int32(errno)
-            // Restore the process-lifetime writer lease before reporting a
-            // competing app/extension holder. A later launch can retry the
-            // staged restore without a window for an unfenced local write.
-            guard bigSyncFlock(lease.descriptor, LOCK_SH) == 0 else {
-                throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
-            }
-            lease.mode = .shared
-            if lockError == EWOULDBLOCK || lockError == EAGAIN {
+        for _ in 0 ..< 3 {
+            let lease = try lease(at: url, waitsForRegistration: false)
+            guard lease.mode == .registered else {
                 throw BigSyncClientIdentityLeaseError.restoreInProgress
             }
-            throw BigSyncClientIdentityLeaseError.leaseUnavailable(lockError)
-        }
-        lease.mode = .exclusive
-        // No mutation may reuse the pre-restore identity after this boundary.
-        // The durable intent publication below also invalidates this cache for
-        // callers that exercise BackupDetection directly.
-        lease.cachedInstallationIdentifier = nil
-        defer {
-            // Downgrading before returning prevents subsequent mutations in
-            // this process from escaping the cross-process restore fence.
-            if bigSyncFlock(lease.descriptor, LOCK_SH) == 0 {
-                lease.mode = .shared
+            guard bigSyncFlock(lease.descriptor, LOCK_EX | LOCK_NB) == 0 else {
+                throw leaseError(errno)
             }
+            // Reopening a replaced path must not split coordination between
+            // this cached descriptor and a newly registering app/extension.
+            guard descriptorMatchesPath(lease.descriptor, at: url) else {
+                _ = bigSyncFlock(lease.descriptor, LOCK_UN)
+                leases.removeValue(forKey: url.standardizedFileURL.path)
+                continue
+            }
+            lease.mode = .exclusive
+            defer {
+                lease.mode = .registered
+                // Closing on an unlock failure still releases the kernel lock;
+                // process presence survives and the next call can reopen it.
+                if bigSyncFlock(lease.descriptor, LOCK_UN) != 0 {
+                    leases.removeValue(forKey: url.standardizedFileURL.path)
+                }
+            }
+            try requireNoOtherProcesses(at: url)
+            // No mutation may reuse the pre-restore identity after this boundary.
+            lease.cachedInstallationIdentifier = nil
+            return try operation()
         }
-        return try operation()
+        throw BigSyncClientIdentityLeaseError.leaseUnavailable(EBUSY)
     }
 
-    private static func lease(at url: URL) throws -> Lease {
+    static func ownerDirectory(at url: URL) -> URL {
+        url.appendingPathExtension("owners")
+    }
+
+    private static func requireNoOtherProcesses(at url: URL) throws {
+        let directory = ownerDirectory(at: url)
+        for file in try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil
+        ) where file.pathExtension == "plist" {
+            // An unreadable/malformed claim is never evidence of process exit.
+            guard let owner = try? PropertyListDecoder().decode(
+                ProcessOwner.self, from: Data(contentsOf: file)
+            ), owner.pid > 0 else {
+                throw BigSyncClientIdentityLeaseError.restoreInProgress
+            }
+            if owner.identifier == processOwner.identifier { continue }
+            guard owner.isDefinitelyExited(
+                currentBootSession: processOwner.bootSession,
+                isProcessAlive: { kill($0, 0) == 0 || errno != ESRCH }
+            ) else { throw BigSyncClientIdentityLeaseError.restoreInProgress }
+            try FileManager.default.removeItem(at: file)
+        }
+    }
+
+    private static func lease(at url: URL, waitsForRegistration: Bool = true) throws -> Lease {
         let key = url.standardizedFileURL.path
-        if let lease = leases[key] { return lease }
-        try bigSyncCreateDirectoryDurably(
-            at: url.deletingLastPathComponent()
-        )
-        let descriptor = Darwin.open(url.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
-        guard descriptor >= 0 else {
-            throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
+        if let lease = leases[key] {
+            // Read-only reentry cannot disturb an active restore, even if its
+            // caller is inspecting/replacing files under the exclusive fence.
+            if lease.mode == .exclusive || descriptorMatchesPath(lease.descriptor, at: url) {
+                return lease
+            }
+            leases.removeValue(forKey: key)
         }
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
+        try bigSyncCreateDirectoryDurably(at: url.deletingLastPathComponent())
+        for _ in 0 ..< 3 {
+            if let lease = try registerLease(at: url, waits: waitsForRegistration) {
+                leases[key] = lease
+                return lease
+            }
+        }
+        throw BigSyncClientIdentityLeaseError.leaseUnavailable(EBUSY)
+    }
+
+    /// Returns nil only when the coordination path changed during acquisition.
+    private static func registerLease(at url: URL, waits: Bool) throws -> Lease? {
+        let descriptor = Darwin.open(url.path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw leaseError(errno) }
+        var retained = false
+        defer { if !retained { Darwin.close(descriptor) } }
+        // Ordinary installation preparation may wait for a running restore.
+        // A nonblocking restore API must remain nonblocking even before this
+        // process has registered or when a stale descriptor needs reopening.
+        guard bigSyncFlock(descriptor, LOCK_SH | (waits ? 0 : LOCK_NB)) == 0 else {
+            throw leaseError(errno)
+        }
+        guard descriptorMatchesPath(descriptor, at: url) else { return nil }
+        let directory = ownerDirectory(at: url)
+        try bigSyncCreateDirectoryDurably(at: directory)
+        var excluded = URLResourceValues()
+        excluded.isExcludedFromBackup = true
         var mutableURL = url
-        do {
-            try mutableURL.setResourceValues(values)
-        } catch {
-            Darwin.close(descriptor)
-            throw error
-        }
-        guard bigSyncFlock(descriptor, LOCK_SH) == 0 else {
-            let lockError = Int32(errno)
-            Darwin.close(descriptor)
-            throw BigSyncClientIdentityLeaseError.leaseUnavailable(lockError)
-        }
-        let lease = Lease(descriptor: descriptor, mode: .shared)
-        leases[key] = lease
+        try mutableURL.setResourceValues(excluded)
+        var mutableDirectory = directory
+        try mutableDirectory.setResourceValues(excluded)
+        // SH protects only atomic presence publication, never idle lifetime.
+        try PropertyListEncoder().encode(processOwner).write(
+            to: directory.appendingPathComponent(processOwner.identifier.uuidString + ".plist"),
+            options: .atomic
+        )
+        guard bigSyncFlock(descriptor, LOCK_UN) == 0 else { throw leaseError(errno) }
+        let lease = Lease(descriptor: descriptor)
+        retained = true
         return lease
+    }
+
+    private static func descriptorMatchesPath(_ descriptor: Int32, at url: URL) -> Bool {
+        var held = stat()
+        var current = stat()
+        return Darwin.fstat(descriptor, &held) == 0
+            && Darwin.lstat(url.path, &current) == 0
+            && held.st_dev == current.st_dev && held.st_ino == current.st_ino
+    }
+
+    private static func leaseError(_ code: Int32) -> BigSyncClientIdentityLeaseError {
+        code == EWOULDBLOCK || code == EAGAIN ? .restoreInProgress : .leaseUnavailable(code)
+    }
+
+    private static func currentBootSession() -> UUID? {
+        var size = 0
+        guard sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0,
+              size > 1, size < 256 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("kern.bootsessionuuid", &buffer, &size, nil, 0) == 0 else { return nil }
+        let value = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        return UUID(uuidString: value)
     }
 }
 
@@ -236,7 +298,7 @@ public struct BigSyncClientIdentity: Sendable {
     /// returns the backup-excluded installation identity used by its journal.
     @discardableResult
     public func prepareInstallation() throws -> String {
-        try BigSyncClientIdentityLeaseRegistry.retainShared(at: leaseURL)
+        try BigSyncClientIdentityLeaseRegistry.retainProcessPresence(at: leaseURL)
         _ = try BackupDetection.run(
             store: UserDefaultsAdapter(userDefaults: .standard),
             namespace: durableStateNamespace,
@@ -426,7 +488,8 @@ public struct BigSyncClientIdentity: Sendable {
                 preflight = try BackupDetection.manualRestorePreflight(
                     namespace: durableStateNamespace,
                     transactionIdentifier: transactionIdentifier,
-                    sharedSentinelBaseURL: sharedStateBaseURL
+                    sharedSentinelBaseURL: sharedStateBaseURL,
+                    allowsUninitializedCancellation: true
                 )
             } catch BackupDetection.Error.manualRestoreTransactionMismatch {
                 throw BigSyncManualBackupRestoreError.transactionMismatch
@@ -461,6 +524,7 @@ public struct BigSyncClientIdentity: Sendable {
     @discardableResult
     public func withManualBackupRestore(
         transactionIdentifier: UUID,
+        validation: (() throws -> Void)? = nil,
         _ replacement: () throws -> Void,
         rollback: () throws -> Void = {}
     ) throws -> BigSyncManualBackupRestoreReceipt {
@@ -468,7 +532,8 @@ public struct BigSyncClientIdentity: Sendable {
             transactionIdentifier: transactionIdentifier,
             replacement,
             rollback: rollback,
-            sentinelPublisher: nil
+            sentinelPublisher: nil,
+            validation: validation
         )
     }
 
@@ -478,9 +543,13 @@ public struct BigSyncClientIdentity: Sendable {
         transactionIdentifier: UUID,
         _ replacement: () throws -> Void,
         rollback: () throws -> Void = {},
-        sentinelPublisher: ((URL, FileManager) throws -> Void)?
+        sentinelPublisher: ((URL, FileManager) throws -> Void)?,
+        validation: (() throws -> Void)? = nil
     ) throws -> BigSyncManualBackupRestoreReceipt {
         try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
+            // Validate the captured account/storage boundary under the same
+            // exclusion as replacement, including retries of completed restores.
+            try validation?()
             let preflight: BackupDetection.ManualRestorePreflight
             do {
                 preflight = try BackupDetection.manualRestorePreflight(

@@ -24,11 +24,26 @@ public extension BigSyncMutationPolicy {
     /// Undeclared records remain indivisible; models may declare independent
     /// fields or an epoch bundle without implementing reconciliation callbacks.
     static func enableRecordRebasing(in configuration: inout Realm.Configuration) {
-        precondition(configuration.objectTypes != nil)
-        for type in BigSyncLocalRecordEvidence.objectTypes where
-            configuration.objectTypes?.contains(where: { $0.className() == type.className() }) != true {
-            configuration.objectTypes?.append(type)
+        guard let objectTypes = configuration.objectTypes else {
+            preconditionFailure("Record rebasing requires explicit objectTypes")
         }
+        let completed = recordRebasingObjectTypes(objectTypes)
+        // Realm rebuilds RLMSchema in the objectTypes setter. Repeated
+        // admission is a no-op; canonical openers can compose before assigning.
+        guard completed.count != objectTypes.count else { return }
+        configuration.objectTypes = completed
+    }
+
+    /// Complete explicit types before constructing Realm's schema. Preserve
+    /// caller order and append only missing local comparison evidence tables.
+    static func recordRebasingObjectTypes(_ objectTypes: [ObjectBase.Type]) -> [ObjectBase.Type] {
+        var completed = objectTypes
+        var classNames = Set(objectTypes.map { $0.className() })
+        for type in BigSyncLocalRecordEvidence.objectTypes
+            where classNames.insert(type.className()).inserted {
+            completed.append(type)
+        }
+        return completed
     }
 }
 

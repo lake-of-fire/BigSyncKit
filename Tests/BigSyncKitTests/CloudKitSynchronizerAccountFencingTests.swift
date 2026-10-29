@@ -383,6 +383,17 @@ private final class InitialAdmissionSynchronizerReference:
         }
         try await synchronizer.revalidateInitialReplicaBindingContext(context)
     }
+
+    @BigSyncBackgroundActor
+    func withStorageOperation<Value: Sendable>(
+        _ context: BigSyncInitialReplicaBindingContext,
+        operation: @BigSyncBackgroundActor @Sendable () async throws -> Value
+    ) async throws -> Value {
+        guard let synchronizer else { throw CancellationError() }
+        return try await synchronizer.withInitialReplicaBindingStorageOperation(
+            context, operation: operation
+        )
+    }
 }
 
 private final class InitialBindingStateMutation: @unchecked Sendable {
@@ -2462,6 +2473,136 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
         XCTAssertEqual(mutationCount, 0)
         XCTAssertNil(try synchronizer.accountScopeLease())
         XCTAssertTrue(synchronizer.accountValidationRequired)
+    }
+
+    @BigSyncBackgroundActor
+    func testInitialAdmissionStorageDrainWaitsForLocalWorkToSettle() async throws {
+        for throwsDuringCleanup in [false, true] {
+            let entered = expectation(description: "local admission work entered")
+            let release = ClosureRestorationGate()
+            let reference = InitialAdmissionSynchronizerReference()
+            let synchronizer = makeSynchronizer(
+                transport: AccountFencingTransport(),
+                accountReplacementPolicy: .requireExplicitDatasetPort,
+                initialReplicaBindingAdmissionHandler: { context in
+                    try await reference.withStorageOperation(context) {
+                        entered.fulfill()
+                        // Models an already-submitted Realm open/commit whose
+                        // cleanup must finish even after task cancellation.
+                        await release.wait()
+                        if throwsDuringCleanup {
+                            throw InitialBindingAdmissionTestError.rejected
+                        }
+                    }
+                }
+            )
+            reference.synchronizer = synchronizer
+            let admission = Task { @BigSyncBackgroundActor in
+                try await synchronizer._test_validateSynchronizationAccount()
+            }
+            addTeardownBlock { @BigSyncBackgroundActor in
+                await release.open()
+                _ = await admission.result
+                await synchronizer.cancelSynchronizationAndWait()
+            }
+            await fulfillment(of: [entered], timeout: 2)
+            let drainStarted = expectation(description: "storage cancellation started")
+            let drainReturned = expectation(description: "local work drained")
+            let drain = Task { @BigSyncBackgroundActor in
+                drainStarted.fulfill()
+                await synchronizer.cancelSynchronizationAndWait()
+                drainReturned.fulfill()
+            }
+            await fulfillment(of: [drainStarted], timeout: 2)
+            // XCTWaiter does not record an expected timeout as a test failure.
+            // The local operation remains held throughout this observation.
+            let premature = await XCTWaiter.fulfillment(of: [drainReturned], timeout: 0.1)
+            XCTAssertEqual(premature, .timedOut)
+            await release.open()
+            await drain.value
+            let result = await admission.result
+            switch result {
+            case .success:
+                XCTFail("Canceled admission must not publish binding success")
+            case .failure(let error):
+                if throwsDuringCleanup {
+                    XCTAssertEqual(error as? InitialBindingAdmissionTestError, .rejected)
+                } else {
+                    XCTAssertTrue(error is CancellationError)
+                }
+            }
+            XCTAssertNil(try synchronizer.accountScopeLease())
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testInitialAdmissionNetworkWaitDoesNotHoldStorageDrain() async throws {
+        let networkEntered = expectation(description: "head fetch entered")
+        let releaseNetwork = ClosureRestorationGate()
+        let mutations = ApplicationBoundaryMutationRecorder()
+        let reference = InitialAdmissionSynchronizerReference()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { context in
+                networkEntered.fulfill()
+                await releaseNetwork.wait()
+                try await reference.withStorageOperation(context) {
+                    await mutations.recordMutation()
+                }
+            }
+        )
+        reference.synchronizer = synchronizer
+        let admission = Task { @BigSyncBackgroundActor in
+            try await synchronizer._test_validateSynchronizationAccount()
+        }
+        addTeardownBlock { @BigSyncBackgroundActor in
+            await releaseNetwork.open()
+            _ = await admission.result
+            await synchronizer.cancelSynchronizationAndWait()
+        }
+        await fulfillment(of: [networkEntered], timeout: 2)
+        let drainReturned = expectation(description: "drained while network held")
+        let drain = Task { @BigSyncBackgroundActor in
+            await synchronizer.cancelSynchronizationAndWait()
+            drainReturned.fulfill()
+        }
+        await fulfillment(of: [drainReturned], timeout: 2)
+        await drain.value
+        await releaseNetwork.open()
+        do {
+            try await admission.value
+            XCTFail("Late network reply must not admit local storage work")
+        } catch is CancellationError { }
+        let count = await mutations.mutationCount
+        XCTAssertEqual(count, 0)
+        XCTAssertNil(try synchronizer.accountScopeLease())
+    }
+
+    @BigSyncBackgroundActor
+    func testInitialAdmissionStorageRejectsAccountChangedBeforeEntry() async throws {
+        let identity = AccountFencingAccountIdentity("account-a")
+        let mutations = ApplicationBoundaryMutationRecorder()
+        let reference = InitialAdmissionSynchronizerReference()
+        let synchronizer = makeSynchronizer(
+            transport: AccountFencingTransport(),
+            accountIdentifierProvider: { await identity.current() },
+            accountReplacementPolicy: .requireExplicitDatasetPort,
+            initialReplicaBindingAdmissionHandler: { context in
+                await identity.replace(with: "account-b")
+                try await reference.withStorageOperation(context) {
+                    await mutations.recordMutation()
+                }
+            }
+        )
+        reference.synchronizer = synchronizer
+        do {
+            try await synchronizer._test_validateSynchronizationAccount()
+            XCTFail("Stale account must not enter storage work")
+        } catch OneOffRecordZoneResetError.cloudKitAccountChanged { }
+        let count = await mutations.mutationCount
+        XCTAssertEqual(count, 0)
+        await synchronizer.cancelSynchronizationAndWait()
     }
 
     @MainActor
