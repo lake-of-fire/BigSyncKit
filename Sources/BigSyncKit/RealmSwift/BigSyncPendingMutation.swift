@@ -179,16 +179,39 @@ struct BigSyncPendingMutationSnapshot: Sendable {
 
 enum BigSyncMutationTrackingRegistry {
     private static let lock = NSLock()
-    private struct Registration {
+    // The configured spelling and its resolved file path share one policy,
+    // including subsequent provider replacements through either spelling.
+    private final class Registration {
+        let identity: String
         let classNames: Set<String>
         let accountScopePropertyByClassName: [String: String]
         var installationIdentifierProvider: (@Sendable () -> String?)?
         var mutationJournalIdentityProvider:
             (@Sendable () -> BigSyncMutationJournalIdentity?)?
+
+        init(
+            identity: String,
+            classNames: Set<String>,
+            accountScopePropertyByClassName: [String: String],
+            installationIdentifierProvider: (@Sendable () -> String?)?,
+            mutationJournalIdentityProvider:
+                (@Sendable () -> BigSyncMutationJournalIdentity?)?
+        ) {
+            self.identity = identity
+            self.classNames = classNames
+            self.accountScopePropertyByClassName = accountScopePropertyByClassName
+            self.installationIdentifierProvider = installationIdentifierProvider
+            self.mutationJournalIdentityProvider = mutationJournalIdentityProvider
+        }
     }
     private static var registrationsByRealm = [String: Registration]()
 
     static func identity(for configuration: Realm.Configuration) -> String {
+        let key = configuredIdentity(for: configuration)
+        return lock.withLock { registrationsByRealm[key]?.identity ?? key }
+    }
+
+    private static func configuredIdentity(for configuration: Realm.Configuration) -> String {
         if let inMemoryIdentifier = configuration.inMemoryIdentifier {
             return "memory:\(inMemoryIdentifier)"
         }
@@ -206,15 +229,41 @@ enum BigSyncMutationTrackingRegistry {
         mutationJournalIdentityProvider:
             (@Sendable () -> BigSyncMutationJournalIdentity?)?
     ) {
+        // Resolve filesystem aliases only at installation, before the Realm
+        // opens. The leaf need not exist yet; its existing parent may contain
+        // symlinks (including iOS app-group /var paths). Mutation lookups must
+        // not perform filesystem resolution or memoize a stale provider.
+        let identities = configurations.map { configuration in
+            let configured = configuredIdentity(for: configuration)
+            var resolved = configuration
+            if let fileURL = configuration.fileURL,
+               configuration.inMemoryIdentifier == nil {
+                // Resolve the parent explicitly so a not-yet-created Realm
+                // file cannot prevent resolution of its existing directory.
+                resolved.fileURL = fileURL.deletingLastPathComponent()
+                    .resolvingSymlinksInPath()
+                    .appendingPathComponent(fileURL.lastPathComponent, isDirectory: false)
+                    .resolvingSymlinksInPath()
+            }
+            return (configured, configuredIdentity(for: resolved))
+        }
         lock.withLock {
-            for configuration in configurations {
+            for (configuration, (configuredIdentity, realmIdentity)) in zip(configurations, identities) {
                 let classNames = Set(
                     (configuration.objectTypes ?? [])
                         .map { $0.className() }
                         .filter { !excludedClassNames.contains($0) }
                 )
-                let realmIdentity = identity(for: configuration)
-                if var registration = registrationsByRealm[realmIdentity] {
+                let registration: Registration
+                if let existing = registrationsByRealm[realmIdentity]
+                    ?? registrationsByRealm[configuredIdentity] {
+                    // A registered symlink cannot be retargeted to another
+                    // Realm while its old registration is still live.
+                    precondition(
+                        existing.identity == realmIdentity,
+                        "BigSync mutation policy path changed for \(configuredIdentity)"
+                    )
+                    registration = existing
                     precondition(
                         registration.classNames == classNames,
                         "Conflicting BigSync mutation policies registered for \(realmIdentity)"
@@ -234,9 +283,9 @@ enum BigSyncMutationTrackingRegistry {
                             mutationJournalIdentityProvider
                         registration.installationIdentifierProvider = nil
                     }
-                    registrationsByRealm[realmIdentity] = registration
                 } else {
-                    registrationsByRealm[realmIdentity] = Registration(
+                    registration = Registration(
+                        identity: realmIdentity,
                         classNames: classNames,
                         accountScopePropertyByClassName:
                             accountScopePropertyByClassName,
@@ -246,6 +295,12 @@ enum BigSyncMutationTrackingRegistry {
                             mutationJournalIdentityProvider
                     )
                 }
+                if let existing = registrationsByRealm[configuredIdentity] {
+                    precondition(existing === registration,
+                                 "Conflicting BigSync mutation policy aliases for \(configuredIdentity)")
+                }
+                registrationsByRealm[realmIdentity] = registration
+                registrationsByRealm[configuredIdentity] = registration
             }
         }
     }
@@ -273,7 +328,7 @@ enum BigSyncMutationTrackingRegistry {
     ) -> MutationContext {
         lock.withLock {
             guard let registration = registrationsByRealm[
-                identity(for: realm.configuration)
+                configuredIdentity(for: realm.configuration)
             ] else {
                 return MutationContext(
                     trackingStatus: .unregistered,
@@ -307,7 +362,7 @@ enum BigSyncMutationTrackingRegistry {
     ) -> BigSyncMutationJournalIdentity? {
         let provider = lock.withLock {
             registrationsByRealm[
-                identity(for: realm.configuration)
+                configuredIdentity(for: realm.configuration)
             ]?.mutationJournalIdentityProvider
         }
         return provider?()
@@ -321,7 +376,7 @@ enum BigSyncMutationTrackingRegistry {
     ) {
         let context = lock.withLock {
             let registration = registrationsByRealm[
-                identity(for: realm.configuration)
+                configuredIdentity(for: realm.configuration)
             ]
             return MutationContext(
                 trackingStatus: registration == nil
@@ -416,7 +471,7 @@ enum BigSyncMutationTrackingRegistry {
     ) -> Bool {
         let provider = lock.withLock {
             let registration = registrationsByRealm[
-                identity(for: realm.configuration)
+                configuredIdentity(for: realm.configuration)
             ]
             return (
                 registration?.mutationJournalIdentityProvider,
@@ -455,7 +510,7 @@ enum BigSyncMutationTrackingRegistry {
         }
         let provider = lock.withLock {
             registrationsByRealm[
-                identity(for: realm.configuration)
+                configuredIdentity(for: realm.configuration)
             ]?.mutationJournalIdentityProvider
         }
         guard let identity = provider?(),

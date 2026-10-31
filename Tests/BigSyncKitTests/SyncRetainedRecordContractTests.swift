@@ -113,6 +113,26 @@ private final class StartupContractUnsupportedPropertyRow: Object, BigSyncRecord
 }
 
 final class SyncRetainedRecordContractTests: XCTestCase {
+    func testFingerprintIncludesSemanticMetadataAndExcludesTransportClocks() throws {
+        let object = RetainedContractRow()
+        let original = try BigSyncRecordFingerprint.fields(of: object)
+        XCTAssertEqual(Set(original.keys), [
+            "epoch", "title", "count", "isDeleted", "createdAt", "bytes", "members", "counts"
+        ])
+
+        object.modifiedAt = Date(timeIntervalSinceReferenceDate: 200)
+        object.explicitlyModifiedAt = Date(timeIntervalSinceReferenceDate: 300)
+        XCTAssertEqual(try BigSyncRecordFingerprint.fields(of: object), original)
+
+        object.createdAt = Date(timeIntervalSinceReferenceDate: 400)
+        let changed = try BigSyncRecordFingerprint.fields(of: object)
+        XCTAssertNotEqual(changed["createdAt"], original["createdAt"])
+        XCTAssertEqual(
+            changed.filter { $0.key != "createdAt" },
+            original.filter { $0.key != "createdAt" }
+        )
+    }
+
     private func contractConfiguration(_ objectTypes: [ObjectBase.Type]) -> Realm.Configuration {
         Realm.Configuration(
             inMemoryIdentifier: "startup-contract-validation-" + UUID().uuidString,

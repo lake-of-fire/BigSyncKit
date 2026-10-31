@@ -152,11 +152,14 @@ enum BigSyncRecordFingerprint {
     static func properties(of object: Object) -> [Property] {
         let skipped = (object as? SyncSkippablePropertiesModel)?
             .skipSyncingProperties() ?? []
-        return object.objectSchema.properties.filter {
-            $0.name != object.objectSchema.primaryKeyProperty?.name
+        let schema = object.objectSchema
+        let primaryKeyName = schema.primaryKeyProperty?.name
+        let metadataFields = BigSyncRecordLifecycle.metadataFields(for: object)
+        return schema.properties.filter {
+            $0.name != primaryKeyName
                 && $0.type != .linkingObjects
                 && !skipped.contains($0.name)
-                && !BigSyncRecordLifecycle.metadataFields(for: object).contains($0.name)
+                && !metadataFields.contains($0.name)
         }
     }
 

@@ -15,6 +15,18 @@ private final class InstallationIdentityMutationObject: Object,
     @Persisted var explicitlyModifiedAt: Date?
 }
 
+@objc(BigSyncMutationPolicyIdentityRegressionObject)
+private final class MutationPolicyIdentityObject: Object, ChangeMetadataRecordable {
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+
+    @Persisted(primaryKey: true) var id = "object"
+    @Persisted var accountScope = "account-a"
+    @Persisted var isDeleted = false
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+}
+
 final class BackupDetectionTests: XCTestCase {
     private final class Store: NSObject, KeyValueStore {
         func object(forKey key: String) -> Any? { nil }
@@ -77,6 +89,267 @@ final class BackupDetectionTests: XCTestCase {
     private func temporaryRoot() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    }
+
+    private func policyIdentityConfiguration(at fileURL: URL) -> Realm.Configuration {
+        var configuration = Realm.Configuration()
+        configuration.fileURL = fileURL
+        configuration.objectTypes = [MutationPolicyIdentityObject.self, BigSyncPendingMutation.self]
+        return configuration
+    }
+
+    private func identityPolicy(excludingObject: Bool = false) -> BigSyncMutationPolicy {
+        BigSyncMutationPolicy(
+            excludedClassNames: excludingObject ? [MutationPolicyIdentityObject.className()] : [],
+            accountScopePropertyByClassName: [MutationPolicyIdentityObject.className(): "accountScope"]
+        )
+    }
+
+    private func journalIdentityMutation(
+        in realm: Realm,
+        at timestamp: Date = Date()
+    ) throws -> BigSyncPendingMutation {
+        // Diagnose a missing registration without deliberately triggering the
+        // production assertion and terminating the entire XCTest process.
+        guard case .tracked = BigSyncMutationTrackingRegistry.mutationContext(
+            className: MutationPolicyIdentityObject.className(), in: realm
+        ).trackingStatus else {
+            XCTFail("Opened Realm lost its installed mutation policy")
+            throw NSError(domain: "MutationPolicyIdentityTests", code: 1)
+        }
+        let object = realm.object(ofType: MutationPolicyIdentityObject.self, forPrimaryKey: "object")
+            ?? MutationPolicyIdentityObject()
+        try realm.write {
+            realm.add(object, update: .modified)
+            object.refreshChangeMetadata(explicitlyModified: true, at: timestamp)
+        }
+        return try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self,
+            forPrimaryKey: MutationPolicyIdentityObject.className() + ".object"
+        ))
+    }
+
+    func testMutationPolicyRecognizesOpenedRealmThroughSymlinkBeforeAndAfterFileCreation() throws {
+        let root = temporaryRoot().resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for (fileAlreadyExists, openUsingAlias) in [(false, false), (false, true), (true, false), (true, true)] {
+            try autoreleasepool {
+                let directory = root.appendingPathComponent("exists-\(fileAlreadyExists)-alias-\(openUsingAlias)")
+                let physical = directory.appendingPathComponent("physical", isDirectory: true)
+                let alias = directory.appendingPathComponent("alias", isDirectory: true)
+                try FileManager.default.createDirectory(at: physical, withIntermediateDirectories: true)
+                try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: physical)
+                let physicalConfiguration = policyIdentityConfiguration(
+                    at: physical.appendingPathComponent("target.realm")
+                )
+                let aliasConfiguration = policyIdentityConfiguration(
+                    at: alias.appendingPathComponent("target.realm")
+                )
+                if fileAlreadyExists {
+                    try autoreleasepool { _ = try Realm(configuration: physicalConfiguration) }
+                }
+                XCTAssertEqual(FileManager.default.fileExists(
+                    atPath: try XCTUnwrap(physicalConfiguration.fileURL).path
+                ), fileAlreadyExists)
+                let identity = BigSyncMutationJournalIdentity(
+                    installationIdentifier: UUID().uuidString,
+                    replicaBindingGenerationIdentifier: "binding-a"
+                )
+                identityPolicy().install(
+                    configurations: [aliasConfiguration],
+                    mutationJournalIdentityProvider: { identity }
+                )
+                // Exercise both open spellings and the actual configuration
+                // returned by Realm, rather than comparing synthetic URLs only.
+                let realm = try Realm(configuration: openUsingAlias ? aliasConfiguration : physicalConfiguration)
+                XCTAssertEqual(
+                    BigSyncMutationTrackingRegistry.identity(for: aliasConfiguration),
+                    BigSyncMutationTrackingRegistry.identity(for: realm.configuration)
+                )
+                XCTAssertEqual(
+                    BigSyncMutationTrackingRegistry.identity(for: physicalConfiguration),
+                    BigSyncMutationTrackingRegistry.identity(for: realm.configuration)
+                )
+                let timestamp = Date(timeIntervalSinceReferenceDate: 42_000)
+                let mutation = try journalIdentityMutation(in: realm, at: timestamp)
+                let generation = mutation.generation
+                XCTAssertEqual(mutation.entityType, MutationPolicyIdentityObject.className())
+                XCTAssertEqual(mutation.objectIdentifier, "object")
+                XCTAssertEqual(mutation.accountScopeIdentifier, "account-a")
+                XCTAssertEqual(mutation.replicaBindingGenerationIdentifier, "binding-a")
+                XCTAssertTrue(BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(
+                    generation, identity: identity
+                ))
+                XCTAssertTrue(BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+                    mutation, realm: realm
+                ))
+                XCTAssertEqual(mutation.changedAt, timestamp)
+                XCTAssertEqual(realm.objects(MutationPolicyIdentityObject.self).first?.explicitlyModifiedAt, timestamp)
+                let roundTrippedRealm = try Realm(configuration: realm.configuration)
+                XCTAssertEqual(roundTrippedRealm.objects(BigSyncPendingMutation.self).count, 1)
+                XCTAssertEqual(roundTrippedRealm.objects(BigSyncPendingMutation.self).first?.generation, generation)
+            }
+        }
+    }
+
+    func testMutationPolicyRecognizesVarPrivateVarRealmConfigurationRoundTrip() throws {
+        let root = temporaryRoot().resolvingSymlinksInPath()
+        let suffix: String
+        if root.path.hasPrefix("/private/var/") {
+            suffix = String(root.path.dropFirst("/private/var".count))
+        } else if root.path.hasPrefix("/var/") {
+            suffix = String(root.path.dropFirst("/var".count))
+        } else {
+            throw XCTSkip("The test container does not use the Darwin /var alias")
+        }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try autoreleasepool {
+            let varRoot = URL(fileURLWithPath: "/var" + suffix, isDirectory: true)
+            let privateVarRoot = URL(fileURLWithPath: "/private/var" + suffix, isDirectory: true)
+            // Confirm these spellings refer to the same actual directory on
+            // this test host before treating them as policy aliases.
+            let varAttributes = try FileManager.default.attributesOfItem(atPath: varRoot.path)
+            let privateAttributes = try FileManager.default.attributesOfItem(atPath: privateVarRoot.path)
+            XCTAssertEqual(try XCTUnwrap(varAttributes[.systemNumber] as? NSNumber),
+                           try XCTUnwrap(privateAttributes[.systemNumber] as? NSNumber))
+            XCTAssertEqual(try XCTUnwrap(varAttributes[.systemFileNumber] as? NSNumber),
+                           try XCTUnwrap(privateAttributes[.systemFileNumber] as? NSNumber))
+            for (index, roots) in [(varRoot, privateVarRoot), (privateVarRoot, varRoot)].enumerated() {
+                let fileName = "target-\(index).realm"
+                let installed = policyIdentityConfiguration(at: roots.0.appendingPathComponent(fileName))
+                let opened = policyIdentityConfiguration(at: roots.1.appendingPathComponent(fileName))
+                identityPolicy().install(configurations: [installed], installationIdentifier: "var-alias-installation")
+                let realm = try Realm(configuration: opened)
+                XCTAssertEqual(BigSyncMutationTrackingRegistry.identity(for: installed),
+                               BigSyncMutationTrackingRegistry.identity(for: realm.configuration))
+                XCTAssertTrue(BigSyncPendingMutation.wasCreatedInInstallation(
+                    try journalIdentityMutation(in: realm).generation,
+                    installationIdentifier: "var-alias-installation"
+                ))
+                XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+            }
+        }
+    }
+
+    func testMutationPolicyProviderUpdatesThroughEitherFileAliasReachOpenedRealm() throws {
+        let root = temporaryRoot().resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try autoreleasepool {
+            let physical = root.appendingPathComponent("physical", isDirectory: true)
+            let alias = root.appendingPathComponent("alias", isDirectory: true)
+            try FileManager.default.createDirectory(at: physical, withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: physical)
+            let physicalConfiguration = policyIdentityConfiguration(at: physical.appendingPathComponent("target.realm"))
+            let aliasConfiguration = policyIdentityConfiguration(at: alias.appendingPathComponent("target.realm"))
+            let first = BigSyncMutationJournalIdentity(
+                installationIdentifier: "first-installation", replicaBindingGenerationIdentifier: "first-binding"
+            )
+            let last = BigSyncMutationJournalIdentity(
+                installationIdentifier: "last-installation", replicaBindingGenerationIdentifier: "last-binding"
+            )
+            let policy = identityPolicy()
+            policy.install(configurations: [aliasConfiguration], mutationJournalIdentityProvider: { first })
+            let realm = try Realm(configuration: physicalConfiguration)
+            let firstMutation = try journalIdentityMutation(in: realm)
+            let firstGeneration = firstMutation.generation
+            XCTAssertTrue(BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(firstGeneration, identity: first))
+
+            // A fixed provider replaces the combined provider for both aliases.
+            policy.install(configurations: [realm.configuration], installationIdentifier: "fixed-installation")
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, firstGeneration,
+                           "Policy replacement must not relabel already committed work")
+            XCTAssertNil(BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm))
+            XCTAssertFalse(BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+                firstMutation, realm: realm
+            ))
+            let fixedMutation = try journalIdentityMutation(in: realm)
+            let fixedGeneration = fixedMutation.generation
+            XCTAssertNotEqual(fixedGeneration, firstGeneration)
+            XCTAssertNil(fixedMutation.replicaBindingGenerationIdentifier)
+            XCTAssertTrue(BigSyncPendingMutation.wasCreatedInInstallation(
+                fixedGeneration, installationIdentifier: "fixed-installation"
+            ))
+            XCTAssertTrue(BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+                fixedMutation, realm: realm
+            ))
+
+            // Reinstall through the original alias after the file exists. The
+            // opened physical Realm must see the replacement combined provider.
+            policy.install(configurations: [aliasConfiguration], mutationJournalIdentityProvider: { last })
+            policy.install(configurations: [physicalConfiguration])
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).first?.generation, fixedGeneration)
+            XCTAssertEqual(BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm), last)
+            XCTAssertFalse(BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+                fixedMutation, realm: realm
+            ))
+            let lastMutation = try journalIdentityMutation(in: realm)
+            XCTAssertNotEqual(lastMutation.generation, fixedGeneration)
+            XCTAssertTrue(BigSyncPendingMutation.wasCreatedInMutationJournalIdentity(lastMutation.generation, identity: last))
+            XCTAssertEqual(lastMutation.replicaBindingGenerationIdentifier, "last-binding")
+            XCTAssertEqual(lastMutation.accountScopeIdentifier, "account-a")
+            XCTAssertTrue(BigSyncMutationTrackingRegistry.mutationWasCreatedInCurrentTransportIdentity(
+                lastMutation, realm: realm
+            ))
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+        }
+    }
+
+    func testMutationPolicyKeepsDistinctFileRootsAndInMemoryIdentitiesSeparate() throws {
+        let root = temporaryRoot().resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try autoreleasepool {
+            let firstDirectory = root.appendingPathComponent("first", isDirectory: true)
+            let secondDirectory = root.appendingPathComponent("second", isDirectory: true)
+            try FileManager.default.createDirectory(at: firstDirectory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: secondDirectory, withIntermediateDirectories: true)
+            let fileName = "target-\(UUID().uuidString).realm"
+            let firstConfiguration = policyIdentityConfiguration(at: firstDirectory.appendingPathComponent(fileName))
+            let secondConfiguration = policyIdentityConfiguration(at: secondDirectory.appendingPathComponent(fileName))
+            var memoryConfiguration = firstConfiguration
+            memoryConfiguration.inMemoryIdentifier = fileName
+            var otherMemoryConfiguration = memoryConfiguration
+            otherMemoryConfiguration.inMemoryIdentifier = UUID().uuidString
+            identityPolicy().install(configurations: [firstConfiguration], installationIdentifier: "file-installation")
+            identityPolicy(excludingObject: true).install(configurations: [secondConfiguration, otherMemoryConfiguration])
+            identityPolicy().install(configurations: [memoryConfiguration], installationIdentifier: "memory-installation")
+            let firstRealm = try Realm(configuration: firstConfiguration)
+            let secondRealm = try Realm(configuration: secondConfiguration)
+            let memoryRealm = try Realm(configuration: memoryConfiguration)
+            let otherMemoryRealm = try Realm(configuration: otherMemoryConfiguration)
+            let identities = [firstRealm, secondRealm, memoryRealm, otherMemoryRealm].map {
+                BigSyncMutationTrackingRegistry.identity(for: $0.configuration)
+            }
+            XCTAssertEqual(Set(identities).count, 4)
+            XCTAssertTrue(BigSyncPendingMutation.wasCreatedInInstallation(
+                try journalIdentityMutation(in: firstRealm).generation, installationIdentifier: "file-installation"
+            ))
+            XCTAssertTrue(BigSyncPendingMutation.wasCreatedInInstallation(
+                try journalIdentityMutation(in: memoryRealm).generation, installationIdentifier: "memory-installation"
+            ))
+            for excludedRealm in [secondRealm, otherMemoryRealm] {
+                guard case .excluded = BigSyncMutationTrackingRegistry.mutationContext(
+                    className: MutationPolicyIdentityObject.className(), in: excludedRealm
+                ).trackingStatus else {
+                    XCTFail("Distinct Realm inherited another Realm's mutation policy")
+                    return
+                }
+                try excludedRealm.write {
+                    let object = MutationPolicyIdentityObject()
+                    excludedRealm.add(object)
+                    object.refreshChangeMetadata(explicitlyModified: true)
+                }
+                XCTAssertTrue(excludedRealm.objects(BigSyncPendingMutation.self).isEmpty)
+            }
+            var unregisteredConfiguration = memoryConfiguration
+            unregisteredConfiguration.inMemoryIdentifier = UUID().uuidString
+            let unregisteredRealm = try Realm(configuration: unregisteredConfiguration)
+            guard case .unregistered = BigSyncMutationTrackingRegistry.mutationContext(
+                className: MutationPolicyIdentityObject.className(), in: unregisteredRealm
+            ).trackingStatus else {
+                return XCTFail("An uninstalled Realm must retain the unregistered diagnostic")
+            }
+        }
     }
 
     private func simulateRestoredMarker(from installed: URL, to restored: URL) throws {
