@@ -60,6 +60,7 @@ enum BigSyncClientIdentityLeaseRegistry {
     private enum Mode {
         case shared
         case exclusive
+        case publication
     }
 
     private final class Lease {
@@ -161,6 +162,18 @@ enum BigSyncClientIdentityLeaseRegistry {
             }
         }
         return try operation()
+    }
+
+    /// Uses the same process-lifetime shared lease and registry frontier as
+    /// restore. No identity/storage callbacks may reenter this registry.
+    static func withPublication<T>(at url: URL, _ body: () throws -> T) throws -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        let current = try lease(at: url)
+        guard current.mode == .shared else { throw BigSyncClientIdentityLeaseError.restoreInProgress }
+        current.mode = .publication
+        defer { current.mode = .shared }
+        return try body()
     }
 
     private static func lease(at url: URL) throws -> Lease {
@@ -312,6 +325,9 @@ public struct BigSyncClientIdentity: Sendable {
     }
 
     public func currentInstallationIdentifier() -> String? {
+        if let borrowed = BigSyncReplicaPublicationReadScope.current(identity: self) {
+            return borrowed.identity.installationIdentifier
+        }
         if let cached = BigSyncClientIdentityLeaseRegistry
             .cachedInstallationIdentifier(at: leaseURL) {
             return cached
@@ -401,7 +417,7 @@ public struct BigSyncClientIdentity: Sendable {
     /// fields from opposite sides of the identity boundary.
     public func currentMutationJournalIdentity()
         -> BigSyncMutationJournalIdentity? {
-        makeMutationJournalIdentityProvider()()
+        currentMutationJournalIdentity(storeURL: synchronizationStateFileURL)
     }
 
     /// Publishes a manual Realm-backup restore before synchronization metadata
@@ -486,7 +502,17 @@ public struct BigSyncClientIdentity: Sendable {
         rollback: () throws -> Void = {},
         sentinelPublisher: ((URL, FileManager) throws -> Void)?
     ) throws -> BigSyncManualBackupRestoreReceipt {
-        try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
+        guard BigSyncReplicaPublicationReadScope.current(identity: self) == nil else {
+            throw BigSyncReplicaPublicationError.reentrantPublication
+        }
+        let before = currentInstallationIdentifier()
+        defer {
+            if before != currentInstallationIdentifier() {
+                // Outside the exclusive lease, including incomplete handoffs.
+                NotificationCenter.default.post(name: .BigSyncReplicaPublicationAuthorityDidChange, object: nil)
+            }
+        }
+        return try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
             // Read-only admission must precede identity preflight: a rejected
             // archive may be encountered before the first installation exists.
             // The caller must still validate again immediately before replacement.
@@ -663,5 +689,135 @@ public struct BigSyncClientIdentity: Sendable {
             namespace: durableStateNamespace,
             sharedBaseURL: sharedStateBaseURL
         ).appendingPathExtension("lease")
+    }
+
+    /// Captures publication authority from the exact store used by the worker.
+    /// Custom non-file stores cannot establish cross-process admission.
+    public func capturePublicationAdmission(store: FileKeyValueStore? = nil) throws -> BigSyncReplicaPublicationAdmission {
+        guard BigSyncReplicaPublicationReadScope.current(identity: self) == nil else {
+            throw BigSyncReplicaPublicationError.reentrantPublication
+        }
+        let store = store ?? FileKeyValueStore(fileURL: synchronizationStateFileURL)
+        return try BigSyncClientIdentityLeaseRegistry.withPublication(at: leaseURL) {
+            guard let installation = publicationInstallationIdentifier() else {
+                throw BigSyncReplicaPublicationError.unavailable
+            }
+            return try store.withDurableSnapshot { values in
+                let key = durableStateNamespace + ".ReplicaBinding.v1"
+                guard let raw = values[key] else { throw BigSyncReplicaPublicationError.unavailable }
+                let binding = try BigSyncReplicaBindingStateStore.decode(raw)
+                guard binding.pendingPort == nil,
+                      binding.installationIdentityDigest == BigSyncReplicaBindingStateStore.installationIdentityDigest(for: installation)
+                else { throw BigSyncReplicaPublicationError.unavailable }
+                return BigSyncReplicaPublicationAdmission(identity: self, store: store,
+                    installationIdentifier: installation, binding: binding)
+            }
+        }
+    }
+
+    // Called only under the registry's admission. Deliberately bypasses its
+    // cached getter: this must neither recurse into a lock nor accept an intent.
+    fileprivate func publicationInstallationIdentifier() -> String? {
+        guard !BackupDetection.manualRestoreIntentIsRequired(namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL), let installation = publishedInstallationIdentifier() else { return nil }
+        if let receipt = BackupDetection.manualRestoreReceipt(namespace: durableStateNamespace,
+            sharedSentinelBaseURL: sharedStateBaseURL), receipt.newInstallationIdentifier != installation { return nil }
+        if BackupDetection.restoreResetIsRequired(namespace: durableStateNamespace, sharedSentinelBaseURL: sharedStateBaseURL),
+           BackupDetection.restoreResetEventIdentifier(namespace: durableStateNamespace, sharedSentinelBaseURL: sharedStateBaseURL) == nil { return nil }
+        return installation
+    }
+
+    fileprivate func withPublication<Value>(_ body: () throws -> Value) throws -> Value {
+        try BigSyncClientIdentityLeaseRegistry.withPublication(at: leaseURL, body)
+    }
+}
+
+public extension Notification.Name {
+    /// Wake for identity owners. Delivered after durable binding writes/restore
+    /// locks release. It is not publication authority; retain an admission instead.
+    static let BigSyncReplicaPublicationAuthorityDidChange = Notification.Name("BigSyncReplicaPublicationAuthorityDidChange")
+}
+
+public enum BigSyncReplicaPublicationError: Error, Equatable { case unavailable, superseded, reentrantPublication }
+
+/// Read-only borrowing for Realm's synchronous mutation-journal attribution
+/// inside a held publication. This is never retained beyond that stack frame.
+/// It avoids recursively acquiring installation/binding locks during COMMIT.
+enum BigSyncReplicaPublicationReadScope {
+    private static let key = "BigSyncReplicaPublicationReadScope"
+    final class Borrowed: NSObject {
+        let namespace: String
+        let root: URL
+        let storeURL: URL
+        let identity: BigSyncMutationJournalIdentity
+        let binding: BigSyncReplicaBindingSnapshot
+        init(client: BigSyncClientIdentity, store: FileKeyValueStore, identity: BigSyncMutationJournalIdentity,
+             binding: BigSyncReplicaBindingSnapshot) {
+            namespace = client.durableStateNamespace; root = client.sharedStateBaseURL
+            storeURL = store.fileURL.standardizedFileURL; self.identity = identity
+            self.binding = binding
+        }
+    }
+    static func current(identity: BigSyncClientIdentity) -> Borrowed? {
+        guard let value = Thread.current.threadDictionary[key] as? Borrowed,
+              value.namespace == identity.durableStateNamespace, value.root == identity.sharedStateBaseURL else { return nil }
+        return value
+    }
+    static func withValue<Value>(_ value: Borrowed, _ body: () throws -> Value) throws -> Value {
+        guard Thread.current.threadDictionary[key] == nil else { throw BigSyncReplicaPublicationError.reentrantPublication }
+        Thread.current.threadDictionary[key] = value
+        defer { Thread.current.threadDictionary.removeObject(forKey: key) }
+        return try body()
+    }
+}
+
+/// Pins the accepted installation and complete binding state, including owner.
+/// Pending port generations are journal attribution, not publication authority.
+public struct BigSyncReplicaPublicationAdmission: @unchecked Sendable {
+    private let identity: BigSyncClientIdentity
+    private let store: FileKeyValueStore
+    public let installationIdentifier: String
+    public var replicaBindingGenerationIdentifier: String { binding.activeGenerationIdentifier }
+    private let binding: BigSyncReplicaBindingSnapshot
+
+    fileprivate init(identity: BigSyncClientIdentity, store: FileKeyValueStore,
+        installationIdentifier: String, binding: BigSyncReplicaBindingSnapshot) {
+        self.identity = identity; self.store = store
+        self.installationIdentifier = installationIdentifier; self.binding = binding
+    }
+
+    /// For a composed inner consumer already enclosed by withCurrent(). This
+    /// checks exact authority without recursively entering replica/store locks.
+    public func validateHeldPublication() throws {
+        guard let borrowed = BigSyncReplicaPublicationReadScope.current(identity: identity),
+              borrowed.storeURL == store.fileURL.standardizedFileURL,
+              borrowed.identity.installationIdentifier == installationIdentifier,
+              borrowed.binding == binding else { throw BigSyncReplicaPublicationError.superseded }
+    }
+
+    /// Holds installation/restore admission and the existing cross-process
+    /// binding file guard THROUGH the caller's COMMIT. Enter after SQL/file and
+    /// account admission. The bounded synchronous callback may install values or
+    /// transact on already-admitted destination handles. It must not await,
+    /// enter Session, SQL executors, store APIs, or start lifecycle/replacement work. Realm's
+    /// journal may read the already-held identity via its read-only borrowed
+    /// scope; nested publication admission is rejected before acquiring locks.
+    public func withCurrent<Value>(_ body: () throws -> Value) throws -> Value {
+        guard BigSyncReplicaPublicationReadScope.current(identity: identity) == nil else {
+            throw BigSyncReplicaPublicationError.reentrantPublication
+        }
+        return try identity.withPublication {
+            guard identity.publicationInstallationIdentifier() == installationIdentifier else {
+                throw BigSyncReplicaPublicationError.superseded
+            }
+            return try store.withDurableSnapshot { values in
+                guard let raw = values[identity.durableStateNamespace + ".ReplicaBinding.v1"],
+                      try BigSyncReplicaBindingStateStore.decode(raw) == binding,
+                      binding.pendingPort == nil else { throw BigSyncReplicaPublicationError.superseded }
+                return try BigSyncReplicaPublicationReadScope.withValue(.init(client: identity, store: store,
+                    identity: .init(installationIdentifier: installationIdentifier,
+                        replicaBindingGenerationIdentifier: replicaBindingGenerationIdentifier), binding: binding), body)
+            }
+        }
     }
 }
