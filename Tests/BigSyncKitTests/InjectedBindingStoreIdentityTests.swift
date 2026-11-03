@@ -39,7 +39,13 @@ final class InjectedBindingStoreIdentityTests: XCTestCase {
             let notification = expectation(description: "Changed binding notified after releasing its file guard")
             let observer = NotificationCenter.default.addObserver(forName: .BigSyncReplicaPublicationAuthorityDidChange,
                 object: nil, queue: nil) { _ in
-                XCTAssertThrowsError(try old.withCurrent { XCTFail("Old publication admitted") })
+                do {
+                    try old.withCurrent {}
+                    XCTFail("Old publication admitted")
+                } catch {
+                    // Rejection is the expected predecessor outcome. The
+                    // notification callback itself must remain nonthrowing.
+                }
                 notification.fulfill()
             }
             defer { NotificationCenter.default.removeObserver(observer) }
