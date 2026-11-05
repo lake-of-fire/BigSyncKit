@@ -74,6 +74,14 @@ struct CloudKitRetryConstraints {
             // NSMultipleUnderlyingErrorsKey. A pure failure proof must not
             // discard a local failure or constraint carried by either form.
             let info = error.userInfo
+            // Single-record absence cannot derive authority from an unexpected
+            // item container on any public unknownItem, including the root.
+            // Reject presence even when empty/malformed; do not reinterpret it.
+            if allowingDirectMissingRecordDetail, cloudError.code == .unknownItem,
+               info[CKPartialErrorsByItemIDKey] != nil {
+                memo[id] = (error, .complete(height: nil))
+                return nil
+            }
             let underlying = cloudKitUnderlyingErrors(in: info)
             guard underlying.isComplete else {
                 memo[id] = (error, .complete(height: nil))

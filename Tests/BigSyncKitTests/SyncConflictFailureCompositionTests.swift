@@ -237,6 +237,65 @@ final class SyncConflictFailureCompositionTests: XCTestCase {
         }
     }
 
+    func testMissingRecordObservedDetailRejectsPublicRootPartialPayloads() {
+        let detail = NSError(domain: "CKInternalErrorDomain", code: 2003)
+        let payloads: [Any] = [
+            ["other": CKError(.notAuthenticated)],
+            ["other": CKError(.accountTemporarilyUnavailable)],
+            ["other": CKError(.unknownItem)],
+            [String: Error](),
+            ["other": "malformed"],
+            "malformed",
+        ]
+        for payload in payloads {
+            let error = CKError(.unknownItem, userInfo: [
+                NSUnderlyingErrorKey: detail, CKPartialErrorsByItemIDKey: payload,
+            ])
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(error),
+                "Observed detail cannot authorize an unexpected public item container")
+        }
+    }
+
+    func testMissingRecordWithoutDetailRejectsPublicRootPartialPayloads() {
+        let payloads: [Any] = [
+            ["other": CKError(.notAuthenticated)],
+            ["other": CKError(.accountTemporarilyUnavailable)],
+            ["other": CKError(.unknownItem)],
+            [String: Error](),
+            ["other": "malformed"],
+            "malformed",
+        ]
+        for payload in payloads {
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+                CKError(.unknownItem, userInfo: [CKPartialErrorsByItemIDKey: payload])),
+                "A public item container cannot prove single-record absence without detail either")
+        }
+    }
+
+    func testMissingRecordObservedDetailRejectsNestedPublicPartialPayloads() {
+        let detail = NSError(domain: "CKInternalErrorDomain", code: 2003)
+        XCTAssertTrue(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+            CKError(.unknownItem, userInfo: [
+                NSMultipleUnderlyingErrorsKey: [detail, CKError(.unknownItem)],
+            ])), "An unconstrained nested public unknownItem remains valid")
+        let payloads: [Any] = [
+            ["other": CKError(.notAuthenticated)],
+            ["other": CKError(.accountTemporarilyUnavailable)],
+            ["other": CKError(.unknownItem)],
+            [String: Error](),
+            ["other": "malformed"],
+            "malformed",
+        ]
+        for payload in payloads {
+            let nested = CKError(.unknownItem, userInfo: [CKPartialErrorsByItemIDKey: payload])
+            let error = CKError(.unknownItem, userInfo: [
+                NSMultipleUnderlyingErrorsKey: [detail, nested],
+            ])
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(error),
+                "Direct observed detail cannot hide a nested public item container")
+        }
+    }
+
     func testMissingRecordProviderDetailPreservesSiblingConstraints() {
         let detail = NSError(domain: "CKInternalErrorDomain", code: 2003)
         let siblings: [Error] = [
