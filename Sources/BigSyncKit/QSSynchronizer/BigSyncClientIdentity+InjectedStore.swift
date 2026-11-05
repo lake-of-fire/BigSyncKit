@@ -1,6 +1,15 @@
 import Foundation
 
 extension BigSyncClientIdentity {
+    /// A read-only sample for callers selecting a file-backed injected store.
+    /// Borrow before constructing FileKeyValueStore: its initializer also takes
+    /// the namespace file guard, which must not be reacquired during COMMIT.
+    public func currentMutationJournalIdentity(storeURL: URL) -> BigSyncMutationJournalIdentity? {
+        if let borrowed = BigSyncReplicaPublicationReadScope.current(identity: self),
+           borrowed.storeURL == storeURL.standardizedFileURL { return borrowed.identity }
+        return currentMutationJournalIdentity(store: FileKeyValueStore(fileURL: storeURL))
+    }
+
     /// Uses the same state store supplied through BigSyncLocalStateConfiguration.
     /// This overload changes resource selection, not identity/restore/binding
     /// policy or the serialized format. Hosts must not prepare a second default

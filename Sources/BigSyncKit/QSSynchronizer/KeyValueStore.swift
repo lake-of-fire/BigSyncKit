@@ -472,6 +472,21 @@ extension KeyValueStore {
         }
     }
 
+    /// Internal identity-owner frontier. The existing namespace file guard stays
+    /// held through the caller's bounded publication, excluding every peer's
+    /// durable binding write. The callback must not reenter this store.
+    func withDurableSnapshot<Value>(_ body: ([String: Any]) throws -> Value) throws -> Value {
+        try lock.withLock {
+            try withFileLockThrowing(mode: LOCK_SH) {
+                let snapshot = try reloadStorageLockedThrowing()
+                guard !hasUncommittedMutationFailure else {
+                    throw lastPersistenceError ?? DurableKeyValueStoreError.mutationNotDurable
+                }
+                return try body(snapshot)
+            }
+        }
+    }
+
     public func setDurably(value: Any?, forKey defaultName: String) throws {
         try lock.withLock {
             do {

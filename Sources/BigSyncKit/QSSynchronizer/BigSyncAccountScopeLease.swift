@@ -293,7 +293,7 @@ enum BigSyncReplicaBindingStateStore {
         return try decode(raw)
     }
 
-    private static func decode(_ raw: Any) throws -> BigSyncReplicaBindingSnapshot {
+    static func decode(_ raw: Any) throws -> BigSyncReplicaBindingSnapshot {
         guard let value = raw as? [String: Any],
               BigSyncPersistedAccountAuthorityValue.nonnegativeInteger(value["version"]) == Int64(version),
               let installationIdentityDigest = validDigest(
@@ -586,7 +586,13 @@ enum BigSyncReplicaBindingStateStore {
         // Keep writes and reads on the same format contract without changing
         // the v1 representation, keys, or transition policy.
         _ = try decode(value)
+        let previous = try load(store: store, key: key)
         try store.bigSyncSetDurably(value: value, forKey: key)
+        if previous != snapshot {
+            // Durable mutation and its namespace lock have finished. Observers
+            // may revoke capabilities, but must schedule any joining/open work.
+            NotificationCenter.default.post(name: .BigSyncReplicaPublicationAuthorityDidChange, object: nil)
+        }
     }
 
     private static func validDigest(_ value: Any?) -> String? {
@@ -630,6 +636,9 @@ final class BigSyncMutationJournalIdentityReader: @unchecked Sendable {
     }
 
     func current() -> BigSyncMutationJournalIdentity? {
+        if let borrowed = BigSyncReplicaPublicationReadScope.current(identity: clientIdentity),
+           let fileStore = store as? FileKeyValueStore,
+           borrowed.storeURL == fileStore.fileURL.standardizedFileURL { return borrowed.identity }
         guard let installationBefore =
                 clientIdentity.currentInstallationIdentifier(),
               let binding = try? BigSyncReplicaBindingStateStore.load(
