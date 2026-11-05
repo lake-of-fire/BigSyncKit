@@ -120,6 +120,13 @@ private actor ConflictFailureTransport: CloudKitRecordStore, CloudKitChangeFeed,
     private struct UnexpectedSurface: Error {}
 }
 
+/// Computed edges exercise cycle rejection without a retained reference cycle.
+private final class MissingRecordDetailCycle: NSError, @unchecked Sendable {
+    init() { super.init(domain: "CKInternalErrorDomain", code: 2003, userInfo: nil) }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+    override var userInfo: [String: Any] { [NSUnderlyingErrorKey: self] }
+}
+
 final class SyncConflictFailureCompositionTests: XCTestCase {
     func testPublicConflictRetryPolicyAdmitsOnlyUnconstrainedConflictTrees() {
         let conflict = CKError(.serverRecordChanged)
@@ -184,6 +191,109 @@ final class SyncConflictFailureCompositionTests: XCTestCase {
             ]])))
         XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
             CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: "malformed"])))
+    }
+
+    func testMissingRecordPolicyAcceptsOnlyDirectObservedProviderDetail() {
+        let detail = NSError(domain: "CKInternalErrorDomain", code: 2003,
+                             userInfo: [NSLocalizedDescriptionKey: "Record not found"])
+        XCTAssertTrue(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+            CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: detail])))
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(detail),
+            "Private metadata alone cannot establish record absence")
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+            CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [
+                "record": CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: detail]),
+            ]])))
+        for unrecognized in [
+            NSError(domain: "IndependentLocalFailure", code: 2003),
+            NSError(domain: "CKInternalErrorDomain", code: 2004),
+            NSError(domain: "CKInternalErrorDomain", code: 1),
+        ] {
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+                CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: unrecognized])))
+        }
+    }
+
+    func testMissingRecordProviderDetailCannotHidePayloads() {
+        let payloads: [[String: Any]] = [
+            [NSUnderlyingErrorKey: CKError(.notAuthenticated)],
+            [NSUnderlyingErrorKey: "malformed"],
+            [NSMultipleUnderlyingErrorsKey: [CKError(.unknownItem)]],
+            [NSMultipleUnderlyingErrorsKey: []],
+            [NSMultipleUnderlyingErrorsKey: "malformed"],
+            [CKPartialErrorsByItemIDKey: ["record": CKError(.unknownItem)]],
+            [CKPartialErrorsByItemIDKey: [:]],
+            [CKPartialErrorsByItemIDKey: "malformed"],
+            [CKErrorRetryAfterKey: 0],
+            [CKErrorRetryAfterKey: 137],
+            [CKErrorRetryAfterKey: "malformed"],
+            [NSUnderlyingErrorKey: NSError(domain: "CKInternalErrorDomain", code: 2003)],
+        ]
+        for payload in payloads {
+            let detail = NSError(domain: "CKInternalErrorDomain", code: 2003, userInfo: payload)
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+                CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: detail])),
+                "Provider detail must remain a payload-free leaf")
+        }
+    }
+
+    func testMissingRecordProviderDetailPreservesSiblingConstraints() {
+        let detail = NSError(domain: "CKInternalErrorDomain", code: 2003)
+        let siblings: [Error] = [
+            CKError(.notAuthenticated), CKError(.accountTemporarilyUnavailable),
+            CKError(.changeTokenExpired), CKError(.networkFailure), CKError(.networkUnavailable),
+            CKError(.unknownItem, userInfo: [CKErrorRetryAfterKey: 137]),
+            NSError(domain: "IndependentLocalFailure", code: 1),
+        ]
+        for sibling in siblings {
+            let error = CKError(.unknownItem, userInfo: [NSMultipleUnderlyingErrorsKey: [detail, sibling]])
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(error))
+            let constraints = CloudKitRetryConstraints(error)
+            if let cloudSibling = sibling as? CKError {
+                XCTAssertTrue(constraints.codes.contains(cloudSibling.code))
+            }
+        }
+        let deadline = CKError(.unknownItem, userInfo: [
+            NSUnderlyingErrorKey: detail, CKErrorRetryAfterKey: 0,
+        ])
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(deadline))
+        XCTAssertEqual(CloudKitRetryConstraints(deadline).serverMinimum, 0)
+        let malformed = CKError(.unknownItem, userInfo: [
+            NSUnderlyingErrorKey: detail, NSMultipleUnderlyingErrorsKey: ["malformed"],
+        ])
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(malformed))
+        XCTAssertFalse(CloudKitRetryConstraints(malformed).isErrorGraphComplete)
+    }
+
+    func testMissingRecordProviderDetailDoesNotAuthorizeNestedOrTruncatedGraphs() {
+        let detail = NSError(domain: "CKInternalErrorDomain", code: 2003)
+        let nested = CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: detail])
+        // The same detail appears at both depths. Root acceptance must never be
+        // memoized as authority for the nested occurrence, in either order.
+        let childOrders: [[Error]] = [[detail, nested], [nested, detail]]
+        for children in childOrders {
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+                CKError(.unknownItem, userInfo: [NSMultipleUnderlyingErrorsKey: children])))
+        }
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+            CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: MissingRecordDetailCycle()])))
+        var deep = CKError(.unknownItem) as NSError
+        for _ in 0..<40 {
+            deep = NSError(domain: CKErrorDomain, code: CKError.unknownItem.rawValue,
+                           userInfo: [NSUnderlyingErrorKey: deep])
+        }
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+            CKError(.unknownItem, userInfo: [NSMultipleUnderlyingErrorsKey: [detail, deep]])))
+    }
+
+    func testMissingRecordProviderDetailDoesNotBroadenConflictOrSizePolicy() {
+        let detail = NSError(domain: "CKInternalErrorDomain", code: 2003)
+        XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+            CKError(.serverRecordChanged, userInfo: [NSUnderlyingErrorKey: detail])))
+        XCTAssertFalse(CloudKitRetryConstraints(
+            CKError(.limitExceeded, userInfo: [NSUnderlyingErrorKey: detail])).containsOnlySizeLimitFailures)
+        XCTAssertTrue(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(CKError(.serverRecordChanged)))
+        XCTAssertTrue(CloudKitRetryConstraints(CKError(.limitExceeded)).containsOnlySizeLimitFailures)
     }
 
     @BigSyncBackgroundActor
