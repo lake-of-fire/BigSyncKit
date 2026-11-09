@@ -7,6 +7,8 @@ import Foundation
 struct CloudKitRetryConstraints {
     let codes: Set<CKError.Code>
     let serverMinimum: TimeInterval?
+    /// Even malformed retry metadata cannot authorize an immediate domain request.
+    let hasRetryDirective: Bool
     let containsOnlySizeLimitFailures: Bool
     /// False when the bounded scan left a previously unseen cause unexamined.
     /// Absence of a discovered constraint then cannot authorize local repair.
@@ -30,6 +32,7 @@ struct CloudKitRetryConstraints {
         let errors = inspection.errors
         isErrorGraphComplete = inspection.isComplete
         codes = Set(errors.map(\.code))
+        hasRetryDirective = errors.contains { $0.userInfo[CKErrorRetryAfterKey] != nil }
         serverMinimum = errors.compactMap {
             ($0.userInfo[CKErrorRetryAfterKey] as? NSNumber)?.doubleValue
         }.filter { $0.isFinite && $0 >= 0 }.max()
@@ -74,10 +77,10 @@ struct CloudKitRetryConstraints {
             // NSMultipleUnderlyingErrorsKey. A pure failure proof must not
             // discard a local failure or constraint carried by either form.
             let info = error.userInfo
-            // Single-record absence cannot derive authority from an unexpected
-            // item container on any public unknownItem, including the root.
-            // Reject presence even when empty/malformed; do not reinterpret it.
-            if allowingDirectMissingRecordDetail, cloudError.code == .unknownItem,
+            // Only partialFailure defines an item-error container. A leaf code
+            // cannot hide independent failures in an unexpected container,
+            // including empty or malformed payloads.
+            if cloudError.code != .partialFailure,
                info[CKPartialErrorsByItemIDKey] != nil {
                 memo[id] = (error, .complete(height: nil))
                 return nil
@@ -149,6 +152,7 @@ public enum BigSyncCloudKitRetryPolicy {
         let constraints = CloudKitRetryConstraints(error)
         return constraints.isErrorGraphComplete
             && !constraints.requiresDeferredRetry
+            && !constraints.hasRetryDirective
             && !constraints.blocksAccountOperations
             && !constraints.requestsTokenRecovery
             && constraints.codes.contains(.serverRecordChanged)
@@ -163,6 +167,7 @@ public enum BigSyncCloudKitRetryPolicy {
         let constraints = CloudKitRetryConstraints(error)
         return constraints.isErrorGraphComplete
             && !constraints.requiresDeferredRetry
+            && !constraints.hasRetryDirective
             && !constraints.blocksAccountOperations
             && !constraints.requestsTokenRecovery
             && CloudKitRetryConstraints.isFailureTree(

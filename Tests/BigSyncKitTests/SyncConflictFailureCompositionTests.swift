@@ -128,6 +128,40 @@ private final class MissingRecordDetailCycle: NSError, @unchecked Sendable {
 }
 
 final class SyncConflictFailureCompositionTests: XCTestCase {
+    func testPublicRecordAdmissionRejectsMalformedRetryDirectivesInEveryCause() {
+        let values: [Any] = [
+            NSNumber(value: Double.nan), NSNumber(value: Double.infinity),
+            NSNumber(value: -1), NSNull(), "malformed",
+        ]
+        let id = CKRecord.ID(recordName: "record")
+        for value in values {
+            let conflict = CKError(.serverRecordChanged, userInfo: [CKErrorRetryAfterKey: value])
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(conflict))
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+                CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [id: conflict]])))
+            let missing = CKError(.unknownItem, userInfo: [CKErrorRetryAfterKey: value])
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(missing))
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+                CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: missing])))
+        }
+    }
+
+    func testLeafCodesCannotHideIndependentItemFailures() {
+        let payloads: [Any] = [
+            ["other-record": CKError(.networkFailure)],
+            NSDictionary(), "malformed", NSNull(),
+        ]
+        for payload in payloads {
+            let hidden = [CKPartialErrorsByItemIDKey: payload]
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+                CKError(.serverRecordChanged, userInfo: hidden)))
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsMissingRecordAsAbsence(
+                CKError(.unknownItem, userInfo: hidden)))
+            XCTAssertFalse(CloudKitRetryConstraints(
+                CKError(.limitExceeded, userInfo: hidden)).containsOnlySizeLimitFailures)
+        }
+    }
+
     func testPublicConflictRetryPolicyAdmitsOnlyUnconstrainedConflictTrees() {
         let conflict = CKError(.serverRecordChanged)
         let id = CKRecord.ID(recordName: "conflict")
