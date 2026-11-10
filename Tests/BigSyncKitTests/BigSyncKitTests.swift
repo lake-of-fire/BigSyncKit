@@ -1491,8 +1491,16 @@ final class BigSyncKitTests: XCTestCase {
                     }
                     return false
                 } catch {
-                    return error is CancellationError
-                        || (error as? OneOffRecordZoneResetError) == .cloudKitAccountChanged
+                    if error is CancellationError { return true }
+                    let constraints = CloudKitRetryConstraints(error)
+                    XCTAssertTrue(constraints.blocksAccountOperations)
+                    // A real CloudKit failure and a later account replacement
+                    // are independent causes. Rejection must retain both.
+                    XCTAssertTrue(cloudKitErrors(in: error).contains {
+                        $0.code == (encrypted ? .zoneNotFound : .userDeletedZone)
+                            && (!encrypted || ($0.userInfo[CKErrorUserDidResetEncryptedDataKey] as? Bool) == true)
+                    })
+                    return constraints.containsAccountChange
                 }
             }
             await entered.wait()
@@ -1541,6 +1549,136 @@ final class BigSyncKitTests: XCTestCase {
         for operation in ["database", "zone", "save"] {
             try await reviewLateFailure(operation: operation, changesAccountOnly: true)
         }
+    }
+
+    @BigSyncBackgroundActor
+    func testAlreadyRejectedAccountDoesNotProbeOrRewrapError() async throws {
+        let accountChange = OneOffRecordZoneResetError.cloudKitAccountChanged
+        let wrapped = NSError(domain: "account-change-wrapper", code: 1, userInfo: [
+            NSUnderlyingErrorKey: accountChange as NSError,
+            NSMultipleUnderlyingErrorsKey: [CKError(.requestRateLimited,
+                userInfo: [CKErrorRetryAfterKey: 91]) as NSError],
+        ])
+        let failures: [Error] = [accountChange, wrapped]
+        for failure in failures {
+            let sync = makeSynchronizer(accountIdentifierProvider: {
+                XCTFail("An already rejected account must not be probed again")
+                return "account-b"
+            })
+            sync.accountScopeAuthorityFence.clear()
+            let context = reviewContext(sync)
+            sync.activeRunContext = context
+            do {
+                try await sync.revalidateRunContext(context, preserving: failure)
+                XCTFail("Account replacement must remain a failure")
+            } catch {
+                if failure is OneOffRecordZoneResetError {
+                    XCTAssertEqual(error as? OneOffRecordZoneResetError, .cloudKitAccountChanged)
+                } else {
+                    XCTAssertTrue((error as NSError) === wrapped,
+                        "A second boundary must retain the whole original failure graph")
+                    XCTAssertEqual(CloudKitRetryConstraints(error).serverMinimum, 91)
+                }
+            }
+            sync.synchronizationAttemptID = UUID()
+            do {
+                try await sync.revalidateRunContext(context, preserving: failure)
+                XCTFail("A superseded attempt must lose authority even for a known account stop")
+            } catch {
+                XCTAssertTrue(error is CancellationError)
+            }
+            await sync.cancelSynchronizationAndWait()
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testNestedAccountChangeBlocksZoneRetryWithoutInventingForeignAccountErrors() {
+        let accountChange = OneOffRecordZoneResetError.cloudKitAccountChanged as NSError
+        let store = DictionaryKeyValueStore()
+        let sync = makeSynchronizer(keyValueStore: store)
+        sync.accountScopeAuthorityFence.clear()
+        let context = reviewContext(sync)
+        sync.activeRunContext = context
+        let before = NSDictionary(dictionary: store.propertyListEntries)
+        for accountCause in [
+            accountChange,
+            NSError(domain: "aggregate-account-stop", code: 1,
+                userInfo: [NSMultipleUnderlyingErrorsKey: [accountChange]]),
+        ] {
+            let failure = CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [
+                "missing": CKError(.zoneNotFound) as NSError,
+                "account": accountCause,
+            ]])
+            let constraints = CloudKitRetryConstraints(failure)
+            XCTAssertTrue(constraints.containsAccountChange)
+            XCTAssertTrue(constraints.blocksAccountOperations)
+            XCTAssertFalse(sync.shouldRetryUpload(for: failure as NSError))
+            XCTAssertNil(sync.applyCloudKitLoss(error: failure,
+                defaultZoneID: sync.recordZoneID, context: context))
+            XCTAssertEqual(NSDictionary(dictionary: store.propertyListEntries), before)
+        }
+        let foreign = NSError(domain: "unrelated-application-error", code: accountChange.code)
+        XCTAssertFalse(CloudKitRetryConstraints(foreign).containsAccountChange)
+        XCTAssertFalse(CloudKitRetryConstraints(OneOffRecordZoneResetError.cloudKitAccountUnavailable)
+            .containsAccountChange)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountReplacementPreservesMixedFailureWithoutRecoveringObsoleteScope() async throws {
+        let store = DictionaryKeyValueStore()
+        let database = FakeCloudKitDatabase()
+        database.accountIdentifier = "account-b"
+        let sync = makeSynchronizer(database: database, keyValueStore: store,
+            accountIdentifierProvider: { database.accountIdentifier })
+        sync.addModelAdapter(FakeModelAdapter(zoneID: sync.recordZoneID, priorities: []))
+        sync.accountScopeAuthorityFence.clear()
+        sync.syncing = true
+        sync.synchronizationDrainIsActive = true
+        sync.synchronizationRequestedWhileRunning = true
+        let context = reviewContext(sync)
+        sync.activeRunContext = context
+        let original = CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [
+            "loss": CKError(.userDeletedZone),
+            "expired": CKError(.changeTokenExpired),
+            "deadline": CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 91]),
+        ]])
+        var failure: Error?
+        do {
+            try await sync.revalidateRunContext(context, preserving: original)
+            XCTFail("The operation's account was replaced")
+        } catch { failure = error }
+        let error = try XCTUnwrap(failure)
+        let constraints = CloudKitRetryConstraints(error)
+        XCTAssertTrue(constraints.containsAccountChange)
+        XCTAssertTrue(constraints.blocksAccountOperations)
+        XCTAssertTrue(constraints.isErrorGraphComplete)
+        XCTAssertTrue(constraints.codes.contains(.userDeletedZone))
+        XCTAssertTrue(constraints.requestsTokenRecovery)
+        XCTAssertTrue(constraints.requiresDeferredRetry)
+        XCTAssertEqual(constraints.serverMinimum, 91)
+        let preserved = try XCTUnwrap((error as NSError).userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError])
+        XCTAssertEqual(preserved.count, 1)
+        let preservedOriginal = try XCTUnwrap(preserved.first)
+        XCTAssertEqual((preservedOriginal as? CKError)?.code, .partialFailure)
+        XCTAssertFalse(sync.shouldRetryUpload(for: error as NSError))
+        let before = NSDictionary(dictionary: store.propertyListEntries)
+        XCTAssertNil(sync.applyCloudKitLoss(error: error, defaultZoneID: sync.recordZoneID, context: context))
+        XCTAssertEqual(NSDictionary(dictionary: store.propertyListEntries), before)
+        XCTAssertFalse(sync.configuredZoneIsTerminal(sync.recordZoneID))
+        let attemptID = sync.synchronizationAttemptID
+        await sync.failSynchronization(error: error, for: attemptID)
+        XCTAssertNotEqual(sync.synchronizationAttemptID, attemptID)
+        XCTAssertNil(sync.activeRunContext)
+        XCTAssertFalse(sync.syncing)
+        XCTAssertFalse(sync.synchronizationDrainIsActive)
+        XCTAssertNil(sync.retrySleepUntil)
+        XCTAssertFalse(store.propertyListEntries.keys.contains { $0.contains("ChangeFeedMigration") },
+            "A known replacement cannot write token recovery for the old account")
+        XCTAssertNil(sync._test_persistedTransientRetryNotBefore(accountScopeIdentifier: context.accountScopeIdentifier))
+        XCTAssertEqual(database.databaseChangeFetchCount, 0)
+        XCTAssertEqual(database.modifyRecordsOperationCount, 0)
+        XCTAssertEqual(database.recordZoneFetchCount, 0)
+        await sync.cancelSynchronizationAndWait()
     }
 
     @BigSyncBackgroundActor
@@ -7343,6 +7481,9 @@ final class BigSyncKitTests: XCTestCase {
             return
         }
         XCTAssertEqual(database.modifyRecordsOperationCount, 1)
+        XCTAssertFalse(adapter.events.contains { $0.hasPrefix("didUpload:") },
+            "A callback for the replaced account cannot acknowledge an upload")
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
         XCTAssertFalse(synchronizer.syncing)
     }
 
@@ -7451,6 +7592,9 @@ final class BigSyncKitTests: XCTestCase {
             return
         }
         XCTAssertEqual(database.modifyRecordsOperationCount, 1)
+        XCTAssertFalse(adapter.events.contains { $0.hasPrefix("didDelete:") },
+            "A callback for the replaced account cannot acknowledge a deletion")
+        XCTAssertFalse(synchronizer.synchronizationDrainIsActive)
         XCTAssertFalse(synchronizer.syncing)
     }
 

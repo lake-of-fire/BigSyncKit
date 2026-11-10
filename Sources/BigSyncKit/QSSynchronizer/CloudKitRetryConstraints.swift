@@ -13,9 +13,13 @@ struct CloudKitRetryConstraints {
     /// False when the bounded scan left a previously unseen cause unexamined.
     /// Absence of a discovered constraint then cannot authorize local repair.
     let isErrorGraphComplete: Bool
+    /// The operation's account authority is obsolete, even if this local
+    /// failure is nested alongside CloudKit errors with their own constraints.
+    let containsAccountChange: Bool
 
     var blocksAccountOperations: Bool {
-        !codes.isDisjoint(with: [.notAuthenticated, .accountTemporarilyUnavailable])
+        containsAccountChange
+            || !codes.isDisjoint(with: [.notAuthenticated, .accountTemporarilyUnavailable])
     }
 
     var requestsTokenRecovery: Bool { codes.contains(.changeTokenExpired) }
@@ -31,6 +35,7 @@ struct CloudKitRetryConstraints {
         let inspection = inspectCloudKitErrors(in: error)
         let errors = inspection.errors
         isErrorGraphComplete = inspection.isComplete
+        containsAccountChange = inspection.containsAccountChange
         codes = Set(errors.map(\.code))
         hasRetryDirective = errors.contains { $0.userInfo[CKErrorRetryAfterKey] != nil }
         serverMinimum = errors.compactMap {
@@ -181,8 +186,8 @@ func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {
 
 private func inspectCloudKitErrors(
     in error: Error, depth: Int = 0
-) -> (errors: [CKError], isComplete: Bool) {
-    guard depth < 32 else { return ([], false) }
+) -> (errors: [CKError], isComplete: Bool, containsAccountChange: Bool) {
+    guard depth < 32 else { return ([], false, false) }
     // Breadth-first visitation finds each identity at its shallowest depth,
     // avoiding both repeated DAG fanout and a deep first path hiding evidence
     // that is also reachable by a shorter path. Keep identity objects alive.
@@ -191,6 +196,10 @@ private func inspectCloudKitErrors(
     var offset = 0
     var errors = [CKError]()
     var isComplete = true
+    var containsAccountChange = false
+    // Use the enum's Foundation representation so both Swift errors and
+    // NSError wrappers preserve the same account-stop meaning.
+    let accountChange = OneOffRecordZoneResetError.cloudKitAccountChanged as NSError
     while offset < queue.count {
         let item = queue[offset]
         offset += 1
@@ -203,6 +212,10 @@ private func inspectCloudKitErrors(
             continue
         }
         visited[id] = item.error
+        if item.error.domain == accountChange.domain,
+           item.error.code == accountChange.code {
+            containsAccountChange = true
+        }
         let info = item.error.userInfo
         if let cloudError = item.error as? CKError {
             errors.append(cloudError)
@@ -222,7 +235,7 @@ private func inspectCloudKitErrors(
             queue.append((underlying as NSError, item.depth + 1))
         }
     }
-    return (errors, isComplete)
+    return (errors, isComplete, containsAccountChange)
 }
 
 /// Read containers entry by entry: a malformed sibling must not erase a known

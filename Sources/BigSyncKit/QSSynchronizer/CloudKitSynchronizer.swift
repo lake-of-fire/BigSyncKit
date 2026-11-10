@@ -2412,6 +2412,13 @@ public class CloudKitSynchronizer: NSObject {
         preserving operationError: Error
     ) async throws {
         if operationError is CancellationError { throw operationError }
+        try checkRunContext(context)
+        let constraints = CloudKitRetryConstraints(operationError)
+        try checkRunContext(context)
+        // A prior account rejection is already final. Probing again would
+        // wrap a pure account change and could issue account work after a
+        // wrapped rejection. Keep any original CloudKit causes intact.
+        if constraints.containsAccountChange { throw operationError }
         do {
             try await revalidateRunContext(context)
         } catch is CancellationError {

@@ -678,7 +678,13 @@ extension CloudKitSynchronizer {
                 && (error as? CloudKitChangeFeedError) != .corruptCursor
         }
 
-        if error is RealmSwiftInboundTargetChangedError
+        if constraints.containsAccountChange {
+            // Unlike a temporary authentication stop, this proves that the
+            // captured account no longer owns the operation. Preserve nested
+            // retry/token evidence for diagnostics, but do not apply recovery
+            // to that obsolete scope or admit another request from this run.
+            stopsAccount = true
+        } else if error is RealmSwiftInboundTargetChangedError
             || error is BigSyncLocalDomainAdmissionDeferredError {
             // An inbound selection changed, or initial domain admission could
             // not inspect a locally owned store. Neither committed its decision.
