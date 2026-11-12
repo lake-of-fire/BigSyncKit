@@ -16887,9 +16887,8 @@ final class BigSyncKitTests: XCTestCase {
             try adapter.pendingCommittedInboundIdentityBatch()
         )
         XCTAssertEqual(Set(firstBatch.identities), expectedIdentities)
-        let persistenceConfiguration = try XCTUnwrap(
-            adapter.realmProvider?.persistenceRealm.configuration
-        )
+        let persistenceRealm = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let persistenceConfiguration = persistenceRealm.configuration
         let targetConfiguration = fixture.targetRealm.configuration
         let trackingURL = try XCTUnwrap(persistenceConfiguration.fileURL)
         XCTAssertTrue(FileManager.default.fileExists(atPath: trackingURL.path))
