@@ -92,6 +92,9 @@ enum BigSyncRecordEvidenceLimits {
     static let maximumPreservationReceiptCount = 4096
 
     static func admit(additionalBytes: Int, in realm: Realm) throws {
+        guard BigSyncMutationTrackingRegistry.recordEvidenceUse(for: realm.configuration) != .retentionOnly else {
+            throw BigSyncRecordRebaseError.retentionOnly
+        }
         var bytes = 0
         for row in realm.objects(BigSyncRecordSubmission.self) {
             bytes += row.payload.count
@@ -288,6 +291,7 @@ struct BigSyncRecordEvidenceStore {
     let realm: Realm
 
     func submission(recordName: String) -> BigSyncRecordSubmission? {
+        guard BigSyncMutationTrackingRegistry.recordEvidenceUse(for: realm.configuration) != .retentionOnly else { return nil }
         guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordSubmission.className() }) else {
             return nil
         }
@@ -314,6 +318,7 @@ struct BigSyncRecordEvidenceStore {
     }
 
     func isBlocked(recordName: String) -> Bool {
+        guard BigSyncMutationTrackingRegistry.recordEvidenceUse(for: realm.configuration) != .retentionOnly else { return false }
         guard realm.schema.objectSchema.contains(where: { $0.className == BigSyncRecordConflict.className() }) else {
             return false
         }
