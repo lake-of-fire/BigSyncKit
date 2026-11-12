@@ -16855,6 +16855,8 @@ final class BigSyncKitTests: XCTestCase {
         // Let the SDK validate its account and activate the adapter's exact
         // account/transport namespace before committing the inbound page.
         _ = try await failedSync.synchronize()
+        let establishedCursor = await adapter.serverChangeToken
+        XCTAssertNotNil(establishedCursor)
         let live = makeRecord(
             type: BigSyncTrackedObject.className(), id: "reopen-upsert",
             zoneID: adapter.recordZoneID
@@ -16864,7 +16866,7 @@ final class BigSyncKitTests: XCTestCase {
             zoneID: adapter.recordZoneID
         )
         try await adapter.commitInboundPage(.init(
-            previousCursor: nil,
+            previousCursor: establishedCursor,
             nextCursor: .init(serializedData: Data("reopen-cursor".utf8)),
             liveResults: [.init(
                 event: .init(ordinal: 0, entityType: live.recordType,
