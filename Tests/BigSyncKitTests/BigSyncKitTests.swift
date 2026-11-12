@@ -16834,6 +16834,133 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPrepublicationFailureReopensAndReplaysCommittedIdentityDelivery()
+    async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            committedInboundIdentityDeliveryEnabled: true,
+            fileBacked: true
+        )
+        let adapter = fixture.adapter
+        let database = FakeCloudKitDatabase()
+        database.completesEmptyZoneChangeOperation = true
+        let durableAccountState = DictionaryKeyValueStore()
+        let synchronizerIdentifier = "inbound-reopen-\(UUID().uuidString)"
+        let failedSync = makeSynchronizer(
+            database: database,
+            keyValueStore: durableAccountState,
+            identifier: synchronizerIdentifier,
+            recordZoneID: adapter.recordZoneID
+        )
+        failedSync.addModelAdapter(adapter)
+        // Let the SDK validate its account and activate the adapter's exact
+        // account/transport namespace before committing the inbound page.
+        _ = try await failedSync.synchronize()
+        let establishedCursor = await adapter.serverChangeToken
+        XCTAssertNotNil(establishedCursor)
+        let live = makeRecord(
+            type: BigSyncTrackedObject.className(), id: "reopen-upsert",
+            zoneID: adapter.recordZoneID
+        )
+        let deleted = makeRecord(
+            type: BigSyncTrackedObject.className(), id: "reopen-hard-delete",
+            zoneID: adapter.recordZoneID
+        )
+        try await adapter.commitInboundPage(.init(
+            previousCursor: establishedCursor,
+            nextCursor: .init(serializedData: Data("reopen-cursor".utf8)),
+            liveResults: [.init(
+                event: .init(ordinal: 0, entityType: live.recordType,
+                             recordID: live.recordID),
+                disposition: .applied
+            )],
+            deletionResults: [.init(
+                event: .init(ordinal: 0, entityType: deleted.recordType,
+                             recordID: deleted.recordID),
+                disposition: .appliedTombstone
+            )]
+        ))
+        let expectedIdentities: Set<CommittedInboundIdentity> = [
+            .init(entityType: live.recordType, recordName: live.recordID.recordName,
+                  disposition: .upsert),
+            .init(entityType: deleted.recordType, recordName: deleted.recordID.recordName,
+                  disposition: .delete),
+        ]
+        let firstBatch = try XCTUnwrap(
+            try adapter.pendingCommittedInboundIdentityBatch()
+        )
+        XCTAssertEqual(Set(firstBatch.identities), expectedIdentities)
+        let persistenceRealm = try XCTUnwrap(adapter.realmProvider?.persistenceRealm)
+        let persistenceConfiguration = persistenceRealm.configuration
+        let targetConfiguration = fixture.targetRealm.configuration
+        let trackingURL = try XCTUnwrap(persistenceConfiguration.fileURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: trackingURL.path))
+
+        var observedFailureBoundary: Set<CommittedInboundIdentity>?
+        failedSync.domainPrepublicationHandler = { context in
+            observedFailureBoundary = Set(context.committedInboundIdentities)
+            throw TestSynchronizationError.terminalForwardingFailed
+        }
+        do {
+            _ = try await failedSync.synchronize()
+            XCTFail("A failed real prepublication boundary must not acknowledge delivery")
+        } catch TestSynchronizationError.terminalForwardingFailed {}
+        XCTAssertEqual(observedFailureBoundary, expectedIdentities)
+        XCTAssertEqual(
+            try adapter.pendingCommittedInboundIdentityBatch()?.deliveryID,
+            firstBatch.deliveryID
+        )
+        await failedSync.cancelSynchronizationAndWait()
+
+        // Release the first adapter's file-backed Realm handles before opening
+        // a new adapter over the same tracking file.
+        adapter.cancelSynchronization()
+        await adapter.waitForCancellation()
+        adapter.invalidateTokens()
+        adapter.realmProvider = nil
+        fixture.persistenceRealm.invalidate()
+        fixture.targetRealm.invalidate()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: trackingURL.path))
+        let reopenedAdapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: persistenceConfiguration,
+            targetRealmConfigurations: [targetConfiguration],
+            excludedClassNames: [],
+            committedInboundIdentityDeliveryEnabled: true,
+            recordZoneID: adapter.recordZoneID,
+            logger: Logger(label: "BigSyncKitTests"),
+            startSetupTask: false
+        )
+        try await reopenedAdapter.ensureSetup()
+        addTeardownBlock { @BigSyncBackgroundActor in
+            reopenedAdapter.cancelSynchronization()
+            await reopenedAdapter.waitForCancellation()
+            reopenedAdapter.invalidateTokens()
+            reopenedAdapter.realmProvider = nil
+        }
+        let reopenedBatch = try XCTUnwrap(
+            try reopenedAdapter.pendingCommittedInboundIdentityBatch()
+        )
+        XCTAssertEqual(reopenedBatch.deliveryID, firstBatch.deliveryID)
+        XCTAssertEqual(Set(reopenedBatch.identities), expectedIdentities)
+
+        let successfulSync = makeSynchronizer(
+            database: database,
+            keyValueStore: durableAccountState,
+            identifier: synchronizerIdentifier,
+            recordZoneID: reopenedAdapter.recordZoneID
+        )
+        successfulSync.addModelAdapter(reopenedAdapter)
+        var observedReplay: Set<CommittedInboundIdentity>?
+        successfulSync.domainPrepublicationHandler = { context in
+            observedReplay = Set(context.committedInboundIdentities)
+            return []
+        }
+        _ = try await successfulSync.synchronize()
+        XCTAssertEqual(observedReplay, expectedIdentities)
+        XCTAssertNil(try reopenedAdapter.pendingCommittedInboundIdentityBatch())
+        await successfulSync.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     func testInboundIdentityDeliveryAppendsPageChunksAndLastDispositionWins()
     async throws {
         let fixture = try await makeRealmAdapterFixture(
