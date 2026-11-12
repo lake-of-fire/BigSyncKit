@@ -17,7 +17,7 @@ let package = Package(
     ],
     dependencies: [
 //                .package(url: "https://github.com/lake-of-fire/RealmBinary.git", branch: "main"),
-        .package(url: "https://github.com/aehlke/realm-swift.git", revision: "c595af8988ec630960d33ce51cd0671c2263086a"),
+        .package(url: "https://github.com/aehlke/realm-swift.git", revision: "5d5058bf4cddd45ba4777b18e669523fab9ee7e2"),
         .package(path: "../RealmSwiftGaps"),
         //        .package(url: "https://github.com/lake-of-fire/Device.git", branch: "main"),
         .package(url: "https://github.com/apple/swift-algorithms.git", branch: "main"),
