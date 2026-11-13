@@ -3,10 +3,156 @@ import Realm
 import RealmSwift
 import Combine
 import Logging
+#if DEBUG
+import Darwin
+#endif
 
 private typealias BigSyncSynchronizationDeadline =
     BigSyncDeadlineRace<CloudKitSynchronizer.SynchronizationResult?>
 private typealias BigSyncDeadlineOutcome = BigSyncSynchronizationDeadline.Outcome
+
+#if DEBUG
+public enum BigSyncDebugDiagnosticEvent: String, Sendable {
+    case appBackground, appForeground, remoteNotificationStarted
+    case syncWorkerStarted, syncWorkerSettled
+    case syncDeadlineStarted, syncDeadlineElapsed, syncCompleted, syncCancelled
+    case syncAttemptCancelled, syncAttemptSettled
+    case uploadAckChunkRequested, uploadAckChunkAdmitted, uploadAckChunkBodyStarted
+    case uploadAckChunkCommitSubmitted
+    case uploadAckChunkSettled, uploadAckChunkFailed
+    case inboundApplyStarted, inboundApplySettled
+    case backgroundExecutionStarted, backgroundExecutionInterrupted, backgroundExecutionSettled
+}
+
+/// Local development diagnostics only. Callers provide static event labels,
+/// random correlation IDs, and aggregate counts or durations; no user or
+/// record identity belongs in this log.
+public enum BigSyncDebugDiagnostics {
+    @TaskLocal public static var correlationID: UUID?
+
+    private static let store = BigSyncDebugDiagnosticsStore(
+        fileURL: FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0]
+            .appendingPathComponent("ManabiReader", isDirectory: true)
+            .appendingPathComponent("debug-sync-diagnostics.log"),
+        retainPreviousSession: true
+    )
+
+    public static func record(
+        _ event: BigSyncDebugDiagnosticEvent,
+        correlationID: UUID? = nil,
+        count: Int? = nil,
+        elapsedMilliseconds: UInt64? = nil
+    ) {
+        store.append(
+            event: event,
+            correlationID: correlationID ?? self.correlationID ?? UUID(),
+            count: count,
+            elapsedMilliseconds: elapsedMilliseconds
+        )
+    }
+
+    public static func withCorrelationID<Result>(
+        _ id: UUID,
+        operation: () async throws -> Result
+    ) async rethrows -> Result {
+        try await $correlationID.withValue(id, operation: operation)
+    }
+
+    public static func exportText() -> String { store.snapshot() }
+
+    static func currentOrNewCorrelationID() -> UUID { correlationID ?? UUID() }
+}
+
+final class BigSyncDebugDiagnosticsStore: @unchecked Sendable {
+    private let fileURL: URL
+    private let previousFileURL: URL
+    private let maximumBytes: Int
+    private let lock = NSLock()
+
+    init(fileURL: URL, maximumBytes: Int = 64 * 1024, retainPreviousSession: Bool = false) {
+        self.fileURL = fileURL
+        previousFileURL = fileURL.appendingPathExtension("previous")
+        self.maximumBytes = max(256, maximumBytes)
+        if retainPreviousSession { rotateSession() }
+    }
+
+    func append(
+        event: BigSyncDebugDiagnosticEvent,
+        correlationID: UUID,
+        count: Int?,
+        elapsedMilliseconds: UInt64?
+    ) {
+        let uptime = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        var line = "uptime_ms=\(uptime) correlation=\(correlationID.uuidString) event=\(event.rawValue)"
+        if let count { line += " count=\(count)" }
+        if let elapsedMilliseconds { line += " elapsed_ms=\(elapsedMilliseconds)" }
+        line += "\n"
+        let bytes = Array(line.utf8)
+        guard bytes.count <= maximumBytes else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+            if size + bytes.count > maximumBytes {
+                // Preserve the previous process's crash evidence until the next
+                // launch. Only replace this session's bounded log, atomically,
+                // with this short record; normal events remain O_APPEND writes.
+                try Data(bytes).write(to: fileURL, options: .atomic)
+                return
+            }
+            let descriptor = open(fileURL.path, O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else { return }
+            defer { close(descriptor) }
+            var offset = 0
+            while offset < bytes.count {
+                let written = bytes.withUnsafeBytes { buffer in
+                    Darwin.write(descriptor, buffer.baseAddress!.advanced(by: offset), bytes.count - offset)
+                }
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    return
+                }
+                guard written > 0 else { return }
+                offset += written
+            }
+        } catch {
+            // Diagnostics never alter synchronization, Realm writes, or app flow.
+        }
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let previous = (try? Data(contentsOf: previousFileURL)) ?? Data()
+        let current = (try? Data(contentsOf: fileURL)) ?? Data()
+        return String(decoding: previous + current, as: UTF8.self)
+    }
+
+    private func rotateSession() {
+        lock.lock()
+        defer { lock.unlock() }
+        rotateSessionContents()
+    }
+
+    private func rotateSessionContents() {
+        do {
+            guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+            try? FileManager.default.removeItem(at: previousFileURL)
+            try FileManager.default.moveItem(at: fileURL, to: previousFileURL)
+        } catch {
+            // Best effort: a failed diagnostic rotation cannot block sync.
+        }
+    }
+}
+#endif
 
 /// Immutable failure evidence only; these identifiers grant no sync authority.
 @_spi(CloudKitE2E)
@@ -729,6 +875,11 @@ public actor BigSyncBackgroundActor {
         guard race.remainingNanoseconds > 0 else {
             return Task.isCancelled ? .cancelled : .timedOut
         }
+#if DEBUG
+        let diagnosticCorrelationID = BigSyncDebugDiagnostics.currentOrNewCorrelationID()
+        let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+        BigSyncDebugDiagnostics.record(.syncDeadlineStarted, correlationID: diagnosticCorrelationID)
+#endif
         let synchronizationTask = Task { @BigSyncBackgroundActor [weak self] in
             guard !Task.isCancelled else {
                 await race.resolve(.cancelled)
@@ -749,6 +900,9 @@ public actor BigSyncBackgroundActor {
             await race.value()
         } onCancel: {
             synchronizationTask.cancel()
+#if DEBUG
+            BigSyncDebugDiagnostics.record(.syncCancelled, correlationID: diagnosticCorrelationID)
+#endif
             // This task settles only the local race actor. It does not cancel,
             // replace, or otherwise mutate a shared synchronizer.
             Task { await race.resolve(.cancelled) }
@@ -760,6 +914,21 @@ public actor BigSyncBackgroundActor {
         // returned, cancellation still owns delivery and must not be reported
         // as a completed request or lifecycle timeout.
         if Task.isCancelled { return .cancelled }
+#if DEBUG
+        if case .timedOut = outcome {
+            BigSyncDebugDiagnostics.record(
+                .syncDeadlineElapsed,
+                correlationID: diagnosticCorrelationID,
+                elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+            )
+        } else if case .completed(_) = outcome {
+            BigSyncDebugDiagnostics.record(
+                .syncCompleted,
+                correlationID: diagnosticCorrelationID,
+                elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+            )
+        }
+#endif
         return outcome
     }
 
@@ -886,6 +1055,10 @@ public actor BigSyncBackgroundActor {
 
     @BigSyncBackgroundActor
     public func cancelSynchronization() async {
+#if DEBUG
+        let diagnosticCorrelationID = BigSyncDebugDiagnostics.currentOrNewCorrelationID()
+        BigSyncDebugDiagnostics.record(.syncAttemptCancelled, correlationID: diagnosticCorrelationID)
+#endif
         initialSynchronizationTask?.cancel()
         initialSynchronizationTask = nil
         accountAvailabilityRetryTask?.cancel()
@@ -896,6 +1069,9 @@ public actor BigSyncBackgroundActor {
         }
 
         await realmSynchronizer.cancelSynchronizationAndWait()
+#if DEBUG
+        BigSyncDebugDiagnostics.record(.syncAttemptSettled, correlationID: diagnosticCorrelationID)
+#endif
     }
 
     /// Restores the current account's redacted, durable CloudKit health state.

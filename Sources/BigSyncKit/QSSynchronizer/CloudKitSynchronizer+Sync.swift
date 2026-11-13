@@ -2088,6 +2088,18 @@ extension CloudKitSynchronizer {
     ) async throws {
         let attemptID = synchronizationAttemptID
         try checkSynchronizationAttempt(attemptID)
+#if DEBUG
+        let diagnosticCorrelationID = BigSyncDebugDiagnostics.currentOrNewCorrelationID()
+        let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+        BigSyncDebugDiagnostics.record(.inboundApplyStarted, correlationID: diagnosticCorrelationID)
+        defer {
+            BigSyncDebugDiagnostics.record(
+                .inboundApplySettled,
+                correlationID: diagnosticCorrelationID,
+                elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+            )
+        }
+#endif
         let changeRequestProcessor = changeRequestProcessor
         try await changeRequestProcessor.finishProcessing(
             for: adapter,

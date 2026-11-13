@@ -18668,3 +18668,51 @@ private extension RealmBackgroundActor {
         return releasedAllWriters
     }
 }
+
+#if DEBUG
+final class BigSyncDebugDiagnosticsStoreTests: XCTestCase {
+    func testAppendPersistsSynchronouslyWithinBoundedCurrentAndPreviousLogs() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("sync.log")
+        let correlationID = UUID()
+
+        let previousSession = BigSyncDebugDiagnosticsStore(fileURL: url, maximumBytes: 512)
+        previousSession.append(
+            event: .uploadAckChunkRequested,
+            correlationID: correlationID,
+            count: 500,
+            elapsedMilliseconds: nil
+        )
+        XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("event=uploadAckChunkRequested"))
+
+        let currentSession = BigSyncDebugDiagnosticsStore(
+            fileURL: url,
+            maximumBytes: 512,
+            retainPreviousSession: true
+        )
+        currentSession.append(
+            event: .appForeground,
+            correlationID: UUID(),
+            count: nil,
+            elapsedMilliseconds: nil
+        )
+        let export = currentSession.snapshot()
+        XCTAssertTrue(export.contains("event=uploadAckChunkRequested"))
+        XCTAssertTrue(export.contains("event=appForeground"))
+        for count in 0..<100 {
+            currentSession.append(
+                event: .uploadAckChunkSettled,
+                correlationID: correlationID,
+                count: count,
+                elapsedMilliseconds: 1
+            )
+        }
+        XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("count=99"))
+        XCTAssertTrue(try String(contentsOf: url.appendingPathExtension("previous"), encoding: .utf8).contains("event=uploadAckChunkRequested"))
+        XCTAssertLessThanOrEqual(try Data(contentsOf: url).count, 512)
+        XCTAssertLessThanOrEqual(try Data(contentsOf: url.appendingPathExtension("previous")).count, 512)
+    }
+}
+#endif
