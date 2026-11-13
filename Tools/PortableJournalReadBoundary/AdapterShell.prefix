@@ -10,6 +10,12 @@ public final class RealmSwiftAdapter: @unchecked Sendable {
     var activeAccountScopeIdentifier: String? = "account"
     var activeReplicaBindingGenerationIdentifier: String? = "binding"
     var cancelSync = false
+    var cancellationGeneration: UInt64 = 0
+    // Inject the value returned by production's policy/registry-derived context.
+    // Its derivation and Realm validation remain outside this portable boundary.
+    var recordRebaseContext: BigSyncRecordRebaseContext?
+    var activeContainerIdentifier = ""
+    var activeDatabaseScopeRawValue = 2 // CKDatabase.Scope.private.rawValue
     weak var modelAdapterDelegate: (any ModelAdapterDelegate)?
     var _testJournalForwardingTrace: ((String) -> Void)?
     var _testBeforePendingMutationTrackingWrite: (() async throws -> Void)?
@@ -30,10 +36,29 @@ public final class RealmSwiftAdapter: @unchecked Sendable {
                         modified: Bool, deleted: Bool, generation: String?,
                         replicaBindingGenerationIdentifier: String?, persistenceRealm: Realm) {
         let name = entityName + "." + objectIdentifier
-        let value = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: name) ?? SyncedEntity()
-        value.set("key", name); value.pendingGeneration = generation
-        value.pendingReplicaBindingGenerationIdentifier = replicaBindingGenerationIdentifier
-        value.isDeletion = deleted
+        let existing = persistenceRealm.object(ofType: SyncedEntity.self, forPrimaryKey: name)
+        let value = existing ?? SyncedEntity()
+        value.set("key", name)
+        // Note uses the physical-deletion policy. Retained-tombstone policy and
+        // encodedRecord handling are not modeled by this tracking collaborator.
+        if deleted {
+            value.entityState = .deletedLocally
+        } else if existing == nil || inserted {
+            value.entityState = .new
+        } else if modified {
+            switch value.entityState {
+            case .deletedLocally, .deletedRemotely, .recreatingRemotely:
+                value.entityState = .new
+            case .synced:
+                value.entityState = .changed
+            default:
+                break
+            }
+        }
+        if deleted || existing == nil || inserted || modified {
+            value.pendingGeneration = generation
+            value.pendingReplicaBindingGenerationIdentifier = replicaBindingGenerationIdentifier
+        }
         persistenceRealm.add(value)
     }
     @BigSyncBackgroundActor

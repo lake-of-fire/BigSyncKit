@@ -21,6 +21,7 @@ func fixture(journal: Bool = true, deletion: Bool = false, trackingGeneration: S
             let entity = SyncedEntity(); entity.set("key", "Note.one")
             entity.pendingGeneration = trackingGeneration
             entity.pendingReplicaBindingGenerationIdentifier = "binding"
+            entity.entityState = .new
             tracking.add(entity)
         }
     }
@@ -223,15 +224,108 @@ struct RuntimeCase {
             RuntimeCase("forwarding_final_binding_gate_preserved") {
                 let (a, r, t) = fixture()
                 a._testBeforePendingMutationTrackingWrite = { a.activeReplicaBindingGenerationIdentifier = "replacement" }
-                let count = try await a.forward(in: r)
-                try require(count == 0 && tracked(t) == nil && journal(r).generation == "g1", "binding fence bypassed")
+                do { _ = try await a.forward(in: r); throw Failure(description: "obsolete binding owner succeeded") }
+                catch is CancellationError { }
+                try require(tracked(t) == nil && journal(r).generation == "g1", "binding fence bypassed")
             },
             RuntimeCase("forwarding_final_account_gate_preserved") {
                 let (a, r, t) = fixture()
                 a.accountScopePropertyByClassName = ["Note": "account"]
                 a._testBeforePendingMutationTrackingWrite = { a.activeAccountScopeIdentifier = "replacement" }
-                let count = try await a.forward(in: r)
-                try require(count == 0 && tracked(t) == nil && journal(r).generation == "g1", "account fence bypassed")
+                do { _ = try await a.forward(in: r); throw Failure(description: "obsolete account owner succeeded") }
+                catch is CancellationError { }
+                try require(tracked(t) == nil && journal(r).generation == "g1", "account fence bypassed")
+            },
+            RuntimeCase("forwarding_lifecycle_replacement_keeps_committed_debt") {
+                let replacements = [
+                    "context-equal", "cancel-resume", "context-enabled", "context-disabled",
+                    "context-namespace", "context-account", "context-binding", "context-preservation",
+                    "container", "scope",
+                ]
+                for replacement in replacements {
+                    let (a, r, t) = fixture()
+                    let context = BigSyncRecordRebaseContext(
+                        namespace: "namespace", account: "account", binding: "binding",
+                        preservationNamespace: "preservation"
+                    )
+                    a.recordRebaseContext = replacement == "context-enabled" ? nil : context
+                    a.activeContainerIdentifier = "container"
+                    a._testBeforePendingMutationTrackingWrite = {
+                        // Revoke ownership from refresh after the tracking write
+                        // is admitted; the production validator must roll it back.
+                        r.onRefresh = {
+                            r.onRefresh = nil
+                            switch replacement {
+                            case "cancel-resume":
+                                a.cancelSync = true
+                                a.cancellationGeneration &+= 1
+                                a.cancelSync = false
+                            case "context-disabled":
+                                a.recordRebaseContext = nil
+                            case "container":
+                                a.activeContainerIdentifier = "replacement"
+                            case "scope":
+                                a.activeDatabaseScopeRawValue = 3
+                            default:
+                                a.recordRebaseContext = BigSyncRecordRebaseContext(
+                                    namespace: replacement == "context-namespace" ? "replacement" : context.namespace,
+                                    account: replacement == "context-account" ? "replacement" : context.account,
+                                    binding: replacement == "context-binding" ? "replacement" : context.binding,
+                                    preservationNamespace: replacement == "context-preservation"
+                                        ? "replacement" : context.preservationNamespace
+                                )
+                            }
+                        }
+                    }
+                    if replacement == "context-equal" {
+                        let count = try await a.forward(in: r)
+                        try require(count == 1 && tracked(t)?.pendingGeneration == "g1", "equal context revoked owner")
+                    } else {
+                        do {
+                            _ = try await a.forward(in: r)
+                            throw Failure(description: "obsolete lifecycle owner succeeded: \(replacement)")
+                        } catch is CancellationError { }
+                        try require(tracked(t) == nil, "obsolete owner published tracking: \(replacement)")
+                    }
+                    try require(journal(r).generation == "g1", "lifecycle transition consumed journal debt")
+                    try require(!r.isInWriteTransaction && !t.isInWriteTransaction, "lifecycle write ownership leaked")
+                }
+            },
+            RuntimeCase("forwarding_tracking_state_matches_transport_lane") {
+                let states: [SyncedEntityState] = [
+                    .new, .changed, .deletedLocally, .synced, .deletedRemotely,
+                    .awaitingServerEvidence, .recreatingRemotely,
+                ]
+                for deletion in [false, true] {
+                    for state in states {
+                        let (a, r, t) = fixture(deletion: deletion, trackingGeneration: "g1")
+                        t.write { tracked(t)!.entityState = state }
+                        let alreadyForwarded = deletion
+                            ? state == .deletedLocally : state == .new || state == .changed
+                        let count = try await a.forward(in: r)
+                        try require(count == (alreadyForwarded ? 0 : 1), "generation alone determined forwarding")
+                        let expectedState: SyncedEntityState
+                        if deletion {
+                            expectedState = .deletedLocally
+                        } else {
+                            switch state {
+                            case .deletedLocally, .deletedRemotely, .recreatingRemotely:
+                                expectedState = .new
+                            case .synced:
+                                expectedState = .changed
+                            default:
+                                expectedState = state
+                            }
+                        }
+                        let committed = tracked(t.freeze())!
+                        try require(committed.entityState == expectedState, "tracking state transition changed")
+                        try require(committed.isDeletion == deletion, "tracking transport lane disagrees with journal")
+                        try require(committed.pendingGeneration == "g1"
+                            && committed.pendingReplicaBindingGenerationIdentifier == "binding",
+                            "transport lane repair changed mutation identity")
+                        try require(journal(r).generation == "g1", "transport lane repair consumed journal debt")
+                    }
+                }
             },
             RuntimeCase("forwarding_cancellation_keeps_committed_debt") {
                 let (a, r, t) = fixture()

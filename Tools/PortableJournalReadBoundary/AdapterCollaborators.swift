@@ -15,10 +15,42 @@ public final class BigSyncPendingMutation: Object, @unchecked Sendable {
     public var generation: String { get { string("generation") ?? "" } set { set("generation", newValue) } }
     public var changedAt: Date { get { date("changedAt") } set { fields["changedAt"] = .date(newValue) } }
 }
+// Match the production state distinctions and raw values; no CloudKit transport.
+public enum SyncedEntityState: Int, Sendable {
+    case new = 1, changed = 2, deletedLocally = 3, synced = 4
+    case deletedRemotely = 5, awaitingServerEvidence = 6, recreatingRemotely = 7
+}
+// Only value equality is consumed by the extracted lifecycle validator. Context
+// construction, installed evidence policy and validate(in:) are not exercised.
+struct BigSyncRecordRebaseContext: Equatable, Sendable {
+    let namespace: String
+    let account: String
+    let binding: String
+    let preservationNamespace: String
+
+    init(namespace: String, account: String, binding: String, preservationNamespace: String? = nil) {
+        self.namespace = namespace
+        self.account = account
+        self.binding = binding
+        self.preservationNamespace = preservationNamespace ?? namespace
+    }
+}
 public final class SyncedEntity: Object, @unchecked Sendable {
     public var pendingGeneration: String? { get { string("generation") } set { set("generation", newValue) } }
     public var pendingReplicaBindingGenerationIdentifier: String? { get { string("binding") } set { set("binding", newValue) } }
-    public var isDeletion: Bool { get { bool("isDeletion") } set { fields["isDeletion"] = .bool(newValue) } }
+    public var entityState: SyncedEntityState {
+        get {
+            guard let stored = string("state"), let rawValue = Int(stored),
+                  let value = SyncedEntityState(rawValue: rawValue) else {
+                preconditionFailure("Tracking fixtures must initialize a valid production state")
+            }
+            return value
+        }
+        // Store in the cloneable field dictionary so committed/provisional cuts
+        // retain state as well as generation; the real Realm column is an Int.
+        set { set("state", String(newValue.rawValue)) }
+    }
+    public var isDeletion: Bool { entityState == .deletedLocally }
 }
 public final class Note: Object, @unchecked Sendable {
     public var isDeleted: Bool { get { bool("isDeleted") } set { fields["isDeleted"] = .bool(newValue) } }
