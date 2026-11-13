@@ -472,6 +472,7 @@ extension KeyValueStore {
         }
     }
 
+<<<<<<< HEAD
     /// Initialize only the additive local publication epoch under the same
     /// exclusive read/modify/write turn. A second process must not overwrite a
     /// newer port while upgrading an existing v1 binding without an epoch.
@@ -505,6 +506,8 @@ extension KeyValueStore {
         }
     }
 
+=======
+>>>>>>> 6c88ba3d3d000ab82fa424c5b0fe6697d013bc92
     /// Internal identity-owner frontier. The existing namespace file guard stays
     /// held through the caller's bounded publication, excluding every peer's
     /// durable binding write. The callback must not reenter this store.
