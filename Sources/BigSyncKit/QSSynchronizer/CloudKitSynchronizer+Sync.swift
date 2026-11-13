@@ -34,7 +34,7 @@ extension CloudKitSynchronizer {
             // Notifications are synchronous callouts. An observer can cancel
             // this attempt or admit a successor before this method continues.
             try checkSynchronizationAttempt(attemptID)
-            let token = self.storedDatabaseToken
+            let token = try self.readStoredDatabaseTokenDurably()
             try checkSynchronizationAttempt(attemptID)
             self.serverChangeToken = token
             self.uploadRetries = 0
@@ -1037,8 +1037,11 @@ extension CloudKitSynchronizer {
         }
         switch disposition {
         case .encryptedDataReset:
-            let recoveryWasActive = isEncryptedDataResetRecoveryActive
-                || hasPendingEncryptedDataResetRecovery(context: context)
+            let recoveryWasActive: Bool
+            do {
+                recoveryWasActive = try isEncryptedDataResetRecoveryActive
+                    || hasPendingEncryptedDataResetRecovery(context: context)
+            } catch { return error }
             if !recoveryWasActive {
                 do {
                     try requestChangeFeedRecovery(
@@ -1087,8 +1090,8 @@ extension CloudKitSynchronizer {
                 // empty and recreated.
                 return nil
             }
-            guard configuredZoneIsEstablished(zoneID) else { return nil }
             do {
+                guard try configuredZoneIsEstablished(zoneID) else { return nil }
                 try markConfiguredZoneTerminal(
                     zoneID,
                     kind: .unknown,

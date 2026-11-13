@@ -1,6 +1,10 @@
 import Foundation
 import RealmSwift
 
+public enum BigSyncMutationIdentityError: Error, Sendable {
+    case unavailable
+}
+
 /// A durable, record-level local mutation journal stored in the target Realm.
 ///
 /// Application writes update this object in the same Realm transaction as the
@@ -127,7 +131,7 @@ public struct BigSyncMutationPolicy: Sendable, Equatable {
         installationIdentifierProvider:
             (@Sendable () -> String?)? = nil,
         mutationJournalIdentityProvider:
-            (@Sendable () -> BigSyncMutationJournalIdentity?)? = nil
+            (@Sendable () throws -> BigSyncMutationJournalIdentity?)? = nil
     ) {
         precondition(
             installationIdentifier == nil
@@ -184,7 +188,7 @@ enum BigSyncMutationTrackingRegistry {
         let accountScopePropertyByClassName: [String: String]
         var installationIdentifierProvider: (@Sendable () -> String?)?
         var mutationJournalIdentityProvider:
-            (@Sendable () -> BigSyncMutationJournalIdentity?)?
+            (@Sendable () throws -> BigSyncMutationJournalIdentity?)?
     }
     private static var registrationsByRealm = [String: Registration]()
 
@@ -204,7 +208,7 @@ enum BigSyncMutationTrackingRegistry {
         accountScopePropertyByClassName: [String: String],
         installationIdentifierProvider: (@Sendable () -> String?)?,
         mutationJournalIdentityProvider:
-            (@Sendable () -> BigSyncMutationJournalIdentity?)?
+            (@Sendable () throws -> BigSyncMutationJournalIdentity?)?
     ) {
         lock.withLock {
             for configuration in configurations {
@@ -264,7 +268,7 @@ enum BigSyncMutationTrackingRegistry {
         let accountScopePropertyName: String?
         let installationIdentifierProvider: (@Sendable () -> String?)?
         let mutationJournalIdentityProvider:
-            (@Sendable () -> BigSyncMutationJournalIdentity?)?
+            (@Sendable () throws -> BigSyncMutationJournalIdentity?)?
     }
 
     static func mutationContext(
@@ -304,18 +308,18 @@ enum BigSyncMutationTrackingRegistry {
 
     static func currentMutationJournalIdentity(
         in realm: Realm
-    ) -> BigSyncMutationJournalIdentity? {
+    ) throws -> BigSyncMutationJournalIdentity? {
         let provider = lock.withLock {
             registrationsByRealm[
                 identity(for: realm.configuration)
             ]?.mutationJournalIdentityProvider
         }
-        return provider?()
+        return try provider?()
     }
 
     static func makeMutationGeneration(
         in realm: Realm
-    ) -> (
+    ) throws -> (
         generation: String,
         replicaBindingGenerationIdentifier: String?
     ) {
@@ -334,23 +338,21 @@ enum BigSyncMutationTrackingRegistry {
                     registration?.mutationJournalIdentityProvider
             )
         }
-        return makeMutationGeneration(context: context)
+        return try makeMutationGeneration(context: context)
     }
 
     static func makeMutationGeneration(
         context: MutationContext
-    ) -> (
+    ) throws -> (
         generation: String,
         replicaBindingGenerationIdentifier: String?
     ) {
         if let identityProvider = context.mutationJournalIdentityProvider {
-            guard let identity = identityProvider(),
+            guard let identity = try identityProvider(),
                   !identity.installationIdentifier.isEmpty,
                   identity.replicaBindingGenerationIdentifier?.isEmpty
                     != true else {
-                fatalError(
-                    "BigSync mutation identity is unavailable for a registered target Realm"
-                )
+                throw BigSyncMutationIdentityError.unavailable
             }
             if let binding =
                 identity.replicaBindingGenerationIdentifier {
@@ -376,9 +378,7 @@ enum BigSyncMutationTrackingRegistry {
             return (BigSyncPendingMutation.makeGeneration(), nil)
         }
         guard let installationIdentifier = installationProvider() else {
-            fatalError(
-                "BigSync installation identity is unavailable for a registered target Realm"
-            )
+            throw BigSyncMutationIdentityError.unavailable
         }
         return (
             BigSyncPendingMutation.makeGeneration(
@@ -413,7 +413,7 @@ enum BigSyncMutationTrackingRegistry {
     static func generationWasCreatedInCurrentInstallation(
         _ generation: String,
         realm: Realm
-    ) -> Bool {
+    ) throws -> Bool {
         let provider = lock.withLock {
             let registration = registrationsByRealm[
                 identity(for: realm.configuration)
@@ -424,7 +424,9 @@ enum BigSyncMutationTrackingRegistry {
             )
         }
         if let combinedProvider = provider.0 {
-            guard let identity = combinedProvider() else { return false }
+            guard let identity = try combinedProvider() else {
+                throw BigSyncMutationIdentityError.unavailable
+            }
             return BigSyncPendingMutation.wasCreatedInInstallation(
                 generation,
                 installationIdentifier: identity.installationIdentifier
@@ -434,7 +436,7 @@ enum BigSyncMutationTrackingRegistry {
             return BigSyncPendingMutation.wasCreatedInCurrentProcess(generation)
         }
         guard let installationIdentifier = installationProvider() else {
-            return false
+            throw BigSyncMutationIdentityError.unavailable
         }
         return BigSyncPendingMutation.wasCreatedInInstallation(
             generation,
@@ -445,10 +447,10 @@ enum BigSyncMutationTrackingRegistry {
     static func mutationWasCreatedInCurrentTransportIdentity(
         _ mutation: BigSyncPendingMutation,
         realm: Realm
-    ) -> Bool {
+    ) throws -> Bool {
         guard let mutationBinding =
                 mutation.replicaBindingGenerationIdentifier else {
-            return generationWasCreatedInCurrentInstallation(
+            return try generationWasCreatedInCurrentInstallation(
                 mutation.generation,
                 realm: realm
             )
@@ -458,8 +460,11 @@ enum BigSyncMutationTrackingRegistry {
                 identity(for: realm.configuration)
             ]?.mutationJournalIdentityProvider
         }
-        guard let identity = provider?(),
-              identity.replicaBindingGenerationIdentifier
+        guard let provider else { return false }
+        guard let identity = try provider() else {
+            throw BigSyncMutationIdentityError.unavailable
+        }
+        guard identity.replicaBindingGenerationIdentifier
                 == mutationBinding else { return false }
         return BigSyncPendingMutation.wasCreatedInInstallation(
             mutation.generation,
@@ -525,7 +530,7 @@ public enum BigSyncMutationTracking {
         installationIdentifierProvider:
             (@Sendable () -> String?)? = nil,
         mutationJournalIdentityProvider:
-            (@Sendable () -> BigSyncMutationJournalIdentity?)? = nil
+            (@Sendable () throws -> BigSyncMutationJournalIdentity?)? = nil
     ) {
         precondition(
             installationIdentifier == nil
@@ -566,9 +571,9 @@ public enum BigSyncMutationTracking {
     public static func currentJournalIdentity<ObjectType: Object>(
         verifyingPendingMutationsFor objects: [ObjectType],
         in realm: Realm
-    ) -> BigSyncMutationJournalIdentity? {
+    ) throws -> BigSyncMutationJournalIdentity? {
         precondition(realm.isInWriteTransaction)
-        guard let identity = BigSyncMutationTrackingRegistry
+        guard let identity = try BigSyncMutationTrackingRegistry
             .currentMutationJournalIdentity(in: realm),
               !identity.installationIdentifier.isEmpty,
               identity.replicaBindingGenerationIdentifier?.isEmpty

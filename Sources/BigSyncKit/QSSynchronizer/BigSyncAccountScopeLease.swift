@@ -630,9 +630,13 @@ final class BigSyncMutationJournalIdentityReader: @unchecked Sendable {
     }
 
     func current() -> BigSyncMutationJournalIdentity? {
+        try? currentThrowing()
+    }
+
+    func currentThrowing() throws -> BigSyncMutationJournalIdentity? {
         guard let installationBefore =
                 clientIdentity.currentInstallationIdentifier(),
-              let binding = try? BigSyncReplicaBindingStateStore.load(
+              let binding = try BigSyncReplicaBindingStateStore.load(
                 store: store,
                 key: key
               ),

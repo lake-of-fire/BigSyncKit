@@ -633,6 +633,14 @@ public struct BigSyncClientIdentity: Sendable {
     /// object mutation.
     public func makeMutationJournalIdentityProvider()
         -> @Sendable () -> BigSyncMutationJournalIdentity? {
+        let provider = makeThrowingMutationJournalIdentityProvider()
+        return { try? provider() }
+    }
+
+    /// Mutation writers preserve storage/admission errors so the owning Realm
+    /// transaction can roll back instead of treating cancellation as corruption.
+    public func makeThrowingMutationJournalIdentityProvider()
+        -> @Sendable () throws -> BigSyncMutationJournalIdentity? {
         let reader = BigSyncMutationJournalIdentityReader(
             clientIdentity: self,
             store: FileKeyValueStore(
@@ -640,7 +648,7 @@ public struct BigSyncClientIdentity: Sendable {
             ),
             key: durableStateNamespace + ".ReplicaBinding.v1"
         )
-        return { reader.current() }
+        return { try reader.currentThrowing() }
     }
 
     /// Reads installation and replica-binding identity as one verified

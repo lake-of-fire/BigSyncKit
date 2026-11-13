@@ -56,7 +56,7 @@ extension CloudKitSynchronizer {
             .serverReconciliation,
         compatibilityVersion: Int = 0,
         logger: Logging.Logger
-    ) -> CloudKitSynchronizer {
+    ) throws -> CloudKitSynchronizer {
         let zoneID = recordZoneID ?? defaultCustomZoneID
         let durableStateZoneID = durableStateRecordZoneID ?? zoneID
         let durableStateNamespace = makeDurableStateNamespace(
@@ -114,15 +114,12 @@ extension CloudKitSynchronizer {
                 // exist. This also covers explicit integration-test stores.
                 try durableStore.prepareForUse()
             } catch {
-                preconditionFailure(
-                    "BigSyncKit durable local state failed validation before provider setup: \(error)"
-                )
+                throw error
             }
         } else {
-            precondition(
-                keyValueStore.synchronize?() == true,
-                "BigSyncKit requires a durable local-state store before provider setup"
-            )
+            guard keyValueStore.synchronize?() == true else {
+                throw DurableKeyValueStoreError.mutationNotDurable
+            }
         }
         // Retain this process's shared restore lease before an adapter can
         // open either target or tracking Realm state. Manabi also prepares
@@ -142,12 +139,10 @@ extension CloudKitSynchronizer {
         do {
             installationIdentifier = try clientIdentity.prepareInstallation()
         } catch {
-            preconditionFailure(
-                "BigSyncKit installation identity failed before provider setup: \(error)"
-            )
+            throw error
         }
         let mutationJournalIdentityProvider:
-            (@Sendable () -> BigSyncMutationJournalIdentity?)?
+            (@Sendable () throws -> BigSyncMutationJournalIdentity?)?
         if accountReplacementPolicy.usesDatasetReplicaBinding {
             let replicaBindingKey = durableStateNamespace
                 + ".ReplicaBinding.v1"
@@ -158,9 +153,7 @@ extension CloudKitSynchronizer {
                     installationIdentifier: installationIdentifier
                 )
             } catch {
-                preconditionFailure(
-                    "BigSyncKit replica binding failed before provider setup: \(error)"
-                )
+                throw error
             }
             let mutationIdentityReader =
                 BigSyncMutationJournalIdentityReader(
@@ -169,7 +162,7 @@ extension CloudKitSynchronizer {
                     key: replicaBindingKey
                 )
             mutationJournalIdentityProvider = {
-                mutationIdentityReader.current()
+                try mutationIdentityReader.currentThrowing()
             }
         } else {
             mutationJournalIdentityProvider = nil
