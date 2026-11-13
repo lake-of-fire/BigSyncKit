@@ -472,6 +472,39 @@ extension KeyValueStore {
         }
     }
 
+    /// Initialize only the additive local publication epoch under the same
+    /// exclusive read/modify/write turn. A second process must not overwrite a
+    /// newer port while upgrading an existing v1 binding without an epoch.
+    func prepareReplicaPublicationEpoch(forKey key: String) throws -> Bool {
+        guard !BigSyncReplicaPublicationReadScope.isActive else {
+            throw BigSyncReplicaPublicationError.reentrantPublication
+        }
+        return try lock.withLock {
+            do {
+                return try withFileLockThrowing(mode: LOCK_EX) {
+                    var snapshot = try reloadStorageLockedThrowing()
+                    guard !hasUncommittedMutationFailure else {
+                        throw lastPersistenceError ?? DurableKeyValueStoreError.mutationNotDurable
+                    }
+                    guard let raw = snapshot[key] as? [String: Any] else {
+                        throw BigSyncReplicaBindingError.corrupt
+                    }
+                    _ = try BigSyncReplicaBindingStateStore.decode(raw)
+                    guard try BigSyncReplicaBindingStateStore.publicationEpoch(from: raw) == nil else { return false }
+                    var upgraded = raw
+                    upgraded["publicationEpoch"] = UUID().uuidString
+                    snapshot[key] = upgraded
+                    try persistThrowing(snapshot)
+                    return true
+                }
+            } catch {
+                hasUncommittedMutationFailure = true
+                lastPersistenceError = error as NSError
+                throw error
+            }
+        }
+    }
+
     /// Internal identity-owner frontier. The existing namespace file guard stays
     /// held through the caller's bounded publication, excluding every peer's
     /// durable binding write. The callback must not reenter this store.
