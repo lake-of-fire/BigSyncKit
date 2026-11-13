@@ -6,11 +6,138 @@
 //
 
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 import CloudKit
 import CryptoKit
 import Logging
 import RealmSwiftGaps
 import SwiftUtilities
+
+/// Owns only execution-lease state, never account or Realm publication state.
+/// Expiration signals the exact queued write rather than cancelling whichever
+/// synchronization attempt happens to be current when a callback is delivered.
+final class BigSyncWriteExecutionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var interrupted = false
+    private var released = false
+    private var interruptionHandler: (@Sendable () -> Void)?
+    private var releaseHandler: (@Sendable () -> Void)?
+
+    var lease: RealmWriteExecutionLease {
+        RealmWriteExecutionLease(
+            checkpoint: { [self] in try checkpoint() },
+            installInterruptionHandler: { [self] in installInterruptionHandler($0) },
+            release: { [self] in release() }
+        )
+    }
+
+    func checkpoint() throws {
+        let denied = lock.withLock { interrupted || released }
+        if denied { throw CancellationError() }
+    }
+
+    func interrupt() {
+        let handler: (@Sendable () -> Void)? = lock.withLock {
+            guard !released else { return nil }
+            interrupted = true
+            return interruptionHandler
+        }
+        handler?()
+    }
+
+    func installInterruptionHandler(_ handler: @escaping @Sendable () -> Void) {
+        let callNow = lock.withLock {
+            if interrupted || released { return true }
+            interruptionHandler = handler
+            return false
+        }
+        if callNow { handler() }
+    }
+
+    func installReleaseHandler(_ handler: @escaping @Sendable () -> Void) {
+        let callNow = lock.withLock {
+            if released { return true }
+            releaseHandler = handler
+            return false
+        }
+        if callNow { handler() }
+    }
+
+    func release() {
+        let handler: (@Sendable () -> Void)? = lock.withLock {
+            guard !released else { return nil }
+            released = true
+            interruptionHandler = nil
+            let handler = releaseHandler
+            releaseHandler = nil
+            return handler
+        }
+        handler?()
+    }
+}
+
+/// A fresh assertion for one durable critical section. Network requests do not
+/// retain it, and long-lived observation tasks inherit this acquisition policy
+/// rather than an assertion belonging to a retired synchronization attempt.
+public enum BigSyncDurableWriteExecution {
+    /// UIApplication's begin/end background-task APIs are explicitly
+    /// nonisolated and thread-safe. Capture its singleton on MainActor once;
+    /// subsequent acquisition/release must not hop there while a journal's
+    /// caller holds an account/database fence.
+    @MainActor
+    public static func installApplicationPolicy() {
+#if os(iOS)
+        let application = UIApplication.shared
+        RealmWriteExecutionProtection.installDefaultSynchronousAcquisition {
+            try makeLease(application: application)
+        }
+#endif
+    }
+
+    public static func acquire() async throws -> RealmWriteExecutionLease {
+        try Task.checkCancellation()
+        if let lease = try RealmWriteExecutionProtection.acquireSynchronousLease() {
+            return lease
+        }
+#if os(iOS)
+        return try await MainActor.run {
+            installApplicationPolicy()
+            return try makeLease(application: UIApplication.shared)
+        }
+#else
+        return RealmWriteExecutionLease(
+            checkpoint: { try Task.checkCancellation() },
+            installInterruptionHandler: { _ in },
+            release: {}
+        )
+#endif
+    }
+
+#if os(iOS)
+    private static func makeLease(application: UIApplication) throws -> RealmWriteExecutionLease {
+        // Synchronous journal cleanup may intentionally finish after caller
+        // cancellation. Admission here depends on OS execution, not that flag;
+        // the owned Realm bridge enforces its own Task cancellation boundary.
+        let state = BigSyncWriteExecutionState()
+        let identifier = application.beginBackgroundTask(
+            withName: "Manabi durable write"
+        ) {
+            state.interrupt()
+        }
+        guard identifier != .invalid else { throw CancellationError() }
+        state.installReleaseHandler { application.endBackgroundTask(identifier) }
+        do {
+            try state.checkpoint()
+            return state.lease
+        } catch {
+            state.release()
+            throw error
+        }
+    }
+#endif
+}
 
 /// Bridges callback-only CloudKit APIs without pinning the caller to a checked
 /// continuation after its task is cancelled. The callback may still arrive,
@@ -1929,6 +2056,24 @@ public class CloudKitSynchronizer: NSObject {
         // intent without making CloudKit work user-interactive.
         synchronizationTask = Task(priority: .utility) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
+#if DEBUG
+            let diagnosticCorrelationID = BigSyncDebugDiagnostics.currentOrNewCorrelationID()
+            let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+            BigSyncDebugDiagnostics.record(.syncWorkerStarted, correlationID: diagnosticCorrelationID)
+            defer {
+                BigSyncDebugDiagnostics.record(
+                    .syncWorkerSettled,
+                    correlationID: diagnosticCorrelationID,
+                    elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+                )
+            }
+#endif
+            // Each actual Realm write owns its assertion through rollback or
+            // commit settlement, including writes in unstructured callbacks.
+            // A waiter or orchestration task may finish independently.
+            await RealmWriteExecutionProtection.$acquire.withValue({
+                try await BigSyncDurableWriteExecution.acquire()
+            }) {
             do {
                 await waitForRunCallbacksToFinish()
                 try checkSynchronizationAttempt(attemptID)
@@ -2090,6 +2235,7 @@ public class CloudKitSynchronizer: NSObject {
             } catch {
                 guard synchronizationAttemptID == attemptID else { return }
                 await failSynchronization(error: error, for: attemptID)
+            }
             }
         }
     }

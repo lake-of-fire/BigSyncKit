@@ -7836,6 +7836,11 @@ public final class RealmSwiftAdapter:
                             $0.semanticReplacementDisposition
                     )
                 }
+                // Encode and compress CloudKit system metadata before any
+                // Realm transaction admits its writer lock.
+                let encodedSystemFields = try safeChunk.map {
+                    try encodedRecord($0.record, onlySystemFields: true)
+                }
                 do {
 #if DEBUG
                     try await _testBeforeImportedRecordTargetWrite?()
@@ -8188,7 +8193,7 @@ public final class RealmSwiftAdapter:
                             }
                             persistenceRealm.add(entity)
                         }
-                        for item in chunk {
+                        for (item, encodedFields) in zip(chunk, encodedSystemFields) {
                             try validateOwner()
                             let syncedEntity: SyncedEntity
                             if let existing = persistenceRealm.object(
@@ -8211,7 +8216,7 @@ public final class RealmSwiftAdapter:
                             } else {
                                 continue
                             }
-                            try save(record: item.record, for: syncedEntity)
+                            syncedEntity.encodedRecord = encodedFields
                             if (syncedEntity.entityState == .deletedRemotely
                                 || syncedEntity.entityState
                                     == .recreatingRemotely),
@@ -9018,11 +9023,21 @@ public final class RealmSwiftAdapter:
             try Task.checkCancellation()
             try validateOwner()
 
-            try await persistenceRealm.asyncWritePreservingOwnership {
+            // CloudKit archiving and compression are CPU work independent of
+            // Realm state. Finish it before admitting the durable Realm write.
+            var encodedSystemFields = [Data]()
+            encodedSystemFields.reserveCapacity(chunk.count)
+            for record in chunk {
+                try validateOwner()
+                encodedSystemFields.append(try encodedRecord(record, onlySystemFields: true))
+            }
+
+            let performAcknowledgementWrite: () async throws -> Void = {
+                try await persistenceRealm.asyncWritePreservingOwnership {
                 try validateOwner()
                 var acknowledgedInThisWrite = [String: String]()
                 var acknowledgedEntityTypesInThisWrite = [String: String]()
-                for record in chunk {
+                for (record, encodedFields) in zip(chunk, encodedSystemFields) {
                     try Task.checkCancellation()
                     try validateOwner()
 
@@ -9031,18 +9046,18 @@ public final class RealmSwiftAdapter:
                         forPrimaryKey: record.recordID.recordName
                     ), let uploadedGeneration = matchingGenerations[record.recordID.recordName],
                        syncedEntity.pendingGeneration == uploadedGeneration,
-                       preparedGenerationIsEligibleForActiveTransport(
+                       self.preparedGenerationIsEligibleForActiveTransport(
                            recordName: record.recordID.recordName,
                            entityType: syncedEntity.entityType,
                            generation: uploadedGeneration
                        ) else { continue }
                     if let receipt = comparisonReceipts[record.recordID.recordName] {
                         guard let target = realmProvider.targetReaderRealmPerSchemaName[syncedEntity.entityType],
-                              try comparisonReceiptIsCurrent(receipt,
+                              try self.comparisonReceiptIsCurrent(receipt,
                                 recordName: record.recordID.recordName, in: target) else { continue }
                     }
                     try Task.checkCancellation()
-                    try save(record: record, for: syncedEntity)
+                    syncedEntity.encodedRecord = encodedFields
                     syncedEntity.state = SyncedEntityState.synced.rawValue
                     syncedEntity.clearPendingMutation()
                     acknowledgedInThisWrite[record.recordID.recordName] = uploadedGeneration
@@ -9053,9 +9068,9 @@ public final class RealmSwiftAdapter:
                 }
                 if let retainedDeletionCleanup, !acknowledgedInThisWrite.isEmpty {
 #if DEBUG
-                    try _testAfterAcceptedRetainedDeletionTrackingAdmission?()
+                    try self._testAfterAcceptedRetainedDeletionTrackingAdmission?()
 #endif
-                    try retireAcceptedRetainedDeletionQuarantines(
+                    try self.retireAcceptedRetainedDeletionQuarantines(
                         retainedDeletionCleanup,
                         acknowledgedGenerations: acknowledgedInThisWrite,
                         comparisonReceipts: comparisonReceipts,
@@ -9066,13 +9081,55 @@ public final class RealmSwiftAdapter:
                     // Every public acknowledgement path must keep restoring
                     // work pending while deletion evidence remains unresolved.
                     // Legacy generations supply no permission to retire it.
-                    try requireRetainedDeletionQuarantinesSettled(
+                    try self.requireRetainedDeletionQuarantinesSettled(
                         acknowledgedEntityTypes: acknowledgedEntityTypesInThisWrite,
                         in: persistenceRealm
                     )
                 }
                 try validateOwner()
+                }
             }
+#if DEBUG
+            let diagnosticCorrelationID = UUID()
+            let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+            BigSyncDebugDiagnostics.record(
+                .uploadAckChunkRequested,
+                correlationID: diagnosticCorrelationID,
+                count: chunk.count
+            )
+            do {
+                try await RealmWriteLifecycleObservation.$didAdmit.withValue({
+                    BigSyncDebugDiagnostics.record(.uploadAckChunkAdmitted, correlationID: diagnosticCorrelationID)
+                }) {
+                    try await RealmWriteLifecycleObservation.$didStartBody.withValue({
+                        BigSyncDebugDiagnostics.record(.uploadAckChunkBodyStarted, correlationID: diagnosticCorrelationID)
+                    }) {
+                        try await RealmWriteLifecycleObservation.$didSubmitCommit.withValue({
+                            BigSyncDebugDiagnostics.record(.uploadAckChunkCommitSubmitted, correlationID: diagnosticCorrelationID)
+                        }) {
+                            try await RealmWriteLifecycleObservation.$didSettle.withValue({
+                                BigSyncDebugDiagnostics.record(
+                                    .uploadAckChunkSettled,
+                                    correlationID: diagnosticCorrelationID,
+                                    elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+                                )
+                            }) {
+                                try await performAcknowledgementWrite()
+                            }
+                        }
+                    }
+                }
+            } catch {
+                BigSyncDebugDiagnostics.record(
+                    .uploadAckChunkFailed,
+                    correlationID: diagnosticCorrelationID,
+                    elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+                )
+                throw error
+            }
+#else
+            try await performAcknowledgementWrite()
+#endif
 #if DEBUG
             try await _testAfterUploadTrackingWrite?()
 #endif
