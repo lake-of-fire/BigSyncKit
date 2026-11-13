@@ -2394,6 +2394,40 @@ public class CloudKitSynchronizer: NSObject {
         try await revalidateRunContext(context)
     }
 
+    internal func revalidateActiveRunContext(
+        for attemptID: UUID,
+        preserving operationError: Error
+    ) async throws {
+        try checkSynchronizationAttempt(attemptID)
+        guard let context = activeRunContext else { return }
+        try await revalidateRunContext(context, preserving: operationError)
+    }
+
+    /// An operation failure remains evidence even when the subsequent account
+    /// probe fails independently. Preserve both causes so lifecycle handling
+    /// retains server retry floors, account stops and token-recovery debt.
+    /// Cancellation still retires the caller without scheduling another retry.
+    internal func revalidateRunContext(
+        _ context: RunContext,
+        preserving operationError: Error
+    ) async throws {
+        if operationError is CancellationError { throw operationError }
+        do {
+            try await revalidateRunContext(context)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw NSError(
+                domain: "BigSyncKit.CloudKitOperationRevalidation",
+                code: 1,
+                userInfo: [
+                    NSUnderlyingErrorKey: error as NSError,
+                    NSMultipleUnderlyingErrorsKey: [operationError as NSError],
+                ]
+            )
+        }
+    }
+
     /// Registers an asynchronous CloudKit callback as work owned by its
     /// synchronization attempt. A newer run does not clear adapter cancellation
     /// until every callback that entered the old attempt has left.

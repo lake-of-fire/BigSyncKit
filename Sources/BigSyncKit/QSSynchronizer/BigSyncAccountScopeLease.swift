@@ -250,6 +250,10 @@ enum BigSyncReplicaBindingStateStore {
             )
             guard existing.installationIdentityDigest
                     != currentInstallationDigest else {
+                if let fileStore = store as? FileKeyValueStore,
+                   try fileStore.prepareReplicaPublicationEpoch(forKey: key) {
+                    NotificationCenter.default.post(name: .BigSyncReplicaPublicationAuthorityDidChange, object: nil)
+                }
                 return existing
             }
             let rotated = BigSyncReplicaBindingSnapshot(
@@ -293,7 +297,8 @@ enum BigSyncReplicaBindingStateStore {
         return try decode(raw)
     }
 
-    private static func decode(_ raw: Any) throws -> BigSyncReplicaBindingSnapshot {
+    static func decode(_ raw: Any) throws -> BigSyncReplicaBindingSnapshot {
+        _ = try publicationEpoch(from: raw)
         guard let value = raw as? [String: Any],
               BigSyncPersistedAccountAuthorityValue.nonnegativeInteger(value["version"]) == Int64(version),
               let installationIdentityDigest = validDigest(
@@ -584,9 +589,30 @@ enum BigSyncReplicaBindingStateStore {
             value["pendingDetectedAt"] = pendingPort.detectedAt
         }
         // Keep writes and reads on the same format contract without changing
-        // the v1 representation, keys, or transition policy.
+        // the v1 journal fields or transition policy. The additive local epoch
+        // versions publication authority independently of journal attribution.
         _ = try decode(value)
+        let previous = try load(store: store, key: key)
+        // Publication lifetimes are distinct from journal attribution. Canceling
+        // a port may restore the old journal generation, but must not revive an
+        // admission captured before that intervening transition.
+        value["publicationEpoch"] = UUID().uuidString
         try store.bigSyncSetDurably(value: value, forKey: key)
+        if previous != snapshot {
+            // Durable mutation and its namespace lock have finished. Observers
+            // may revoke capabilities, but must schedule any joining/open work.
+            NotificationCenter.default.post(name: .BigSyncReplicaPublicationAuthorityDidChange, object: nil)
+        }
+    }
+
+    /// Optional only for existing v1 local state. Capture requires preparation
+    /// to durably initialize it; malformed epochs never grant authority.
+    static func publicationEpoch(from raw: Any) throws -> String? {
+        guard let value = raw as? [String: Any] else { throw BigSyncReplicaBindingError.corrupt }
+        guard let epoch = value["publicationEpoch"] else { return nil }
+        guard let text = epoch as? String, let uuid = UUID(uuidString: text),
+              uuid.uuidString == text else { throw BigSyncReplicaBindingError.corrupt }
+        return text
     }
 
     private static func validDigest(_ value: Any?) -> String? {
@@ -630,6 +656,12 @@ final class BigSyncMutationJournalIdentityReader: @unchecked Sendable {
     }
 
     func current() -> BigSyncMutationJournalIdentity? {
+        if BigSyncReplicaPublicationReadScope.isActive {
+            guard let borrowed = BigSyncReplicaPublicationReadScope.current(identity: clientIdentity),
+                  let fileStore = store as? FileKeyValueStore,
+                  borrowed.storeURL == fileStore.fileURL.standardizedFileURL else { return nil }
+            return borrowed.identity
+        }
         guard let installationBefore =
                 clientIdentity.currentInstallationIdentifier(),
               let binding = try? BigSyncReplicaBindingStateStore.load(
