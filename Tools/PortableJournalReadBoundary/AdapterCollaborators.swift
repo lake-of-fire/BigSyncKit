@@ -11,6 +11,7 @@ public final class BigSyncPendingMutation: Object, @unchecked Sendable {
     public var objectIdentifier: String { get { string("objectIdentifier") ?? "" } set { set("objectIdentifier", newValue) } }
     public var accountScopeIdentifier: String? { get { string("account") } set { set("account", newValue) } }
     public var replicaBindingGenerationIdentifier: String? { get { string("binding") } set { set("binding", newValue) } }
+    public var requiresReplicaBindingRecovery: Bool { get { bool("requiresReplicaBindingRecovery") } set { fields["requiresReplicaBindingRecovery"] = .bool(newValue) } }
     public var generation: String { get { string("generation") ?? "" } set { set("generation", newValue) } }
     public var changedAt: Date { get { date("changedAt") } set { fields["changedAt"] = .date(newValue) } }
 }
@@ -25,6 +26,7 @@ public final class Note: Object, @unchecked Sendable {
 public struct BigSyncPendingMutationSnapshot: Sendable {
     public let recordName: String, entityType: String, objectIdentifier: String
     public let accountScopeIdentifier: String?, replicaBindingGenerationIdentifier: String?
+    public let requiresReplicaBindingRecovery: Bool
     public let generation: String
     public let changedAt: Date
     public let isDeletion: Bool

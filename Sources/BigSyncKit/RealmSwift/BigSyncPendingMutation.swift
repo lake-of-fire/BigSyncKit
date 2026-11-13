@@ -73,8 +73,30 @@ public final class BigSyncPendingMutation: Object {
     /// work prepared for an older remote replica.
     @Persisted(indexed: true)
     public var replicaBindingGenerationIdentifier: String?
+    /// Retained legacy debt must not become uploadable merely because the
+    /// active account or binding later matches its copied attribution.
+    @Persisted(indexed: true) public var requiresReplicaBindingRecovery = false
     @Persisted public var generation = ""
     @Persisted public var changedAt = Date()
+
+    /// Called only by the owning target Realm's legacy bridge migration.
+    /// Recompute the historical inverted flag from attribution without
+    /// rewriting the original generation, timestamps or account/binding.
+    public static func quarantineLegacyReplicaBoundRows(migration: Migration) {
+        migration.enumerateObjects(ofType: className()) { oldObject, newObject in
+            guard let oldObject, let newObject,
+                  newObject.objectSchema.properties.contains(where: {
+                      $0.name == "requiresReplicaBindingRecovery"
+                  }) else { return }
+            func hasAttribution(_ property: String) -> Bool {
+                oldObject.objectSchema.properties.contains { $0.name == property }
+                    && oldObject[property] as? String != nil
+            }
+            newObject["requiresReplicaBindingRecovery"] =
+                hasAttribution("accountScopeIdentifier")
+                || hasAttribution("replicaBindingGenerationIdentifier")
+        }
+    }
 
     public convenience init(
         recordName: String,
@@ -181,6 +203,7 @@ struct BigSyncPendingMutationSnapshot: Sendable {
     let objectIdentifier: String
     let accountScopeIdentifier: String?
     let replicaBindingGenerationIdentifier: String?
+    let requiresReplicaBindingRecovery: Bool
     let generation: String
     let changedAt: Date
     let isDeletion: Bool
@@ -625,7 +648,8 @@ public enum BigSyncMutationTracking {
             guard let mutation = realm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
-            ), mutation.entityType == entityType,
+            ), !mutation.requiresReplicaBindingRecovery,
+               mutation.entityType == entityType,
                mutation.objectIdentifier == objectIdentifier,
                mutation.replicaBindingGenerationIdentifier
                 == identity.replicaBindingGenerationIdentifier,

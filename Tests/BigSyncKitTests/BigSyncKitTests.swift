@@ -4921,6 +4921,184 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testFreshExplicitMutationSupersedesQuarantineWithoutRetransmittingLegacyIntent() async throws {
+        for scope in [nil, "current-account"] as [String?] {
+            let accountProperties = scope == nil ? [:] : [
+                BigSyncTrackedObject.className(): "cloudKitAccountScopeIdentifier"
+            ]
+            let fixture = try await makeRealmAdapterFixture(accountScopePropertyByClassName: accountProperties)
+            BigSyncMutationPolicy(excludedClassNames: [], accountScopePropertyByClassName: accountProperties)
+                .install(configurations: [fixture.targetRealm.configuration], installationIdentifier: "current-installation")
+            try await fixture.adapter.activateReplicaBinding(
+                accountScopeIdentifier: "current-account", replicaBindingGenerationIdentifier: nil)
+            let originalDate = Date(timeIntervalSince1970: 20_000)
+            let freshDate = originalDate.addingTimeInterval(10)
+            let object = BigSyncTrackedObject(id: "fresh-intent", createdAt: originalDate,
+                modifiedAt: originalDate, explicitlyModifiedAt: originalDate)
+            object.cloudKitAccountScopeIdentifier = scope ?? "unused-unscoped-property"
+            object.tags.append("legacy-value")
+            let name = BigSyncTrackedObject.className() + "." + object.id
+            let legacyAccount = scope ?? "retained-legacy-account"
+            let mutation = BigSyncPendingMutation(recordName: name, entityType: BigSyncTrackedObject.className(),
+                objectIdentifier: object.id, accountScopeIdentifier: legacyAccount,
+                replicaBindingGenerationIdentifier: "retained-binding", generation: "retained-generation",
+                changedAt: originalDate)
+            mutation.requiresReplicaBindingRecovery = true
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add(object)
+                fixture.targetRealm.add(mutation)
+                object.refreshChangeMetadata(explicitlyModified: false, at: freshDate)
+                object.journalCurrentValuePreservingChangeMetadata(at: freshDate)
+            }
+            XCTAssertTrue(mutation.requiresReplicaBindingRecovery)
+            XCTAssertEqual(mutation.generation, "retained-generation")
+            XCTAssertEqual(mutation.changedAt, originalDate)
+            XCTAssertEqual(mutation.accountScopeIdentifier, legacyAccount)
+            XCTAssertEqual(mutation.replicaBindingGenerationIdentifier, "retained-binding")
+            let retainedUploads = try await fixture.adapter.preparedRecordsToUpload(
+                limit: 10, restrictedToEntityType: nil)
+            XCTAssertTrue(retainedUploads.isEmpty)
+
+            try await fixture.targetRealm.asyncWrite {
+                object.tags.removeAll()
+                object.tags.append("fresh-authored-value")
+                object.refreshChangeMetadata(explicitlyModified: true, at: freshDate)
+            }
+            XCTAssertFalse(mutation.requiresReplicaBindingRecovery)
+            XCTAssertNotEqual(mutation.generation, "retained-generation")
+            XCTAssertTrue(BigSyncPendingMutation.wasCreatedInInstallation(
+                mutation.generation, installationIdentifier: "current-installation"))
+            XCTAssertEqual(mutation.changedAt, freshDate)
+            XCTAssertEqual(mutation.accountScopeIdentifier, scope)
+            XCTAssertNil(mutation.replicaBindingGenerationIdentifier)
+            _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+            let freshUploads = try await fixture.adapter.preparedRecordsToUpload(
+                limit: 10, restrictedToEntityType: nil)
+            XCTAssertEqual(freshUploads.count, 1)
+            XCTAssertEqual(freshUploads.first?.generation, mutation.generation)
+            XCTAssertEqual(freshUploads.first?.record["tags"] as? [String], ["fresh-authored-value"])
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testQuarantineCommittedAfterSelectionWithholdsPreparedUpload() async throws {
+        let fixture = try await makeRealmAdapterFixture()
+        let object = BigSyncTrackedObject(id: "late-quarantine", createdAt: Date(),
+            modifiedAt: Date(), explicitlyModifiedAt: nil)
+        try await fixture.targetRealm.asyncWrite {
+            fixture.targetRealm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        let name = BigSyncTrackedObject.className() + "." + object.id
+        let mutation = try XCTUnwrap(fixture.targetRealm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+        let generation = mutation.generation
+        let changedAt = mutation.changedAt
+        _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+        fixture.adapter._testAfterUploadRecordSelection = {
+            try await fixture.targetRealm.asyncWrite { mutation.requiresReplicaBindingRecovery = true }
+        }
+        let prepared = try await fixture.adapter.preparedRecordsToUpload(
+            limit: 10, restrictedToEntityType: nil)
+        fixture.adapter._testAfterUploadRecordSelection = nil
+        XCTAssertTrue(prepared.isEmpty)
+        XCTAssertEqual(mutation.generation, generation)
+        XCTAssertEqual(mutation.changedAt, changedAt)
+        XCTAssertTrue(mutation.requiresReplicaBindingRecovery)
+    }
+
+    @BigSyncBackgroundActor
+    func testQuarantinedJournalRejectsMatchingTransportAndPreparedAcknowledgement() async throws {
+        for binding in [nil, String(repeating: "f", count: 64)] as [String?] {
+            let fixture = try await makeRealmAdapterFixture()
+            try await fixture.adapter.activateReplicaBinding(
+                accountScopeIdentifier: "current-account", replicaBindingGenerationIdentifier: binding)
+            let object = BigSyncTrackedObject(id: "quarantined", createdAt: Date(),
+                modifiedAt: Date(), explicitlyModifiedAt: nil)
+            let name = BigSyncTrackedObject.className() + "." + object.id
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add(object)
+                object.refreshChangeMetadata(explicitlyModified: true)
+                fixture.targetRealm.object(ofType: BigSyncPendingMutation.self,
+                    forPrimaryKey: name)?.replicaBindingGenerationIdentifier = binding
+            }
+            _ = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+            let prepared = try await fixture.adapter.preparedRecordsToUpload(
+                limit: 10, restrictedToEntityType: nil)
+            XCTAssertEqual(prepared.count, 1)
+            let generation = try XCTUnwrap(prepared.first?.generation)
+            let mutation = try XCTUnwrap(fixture.targetRealm.object(
+                ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+            let changedAt = mutation.changedAt
+            try await fixture.targetRealm.asyncWrite { mutation.requiresReplicaBindingRecovery = true }
+
+            let forwarded = try await fixture.adapter._test_forwardPendingMutations(in: fixture.targetRealm)
+            XCTAssertEqual(forwarded, 0)
+            let blocked = try await fixture.adapter.preparedRecordsToUpload(
+                limit: 10, restrictedToEntityType: nil)
+            XCTAssertTrue(blocked.isEmpty)
+            try await fixture.adapter.didUpload(savedRecords: prepared.map(\.record),
+                matchingGenerations: [name: generation])
+            XCTAssertEqual(mutation.generation, generation)
+            XCTAssertEqual(mutation.changedAt, changedAt)
+            XCTAssertEqual(mutation.replicaBindingGenerationIdentifier, binding)
+            XCTAssertTrue(mutation.requiresReplicaBindingRecovery)
+            XCTAssertEqual(fixture.persistenceRealm.object(ofType: SyncedEntity.self,
+                forPrimaryKey: name)?.pendingGeneration, generation)
+            XCTAssertFalse(try fixture.adapter.hasPendingChangesAtTerminalBoundary())
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testQuarantinedJournalSurvivesRestoreAndBootstrapDiscovery() async throws {
+        for mode in [ChangeFeedResetMode.backupRestore, .initialImport, .serverReconciliation] {
+            let fixture = try await makeRealmAdapterFixture()
+            let timestamp = Date(timeIntervalSince1970: 12_345)
+            var names = [String]()
+            try await fixture.targetRealm.asyncWrite {
+                for deleted in [false, true] {
+                    let object = BigSyncTrackedObject(id: deleted ? "retained-deleted" : "retained-live",
+                        createdAt: timestamp, modifiedAt: timestamp, explicitlyModifiedAt: timestamp)
+                    object.isDeleted = deleted
+                    object.tags.append("original-local-value")
+                    fixture.targetRealm.add(object)
+                    let name = BigSyncTrackedObject.className() + "." + object.id
+                    names.append(name)
+                    let mutation = BigSyncPendingMutation(recordName: name,
+                        entityType: BigSyncTrackedObject.className(), objectIdentifier: object.id,
+                        accountScopeIdentifier: "legacy-account", replicaBindingGenerationIdentifier: "legacy-binding",
+                        generation: "original-" + object.id, changedAt: timestamp)
+                    mutation.requiresReplicaBindingRecovery = true
+                    fixture.targetRealm.add(mutation)
+                }
+            }
+            try await activateChangeFeedNamespace(fixture.adapter, account: "current-account")
+            try await fixture.adapter.prepareChangeFeedReset(
+                accountScopeIdentifier: "current-account", epoch: 1, mode: mode)
+            try await fixture.adapter.beginChangeFeedServerBootstrap(
+                accountScopeIdentifier: "current-account", epoch: 1, mode: mode)
+            try await fixture.adapter.reconcileAfterChangeFeedServerBootstrap(
+                accountScopeIdentifier: "current-account", epoch: 1, mode: mode)
+            for name in names {
+                let mutation = try XCTUnwrap(fixture.targetRealm.object(
+                    ofType: BigSyncPendingMutation.self, forPrimaryKey: name))
+                XCTAssertEqual(mutation.generation, "original-" + mutation.objectIdentifier)
+                XCTAssertEqual(mutation.changedAt, timestamp)
+                XCTAssertEqual(mutation.accountScopeIdentifier, "legacy-account")
+                XCTAssertEqual(mutation.replicaBindingGenerationIdentifier, "legacy-binding")
+                XCTAssertTrue(mutation.requiresReplicaBindingRecovery)
+                let object = try XCTUnwrap(fixture.targetRealm.object(
+                    ofType: BigSyncTrackedObject.self, forPrimaryKey: mutation.objectIdentifier))
+                XCTAssertEqual(Array(object.tags), ["original-local-value"])
+                XCTAssertEqual(object.isDeleted, mutation.objectIdentifier == "retained-deleted")
+            }
+            let uploads = try await fixture.adapter.preparedRecordsToUpload(
+                limit: 10, restrictedToEntityType: nil)
+            XCTAssertTrue(uploads.isEmpty)
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testUnattributedMutationIsRejectedWhenReplicaBindingIsActive()
     async throws {
         let fixture = try await makeRealmAdapterFixture()

@@ -1478,7 +1478,7 @@ public final class RealmSwiftAdapter:
     private func pendingMutationIsEligibleForActiveTransport(
         _ mutation: BigSyncPendingMutationSnapshot
     ) -> Bool {
-        pendingMutationIsEligibleForActiveTransport(
+        !mutation.requiresReplicaBindingRecovery && pendingMutationIsEligibleForActiveTransport(
             entityType: mutation.entityType,
             accountScopeIdentifier: mutation.accountScopeIdentifier,
             replicaBindingGenerationIdentifier:
@@ -1493,7 +1493,7 @@ public final class RealmSwiftAdapter:
     func pendingMutationIsEligibleForActiveTransport(
         _ mutation: BigSyncPendingMutation
     ) -> Bool {
-        pendingMutationIsEligibleForActiveTransport(
+        !mutation.requiresReplicaBindingRecovery && pendingMutationIsEligibleForActiveTransport(
             entityType: mutation.entityType,
             accountScopeIdentifier: mutation.accountScopeIdentifier,
             replicaBindingGenerationIdentifier:
@@ -1548,6 +1548,22 @@ public final class RealmSwiftAdapter:
     private func transportEligiblePendingEntities(
         _ entities: Results<SyncedEntity>
     ) -> Results<SyncedEntity> {
+        // Tracking rows may predate the target bridge. Keep them intact, but
+        // exclude their quarantined journal owners from uploads and idle status.
+        // This is an indexed journal-only query, not another model scan.
+        var quarantinedRecordNames = [String]()
+        for target in realmProvider?.targetReaderRealms ?? [] {
+            let snapshot = committedRealmReadSnapshot(in: target)
+            guard snapshot.schema.objectSchema.contains(where: {
+                $0.className == BigSyncPendingMutation.className()
+            }) else { continue }
+            quarantinedRecordNames.append(contentsOf:
+                snapshot.objects(BigSyncPendingMutation.self).where {
+                    $0.requiresReplicaBindingRecovery
+                }.map(\.recordName))
+        }
+        let entities = quarantinedRecordNames.isEmpty ? entities
+            : entities.filter("NOT (identifier IN %@)", quarantinedRecordNames)
         guard let activeReplicaBindingGenerationIdentifier else {
             return entities.where {
                 $0.pendingReplicaBindingGenerationIdentifier == nil
@@ -1563,6 +1579,7 @@ public final class RealmSwiftAdapter:
     private func transportEligiblePendingMutations(
         _ mutations: Results<BigSyncPendingMutation>
     ) -> Results<BigSyncPendingMutation> {
+        let mutations = mutations.where { !$0.requiresReplicaBindingRecovery }
         guard let activeReplicaBindingGenerationIdentifier else {
             return mutations.where {
                 $0.replicaBindingGenerationIdentifier == nil
@@ -1884,6 +1901,16 @@ public final class RealmSwiftAdapter:
         ) else {
             return false
         }
+        if let target = targetReadSnapshot
+            ?? realmProvider?.targetReaderRealmPerSchemaName[entityType] {
+            let snapshot = targetReadSnapshot ?? committedRealmReadSnapshot(in: target)
+            if snapshot.schema.objectSchema.contains(where: {
+                $0.className == BigSyncPendingMutation.className()
+            }), snapshot.object(ofType: BigSyncPendingMutation.self,
+                                forPrimaryKey: recordName)?.requiresReplicaBindingRecovery == true {
+                return false
+            }
+        }
         // For unscoped models, the tracking row already carries every
         // transport fence needed to acknowledge this prepared generation.
         // The target journal may legitimately have advanced while CloudKit
@@ -1907,6 +1934,24 @@ public final class RealmSwiftAdapter:
             return false
         }
         return pendingMutationIsEligibleForActiveTransport(mutation)
+    }
+
+    @BigSyncBackgroundActor
+    private func preparedMutationIsCurrentForPreparation(
+        recordName: String, entityType: String, generation: String?,
+        trackingReadSnapshot: Realm, targetReadSnapshot: Realm
+    ) -> Bool {
+        if targetReadSnapshot.schema.objectSchema.contains(where: {
+            $0.className == BigSyncPendingMutation.className()
+        }), let mutation = targetReadSnapshot.object(ofType: BigSyncPendingMutation.self,
+                                                     forPrimaryKey: recordName) {
+            guard !mutation.requiresReplicaBindingRecovery,
+                  mutation.generation == generation else { return false }
+        }
+        guard let generation else { return true }
+        return preparedGenerationIsEligibleForActiveTransport(
+            recordName: recordName, entityType: entityType, generation: generation,
+            trackingReadSnapshot: trackingReadSnapshot, targetReadSnapshot: targetReadSnapshot)
     }
 
     /// The owning synchronizer has awaited callback/adapter quiescence and
@@ -2610,6 +2655,7 @@ public final class RealmSwiftAdapter:
             accountScopeIdentifier: mutation.accountScopeIdentifier,
             replicaBindingGenerationIdentifier:
                 mutation.replicaBindingGenerationIdentifier,
+            requiresReplicaBindingRecovery: mutation.requiresReplicaBindingRecovery,
             generation: mutation.generation,
             changedAt: mutation.changedAt,
             isDeletion: pendingMutationTargetsDeletedObject(mutation, in: realm)
@@ -2770,7 +2816,8 @@ public final class RealmSwiftAdapter:
         }
         let ignoredGenerationsByRecordName = pending.reduce(into: [String: String]()) {
             result, mutation in
-            if self.modelTypes[mutation.entityType] == nil
+            if !mutation.requiresReplicaBindingRecovery,
+               self.modelTypes[mutation.entityType] == nil
                 || self.excludedClassNames.contains(mutation.entityType) {
                 result[mutation.recordName] = mutation.generation
             }
@@ -2929,7 +2976,8 @@ public final class RealmSwiftAdapter:
                     if let mutation = targetReaderRealm.object(
                         ofType: BigSyncPendingMutation.self,
                         forPrimaryKey: recordName
-                    ), mutation.generation == ignoredGeneration {
+                    ), mutation.generation == ignoredGeneration,
+                       !mutation.requiresReplicaBindingRecovery {
                         targetReaderRealm.delete(mutation)
                     }
                 }
@@ -5493,7 +5541,8 @@ public final class RealmSwiftAdapter:
             let restoredMutations: [(recordName: String, generation: String)] = {
                 let snapshot = committedRealmReadSnapshot(in: targetRealm)
                 return snapshot.objects(BigSyncPendingMutation.self).compactMap { mutation in
-                    guard !BigSyncMutationTrackingRegistry
+                    guard !mutation.requiresReplicaBindingRecovery,
+                          !BigSyncMutationTrackingRegistry
                         .mutationWasCreatedInCurrentTransportIdentity(
                             mutation, realm: snapshot
                         ) else { return nil }
@@ -5516,7 +5565,8 @@ public final class RealmSwiftAdapter:
                     guard let liveMutation = targetRealm.object(
                         ofType: BigSyncPendingMutation.self,
                         forPrimaryKey: restoredMutation.recordName
-                    ), liveMutation.generation == restoredMutation.generation,
+                    ), !liveMutation.requiresReplicaBindingRecovery,
+                       liveMutation.generation == restoredMutation.generation,
                        !BigSyncMutationTrackingRegistry
                         .mutationWasCreatedInCurrentTransportIdentity(
                             liveMutation,
@@ -5804,6 +5854,9 @@ public final class RealmSwiftAdapter:
                             ofType: BigSyncPendingMutation.self,
                             forPrimaryKey: candidate.identifier
                         )
+                        // A retained recovery row is not reset-discovery authority.
+                        // Neither a tombstone nor a live object may erase/rebind it.
+                        if existingMutation?.requiresReplicaBindingRecovery == true { continue }
                         if candidate.isDeleted {
                             // The reset server has no corresponding record to
                             // delete. Retain the local tombstone but retire its
@@ -7952,10 +8005,16 @@ public final class RealmSwiftAdapter:
                                         if targetReaderRealm.schema.objectSchema.contains(where: {
                                             $0.className == BigSyncPendingMutation.className()
                                         }) {
-                                            currentMutationGeneration = targetReaderRealm.object(
+                                            let mutation = targetReaderRealm.object(
                                                 ofType: BigSyncPendingMutation.self,
                                                 forPrimaryKey: candidate.syncedEntityID
-                                            )?.generation
+                                            )
+                                            if let mutation, mutation.requiresReplicaBindingRecovery {
+                                                preservedDispositionsByRecordName[candidate.syncedEntityID] =
+                                                    .preservedPendingLocal(generation: mutation.generation)
+                                                continue
+                                            }
+                                            currentMutationGeneration = mutation?.generation
                                         } else {
                                             currentMutationGeneration = nil
                                         }
@@ -8960,7 +9019,27 @@ public final class RealmSwiftAdapter:
         }
 
         try validatePreparationOwner()
-        return try attachingRetainedDeletionQuarantineEvidence(to: recordsArray)
+        // Selection and contract preparation can suspend after target flags were
+        // sampled. Recheck committed ownership at the final preparation cut.
+        guard let tracking = realmProvider?.persistenceRealm else { return [] }
+        let trackingSnapshot = committedRealmReadSnapshot(in: tracking)
+        var targetSnapshots = [String: Realm]()
+        let eligibleRecords = recordsArray.filter { item in
+            let entityType = item.record.recordType
+            guard let target = realmProvider?.targetReaderRealmPerSchemaName[entityType] else { return false }
+            let snapshot: Realm
+            if let existing = targetSnapshots[entityType] {
+                snapshot = existing
+            } else {
+                snapshot = committedRealmReadSnapshot(in: target)
+                targetSnapshots[entityType] = snapshot
+            }
+            return preparedMutationIsCurrentForPreparation(
+                recordName: item.record.recordID.recordName, entityType: entityType, generation: item.generation,
+                trackingReadSnapshot: trackingSnapshot, targetReadSnapshot: snapshot)
+        }
+        try validatePreparationOwner()
+        return try attachingRetainedDeletionQuarantineEvidence(to: eligibleRecords)
     }
     /// Prepares upload records together with an opaque snapshot of their local
     /// mutation generations. Pass this batch back when acknowledging successes.
@@ -9271,9 +9350,26 @@ public final class RealmSwiftAdapter:
                 deletions.append(.init(recordID: recordID, generation: candidate.generation))
             }
         }
-        updateHasChanges(realm: committedRealmReadSnapshot(in: persistenceRealm))
+        let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        var targetSnapshots = [String: Realm]()
+        let eligibleDeletions = deletions.filter { item in
+            guard let entity = trackingSnapshot.object(ofType: SyncedEntity.self,
+                                                       forPrimaryKey: item.recordID.recordName),
+                  let target = provider.targetReaderRealmPerSchemaName[entity.entityType] else { return false }
+            let snapshot: Realm
+            if let existing = targetSnapshots[entity.entityType] {
+                snapshot = existing
+            } else {
+                snapshot = committedRealmReadSnapshot(in: target)
+                targetSnapshots[entity.entityType] = snapshot
+            }
+            return preparedMutationIsCurrentForPreparation(
+                recordName: item.recordID.recordName, entityType: entity.entityType, generation: item.generation,
+                trackingReadSnapshot: trackingSnapshot, targetReadSnapshot: snapshot)
+        }
+        updateHasChanges(realm: trackingSnapshot)
         try validatePreparationOwner()
-        return deletions
+        return eligibleDeletions
     }
 
     /// Prepares deletions together with an opaque snapshot of their local
