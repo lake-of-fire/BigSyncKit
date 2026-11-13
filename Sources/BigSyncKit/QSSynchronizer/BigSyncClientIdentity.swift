@@ -1,12 +1,12 @@
 import CloudKit
 import Darwin
 import Foundation
+import RealmSwiftGaps
 
 /// A manual restore could otherwise replace an app-group Realm while an
-/// extension has a write transaction in flight.  Every configured client
-/// process retains a shared advisory lock for its lifetime; restore briefly
-/// upgrades its own holder to an exclusive nonblocking lock before it touches
-/// either the Realm files or the installation identity.
+/// extension has an open Realm. Configured clients publish process presence;
+/// restore excludes live peers before touching files or installation identity.
+/// Idle iOS processes must not retain shared-container advisory locks.
 public enum BigSyncClientIdentityLeaseError: Error, Equatable, Sendable {
     case restoreInProgress
     case leaseUnavailable(Int32)
@@ -56,20 +56,241 @@ public enum BigSyncManualBackupRestoreError: Error, Equatable, Sendable {
     case transactionMismatch
 }
 
+/// Process presence preserves the lifetime restore fence without retaining a
+/// file lock across iOS suspension. Records are immutable and atomically saved.
+/// A restore publishes its gate before scanning records; registration publishes
+/// its record before checking that gate. Either the restorer sees the client or
+/// the client sees the restorer, so neither can miss the other's admission.
+final class BigSyncClientProcessPresence {
+    struct Birth: Codable, Equatable, Sendable {
+        let seconds: Int64
+        let microseconds: Int64
+
+        static func observed(seconds: Int64, microseconds: Int64) -> Self? {
+            guard seconds > 0, (0..<1_000_000).contains(microseconds) else { return nil }
+            return Self(seconds: seconds, microseconds: microseconds)
+        }
+    }
+
+    struct Owner: Codable, Equatable, Sendable {
+        let pid: Int32
+        let birth: Birth?
+        let nonce: UUID
+    }
+
+    private struct Record: Codable {
+        let version: Int
+        let owner: Owner
+    }
+
+    private enum Observation {
+        case alive(Birth?)
+        case dead
+    }
+
+    let owner: Owner
+    let directoryURL: URL
+    let recordURL: URL
+    let gateURL: URL
+    private let isAlive: @Sendable (Owner) -> Bool
+
+    init(
+        leaseURL: URL,
+        owner: Owner? = nil,
+        isAlive: @escaping @Sendable (Owner) -> Bool = BigSyncClientProcessPresence.processIsAlive
+    ) throws {
+        let owner = owner ?? Self.currentOwner()
+        self.owner = owner
+        self.isAlive = isAlive
+        directoryURL = leaseURL.appendingPathExtension("clients")
+        recordURL = directoryURL.appendingPathComponent(owner.nonce.uuidString + ".json")
+        gateURL = directoryURL.appendingPathComponent("restore")
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let values = try directoryURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw BigSyncClientIdentityLeaseError.leaseUnavailable(EINVAL)
+        }
+        var exclusions = URLResourceValues()
+        exclusions.isExcludedFromBackup = true
+        var directory = directoryURL
+        try directory.setResourceValues(exclusions)
+        do {
+            try publishOwner(at: recordURL)
+            try rejectForeignRestore()
+            pruneDeadClients()
+        } catch {
+            try? FileManager.default.removeItem(at: recordURL)
+            throw error
+        }
+    }
+
+    deinit { try? FileManager.default.removeItem(at: recordURL) }
+
+    private func pruneDeadClients() {
+        // Widget processes can exit without running deinit. Retire their
+        // immutable records on later registrations, without revoking unknown
+        // or unreadable peers and without waiting for a manual restore.
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directoryURL, includingPropertiesForKeys: nil
+        ) else { return }
+        for url in urls where url.pathExtension == "json" {
+            guard let peer = try? readOwner(at: url), peer != owner, !isAlive(peer) else { continue }
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Caller holds the namespace's exclusive advisory lock throughout this
+    /// method and the actual replacement, and serializes same-process reentry.
+    func beginExclusive() throws {
+        try rejectForeignRestore()
+        try publishOwner(at: gateURL)
+        var admitted = false
+        defer { if !admitted { endExclusive() } }
+        for url in try FileManager.default.contentsOfDirectory(
+            at: directoryURL, includingPropertiesForKeys: nil
+        ) where url.pathExtension == "json" {
+            let peer: Owner
+            do { peer = try readOwner(at: url) }
+            catch where Self.isMissing(error) { continue }
+            if peer == owner { continue }
+            guard !isAlive(peer) else {
+                throw BigSyncClientIdentityLeaseError.restoreInProgress
+            }
+            // Nonces never change ownership. A dead client's immutable record
+            // cannot become a newly registered client's record through PID reuse.
+            try? FileManager.default.removeItem(at: url)
+        }
+        admitted = true
+    }
+
+    func endExclusive() {
+        // Only restore owners write this path and the caller still holds the
+        // exclusive namespace lock. A failed unlink stays fail-closed for peers
+        // until the owner exits; this process remains serialized by its registry.
+        try? FileManager.default.removeItem(at: gateURL)
+    }
+
+    private func rejectForeignRestore() throws {
+        let restore: Owner
+        do { restore = try readOwner(at: gateURL) }
+        catch where Self.isMissing(error) { return }
+        if restore != owner, isAlive(restore) {
+            throw BigSyncClientIdentityLeaseError.restoreInProgress
+        }
+    }
+
+    private func publishOwner(at url: URL) throws {
+        let data = try JSONEncoder().encode(Record(version: 1, owner: owner))
+        try data.write(to: url, options: .atomic)
+    }
+
+    private func readOwner(at url: URL) throws -> Owner {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size <= 16_384 else {
+            throw BigSyncClientIdentityLeaseError.leaseUnavailable(EINVAL)
+        }
+        let record = try JSONDecoder().decode(Record.self, from: Data(contentsOf: url))
+        guard record.version == 1, record.owner.pid > 0,
+              record.owner.birth.map({ $0.seconds > 0 && (0..<1_000_000).contains($0.microseconds) }) != false else {
+            throw BigSyncClientIdentityLeaseError.leaseUnavailable(EINVAL)
+        }
+        return record.owner
+    }
+
+    private static func isMissing(_ error: Error) -> Bool {
+        let error = error as NSError
+        return (error.domain == NSCocoaErrorDomain && (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError))
+            || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
+    }
+
+    private static func currentOwner() -> Owner {
+        let pid = getpid()
+        let birth: Birth?
+        if case .alive(let observed) = observe(pid) { birth = observed }
+        else { birth = nil }
+        return Owner(pid: pid, birth: birth, nonce: UUID())
+    }
+
+    static func processIsAlive(_ owner: Owner) -> Bool {
+        guard owner.pid > 0 else { return true }
+        switch observe(owner.pid) {
+        case .dead: return false
+        case .alive(let actual):
+            if let expected = owner.birth, let actual { return expected == actual }
+            // A sandbox denial is not proof that another client exited.
+            return true
+        }
+    }
+
+    private static func observe(_ pid: Int32) -> Observation {
+        var query: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        let result = query.withUnsafeMutableBufferPointer {
+            sysctl($0.baseAddress, UInt32($0.count), &info, &size, nil, 0)
+        }
+        if result == 0 {
+            if size == MemoryLayout<kinfo_proc>.stride, info.kp_proc.p_pid == pid {
+                let start = info.kp_proc.p_un.__p_starttime
+                // XNU stores this at process creation and preserves it through
+                // exec. Missing/redacted values cannot prove PID reuse.
+                return .alive(Birth.observed(seconds: Int64(start.tv_sec), microseconds: Int64(start.tv_usec)))
+            }
+        } else if errno == ESRCH {
+            return .dead
+        }
+        // A zero-length or denied sysctl response is not proof of exit.
+        // Signal zero is a liveness query; it sends no signal to the process.
+        if Darwin.kill(pid, 0) == -1, errno == ESRCH { return .dead }
+        return .alive(nil)
+    }
+}
+
 enum BigSyncClientIdentityLeaseRegistry {
+    // Desktop app copies can overlap across versions. Older restorers know only
+    // flock, so desktop clients must preserve that fence. iOS updates replace
+    // the containing app and its extensions together; their idle clients use
+    // presence instead of retaining a shared-container lock through suspension.
+    private static var platformRetainsSharedLock: Bool {
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        true
+        #elseif os(iOS)
+        ProcessInfo.processInfo.isiOSAppOnMac
+        #else
+        false
+        #endif
+    }
+
+    #if DEBUG
+    @TaskLocal static var retainsSharedLockForTesting: Bool? = nil
+    #endif
+
+    private static var retainsSharedLock: Bool {
+        #if DEBUG
+        retainsSharedLockForTesting ?? platformRetainsSharedLock
+        #else
+        platformRetainsSharedLock
+        #endif
+    }
+
     private enum Mode {
-        case shared
+        case registered
         case exclusive
     }
 
     private final class Lease {
         let descriptor: Int32
+        let presence: BigSyncClientProcessPresence
+        let retainsSharedLock: Bool
         var mode: Mode
         var cachedInstallationIdentifier: String?
 
-        init(descriptor: Int32, mode: Mode) {
+        init(descriptor: Int32, presence: BigSyncClientProcessPresence, retainsSharedLock: Bool) {
             self.descriptor = descriptor
-            self.mode = mode
+            self.presence = presence
+            self.retainsSharedLock = retainsSharedLock
+            self.mode = .registered
         }
 
         deinit {
@@ -122,50 +343,58 @@ enum BigSyncClientIdentityLeaseRegistry {
         at url: URL,
         _ operation: () throws -> T
     ) throws -> T {
+        let execution = try RealmWriteExecutionProtection.acquireSynchronousLease()
+        defer { execution?.release() }
+        try execution?.checkpoint()
         lock.lock()
         defer { lock.unlock() }
         let lease = try lease(at: url)
         // A recursive registry lock permits read-only identity probes, not
         // another restore of this client. Its nested defer would otherwise
         // release the outer operation's cross-process exclusion too early.
-        guard lease.mode == .shared else {
+        guard lease.mode == .registered else {
             throw BigSyncClientIdentityLeaseError.restoreInProgress
         }
-        guard bigSyncFlock(lease.descriptor, LOCK_UN) == 0 else {
+        if lease.retainsSharedLock, bigSyncFlock(lease.descriptor, LOCK_UN) != 0 {
             throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
         }
         guard bigSyncFlock(lease.descriptor, LOCK_EX | LOCK_NB) == 0 else {
             let lockError = Int32(errno)
-            // Restore the process-lifetime writer lease before reporting a
-            // competing app/extension holder. A later launch can retry the
-            // staged restore without a window for an unfenced local write.
-            guard bigSyncFlock(lease.descriptor, LOCK_SH) == 0 else {
+            // Desktop clients must reacquire their legacy fence before any
+            // caller can continue using an already-open Realm.
+            if lease.retainsSharedLock, bigSyncFlock(lease.descriptor, LOCK_SH) != 0 {
                 throw BigSyncClientIdentityLeaseError.leaseUnavailable(Int32(errno))
             }
-            lease.mode = .shared
             if lockError == EWOULDBLOCK || lockError == EAGAIN {
                 throw BigSyncClientIdentityLeaseError.restoreInProgress
             }
             throw BigSyncClientIdentityLeaseError.leaseUnavailable(lockError)
         }
+        defer {
+            if lease.retainsSharedLock {
+                _ = bigSyncFlock(lease.descriptor, LOCK_SH)
+            } else {
+                _ = bigSyncFlock(lease.descriptor, LOCK_UN)
+            }
+        }
+        try execution?.checkpoint()
+        try lease.presence.beginExclusive()
+        defer { lease.presence.endExclusive() }
         lease.mode = .exclusive
         // No mutation may reuse the pre-restore identity after this boundary.
         // The durable intent publication below also invalidates this cache for
         // callers that exercise BackupDetection directly.
         lease.cachedInstallationIdentifier = nil
-        defer {
-            // Downgrading before returning prevents subsequent mutations in
-            // this process from escaping the cross-process restore fence.
-            if bigSyncFlock(lease.descriptor, LOCK_SH) == 0 {
-                lease.mode = .shared
-            }
-        }
+        defer { lease.mode = .registered }
         return try operation()
     }
 
     private static func lease(at url: URL) throws -> Lease {
         let key = url.standardizedFileURL.path
         if let lease = leases[key] { return lease }
+        let execution = try RealmWriteExecutionProtection.acquireSynchronousLease()
+        defer { execution?.release() }
+        try execution?.checkpoint()
         try bigSyncCreateDirectoryDurably(
             at: url.deletingLastPathComponent()
         )
@@ -182,12 +411,30 @@ enum BigSyncClientIdentityLeaseRegistry {
             Darwin.close(descriptor)
             throw error
         }
-        guard bigSyncFlock(descriptor, LOCK_SH) == 0 else {
+        // Even suspension-safe clients reject an already-active legacy
+        // restorer. This short registration lock is execution-protected.
+        guard bigSyncFlock(descriptor, LOCK_SH | LOCK_NB) == 0 else {
+            let lockError = Int32(errno)
+            Darwin.close(descriptor)
+            if lockError == EWOULDBLOCK || lockError == EAGAIN {
+                throw BigSyncClientIdentityLeaseError.restoreInProgress
+            }
+            throw BigSyncClientIdentityLeaseError.leaseUnavailable(lockError)
+        }
+        let presence: BigSyncClientProcessPresence
+        do {
+            presence = try BigSyncClientProcessPresence(leaseURL: url)
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
+        let retainsSharedLock = Self.retainsSharedLock
+        if !retainsSharedLock, bigSyncFlock(descriptor, LOCK_UN) != 0 {
             let lockError = Int32(errno)
             Darwin.close(descriptor)
             throw BigSyncClientIdentityLeaseError.leaseUnavailable(lockError)
         }
-        let lease = Lease(descriptor: descriptor, mode: .shared)
+        let lease = Lease(descriptor: descriptor, presence: presence, retainsSharedLock: retainsSharedLock)
         leases[key] = lease
         return lease
     }

@@ -1584,10 +1584,15 @@ final class BackupDetectionTests: XCTestCase {
         XCTAssertEqual(flock(peerDescriptor, LOCK_UN), 0)
         let exclusiveProbeDescriptor = Darwin.open(leaseURL.path, O_RDWR)
         XCTAssertGreaterThanOrEqual(exclusiveProbeDescriptor, 0)
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        let expectedExclusiveResult: Int32 = -1
+        #else
+        let expectedExclusiveResult: Int32 = 0
+        #endif
         XCTAssertEqual(
             flock(exclusiveProbeDescriptor, LOCK_EX | LOCK_NB),
-            -1,
-            "A failed upgrade must immediately restore this process's shared lease"
+            expectedExclusiveResult,
+            "A failed upgrade preserves the platform's idle restore fence"
         )
         Darwin.close(exclusiveProbeDescriptor)
 
