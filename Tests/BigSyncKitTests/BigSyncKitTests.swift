@@ -1697,7 +1697,7 @@ final class BigSyncKitTests: XCTestCase {
             } catch is ChangeFeedMigrationError {}
             XCTAssertTrue(try sync.configuredZoneIsTerminal(sync.recordZoneID))
             let context = try XCTUnwrap(sync.activeRunContext)
-            XCTAssertEqual(sync.hasPendingEncryptedDataResetRecovery(context: context), encrypted)
+            XCTAssertEqual(try sync.hasPendingEncryptedDataResetRecovery(context: context), encrypted)
             await sync.cancelSynchronizationAndWait()
         }
     }

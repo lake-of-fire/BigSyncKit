@@ -1283,7 +1283,7 @@ extension SyncPhaseAttemptOwnershipTests {
             }
             if encrypted {
                 let context = try XCTUnwrap(sync.activeRunContext)
-                XCTAssertTrue(sync.hasPendingEncryptedDataResetRecovery(context: context))
+                XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context))
                 XCTAssertEqual((delivered as? ChangeFeedMigrationError)?.deletionKind, .encryptedDataReset)
             }
         }
@@ -1331,7 +1331,7 @@ extension SyncPhaseAttemptOwnershipTests {
             let deadline = try XCTUnwrap(sync.retrySleepUntil)
             let minimum = CloudKitRetryConstraints(error).serverMinimum ?? CloudKitRetryBackoff.initialFallbackDelay
             XCTAssertGreaterThanOrEqual(deadline.timeIntervalSince(start), minimum)
-            if token { XCTAssertTrue(sync.hasPendingEncryptedDataResetRecovery(context: context)) }
+            if token { XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context)) }
             let saves = await transport.zoneSaveCount
             let mutations = await transport.recordMutationCount
             XCTAssertEqual(saves, 0); XCTAssertEqual(mutations, 0)
@@ -1387,7 +1387,7 @@ extension SyncPhaseAttemptOwnershipTests {
                 XCTAssertEqual(NSArray(array: store.persistedPropertyLists), persistedBefore,
                     "Neither originating nor replacement account may acquire lifecycle evidence")
                 XCTAssertNil(try sync.configuredZoneTerminalState(adapter.recordZoneID))
-                XCTAssertFalse(sync.hasPendingEncryptedDataResetRecovery(context: originalContext))
+                XCTAssertFalse(try sync.hasPendingEncryptedDataResetRecovery(context: originalContext))
                 if interruption != .account { XCTAssertEqual(probe.accountIdentifierCalls, accountsAtThrow) }
             } else if stop {
                 XCTAssertEqual(probe.accountIdentifierCalls, accountsAtThrow)
@@ -1474,7 +1474,7 @@ extension SyncPhaseAttemptOwnershipTests {
             XCTAssertEqual(mutations, 0); XCTAssertEqual(deletes, 0)
             XCTAssertEqual(saves, route == .zoneSave ? 1 : 0)
             XCTAssertEqual(probe.persistenceCount, 0)
-            if reset { XCTAssertTrue(sync.hasPendingEncryptedDataResetRecovery(context: context)) }
+            if reset { XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context)) }
         }
     }
     @BigSyncBackgroundActor
@@ -1527,7 +1527,7 @@ extension SyncPhaseAttemptOwnershipTests {
             let retained = CloudKitRetryConstraints(try XCTUnwrap(error))
             XCTAssertEqual(retained.serverMinimum, CloudKitRetryConstraints(original).serverMinimum)
             XCTAssertEqual(retained.requestsTokenRecovery, token)
-            XCTAssertTrue(sync.hasPendingEncryptedDataResetRecovery(context: context))
+            XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context))
             let saves = await transport.zoneSaveCount
             XCTAssertEqual(saves, 0)
         }
@@ -1544,7 +1544,7 @@ extension SyncPhaseAttemptOwnershipTests {
             let context = try XCTUnwrap(sync.activeRunContext)
             let error = lossFailure(reset: true, sibling: CKError(.changeTokenExpired), malformed: true)
             XCTAssertNil(sync.applyCloudKitLoss(error: error, defaultZoneID: adapter.recordZoneID, context: context))
-            XCTAssertFalse(sync.hasPendingEncryptedDataResetRecovery(context: context))
+            XCTAssertFalse(try sync.hasPendingEncryptedDataResetRecovery(context: context))
             XCTAssertNil(try sync.configuredZoneTerminalState(adapter.recordZoneID))
             XCTAssertFalse(sync.shouldRetryUpload(for: error))
         }
@@ -1596,7 +1596,7 @@ extension SyncPhaseAttemptOwnershipTests {
             let error = await operation.value
             XCTAssertTrue(error is CancellationError)
             XCTAssertNil(try sync.configuredZoneTerminalState(adapter.recordZoneID))
-            XCTAssertFalse(sync.hasPendingEncryptedDataResetRecovery(context: original))
+            XCTAssertFalse(try sync.hasPendingEncryptedDataResetRecovery(context: original))
             probe.accountEntered = nil
         }
     }
