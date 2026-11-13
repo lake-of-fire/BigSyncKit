@@ -2551,6 +2551,8 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             zoneID,
             accountScopeIdentifier: scope
         ))
+        XCTAssertThrowsError(try synchronizer.configuredZoneIsEstablished(zoneID))
+        store.synchronizesDurably = true
         XCTAssertFalse(try synchronizer.configuredZoneIsEstablished(zoneID))
         XCTAssertNil(store.value(forKey: synchronizer.durableStateKey(
             "ZoneLifecycle.v3.\(scope).\(zoneID.ownerName).\(zoneID.zoneName)"

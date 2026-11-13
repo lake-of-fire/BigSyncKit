@@ -8336,6 +8336,8 @@ final class BigSyncKitTests: XCTestCase {
             accountIdentifier: database.accountIdentifier,
             accountScopeIdentifier: scope
         )
+        XCTAssertThrowsError(try restored.configuredZoneIsTerminal(zoneID))
+        store.synchronizesDurably = true
         XCTAssertTrue(try restored.configuredZoneIsTerminal(zoneID))
         XCTAssertEqual(database.subscriptionFetchCount, 0)
         XCTAssertEqual(database.databaseChangeFetchCount, 0)
@@ -17742,10 +17744,12 @@ final class BigSyncKitTests: XCTestCase {
             context: context
         )
 
-        XCTAssertEqual(
-            error as? ChangeFeedMigrationPersistenceError,
-            .stateNotDurable
-        )
+        guard let persistenceError = error as? DurableKeyValueStoreError,
+              case .unavailable = persistenceError else {
+            return XCTFail("Unavailable recovery state must stop before publication: \(String(describing: error))")
+        }
+        XCTAssertThrowsError(try synchronizer.configuredZoneIsTerminal(zoneID))
+        store.synchronizesDurably = true
         XCTAssertFalse(try synchronizer.configuredZoneIsTerminal(zoneID))
         XCTAssertTrue(store.propertyListEntries.keys.allSatisfy {
             !$0.contains("ChangeFeedMigration.v3")

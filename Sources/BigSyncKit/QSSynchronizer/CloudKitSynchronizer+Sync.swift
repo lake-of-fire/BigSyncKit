@@ -1782,6 +1782,11 @@ extension CloudKitSynchronizer {
                 let constraints = CloudKitRetryConstraints(error)
                 try checkSynchronizationAttempt(attemptID)
                 guard activeRunContext == uploadContext else { throw CancellationError() }
+                // Account rejection is an ownership failure, including when
+                // wrapped with the transport error that prompted revalidation.
+                // It must reach the caller rather than look like a completed
+                // upload after failSynchronization handles its status.
+                if constraints.containsAccountChange { throw error }
                 if let context = uploadContext {
                     try checkRunContext(context)
                     if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {

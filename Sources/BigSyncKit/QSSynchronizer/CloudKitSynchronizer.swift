@@ -1819,21 +1819,30 @@ public class CloudKitSynchronizer: NSObject {
             accountScopeIdentifier: accountScopeIdentifier
         )
         let previousValue = try keyValueStore.bigSyncDurableObject(forKey: key)
-        try keyValueStore.bigSyncSetDurably(value: state, forKey: key)
-        guard
-              let persisted = try storedZoneLifecycleState(
+        do {
+            try keyValueStore.bigSyncSetDurably(value: state, forKey: key)
+            guard let persisted = try storedZoneLifecycleState(
                 zoneID,
                 accountScopeIdentifier: accountScopeIdentifier
-              ),
-              NSDictionary(dictionary: persisted).isEqual(to: state) else {
-            if let previousValue {
-                try? keyValueStore.bigSyncSetDurably(value: previousValue, forKey: key)
-            } else {
-                try? keyValueStore.bigSyncRemoveDurably(forKey: key)
+            ), NSDictionary(dictionary: persisted).isEqual(to: state) else {
+                throw ChangeFeedMigrationPersistenceError.stateNotDurable
             }
-            _ = keyValueStore.synchronize?()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            restoreLegacyRecoveryValue(previousValue, forKey: key)
             throw ChangeFeedMigrationPersistenceError.stateNotDurable
         }
+    }
+
+    private func restoreLegacyRecoveryValue(_ value: Any?, forKey key: String) {
+        // Legacy stores mutate their in-process dictionary before synchronize
+        // can report failure. Restore that view without bypassing an atomic
+        // DurableKeyValueStore's own publication/error latch.
+        guard !(keyValueStore is any DurableKeyValueStore) else { return }
+        if let value { keyValueStore.set(value: value, forKey: key) }
+        else { keyValueStore.removeObject(forKey: key) }
+        _ = keyValueStore.synchronize?()
     }
 
     deinit {
@@ -3610,8 +3619,9 @@ public class CloudKitSynchronizer: NSObject {
         // CloudKit replays the loss event. No partially updated mode/epoch/
         // phase combination can be observed after relaunch.
         let previousValue = try keyValueStore.bigSyncDurableObject(forKey: state.key)
-        try keyValueStore.bigSyncSetDurably(value: state.propertyList, forKey: state.key)
-        guard let propertyList = try keyValueStore.bigSyncDurableObject(forKey: state.key)
+        do {
+            try keyValueStore.bigSyncSetDurably(value: state.propertyList, forKey: state.key)
+            guard let propertyList = try keyValueStore.bigSyncDurableObject(forKey: state.key)
                 as? [String: Any],
               let persisted = ChangeFeedMigrationState(
                 key: state.key,
@@ -3627,12 +3637,12 @@ public class CloudKitSynchronizer: NSObject {
               persisted.phase == state.phase,
               persisted.backupRestoreEventIdentifier
                 == state.backupRestoreEventIdentifier else {
-            if let previousValue {
-                try? keyValueStore.bigSyncSetDurably(value: previousValue, forKey: state.key)
-            } else {
-                try? keyValueStore.bigSyncRemoveDurably(forKey: state.key)
+                throw ChangeFeedMigrationPersistenceError.stateNotDurable
             }
-            _ = keyValueStore.synchronize?()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            restoreLegacyRecoveryValue(previousValue, forKey: state.key)
             throw ChangeFeedMigrationPersistenceError.stateNotDurable
         }
     }
