@@ -137,19 +137,25 @@ private actor ReceiptFailureTransport: CloudKitRecordStore, CloudKitRecordFetchi
     let sibling: CKError
     let account: ReceiptAccountProbe
     let succeedsCompletely: Bool
+    let operationFailure: CKError?
     private(set) var databaseFetchCount = 0
     private(set) var mutationCount = 0
     private(set) var lookupCount = 0
     init(phase: ReceiptFailurePhase, sibling: CKError, account: ReceiptAccountProbe,
-         succeedsCompletely: Bool = false) {
+         succeedsCompletely: Bool = false, operationFailure: CKError? = nil) {
         self.phase = phase
         self.sibling = sibling
         self.account = account
         self.succeedsCompletely = succeedsCompletely
+        self.operationFailure = operationFailure
     }
     func modifyRecords(saving records: [CKRecord], deleting recordIDs: [CKRecord.ID],
                        savePolicy: CKModifyRecordsOperation.RecordSavePolicy, atomically: Bool) async throws -> CloudKitRecordMutationResults {
         mutationCount += 1
+        if let operationFailure {
+            await account.didReturnResult()
+            throw operationFailure
+        }
         var saves: [CKRecord.ID: Result<CKRecord, Error>] = [:]
         var deletes: [CKRecord.ID: Result<Void, Error>] = [:]
         for record in records {
@@ -310,6 +316,110 @@ final class SyncMutationReceiptFailureCompositionTests: XCTestCase {
     func testAccountRevalidationFailureCannotHideReturnedRetryDeadline() async throws {
         try await check(.none, sibling: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]), failAccountRevalidation: true)
     }
+
+    @BigSyncBackgroundActor
+    func testThrownMutationFailureRetainsConstraintsAfterAccountProbeFails() async throws {
+        for deletes in [false, true] {
+            for failure in [
+                CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]),
+                CKError(.changeTokenExpired),
+                CKError(.limitExceeded),
+            ] {
+                let phase: ReceiptFailurePhase = deletes ? .deleteAcknowledgement : .none
+                let adapter = ReceiptFailureAdapter(phase)
+                let account = ReceiptAccountProbe(failAfterResult: true)
+                let transport = ReceiptFailureTransport(phase: phase, sibling: failure,
+                    account: account, operationFailure: failure)
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                let sync = CloudKitSynchronizer(identifier: UUID().uuidString,
+                    containerIdentifier: "iCloud.test.operation-failure", database: ReceiptDatabaseIdentity(),
+                    recordZoneID: adapter.recordZoneID, keyValueStore: ReceiptKeyValueStore(),
+                    accountIdentifierProvider: { try await account.identity() }, accountStatusProvider: { .available },
+                    changeFeed: transport, subscriptionStore: transport, zoneStore: transport,
+                    recordStore: transport, backupDetectionBaseURL: directory,
+                    logger: Logger(label: "OperationFailureComposition"))
+                addTeardownBlock { @BigSyncBackgroundActor in
+                    await sync.cancelSynchronizationAndWait()
+                    try? FileManager.default.removeItem(at: directory)
+                }
+                sync.accountScopeAuthorityFence.clear()
+                sync.activeRunContext = .init(attemptID: sync.synchronizationAttemptID,
+                    runID: sync.synchronizationRunID, accountIdentifier: "receipt-account",
+                    accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "receipt-account"))
+                let pending = adapter.pending
+                let captured = ReceiptFailureCapture()
+                if deletes {
+                    try await sync.uploadDeletionsUsingAsyncStore(adapter: adapter, restrictedToEntityType: nil,
+                        attemptID: sync.synchronizationAttemptID) { captured.error = $0 }
+                } else {
+                    try await sync.uploadRecordsUsingAsyncStore(adapter: adapter, restrictedToEntityType: nil,
+                        attemptID: sync.synchronizationAttemptID) { captured.error = $0 }
+                }
+                let error = try XCTUnwrap(captured.error)
+                let constraints = CloudKitRetryConstraints(error)
+                XCTAssertTrue(constraints.isErrorGraphComplete)
+                XCTAssertTrue(constraints.codes.contains(failure.code))
+                XCTAssertEqual(constraints.serverMinimum, failure.code == .requestRateLimited ? 137 : nil)
+                XCTAssertEqual(constraints.requestsTokenRecovery, failure.code == .changeTokenExpired)
+                XCTAssertFalse(constraints.containsOnlySizeLimitFailures,
+                    "The independent account-probe failure forbids an immediate size-only retry")
+                let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError
+                XCTAssertEqual(underlying?.domain, "AccountRevalidationFailure")
+                XCTAssertEqual(adapter.pending, pending)
+                XCTAssertTrue(adapter.acknowledged.isEmpty)
+                let mutations = await transport.mutationCount
+                let probes = await account.callsAfterResult
+                XCTAssertEqual(mutations, 1)
+                XCTAssertEqual(probes, 1)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRepeatedFailureRevalidationPreservesEveryConstraintAndCancellation() async throws {
+        let account = ReceiptAccountProbe(failAfterResult: true)
+        let adapter = ReceiptFailureAdapter(.none)
+        let transport = ReceiptFailureTransport(phase: .none, sibling: CKError(.networkFailure), account: account)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let sync = CloudKitSynchronizer(identifier: UUID().uuidString,
+            containerIdentifier: "iCloud.test.operation-revalidation", database: ReceiptDatabaseIdentity(),
+            recordZoneID: adapter.recordZoneID, keyValueStore: ReceiptKeyValueStore(),
+            accountIdentifierProvider: { try await account.identity() }, accountStatusProvider: { .available },
+            changeFeed: transport, subscriptionStore: transport, zoneStore: transport,
+            recordStore: transport, backupDetectionBaseURL: directory,
+            logger: Logger(label: "OperationRevalidation"))
+        addTeardownBlock { @BigSyncBackgroundActor in
+            await sync.cancelSynchronizationAndWait()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        sync.accountScopeAuthorityFence.clear()
+        let context = CloudKitSynchronizer.RunContext(attemptID: sync.synchronizationAttemptID,
+            runID: sync.synchronizationRunID, accountIdentifier: "receipt-account",
+            accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "receipt-account"))
+        sync.activeRunContext = context
+        await account.didReturnResult()
+        var failure: Error = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137])
+        // A lower mutation boundary and its outer upload boundary can each
+        // revalidate the same failure. Neither probe can erase the first cause.
+        for _ in 0..<2 {
+            do {
+                try await sync.revalidateRunContext(context, preserving: failure)
+                XCTFail("Expected the injected account probe to fail")
+            } catch { failure = error }
+            let constraints = CloudKitRetryConstraints(failure)
+            XCTAssertTrue(constraints.requiresDeferredRetry)
+            XCTAssertEqual(constraints.serverMinimum, 137)
+            XCTAssertTrue(constraints.isErrorGraphComplete)
+        }
+        let beforeCancellation = await account.callsAfterResult
+        do {
+            try await sync.revalidateRunContext(context, preserving: CancellationError())
+            XCTFail("Operation cancellation must retire the caller")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        let afterCancellation = await account.callsAfterResult
+        XCTAssertEqual(beforeCancellation, afterCancellation,
+            "An already cancelled operation cannot start another account request")
+    }
     @BigSyncBackgroundActor
     func testLocalReceiptFailureNeverBecomesPureSizeRetry() async throws {
         for phase in ReceiptFailurePhase.allCases where phase != .none {
@@ -414,15 +524,20 @@ private actor ReceiptCompletionAccountProbe {
 private actor ReceiptCompletionZoneStore: CloudKitZoneStore {
     let missing: Bool
     let fetchError: Error?
+    let account: ReceiptAccountProbe?
     private(set) var fetches = 0
     private(set) var saves = 0
-    init(missing: Bool, fetchError: Error? = nil) {
+    init(missing: Bool, fetchError: Error? = nil, account: ReceiptAccountProbe? = nil) {
         self.missing = missing
         self.fetchError = fetchError
+        self.account = account
     }
     func recordZone(withID id: CKRecordZone.ID) async throws -> CKRecordZone {
         fetches += 1
-        if let fetchError { throw fetchError }
+        if let fetchError {
+            await account?.didReturnResult()
+            throw fetchError
+        }
         if missing { throw CKError(.zoneNotFound) }
         return CKRecordZone(zoneID: id)
     }
@@ -441,6 +556,64 @@ private final class ReceiptCompletionObservation {
 }
 
 extension SyncMutationReceiptFailureCompositionTests {
+    @BigSyncBackgroundActor
+    func testZoneLookupFailurePreservesRetryAndTokenConstraintsThroughAccountProbe() async throws {
+        for failsAccountProbe in [false, true] {
+            for failure in [
+                CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]),
+                CKError(.changeTokenExpired),
+            ] {
+                let account = ReceiptAccountProbe(failAfterResult: failsAccountProbe)
+                let adapter = ReceiptFailureAdapter(.none)
+                let zone = ReceiptCompletionZoneStore(missing: false, fetchError: failure, account: account)
+                let transport = ReceiptFailureTransport(phase: .none, sibling: failure, account: account)
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                let sync = CloudKitSynchronizer(identifier: UUID().uuidString,
+                    containerIdentifier: "iCloud.test.zone-failure", database: ReceiptDatabaseIdentity(),
+                    recordZoneID: adapter.recordZoneID, keyValueStore: ReceiptKeyValueStore(),
+                    accountIdentifierProvider: { try await account.identity() }, accountStatusProvider: { .available },
+                    changeFeed: transport, subscriptionStore: transport, zoneStore: zone,
+                    recordStore: transport, backupDetectionBaseURL: directory,
+                    logger: Logger(label: "ZoneFailureComposition"))
+                addTeardownBlock { @BigSyncBackgroundActor in
+                    await sync.cancelSynchronizationAndWait()
+                    try? FileManager.default.removeItem(at: directory)
+                }
+                sync.accountScopeAuthorityFence.clear()
+                sync.activeRunContext = .init(attemptID: sync.synchronizationAttemptID,
+                    runID: sync.synchronizationRunID, accountIdentifier: "receipt-account",
+                    accountScopeIdentifier: CloudKitSynchronizer.accountScopeIdentifier(for: "receipt-account"))
+                let captured = ReceiptFailureCapture()
+                // The real zone preparation API invokes private lookup/setup
+                // and delivers its outcome through the maintained completion.
+                try await sync.setupRecordZoneID(adapter.recordZoneID,
+                    attemptID: sync.synchronizationAttemptID) { captured.error = $0 }
+                let error = try XCTUnwrap(captured.error)
+                let constraints = CloudKitRetryConstraints(error)
+                XCTAssertTrue(constraints.isErrorGraphComplete)
+                XCTAssertTrue(constraints.codes.contains(failure.code))
+                XCTAssertEqual(constraints.serverMinimum, failure.code == .requestRateLimited ? 137 : nil)
+                XCTAssertEqual(constraints.requestsTokenRecovery, failure.code == .changeTokenExpired)
+                if failsAccountProbe {
+                    let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError
+                    XCTAssertEqual(underlying?.domain, "AccountRevalidationFailure")
+                } else {
+                    XCTAssertEqual((error as? CKError)?.code, failure.code,
+                        "A successful account probe leaves the original operation error intact")
+                }
+                let fetches = await zone.fetches
+                let saves = await zone.saves
+                let probes = await account.callsAfterResult
+                let mutations = await transport.mutationCount
+                XCTAssertEqual(fetches, 1)
+                XCTAssertEqual(saves, 0)
+                XCTAssertEqual(probes, 1)
+                XCTAssertEqual(mutations, 0)
+                XCTAssertTrue(adapter.acknowledged.isEmpty)
+            }
+        }
+    }
+
     private enum CompletionRoute: CaseIterable {
         case allUploads, records, deletions, setupAndUpload, existingZone, createdZone
     }

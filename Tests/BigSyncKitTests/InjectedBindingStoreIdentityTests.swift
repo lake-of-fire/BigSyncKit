@@ -5,6 +5,192 @@ import XCTest
 @testable import BigSyncKit
 
 final class InjectedBindingStoreIdentityTests: XCTestCase {
+    func testCanceledPortDoesNotRevivePublicationAcrossPeerStoreABA() throws {
+        try withResources { identity, store, root in
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let key = identity.durableStateNamespace + ".ReplicaBinding.v1"
+            _ = try BigSyncReplicaBindingStateStore.bindInitialAccount("a", store: store, key: key)
+            let predecessor = try identity.capturePublicationAdmission(store: store)
+            let peer = FileKeyValueStore(fileURL: root.appendingPathComponent("bigsync-state.plist"))
+            let port = try BigSyncReplicaBindingStateStore.requirePort(
+                sourceAccountScopeIdentifier: "a", destinationAccountScopeIdentifier: "b", store: peer, key: key)
+            _ = try BigSyncReplicaBindingStateStore.cancelPort(port, store: peer, key: key)
+            let successor = try identity.capturePublicationAdmission(store: peer)
+            XCTAssertEqual(successor.installationIdentifier, predecessor.installationIdentifier)
+            XCTAssertEqual(successor.replicaBindingGenerationIdentifier, predecessor.replicaBindingGenerationIdentifier,
+                           "Publication retirement must not change journal attribution")
+            XCTAssertThrowsError(try predecessor.withCurrent {}) { error in
+                XCTAssertEqual(error as? BigSyncReplicaPublicationError, .superseded)
+            }
+            try successor.withCurrent {
+                XCTAssertNoThrow(try successor.validateHeldPublication())
+                XCTAssertThrowsError(try predecessor.validateHeldPublication())
+            }
+        }
+    }
+
+    func testDifferentClientNestedPublicationAndSetupRejectBeforeStoreReentry() throws {
+        try withResources { identity, store, root in
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let other = BigSyncClientIdentity(synchronizerName: "other-client",
+                containerName: "iCloud.example.injected-store-tests", recordZoneID: .init(zoneName: "other-zone"),
+                sharedStateBaseURL: root.appendingPathComponent("other-identity", isDirectory: true))
+            _ = try other.prepareReplicaBindingGenerationIdentifier(store: store)
+            let first = try identity.capturePublicationAdmission(store: store)
+            let second = try other.capturePublicationAdmission(store: store)
+            let otherProvider = other.makeMutationJournalIdentityProvider(store: store)
+            try first.withCurrent {
+                XCTAssertThrowsError(try second.withCurrent { XCTFail("Nested publication entered") }) { error in
+                    XCTAssertEqual(error as? BigSyncReplicaPublicationError, .reentrantPublication)
+                }
+                XCTAssertThrowsError(try other.capturePublicationAdmission(store: store)) { error in
+                    XCTAssertEqual(error as? BigSyncReplicaPublicationError, .reentrantPublication)
+                }
+                XCTAssertThrowsError(try other.prepareReplicaBindingGenerationIdentifier(store: store)) { error in
+                    XCTAssertEqual(error as? BigSyncReplicaPublicationError, .reentrantPublication)
+                }
+                XCTAssertThrowsError(try other.cancelManualBackupRestoreIntent(transactionIdentifier: UUID())) { error in
+                    XCTAssertEqual(error as? BigSyncReplicaPublicationError, .reentrantPublication)
+                }
+                XCTAssertNil(otherProvider(), "Another client must not borrow this publication's identity")
+                XCTAssertNil(other.currentMutationJournalIdentity(storeURL: store.fileURL))
+            }
+            XCTAssertEqual(try second.withCurrent { 7 }, 7)
+        }
+    }
+
+    func testThrowingPublicationReleasesBorrowAndRealFileGuard() throws {
+        enum Failure: Error { case callback }
+        try withResources { identity, store, root in
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let admission = try identity.capturePublicationAdmission(store: store)
+            let descriptor = Darwin.open(root.appendingPathComponent("bigsync-state.plist.lock").path, O_RDWR)
+            guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+            defer { Darwin.close(descriptor) }
+            XCTAssertThrowsError(try admission.withCurrent { () -> Void in throw Failure.callback }) { error in
+                XCTAssertTrue(error is Failure)
+            }
+            XCTAssertFalse(BigSyncReplicaPublicationReadScope.isActive)
+            XCTAssertEqual(bigSyncFlock(descriptor, LOCK_EX | LOCK_NB), 0)
+            XCTAssertEqual(bigSyncFlock(descriptor, LOCK_UN), 0)
+            XCTAssertEqual(try admission.withCurrent { 9 }, 9)
+        }
+    }
+
+    func testExistingV1BindingInitializesEpochWithoutChangingItsJournalOrOtherState() throws {
+        try withResources { identity, store, _ in
+            let generation = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let key = identity.durableStateNamespace + ".ReplicaBinding.v1"
+            var legacy = try XCTUnwrap(store.durableObject(forKey: key) as? [String: Any])
+            legacy.removeValue(forKey: "publicationEpoch")
+            try store.setDurably(value: legacy, forKey: key)
+            try store.setDurably(value: Data([7, 8]), forKey: "unrelated-current-state")
+            XCTAssertThrowsError(try identity.capturePublicationAdmission(store: store)) { error in
+                XCTAssertEqual(error as? BigSyncReplicaPublicationError, .unavailable)
+            }
+            XCTAssertEqual(try identity.prepareReplicaBindingGenerationIdentifier(store: store), generation)
+            let current = try identity.capturePublicationAdmission(store: store)
+            XCTAssertEqual(current.replicaBindingGenerationIdentifier, generation)
+            var upgraded = try XCTUnwrap(store.durableObject(forKey: key) as? [String: Any])
+            XCTAssertNotNil(try BigSyncReplicaBindingStateStore.publicationEpoch(from: upgraded))
+            upgraded.removeValue(forKey: "publicationEpoch")
+            XCTAssertTrue(NSDictionary(dictionary: legacy).isEqual(to: upgraded))
+            XCTAssertEqual(try store.durableObject(forKey: "unrelated-current-state") as? Data, Data([7, 8]))
+            XCTAssertEqual(try current.withCurrent { 3 }, 3)
+        }
+    }
+
+    func testMalformedEpochCannotAuthorizeCaptureOrPreparation() throws {
+        try withResources { identity, store, _ in
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let key = identity.durableStateNamespace + ".ReplicaBinding.v1"
+            var malformed = try XCTUnwrap(store.durableObject(forKey: key) as? [String: Any])
+            malformed["publicationEpoch"] = "not-a-uuid"
+            try store.setDurably(value: malformed, forKey: key)
+            XCTAssertThrowsError(try identity.capturePublicationAdmission(store: store)) { error in
+                XCTAssertEqual(error as? BigSyncReplicaBindingError, .corrupt)
+            }
+            XCTAssertThrowsError(try identity.prepareReplicaBindingGenerationIdentifier(store: store))
+            let retained = try XCTUnwrap(store.durableObject(forKey: key) as? [String: Any])
+            XCTAssertTrue(NSDictionary(dictionary: malformed).isEqual(to: retained))
+        }
+    }
+
+    func testManualRestoreRetiresPublicationUntilReplacementBindingIsPrepared() throws {
+        try withResources { identity, store, _ in
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let original = try identity.capturePublicationAdmission(store: store)
+            let receipt = try identity.withManualBackupRestore(transactionIdentifier: UUID()) {}
+            XCTAssertNotEqual(receipt.newInstallationIdentifier, original.installationIdentifier)
+            XCTAssertThrowsError(try original.withCurrent {})
+            XCTAssertThrowsError(try identity.capturePublicationAdmission(store: store))
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let replacement = try identity.capturePublicationAdmission(store: store)
+            XCTAssertEqual(replacement.installationIdentifier, receipt.newInstallationIdentifier)
+            XCTAssertNotEqual(replacement.replicaBindingGenerationIdentifier, original.replicaBindingGenerationIdentifier)
+            XCTAssertEqual(try replacement.withCurrent { 4 }, 4)
+        }
+    }
+
+    func testPublicationHoldsRealBindingFileGuardAndBorrowsJournalIdentity() throws {
+        try withResources { identity, store, root in
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let admission = try identity.capturePublicationAdmission(store: store)
+            let provider = identity.makeMutationJournalIdentityProvider(store: store)
+            let descriptor = Darwin.open(root.appendingPathComponent("bigsync-state.plist.lock").path, O_RDWR)
+            XCTAssertGreaterThanOrEqual(descriptor, 0)
+            guard descriptor >= 0 else { return }
+            defer { Darwin.close(descriptor) }
+            try admission.withCurrent {
+                XCTAssertNotEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0,
+                    "A separately opened writer cannot replace binding state during COMMIT")
+                XCTAssertEqual(provider()?.installationIdentifier, admission.installationIdentifier)
+                XCTAssertEqual(provider()?.replicaBindingGenerationIdentifier, admission.replicaBindingGenerationIdentifier)
+                XCTAssertEqual(identity.currentMutationJournalIdentity(storeURL: store.fileURL), provider())
+                XCTAssertThrowsError(try admission.withCurrent {})
+                XCTAssertThrowsError(try identity.withManualBackupRestore(transactionIdentifier: UUID()) {
+                    XCTFail("Nested restore entered a held publication")
+                })
+            }
+            XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+            _ = flock(descriptor, LOCK_UN)
+        }
+    }
+
+    func testBindingLifecycleRejectsPredecessorBeforeNotificationDeliveryAndStablePrepareDoesNotRestart() throws {
+        try withResources { identity, store, _ in
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            let key = identity.durableStateNamespace + ".ReplicaBinding.v1"
+            _ = try BigSyncReplicaBindingStateStore.bindInitialAccount("a", store: store, key: key)
+            let old = try identity.capturePublicationAdmission(store: store)
+            let notification = expectation(description: "Changed binding notified after releasing its file guard")
+            let observer = NotificationCenter.default.addObserver(forName: .BigSyncReplicaPublicationAuthorityDidChange,
+                object: nil, queue: nil) { _ in
+                do {
+                    try old.withCurrent {}
+                    XCTFail("Old publication admitted")
+                } catch {
+                    // Rejection is the expected predecessor outcome. The
+                    // notification callback itself must remain nonthrowing.
+                }
+                notification.fulfill()
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+            _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
+            XCTAssertEqual(try old.withCurrent { 1 }, 1)
+            let port = try BigSyncReplicaBindingStateStore.requirePort(sourceAccountScopeIdentifier: "a",
+                destinationAccountScopeIdentifier: "b", store: store, key: key)
+            wait(for: [notification], timeout: 1)
+            NotificationCenter.default.removeObserver(observer)
+            XCTAssertThrowsError(try identity.capturePublicationAdmission(store: store), "Pending port is not publication authority")
+            _ = try BigSyncReplicaBindingStateStore.activatePort(port, store: store, key: key)
+            let successor = try identity.capturePublicationAdmission(store: store)
+            XCTAssertNotEqual(successor.replicaBindingGenerationIdentifier, old.replicaBindingGenerationIdentifier)
+            XCTAssertEqual(try successor.withCurrent { 2 }, 2)
+            XCTAssertThrowsError(try old.withCurrent {})
+        }
+    }
+
     func testInjectedStoreIsTheOnlyPreparedBindingStore() throws {
         try withResources { identity, store, root in
             let installation = try identity.prepareInstallation()
