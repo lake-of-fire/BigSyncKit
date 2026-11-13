@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: lake-of-fire/RealmSwiftGaps
-          ref: 32ac2f7a2a819bbe5081eb7013baa5ea91c6f2af
+          ref: ec1348a14665db9ae405cfb306735bf146e71200
           path: RealmSwiftGaps
           persist-credentials: false
       - uses: actions/checkout@v4
@@ -44,7 +44,7 @@ jobs:
           mkdir -p evidence
           git -C RealmSwiftGaps rev-parse HEAD > evidence/realm-gaps-commit.txt
           git -C SwiftUtilities rev-parse HEAD > evidence/swift-utilities-commit.txt
-          test "$(cat evidence/realm-gaps-commit.txt)" = 32ac2f7a2a819bbe5081eb7013baa5ea91c6f2af
+          test "$(cat evidence/realm-gaps-commit.txt)" = ec1348a14665db9ae405cfb306735bf146e71200
           test "$(cat evidence/swift-utilities-commit.txt)" = f437c7d06fc631cd7a67731279411c417cdf8077
       - name: Execute native collection and asset regressions
         shell: bash
