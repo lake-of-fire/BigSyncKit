@@ -312,7 +312,7 @@ actor RealmProvider {
         self.targetConfigurations = targetConfigurations
 
         do {
-            persistenceRealmObject = try await Realm(
+            persistenceRealmObject = try await RealmWriteExecutionProtection.openRealm(
                 configuration: persistenceConfiguration,
                 actor: BigSyncBackgroundActor.shared
             )
@@ -321,7 +321,7 @@ actor RealmProvider {
             var targetReaderRealmObjects = [Realm]()
             for targetConfiguration in targetConfigurations {
                 try await targetReaderRealmObjects.append(
-                    Realm(
+                    RealmWriteExecutionProtection.openRealm(
                         configuration: targetConfiguration,
                         actor: BigSyncBackgroundActor.shared
                     )
@@ -797,7 +797,7 @@ public final class RealmSwiftAdapter:
         if let configuredPersistenceRealm = realmProvider?.persistenceRealm {
             persistenceRealm = configuredPersistenceRealm
         } else {
-            persistenceRealm = try await Realm(
+            persistenceRealm = try await RealmWriteExecutionProtection.openRealm(
                 configuration: persistenceRealmConfiguration,
                 actor: BigSyncBackgroundActor.shared
             )
@@ -1327,9 +1327,9 @@ public final class RealmSwiftAdapter:
                         else { return false }
                     }
                 }
-                let livePersistenceRealm = try Realm(configuration: persistenceConfiguration)
+                let livePersistenceRealm = try RealmWriteExecutionProtection.openRealm(configuration: persistenceConfiguration)
                 for configuration in targetConfigurations {
-                    let liveRealm = try Realm(configuration: configuration)
+                    let liveRealm = try RealmWriteExecutionProtection.openRealm(configuration: configuration)
                     // A coordinated open can reuse a handle held by another
                     // writer. Read its committed base, not provisional debt.
                     // An immutable read-only configuration is already stable.
@@ -5333,7 +5333,7 @@ public final class RealmSwiftAdapter:
         // target objects. Open only the tracking Realm here; `ensureSetup()` can
         // perform broad initial discovery and is intentionally forbidden at
         // this pre-reset boundary.
-        let persistenceRealm = try await Realm(
+        let persistenceRealm = try await RealmWriteExecutionProtection.openRealm(
             configuration: persistenceRealmConfiguration,
             actor: BigSyncBackgroundActor.shared
         )
@@ -5354,7 +5354,7 @@ public final class RealmSwiftAdapter:
         epoch: Int,
         mode: ChangeFeedResetMode
     ) async throws {
-        let persistenceRealm = try await Realm(
+        let persistenceRealm = try await RealmWriteExecutionProtection.openRealm(
             configuration: persistenceRealmConfiguration,
             actor: BigSyncBackgroundActor.shared
         )
@@ -5481,7 +5481,7 @@ public final class RealmSwiftAdapter:
             guard openedRealmIdentities.insert(identity).inserted else {
                 continue
             }
-            let targetRealm = try await Realm(
+            let targetRealm = try await RealmWriteExecutionProtection.openRealm(
                 configuration: configuration,
                 actor: BigSyncBackgroundActor.shared
             )
@@ -6212,7 +6212,7 @@ public final class RealmSwiftAdapter:
         let persistenceRealm = if let configuredPersistenceRealm = realmProvider?.persistenceRealm {
             configuredPersistenceRealm
         } else {
-            try await Realm(
+            try await RealmWriteExecutionProtection.openRealm(
                 configuration: persistenceRealmConfiguration,
                 actor: BigSyncBackgroundActor.shared
             )
@@ -6365,7 +6365,7 @@ public final class RealmSwiftAdapter:
         epoch: Int,
         mode: ChangeFeedResetMode
     ) async throws -> Bool {
-        let persistenceRealm = try await Realm(
+        let persistenceRealm = try await RealmWriteExecutionProtection.openRealm(
             configuration: persistenceRealmConfiguration,
             actor: BigSyncBackgroundActor.shared
         )
