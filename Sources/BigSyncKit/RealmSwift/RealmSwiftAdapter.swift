@@ -970,16 +970,29 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     public func waitForCancellation() async {
+        let barrier = captureCancellationBarrier()
+        await barrier()
+    }
+
+    @BigSyncBackgroundActor
+    public func captureCancellationBarrier() -> @BigSyncBackgroundActor @Sendable () async -> Void {
+        let generation = cancellationGeneration
+        let capturedSetupGeneration = setupGeneration
         let activeInitialSetupTask = initialSetupTask
         let activeSetupTask = setupTask
         let activeObservedRealmChangesTask = observedRealmChangesTask
         activeInitialSetupTask?.cancel()
         activeSetupTask?.cancel()
         activeObservedRealmChangesTask?.cancel()
-        await activeInitialSetupTask?.value
-        _ = try? await activeSetupTask?.value
-        await activeObservedRealmChangesTask?.value
-        initialSetupTask = nil
+        return { [weak self] in
+            await activeInitialSetupTask?.value
+            _ = try? await activeSetupTask?.value
+            await activeObservedRealmChangesTask?.value
+            guard let self,
+                  self.cancellationGeneration == generation,
+                  self.setupGeneration == capturedSetupGeneration else { return }
+            self.initialSetupTask = nil
+        }
     }
 
     @BigSyncBackgroundActor
@@ -3111,6 +3124,19 @@ public final class RealmSwiftAdapter:
 
 #if DEBUG
     @BigSyncBackgroundActor
+    func _test_installCancellationTasks(
+        initial: Task<Void, Never>, setup: Task<Void, Error>, observed: Task<Void, Never>
+    ) {
+        setupGeneration = UUID()
+        initialSetupTask = initial
+        setupTask = setup
+        observedRealmChangesTask = observed
+    }
+
+    @BigSyncBackgroundActor
+    var _test_hasInitialSetupTask: Bool { initialSetupTask != nil }
+
+    @BigSyncBackgroundActor
     func _test_enqueueObservedJournalRecordNames(
         _ recordNames: [String],
         realmIndex: Int = 0
@@ -4181,7 +4207,7 @@ public final class RealmSwiftAdapter:
                     // A custom delegate may have intentionally changed the
                     // local object while deciding to keep it. Preserve the
                     // historical authoring behavior for that model-owned merge.
-                    changeMetadata.refreshChangeMetadata(
+                    try changeMetadata.refreshChangeMetadataThrowing(
                         explicitlyModified: true,
                         at: Date()
                     )
@@ -4189,7 +4215,7 @@ public final class RealmSwiftAdapter:
                     // The built-in timestamp policy selected an unchanged,
                     // already-authored local value. Retransmit it under a new
                     // journal generation without inventing a new conflict clock.
-                    changeMetadata.journalCurrentValuePreservingChangeMetadata(
+                    try changeMetadata.journalCurrentValuePreservingChangeMetadata(
                         at: Date()
                     )
                 }
@@ -5491,10 +5517,10 @@ public final class RealmSwiftAdapter:
             )
             // A provisional current edit must not hide committed backup debt
             // that returns if its owner rolls back. Carry detached identities only.
-            let restoredMutations: [(recordName: String, generation: String)] = {
+            let restoredMutations: [(recordName: String, generation: String)] = try {
                 let snapshot = committedRealmReadSnapshot(in: targetRealm)
-                return snapshot.objects(BigSyncPendingMutation.self).compactMap { mutation in
-                    guard !BigSyncMutationTrackingRegistry
+                return try snapshot.objects(BigSyncPendingMutation.self).compactMap { mutation in
+                    guard try !BigSyncMutationTrackingRegistry
                         .mutationWasCreatedInCurrentTransportIdentity(
                             mutation, realm: snapshot
                         ) else { return nil }
@@ -5518,7 +5544,7 @@ public final class RealmSwiftAdapter:
                         ofType: BigSyncPendingMutation.self,
                         forPrimaryKey: restoredMutation.recordName
                     ), liveMutation.generation == restoredMutation.generation,
-                       !BigSyncMutationTrackingRegistry
+                       try !BigSyncMutationTrackingRegistry
                         .mutationWasCreatedInCurrentTransportIdentity(
                             liveMutation,
                             realm: targetRealm
@@ -5812,7 +5838,7 @@ public final class RealmSwiftAdapter:
                             // revival while this write waited owns its new
                             // generation and must remain pending.
                             if let existingMutation,
-                               !BigSyncMutationTrackingRegistry
+                               try !BigSyncMutationTrackingRegistry
                                 .mutationWasCreatedInCurrentTransportIdentity(
                                     existingMutation,
                                     realm: targetRealm
@@ -5822,7 +5848,7 @@ public final class RealmSwiftAdapter:
                             continue
                         }
                         if let existingMutation {
-                            guard !BigSyncMutationTrackingRegistry
+                            guard try !BigSyncMutationTrackingRegistry
                                 .mutationWasCreatedInCurrentTransportIdentity(
                                     existingMutation,
                                     realm: targetRealm
@@ -5832,7 +5858,7 @@ public final class RealmSwiftAdapter:
                             targetRealm.delete(existingMutation)
                         }
                         let mutationGeneration =
-                            BigSyncMutationTrackingRegistry
+                            try BigSyncMutationTrackingRegistry
                                 .makeMutationGeneration(in: targetRealm)
                         targetRealm.add(BigSyncPendingMutation(
                             recordName: candidate.identifier,
@@ -5970,7 +5996,7 @@ public final class RealmSwiftAdapter:
                                     entityType: candidate.entityType
                                 )
                             }
-                            metadata.journalCurrentValuePreservingChangeMetadata(at: changedAt)
+                            try metadata.journalCurrentValuePreservingChangeMetadata(at: changedAt)
                         }
                         guard let mutation = targetRealm.object(
                             ofType: BigSyncPendingMutation.self,
@@ -8014,7 +8040,7 @@ public final class RealmSwiftAdapter:
                                                 throw BigSyncSemanticAdmissionUnavailable(entityType: candidate.entityType)
                                             }
                                             if currentMutationGeneration == nil {
-                                                metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
+                                                try metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
                                             }
                                             guard let generation = targetReaderRealm.object(
                                                 ofType: BigSyncPendingMutation.self,
@@ -8128,7 +8154,7 @@ public final class RealmSwiftAdapter:
                                                 guard let metadata = object as? ChangeMetadataRecordable else {
                                                     throw BigSyncSemanticAdmissionUnavailable(entityType: candidate.entityType)
                                                 }
-                                                metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
+                                                try metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
                                                 guard let generation = targetReaderRealm.object(
                                                     ofType: BigSyncPendingMutation.self,
                                                     forPrimaryKey: candidate.syncedEntityID)?.generation,
@@ -11146,7 +11172,7 @@ extension RealmSwiftAdapter {
             || (!pending && merged != remote) {
             // A changed ancestor also invalidates older upload receipts even
             // when conflict selection retained every local payload field.
-            (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
+            try (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
         }
         try context.validate(in: realm)
         return true
@@ -11209,7 +11235,7 @@ extension RealmSwiftAdapter {
         try validateOwner()
         switch readBoundary {
         case .committed:
-            guard let identity = BigSyncMutationTrackingRegistry
+            guard let identity = try BigSyncMutationTrackingRegistry
                 .currentMutationJournalIdentity(in: realm),
                   !identity.installationIdentifier.isEmpty,
                   identity.replicaBindingGenerationIdentifier
@@ -12259,7 +12285,7 @@ extension RealmSwiftAdapter {
         if realm.isInWriteTransaction {
             try cut.context.validate(in: realm)
         } else {
-            guard let identity = BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm),
+            guard let identity = try BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm),
                   !identity.installationIdentifier.isEmpty,
                   identity.replicaBindingGenerationIdentifier == cut.context.binding else {
                 throw CancellationError()

@@ -10,6 +10,91 @@ import Logging
 
 final class BigSyncWorkerRequestCancellationTests: XCTestCase {
     @BigSyncBackgroundActor
+    func testInterruptedPublicationRestorationRetriesBeforeNextPreflight() async {
+        let fixture = makeFixture()
+        let restoration = WorkerRestorationAttempts()
+        fixture.worker._test_installPublicationRestorationOperation {
+            try await restoration.restore()
+        }
+        let first = await fixture.worker.synchronizeCloudKit()
+        XCTAssertNil(first)
+        let failedAttempts = await restoration.count
+        let preflightBeforeRestore = await fixture.availability.count
+        XCTAssertEqual(failedAttempts, 1)
+        XCTAssertEqual(preflightBeforeRestore, 0)
+        XCTAssertFalse(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+
+        _ = await fixture.worker.synchronizeCloudKit()
+        let successfulAttempts = await restoration.count
+        let preflightAfterRestore = await fixture.availability.count
+        XCTAssertEqual(successfulAttempts, 2)
+        XCTAssertEqual(preflightAfterRestore, 1)
+        _ = await fixture.worker.synchronizeCloudKit()
+        let finalAttempts = await restoration.count
+        XCTAssertEqual(finalAttempts, 2, "Completed receipt restoration must not replay")
+    }
+
+    @BigSyncBackgroundActor
+    func testObsoleteLifecycleRequestPreservesScheduledStartup() async {
+        let fixture = makeFixture()
+        fixture.worker._test_scheduleDormantInitialSynchronization()
+        let result = await fixture.worker.synchronizeCloudKit(ifCurrent: { false })
+        XCTAssertNil(result)
+        XCTAssertTrue(fixture.worker._test_hasScheduledInitialSynchronization)
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+    }
+
+    @BigSyncBackgroundActor
+    func testLifecycleSupersededDuringRestorationCannotEnterPreflight() async {
+        let fixture = makeFixture()
+        let admission = WorkerLifecycleAdmission()
+        let release = WorkerRestorationRelease()
+        let restoration = installRestoration(on: fixture.worker, release: release)
+        let entered = expectation(description: "request entered restoration")
+        let request = Task { @BigSyncBackgroundActor in
+            entered.fulfill()
+            return await fixture.worker.synchronizeCloudKit(ifCurrent: { admission.isCurrent })
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        admission.invalidate()
+        await fixture.worker.cancelSynchronization()
+        await release.open()
+        let result = await request.value
+        await restoration.value
+        XCTAssertNil(result)
+        let count = await fixture.availability.count
+        XCTAssertEqual(count, 0)
+        XCTAssertEqual(fixture.transport.operationCount, 0)
+        XCTAssertFalse(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+    }
+
+    @BigSyncBackgroundActor
+    func testLifecycleSupersededDuringAvailabilityCannotStartSyncOrRetry() async {
+        for status in [CloudKitAccountAvailability.available, .failed] {
+            let release = WorkerRestorationRelease()
+            let entered = expectation(description: "availability entered")
+            let fixture = makeFixture(statusProvider: { _ in
+                entered.fulfill()
+                await release.wait()
+                return status
+            })
+            let admission = WorkerLifecycleAdmission()
+            let request = Task { @BigSyncBackgroundActor in
+                await fixture.worker.synchronizeCloudKit(ifCurrent: { admission.isCurrent })
+            }
+            await fulfillment(of: [entered], timeout: 2)
+            admission.invalidate()
+            await fixture.worker.cancelSynchronization()
+            await release.open()
+            let result = await request.value
+            XCTAssertNil(result)
+            XCTAssertEqual(fixture.transport.operationCount, 0)
+            XCTAssertFalse(fixture.worker._test_hasScheduledAccountAvailabilityRetry)
+        }
+    }
+
+    @BigSyncBackgroundActor
     func testAlreadyCancelledRequestPreservesScheduledStartup() async {
         await assertCancelledRequestPreservesStartup(withDeadline: false)
     }
@@ -333,8 +418,10 @@ final class BigSyncWorkerRequestCancellationTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
-    private func makeFixture() -> WorkerPreflightFixture {
-        let fixture = WorkerPreflightFixture()
+    private func makeFixture(
+        statusProvider: CloudKitAccountAvailabilityGate.StatusProvider? = nil
+    ) -> WorkerPreflightFixture {
+        let fixture = WorkerPreflightFixture(statusProvider: statusProvider)
         addTeardownBlock { @BigSyncBackgroundActor in
             await fixture.worker.cancelSynchronization()
             await fixture.synchronizer.cancelSynchronizationAndWait()
@@ -577,6 +664,21 @@ private actor WorkerAvailabilityCalls {
     func record() { count += 1 }
 }
 
+private actor WorkerRestorationAttempts {
+    private(set) var count = 0
+    func restore() throws {
+        count += 1
+        if count == 1 { throw CancellationError() }
+    }
+}
+
+private final class WorkerLifecycleAdmission: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = true
+    var isCurrent: Bool { lock.withLock { current } }
+    func invalidate() { lock.withLock { current = false } }
+}
+
 private actor WorkerRestorationRelease {
     private var isOpen = false
     private var waiters = [CheckedContinuation<Void, Never>]()
@@ -599,12 +701,12 @@ private final class WorkerPreflightFixture {
     let worker: BigSyncBackgroundActor
     let synchronizer: CloudKitSynchronizer
 
-    init() {
+    init(statusProvider: CloudKitAccountAvailabilityGate.StatusProvider? = nil) {
         let calls = availability
         worker = BigSyncBackgroundActor(accountAvailabilityGate: CloudKitAccountAvailabilityGate(
-            statusProvider: { _ in
+            statusProvider: { identifier in
                 await calls.record()
-                return .failed
+                return await statusProvider?(identifier) ?? .failed
             },
             deadlineNanoseconds: 5_000_000_000
         ))

@@ -284,7 +284,7 @@ struct BigSyncRecordRebaseContext: Sendable, Equatable {
     }
 
     func validate(in realm: Realm) throws {
-        guard let identity = BigSyncMutationTracking.currentJournalIdentity(
+        guard let identity = try BigSyncMutationTracking.currentJournalIdentity(
             verifyingPendingMutationsFor: [Object](), in: realm
         ), identity.replicaBindingGenerationIdentifier == binding else {
             throw CancellationError()

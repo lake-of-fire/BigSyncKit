@@ -584,7 +584,7 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
             }
             try await Self.expectCancellation { _ = try await sync.fetchDatabaseChanges() }
             XCTAssertTrue(observed)
-            XCTAssertNil(sync.configuredZoneTerminalState(sync.recordZoneID))
+            XCTAssertNil(try sync.configuredZoneTerminalState(sync.recordZoneID))
         }
     }
 
@@ -594,7 +594,7 @@ final class SyncPhaseAttemptOwnershipTests: XCTestCase {
             await transport.returnDeletion(in: sync.recordZoneID)
             do { _ = try await sync.fetchDatabaseChanges(); XCTFail("Expected current zone deletion") }
             catch let error as ChangeFeedMigrationError { XCTAssertEqual(error.deletionKind, .deleted) }
-            XCTAssertEqual(sync.configuredZoneTerminalState(sync.recordZoneID)?.deletionKind, .deleted)
+            XCTAssertEqual(try sync.configuredZoneTerminalState(sync.recordZoneID)?.deletionKind, .deleted)
         }
     }
 
@@ -1283,7 +1283,7 @@ extension SyncPhaseAttemptOwnershipTests {
             }
             if encrypted {
                 let context = try XCTUnwrap(sync.activeRunContext)
-                XCTAssertTrue(sync.hasPendingEncryptedDataResetRecovery(context: context))
+                XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context))
                 XCTAssertEqual((delivered as? ChangeFeedMigrationError)?.deletionKind, .encryptedDataReset)
             }
         }
@@ -1316,7 +1316,7 @@ extension SyncPhaseAttemptOwnershipTests {
             XCTAssertNil(failure)
             let saves = await transport.zoneSaveCount
             XCTAssertEqual(saves, 1)
-            XCTAssertTrue(sync.configuredZoneIsEstablished(adapter.recordZoneID))
+            XCTAssertTrue(try sync.configuredZoneIsEstablished(adapter.recordZoneID))
         }
     }
 
@@ -1331,7 +1331,7 @@ extension SyncPhaseAttemptOwnershipTests {
             let deadline = try XCTUnwrap(sync.retrySleepUntil)
             let minimum = CloudKitRetryConstraints(error).serverMinimum ?? CloudKitRetryBackoff.initialFallbackDelay
             XCTAssertGreaterThanOrEqual(deadline.timeIntervalSince(start), minimum)
-            if token { XCTAssertTrue(sync.hasPendingEncryptedDataResetRecovery(context: context)) }
+            if token { XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context)) }
             let saves = await transport.zoneSaveCount
             let mutations = await transport.recordMutationCount
             XCTAssertEqual(saves, 0); XCTAssertEqual(mutations, 0)
@@ -1386,15 +1386,15 @@ extension SyncPhaseAttemptOwnershipTests {
                 }
                 XCTAssertEqual(NSArray(array: store.persistedPropertyLists), persistedBefore,
                     "Neither originating nor replacement account may acquire lifecycle evidence")
-                XCTAssertNil(sync.configuredZoneTerminalState(adapter.recordZoneID))
-                XCTAssertFalse(sync.hasPendingEncryptedDataResetRecovery(context: originalContext))
+                XCTAssertNil(try sync.configuredZoneTerminalState(adapter.recordZoneID))
+                XCTAssertFalse(try sync.hasPendingEncryptedDataResetRecovery(context: originalContext))
                 if interruption != .account { XCTAssertEqual(probe.accountIdentifierCalls, accountsAtThrow) }
             } else if stop {
                 XCTAssertEqual(probe.accountIdentifierCalls, accountsAtThrow)
-                XCTAssertNil(sync.configuredZoneTerminalState(adapter.recordZoneID))
+                XCTAssertNil(try sync.configuredZoneTerminalState(adapter.recordZoneID))
                 XCTAssertTrue(sync.cancelledDueToUnauthentication)
             } else {
-                XCTAssertEqual(sync.configuredZoneTerminalState(adapter.recordZoneID)?.deletionKind,
+                XCTAssertEqual(try sync.configuredZoneTerminalState(adapter.recordZoneID)?.deletionKind,
                                reset ? .encryptedDataReset : .deleted)
             }
             XCTAssertTrue(probe.uploadsPending || probe.deletionsPending)
@@ -1474,7 +1474,7 @@ extension SyncPhaseAttemptOwnershipTests {
             XCTAssertEqual(mutations, 0); XCTAssertEqual(deletes, 0)
             XCTAssertEqual(saves, route == .zoneSave ? 1 : 0)
             XCTAssertEqual(probe.persistenceCount, 0)
-            if reset { XCTAssertTrue(sync.hasPendingEncryptedDataResetRecovery(context: context)) }
+            if reset { XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context)) }
         }
     }
     @BigSyncBackgroundActor
@@ -1527,7 +1527,7 @@ extension SyncPhaseAttemptOwnershipTests {
             let retained = CloudKitRetryConstraints(try XCTUnwrap(error))
             XCTAssertEqual(retained.serverMinimum, CloudKitRetryConstraints(original).serverMinimum)
             XCTAssertEqual(retained.requestsTokenRecovery, token)
-            XCTAssertTrue(sync.hasPendingEncryptedDataResetRecovery(context: context))
+            XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context))
             let saves = await transport.zoneSaveCount
             XCTAssertEqual(saves, 0)
         }
@@ -1544,8 +1544,8 @@ extension SyncPhaseAttemptOwnershipTests {
             let context = try XCTUnwrap(sync.activeRunContext)
             let error = lossFailure(reset: true, sibling: CKError(.changeTokenExpired), malformed: true)
             XCTAssertNil(sync.applyCloudKitLoss(error: error, defaultZoneID: adapter.recordZoneID, context: context))
-            XCTAssertFalse(sync.hasPendingEncryptedDataResetRecovery(context: context))
-            XCTAssertNil(sync.configuredZoneTerminalState(adapter.recordZoneID))
+            XCTAssertFalse(try sync.hasPendingEncryptedDataResetRecovery(context: context))
+            XCTAssertNil(try sync.configuredZoneTerminalState(adapter.recordZoneID))
             XCTAssertFalse(sync.shouldRetryUpload(for: error))
         }
     }
@@ -1560,7 +1560,7 @@ extension SyncPhaseAttemptOwnershipTests {
             XCTAssertFalse(CloudKitRetryConstraints(lifecycle).isErrorGraphComplete)
             XCTAssertEqual(CloudKitRetryConstraints(lifecycle).serverMinimum, 137)
             await sync.failSynchronization(error: lifecycle, for: sync.synchronizationAttemptID)
-            XCTAssertEqual(sync.configuredZoneTerminalState(adapter.recordZoneID)?.deletionKind, .deleted)
+            XCTAssertEqual(try sync.configuredZoneTerminalState(adapter.recordZoneID)?.deletionKind, .deleted)
             XCTAssertNil(sync.synchronizationTask)
         }
     }
@@ -1595,8 +1595,8 @@ extension SyncPhaseAttemptOwnershipTests {
             await probe.accountGate.open()
             let error = await operation.value
             XCTAssertTrue(error is CancellationError)
-            XCTAssertNil(sync.configuredZoneTerminalState(adapter.recordZoneID))
-            XCTAssertFalse(sync.hasPendingEncryptedDataResetRecovery(context: original))
+            XCTAssertNil(try sync.configuredZoneTerminalState(adapter.recordZoneID))
+            XCTAssertFalse(try sync.hasPendingEncryptedDataResetRecovery(context: original))
             probe.accountEntered = nil
         }
     }
@@ -1825,7 +1825,7 @@ extension SyncPhaseAttemptOwnershipTests {
             let retained = CloudKitRetryConstraints(try XCTUnwrap(delivered))
             XCTAssertFalse(retained.isErrorGraphComplete)
             XCTAssertFalse(retained.codes.contains(.notAuthenticated), "Do not invent an unseen stop")
-            XCTAssertEqual(sync.configuredZoneTerminalState(adapter.recordZoneID)?.deletionKind,
+            XCTAssertEqual(try sync.configuredZoneTerminalState(adapter.recordZoneID)?.deletionKind,
                 knownTerminal ? .deleted : nil)
             XCTAssertNil(sync.synchronizationTask)
             let saves = await transport.zoneSaveCount

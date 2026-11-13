@@ -20,10 +20,20 @@ public extension ChangeMetadataRecordable {
     }
 
     func refreshChangeMetadata(explicitlyModified: Bool, at timestamp: Date) {
+        do {
+            try refreshChangeMetadataThrowing(explicitlyModified: explicitlyModified, at: timestamp)
+        } catch {
+            preconditionFailure("BigSync mutation identity is unavailable: \(error)")
+        }
+    }
+
+    /// Use from a throwing Realm write body. Storage admission failures abort
+    /// that transaction, including its domain edits and pending journal row.
+    func refreshChangeMetadataThrowing(explicitlyModified: Bool, at timestamp: Date = Date()) throws {
         modifiedAt = timestamp
         if explicitlyModified {
             explicitlyModifiedAt = timestamp
-            recordBigSyncMutation(at: timestamp)
+            try recordBigSyncMutation(at: timestamp)
         }
     }
 
@@ -34,10 +44,24 @@ public extension ChangeMetadataRecordable {
         at timestamp: Date,
         preparedWrite: BigSyncMutationTracking.PreparedWrite
     ) {
+        do {
+            try refreshChangeMetadataThrowing(
+                explicitlyModified: explicitlyModified, at: timestamp, preparedWrite: preparedWrite
+            )
+        } catch {
+            preconditionFailure("BigSync mutation identity is unavailable: \(error)")
+        }
+    }
+
+    func refreshChangeMetadataThrowing(
+        explicitlyModified: Bool,
+        at timestamp: Date,
+        preparedWrite: BigSyncMutationTracking.PreparedWrite
+    ) throws {
         modifiedAt = timestamp
         if explicitlyModified {
             explicitlyModifiedAt = timestamp
-            recordBigSyncMutation(at: timestamp, preparedWrite: preparedWrite)
+            try recordBigSyncMutation(at: timestamp, preparedWrite: preparedWrite)
         }
     }
 
@@ -45,14 +69,14 @@ public extension ChangeMetadataRecordable {
     /// Queue that value for retransmission without manufacturing a later user
     /// edit clock. Custom delegates that mutate the object continue to use the
     /// ordinary explicit refresh path in RealmSwiftAdapter.
-    internal func journalCurrentValuePreservingChangeMetadata(at timestamp: Date) {
-        recordBigSyncMutation(at: timestamp)
+    internal func journalCurrentValuePreservingChangeMetadata(at timestamp: Date) throws {
+        try recordBigSyncMutation(at: timestamp)
     }
 
     private func recordBigSyncMutation(
         at timestamp: Date,
         preparedWrite: BigSyncMutationTracking.PreparedWrite? = nil
-    ) {
+    ) throws {
         guard let object = self as? Object else {
             assertionFailure("BigSync mutations require a Realm Object")
             return
@@ -116,7 +140,7 @@ public extension ChangeMetadataRecordable {
             // Resurrection must not compare against a pre-deletion lifetime.
             BigSyncRecordBaseline.invalidate(recordName: recordName, in: realm)
         }
-        let mutationGeneration = BigSyncMutationTrackingRegistry
+        let mutationGeneration = try BigSyncMutationTrackingRegistry
             .makeMutationGeneration(context: mutationContext)
         let accountScopeIdentifier = BigSyncMutationTrackingRegistry
             .accountScopeIdentifier(

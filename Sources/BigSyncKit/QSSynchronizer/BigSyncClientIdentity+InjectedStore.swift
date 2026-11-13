@@ -28,12 +28,19 @@ extension BigSyncClientIdentity {
     public func makeMutationJournalIdentityProvider(
         store: any KeyValueStore
     ) -> @Sendable () -> BigSyncMutationJournalIdentity? {
+        let provider = makeThrowingMutationJournalIdentityProvider(store: store)
+        return { try? provider() }
+    }
+
+    public func makeThrowingMutationJournalIdentityProvider(
+        store: any KeyValueStore
+    ) -> @Sendable () throws -> BigSyncMutationJournalIdentity? {
         let reader = BigSyncMutationJournalIdentityReader(
             clientIdentity: self,
             store: store,
             key: durableStateNamespace + ".ReplicaBinding.v1"
         )
-        return { reader.current() }
+        return { try reader.currentThrowing() }
     }
 
     public func currentMutationJournalIdentity(

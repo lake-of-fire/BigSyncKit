@@ -6,9 +6,9 @@ import XCTest
 @_spi(CloudKitE2E) @testable import BigSyncKit
 
 final class DisposableZoneAuthorizationTests: XCTestCase {
-    func testArbitraryZoneCannotAcquireDisposableDeletionCapability() {
+    func testArbitraryZoneCannotAcquireDisposableDeletionCapability() throws {
         let runID = UUID()
-        var configuration = makeConfiguration(
+        var configuration = try makeConfiguration(
             runID: runID,
             zoneName: "ImportantProductionZone"
         )
@@ -18,10 +18,10 @@ final class DisposableZoneAuthorizationTests: XCTestCase {
         )
     }
 
-    func testIsolatedPerRunE2EZoneCanAcquireDisposableDeletionCapability() {
+    func testIsolatedPerRunE2EZoneCanAcquireDisposableDeletionCapability() throws {
         let runID = UUID()
         let canonicalRunID = runID.uuidString.lowercased()
-        var configuration = makeConfiguration(
+        var configuration = try makeConfiguration(
             runID: runID,
             zoneName: "ManabiPlatform.e2e.v2.\(canonicalRunID)"
         )
@@ -31,10 +31,10 @@ final class DisposableZoneAuthorizationTests: XCTestCase {
         )
     }
 
-    func testNonCleanupE2EPhaseCannotAcquireDeletionCapability() {
+    func testNonCleanupE2EPhaseCannotAcquireDeletionCapability() throws {
         let runID = UUID()
         let canonicalRunID = runID.uuidString.lowercased()
-        var configuration = makeConfiguration(
+        var configuration = try makeConfiguration(
             runID: runID,
             zoneName: "ManabiPlatform.e2e.v2.\(canonicalRunID)",
             phase: "writer-b"
@@ -49,7 +49,7 @@ final class DisposableZoneAuthorizationTests: XCTestCase {
         runID: UUID,
         zoneName: String,
         phase: String = "cleanup"
-    ) -> BigSyncBackgroundWorkerConfiguration {
+    ) throws -> BigSyncBackgroundWorkerConfiguration {
         let canonicalRunID = runID.uuidString.lowercased()
         let phaseRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("CloudKitE2E", isDirectory: true)
@@ -59,7 +59,7 @@ final class DisposableZoneAuthorizationTests: XCTestCase {
             inMemoryIdentifier: UUID().uuidString,
             objectTypes: [BigSyncPendingMutation.self]
         )
-        return BigSyncBackgroundWorkerConfiguration(
+        return try BigSyncBackgroundWorkerConfiguration(
             synchronizerName: "\(zoneName).\(phase)",
             containerName: "iCloud.io.manabi.ManabiPlatform.v2",
             configurations: [realmConfiguration],

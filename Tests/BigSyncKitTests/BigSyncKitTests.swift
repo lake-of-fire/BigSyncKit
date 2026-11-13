@@ -1524,7 +1524,7 @@ final class BigSyncKitTests: XCTestCase {
             XCTAssertTrue(rejected, "\(operation), encrypted=\(encrypted) must reject obsolete authority")
             XCTAssertEqual(NSDictionary(dictionary: store.propertyListEntries), before,
                 "Neither original nor replacement scope may acquire lifecycle/recovery state")
-            XCTAssertFalse(sync.configuredZoneIsTerminal(zoneID))
+            XCTAssertFalse(try sync.configuredZoneIsTerminal(zoneID))
             await sync.cancelSynchronizationAndWait()
         }
     }
@@ -1664,7 +1664,7 @@ final class BigSyncKitTests: XCTestCase {
         let before = NSDictionary(dictionary: store.propertyListEntries)
         XCTAssertNil(sync.applyCloudKitLoss(error: error, defaultZoneID: sync.recordZoneID, context: context))
         XCTAssertEqual(NSDictionary(dictionary: store.propertyListEntries), before)
-        XCTAssertFalse(sync.configuredZoneIsTerminal(sync.recordZoneID))
+        XCTAssertFalse(try sync.configuredZoneIsTerminal(sync.recordZoneID))
         let attemptID = sync.synchronizationAttemptID
         await sync.failSynchronization(error: error, for: attemptID)
         XCTAssertNotEqual(sync.synchronizationAttemptID, attemptID)
@@ -1695,9 +1695,9 @@ final class BigSyncKitTests: XCTestCase {
                 _ = try await sync.fetchDatabaseChanges()
                 XCTFail("A current loss must still fail the attempt")
             } catch is ChangeFeedMigrationError {}
-            XCTAssertTrue(sync.configuredZoneIsTerminal(sync.recordZoneID))
+            XCTAssertTrue(try sync.configuredZoneIsTerminal(sync.recordZoneID))
             let context = try XCTUnwrap(sync.activeRunContext)
-            XCTAssertEqual(sync.hasPendingEncryptedDataResetRecovery(context: context), encrypted)
+            XCTAssertEqual(try sync.hasPendingEncryptedDataResetRecovery(context: context), encrypted)
             await sync.cancelSynchronizationAndWait()
         }
     }
@@ -4564,7 +4564,7 @@ final class BigSyncKitTests: XCTestCase {
             realm.add([first, second])
             first.refreshChangeMetadata(explicitlyModified: true)
             second.refreshChangeMetadata(explicitlyModified: true)
-            verifiedIdentity = BigSyncMutationTracking.currentJournalIdentity(
+            verifiedIdentity = try BigSyncMutationTracking.currentJournalIdentity(
                 verifyingPendingMutationsFor: [first, second],
                 in: realm
             )
@@ -4584,7 +4584,7 @@ final class BigSyncKitTests: XCTestCase {
         currentIdentity.store(identityB)
         var rotatedVerification: BigSyncMutationJournalIdentity?
         try realm.write {
-            rotatedVerification = BigSyncMutationTracking
+            rotatedVerification = try BigSyncMutationTracking
                 .currentJournalIdentity(
                     verifyingPendingMutationsFor: [first, second],
                     in: realm
@@ -4654,13 +4654,13 @@ final class BigSyncKitTests: XCTestCase {
             realm.add(owned)
             owned.refreshChangeMetadata(explicitlyModified: true)
             XCTAssertEqual(
-                BigSyncMutationTracking.currentJournalIdentity(
+                try BigSyncMutationTracking.currentJournalIdentity(
                     verifyingPendingMutationsFor: [owned], in: realm
                 ),
                 identity
             )
             XCTAssertNil(
-                BigSyncMutationTracking.currentJournalIdentity(
+                try BigSyncMutationTracking.currentJournalIdentity(
                     verifyingPendingMutationsFor: [foreign], in: realm
                 )
             )
@@ -7254,7 +7254,7 @@ final class BigSyncKitTests: XCTestCase {
         let result = try await synchronizer.synchronize()
 
         XCTAssertNotNil(result.receipt)
-        XCTAssertFalse(synchronizer.configuredZoneIsTerminal(configuredZoneID))
+        XCTAssertFalse(try synchronizer.configuredZoneIsTerminal(configuredZoneID))
     }
 
     @BigSyncBackgroundActor
@@ -8336,7 +8336,9 @@ final class BigSyncKitTests: XCTestCase {
             accountIdentifier: database.accountIdentifier,
             accountScopeIdentifier: scope
         )
-        XCTAssertTrue(restored.configuredZoneIsTerminal(zoneID))
+        XCTAssertThrowsError(try restored.configuredZoneIsTerminal(zoneID))
+        store.synchronizesDurably = true
+        XCTAssertTrue(try restored.configuredZoneIsTerminal(zoneID))
         XCTAssertEqual(database.subscriptionFetchCount, 0)
         XCTAssertEqual(database.databaseChangeFetchCount, 0)
         XCTAssertEqual(database.recordZoneChangeFetchCount, 0)
@@ -14461,7 +14463,7 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(database.savedZoneCount, 1)
         XCTAssertGreaterThanOrEqual(database.modifyRecordsOperationCount, 1)
         XCTAssertTrue(database.deletedZoneIDs.isEmpty)
-        XCTAssertFalse(synchronizer.configuredZoneIsTerminal(fixture.adapter.recordZoneID))
+        XCTAssertFalse(try synchronizer.configuredZoneIsTerminal(fixture.adapter.recordZoneID))
         XCTAssertNil(
             targetRealm.object(
                 ofType: BigSyncPendingMutation.self,
@@ -14775,12 +14777,12 @@ final class BigSyncKitTests: XCTestCase {
             ofType: BigSyncTrackedObject.self, forPrimaryKey: objectID
         ))
         XCTAssertTrue(
-            synchronizer.configuredZoneIsEstablished(
+            try synchronizer.configuredZoneIsEstablished(
                 fixture.adapter.recordZoneID
             )
         )
         XCTAssertTrue(
-            synchronizer.configuredZoneIsTerminal(
+            try synchronizer.configuredZoneIsTerminal(
                 fixture.adapter.recordZoneID
             )
         )
@@ -14837,7 +14839,7 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(database.savedZoneCount, 0)
         XCTAssertEqual(database.modifyRecordsOperationCount, 0)
         XCTAssertEqual(
-            synchronizer.configuredZoneTerminalState(
+            try synchronizer.configuredZoneTerminalState(
                 fixture.adapter.recordZoneID
             )?.deletionKind,
             .purged
@@ -14963,7 +14965,7 @@ final class BigSyncKitTests: XCTestCase {
             forPrimaryKey: tombstoneRecordName
         ))
         XCTAssertFalse(
-            synchronizer.configuredZoneIsTerminal(
+            try synchronizer.configuredZoneIsTerminal(
                 fixture.adapter.recordZoneID
             )
         )
@@ -17742,11 +17744,13 @@ final class BigSyncKitTests: XCTestCase {
             context: context
         )
 
-        XCTAssertEqual(
-            error as? ChangeFeedMigrationPersistenceError,
-            .stateNotDurable
-        )
-        XCTAssertFalse(synchronizer.configuredZoneIsTerminal(zoneID))
+        guard let persistenceError = error as? DurableKeyValueStoreError,
+              case .unavailable = persistenceError else {
+            return XCTFail("Unavailable recovery state must stop before publication: \(String(describing: error))")
+        }
+        XCTAssertThrowsError(try synchronizer.configuredZoneIsTerminal(zoneID))
+        store.synchronizesDurably = true
+        XCTAssertFalse(try synchronizer.configuredZoneIsTerminal(zoneID))
         XCTAssertTrue(store.propertyListEntries.keys.allSatisfy {
             !$0.contains("ChangeFeedMigration.v3")
         })
@@ -17799,7 +17803,7 @@ final class BigSyncKitTests: XCTestCase {
                 failureKind
             )
             XCTAssertFalse(
-                synchronizer.configuredZoneIsTerminal(
+                try synchronizer.configuredZoneIsTerminal(
                     fixture.adapter.recordZoneID
                 ),
                 failureKind
@@ -17832,7 +17836,7 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(database.recordZoneChangeFetchCount, 1)
         XCTAssertGreaterThanOrEqual(database.modifyRecordsOperationCount, 1)
         XCTAssertFalse(
-            synchronizer.configuredZoneIsTerminal(
+            try synchronizer.configuredZoneIsTerminal(
                 fixture.adapter.recordZoneID
             )
         )
@@ -17905,7 +17909,7 @@ final class BigSyncKitTests: XCTestCase {
 
         XCTAssertNotNil(result.receipt)
         XCTAssertFalse(
-            reopened.configuredZoneIsTerminal(fixture.adapter.recordZoneID)
+            try reopened.configuredZoneIsTerminal(fixture.adapter.recordZoneID)
         )
         XCTAssertNil(
             fixture.targetRealm.object(
@@ -17959,7 +17963,7 @@ final class BigSyncKitTests: XCTestCase {
 
         XCTAssertNotNil(result.receipt)
         XCTAssertFalse(
-            reopened.configuredZoneIsTerminal(fixture.adapter.recordZoneID)
+            try reopened.configuredZoneIsTerminal(fixture.adapter.recordZoneID)
         )
         XCTAssertNil(
             fixture.targetRealm.object(
@@ -18076,7 +18080,7 @@ final class BigSyncKitTests: XCTestCase {
 
             XCTAssertNotNil(result.receipt, phase)
             XCTAssertFalse(
-                reopened.configuredZoneIsTerminal(fixture.adapter.recordZoneID),
+                try reopened.configuredZoneIsTerminal(fixture.adapter.recordZoneID),
                 phase
             )
             let finalEnvelope = try XCTUnwrap(store.object(forKey: entry.key) as? [String: Any])
@@ -18128,7 +18132,7 @@ final class BigSyncKitTests: XCTestCase {
             let result = try await synchronizer.synchronize()
             XCTAssertNotNil(result.receipt, "reset \(resetIndex)")
             XCTAssertFalse(
-                synchronizer.configuredZoneIsTerminal(fixture.adapter.recordZoneID),
+                try synchronizer.configuredZoneIsTerminal(fixture.adapter.recordZoneID),
                 "reset \(resetIndex)"
             )
         }

@@ -1,9 +1,184 @@
 import CloudKit
 import Darwin
 import Foundation
+import RealmSwift
 import RealmSwiftGaps
 import XCTest
 @testable import BigSyncKit
+
+@objc(BigSyncMetadataExecutionMutation)
+private final class MetadataExecutionMutation: Object, ChangeMetadataRecordable {
+    @Persisted(primaryKey: true) var id = "value"
+    @Persisted var value = "original"
+    @Persisted var createdAt = Date()
+    @Persisted var modifiedAt = Date()
+    @Persisted var explicitlyModifiedAt: Date?
+    @Persisted var isDeleted = false
+    override class func shouldIncludeInDefaultSchema() -> Bool { false }
+}
+
+final class BigSyncMetadataExecutionTests: XCTestCase {
+    private final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var expired = false
+        var released = false
+        var checks = 0
+        func expire() { lock.withLock { expired = true } }
+        var lease: RealmWriteExecutionLease {
+            .init(checkpoint: { [self] in
+                try lock.withLock {
+                    checks += 1
+                    if expired { throw CancellationError() }
+                }
+            }, installInterruptionHandler: { _ in }, release: { [self] in
+                lock.withLock { released = true }
+            })
+        }
+    }
+
+    private func withRoot(_ body: (URL) throws -> Void) throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BigSyncMetadataExecution-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try body(root)
+    }
+
+    func testDeniedFileStoreReadAndWriteAreRetryableAndDoNotRetainLocks() throws {
+        try withRoot { root in
+            let url = root.appendingPathComponent("state.plist")
+            let store = FileKeyValueStore(fileURL: url)
+            try store.setDurably(value: "old", forKey: "value")
+            try RealmWriteExecutionProtection.$synchronousAcquisition.withValue({ throw CancellationError() }) {
+                XCTAssertThrowsError(try store.durableObject(forKey: "value")) { XCTAssertTrue($0 is CancellationError) }
+                XCTAssertThrowsError(try store.setDurably(value: "denied", forKey: "value")) { XCTAssertTrue($0 is CancellationError) }
+            }
+            XCTAssertEqual(try store.durableObject(forKey: "value") as? String, "old")
+            try store.setDurably(value: "retry", forKey: "value")
+            XCTAssertEqual(try store.durableObject(forKey: "value") as? String, "retry")
+            try store.validateDurability()
+        }
+    }
+
+    func testExpirationBeforeAtomicPublicationPreservesOldValueAndAllowsRetry() throws {
+        try withRoot { root in
+            let url = root.appendingPathComponent("state.plist")
+            try FileKeyValueStore(fileURL: url).setDurably(value: "old", forKey: "value")
+            let state = State()
+            let store = FileKeyValueStore(fileURL: url, beforeAtomicReplace: { state.expire() })
+            try RealmWriteExecutionProtection.$synchronousAcquisition.withValue({ state.lease }) {
+                XCTAssertThrowsError(try store.setDurably(value: "cancelled", forKey: "value")) {
+                    XCTAssertTrue($0 is CancellationError)
+                }
+            }
+            XCTAssertTrue(state.lock.withLock { state.released })
+            XCTAssertEqual(try store.durableObject(forKey: "value") as? String, "old")
+            try store.setDurably(value: "retry", forKey: "value")
+            XCTAssertEqual(try store.durableObject(forKey: "value") as? String, "retry")
+            XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains { $0.hasSuffix(".tmp") })
+        }
+    }
+
+    func testStoreReleasesExecutionOnlyAfterFileLockIsReleased() throws {
+        try withRoot { root in
+            let url = root.appendingPathComponent("state.plist")
+            let store = FileKeyValueStore(fileURL: url, beforeAtomicReplace: {})
+            let peer = Darwin.open(url.appendingPathExtension("lock").path, O_RDWR)
+            guard peer >= 0 else { throw POSIXError(.EIO) }
+            defer { Darwin.close(peer) }
+            let state = State()
+            let lease = RealmWriteExecutionLease(checkpoint: state.lease.checkpoint,
+                installInterruptionHandler: { _ in }, release: {
+                    XCTAssertEqual(bigSyncFlock(peer, LOCK_EX | LOCK_NB), 0)
+                    _ = bigSyncFlock(peer, LOCK_UN)
+                    state.lease.release()
+                })
+            try RealmWriteExecutionProtection.$synchronousAcquisition.withValue({ lease }) {
+                try store.setDurably(value: "saved", forKey: "value")
+            }
+            XCTAssertTrue(state.lock.withLock { state.released })
+        }
+    }
+
+    func testContentionCanBeInterruptedWithoutUnlockingPeerOrPoisoningStore() throws {
+        try withRoot { root in
+            let url = root.appendingPathComponent("state.plist")
+            let store = FileKeyValueStore(fileURL: url)
+            try store.setDurably(value: "old", forKey: "value")
+            let peer = Darwin.open(url.appendingPathExtension("lock").path, O_RDWR)
+            guard peer >= 0 else { throw POSIXError(.EIO) }
+            defer { Darwin.close(peer) }
+            XCTAssertEqual(bigSyncFlock(peer, LOCK_EX | LOCK_NB), 0)
+            let state = State()
+            let lease = RealmWriteExecutionLease(checkpoint: {
+                try state.lock.withLock {
+                    state.checks += 1
+                    if state.checks >= 3 { throw CancellationError() }
+                }
+            }, installInterruptionHandler: { _ in }, release: state.lease.release)
+            try RealmWriteExecutionProtection.$synchronousAcquisition.withValue({ lease }) {
+                XCTAssertThrowsError(try store.setDurably(value: "blocked", forKey: "value")) {
+                    XCTAssertTrue($0 is CancellationError)
+                }
+            }
+            XCTAssertTrue(state.lock.withLock { state.released })
+            let probe = Darwin.open(url.appendingPathExtension("lock").path, O_RDWR)
+            guard probe >= 0 else { throw POSIXError(.EIO) }
+            defer { Darwin.close(probe) }
+            XCTAssertEqual(bigSyncFlock(probe, LOCK_EX | LOCK_NB), -1)
+            XCTAssertTrue(errno == EWOULDBLOCK || errno == EAGAIN)
+            XCTAssertEqual(bigSyncFlock(peer, LOCK_UN), 0)
+            try store.setDurably(value: "retry", forKey: "value")
+            XCTAssertEqual(try store.durableObject(forKey: "value") as? String, "retry")
+        }
+    }
+
+    func testDeniedBackupDetectionDoesNotPublishStateAndAllowsRetry() throws {
+        try withRoot { root in
+            let sentinel = root.appendingPathComponent("sentinel")
+            let store = FileKeyValueStore(fileURL: root.appendingPathComponent("state.plist"))
+            try RealmWriteExecutionProtection.$synchronousAcquisition.withValue({ throw CancellationError() }) {
+                XCTAssertThrowsError(try BackupDetection.run(store: store, namespace: "metadata-test", sentinelURL: sentinel)) {
+                    XCTAssertTrue($0 is CancellationError)
+                }
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+            XCTAssertEqual(try BackupDetection.run(store: store, namespace: "metadata-test", sentinelURL: sentinel), .firstRun)
+        }
+    }
+
+    func testDeniedMutationIdentityReadRollsBackDomainAndJournalAndAllowsRetry() throws {
+        try withRoot { root in
+            let identity = BigSyncClientIdentity(synchronizerName: "metadata-rollback", containerName: "iCloud.test",
+                recordZoneID: .init(zoneName: "isolated"), sharedStateBaseURL: root)
+            _ = try identity.prepareReplicaBindingGenerationIdentifier()
+            let provider = identity.makeThrowingMutationJournalIdentityProvider()
+            var configuration = Realm.Configuration()
+            configuration.inMemoryIdentifier = UUID().uuidString
+            configuration.objectTypes = [MetadataExecutionMutation.self, BigSyncPendingMutation.self]
+            BigSyncMutationPolicy(excludedClassNames: []).install(configurations: [configuration], mutationJournalIdentityProvider: provider)
+            let realm = try Realm(configuration: configuration)
+            try RealmWriteExecutionProtection.$synchronousAcquisition.withValue({ throw CancellationError() }) {
+                XCTAssertThrowsError(try realm.write {
+                    let object = MetadataExecutionMutation()
+                    realm.add(object)
+                    object.value = "denied"
+                    try object.refreshChangeMetadataThrowing(explicitlyModified: true)
+                }) { XCTAssertTrue($0 is CancellationError) }
+            }
+            XCTAssertEqual(realm.objects(MetadataExecutionMutation.self).count, 0)
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 0)
+            try realm.write {
+                let object = MetadataExecutionMutation()
+                realm.add(object)
+                object.value = "saved"
+                try object.refreshChangeMetadataThrowing(explicitlyModified: true)
+            }
+            XCTAssertEqual(realm.objects(MetadataExecutionMutation.self).first?.value, "saved")
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+        }
+    }
+}
 
 final class InjectedBindingStoreIdentityTests: XCTestCase {
     func testInjectedStoreIsTheOnlyPreparedBindingStore() throws {

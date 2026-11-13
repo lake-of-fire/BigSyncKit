@@ -258,7 +258,7 @@ extension RealmSwiftAdapter {
                         return state == .new || state == .changed || state == .deletedLocally
                     }
                     if hasCommittedLocalWork {
-                        (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
+                        try (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
                         mutation = target.object(ofType: BigSyncPendingMutation.self, forPrimaryKey: name)
                     }
                 }

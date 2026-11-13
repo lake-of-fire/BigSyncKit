@@ -426,7 +426,7 @@ struct BigSyncRecordEvidenceStore {
         values[key.name] = uuid
         values["isDeleted"] = false
         let copy = realm.create(type, value: values)
-        (copy as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
+        try (copy as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
     }
 }
 

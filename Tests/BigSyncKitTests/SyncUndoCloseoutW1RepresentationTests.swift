@@ -540,14 +540,14 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertEqual(reopened.objects(BigSyncRecordBaseline.self).first?.revision, fence)
         let newObject = try XCTUnwrap(restarted.decodedComparisonObject(oldRecord, type: W1ContractNote.self) as? W1ContractNote)
         newObject.id = noteID
-        try reopened.write { reopened.add(newObject); newObject.journalCurrentValuePreservingChangeMetadata(at: Date()) }
+        try reopened.write { reopened.add(newObject); try newObject.journalCurrentValuePreservingChangeMetadata(at: Date()) }
         try await restarted.didFinishImport()
         let current = try await restarted.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
         XCTAssertEqual(current.first?.comparisonBase?.fields, old.first?.comparisonBase?.fields)
         XCTAssertNotEqual(current.first?.comparisonBase?.submissionIdentity, old.first?.comparisonBase?.submissionIdentity)
         try await restarted.didUpload(savedRecords: current.map(\.record), matchingPreparedUploads: current)
         let acceptedRevision = reopened.objects(BigSyncRecordBaseline.self).first?.revision
-        try reopened.write { newObject.journalCurrentValuePreservingChangeMetadata(at: Date()) }
+        try reopened.write { try newObject.journalCurrentValuePreservingChangeMetadata(at: Date()) }
         try await restarted.didFinishImport()
         let latest = try await restarted.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
         let latestIdentity = reopened.objects(BigSyncRecordSubmission.self).first?.candidateIdentity
