@@ -23,7 +23,7 @@ public extension ChangeMetadataRecordable {
         modifiedAt = timestamp
         if explicitlyModified {
             explicitlyModifiedAt = timestamp
-            recordBigSyncMutation(at: timestamp)
+            recordBigSyncMutation(at: timestamp, isExplicitLocalMutation: true)
         }
     }
 
@@ -37,7 +37,7 @@ public extension ChangeMetadataRecordable {
         modifiedAt = timestamp
         if explicitlyModified {
             explicitlyModifiedAt = timestamp
-            recordBigSyncMutation(at: timestamp, preparedWrite: preparedWrite)
+            recordBigSyncMutation(at: timestamp, isExplicitLocalMutation: true, preparedWrite: preparedWrite)
         }
     }
 
@@ -46,11 +46,12 @@ public extension ChangeMetadataRecordable {
     /// edit clock. Custom delegates that mutate the object continue to use the
     /// ordinary explicit refresh path in RealmSwiftAdapter.
     internal func journalCurrentValuePreservingChangeMetadata(at timestamp: Date) {
-        recordBigSyncMutation(at: timestamp)
+        recordBigSyncMutation(at: timestamp, isExplicitLocalMutation: false)
     }
 
     private func recordBigSyncMutation(
         at timestamp: Date,
+        isExplicitLocalMutation: Bool,
         preparedWrite: BigSyncMutationTracking.PreparedWrite? = nil
     ) {
         guard let object = self as? Object else {
@@ -112,6 +113,13 @@ public extension ChangeMetadataRecordable {
             usingPrimaryKey: primaryKey
         )
         let recordName = entityType + "." + objectIdentifier
+        let existingMutation = realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        )
+        // Discovery/retransmission cannot adopt retained debt as current intent.
+        // Only the public explicit-refresh routes can author its successor.
+        guard existingMutation?.requiresReplicaBindingRecovery != true
+            || isExplicitLocalMutation else { return }
         if isDeleted && !BigSyncRecordLifecycle.retainsTombstone(type(of: object)) {
             // Resurrection must not compare against a pre-deletion lifetime.
             BigSyncRecordBaseline.invalidate(recordName: recordName, in: realm)
@@ -127,10 +135,7 @@ public extension ChangeMetadataRecordable {
         let replicaBindingGenerationIdentifier =
             mutationGeneration.replicaBindingGenerationIdentifier
 
-        let mutation = realm.object(
-            ofType: BigSyncPendingMutation.self,
-            forPrimaryKey: recordName
-        ) ?? BigSyncPendingMutation(
+        let mutation = existingMutation ?? BigSyncPendingMutation(
             recordName: recordName,
             entityType: entityType,
             objectIdentifier: objectIdentifier,
@@ -145,7 +150,14 @@ public extension ChangeMetadataRecordable {
                 "BigSync account scope changed for immutable record \(recordName)"
             )
         }
-        if let accountScopeIdentifier {
+        if isExplicitLocalMutation && mutation.requiresReplicaBindingRecovery {
+            // This replaces the old generation with an actually authored value;
+            // it does not make the retained generation eligible or reuse its
+            // transport attribution. A declared immutable account still had to
+            // match above. An explicitly unscoped model takes nil from policy.
+            mutation.accountScopeIdentifier = accountScopeIdentifier
+            mutation.requiresReplicaBindingRecovery = false
+        } else if let accountScopeIdentifier {
             mutation.accountScopeIdentifier = accountScopeIdentifier
         }
         mutation.replicaBindingGenerationIdentifier =

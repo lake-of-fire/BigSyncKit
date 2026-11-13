@@ -73,8 +73,30 @@ public final class BigSyncPendingMutation: Object {
     /// work prepared for an older remote replica.
     @Persisted(indexed: true)
     public var replicaBindingGenerationIdentifier: String?
+    /// Retained legacy debt must not become uploadable merely because the
+    /// active account or binding later matches its copied attribution.
+    @Persisted(indexed: true) public var requiresReplicaBindingRecovery = false
     @Persisted public var generation = ""
     @Persisted public var changedAt = Date()
+
+    /// Called only by the owning target Realm's legacy bridge migration.
+    /// Recompute the historical inverted flag from attribution without
+    /// rewriting the original generation, timestamps or account/binding.
+    public static func quarantineLegacyReplicaBoundRows(migration: Migration) {
+        migration.enumerateObjects(ofType: className()) { oldObject, newObject in
+            guard let oldObject, let newObject,
+                  newObject.objectSchema.properties.contains(where: {
+                      $0.name == "requiresReplicaBindingRecovery"
+                  }) else { return }
+            func hasAttribution(_ property: String) -> Bool {
+                oldObject.objectSchema.properties.contains { $0.name == property }
+                    && oldObject[property] as? String != nil
+            }
+            newObject["requiresReplicaBindingRecovery"] =
+                hasAttribution("accountScopeIdentifier")
+                || hasAttribution("replicaBindingGenerationIdentifier")
+        }
+    }
 
     public convenience init(
         recordName: String,
@@ -99,7 +121,13 @@ public final class BigSyncPendingMutation: Object {
 
 /// One policy value shared by Realm configuration construction and the sync
 /// worker, preventing their exclusion lists from drifting apart.
+public enum BigSyncRecordEvidenceUse: Sendable, Equatable {
+    case legacyAutomatic
+    case retentionOnly
+}
+
 public struct BigSyncMutationPolicy: Sendable, Equatable {
+    public let recordEvidenceUse: BigSyncRecordEvidenceUse
     public let excludedClassNames: [String]
     /// Maps a synchronized Realm class name to its immutable CloudKit account
     /// scope property. The same map is installed for local journaling and
@@ -108,8 +136,10 @@ public struct BigSyncMutationPolicy: Sendable, Equatable {
 
     public init(
         excludedClassNames: [String],
-        accountScopePropertyByClassName: [String: String] = [:]
+        accountScopePropertyByClassName: [String: String] = [:],
+        recordEvidenceUse: BigSyncRecordEvidenceUse = .legacyAutomatic
     ) {
+        self.recordEvidenceUse = recordEvidenceUse
         self.excludedClassNames = Array(Set(excludedClassNames)).sorted()
         precondition(
             accountScopePropertyByClassName.allSatisfy {
@@ -153,6 +183,7 @@ public struct BigSyncMutationPolicy: Sendable, Equatable {
         BigSyncMutationTracking.install(
             configurations: configurations,
             excludedClassNames: excludedClassNames,
+            recordEvidenceUse: recordEvidenceUse,
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName,
             installationIdentifierProvider:
@@ -172,6 +203,7 @@ struct BigSyncPendingMutationSnapshot: Sendable {
     let objectIdentifier: String
     let accountScopeIdentifier: String?
     let replicaBindingGenerationIdentifier: String?
+    let requiresReplicaBindingRecovery: Bool
     let generation: String
     let changedAt: Date
     let isDeletion: Bool
@@ -181,6 +213,7 @@ enum BigSyncMutationTrackingRegistry {
     private static let lock = NSLock()
     private struct Registration {
         let classNames: Set<String>
+        let recordEvidenceUse: BigSyncRecordEvidenceUse
         let accountScopePropertyByClassName: [String: String]
         var installationIdentifierProvider: (@Sendable () -> String?)?
         var mutationJournalIdentityProvider:
@@ -201,6 +234,7 @@ enum BigSyncMutationTrackingRegistry {
     static func register(
         configurations: [Realm.Configuration],
         excluding excludedClassNames: Set<String>,
+        recordEvidenceUse: BigSyncRecordEvidenceUse = .legacyAutomatic,
         accountScopePropertyByClassName: [String: String],
         installationIdentifierProvider: (@Sendable () -> String?)?,
         mutationJournalIdentityProvider:
@@ -215,6 +249,8 @@ enum BigSyncMutationTrackingRegistry {
                 )
                 let realmIdentity = identity(for: configuration)
                 if var registration = registrationsByRealm[realmIdentity] {
+                    precondition(registration.recordEvidenceUse == recordEvidenceUse,
+                        "Conflicting BigSync comparison-evidence policies registered for \(realmIdentity)")
                     precondition(
                         registration.classNames == classNames,
                         "Conflicting BigSync mutation policies registered for \(realmIdentity)"
@@ -238,6 +274,7 @@ enum BigSyncMutationTrackingRegistry {
                 } else {
                     registrationsByRealm[realmIdentity] = Registration(
                         classNames: classNames,
+                        recordEvidenceUse: recordEvidenceUse,
                         accountScopePropertyByClassName:
                             accountScopePropertyByClassName,
                         installationIdentifierProvider:
@@ -248,6 +285,10 @@ enum BigSyncMutationTrackingRegistry {
                 }
             }
         }
+    }
+
+    static func recordEvidenceUse(for configuration: Realm.Configuration) -> BigSyncRecordEvidenceUse {
+        lock.withLock { registrationsByRealm[identity(for: configuration)]?.recordEvidenceUse ?? .legacyAutomatic }
     }
 
     enum TrackingStatus {
@@ -520,6 +561,7 @@ public enum BigSyncMutationTracking {
     public static func install(
         configurations: [Realm.Configuration],
         excludedClassNames: [String],
+        recordEvidenceUse: BigSyncRecordEvidenceUse = .legacyAutomatic,
         accountScopePropertyByClassName: [String: String] = [:],
         installationIdentifier: String? = nil,
         installationIdentifierProvider:
@@ -545,6 +587,7 @@ public enum BigSyncMutationTracking {
             excluding: Set(
                 excludedClassNames + BigSyncLocalRecordEvidence.classNames
             ),
+            recordEvidenceUse: recordEvidenceUse,
             accountScopePropertyByClassName:
                 accountScopePropertyByClassName,
             installationIdentifierProvider:
@@ -605,7 +648,8 @@ public enum BigSyncMutationTracking {
             guard let mutation = realm.object(
                 ofType: BigSyncPendingMutation.self,
                 forPrimaryKey: recordName
-            ), mutation.entityType == entityType,
+            ), !mutation.requiresReplicaBindingRecovery,
+               mutation.entityType == entityType,
                mutation.objectIdentifier == objectIdentifier,
                mutation.replicaBindingGenerationIdentifier
                 == identity.replicaBindingGenerationIdentifier,

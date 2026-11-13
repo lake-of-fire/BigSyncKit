@@ -133,6 +133,7 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     @BigSyncBackgroundActor
     func fixture(
         enableRecordRebasing: Bool = true,
+        recordEvidenceUse: BigSyncRecordEvidenceUse = .legacyAutomatic,
         replicaBindingGenerationIdentifier: String? = "w1-binding",
         accountScopePropertyByClassName: [String: String] = [:]
     ) async throws -> (RealmSwiftAdapter, Realm) {
@@ -147,7 +148,8 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
             BigSyncMutationPolicy.enableRecordRebasing(in: &target)
         }
         BigSyncMutationPolicy(excludedClassNames: [],
-            accountScopePropertyByClassName: accountScopePropertyByClassName
+            accountScopePropertyByClassName: accountScopePropertyByClassName,
+            recordEvidenceUse: recordEvidenceUse
         ).install(configurations: [target],
             mutationJournalIdentityProvider: {
                 .init(installationIdentifier: "w1-local",
@@ -465,8 +467,10 @@ final class SyncUndoCloseoutW1Tests: XCTestCase {
     func initialImportNote(priorPending: Bool,
         mode: ChangeFeedResetMode = .initialImport,
         priorBinding: String = "w1-binding",
-        enableRecordRebasing: Bool = true) async throws -> (RealmSwiftAdapter, Realm) {
-        let (adapter, realm) = try await fixture(enableRecordRebasing: enableRecordRebasing)
+        enableRecordRebasing: Bool = true,
+        recordEvidenceUse: BigSyncRecordEvidenceUse = .legacyAutomatic) async throws -> (RealmSwiftAdapter, Realm) {
+        let (adapter, realm) = try await fixture(enableRecordRebasing: enableRecordRebasing,
+            recordEvidenceUse: recordEvidenceUse)
         let object = W1ContractNote()
         object.id = noteID
         object.text = "legacy-local-note"

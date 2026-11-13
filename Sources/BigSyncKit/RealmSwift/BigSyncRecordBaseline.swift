@@ -47,6 +47,7 @@ public protocol BigSyncRecordRebasePolicyProviding {
 }
 
 public enum BigSyncRecordRebaseError: Error {
+    case retentionOnly
     case unsupportedField(String)
     case invalidPolicy
     case missingBaseline(String)
@@ -284,6 +285,9 @@ struct BigSyncRecordRebaseContext: Sendable, Equatable {
     }
 
     func validate(in realm: Realm) throws {
+        guard BigSyncMutationTrackingRegistry.recordEvidenceUse(for: realm.configuration) == .legacyAutomatic else {
+            throw BigSyncRecordRebaseError.retentionOnly
+        }
         guard let identity = BigSyncMutationTracking.currentJournalIdentity(
             verifyingPendingMutationsFor: [Object](), in: realm
         ), identity.replicaBindingGenerationIdentifier == binding else {
@@ -327,7 +331,8 @@ extension BigSyncRecordBaseline {
     static func isEnabled(in configuration: Realm.Configuration) -> Bool {
         // Merely linking BigSyncKit can make the table visible to Realm's
         // automatic schema discovery. That is not consent to change merging.
-        configuration.objectTypes?.contains { $0.className() == className() } == true
+        BigSyncMutationTrackingRegistry.recordEvidenceUse(for: configuration) == .legacyAutomatic
+            && configuration.objectTypes?.contains { $0.className() == className() } == true
     }
 
     @discardableResult
@@ -336,6 +341,7 @@ extension BigSyncRecordBaseline {
                         schemaSignature: String = "", systemFields: Data? = nil,
                         acceptedRevision: String? = nil, in realm: Realm) -> Bool {
         precondition(realm.isInWriteTransaction)
+        guard BigSyncMutationTrackingRegistry.recordEvidenceUse(for: realm.configuration) != .retentionOnly else { return false }
         let existing = realm.object(ofType: Self.self, forPrimaryKey: recordName)
         if existing?.isComparisonInvalidated == false, existing?.namespace == namespace,
            existing?.fieldDigests == fields, existing?.serverChangeTag == serverChangeTag,

@@ -50,7 +50,8 @@ extension RealmSwiftAdapter {
             return (entityType, type)
         }
         func eligible(_ mutation: BigSyncPendingMutation, entityType: String) -> Bool {
-            mutation.entityType == entityType
+            !mutation.requiresReplicaBindingRecovery
+                && mutation.entityType == entityType
                 && mutation.replicaBindingGenerationIdentifier == context.binding
                 && (accountScopePropertyByClassName[entityType] == nil
                     || mutation.accountScopeIdentifier == context.account)
