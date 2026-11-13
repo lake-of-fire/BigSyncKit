@@ -155,7 +155,6 @@ final class SyncConflictFailureCompositionTests: XCTestCase {
             CKError(.serverRecordChanged, userInfo: [NSUnderlyingErrorKey: "malformed"])))
     }
 
-<<<<<<< HEAD
     func testConflictRetryPolicyRejectsUnexpectedItemPayloadsAtEveryDepth() {
         let payloads: [Any] = [
             ["record": CKError(.notAuthenticated)],
@@ -177,8 +176,6 @@ final class SyncConflictFailureCompositionTests: XCTestCase {
         }
     }
 
-=======
->>>>>>> 6c88ba3d3d000ab82fa424c5b0fe6697d013bc92
     func testConflictRetryPolicyRetainsBoundedPureTreeProofAndSizePolicy() {
         var nested = CKError(.serverRecordChanged) as NSError
         for _ in 0..<40 {

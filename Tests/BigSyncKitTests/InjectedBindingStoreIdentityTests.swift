@@ -5,7 +5,6 @@ import XCTest
 @testable import BigSyncKit
 
 final class InjectedBindingStoreIdentityTests: XCTestCase {
-<<<<<<< HEAD
     func testCanceledPortDoesNotRevivePublicationAcrossPeerStoreABA() throws {
         try withResources { identity, store, root in
             _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
@@ -133,8 +132,6 @@ final class InjectedBindingStoreIdentityTests: XCTestCase {
         }
     }
 
-=======
->>>>>>> 6c88ba3d3d000ab82fa424c5b0fe6697d013bc92
     func testPublicationHoldsRealBindingFileGuardAndBorrowsJournalIdentity() throws {
         try withResources { identity, store, root in
             _ = try identity.prepareReplicaBindingGenerationIdentifier(store: store)
