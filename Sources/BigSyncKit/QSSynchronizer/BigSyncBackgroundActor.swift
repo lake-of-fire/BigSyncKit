@@ -605,25 +605,10 @@ public actor BigSyncBackgroundActor {
         cloudKitE2ELastRestoredPublicationEvidence = nil
 #endif
 
-        if let restorationHandler =
-            configuration.durablePublicationEvidenceHandler {
-            publicationRestorationDidSucceed = false
-            publicationRestorationOperation = { [weak self] in
-                try await synchronizer.restoreDurablePublicationEvidence(
-                    deliveringTo: { evidence in
-#if DEBUG
-                        await self?.recordRestoredPublicationEvidence(evidence)
-#endif
-                        try await restorationHandler(evidence)
-                    }
-                )
-            }
-            startPublicationRestorationIfNeeded()
-        } else {
-            publicationRestorationTask = nil
-            publicationRestorationOperation = nil
-            publicationRestorationDidSucceed = true
-        }
+        installPublicationRestoration(
+            for: synchronizer,
+            deliveringTo: configuration.durablePublicationEvidenceHandler
+        )
 
         (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
 
@@ -638,6 +623,32 @@ public actor BigSyncBackgroundActor {
                 return
             }
             _ = await self.synchronizeCloudKit(expectedSynchronizer: synchronizer)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func installPublicationRestoration(
+        for synchronizer: CloudKitSynchronizer,
+        deliveringTo restorationHandler: BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler?
+    ) {
+        if let restorationHandler {
+            publicationRestorationDidSucceed = false
+            publicationRestorationOperation = { [weak self] in
+                let delivered = try await synchronizer.restoreDurablePublicationEvidence(
+                    deliveringTo: { evidence in
+                        try await restorationHandler(evidence)
+#if DEBUG
+                        await self?.recordRestoredPublicationEvidence(evidence)
+#endif
+                    }
+                )
+                guard delivered else { throw CancellationError() }
+            }
+            startPublicationRestorationIfNeeded()
+        } else {
+            publicationRestorationTask = nil
+            publicationRestorationOperation = nil
+            publicationRestorationDidSucceed = true
         }
     }
 
@@ -656,6 +667,7 @@ public actor BigSyncBackgroundActor {
     public func awaitCloudKitE2EPublicationRestoration()
         async -> BigSyncDurablePublicationEvidence? {
         await publicationRestorationTask?.value
+        guard publicationRestorationDidSucceed else { return nil }
         return cloudKitE2ELastRestoredPublicationEvidence
     }
 #endif
@@ -1261,6 +1273,17 @@ public actor BigSyncBackgroundActor {
         publicationRestorationDidSucceed = true
         publicationRestorationOperation = nil
         publicationRestorationTask = task
+    }
+
+    @BigSyncBackgroundActor
+    func _test_installPublicationRestorationHandler(
+        _ handler: @escaping BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler
+    ) {
+        guard let realmSynchronizer else {
+            preconditionFailure("Install the test synchronizer before restoration")
+        }
+        precondition(publicationRestorationOperation == nil && publicationRestorationTask == nil)
+        installPublicationRestoration(for: realmSynchronizer, deliveringTo: handler)
     }
 
     @BigSyncBackgroundActor
