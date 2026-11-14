@@ -9,10 +9,13 @@ import XCTest
 // The fixture hook is nil by default and does not alter preceding tests.
 extension CloudKitSynchronizerAccountFencingTests {
     @BigSyncBackgroundActor
-    private func publicationTailFixture() async throws -> (CloudKitSynchronizer, AccountFencingModelAdapter) {
+    private func publicationTailFixture(
+        accountIdentifierProvider: @escaping CloudKitSynchronizer.AccountIdentifierProvider = { "account-a" }
+    ) async throws -> (CloudKitSynchronizer, AccountFencingModelAdapter) {
         let sync = makeSynchronizer(
             transport: AccountFencingTransport(), store: AccountFencingStore(),
             identifier: "publication-tail-\(UUID().uuidString)", recordZoneID: makeZoneID(),
+            accountIdentifierProvider: accountIdentifierProvider,
             accountReplacementPolicy: .localDatasetRebootstrap,
             initialReplicaBindingAdmissionHandler: { _ in })
         let adapter = AccountFencingModelAdapter(zoneID: sync.recordZoneID)
@@ -2958,7 +2961,8 @@ extension CloudKitSynchronizerAccountFencingTests {
         XCTAssertNotNil(newer.receipt)
         XCTAssertNotEqual(original.receipt?.runID, newer.receipt?.runID)
         await account.release.open()
-        try await inspection.value
+        let delivered = try await inspection.value
+        XCTAssertFalse(delivered)
         let count = await delivery.count
         XCTAssertEqual(count, 0, "Obsolete nil evidence must not discard a newer live completion")
         XCTAssertFalse(sync.synchronizationDrainIsActive)
@@ -2995,7 +2999,8 @@ extension CloudKitSynchronizerAccountFencingTests {
         XCTAssertNil(sync.activeRunContext)
         XCTAssertEqual(transport.databaseChangeFetchCount, before)
         await release.open()
-        try await restoration.value
+        let delivered = try await restoration.value
+        XCTAssertTrue(delivered)
         await fulfillment(of: [finished], timeout: 5)
         if sync.synchronizationDrainIsActive { sync.cancelSynchronization() }
         await replacement.value
@@ -3004,6 +3009,88 @@ extension CloudKitSynchronizerAccountFencingTests {
         XCTAssertEqual(count, 1)
         XCTAssertTrue(sawNil)
         await sync.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerRetriesRestorationSupersededDuringAccountInspection() async throws {
+        let entered = expectation(description: "worker restoration account inspection held")
+        let account = ClosureRestorationAccount(entered: entered)
+        let (sync, _) = try await publicationTailFixture(
+            accountIdentifierProvider: { await account.current() }
+        )
+        let worker = publicationRestorationWorker(for: sync)
+        let delivery = ClosureRestorationDelivery()
+        await account.arm()
+        worker._test_installPublicationRestorationHandler { evidence in
+            await delivery.receive(evidence)
+        }
+        addTeardownBlock { await account.release.open() }
+        await fulfillment(of: [entered], timeout: 5)
+        await worker.cancelSynchronization()
+        await account.release.open()
+        let interrupted = await worker.awaitCloudKitE2EPublicationRestoration()
+        XCTAssertNil(interrupted)
+        let beforeRetry = await delivery.count
+        XCTAssertEqual(beforeRetry, 0)
+
+        _ = await worker.synchronizeCloudKit()
+        let restored = await worker.awaitCloudKitE2EPublicationRestoration()
+        XCTAssertEqual(restored?.consumedServerBoundaryIdentifier, "publication-tail-boundary")
+        let afterRetry = await delivery.count
+        let sawNil = await delivery.sawNil
+        XCTAssertEqual(afterRetry, 1)
+        XCTAssertFalse(sawNil)
+
+        _ = await worker.synchronizeCloudKit()
+        let afterSuccess = await delivery.count
+        XCTAssertEqual(afterSuccess, 1, "Accepted restoration must not replay")
+    }
+
+    @BigSyncBackgroundActor
+    func testWorkerPublishesRestorationEvidenceOnlyAfterHandlerAcceptsIt() async throws {
+        let (sync, _) = try await publicationTailFixture()
+        let worker = publicationRestorationWorker(for: sync)
+        let acceptance = ClosureRestorationAcceptance()
+        worker._test_installPublicationRestorationHandler { evidence in
+            try await acceptance.receive(evidence)
+        }
+
+        let rejected = await worker.awaitCloudKitE2EPublicationRestoration()
+        XCTAssertNil(rejected, "Rejected evidence must not appear as restored success")
+        let rejectedAttempts = await acceptance.count
+        XCTAssertEqual(rejectedAttempts, 1)
+
+        _ = await worker.synchronizeCloudKit()
+        let accepted = await worker.awaitCloudKitE2EPublicationRestoration()
+        XCTAssertEqual(accepted?.consumedServerBoundaryIdentifier, "publication-tail-boundary")
+        let acceptedAttempts = await acceptance.count
+        XCTAssertEqual(acceptedAttempts, 2)
+
+        _ = await worker.synchronizeCloudKit()
+        let finalAttempts = await acceptance.count
+        XCTAssertEqual(finalAttempts, 2)
+    }
+
+    @BigSyncBackgroundActor
+    private func publicationRestorationWorker(for sync: CloudKitSynchronizer) -> BigSyncBackgroundActor {
+        let worker = BigSyncBackgroundActor(accountAvailabilityGate: CloudKitAccountAvailabilityGate(
+            statusProvider: { _ in .failed },
+            deadlineNanoseconds: 5_000_000_000
+        ))
+        worker._test_installSynchronizer(sync)
+        addTeardownBlock { @BigSyncBackgroundActor in
+            await worker.cancelSynchronization()
+        }
+        return worker
+    }
+}
+
+private actor ClosureRestorationAcceptance {
+    private(set) var count = 0
+    func receive(_ evidence: BigSyncDurablePublicationEvidence?) throws {
+        count += 1
+        XCTAssertNotNil(evidence)
+        if count == 1 { throw CancellationError() }
     }
 }
 
