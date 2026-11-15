@@ -94,19 +94,33 @@ final class BigSyncWriteExecutionState: @unchecked Sendable {
 /// retain it, and long-lived observation tasks inherit this acquisition policy
 /// rather than an assertion belonging to a retired synchronization attempt.
 public enum BigSyncDurableWriteExecution {
+#if os(iOS)
+    @MainActor private static var hasInstalledApplicationPolicy = false
+#endif
+
+    /// Reject storage admission before UIKit supplies a valid application.
+    @MainActor
+    public static func prepareApplicationPolicy() {
+#if os(iOS)
+        guard !hasInstalledApplicationPolicy else { return }
+        RealmWriteExecutionProtection.installDefaultSynchronousAcquisition {
+            throw CancellationError()
+        }
+#endif
+    }
     /// UIApplication's begin/end background-task APIs are explicitly
     /// nonisolated and thread-safe. Capture its singleton on MainActor once;
     /// subsequent acquisition/release must not hop there while a journal's
     /// caller holds an account/database fence.
+    #if os(iOS)
     @MainActor
-    public static func installApplicationPolicy() {
-#if os(iOS)
-        let application = UIApplication.shared
+    public static func installApplicationPolicy(application: UIApplication) {
+        hasInstalledApplicationPolicy = true
         RealmWriteExecutionProtection.installDefaultSynchronousAcquisition {
             try makeLease(application: application)
         }
-#endif
     }
+#endif
 
     public static func acquire() async throws -> RealmWriteExecutionLease {
         try Task.checkCancellation()
@@ -114,10 +128,8 @@ public enum BigSyncDurableWriteExecution {
             return lease
         }
 #if os(iOS)
-        return try await MainActor.run {
-            installApplicationPolicy()
-            return try makeLease(application: UIApplication.shared)
-        }
+        // App startup owns policy installation; acquisition cannot initialize UIKit.
+        throw CancellationError()
 #else
         return RealmWriteExecutionLease(
             checkpoint: { try Task.checkCancellation() },
