@@ -201,6 +201,8 @@ extension CloudKitSynchronizer {
             accountStatusProvider: accountStatusProvider,
             progressHandler: progressHandler,
             changeFeed: changeFeed ?? database,
+            subscriptionStore: changeFeed as? any CloudKitSubscriptionStore,
+            zoneStore: changeFeed as? any CloudKitZoneStore,
             recordStore: recordStore ?? database,
             backupDetectionBaseURL: backupDetectionBaseURL,
             initialReplicaBindingAdmissionHandler:
