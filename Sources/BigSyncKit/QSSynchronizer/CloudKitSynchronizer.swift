@@ -6,6 +6,8 @@
 //
 
 import Foundation
+import class OSLog.OSLog
+import func OSLog.os_log
 #if os(iOS)
 import UIKit
 #endif
@@ -14,6 +16,10 @@ import CryptoKit
 import Logging
 import RealmSwiftGaps
 import SwiftUtilities
+
+private let bigSyncExecutionDiagnosticLog = OSLog(
+    subsystem: "io.manabi.ManabiReader", category: "DurableExecution"
+)
 
 /// Owns only execution-lease state, never account or Realm publication state.
 /// Expiration signals the exact queued write rather than cancelling whichever
@@ -34,8 +40,14 @@ final class BigSyncWriteExecutionState: @unchecked Sendable {
     }
 
     func checkpoint() throws {
-        let denied = lock.withLock { interrupted || released }
-        if denied { throw CancellationError() }
+        let denial = lock.withLock { (interrupted: interrupted, released: released) }
+        if denial.interrupted || denial.released {
+            os_log(.error, log: bigSyncExecutionDiagnosticLog,
+                   "operation=durable-execution.checkpoint interrupted=%{public}@ released=%{public}@ taskIsCancelled=%{public}@",
+                   denial.interrupted ? "true" : "false", denial.released ? "true" : "false",
+                   Task.isCancelled ? "true" : "false")
+            throw CancellationError()
+        }
     }
 
     func interrupt() {
@@ -126,7 +138,12 @@ public enum BigSyncDurableWriteExecution {
         ) {
             state.interrupt()
         }
-        guard identifier != .invalid else { throw CancellationError() }
+        guard identifier != .invalid else {
+            os_log(.error, log: bigSyncExecutionDiagnosticLog,
+                   "operation=durable-execution.acquire backgroundTaskIdentifierInvalid=true taskIsCancelled=%{public}@",
+                   Task.isCancelled ? "true" : "false")
+            throw CancellationError()
+        }
         state.installReleaseHandler { application.endBackgroundTask(identifier) }
         do {
             try state.checkpoint()

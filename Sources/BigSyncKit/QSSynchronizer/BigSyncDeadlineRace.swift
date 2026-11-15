@@ -3,22 +3,23 @@ import Dispatch
 /// One request's result race, not ownership of the shared synchronization.
 /// The timer wakes a waiter; the immutable monotonic deadline decides whether
 /// a completion can win. Scheduling the timer late never renews the budget.
-actor BigSyncDeadlineRace<Value: Sendable> {
-    enum Outcome: Sendable {
+@_spi(ReaderLifecycle)
+public actor BigSyncDeadlineRace<Value: Sendable> {
+    public enum Outcome: Sendable {
         case completed(Value)
         case timedOut
         case cancelled
     }
 
-    typealias Now = @Sendable () -> UInt64
-    typealias Sleep = @Sendable (UInt64) async throws -> Void
+    public typealias Now = @Sendable () -> UInt64
+    public typealias Sleep = @Sendable (UInt64) async throws -> Void
 
     private let deadline: UInt64
     private let now: Now
     private var outcome: Outcome?
     private var continuation: CheckedContinuation<Outcome, Never>?
 
-    init(
+    public init(
         durationNanoseconds: UInt64,
         now: @escaping Now = { DispatchTime.now().uptimeNanoseconds }
     ) {
@@ -30,7 +31,7 @@ actor BigSyncDeadlineRace<Value: Sendable> {
     /// Preserve a cutoff captured by a caller before logging, actor hops or
     /// earlier attempts. This is DispatchTime uptime within the same process;
     /// never pass wall-clock nanoseconds or persist/reuse it after relaunch.
-    init(
+    public init(
         untilUptimeNanoseconds deadline: UInt64,
         now: @escaping Now = { DispatchTime.now().uptimeNanoseconds }
     ) {
@@ -40,13 +41,13 @@ actor BigSyncDeadlineRace<Value: Sendable> {
 
     /// Safe on the worker actor before any admission side effect. This only
     /// inspects immutable timing inputs, never actor-owned result state.
-    nonisolated var remainingNanoseconds: UInt64 {
+    public nonisolated var remainingNanoseconds: UInt64 {
         let instant = now()
         return instant < deadline ? deadline - instant : 0
     }
 
     @discardableResult
-    func resolve(_ proposed: Outcome) -> Bool {
+    public func resolve(_ proposed: Outcome) -> Bool {
         guard outcome == nil else { return false }
         let accepted: Outcome
         switch proposed {
@@ -65,7 +66,7 @@ actor BigSyncDeadlineRace<Value: Sendable> {
         return true
     }
 
-    func value() async -> Outcome {
+    public func value() async -> Outcome {
         if let outcome { return outcome }
         precondition(continuation == nil, "A deadline race has one request waiter")
         return await withCheckedContinuation { continuation in
@@ -75,7 +76,7 @@ actor BigSyncDeadlineRace<Value: Sendable> {
 
     /// All sleeps consume the same absolute budget, including a delayed start
     /// or early wake. Cancellation of this timer is not deadline expiration.
-    nonisolated func waitUntilDeadline(
+    public nonisolated func waitUntilDeadline(
         sleep: Sleep = { try await Task.sleep(nanoseconds: $0) }
     ) async {
         while !Task.isCancelled {
