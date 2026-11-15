@@ -185,10 +185,26 @@ extension CloudKitSynchronizer {
             startSetupTask: false,
             logger: logger
         )
+        let database: any CloudKitDatabaseAdapter & CloudKitChangeFeed
+            & CloudKitRecordStore & CloudKitSubscriptionStore & CloudKitZoneStore
+#if DEBUG
+        // An entirely injected offline E2E transport must not instantiate a
+        // CKContainer in a host that deliberately has no CloudKit entitlement.
+        // Require all transport and account surfaces plus isolated persistence;
+        // partial injection retains the ordinary CloudKit construction path.
+        if localState != nil, accountIdentifierProvider != nil,
+           accountStatusProvider != nil, recordStore != nil,
+           let injected = changeFeed as? (any CloudKitDatabaseAdapter & CloudKitChangeFeed
+                & CloudKitRecordStore & CloudKitSubscriptionStore & CloudKitZoneStore) {
+            database = injected
+        } else {
+            let container = CKContainer(identifier: containerName)
+            database = DefaultCloudKitDatabaseAdapter(database: container.privateCloudDatabase)
+        }
+#else
         let container = CKContainer(identifier: containerName)
-        let database = DefaultCloudKitDatabaseAdapter(
-            database: container.privateCloudDatabase
-        )
+        database = DefaultCloudKitDatabaseAdapter(database: container.privateCloudDatabase)
+#endif
         let synchronizer = CloudKitSynchronizer(
             identifier: synchronizerName,
             containerIdentifier: containerName,
