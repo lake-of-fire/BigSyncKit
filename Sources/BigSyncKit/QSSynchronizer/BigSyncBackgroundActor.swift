@@ -854,6 +854,20 @@ public actor BigSyncBackgroundActor {
         }
     }
 
+    /// Preserve the lifecycle caller’s original budget across launch preparation.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func synchronizeCloudKit(
+        untilUptimeNanoseconds deadline: UInt64
+    ) async -> CloudKitSynchronizer.SynchronizationResult? {
+        switch await synchronizationDeadlineOutcome(BigSyncSynchronizationDeadline(
+            untilUptimeNanoseconds: deadline
+        )) {
+        case .completed(let result): return result
+        case .timedOut, .cancelled: return nil
+        }
+    }
+
 #if DEBUG
     /// Duration compatibility entry: its budget starts on this worker actor.
     /// A caller with an existing cutoff must use the uptime overload below.

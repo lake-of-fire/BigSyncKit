@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@_spi(CloudKitE2E) @testable import BigSyncKit
+@_spi(ReaderLifecycle) @_spi(CloudKitE2E) @testable import BigSyncKit
 
 // Only the dedicated dependency-free deadline runner sets this flag. Normal
 // Apple package and assembled Reader tests always compile the real worker tests.
