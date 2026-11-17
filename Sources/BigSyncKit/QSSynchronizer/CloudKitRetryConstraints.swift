@@ -178,6 +178,36 @@ public enum BigSyncCloudKitRetryPolicy {
             && CloudKitRetryConstraints.isFailureTree(
                 error, allowing: [.unknownItem], allowingDirectMissingRecordDetail: true)
     }
+
+    /// Either a direct miss or a single item result for the requested subscription
+    /// can prove absence. Other item keys and independent failures cannot.
+    static func allowsMissingSubscriptionAsAbsence(
+        _ error: Error, identifier: CKSubscription.ID
+    ) -> Bool {
+        guard let cloudError = error as? CKError else { return false }
+        let itemError: Error
+        if cloudError.code == .partialFailure {
+            let info = cloudError.userInfo
+            let partial = cloudKitPartialErrors(in: info)
+            let underlying = cloudKitUnderlyingErrors(in: info)
+            guard partial.isComplete, partial.entries.count == 1,
+                  let item = partial.entries.first,
+                  let itemID = item.key as? CKSubscription.ID, itemID == identifier,
+                  underlying.isComplete, underlying.errors.isEmpty,
+                  info[CKErrorRetryAfterKey] == nil else { return false }
+            itemError = item.error
+        } else {
+            itemError = error
+        }
+
+        guard let missing = itemError as? CKError, missing.code == .unknownItem else { return false }
+        let constraints = CloudKitRetryConstraints(itemError)
+        return constraints.isErrorGraphComplete
+            && constraints.codes == [.unknownItem]
+            && !constraints.hasRetryDirective
+            && !constraints.blocksAccountOperations
+            && CloudKitRetryConstraints.isFailureTree(itemError, allowing: [.unknownItem])
+    }
 }
 
 func cloudKitErrors(in error: Error, depth: Int = 0) -> [CKError] {

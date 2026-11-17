@@ -30,13 +30,25 @@ extension DefaultCloudKitDatabaseAdapter: CloudKitSubscriptionStore {
 
     public func subscription(withID identifier: CKSubscription.ID) async throws
         -> CKSubscription? {
-        do {
-            return try await database.configuredWith(
+        try await Self.fetchSubscriptionIfPresent(withID: identifier) {
+            try await database.configuredWith(
                 configuration: subscriptionConfiguration()
             ) { database in
                 try await database.subscription(for: identifier)
             }
-        } catch let error as CKError where error.code == .unknownItem {
+        }
+    }
+
+    static func fetchSubscriptionIfPresent(
+        withID identifier: CKSubscription.ID,
+        fetch: () async throws -> CKSubscription
+    ) async throws -> CKSubscription? {
+        do {
+            return try await fetch()
+        } catch {
+            guard BigSyncCloudKitRetryPolicy.allowsMissingSubscriptionAsAbsence(
+                error, identifier: identifier
+            ) else { throw error }
             return nil
         }
     }
