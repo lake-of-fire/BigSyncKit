@@ -17640,6 +17640,149 @@ final class BigSyncKitTests: XCTestCase {
         )
     }
 
+    func testRecordZoneChangePagePreservesAccountStopAndZoneLossByRecordID() {
+        let zoneID = CKRecordZone.ID(zoneName: "zone", ownerName: "owner")
+        let accountID = CKRecord.ID(recordName: "account", zoneID: zoneID)
+        let missingID = CKRecord.ID(recordName: "missing", zoneID: zoneID)
+        let successID = CKRecord.ID(recordName: "success", zoneID: zoneID)
+        let deletedID = CKRecord.ID(recordName: "deleted", zoneID: zoneID)
+        let record = CKRecord(recordType: "Bookmark", recordID: successID)
+
+        XCTAssertThrowsError(try CloudKitRecordZoneChangePage(
+            modificationResultsByID: [
+                accountID: .failure(CKError(.accountTemporarilyUnavailable)),
+                missingID: .failure(CKError(.zoneNotFound)),
+                successID: .success(record),
+            ],
+            changeToken: nil,
+            deletedRecordIDs: [deletedID],
+            moreComing: true,
+            recordForModification: \.self
+        )) { error in
+            guard let cloudError = error as? CKError,
+                  let failures = cloudError.userInfo[CKPartialErrorsByItemIDKey]
+                    as? [CKRecord.ID: NSError] else {
+                return XCTFail("Expected CloudKit item errors, got \(error)")
+            }
+            XCTAssertEqual(cloudError.code, .partialFailure)
+            XCTAssertEqual(Set(failures.keys), [accountID, missingID])
+            XCTAssertEqual((failures[accountID] as? CKError)?.code, .accountTemporarilyUnavailable)
+            XCTAssertEqual((failures[missingID] as? CKError)?.code, .zoneNotFound)
+            XCTAssertTrue(CloudKitRetryConstraints(error).blocksAccountOperations)
+            let loss = CloudKitLossClassifier.classify(error: error)
+            XCTAssertEqual(loss.zoneDispositions[zoneID], .missing)
+            XCTAssertEqual(loss.affectedRecordIDs, [accountID, missingID])
+        }
+    }
+
+    func testRecordZoneChangePagePreservesRetryDeadlineAndTokenRecovery() {
+        let zoneID = CKRecordZone.ID(zoneName: "zone", ownerName: "owner")
+        let rateLimitedID = CKRecord.ID(recordName: "limited", zoneID: zoneID)
+        let expiredID = CKRecord.ID(recordName: "expired", zoneID: zoneID)
+        let rateLimit = CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 91])
+        let results: [CKRecord.ID: Result<CKRecord, Error>] = [
+            rateLimitedID: .failure(rateLimit),
+            expiredID: .failure(CKError(.changeTokenExpired)),
+        ]
+
+        XCTAssertThrowsError(try CloudKitRecordZoneChangePage(
+            modificationResultsByID: results,
+            changeToken: nil,
+            deletedRecordIDs: [],
+            moreComing: false,
+            recordForModification: \.self
+        )) { error in
+            let constraints = CloudKitRetryConstraints(error)
+            XCTAssertTrue(constraints.requiresDeferredRetry)
+            XCTAssertEqual(constraints.serverMinimum, 91)
+            XCTAssertTrue(constraints.requestsTokenRecovery)
+        }
+    }
+
+    func testRecordZoneChangePageRethrowsSingleModificationFailure() {
+        let recordID = CKRecord.ID(recordName: "expired")
+        let results: [CKRecord.ID: Result<CKRecord, Error>] = [
+            recordID: .failure(CKError(.changeTokenExpired)),
+        ]
+
+        XCTAssertThrowsError(try CloudKitRecordZoneChangePage(
+            modificationResultsByID: results,
+            changeToken: nil,
+            deletedRecordIDs: [],
+            moreComing: false,
+            recordForModification: \.self
+        )) { error in
+            XCTAssertEqual((error as? CKError)?.code, .changeTokenExpired)
+        }
+    }
+
+    func testRecordZoneChangePageKeepsRecordScopeForSingleZoneLoss() {
+        let zoneID = CKRecordZone.ID(zoneName: "zone", ownerName: "owner")
+        let failedID = CKRecord.ID(recordName: "failed", zoneID: zoneID)
+        let successID = CKRecord.ID(recordName: "success", zoneID: zoneID)
+        let success = CKRecord(recordType: "Bookmark", recordID: successID)
+        let failures: [(CKError, CloudKitLossClassifier.ZoneDisposition)] = [
+            (CKError(.zoneNotFound), .missing),
+            (CKError(.zoneNotFound, userInfo: [CKErrorUserDidResetEncryptedDataKey: true]), .encryptedDataReset),
+            (CKError(.userDeletedZone), .terminal(.deleted)),
+        ]
+
+        for (failure, expectedDisposition) in failures {
+            XCTAssertThrowsError(try CloudKitRecordZoneChangePage(
+                modificationResultsByID: [failedID: .failure(failure), successID: .success(success)],
+                changeToken: nil,
+                deletedRecordIDs: [],
+                moreComing: true,
+                recordForModification: \.self
+            )) { error in
+                XCTAssertEqual((error as? CKError)?.code, .partialFailure)
+                let loss = CloudKitLossClassifier.classify(error: error)
+                XCTAssertEqual(loss.affectedRecordIDs, [failedID])
+                XCTAssertEqual(loss.zoneDispositions, [zoneID: expectedDisposition])
+            }
+        }
+    }
+
+    func testRecordZoneChangePageRethrowsSingleCancellation() {
+        let recordID = CKRecord.ID(recordName: "cancelled")
+        let results: [CKRecord.ID: Result<CKRecord, Error>] = [
+            recordID: .failure(CancellationError()),
+        ]
+
+        XCTAssertThrowsError(try CloudKitRecordZoneChangePage(
+            modificationResultsByID: results,
+            changeToken: nil,
+            deletedRecordIDs: [],
+            moreComing: false,
+            recordForModification: \.self
+        )) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
+    func testRecordZoneChangePageReturnsAllSuccessfulModificationsAndDeletions() throws {
+        let zoneID = CKRecordZone.ID(zoneName: "zone", ownerName: "owner")
+        let firstID = CKRecord.ID(recordName: "first", zoneID: zoneID)
+        let secondID = CKRecord.ID(recordName: "second", zoneID: zoneID)
+        let deletedID = CKRecord.ID(recordName: "deleted", zoneID: zoneID)
+
+        let page = try CloudKitRecordZoneChangePage(
+            modificationResultsByID: [
+                firstID: .success(CKRecord(recordType: "Bookmark", recordID: firstID)),
+                secondID: .success(CKRecord(recordType: "Bookmark", recordID: secondID)),
+            ],
+            changeToken: nil,
+            deletedRecordIDs: [deletedID],
+            moreComing: true,
+            recordForModification: \.self
+        )
+
+        XCTAssertEqual(Set(page.records.map(\.recordID)), [firstID, secondID])
+        XCTAssertEqual(page.deletedRecordIDs, [deletedID])
+        XCTAssertTrue(page.moreComing)
+        XCTAssertEqual(page.cursor.serializedData, Data())
+    }
+
     func testCloudKitLossClassifierRecognizesTopLevelEncryptedDataReset() {
         let zoneID = CKRecordZone.ID(zoneName: "encrypted-reset", ownerName: CKCurrentUserDefaultName)
         let error = CKError(
