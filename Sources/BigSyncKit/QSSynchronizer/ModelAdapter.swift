@@ -484,6 +484,11 @@ public protocol ModelAdapter: AnyObject, Sendable {
     /// longer publish tracking metadata. Implementations without background
     /// work may use the default no-op implementation.
     func waitForCancellation() async
+    /// Captures cancellation-owned work synchronously, before another actor
+    /// turn can install its successor. The returned join must not cancel work
+    /// discovered later. Existing adapters retain their legacy wait by default.
+    @BigSyncBackgroundActor
+    func captureCancellationBarrier() -> @BigSyncBackgroundActor @Sendable () async -> Void
     func unsetCancellation() async throws
         
     /// Returns corresponding `CKRecord` for the given model object.
@@ -558,6 +563,11 @@ public extension ModelAdapter {
     var priorityEntityTypeNames: [String] { [] }
 
     func waitForCancellation() async {}
+
+    @BigSyncBackgroundActor
+    func captureCancellationBarrier() -> @BigSyncBackgroundActor @Sendable () async -> Void {
+        { await self.waitForCancellation() }
+    }
 
     @BigSyncBackgroundActor
     func activateAccountScope(_ accountScopeIdentifier: String) async throws {

@@ -6,11 +6,167 @@
 //
 
 import Foundation
+import class OSLog.OSLog
+import func OSLog.os_log
+#if os(iOS)
+import UIKit
+#endif
 import CloudKit
 import CryptoKit
 import Logging
 import RealmSwiftGaps
 import SwiftUtilities
+
+private let bigSyncExecutionDiagnosticLog = OSLog(
+    subsystem: "io.manabi.ManabiReader", category: "DurableExecution"
+)
+
+/// Owns only execution-lease state, never account or Realm publication state.
+/// Expiration signals the exact queued write rather than cancelling whichever
+/// synchronization attempt happens to be current when a callback is delivered.
+final class BigSyncWriteExecutionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var interrupted = false
+    private var released = false
+    private var interruptionHandler: (@Sendable () -> Void)?
+    private var releaseHandler: (@Sendable () -> Void)?
+
+    var lease: RealmWriteExecutionLease {
+        RealmWriteExecutionLease(
+            checkpoint: { [self] in try checkpoint() },
+            installInterruptionHandler: { [self] in installInterruptionHandler($0) },
+            release: { [self] in release() }
+        )
+    }
+
+    func checkpoint() throws {
+        let denial = lock.withLock { (interrupted: interrupted, released: released) }
+        if denial.interrupted || denial.released {
+            os_log(.error, log: bigSyncExecutionDiagnosticLog,
+                   "operation=durable-execution.checkpoint interrupted=%{public}@ released=%{public}@ taskIsCancelled=%{public}@",
+                   denial.interrupted ? "true" : "false", denial.released ? "true" : "false",
+                   Task.isCancelled ? "true" : "false")
+            throw CancellationError()
+        }
+    }
+
+    func interrupt() {
+        let handler: (@Sendable () -> Void)? = lock.withLock {
+            guard !released else { return nil }
+            interrupted = true
+            return interruptionHandler
+        }
+        handler?()
+    }
+
+    func installInterruptionHandler(_ handler: @escaping @Sendable () -> Void) {
+        let callNow = lock.withLock {
+            if interrupted || released { return true }
+            interruptionHandler = handler
+            return false
+        }
+        if callNow { handler() }
+    }
+
+    func installReleaseHandler(_ handler: @escaping @Sendable () -> Void) {
+        let callNow = lock.withLock {
+            if released { return true }
+            releaseHandler = handler
+            return false
+        }
+        if callNow { handler() }
+    }
+
+    func release() {
+        let handler: (@Sendable () -> Void)? = lock.withLock {
+            guard !released else { return nil }
+            released = true
+            interruptionHandler = nil
+            let handler = releaseHandler
+            releaseHandler = nil
+            return handler
+        }
+        handler?()
+    }
+}
+
+/// A fresh assertion for one durable critical section. Network requests do not
+/// retain it, and long-lived observation tasks inherit this acquisition policy
+/// rather than an assertion belonging to a retired synchronization attempt.
+public enum BigSyncDurableWriteExecution {
+#if os(iOS)
+    @MainActor private static var hasInstalledApplicationPolicy = false
+#endif
+
+    /// Reject storage admission before UIKit supplies a valid application.
+    @MainActor
+    public static func prepareApplicationPolicy() {
+#if os(iOS)
+        guard !hasInstalledApplicationPolicy else { return }
+        RealmWriteExecutionProtection.installDefaultSynchronousAcquisition {
+            throw CancellationError()
+        }
+#endif
+    }
+    /// UIApplication's begin/end background-task APIs are explicitly
+    /// nonisolated and thread-safe. Capture its singleton on MainActor once;
+    /// subsequent acquisition/release must not hop there while a journal's
+    /// caller holds an account/database fence.
+    #if os(iOS)
+    @MainActor
+    public static func installApplicationPolicy(application: UIApplication) {
+        hasInstalledApplicationPolicy = true
+        RealmWriteExecutionProtection.installDefaultSynchronousAcquisition {
+            try makeLease(application: application)
+        }
+    }
+#endif
+
+    public static func acquire() async throws -> RealmWriteExecutionLease {
+        try Task.checkCancellation()
+        if let lease = try RealmWriteExecutionProtection.acquireSynchronousLease() {
+            return lease
+        }
+#if os(iOS)
+        // App startup owns policy installation; acquisition cannot initialize UIKit.
+        throw CancellationError()
+#else
+        return RealmWriteExecutionLease(
+            checkpoint: { try Task.checkCancellation() },
+            installInterruptionHandler: { _ in },
+            release: {}
+        )
+#endif
+    }
+
+#if os(iOS)
+    private static func makeLease(application: UIApplication) throws -> RealmWriteExecutionLease {
+        // Synchronous journal cleanup may intentionally finish after caller
+        // cancellation. Admission here depends on OS execution, not that flag;
+        // the owned Realm bridge enforces its own Task cancellation boundary.
+        let state = BigSyncWriteExecutionState()
+        let identifier = application.beginBackgroundTask(
+            withName: "Manabi durable write"
+        ) {
+            state.interrupt()
+        }
+        guard identifier != .invalid else {
+            os_log(.error, log: bigSyncExecutionDiagnosticLog,
+                   "operation=durable-execution.acquire backgroundTaskIdentifierInvalid=true taskIsCancelled=%{public}@",
+                   Task.isCancelled ? "true" : "false")
+            throw CancellationError()
+        }
+        state.installReleaseHandler { application.endBackgroundTask(identifier) }
+        do {
+            try state.checkpoint()
+            return state.lease
+        } catch {
+            state.release()
+            throw error
+        }
+    }
+#endif
+}
 
 /// Bridges callback-only CloudKit APIs without pinning the caller to a checked
 /// continuation after its task is cancelled. The callback may still arrive,
@@ -1554,7 +1710,7 @@ public class CloudKitSynchronizer: NSObject {
         _ zoneID: CKRecordZone.ID,
         accountScopeIdentifier: String
     ) throws {
-        var state = storedZoneLifecycleState(
+        var state = try storedZoneLifecycleState(
             zoneID,
             accountScopeIdentifier: accountScopeIdentifier
         ) ?? baseZoneLifecycleState(
@@ -1593,23 +1749,23 @@ public class CloudKitSynchronizer: NSObject {
         )
     }
 
-    internal func configuredZoneIsEstablished(_ zoneID: CKRecordZone.ID) -> Bool {
+    internal func configuredZoneIsEstablished(_ zoneID: CKRecordZone.ID) throws -> Bool {
         guard let context = activeRunContext else { return false }
-        return storedZoneLifecycleState(
+        return try storedZoneLifecycleState(
             zoneID,
             accountScopeIdentifier: context.accountScopeIdentifier
         )?["established"] as? Bool == true
     }
 
-    internal func configuredZoneIsTerminal(_ zoneID: CKRecordZone.ID) -> Bool {
-        configuredZoneTerminalState(zoneID) != nil
+    internal func configuredZoneIsTerminal(_ zoneID: CKRecordZone.ID) throws -> Bool {
+        try configuredZoneTerminalState(zoneID) != nil
     }
 
     internal func configuredZoneTerminalState(
         _ zoneID: CKRecordZone.ID
-    ) -> CloudKitTerminalZoneState? {
+    ) throws -> CloudKitTerminalZoneState? {
         guard let context = activeRunContext,
-              let state = storedZoneLifecycleState(
+              let state = try storedZoneLifecycleState(
                 zoneID,
                 accountScopeIdentifier: context.accountScopeIdentifier
               ),
@@ -1631,7 +1787,7 @@ public class CloudKitSynchronizer: NSObject {
         _ zoneID: CKRecordZone.ID,
         accountScopeIdentifier: String
     ) throws {
-        guard var state = storedZoneLifecycleState(
+        guard var state = try storedZoneLifecycleState(
             zoneID,
             accountScopeIdentifier: accountScopeIdentifier
         ) else { return }
@@ -1668,8 +1824,8 @@ public class CloudKitSynchronizer: NSObject {
     private func storedZoneLifecycleState(
         _ zoneID: CKRecordZone.ID,
         accountScopeIdentifier: String
-    ) -> [String: Any]? {
-        guard let state = keyValueStore.object(forKey: zoneLifecycleStateKey(
+    ) throws -> [String: Any]? {
+        guard let state = try keyValueStore.bigSyncDurableObject(forKey: zoneLifecycleStateKey(
             zoneID,
             accountScopeIdentifier: accountScopeIdentifier
         )) as? [String: Any],
@@ -1691,22 +1847,31 @@ public class CloudKitSynchronizer: NSObject {
             zoneID,
             accountScopeIdentifier: accountScopeIdentifier
         )
-        let previousValue = keyValueStore.object(forKey: key)
-        keyValueStore.set(value: state, forKey: key)
-        guard keyValueStore.synchronize?() == true,
-              let persisted = storedZoneLifecycleState(
+        let previousValue = try keyValueStore.bigSyncDurableObject(forKey: key)
+        do {
+            try keyValueStore.bigSyncSetDurably(value: state, forKey: key)
+            guard let persisted = try storedZoneLifecycleState(
                 zoneID,
                 accountScopeIdentifier: accountScopeIdentifier
-              ),
-              NSDictionary(dictionary: persisted).isEqual(to: state) else {
-            if let previousValue {
-                keyValueStore.set(value: previousValue, forKey: key)
-            } else {
-                keyValueStore.removeObject(forKey: key)
+            ), NSDictionary(dictionary: persisted).isEqual(to: state) else {
+                throw ChangeFeedMigrationPersistenceError.stateNotDurable
             }
-            _ = keyValueStore.synchronize?()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            restoreLegacyRecoveryValue(previousValue, forKey: key)
             throw ChangeFeedMigrationPersistenceError.stateNotDurable
         }
+    }
+
+    private func restoreLegacyRecoveryValue(_ value: Any?, forKey key: String) {
+        // Legacy stores mutate their in-process dictionary before synchronize
+        // can report failure. Restore that view without bypassing an atomic
+        // DurableKeyValueStore's own publication/error latch.
+        guard !(keyValueStore is any DurableKeyValueStore) else { return }
+        if let value { keyValueStore.set(value: value, forKey: key) }
+        else { keyValueStore.removeObject(forKey: key) }
+        _ = keyValueStore.synchronize?()
     }
 
     deinit {
@@ -1812,7 +1977,7 @@ public class CloudKitSynchronizer: NSObject {
             mode: .backupRestore,
             backupRestoreEventIdentifier: restoreEventIdentifier
         )
-        guard let recovery = storedChangeFeedMigrationState(for: context),
+        guard let recovery = try storedChangeFeedMigrationState(for: context),
               recovery.phase != .completed,
               recovery.mode == .backupRestore else {
             // The restore event remains on disk. Do not recreate upload state
@@ -1869,10 +2034,10 @@ public class CloudKitSynchronizer: NSObject {
     ) throws {
         refreshBackupRestoreRequirement()
         guard backupRestoreDetected else { return }
-        guard let expectedEventIdentifier = expectedEventIdentifier
+        guard let expectedEventIdentifier = try expectedEventIdentifier
             ?? activeChangeFeedMigration?.backupRestoreEventIdentifier
             ?? activeRunContext.flatMap({ context in
-                storedChangeFeedMigrationState(for: context)?
+                try storedChangeFeedMigrationState(for: context)?
                     .backupRestoreEventIdentifier
             }) else {
             throw CocoaError(.fileReadCorruptFile)
@@ -1929,6 +2094,24 @@ public class CloudKitSynchronizer: NSObject {
         // intent without making CloudKit work user-interactive.
         synchronizationTask = Task(priority: .utility) { @BigSyncBackgroundActor [weak self] in
             guard let self else { return }
+#if DEBUG
+            let diagnosticCorrelationID = BigSyncDebugDiagnostics.currentOrNewCorrelationID()
+            let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+            BigSyncDebugDiagnostics.record(.syncWorkerStarted, correlationID: diagnosticCorrelationID)
+            defer {
+                BigSyncDebugDiagnostics.record(
+                    .syncWorkerSettled,
+                    correlationID: diagnosticCorrelationID,
+                    elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+                )
+            }
+#endif
+            // Each actual Realm write owns its assertion through rollback or
+            // commit settlement, including writes in unstructured callbacks.
+            // A waiter or orchestration task may finish independently.
+            await RealmWriteExecutionProtection.$acquire.withValue({
+                try await BigSyncDurableWriteExecution.acquire()
+            }) {
             do {
                 await waitForRunCallbacksToFinish()
                 try checkSynchronizationAttempt(attemptID)
@@ -2017,8 +2200,8 @@ public class CloudKitSynchronizer: NSObject {
                 try await prepareRestoredBackupRecoveryIfNeeded(context: context)
                 let isRestoredBackupRecovery = backupRestoreDetected
                 if !isRestoredBackupRecovery,
-                   let terminalState = configuredZoneTerminalState(recordZoneID),
-                   !hasPendingEncryptedDataResetRecovery(context: context) {
+                   let terminalState = try configuredZoneTerminalState(recordZoneID),
+                   !(try hasPendingEncryptedDataResetRecovery(context: context)) {
                     let terminalZoneID = CKRecordZone.ID(
                         zoneName: terminalState.zoneName,
                         ownerName: terminalState.ownerName
@@ -2090,6 +2273,7 @@ public class CloudKitSynchronizer: NSObject {
             } catch {
                 guard synchronizationAttemptID == attemptID else { return }
                 await failSynchronization(error: error, for: attemptID)
+            }
             }
         }
     }
@@ -2690,7 +2874,7 @@ public class CloudKitSynchronizer: NSObject {
             }
             preparedReplicaBinding = binding
         } else {
-            previousAccountIdentifier = keyValueStore.object(
+            previousAccountIdentifier = try keyValueStore.bigSyncDurableObject(
                 forKey: cloudKitAccountIdentifierKey
             ) as? String
             preparedReplicaBinding = nil
@@ -3362,7 +3546,7 @@ public class CloudKitSynchronizer: NSObject {
         notBefore: Date,
         consecutiveFailures: Int
     ) {
-        keyValueStore.set(
+        try? keyValueStore.bigSyncSetDurably(
             value: [
                 "accountScopeIdentifier": context.accountScopeIdentifier,
                 "notBefore": notBefore,
@@ -3373,7 +3557,7 @@ public class CloudKitSynchronizer: NSObject {
     }
 
     internal func clearPersistedTransientRetryState() {
-        keyValueStore.removeObject(forKey: transientRetryStateKey)
+        try? keyValueStore.bigSyncRemoveDurably(forKey: transientRetryStateKey)
     }
 
     internal func waitForPersistedTransientRetryIfNeeded(
@@ -3443,9 +3627,9 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     private func storedChangeFeedMigrationState(
         for context: RunContext
-    ) -> ChangeFeedMigrationState? {
+    ) throws -> ChangeFeedMigrationState? {
         let key = changeFeedMigrationStateKey(for: context)
-        guard let propertyList = keyValueStore.object(forKey: key)
+        guard let propertyList = try keyValueStore.bigSyncDurableObject(forKey: key)
             as? [String: Any] else { return nil }
         return ChangeFeedMigrationState(
             key: key,
@@ -3463,10 +3647,10 @@ public class CloudKitSynchronizer: NSObject {
         // is not durable, the database cursor is still uncommitted and
         // CloudKit replays the loss event. No partially updated mode/epoch/
         // phase combination can be observed after relaunch.
-        let previousValue = keyValueStore.object(forKey: state.key)
-        keyValueStore.set(value: state.propertyList, forKey: state.key)
-        guard keyValueStore.synchronize?() == true,
-              let propertyList = keyValueStore.object(forKey: state.key)
+        let previousValue = try keyValueStore.bigSyncDurableObject(forKey: state.key)
+        do {
+            try keyValueStore.bigSyncSetDurably(value: state.propertyList, forKey: state.key)
+            guard let propertyList = try keyValueStore.bigSyncDurableObject(forKey: state.key)
                 as? [String: Any],
               let persisted = ChangeFeedMigrationState(
                 key: state.key,
@@ -3482,12 +3666,12 @@ public class CloudKitSynchronizer: NSObject {
               persisted.phase == state.phase,
               persisted.backupRestoreEventIdentifier
                 == state.backupRestoreEventIdentifier else {
-            if let previousValue {
-                keyValueStore.set(value: previousValue, forKey: state.key)
-            } else {
-                keyValueStore.removeObject(forKey: state.key)
+                throw ChangeFeedMigrationPersistenceError.stateNotDurable
             }
-            _ = keyValueStore.synchronize?()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            restoreLegacyRecoveryValue(previousValue, forKey: state.key)
             throw ChangeFeedMigrationPersistenceError.stateNotDurable
         }
     }
@@ -3495,8 +3679,8 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     internal func hasPendingEncryptedDataResetRecovery(
         context: RunContext
-    ) -> Bool {
-        guard let state = storedChangeFeedMigrationState(for: context) else {
+    ) throws -> Bool {
+        guard let state = try storedChangeFeedMigrationState(for: context) else {
             return false
         }
         return state.phase != .completed && state.mode == .encryptedDataReset
@@ -3518,7 +3702,7 @@ public class CloudKitSynchronizer: NSObject {
             "Only backup-restore recovery carries a restore event identifier"
         )
         let stateKey = changeFeedMigrationStateKey(for: context)
-        let current = storedChangeFeedMigrationState(for: context)
+        let current = try storedChangeFeedMigrationState(for: context)
 
         // A migration already in progress owns valid provenance for this exact
         // epoch. Restarting its nil-token bootstrap is idempotent; incrementing
@@ -3587,7 +3771,7 @@ public class CloudKitSynchronizer: NSObject {
                 as? any ChangeFeedResetMigrating else { return }
 
         let stateKey = changeFeedMigrationStateKey(for: context)
-        var stored = storedChangeFeedMigrationState(for: context)
+        var stored = try storedChangeFeedMigrationState(for: context)
         if stored == nil {
             let initial = ChangeFeedMigrationState(
                 key: stateKey,
@@ -3816,6 +4000,10 @@ public class CloudKitSynchronizer: NSObject {
     @BigSyncBackgroundActor
     public func cancelSynchronizationAndWait() async {
         cancelSynchronization()
+        // Capture each adapter's cancelled work before the first suspension.
+        // A foreground successor may start while processor/callback work joins;
+        // this older barrier must never discover and cancel its new tasks.
+        let adapterBarriers = modelAdapters.map { $0.captureCancellationBarrier() }
         // Do not await the orchestration task itself. An async CloudKit request
         // is allowed to ignore cooperative task cancellation and can therefore
         // remain suspended indefinitely. Attempt/run-context fencing prevents
@@ -3824,8 +4012,8 @@ public class CloudKitSynchronizer: NSObject {
         // durable state.
         await changeRequestProcessor.waitForProcessingToStop()
         await waitForRunCallbacksToFinish()
-        for adapter in modelAdapters {
-            await adapter.waitForCancellation()
+        for barrier in adapterBarriers {
+            await barrier()
         }
     }
     

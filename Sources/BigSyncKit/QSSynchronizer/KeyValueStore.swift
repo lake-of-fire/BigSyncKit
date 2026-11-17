@@ -7,6 +7,7 @@
 
 import Foundation
 import Darwin
+import RealmSwiftGaps
 
 private let bigSyncInterruptedOperationAttemptLimit = 8
 
@@ -53,6 +54,33 @@ internal func bigSyncFlock(
         if result == 0 || errno != EINTR {
             return result
         }
+    }
+}
+
+/// Mobile lock admission must remain interruptible: a suspended peer must not
+/// strand a caller past its execution deadline. Desktop clients without a host
+/// policy retain their existing blocking coordination behavior.
+internal func bigSyncAcquireFileLock(
+    _ descriptor: Int32, mode: Int32, execution: RealmWriteExecutionLease?
+) throws {
+    guard let execution else {
+        guard bigSyncFlock(descriptor, mode) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return
+    }
+    let deadline = DispatchTime.now() + .milliseconds(250)
+    while true {
+        try execution.checkpoint()
+        if flock(descriptor, mode | LOCK_NB) == 0 { return }
+        let code = errno
+        guard code == EINTR || code == EWOULDBLOCK || code == EAGAIN else {
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        // Admission did not enter a mutation. Existing lifecycle retry paths
+        // can defer this work without interpreting contention as corrupt data.
+        if DispatchTime.now() >= deadline { throw CancellationError() }
+        Thread.sleep(forTimeInterval: 0.005)
     }
 }
 
@@ -324,6 +352,7 @@ extension KeyValueStore {
     private var lockFileDescriptor: Int32 = -1
     private var lockFileDevice: dev_t?
     private var lockFileInode: ino_t?
+    private var currentExecution: RealmWriteExecutionLease?
 
     private final class UnreadableValue: NSObject {
         static let shared = UnreadableValue()
@@ -492,7 +521,8 @@ extension KeyValueStore {
                 // A throwing caller observes this failure immediately, while
                 // the retained mutation error also prevents a later terminal
                 // sync boundary from silently succeeding after a plain read.
-                hasUncommittedMutationFailure = true
+                // persistThrowing latches publication failures. An admission
+                // failure happened before publication and remains retryable.
                 lastPersistenceError = error as NSError
                 throw error
             }
@@ -529,21 +559,30 @@ extension KeyValueStore {
         mode: Int32,
         _ body: () throws -> T
     ) throws -> T {
+        let execution = try RealmWriteExecutionProtection.acquireSynchronousLease()
+        defer { execution?.release() }
+        try execution?.checkpoint()
+        currentExecution = execution
+        defer { currentExecution = nil }
         // A lock file is never intentionally replaced, but validate the path
         // after flock so external cleanup/recreation cannot leave this store
         // locking an unlinked inode while a peer locks the replacement.
         for _ in 0 ..< 3 {
             let descriptor = try preparedLockFileDescriptor()
-            guard bigSyncFlock(descriptor, mode) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
+            try bigSyncAcquireFileLock(descriptor, mode: mode, execution: execution)
+            // Install settlement before any throwing interruption check.
+            var ownsLock = true
+            defer { if ownsLock { _ = bigSyncFlock(descriptor, LOCK_UN) } }
+            try execution?.checkpoint()
             guard lockFileIdentityMatchesPath() else {
                 _ = bigSyncFlock(descriptor, LOCK_UN)
+                ownsLock = false
                 closePreparedLockFileDescriptor()
                 continue
             }
-            defer { _ = bigSyncFlock(descriptor, LOCK_UN) }
-            return try body()
+            let result = try body()
+            if mode == LOCK_SH { try execution?.checkpoint() }
+            return result
         }
         throw POSIXError(.EBUSY)
     }
@@ -640,6 +679,7 @@ extension KeyValueStore {
     }
 
     private func persistThrowing(_ updatedStorage: [String: Any]) throws {
+        try currentExecution?.checkpoint()
         guard PropertyListSerialization.propertyList(updatedStorage, isValidFor: .binary) else {
             hasUncommittedMutationFailure = true
             let error = NSError(
@@ -650,6 +690,7 @@ extension KeyValueStore {
             lastPersistenceError = error
             throw error
         }
+        var publicationStarted = false
         do {
             let data = try PropertyListSerialization.data(
                 fromPropertyList: updatedStorage,
@@ -678,11 +719,15 @@ extension KeyValueStore {
                 }
                 try handle.close()
                 try beforeAtomicReplace?()
+                try currentExecution?.checkpoint()
                 guard Darwin.rename(temporaryURL.path, fileURL.path) == 0 else {
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
+                publicationStarted = true
                 shouldRemoveTemporaryFile = false
             } else {
+                try currentExecution?.checkpoint()
+                publicationStarted = true
                 try bigSyncRetryingInterruptedOperation {
                     try data.write(to: fileURL)
                 }
@@ -704,7 +749,9 @@ extension KeyValueStore {
             hasUncommittedMutationFailure = false
             lastPersistenceError = nil
         } catch {
-            hasUncommittedMutationFailure = true
+            if publicationStarted || !(error is CancellationError) {
+                hasUncommittedMutationFailure = true
+            }
             lastPersistenceError = error as NSError
             throw error
         }

@@ -1,12 +1,105 @@
 import CloudKit
 import Foundation
 import Logging
+import RealmSwift
 import XCTest
 @testable import BigSyncKit
 
 /// Full-caller native companions to the processor tests. No real CloudKit or
 /// target Realm operation is permitted. These require the owning Apple graph.
 final class SynchronizationProcessorStartupTests: XCTestCase, @unchecked Sendable {
+    @BigSyncBackgroundActor
+    func testCancellationBarrierDoesNotCancelOrRetireSuccessorAdapterTasks() async {
+        let cancelled = expectation(description: "original adapter tasks cancelled")
+        cancelled.expectedFulfillmentCount = 3
+        let oldGate = StartupProcessorGate()
+        let successorGate = StartupProcessorGate()
+        let oldInitial = Task { @BigSyncBackgroundActor in
+            await withTaskCancellationHandler {
+                await oldGate.wait()
+            } onCancel: { cancelled.fulfill() }
+        }
+        let oldSetup = Task<Void, Error> { @BigSyncBackgroundActor in
+            await withTaskCancellationHandler {
+                await oldGate.wait()
+            } onCancel: { cancelled.fulfill() }
+            try Task.checkCancellation()
+        }
+        let oldObserved = Task { @BigSyncBackgroundActor in
+            await withTaskCancellationHandler {
+                await oldGate.wait()
+            } onCancel: { cancelled.fulfill() }
+        }
+        let successorInitial = Task { @BigSyncBackgroundActor in
+            await withTaskCancellationHandler {
+                await successorGate.wait()
+            } onCancel: { Task { await successorGate.open() } }
+        }
+        let successorSetup = Task<Void, Error> { @BigSyncBackgroundActor in
+            await withTaskCancellationHandler {
+                await successorGate.wait()
+            } onCancel: { Task { await successorGate.open() } }
+            try Task.checkCancellation()
+        }
+        let successorObserved = Task { @BigSyncBackgroundActor in
+            await withTaskCancellationHandler {
+                await successorGate.wait()
+            } onCancel: { Task { await successorGate.open() } }
+        }
+        let zone = CKRecordZone.ID(zoneName: "captured-cancellation-" + UUID().uuidString)
+        let configuration = Realm.Configuration(
+            inMemoryIdentifier: "captured-cancellation-" + UUID().uuidString,
+            objectTypes: []
+        )
+        let adapter = RealmSwiftAdapter(
+            persistenceRealmConfiguration: configuration,
+            targetRealmConfigurations: [], excludedClassNames: [],
+            recordZoneID: zone, logger: Logger(label: "CapturedCancellation"),
+            startSetupTask: false
+        )
+        adapter._test_installCancellationTasks(
+            initial: oldInitial, setup: oldSetup, observed: oldObserved
+        )
+        let transport = StartupProcessorTransport()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("captured-cancellation-" + UUID().uuidString)
+        let sync = CloudKitSynchronizer(
+            identifier: UUID().uuidString,
+            containerIdentifier: "iCloud.test.captured-cancellation", database: transport,
+            recordZoneID: zone, keyValueStore: StartupProcessorStore(),
+            accountIdentifierProvider: { "account-a" }, accountStatusProvider: { .available },
+            changeFeed: transport, subscriptionStore: transport, zoneStore: transport,
+            recordStore: transport, backupDetectionBaseURL: directory,
+            logger: Logger(label: "CapturedCancellation")
+        )
+        sync._allowRecordZoneRebindingForTesting()
+        sync.addModelAdapter(adapter)
+        XCTAssertTrue(sync.beginRunCallback(for: sync.synchronizationAttemptID))
+        let cancellation = Task { @BigSyncBackgroundActor in
+            await sync.cancelSynchronizationAndWait()
+        }
+        await fulfillment(of: [cancelled], timeout: 3)
+        // The old cancellation now joins the held callback. A new foreground
+        // setup can replace all three task handles before that callback returns.
+        adapter._test_installCancellationTasks(
+            initial: successorInitial, setup: successorSetup, observed: successorObserved
+        )
+        sync.endRunCallback()
+        await oldGate.open()
+        await cancellation.value
+
+        XCTAssertFalse(successorInitial.isCancelled)
+        XCTAssertFalse(successorSetup.isCancelled)
+        XCTAssertFalse(successorObserved.isCancelled)
+        XCTAssertTrue(adapter._test_hasInitialSetupTask,
+                      "An older join retired the successor's initial setup handle")
+        XCTAssertEqual(transport.operationCalls, 0)
+        let cleanup = adapter.captureCancellationBarrier()
+        await successorGate.open()
+        await cleanup()
+        try? FileManager.default.removeItem(at: directory)
+    }
+
     @BigSyncBackgroundActor
     func testStartupCancelledDuringProcessorJoinDoesNotActivateRetiredContext() async throws {
         try await checkHandoff(invalidateAccountOnly: false)

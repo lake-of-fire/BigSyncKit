@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import RealmSwiftGaps
 import Darwin
 
 /// Detects a restored installation without sharing reset state between
@@ -989,6 +990,9 @@ enum BackupDetection {
         fileManager: FileManager,
         _ operation: () throws -> T
     ) throws -> T {
+        let execution = try RealmWriteExecutionProtection.acquireSynchronousLease()
+        defer { execution?.release() }
+        try execution?.checkpoint()
         let lockURL = restoreEventLockURL(sentinelURL: sentinelURL)
         try bigSyncCreateDirectoryDurably(
             at: lockURL.deletingLastPathComponent(),
@@ -1007,10 +1011,9 @@ enum BackupDetection {
         values.isExcludedFromBackup = true
         var mutableLockURL = lockURL
         try mutableLockURL.setResourceValues(values)
-        guard bigSyncFlock(descriptor, LOCK_EX) == 0 else {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
-        }
+        try bigSyncAcquireFileLock(descriptor, mode: LOCK_EX, execution: execution)
         defer { _ = bigSyncFlock(descriptor, LOCK_UN) }
+        try execution?.checkpoint()
         return try operation()
     }
 

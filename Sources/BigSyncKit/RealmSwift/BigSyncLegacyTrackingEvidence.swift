@@ -1,6 +1,7 @@
 import CloudKit
 import Foundation
 import RealmSwift
+import RealmSwiftGaps
 
 /// Read-only evidence from a pre-v3 BigSync tracking Realm. The source Realm is
 /// copied before opening so current schema migration can never mutate the
@@ -86,7 +87,7 @@ public enum BigSyncLegacyTrackingEvidence {
         configuration.fileURL = copyURL
         var result = [BigSyncLegacyTrackedRecordEvidence]()
         try autoreleasepool {
-            let realm = try Realm(configuration: configuration)
+            let realm = try RealmWriteExecutionProtection.openRealm(configuration: configuration)
             for entity in realm.objects(SyncedEntity.self)
             where entity.entityState == .synced {
                 guard !entity.identifier.isEmpty,

@@ -311,7 +311,7 @@ actor RealmProvider {
         self.targetConfigurations = targetConfigurations
 
         do {
-            persistenceRealmObject = try await Realm(
+            persistenceRealmObject = try await RealmWriteExecutionProtection.openRealm(
                 configuration: persistenceConfiguration,
                 actor: BigSyncBackgroundActor.shared
             )
@@ -320,7 +320,7 @@ actor RealmProvider {
             var targetReaderRealmObjects = [Realm]()
             for targetConfiguration in targetConfigurations {
                 try await targetReaderRealmObjects.append(
-                    Realm(
+                    RealmWriteExecutionProtection.openRealm(
                         configuration: targetConfiguration,
                         actor: BigSyncBackgroundActor.shared
                     )
@@ -796,7 +796,7 @@ public final class RealmSwiftAdapter:
         if let configuredPersistenceRealm = realmProvider?.persistenceRealm {
             persistenceRealm = configuredPersistenceRealm
         } else {
-            persistenceRealm = try await Realm(
+            persistenceRealm = try await RealmWriteExecutionProtection.openRealm(
                 configuration: persistenceRealmConfiguration,
                 actor: BigSyncBackgroundActor.shared
             )
@@ -969,16 +969,29 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     public func waitForCancellation() async {
+        let barrier = captureCancellationBarrier()
+        await barrier()
+    }
+
+    @BigSyncBackgroundActor
+    public func captureCancellationBarrier() -> @BigSyncBackgroundActor @Sendable () async -> Void {
+        let generation = cancellationGeneration
+        let capturedSetupGeneration = setupGeneration
         let activeInitialSetupTask = initialSetupTask
         let activeSetupTask = setupTask
         let activeObservedRealmChangesTask = observedRealmChangesTask
         activeInitialSetupTask?.cancel()
         activeSetupTask?.cancel()
         activeObservedRealmChangesTask?.cancel()
-        await activeInitialSetupTask?.value
-        _ = try? await activeSetupTask?.value
-        await activeObservedRealmChangesTask?.value
-        initialSetupTask = nil
+        return { [weak self] in
+            await activeInitialSetupTask?.value
+            _ = try? await activeSetupTask?.value
+            await activeObservedRealmChangesTask?.value
+            guard let self,
+                  self.cancellationGeneration == generation,
+                  self.setupGeneration == capturedSetupGeneration else { return }
+            self.initialSetupTask = nil
+        }
     }
 
     @BigSyncBackgroundActor
@@ -1326,9 +1339,9 @@ public final class RealmSwiftAdapter:
                         else { return false }
                     }
                 }
-                let livePersistenceRealm = try Realm(configuration: persistenceConfiguration)
+                let livePersistenceRealm = try RealmWriteExecutionProtection.openRealm(configuration: persistenceConfiguration)
                 for configuration in targetConfigurations {
-                    let liveRealm = try Realm(configuration: configuration)
+                    let liveRealm = try RealmWriteExecutionProtection.openRealm(configuration: configuration)
                     // A coordinated open can reuse a handle held by another
                     // writer. Read its committed base, not provisional debt.
                     // An immutable read-only configuration is already stable.
@@ -3158,6 +3171,19 @@ public final class RealmSwiftAdapter:
 
 #if DEBUG
     @BigSyncBackgroundActor
+    func _test_installCancellationTasks(
+        initial: Task<Void, Never>, setup: Task<Void, Error>, observed: Task<Void, Never>
+    ) {
+        setupGeneration = UUID()
+        initialSetupTask = initial
+        setupTask = setup
+        observedRealmChangesTask = observed
+    }
+
+    @BigSyncBackgroundActor
+    var _test_hasInitialSetupTask: Bool { initialSetupTask != nil }
+
+    @BigSyncBackgroundActor
     func _test_enqueueObservedJournalRecordNames(
         _ recordNames: [String],
         realmIndex: Int = 0
@@ -4228,7 +4254,7 @@ public final class RealmSwiftAdapter:
                     // A custom delegate may have intentionally changed the
                     // local object while deciding to keep it. Preserve the
                     // historical authoring behavior for that model-owned merge.
-                    changeMetadata.refreshChangeMetadata(
+                    try changeMetadata.refreshChangeMetadataThrowing(
                         explicitlyModified: true,
                         at: Date()
                     )
@@ -4236,7 +4262,7 @@ public final class RealmSwiftAdapter:
                     // The built-in timestamp policy selected an unchanged,
                     // already-authored local value. Retransmit it under a new
                     // journal generation without inventing a new conflict clock.
-                    changeMetadata.journalCurrentValuePreservingChangeMetadata(
+                    try changeMetadata.journalCurrentValuePreservingChangeMetadata(
                         at: Date()
                     )
                 }
@@ -5380,7 +5406,7 @@ public final class RealmSwiftAdapter:
         // target objects. Open only the tracking Realm here; `ensureSetup()` can
         // perform broad initial discovery and is intentionally forbidden at
         // this pre-reset boundary.
-        let persistenceRealm = try await Realm(
+        let persistenceRealm = try await RealmWriteExecutionProtection.openRealm(
             configuration: persistenceRealmConfiguration,
             actor: BigSyncBackgroundActor.shared
         )
@@ -5401,7 +5427,7 @@ public final class RealmSwiftAdapter:
         epoch: Int,
         mode: ChangeFeedResetMode
     ) async throws {
-        let persistenceRealm = try await Realm(
+        let persistenceRealm = try await RealmWriteExecutionProtection.openRealm(
             configuration: persistenceRealmConfiguration,
             actor: BigSyncBackgroundActor.shared
         )
@@ -5528,7 +5554,7 @@ public final class RealmSwiftAdapter:
             guard openedRealmIdentities.insert(identity).inserted else {
                 continue
             }
-            let targetRealm = try await Realm(
+            let targetRealm = try await RealmWriteExecutionProtection.openRealm(
                 configuration: configuration,
                 actor: BigSyncBackgroundActor.shared
             )
@@ -5538,11 +5564,11 @@ public final class RealmSwiftAdapter:
             )
             // A provisional current edit must not hide committed backup debt
             // that returns if its owner rolls back. Carry detached identities only.
-            let restoredMutations: [(recordName: String, generation: String)] = {
+            let restoredMutations: [(recordName: String, generation: String)] = try {
                 let snapshot = committedRealmReadSnapshot(in: targetRealm)
-                return snapshot.objects(BigSyncPendingMutation.self).compactMap { mutation in
+                return try snapshot.objects(BigSyncPendingMutation.self).compactMap { mutation in
                     guard !mutation.requiresReplicaBindingRecovery,
-                          !BigSyncMutationTrackingRegistry
+                          try !BigSyncMutationTrackingRegistry
                         .mutationWasCreatedInCurrentTransportIdentity(
                             mutation, realm: snapshot
                         ) else { return nil }
@@ -5567,7 +5593,7 @@ public final class RealmSwiftAdapter:
                         forPrimaryKey: restoredMutation.recordName
                     ), !liveMutation.requiresReplicaBindingRecovery,
                        liveMutation.generation == restoredMutation.generation,
-                       !BigSyncMutationTrackingRegistry
+                       try !BigSyncMutationTrackingRegistry
                         .mutationWasCreatedInCurrentTransportIdentity(
                             liveMutation,
                             realm: targetRealm
@@ -5864,7 +5890,7 @@ public final class RealmSwiftAdapter:
                             // revival while this write waited owns its new
                             // generation and must remain pending.
                             if let existingMutation,
-                               !BigSyncMutationTrackingRegistry
+                               try !BigSyncMutationTrackingRegistry
                                 .mutationWasCreatedInCurrentTransportIdentity(
                                     existingMutation,
                                     realm: targetRealm
@@ -5874,7 +5900,7 @@ public final class RealmSwiftAdapter:
                             continue
                         }
                         if let existingMutation {
-                            guard !BigSyncMutationTrackingRegistry
+                            guard try !BigSyncMutationTrackingRegistry
                                 .mutationWasCreatedInCurrentTransportIdentity(
                                     existingMutation,
                                     realm: targetRealm
@@ -5884,7 +5910,7 @@ public final class RealmSwiftAdapter:
                             targetRealm.delete(existingMutation)
                         }
                         let mutationGeneration =
-                            BigSyncMutationTrackingRegistry
+                            try BigSyncMutationTrackingRegistry
                                 .makeMutationGeneration(in: targetRealm)
                         targetRealm.add(BigSyncPendingMutation(
                             recordName: candidate.identifier,
@@ -5919,7 +5945,7 @@ public final class RealmSwiftAdapter:
                     try requireCurrentTransport(namespace,
                         cancellationGeneration: expectedCancellationGeneration)
                     guard recordTransportContext == journalContext,
-                          let identity = BigSyncMutationTracking.currentJournalIdentity(
+                          let identity = try BigSyncMutationTracking.currentJournalIdentity(
                             verifyingPendingMutationsFor: [Object](), in: targetRealm
                           ), identity.replicaBindingGenerationIdentifier == journalContext.binding else {
                         throw CancellationError()
@@ -6045,7 +6071,7 @@ public final class RealmSwiftAdapter:
                                     entityType: candidate.entityType
                                 )
                             }
-                            metadata.journalCurrentValuePreservingChangeMetadata(at: changedAt)
+                            try metadata.journalCurrentValuePreservingChangeMetadata(at: changedAt)
                         }
                         guard let mutation = targetRealm.object(
                             ofType: BigSyncPendingMutation.self,
@@ -6288,7 +6314,7 @@ public final class RealmSwiftAdapter:
         let persistenceRealm = if let configuredPersistenceRealm = realmProvider?.persistenceRealm {
             configuredPersistenceRealm
         } else {
-            try await Realm(
+            try await RealmWriteExecutionProtection.openRealm(
                 configuration: persistenceRealmConfiguration,
                 actor: BigSyncBackgroundActor.shared
             )
@@ -6441,7 +6467,7 @@ public final class RealmSwiftAdapter:
         epoch: Int,
         mode: ChangeFeedResetMode
     ) async throws -> Bool {
-        let persistenceRealm = try await Realm(
+        let persistenceRealm = try await RealmWriteExecutionProtection.openRealm(
             configuration: persistenceRealmConfiguration,
             actor: BigSyncBackgroundActor.shared
         )
@@ -7924,6 +7950,11 @@ public final class RealmSwiftAdapter:
                             $0.semanticReplacementDisposition
                     )
                 }
+                // Encode and compress CloudKit system metadata before any
+                // Realm transaction admits its writer lock.
+                let encodedSystemFields = try safeChunk.map {
+                    try encodedRecord($0.record, onlySystemFields: true)
+                }
                 do {
 #if DEBUG
                     try await _testBeforeImportedRecordTargetWrite?()
@@ -8103,7 +8134,7 @@ public final class RealmSwiftAdapter:
                                                 throw BigSyncSemanticAdmissionUnavailable(entityType: candidate.entityType)
                                             }
                                             if currentMutationGeneration == nil {
-                                                metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
+                                                try metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
                                             }
                                             guard let generation = targetReaderRealm.object(
                                                 ofType: BigSyncPendingMutation.self,
@@ -8217,7 +8248,7 @@ public final class RealmSwiftAdapter:
                                                 guard let metadata = object as? ChangeMetadataRecordable else {
                                                     throw BigSyncSemanticAdmissionUnavailable(entityType: candidate.entityType)
                                                 }
-                                                metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
+                                                try metadata.journalCurrentValuePreservingChangeMetadata(at: Date())
                                                 guard let generation = targetReaderRealm.object(
                                                     ofType: BigSyncPendingMutation.self,
                                                     forPrimaryKey: candidate.syncedEntityID)?.generation,
@@ -8282,7 +8313,7 @@ public final class RealmSwiftAdapter:
                             }
                             persistenceRealm.add(entity)
                         }
-                        for item in chunk {
+                        for (item, encodedFields) in zip(chunk, encodedSystemFields) {
                             try validateOwner()
                             let syncedEntity: SyncedEntity
                             if let existing = persistenceRealm.object(
@@ -8305,7 +8336,7 @@ public final class RealmSwiftAdapter:
                             } else {
                                 continue
                             }
-                            try save(record: item.record, for: syncedEntity)
+                            syncedEntity.encodedRecord = encodedFields
                             if (syncedEntity.entityState == .deletedRemotely
                                 || syncedEntity.entityState
                                     == .recreatingRemotely),
@@ -9132,11 +9163,21 @@ public final class RealmSwiftAdapter:
             try Task.checkCancellation()
             try validateOwner()
 
-            try await persistenceRealm.asyncWritePreservingOwnership {
+            // CloudKit archiving and compression are CPU work independent of
+            // Realm state. Finish it before admitting the durable Realm write.
+            var encodedSystemFields = [Data]()
+            encodedSystemFields.reserveCapacity(chunk.count)
+            for record in chunk {
+                try validateOwner()
+                encodedSystemFields.append(try encodedRecord(record, onlySystemFields: true))
+            }
+
+            let performAcknowledgementWrite: () async throws -> Void = {
+                try await persistenceRealm.asyncWritePreservingOwnership {
                 try validateOwner()
                 var acknowledgedInThisWrite = [String: String]()
                 var acknowledgedEntityTypesInThisWrite = [String: String]()
-                for record in chunk {
+                for (record, encodedFields) in zip(chunk, encodedSystemFields) {
                     try Task.checkCancellation()
                     try validateOwner()
 
@@ -9145,18 +9186,18 @@ public final class RealmSwiftAdapter:
                         forPrimaryKey: record.recordID.recordName
                     ), let uploadedGeneration = matchingGenerations[record.recordID.recordName],
                        syncedEntity.pendingGeneration == uploadedGeneration,
-                       preparedGenerationIsEligibleForActiveTransport(
+                       self.preparedGenerationIsEligibleForActiveTransport(
                            recordName: record.recordID.recordName,
                            entityType: syncedEntity.entityType,
                            generation: uploadedGeneration
                        ) else { continue }
                     if let receipt = comparisonReceipts[record.recordID.recordName] {
                         guard let target = realmProvider.targetReaderRealmPerSchemaName[syncedEntity.entityType],
-                              try comparisonReceiptIsCurrent(receipt,
+                              try self.comparisonReceiptIsCurrent(receipt,
                                 recordName: record.recordID.recordName, in: target) else { continue }
                     }
                     try Task.checkCancellation()
-                    try save(record: record, for: syncedEntity)
+                    syncedEntity.encodedRecord = encodedFields
                     syncedEntity.state = SyncedEntityState.synced.rawValue
                     syncedEntity.clearPendingMutation()
                     acknowledgedInThisWrite[record.recordID.recordName] = uploadedGeneration
@@ -9167,9 +9208,9 @@ public final class RealmSwiftAdapter:
                 }
                 if let retainedDeletionCleanup, !acknowledgedInThisWrite.isEmpty {
 #if DEBUG
-                    try _testAfterAcceptedRetainedDeletionTrackingAdmission?()
+                    try self._testAfterAcceptedRetainedDeletionTrackingAdmission?()
 #endif
-                    try retireAcceptedRetainedDeletionQuarantines(
+                    try self.retireAcceptedRetainedDeletionQuarantines(
                         retainedDeletionCleanup,
                         acknowledgedGenerations: acknowledgedInThisWrite,
                         comparisonReceipts: comparisonReceipts,
@@ -9180,13 +9221,55 @@ public final class RealmSwiftAdapter:
                     // Every public acknowledgement path must keep restoring
                     // work pending while deletion evidence remains unresolved.
                     // Legacy generations supply no permission to retire it.
-                    try requireRetainedDeletionQuarantinesSettled(
+                    try self.requireRetainedDeletionQuarantinesSettled(
                         acknowledgedEntityTypes: acknowledgedEntityTypesInThisWrite,
                         in: persistenceRealm
                     )
                 }
                 try validateOwner()
+                }
             }
+#if DEBUG
+            let diagnosticCorrelationID = UUID()
+            let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+            BigSyncDebugDiagnostics.record(
+                .uploadAckChunkRequested,
+                correlationID: diagnosticCorrelationID,
+                count: chunk.count
+            )
+            do {
+                try await RealmWriteLifecycleObservation.$didAdmit.withValue({
+                    BigSyncDebugDiagnostics.record(.uploadAckChunkAdmitted, correlationID: diagnosticCorrelationID)
+                }) {
+                    try await RealmWriteLifecycleObservation.$didStartBody.withValue({
+                        BigSyncDebugDiagnostics.record(.uploadAckChunkBodyStarted, correlationID: diagnosticCorrelationID)
+                    }) {
+                        try await RealmWriteLifecycleObservation.$didSubmitCommit.withValue({
+                            BigSyncDebugDiagnostics.record(.uploadAckChunkCommitSubmitted, correlationID: diagnosticCorrelationID)
+                        }) {
+                            try await RealmWriteLifecycleObservation.$didSettle.withValue({
+                                BigSyncDebugDiagnostics.record(
+                                    .uploadAckChunkSettled,
+                                    correlationID: diagnosticCorrelationID,
+                                    elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+                                )
+                            }) {
+                                try await performAcknowledgementWrite()
+                            }
+                        }
+                    }
+                }
+            } catch {
+                BigSyncDebugDiagnostics.record(
+                    .uploadAckChunkFailed,
+                    correlationID: diagnosticCorrelationID,
+                    elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+                )
+                throw error
+            }
+#else
+            try await performAcknowledgementWrite()
+#endif
 #if DEBUG
             try await _testAfterUploadTrackingWrite?()
 #endif
@@ -11230,7 +11313,7 @@ extension RealmSwiftAdapter {
             || (!pending && merged != remote) {
             // A changed ancestor also invalidates older upload receipts even
             // when conflict selection retained every local payload field.
-            (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
+            try (object as? ChangeMetadataRecordable)?.journalCurrentValuePreservingChangeMetadata(at: Date())
         }
         try context.validate(in: realm)
         return true
@@ -11293,7 +11376,7 @@ extension RealmSwiftAdapter {
         try validateOwner()
         switch readBoundary {
         case .committed:
-            guard let identity = BigSyncMutationTrackingRegistry
+            guard let identity = try BigSyncMutationTrackingRegistry
                 .currentMutationJournalIdentity(in: realm),
                   !identity.installationIdentifier.isEmpty,
                   identity.replicaBindingGenerationIdentifier
@@ -12345,7 +12428,7 @@ extension RealmSwiftAdapter {
         if realm.isInWriteTransaction {
             try cut.context.validate(in: realm)
         } else {
-            guard let identity = BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm),
+            guard let identity = try BigSyncMutationTrackingRegistry.currentMutationJournalIdentity(in: realm),
                   !identity.installationIdentifier.isEmpty,
                   identity.replicaBindingGenerationIdentifier == cut.context.binding else {
                 throw CancellationError()

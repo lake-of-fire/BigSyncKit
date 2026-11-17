@@ -268,7 +268,7 @@ public extension CloudKitSynchronizer {
             attemptID: reservation.attemptID,
             runContext: reservation.runContext
         )
-        if let storedSubscriptionID = subscriptionIDForDatabaseSubscription(),
+        if let storedSubscriptionID = try readDatabaseSubscriptionIDDurably(),
            storedSubscriptionID != expectedSubscriptionID {
             // Do not perpetuate an older arbitrary ID: it may have been
             // adopted from another CloudKit client by pre-v2 code. Local
@@ -350,7 +350,7 @@ public extension CloudKitSynchronizer {
             attemptID: reservation.attemptID,
             runContext: reservation.runContext
         )
-        if let storedSubscriptionID = subscriptionID(forRecordZoneID: zoneID),
+        if let storedSubscriptionID = try readStoredSubscriptionIDDurably(for: zoneID),
            storedSubscriptionID != expectedSubscriptionID {
             // See the database-subscription equivalent above. Clear only local
             // metadata; an unknown server subscription is not ours to delete.
@@ -429,7 +429,7 @@ public extension CloudKitSynchronizer {
             runContext: reservation.runContext
         )
         let expectedSubscriptionID = ownedSubscriptionID(kind: "database")
-        if let stored = subscriptionIDForDatabaseSubscription(),
+        if let stored = try readDatabaseSubscriptionIDDurably(),
            stored != expectedSubscriptionID {
             // Pre-v2 code may have persisted another client's ID. Clear only
             // our local pointer; never delete an unowned server subscription.
@@ -506,7 +506,7 @@ public extension CloudKitSynchronizer {
             kind: "zone",
             zoneID: zoneID
         )
-        if let stored = subscriptionID(forRecordZoneID: zoneID),
+        if let stored = try readStoredSubscriptionIDDurably(for: zoneID),
            stored != expectedSubscriptionID {
             // A foreign local pointer is never deletion authority.
             try persistSubscriptionID(nil, for: zoneID)

@@ -33,7 +33,7 @@ extension CloudKitSynchronizer {
             // Notifications are synchronous callouts. An observer can cancel
             // this attempt or admit a successor before this method continues.
             try checkSynchronizationAttempt(attemptID)
-            let token = self.storedDatabaseToken
+            let token = try self.readStoredDatabaseTokenDurably()
             try checkSynchronizationAttempt(attemptID)
             self.serverChangeToken = token
             self.uploadRetries = 0
@@ -1036,8 +1036,11 @@ extension CloudKitSynchronizer {
         }
         switch disposition {
         case .encryptedDataReset:
-            let recoveryWasActive = isEncryptedDataResetRecoveryActive
-                || hasPendingEncryptedDataResetRecovery(context: context)
+            let recoveryWasActive: Bool
+            do {
+                recoveryWasActive = try isEncryptedDataResetRecoveryActive
+                    || hasPendingEncryptedDataResetRecovery(context: context)
+            } catch { return error }
             if !recoveryWasActive {
                 do {
                     try requestChangeFeedRecovery(
@@ -1086,8 +1089,8 @@ extension CloudKitSynchronizer {
                 // empty and recreated.
                 return nil
             }
-            guard configuredZoneIsEstablished(zoneID) else { return nil }
             do {
+                guard try configuredZoneIsEstablished(zoneID) else { return nil }
                 try markConfiguredZoneTerminal(
                     zoneID,
                     kind: .unknown,
@@ -1778,6 +1781,11 @@ extension CloudKitSynchronizer {
                 let constraints = CloudKitRetryConstraints(error)
                 try checkSynchronizationAttempt(attemptID)
                 guard activeRunContext == uploadContext else { throw CancellationError() }
+                // Account rejection is an ownership failure, including when
+                // wrapped with the transport error that prompted revalidation.
+                // It must reach the caller rather than look like a completed
+                // upload after failSynchronization handles its status.
+                if constraints.containsAccountChange { throw error }
                 if let context = uploadContext {
                     try checkRunContext(context)
                     if constraints.isErrorGraphComplete && !constraints.blocksAccountOperations {
@@ -2087,6 +2095,18 @@ extension CloudKitSynchronizer {
     ) async throws {
         let attemptID = synchronizationAttemptID
         try checkSynchronizationAttempt(attemptID)
+#if DEBUG
+        let diagnosticCorrelationID = BigSyncDebugDiagnostics.currentOrNewCorrelationID()
+        let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+        BigSyncDebugDiagnostics.record(.inboundApplyStarted, correlationID: diagnosticCorrelationID)
+        defer {
+            BigSyncDebugDiagnostics.record(
+                .inboundApplySettled,
+                correlationID: diagnosticCorrelationID,
+                elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+            )
+        }
+#endif
         let changeRequestProcessor = changeRequestProcessor
         try await changeRequestProcessor.finishProcessing(
             for: adapter,

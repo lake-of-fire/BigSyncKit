@@ -3,10 +3,156 @@ import Realm
 import RealmSwift
 import Combine
 import Logging
+#if DEBUG
+import Darwin
+#endif
 
 private typealias BigSyncSynchronizationDeadline =
     BigSyncDeadlineRace<CloudKitSynchronizer.SynchronizationResult?>
 private typealias BigSyncDeadlineOutcome = BigSyncSynchronizationDeadline.Outcome
+
+#if DEBUG
+public enum BigSyncDebugDiagnosticEvent: String, Sendable {
+    case appBackground, appForeground, remoteNotificationStarted
+    case syncWorkerStarted, syncWorkerSettled
+    case syncDeadlineStarted, syncDeadlineElapsed, syncCompleted, syncCancelled
+    case syncAttemptCancelled, syncAttemptSettled
+    case uploadAckChunkRequested, uploadAckChunkAdmitted, uploadAckChunkBodyStarted
+    case uploadAckChunkCommitSubmitted
+    case uploadAckChunkSettled, uploadAckChunkFailed
+    case inboundApplyStarted, inboundApplySettled
+    case backgroundExecutionStarted, backgroundExecutionInterrupted, backgroundExecutionSettled
+}
+
+/// Local development diagnostics only. Callers provide static event labels,
+/// random correlation IDs, and aggregate counts or durations; no user or
+/// record identity belongs in this log.
+public enum BigSyncDebugDiagnostics {
+    @TaskLocal public static var correlationID: UUID?
+
+    private static let store = BigSyncDebugDiagnosticsStore(
+        fileURL: FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0]
+            .appendingPathComponent("ManabiReader", isDirectory: true)
+            .appendingPathComponent("debug-sync-diagnostics.log"),
+        retainPreviousSession: true
+    )
+
+    public static func record(
+        _ event: BigSyncDebugDiagnosticEvent,
+        correlationID: UUID? = nil,
+        count: Int? = nil,
+        elapsedMilliseconds: UInt64? = nil
+    ) {
+        store.append(
+            event: event,
+            correlationID: correlationID ?? self.correlationID ?? UUID(),
+            count: count,
+            elapsedMilliseconds: elapsedMilliseconds
+        )
+    }
+
+    public static func withCorrelationID<Result>(
+        _ id: UUID,
+        operation: () async throws -> Result
+    ) async rethrows -> Result {
+        try await $correlationID.withValue(id, operation: operation)
+    }
+
+    public static func exportText() -> String { store.snapshot() }
+
+    static func currentOrNewCorrelationID() -> UUID { correlationID ?? UUID() }
+}
+
+final class BigSyncDebugDiagnosticsStore: @unchecked Sendable {
+    private let fileURL: URL
+    private let previousFileURL: URL
+    private let maximumBytes: Int
+    private let lock = NSLock()
+
+    init(fileURL: URL, maximumBytes: Int = 64 * 1024, retainPreviousSession: Bool = false) {
+        self.fileURL = fileURL
+        previousFileURL = fileURL.appendingPathExtension("previous")
+        self.maximumBytes = max(256, maximumBytes)
+        if retainPreviousSession { rotateSession() }
+    }
+
+    func append(
+        event: BigSyncDebugDiagnosticEvent,
+        correlationID: UUID,
+        count: Int?,
+        elapsedMilliseconds: UInt64?
+    ) {
+        let uptime = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        var line = "uptime_ms=\(uptime) correlation=\(correlationID.uuidString) event=\(event.rawValue)"
+        if let count { line += " count=\(count)" }
+        if let elapsedMilliseconds { line += " elapsed_ms=\(elapsedMilliseconds)" }
+        line += "\n"
+        let bytes = Array(line.utf8)
+        guard bytes.count <= maximumBytes else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+            if size + bytes.count > maximumBytes {
+                // Preserve the previous process's crash evidence until the next
+                // launch. Only replace this session's bounded log, atomically,
+                // with this short record; normal events remain O_APPEND writes.
+                try Data(bytes).write(to: fileURL, options: .atomic)
+                return
+            }
+            let descriptor = open(fileURL.path, O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else { return }
+            defer { close(descriptor) }
+            var offset = 0
+            while offset < bytes.count {
+                let written = bytes.withUnsafeBytes { buffer in
+                    Darwin.write(descriptor, buffer.baseAddress!.advanced(by: offset), bytes.count - offset)
+                }
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    return
+                }
+                guard written > 0 else { return }
+                offset += written
+            }
+        } catch {
+            // Diagnostics never alter synchronization, Realm writes, or app flow.
+        }
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let previous = (try? Data(contentsOf: previousFileURL)) ?? Data()
+        let current = (try? Data(contentsOf: fileURL)) ?? Data()
+        return String(decoding: previous + current, as: UTF8.self)
+    }
+
+    private func rotateSession() {
+        lock.lock()
+        defer { lock.unlock() }
+        rotateSessionContents()
+    }
+
+    private func rotateSessionContents() {
+        do {
+            guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+            try? FileManager.default.removeItem(at: previousFileURL)
+            try FileManager.default.moveItem(at: fileURL, to: previousFileURL)
+        } catch {
+            // Best effort: a failed diagnostic rotation cannot block sync.
+        }
+    }
+}
+#endif
 
 /// Immutable failure evidence only; these identifiers grant no sync authority.
 @_spi(CloudKitE2E)
@@ -165,7 +311,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
         accountReplacementPolicy: BigSyncCloudAccountReplacementPolicy =
             .serverReconciliation,
         logger: Logging.Logger
-    ) {
+    ) throws {
         let zoneID = recordZoneID ?? CloudKitSynchronizer.defaultCustomZoneID
         let durableStateZoneID = durableStateRecordZoneID ?? zoneID
         let sharedStateBaseURL: URL
@@ -209,12 +355,10 @@ public struct BigSyncBackgroundWorkerConfiguration {
         do {
             installationIdentifier = try clientIdentity.prepareInstallation()
         } catch {
-            preconditionFailure(
-                "BigSyncKit installation identity failed before worker configuration: \(error)"
-            )
+            throw error
         }
         let mutationJournalIdentityProvider:
-            (@Sendable () -> BigSyncMutationJournalIdentity?)?
+            (@Sendable () throws -> BigSyncMutationJournalIdentity?)?
         if accountReplacementPolicy.usesDatasetReplicaBinding {
             let replicaBindingStore: any KeyValueStore =
                 localState?.keyValueStore
@@ -236,9 +380,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
                     installationIdentifier: installationIdentifier
                 )
             } catch {
-                preconditionFailure(
-                    "BigSyncKit replica binding failed before worker configuration: \(error)"
-                )
+                throw error
             }
             let mutationIdentityReader =
                 BigSyncMutationJournalIdentityReader(
@@ -247,7 +389,7 @@ public struct BigSyncBackgroundWorkerConfiguration {
                     key: replicaBindingKey
                 )
             mutationJournalIdentityProvider = {
-                mutationIdentityReader.current()
+                try mutationIdentityReader.currentThrowing()
             }
         } else {
             mutationJournalIdentityProvider = nil
@@ -375,6 +517,12 @@ public actor BigSyncBackgroundActor {
     private var accountAvailabilityRetryTask: Task<Void, Never>?
     @BigSyncBackgroundActor
     private var publicationRestorationTask: Task<Void, Never>?
+    @BigSyncBackgroundActor
+    private var publicationRestorationAttemptID = UUID()
+    @BigSyncBackgroundActor
+    private var publicationRestorationDidSucceed = true
+    @BigSyncBackgroundActor
+    private var publicationRestorationOperation: (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
 #if DEBUG
     @BigSyncBackgroundActor
     private var cloudKitE2ELastRestoredPublicationEvidence:
@@ -396,7 +544,7 @@ public actor BigSyncBackgroundActor {
     }
 
     @BigSyncBackgroundActor
-    public func configure(_ configuration: BigSyncBackgroundWorkerConfiguration) {
+    public func configure(_ configuration: BigSyncBackgroundWorkerConfiguration) throws {
         precondition(
             realmSynchronizer == nil,
             "BigSyncKit worker configuration is one-shot; await shutdown before introducing runtime replacement"
@@ -408,7 +556,7 @@ public actor BigSyncBackgroundActor {
                 configuration.performsAccountAvailabilityPreflight
                     ? nil
                     : { @Sendable in .available }
-        let synchronizer = CloudKitSynchronizer.privateSynchronizer(
+        let synchronizer = try CloudKitSynchronizer.privateSynchronizer(
             synchronizerName: configuration.synchronizerName,
             containerName: configuration.containerName,
             configurations: configuration.configurations,
@@ -457,29 +605,10 @@ public actor BigSyncBackgroundActor {
         cloudKitE2ELastRestoredPublicationEvidence = nil
 #endif
 
-        if let restorationHandler =
-            configuration.durablePublicationEvidenceHandler {
-            publicationRestorationTask = Task(
-                priority: .utility
-            ) { @BigSyncBackgroundActor in
-                do {
-                    try await synchronizer.restoreDurablePublicationEvidence(
-                        deliveringTo: { evidence in
-#if DEBUG
-                            await self.recordRestoredPublicationEvidence(evidence)
-#endif
-                            try await restorationHandler(evidence)
-                        }
-                    )
-                } catch {
-                    configuration.logger.error(
-                        "QSCloudKitSynchronizer >> Could not restore terminal publication evidence: \(error)"
-                    )
-                }
-            }
-        } else {
-            publicationRestorationTask = nil
-        }
+        installPublicationRestoration(
+            for: synchronizer,
+            deliveringTo: configuration.durablePublicationEvidenceHandler
+        )
 
         (synchronizer.modelAdapters.first as? RealmSwiftAdapter)?.mergePolicy = .custom
 
@@ -494,6 +623,32 @@ public actor BigSyncBackgroundActor {
                 return
             }
             _ = await self.synchronizeCloudKit(expectedSynchronizer: synchronizer)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func installPublicationRestoration(
+        for synchronizer: CloudKitSynchronizer,
+        deliveringTo restorationHandler: BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler?
+    ) {
+        if let restorationHandler {
+            publicationRestorationDidSucceed = false
+            publicationRestorationOperation = { [weak self] in
+                let delivered = try await synchronizer.restoreDurablePublicationEvidence(
+                    deliveringTo: { evidence in
+                        try await restorationHandler(evidence)
+#if DEBUG
+                        await self?.recordRestoredPublicationEvidence(evidence)
+#endif
+                    }
+                )
+                guard delivered else { throw CancellationError() }
+            }
+            startPublicationRestorationIfNeeded()
+        } else {
+            publicationRestorationTask = nil
+            publicationRestorationOperation = nil
+            publicationRestorationDidSucceed = true
         }
     }
 
@@ -512,6 +667,7 @@ public actor BigSyncBackgroundActor {
     public func awaitCloudKitE2EPublicationRestoration()
         async -> BigSyncDurablePublicationEvidence? {
         await publicationRestorationTask?.value
+        guard publicationRestorationDidSucceed else { return nil }
         return cloudKitE2ELastRestoredPublicationEvidence
     }
 #endif
@@ -613,19 +769,45 @@ public actor BigSyncBackgroundActor {
     }
 
     @BigSyncBackgroundActor
+    private func startPublicationRestorationIfNeeded() {
+        guard publicationRestorationTask == nil,
+              !publicationRestorationDidSucceed,
+              let operation = publicationRestorationOperation else { return }
+        let attemptID = UUID()
+        publicationRestorationAttemptID = attemptID
+        publicationRestorationTask = Task(priority: .utility) { @BigSyncBackgroundActor [weak self] in
+            do {
+                try await operation()
+                guard let self, self.publicationRestorationAttemptID == attemptID else { return }
+                self.publicationRestorationDidSucceed = true
+            } catch {
+                guard let self, self.publicationRestorationAttemptID == attemptID else { return }
+                // A failure before the first foreground request must not
+                // consume that request just joining an already-failed task.
+                self.publicationRestorationTask = nil
+                if !(error is CancellationError) {
+                    self.logger?.error("QSCloudKitSynchronizer >> Could not restore terminal publication evidence: \(error)")
+                }
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
     @discardableResult
-    public func synchronizeCloudKit()
+    public func synchronizeCloudKit(ifCurrent: @escaping @Sendable () -> Bool = { true })
         async -> CloudKitSynchronizer.SynchronizationResult? {
-        await synchronizeCloudKit(failureHandler: nil)
+        guard ifCurrent() else { return nil }
+        return await synchronizeCloudKit(failureHandler: nil, ifCurrent: ifCurrent)
     }
 
     @BigSyncBackgroundActor
     private func synchronizeCloudKit(
-        failureHandler: BigSyncSynchronizationFailureHandler?
+        failureHandler: BigSyncSynchronizationFailureHandler?,
+        ifCurrent: @escaping @Sendable () -> Bool = { true }
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
         // A cancelled caller owns no admission and must not retire valid
         // startup/retry work belonging to another request.
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, ifCurrent() else { return nil }
 
         // An explicit request supersedes the delayed startup request. Leaving
         // both alive performs a second full drain ten seconds after every
@@ -642,7 +824,8 @@ public actor BigSyncBackgroundActor {
 
         return await synchronizeCloudKit(
             expectedSynchronizer: realmSynchronizer,
-            failureHandler: failureHandler
+            failureHandler: failureHandler,
+            ifCurrent: ifCurrent
         )
     }
 
@@ -668,6 +851,20 @@ public actor BigSyncBackgroundActor {
             return nil
         case .cancelled:
             return nil
+        }
+    }
+
+    /// Preserve the lifecycle caller’s original budget across launch preparation.
+    @BigSyncBackgroundActor
+    @discardableResult
+    public func synchronizeCloudKit(
+        untilUptimeNanoseconds deadline: UInt64
+    ) async -> CloudKitSynchronizer.SynchronizationResult? {
+        switch await synchronizationDeadlineOutcome(BigSyncSynchronizationDeadline(
+            untilUptimeNanoseconds: deadline
+        )) {
+        case .completed(let result): return result
+        case .timedOut, .cancelled: return nil
         }
     }
 
@@ -729,6 +926,11 @@ public actor BigSyncBackgroundActor {
         guard race.remainingNanoseconds > 0 else {
             return Task.isCancelled ? .cancelled : .timedOut
         }
+#if DEBUG
+        let diagnosticCorrelationID = BigSyncDebugDiagnostics.currentOrNewCorrelationID()
+        let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+        BigSyncDebugDiagnostics.record(.syncDeadlineStarted, correlationID: diagnosticCorrelationID)
+#endif
         let synchronizationTask = Task { @BigSyncBackgroundActor [weak self] in
             guard !Task.isCancelled else {
                 await race.resolve(.cancelled)
@@ -749,6 +951,9 @@ public actor BigSyncBackgroundActor {
             await race.value()
         } onCancel: {
             synchronizationTask.cancel()
+#if DEBUG
+            BigSyncDebugDiagnostics.record(.syncCancelled, correlationID: diagnosticCorrelationID)
+#endif
             // This task settles only the local race actor. It does not cancel,
             // replace, or otherwise mutate a shared synchronizer.
             Task { await race.resolve(.cancelled) }
@@ -760,24 +965,45 @@ public actor BigSyncBackgroundActor {
         // returned, cancellation still owns delivery and must not be reported
         // as a completed request or lifecycle timeout.
         if Task.isCancelled { return .cancelled }
+#if DEBUG
+        if case .timedOut = outcome {
+            BigSyncDebugDiagnostics.record(
+                .syncDeadlineElapsed,
+                correlationID: diagnosticCorrelationID,
+                elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+            )
+        } else if case .completed(_) = outcome {
+            BigSyncDebugDiagnostics.record(
+                .syncCompleted,
+                correlationID: diagnosticCorrelationID,
+                elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+            )
+        }
+#endif
         return outcome
     }
 
     @BigSyncBackgroundActor
     private func synchronizeCloudKit(
         expectedSynchronizer: CloudKitSynchronizer,
-        failureHandler: BigSyncSynchronizationFailureHandler? = nil
+        failureHandler: BigSyncSynchronizationFailureHandler? = nil,
+        ifCurrent: @escaping @Sendable () -> Bool = { true }
     ) async -> CloudKitSynchronizer.SynchronizationResult? {
-        guard !Task.isCancelled,
+        guard !Task.isCancelled, ifCurrent(),
               realmSynchronizer === expectedSynchronizer else {
             return nil
         }
+        startPublicationRestorationIfNeeded()
+        let restorationAttemptID = publicationRestorationAttemptID
         await publicationRestorationTask?.value
-        guard !Task.isCancelled,
+        guard !Task.isCancelled, ifCurrent(),
               realmSynchronizer === expectedSynchronizer else {
             return nil
         }
-        publicationRestorationTask = nil
+        if publicationRestorationAttemptID == restorationAttemptID {
+            publicationRestorationTask = nil
+        }
+        guard publicationRestorationDidSucceed else { return nil }
         let containerIdentifier = expectedSynchronizer.containerIdentifier
 
         // Explicit lifecycle requests share the same cheap durable gate used
@@ -793,7 +1019,7 @@ public actor BigSyncBackgroundActor {
             let availability = await accountAvailabilityGate.availability(
                 for: containerIdentifier
             )
-            guard !Task.isCancelled,
+            guard !Task.isCancelled, ifCurrent(),
                   realmSynchronizer === expectedSynchronizer else {
                 return nil
             }
@@ -815,14 +1041,16 @@ public actor BigSyncBackgroundActor {
                 // transition notification, so retain its bounded poll.
                 if status == .couldNotDetermine {
                     scheduleAccountAvailabilityRetry(
-                        expectedSynchronizer: expectedSynchronizer
+                        expectedSynchronizer: expectedSynchronizer,
+                        ifCurrent: ifCurrent
                     )
                 }
                 return nil
             case .failed:
                 logger?.warning("QSCloudKitSynchronizer >> Synchronization deferred because iCloud account status failed")
                 scheduleAccountAvailabilityRetry(
-                    expectedSynchronizer: expectedSynchronizer
+                    expectedSynchronizer: expectedSynchronizer,
+                    ifCurrent: ifCurrent
                 )
                 return nil
             }
@@ -835,11 +1063,11 @@ public actor BigSyncBackgroundActor {
             expectedSynchronizer.accountValidationRequired = false
         }
 
-        guard !Task.isCancelled,
+        guard !Task.isCancelled, ifCurrent(),
               realmSynchronizer === expectedSynchronizer else { return nil }
         do {
             let result = try await expectedSynchronizer.synchronize(failureHandler: failureHandler)
-            guard !Task.isCancelled,
+            guard !Task.isCancelled, ifCurrent(),
                   realmSynchronizer === expectedSynchronizer else {
                 return nil
             }
@@ -857,11 +1085,12 @@ public actor BigSyncBackgroundActor {
     @BigSyncBackgroundActor
     private func scheduleAccountAvailabilityRetry(
         expectedSynchronizer: CloudKitSynchronizer,
+        ifCurrent: @escaping @Sendable () -> Bool = { true },
         sleep: @escaping @Sendable (UInt64) async throws -> Void = {
             try await Task.sleep(nanoseconds: $0)
         }
     ) {
-        guard !Task.isCancelled,
+        guard !Task.isCancelled, ifCurrent(),
               realmSynchronizer === expectedSynchronizer else { return }
         accountAvailabilityRetryTask?.cancel()
         accountAvailabilityRetryTask = Task(priority: .utility) {
@@ -874,18 +1103,24 @@ public actor BigSyncBackgroundActor {
             // A cancelled timer may already be queued to resume on this
             // actor. It must not clear a newer retry's handle. Promote weak
             // ownership only after sleeping so idle retries retain no worker.
-            guard !Task.isCancelled,
+            guard !Task.isCancelled, ifCurrent(),
                   let self, let expectedSynchronizer,
                   realmSynchronizer === expectedSynchronizer else { return }
             accountAvailabilityRetryTask = nil
             _ = await synchronizeCloudKit(
-                expectedSynchronizer: expectedSynchronizer
+                expectedSynchronizer: expectedSynchronizer,
+                ifCurrent: ifCurrent
             )
         }
     }
 
     @BigSyncBackgroundActor
-    public func cancelSynchronization() async {
+    public func cancelSynchronization(ifCurrent: @Sendable () -> Bool = { true }) async {
+        guard ifCurrent() else { return }
+#if DEBUG
+        let diagnosticCorrelationID = BigSyncDebugDiagnostics.currentOrNewCorrelationID()
+        BigSyncDebugDiagnostics.record(.syncAttemptCancelled, correlationID: diagnosticCorrelationID)
+#endif
         initialSynchronizationTask?.cancel()
         initialSynchronizationTask = nil
         accountAvailabilityRetryTask?.cancel()
@@ -896,6 +1131,9 @@ public actor BigSyncBackgroundActor {
         }
 
         await realmSynchronizer.cancelSynchronizationAndWait()
+#if DEBUG
+        BigSyncDebugDiagnostics.record(.syncAttemptSettled, correlationID: diagnosticCorrelationID)
+#endif
     }
 
     /// Restores the current account's redacted, durable CloudKit health state.
@@ -1045,7 +1283,32 @@ public actor BigSyncBackgroundActor {
     /// production configuration or introducing a second admission path.
     @BigSyncBackgroundActor
     func _test_installPublicationRestoration(_ task: Task<Void, Never>) {
+        publicationRestorationAttemptID = UUID()
+        publicationRestorationDidSucceed = true
+        publicationRestorationOperation = nil
         publicationRestorationTask = task
+    }
+
+    @BigSyncBackgroundActor
+    func _test_installPublicationRestorationHandler(
+        _ handler: @escaping BigSyncBackgroundWorkerConfiguration.DurablePublicationEvidenceHandler
+    ) {
+        guard let realmSynchronizer else {
+            preconditionFailure("Install the test synchronizer before restoration")
+        }
+        precondition(publicationRestorationOperation == nil && publicationRestorationTask == nil)
+        installPublicationRestoration(for: realmSynchronizer, deliveringTo: handler)
+    }
+
+    @BigSyncBackgroundActor
+    func _test_installPublicationRestorationOperation(
+        _ operation: @escaping @BigSyncBackgroundActor @Sendable () async throws -> Void
+    ) {
+        publicationRestorationAttemptID = UUID()
+        publicationRestorationTask = nil
+        publicationRestorationDidSucceed = false
+        publicationRestorationOperation = operation
+        startPublicationRestorationIfNeeded()
     }
 
     /// Hold only the existing retry sleep; production callers always use

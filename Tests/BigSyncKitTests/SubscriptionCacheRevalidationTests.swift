@@ -4,14 +4,32 @@ import Logging
 import XCTest
 @testable import BigSyncKit
 
-private final class SubscriptionCacheStore: NSObject, KeyValueStore {
+private final class SubscriptionCacheStore: NSObject, DurableKeyValueStore {
     private var values: [String: Any] = [:]
-    func object(forKey key: String) -> Any? { values[key] }
+    var denyReads = false
+    private(set) var durableWrites = 0
+    func object(forKey key: String) -> Any? { denyReads ? nil : values[key] }
     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
     func set(value: Any?, forKey key: String) { values[key] = value }
     func set(boolValue: Bool, forKey key: String) { values[key] = boolValue }
     func removeObject(forKey key: String) { values.removeValue(forKey: key) }
     func synchronize() -> Bool { true }
+    func prepareForUse() throws { try validateDurability() }
+    func validateDurability() throws {
+        if denyReads { throw CancellationError() }
+    }
+    func durableObject(forKey key: String) throws -> Any? {
+        try validateDurability()
+        return values[key]
+    }
+    func setDurably(value: Any?, forKey key: String) throws {
+        durableWrites += 1
+        values[key] = value
+    }
+    func removeDurably(forKey key: String) throws {
+        durableWrites += 1
+        values.removeValue(forKey: key)
+    }
 }
 
 private final class SubscriptionCacheDatabase: NSObject, CloudKitDatabaseAdapter {
@@ -127,7 +145,7 @@ private actor SubscriptionCacheServices: CloudKitSubscriptionStore,
 
 final class SubscriptionCacheRevalidationTests: XCTestCase {
     @BigSyncBackgroundActor
-    private func fixture() -> (CloudKitSynchronizer, SubscriptionCacheServices) {
+    private func fixture(store: SubscriptionCacheStore = SubscriptionCacheStore()) -> (CloudKitSynchronizer, SubscriptionCacheServices) {
         let services = SubscriptionCacheServices()
         let nonce = UUID().uuidString
         let synchronizer = CloudKitSynchronizer(
@@ -138,7 +156,7 @@ final class SubscriptionCacheRevalidationTests: XCTestCase {
                 zoneName: "subscription-cache",
                 ownerName: CKCurrentUserDefaultName
             ),
-            keyValueStore: SubscriptionCacheStore(),
+            keyValueStore: store,
             accountIdentifierProvider: { await services.currentAccount() },
             accountStatusProvider: { .available },
             changeFeed: services,
@@ -150,6 +168,39 @@ final class SubscriptionCacheRevalidationTests: XCTestCase {
             logger: Logger(label: "SubscriptionCacheRevalidationTests")
         )
         return (synchronizer, services)
+    }
+
+    @BigSyncBackgroundActor
+    func testInterruptedSubscriptionReadPreservesAllIDsAndAllowsRetry() throws {
+        let store = SubscriptionCacheStore()
+        let (synchronizer, _) = fixture(store: store)
+        let firstZone = CKRecordZone.ID(zoneName: "first")
+        let secondZone = CKRecordZone.ID(zoneName: "second")
+        try synchronizer.persistDatabaseSubscriptionID("database")
+        try synchronizer.persistSubscriptionID("first", for: firstZone)
+        try synchronizer.persistSubscriptionID("second", for: secondZone)
+        let writesBeforeDenial = store.durableWrites
+
+        store.denyReads = true
+        XCTAssertThrowsError(try synchronizer.persistDatabaseSubscriptionID("replacement")) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+        XCTAssertThrowsError(try synchronizer.persistSubscriptionID(nil, for: firstZone)) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+        XCTAssertThrowsError(try synchronizer.persistRemovingSubscriptionID("second")) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+        XCTAssertEqual(store.durableWrites, writesBeforeDenial)
+
+        store.denyReads = false
+        XCTAssertEqual(try synchronizer.readDatabaseSubscriptionIDDurably(), "database")
+        XCTAssertEqual(try synchronizer.readStoredSubscriptionIDDurably(for: firstZone), "first")
+        XCTAssertEqual(try synchronizer.readStoredSubscriptionIDDurably(for: secondZone), "second")
+        try synchronizer.persistDatabaseSubscriptionID("replacement")
+        XCTAssertEqual(try synchronizer.readDatabaseSubscriptionIDDurably(), "replacement")
+        XCTAssertEqual(try synchronizer.readStoredSubscriptionIDDurably(for: firstZone), "first")
+        XCTAssertEqual(try synchronizer.readStoredSubscriptionIDDurably(for: secondZone), "second")
     }
 
     @BigSyncBackgroundActor

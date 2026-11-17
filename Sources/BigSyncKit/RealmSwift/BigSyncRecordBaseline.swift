@@ -288,7 +288,7 @@ struct BigSyncRecordRebaseContext: Sendable, Equatable {
         guard BigSyncMutationTrackingRegistry.recordEvidenceUse(for: realm.configuration) == .legacyAutomatic else {
             throw BigSyncRecordRebaseError.retentionOnly
         }
-        guard let identity = BigSyncMutationTracking.currentJournalIdentity(
+        guard let identity = try BigSyncMutationTracking.currentJournalIdentity(
             verifyingPendingMutationsFor: [Object](), in: realm
         ), identity.replicaBindingGenerationIdentifier == binding else {
             throw CancellationError()
