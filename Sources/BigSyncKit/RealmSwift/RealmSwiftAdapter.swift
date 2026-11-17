@@ -9172,8 +9172,17 @@ public final class RealmSwiftAdapter:
                 encodedSystemFields.append(try encodedRecord(record, onlySystemFields: true))
             }
 
+#if DEBUG
+            let diagnosticCorrelationID = UUID()
+            let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
+#endif
             let performAcknowledgementWrite: () async throws -> Void = {
                 try await persistenceRealm.asyncWritePreservingOwnership {
+#if DEBUG
+                BigSyncDebugDiagnostics.record(
+                    .uploadAckChunkBodyStarted, correlationID: diagnosticCorrelationID
+                )
+#endif
                 try validateOwner()
                 var acknowledgedInThisWrite = [String: String]()
                 var acknowledgedEntityTypesInThisWrite = [String: String]()
@@ -9230,35 +9239,20 @@ public final class RealmSwiftAdapter:
                 }
             }
 #if DEBUG
-            let diagnosticCorrelationID = UUID()
-            let diagnosticStartedAt = DispatchTime.now().uptimeNanoseconds
             BigSyncDebugDiagnostics.record(
                 .uploadAckChunkRequested,
                 correlationID: diagnosticCorrelationID,
                 count: chunk.count
             )
             do {
-                try await RealmWriteLifecycleObservation.$didAdmit.withValue({
-                    BigSyncDebugDiagnostics.record(.uploadAckChunkAdmitted, correlationID: diagnosticCorrelationID)
-                }) {
-                    try await RealmWriteLifecycleObservation.$didStartBody.withValue({
-                        BigSyncDebugDiagnostics.record(.uploadAckChunkBodyStarted, correlationID: diagnosticCorrelationID)
-                    }) {
-                        try await RealmWriteLifecycleObservation.$didSubmitCommit.withValue({
-                            BigSyncDebugDiagnostics.record(.uploadAckChunkCommitSubmitted, correlationID: diagnosticCorrelationID)
-                        }) {
-                            try await RealmWriteLifecycleObservation.$didSettle.withValue({
-                                BigSyncDebugDiagnostics.record(
-                                    .uploadAckChunkSettled,
-                                    correlationID: diagnosticCorrelationID,
-                                    elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
-                                )
-                            }) {
-                                try await performAcknowledgementWrite()
-                            }
-                        }
-                    }
-                }
+                try await performAcknowledgementWrite()
+                // The owned-write call returns only after durable commit settlement.
+                // The wrapper has no separate native admission or submission witness.
+                BigSyncDebugDiagnostics.record(
+                    .uploadAckChunkSettled,
+                    correlationID: diagnosticCorrelationID,
+                    elapsedMilliseconds: (DispatchTime.now().uptimeNanoseconds - diagnosticStartedAt) / 1_000_000
+                )
             } catch {
                 BigSyncDebugDiagnostics.record(
                     .uploadAckChunkFailed,

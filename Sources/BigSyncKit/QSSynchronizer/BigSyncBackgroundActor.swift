@@ -17,8 +17,7 @@ public enum BigSyncDebugDiagnosticEvent: String, Sendable {
     case syncWorkerStarted, syncWorkerSettled
     case syncDeadlineStarted, syncDeadlineElapsed, syncCompleted, syncCancelled
     case syncAttemptCancelled, syncAttemptSettled
-    case uploadAckChunkRequested, uploadAckChunkAdmitted, uploadAckChunkBodyStarted
-    case uploadAckChunkCommitSubmitted
+    case uploadAckChunkRequested, uploadAckChunkBodyStarted
     case uploadAckChunkSettled, uploadAckChunkFailed
     case inboundApplyStarted, inboundApplySettled
     case backgroundExecutionStarted, backgroundExecutionInterrupted, backgroundExecutionSettled
