@@ -42,6 +42,8 @@ private enum SubscriptionReviewUnexpectedOperation: Error { case unrelatedTransp
 private actor SubscriptionReviewServices: CloudKitSubscriptionStore,
     CloudKitChangeFeed, CloudKitZoneStore, CloudKitRecordStore {
     private var account = "account-a"
+    private var lookupError: Error?
+    private var lookupResponse: CKSubscription?
     private var deleteError: Error?
     private var replacementAccountOnDelete: String?
     private var subscriptions: [String: CKSubscription] = [:]
@@ -51,7 +53,8 @@ private actor SubscriptionReviewServices: CloudKitSubscriptionStore,
     private var saveEntered: XCTestExpectation?
     private var deleteGate: SubscriptionReviewGate?
     private var deleteEntered: XCTestExpectation?
-    private var accountReadCount = 0
+    private(set) var accountReadCount = 0
+    private(set) var accountReadCountAtLastRequest = 0
     private var pausedAccountRead: (
         number: Int, gate: SubscriptionReviewGate, entered: XCTestExpectation
     )?
@@ -85,6 +88,11 @@ private actor SubscriptionReviewServices: CloudKitSubscriptionStore,
         replacementAccountOnDelete = replacementAccount
     }
 
+    func configureLookup(error: Error? = nil, response: CKSubscription? = nil) {
+        lookupError = error
+        lookupResponse = response
+    }
+
     func pauseLookup(gate: SubscriptionReviewGate, entered: XCTestExpectation) {
         lookupGate = gate
         lookupEntered = entered
@@ -97,16 +105,23 @@ private actor SubscriptionReviewServices: CloudKitSubscriptionStore,
 
     func subscription(withID identifier: CKSubscription.ID) async throws -> CKSubscription? {
         lookupCount += 1
+        accountReadCountAtLastRequest = accountReadCount
         let gate = lookupGate
         lookupGate = nil
         lookupEntered?.fulfill()
         lookupEntered = nil
         await gate?.wait()
-        return subscriptions[identifier]
+        if let lookupError {
+            return try await DefaultCloudKitDatabaseAdapter.fetchSubscriptionIfPresent(withID: identifier) {
+                throw lookupError
+            }
+        }
+        return lookupResponse ?? subscriptions[identifier]
     }
 
     func save(subscription: CKSubscription) async throws -> CKSubscription {
         saveCount += 1
+        accountReadCountAtLastRequest = accountReadCount
         subscriptions[subscription.subscriptionID] = subscription
         let gate = saveGate
         saveGate = nil
@@ -118,6 +133,7 @@ private actor SubscriptionReviewServices: CloudKitSubscriptionStore,
 
     func deleteSubscription(withID identifier: CKSubscription.ID) async throws {
         deletedIDs.append(identifier)
+        accountReadCountAtLastRequest = accountReadCount
         let gate = deleteGate
         deleteGate = nil
         deleteEntered?.fulfill()
@@ -186,8 +202,12 @@ final class HotfixSubscriptionSafetyTests: XCTestCase {
         return (synchronizer, service)
     }
 
-    private func partialError(_ failures: [AnyHashable: Error]) -> CKError {
-        CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: failures])
+    private func partialError(
+        _ failures: [AnyHashable: Error], userInfo: [String: Any] = [:]
+    ) -> CKError {
+        var info = userInfo
+        info[CKPartialErrorsByItemIDKey] = failures
+        return CKError(.partialFailure, userInfo: info)
     }
 
     @BigSyncBackgroundActor
@@ -232,6 +252,7 @@ final class HotfixSubscriptionSafetyTests: XCTestCase {
         let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
         let failures: [[AnyHashable: Error]] = [
             ["different-subscription": CKError(.unknownItem)],
+            [identifier: partialError(["different-subscription": CKError(.unknownItem)])],
             [identifier: CKError(.unknownItem), "different-subscription": CKError(.networkFailure)],
             [identifier: CKError(.networkFailure)],
             [:],
@@ -246,6 +267,140 @@ final class HotfixSubscriptionSafetyTests: XCTestCase {
             }
             XCTAssertEqual(synchronizer.subscriptionIDForDatabaseSubscription(), identifier)
         }
+    }
+
+    @BigSyncBackgroundActor
+    func testConstrainedSubscriptionLookupRetainsCacheWithoutAnotherRequest() async throws {
+        let (synchronizer, service) = fixture()
+        try await synchronizer.subscribeForChangesInDatabase()
+        let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
+        let errors = [
+            CKError(.unknownItem, userInfo: [CKErrorRetryAfterKey: 60]),
+            CKError(.unknownItem, userInfo: [CKErrorRetryAfterKey: "malformed"]),
+            CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: CKError(.notAuthenticated)]),
+            CKError(.unknownItem, userInfo: [
+                NSUnderlyingErrorKey: partialError(["different-subscription": CKError(.unknownItem)]),
+            ]),
+        ]
+
+        for lookupError in errors {
+            let original = lookupError as NSError
+            await service.configureLookup(error: original)
+            do {
+                try await synchronizer.subscribeForChangesInDatabase()
+                XCTFail("An ambiguous lookup cannot authorize a subscription save")
+            } catch {
+                XCTAssertTrue((error as NSError) === original)
+            }
+            let subscribeReads = await service.accountReadCount
+            let lookupReads = await service.accountReadCountAtLastRequest
+            XCTAssertEqual(subscribeReads, lookupReads)
+
+            do {
+                try await synchronizer.cancelSubscriptionForChangesInDatabase()
+                XCTFail("An ambiguous lookup cannot authorize cancellation")
+            } catch {
+                XCTAssertTrue((error as NSError) === original)
+            }
+            let cancelReads = await service.accountReadCount
+            let cancelLookupReads = await service.accountReadCountAtLastRequest
+            XCTAssertEqual(cancelReads, cancelLookupReads)
+            XCTAssertEqual(synchronizer.subscriptionIDForDatabaseSubscription(), identifier)
+        }
+        let saves = await service.saveCount
+        let deletions = await service.deletedIDs
+        XCTAssertEqual(saves, 1)
+        XCTAssertTrue(deletions.isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testSubscriptionLookupTreatsOnlyTheRequestedMissingItemAsAbsent() async throws {
+        let (synchronizer, service) = fixture()
+        await service.configureLookup(error: CKError(.unknownItem))
+        try await synchronizer.subscribeForChangesInDatabase()
+        let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
+        let foreignMiss = partialError(["different-subscription": CKError(.unknownItem)]) as NSError
+        await service.configureLookup(error: foreignMiss)
+        do {
+            try await synchronizer.cancelSubscriptionForChangesInDatabase()
+            XCTFail("Another subscription's absence cannot clear this registration")
+        } catch {
+            XCTAssertTrue((error as NSError) === foreignMiss)
+        }
+        XCTAssertEqual(synchronizer.subscriptionIDForDatabaseSubscription(), identifier)
+
+        await service.configureLookup(error: partialError([identifier: CKError(.unknownItem)]))
+        try await synchronizer.cancelSubscriptionForChangesInDatabase()
+        XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
+        let saves = await service.saveCount
+        let deletions = await service.deletedIDs
+        XCTAssertEqual(saves, 1)
+        XCTAssertTrue(deletions.isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testConstrainedSubscriptionDeletionRetainsCacheWithoutAnotherAccountRead() async throws {
+        let (synchronizer, service) = fixture()
+        try await synchronizer.subscribeForChangesInDatabase()
+        let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
+        let missing = CKError(.unknownItem)
+        let retryInfo = [CKErrorRetryAfterKey: 60]
+        let accountInfo = [NSUnderlyingErrorKey: CKError(.accountTemporarilyUnavailable)]
+        let errors = [
+            CKError(.unknownItem, userInfo: retryInfo),
+            CKError(.unknownItem, userInfo: accountInfo),
+            partialError([identifier: missing], userInfo: retryInfo),
+            partialError([identifier: missing], userInfo: accountInfo),
+            partialError([identifier: CKError(.unknownItem, userInfo: retryInfo)]),
+            partialError([identifier: CKError(.unknownItem, userInfo: accountInfo)]),
+        ]
+
+        for deleteError in errors {
+            let original = deleteError as NSError
+            await service.configureDeletion(error: original)
+            do {
+                try await synchronizer.cancelSubscriptionForChangesInDatabase()
+                XCTFail("A constrained delete cannot clear the subscription registration")
+            } catch {
+                XCTAssertTrue((error as NSError) === original)
+            }
+            XCTAssertEqual(synchronizer.subscriptionIDForDatabaseSubscription(), identifier)
+            let accountReads = await service.accountReadCount
+            let deleteReads = await service.accountReadCountAtLastRequest
+            XCTAssertEqual(accountReads, deleteReads)
+        }
+        let deletions = await service.deletedIDs
+        XCTAssertEqual(deletions, Array(repeating: identifier, count: errors.count))
+    }
+
+    @BigSyncBackgroundActor
+    func testSubscriptionLookupRejectsMismatchedResponseID() async throws {
+        let (synchronizer, service) = fixture()
+        try await synchronizer.subscribeForChangesInDatabase()
+        let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
+        let foreign = CKDatabaseSubscription(subscriptionID: "different-subscription")
+        let notifications = CKSubscription.NotificationInfo()
+        notifications.shouldSendContentAvailable = true
+        foreign.notificationInfo = notifications
+        await service.configureLookup(response: foreign)
+
+        do {
+            try await synchronizer.subscribeForChangesInDatabase()
+            XCTFail("The foreign response cannot replace the registered subscription")
+        } catch let error as CocoaError {
+            XCTAssertEqual(error.code, .coderValueNotFound)
+        }
+        do {
+            try await synchronizer.cancelSubscriptionForChangesInDatabase()
+            XCTFail("The foreign response cannot authorize deletion")
+        } catch let error as CocoaError {
+            XCTAssertEqual(error.code, .coderValueNotFound)
+        }
+        XCTAssertEqual(synchronizer.subscriptionIDForDatabaseSubscription(), identifier)
+        let saves = await service.saveCount
+        let deletions = await service.deletedIDs
+        XCTAssertEqual(saves, 1)
+        XCTAssertTrue(deletions.isEmpty)
     }
 
     @BigSyncBackgroundActor

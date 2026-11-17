@@ -187,6 +187,19 @@ public extension CloudKitSynchronizer {
         }
     }
 
+    @BigSyncBackgroundActor
+    private func lookupSubscription(
+        identifier: CKSubscription.ID,
+        accountFence: CloudKitSubscriptionAccountFence
+    ) async throws -> CKSubscription? {
+        let existing = try await subscriptionStore.subscription(withID: identifier)
+        try await revalidateSubscriptionAccountFence(accountFence)
+        if let existing, existing.subscriptionID != identifier {
+            throw CocoaError(.coderValueNotFound)
+        }
+        return existing
+    }
+
     /// CloudKit subscriptions are shared by every client of this database.
     /// Never adopt an arbitrary subscription merely because it has the same
     /// type: it may belong to another feature/app and not request a
@@ -275,10 +288,9 @@ public extension CloudKitSynchronizer {
             // metadata is not proof that any server subscription still exists.
             try persistDatabaseSubscriptionID(nil)
         }
-        let existing = try await subscriptionStore.subscription(
-            withID: expectedSubscriptionID
+        let existing = try await lookupSubscription(
+            identifier: expectedSubscriptionID, accountFence: accountFence
         )
-        try await revalidateSubscriptionAccountFence(accountFence)
         if let existing {
             guard existing is CKDatabaseSubscription else {
                 // A deterministic ID resolving to an incompatible server type
@@ -356,10 +368,9 @@ public extension CloudKitSynchronizer {
             // metadata; an unknown server subscription is not ours to delete.
             try persistSubscriptionID(nil, for: zoneID)
         }
-        let existing = try await subscriptionStore.subscription(
-            withID: expectedSubscriptionID
+        let existing = try await lookupSubscription(
+            identifier: expectedSubscriptionID, accountFence: accountFence
         )
-        try await revalidateSubscriptionAccountFence(accountFence)
         if let existing {
             guard let zoneSubscription = existing as? CKRecordZoneSubscription,
                   zoneSubscription.zoneID == zoneID else {
@@ -436,10 +447,9 @@ public extension CloudKitSynchronizer {
             try persistDatabaseSubscriptionID(nil)
         }
 
-        let existing = try await subscriptionStore.subscription(
-            withID: expectedSubscriptionID
+        let existing = try await lookupSubscription(
+            identifier: expectedSubscriptionID, accountFence: accountFence
         )
-        try await revalidateSubscriptionAccountFence(accountFence)
         guard let existing else {
             // Exact absence already satisfies cancellation. Clear stale local
             // registration without issuing a delete for a nonexistent object.
@@ -512,10 +522,9 @@ public extension CloudKitSynchronizer {
             try persistSubscriptionID(nil, for: zoneID)
         }
 
-        let existing = try await subscriptionStore.subscription(
-            withID: expectedSubscriptionID
+        let existing = try await lookupSubscription(
+            identifier: expectedSubscriptionID, accountFence: accountFence
         )
-        try await revalidateSubscriptionAccountFence(accountFence)
         guard let existing else {
             try persistSubscriptionID(nil, for: zoneID)
             return
@@ -544,7 +553,7 @@ public extension CloudKitSynchronizer {
             // deleted this deterministic ID. Its absence is the desired result,
             // not an error that should pin our cached registration forever.
             // An unrelated partial failure must not erase local retry state.
-            guard subscriptionDeletionReportsMissingItem(
+            guard BigSyncCloudKitRetryPolicy.allowsMissingSubscriptionAsAbsence(
                 error, identifier: identifier
             ) else { throw error }
         }
@@ -552,23 +561,5 @@ public extension CloudKitSynchronizer {
         // nor cancellation may turn an old response into local success.
         try await revalidateSubscriptionAccountFence(accountFence)
         try persistRemovingSubscriptionID(identifier)
-    }
-
-    @BigSyncBackgroundActor
-    private func subscriptionDeletionReportsMissingItem(
-        _ error: Error,
-        identifier: CKSubscription.ID
-    ) -> Bool {
-        guard let cloudKitError = error as? CKError else { return false }
-        if cloudKitError.code == .unknownItem { return true }
-        guard cloudKitError.code == .partialFailure,
-              let failures = cloudKitError.userInfo[
-                CKPartialErrorsByItemIDKey
-              ] as? [AnyHashable: Error],
-              failures.count == 1,
-              let itemError = failures[identifier] as? CKError else {
-            return false
-        }
-        return itemError.code == .unknownItem
     }
 }
