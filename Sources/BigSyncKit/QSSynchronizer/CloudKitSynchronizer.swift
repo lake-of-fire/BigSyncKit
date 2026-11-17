@@ -2106,12 +2106,10 @@ public class CloudKitSynchronizer: NSObject {
                 )
             }
 #endif
-            // Each actual Realm write owns its assertion through rollback or
-            // commit settlement, including writes in unstructured callbacks.
-            // A waiter or orchestration task may finish independently.
-            await RealmWriteExecutionProtection.$acquire.withValue({
-                try await BigSyncDurableWriteExecution.acquire()
-            }) {
+            // The application installs the synchronous execution policy before
+            // workers start. Each storage operation acquires its own assertion
+            // through rollback or commit settlement, including detached callbacks.
+            // Do not shadow that policy with a task-local factory that re-enters it.
             do {
                 await waitForRunCallbacksToFinish()
                 try checkSynchronizationAttempt(attemptID)
@@ -2273,7 +2271,6 @@ public class CloudKitSynchronizer: NSObject {
             } catch {
                 guard synchronizationAttemptID == attemptID else { return }
                 await failSynchronization(error: error, for: attemptID)
-            }
             }
         }
     }
