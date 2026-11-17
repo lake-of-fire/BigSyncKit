@@ -23,7 +23,7 @@ final class BigSyncDurableWriteExecutionTests: XCTestCase {
         init() {
             state.installReleaseHandler { [weak self] in
                 guard let self else { return }
-                lock.withLock { releaseCount += 1 }
+                self.lock.withLock { self.releaseCount += 1 }
             }
         }
 
