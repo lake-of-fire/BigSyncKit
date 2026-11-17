@@ -128,6 +128,47 @@ public struct CloudKitRecordZoneChangePage: Sendable {
         self.deletedRecordIDs = deletedRecordIDs
         self.moreComing = moreComing
     }
+
+    init<Modification>(
+        modificationResultsByID: [CKRecord.ID: Result<Modification, Error>],
+        changeToken: CKServerChangeToken?,
+        deletedRecordIDs: [CKRecord.ID],
+        moreComing: Bool,
+        recordForModification: (Modification) -> CKRecord
+    ) throws {
+        var records: [CKRecord] = []
+        records.reserveCapacity(modificationResultsByID.count)
+        var failures: [CKRecord.ID: Error] = [:]
+        for (recordID, result) in modificationResultsByID {
+            switch result {
+            case .success(let modification):
+                records.append(recordForModification(modification))
+            case .failure(let error):
+                failures[recordID] = error
+            }
+        }
+
+        // A failed page must be replayed from the previous cursor. Keep the
+        // record ID for a singleton zone loss so the caller can distinguish
+        // an item failure from an error thrown by the zone operation itself.
+        if failures.count == 1, let (recordID, error) = failures.first {
+            let loss = CloudKitLossClassifier.classify(error: error, defaultZoneID: recordID.zoneID)
+            if loss.zoneDispositions.isEmpty {
+                throw error
+            }
+        }
+        guard failures.isEmpty else {
+            throw CKError(.partialFailure, userInfo: [
+                CKPartialErrorsByItemIDKey: failures.mapValues { $0 as NSError },
+            ])
+        }
+        self.init(
+            cursor: try RecordZoneChangeCursor(token: changeToken),
+            records: records,
+            deletedRecordIDs: deletedRecordIDs,
+            moreComing: moreComing
+        )
+    }
 }
 
 @available(iOS 15.0, macOS 12.0, watchOS 8.0, *)
@@ -164,7 +205,13 @@ extension DefaultCloudKitDatabaseAdapter: CloudKitChangeFeed {
     public func recordZoneChanges(in zoneID: CKRecordZone.ID, since cursor: RecordZoneChangeCursor?, desiredKeys: [CKRecord.FieldKey]?, resultsLimit: Int?) async throws -> CloudKitRecordZoneChangePage {
         return try await database.configuredWith(configuration: historyConfiguration(), body: { database in
             let page = try await database.recordZoneChanges(inZoneWith: zoneID, since: try cursor?.token(), desiredKeys: desiredKeys, resultsLimit: resultsLimit)
-            return try CloudKitRecordZoneChangePage(cursor: try RecordZoneChangeCursor(token: page.changeToken), records: page.modificationResultsByID.values.map { try $0.get().record }, deletedRecordIDs: page.deletions.map(\.recordID), moreComing: page.moreComing)
+            return try CloudKitRecordZoneChangePage(
+                modificationResultsByID: page.modificationResultsByID,
+                changeToken: page.changeToken,
+                deletedRecordIDs: page.deletions.map(\.recordID),
+                moreComing: page.moreComing,
+                recordForModification: \.record
+            )
         })
     }
 }

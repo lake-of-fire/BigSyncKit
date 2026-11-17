@@ -1533,6 +1533,11 @@ extension CloudKitSynchronizer {
                         throw error
                     }
                     try validateFetchOwner()
+                    // Record-level failures from a returned page cannot prove
+                    // zone absence. Explicit terminal and encrypted losses
+                    // still go through the normal lifecycle handling.
+                    let hasRecordFailures = !classification.affectedRecordIDs.isEmpty
+                    if disposition == .missing, hasRecordFailures { throw error }
                     if constraints.isErrorGraphComplete {
                         try await revalidateRunContext(context, preserving: error)
                     }
@@ -1550,6 +1555,7 @@ extension CloudKitSynchronizer {
                     }
                     try validateFetchOwner()
                     guard isChangeFeedMigrationActive,
+                          !hasRecordFailures,
                           constraints.isErrorGraphComplete,
                           !constraints.requiresDeferredRetry,
                           !constraints.requestsTokenRecovery else { throw error }

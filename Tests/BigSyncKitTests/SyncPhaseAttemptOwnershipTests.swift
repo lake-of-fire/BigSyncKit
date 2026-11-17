@@ -179,6 +179,7 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     private var zoneFailure: NSError?
     private var zoneSaveFailure: NSError?
     private var zonePageFailure: NSError?
+    private var zonePageModifications: [CKRecord.ID: Result<CKRecord, Error>]?
     private var databaseFailure: NSError?
     private(set) var zonePageCount = 0
     private var observeTransportFailure: (@Sendable () async -> Void)?
@@ -188,6 +189,9 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     func failMutation(_ error: NSError) { mutationFailure = error }
     func failDatabase(_ error: NSError) { databaseFailure = error }
     func failZonePage(_ error: NSError) { zonePageFailure = error }
+    func returnZonePageModifications(_ results: [CKRecord.ID: Result<CKRecord, Error>]) {
+        zonePageModifications = results
+    }
     func failZoneSave(_ error: NSError) { zoneSaveFailure = error }
     private var mutationFailure: NSError?
     private var mutationEntered: XCTestExpectation?
@@ -221,6 +225,15 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     func recordZoneChanges(in: CKRecordZone.ID, since: RecordZoneChangeCursor?, desiredKeys: [CKRecord.FieldKey]?, resultsLimit: Int?) async throws -> CloudKitRecordZoneChangePage {
         zonePageCount += 1
         if let zonePageFailure { await observeTransportFailure?(); throw zonePageFailure }
+        if let zonePageModifications {
+            return try CloudKitRecordZoneChangePage(
+                modificationResultsByID: zonePageModifications,
+                changeToken: nil,
+                deletedRecordIDs: [],
+                moreComing: false,
+                recordForModification: { $0 }
+            )
+        }
         XCTFail("No phase-ownership test should request a zone page")
         throw NSError(domain: "UnexpectedPhaseTransport", code: 1)
     }
@@ -1501,6 +1514,80 @@ extension SyncPhaseAttemptOwnershipTests {
     func testMissingBootstrapPageCannotConsumeTransientSibling() async throws { try await requireConstrainedCallsite(.zonePage, transient: true, reset: false, bootstrap: true) }
     @BigSyncBackgroundActor
     func testMissingBootstrapPageCannotConsumeTokenExpiry() async throws { try await requireConstrainedCallsite(.zonePage, token: true, reset: false, bootstrap: true) }
+
+    @BigSyncBackgroundActor
+    func testRecordFailureCannotCompleteBootstrapAsMissingZone() async throws {
+        for includesPermissionFailure in [false, true] {
+            try await withFixture(migrating: true) { sync, adapter, probe, transport in
+                let context = try XCTUnwrap(sync.activeRunContext)
+                try await sync.beginChangeFeedMigrationIfNeeded(context: context)
+                let zoneID = adapter.recordZoneID
+                let present = CKRecord.ID(recordName: "present", zoneID: zoneID)
+                let missing = CKRecord.ID(recordName: "missing", zoneID: zoneID)
+                var modifications: [CKRecord.ID: Result<CKRecord, Error>] = [
+                    present: .success(CKRecord(recordType: "SyncPhaseFixture", recordID: present)),
+                    missing: .failure(CKError(.zoneNotFound)),
+                ]
+                if includesPermissionFailure {
+                    let denied = CKRecord.ID(recordName: "denied", zoneID: zoneID)
+                    modifications[denied] = .failure(CKError(.permissionFailure))
+                }
+                await transport.returnZonePageModifications(modifications)
+
+                do {
+                    _ = try await sync.fetchDatabaseChanges()
+                    XCTFail("A failed record-zone page cannot return a database cursor")
+                } catch {
+                    let constraints = CloudKitRetryConstraints(error)
+                    XCTAssertTrue(constraints.codes.contains(.zoneNotFound))
+                    XCTAssertEqual(constraints.codes.contains(.permissionFailure), includesPermissionFailure)
+                }
+                let pageCount = await transport.zonePageCount
+                XCTAssertEqual(pageCount, 1)
+                XCTAssertEqual(probe.persistenceCount, 0)
+                XCTAssertNil(try sync.configuredZoneTerminalState(zoneID))
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testWholeOperationMissingZoneCanCompleteBootstrap() async throws {
+        try await withFixture(migrating: true) { sync, adapter, probe, transport in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            try await sync.beginChangeFeedMigrationIfNeeded(context: context)
+            await transport.failZonePage(CKError(.zoneNotFound) as NSError)
+
+            let cursor = try await sync.fetchDatabaseChanges()
+            XCTAssertEqual(cursor?.serializedData, Data("phase-db".utf8))
+            let pageCount = await transport.zonePageCount
+            XCTAssertEqual(pageCount, 1)
+            XCTAssertEqual(probe.persistenceCount, 0)
+            XCTAssertNil(try sync.configuredZoneTerminalState(adapter.recordZoneID))
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRecordEncryptedResetFencesZoneWithoutCompletingBootstrap() async throws {
+        try await withFixture(migrating: true) { sync, adapter, probe, transport in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            try sync.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset)
+            try await sync.beginChangeFeedMigrationIfNeeded(context: context)
+            let recordID = CKRecord.ID(recordName: "encrypted", zoneID: adapter.recordZoneID)
+            await transport.returnZonePageModifications([recordID: .failure(lossFailure(reset: true))])
+
+            do {
+                _ = try await sync.fetchDatabaseChanges()
+                XCTFail("An encrypted reset in a failed page cannot return a database cursor")
+            } catch {
+                XCTAssertTrue(CloudKitRetryConstraints(error).codes.contains(.zoneNotFound))
+            }
+            XCTAssertEqual(try sync.configuredZoneTerminalState(adapter.recordZoneID)?.deletionKind,
+                           .encryptedDataReset)
+            XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context))
+            XCTAssertEqual(probe.persistenceCount, 0)
+        }
+    }
+
     @BigSyncBackgroundActor
     func testEncryptedBootstrapPageCannotConsumeDeadline() async throws { try await requireConstrainedCallsite(.zonePage, bootstrap: true) }
     @BigSyncBackgroundActor
