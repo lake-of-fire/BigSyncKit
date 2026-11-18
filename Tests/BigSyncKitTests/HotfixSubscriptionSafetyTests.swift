@@ -210,6 +210,10 @@ final class HotfixSubscriptionSafetyTests: XCTestCase {
         return CKError(.partialFailure, userInfo: info)
     }
 
+    private func missingSubscriptionDetail(userInfo: [String: Any] = [:]) -> NSError {
+        NSError(domain: "CKInternalErrorDomain", code: 2003, userInfo: userInfo)
+    }
+
     @BigSyncBackgroundActor
     func testAlreadyAbsentDatabaseSubscriptionClearsCachedRegistration() async throws {
         let (synchronizer, service) = fixture()
@@ -274,13 +278,21 @@ final class HotfixSubscriptionSafetyTests: XCTestCase {
         let (synchronizer, service) = fixture()
         try await synchronizer.subscribeForChangesInDatabase()
         let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
-        let errors = [
+        let detail = missingSubscriptionDetail()
+        let errors: [Error] = [
             CKError(.unknownItem, userInfo: [CKErrorRetryAfterKey: 60]),
             CKError(.unknownItem, userInfo: [CKErrorRetryAfterKey: "malformed"]),
             CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: CKError(.notAuthenticated)]),
             CKError(.unknownItem, userInfo: [
-                NSUnderlyingErrorKey: partialError(["different-subscription": CKError(.unknownItem)]),
+                NSMultipleUnderlyingErrorsKey: [
+                    detail,
+                    partialError(["different-subscription": CKError(.unknownItem)]),
+                ] as [Error],
             ]),
+            CKError(.unknownItem, userInfo: [
+                NSUnderlyingErrorKey: missingSubscriptionDetail(userInfo: [NSUnderlyingErrorKey: "malformed"]),
+            ]),
+            detail,
         ]
 
         for lookupError in errors {
@@ -339,20 +351,68 @@ final class HotfixSubscriptionSafetyTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testSubscriptionLookupAcceptsCloudKitMissingItemDiagnostic() async throws {
+        let (synchronizer, service) = fixture()
+        let missing = CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: missingSubscriptionDetail()])
+        await service.configureLookup(error: missing)
+        try await synchronizer.subscribeForChangesInDatabase()
+        let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
+
+        await service.configureLookup(error: partialError([identifier: missing]))
+        try await synchronizer.cancelSubscriptionForChangesInDatabase()
+        XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
+        let saves = await service.saveCount
+        let deletions = await service.deletedIDs
+        XCTAssertEqual(saves, 1)
+        XCTAssertTrue(deletions.isEmpty)
+    }
+
+    @BigSyncBackgroundActor
+    func testSubscriptionDeletionAcceptsCloudKitMissingItemDiagnostic() async throws {
+        let (synchronizer, service) = fixture()
+        let missing = CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: missingSubscriptionDetail()])
+        try await synchronizer.subscribeForChangesInDatabase()
+        let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
+
+        for deleteError in [missing, partialError([identifier: missing])] {
+            try await synchronizer.subscribeForChangesInDatabase()
+            await service.configureDeletion(error: deleteError)
+            try await synchronizer.cancelSubscriptionForChangesInDatabase()
+            XCTAssertNil(synchronizer.subscriptionIDForDatabaseSubscription())
+        }
+        let deletions = await service.deletedIDs
+        XCTAssertEqual(deletions, [identifier, identifier])
+    }
+
+    @BigSyncBackgroundActor
     func testConstrainedSubscriptionDeletionRetainsCacheWithoutAnotherAccountRead() async throws {
         let (synchronizer, service) = fixture()
         try await synchronizer.subscribeForChangesInDatabase()
         let identifier = try XCTUnwrap(synchronizer.subscriptionIDForDatabaseSubscription())
         let missing = CKError(.unknownItem)
+        let detail = missingSubscriptionDetail()
+        let missingWithDetail = CKError(.unknownItem, userInfo: [NSUnderlyingErrorKey: detail])
         let retryInfo = [CKErrorRetryAfterKey: 60]
         let accountInfo = [NSUnderlyingErrorKey: CKError(.accountTemporarilyUnavailable)]
-        let errors = [
+        let errors: [Error] = [
             CKError(.unknownItem, userInfo: retryInfo),
             CKError(.unknownItem, userInfo: accountInfo),
             partialError([identifier: missing], userInfo: retryInfo),
             partialError([identifier: missing], userInfo: accountInfo),
             partialError([identifier: CKError(.unknownItem, userInfo: retryInfo)]),
             partialError([identifier: CKError(.unknownItem, userInfo: accountInfo)]),
+            partialError([identifier: missingWithDetail], userInfo: retryInfo),
+            partialError([identifier: CKError(.unknownItem, userInfo: [
+                NSUnderlyingErrorKey: detail,
+                CKErrorRetryAfterKey: 60,
+            ])]),
+            partialError([identifier: CKError(.unknownItem, userInfo: [
+                NSMultipleUnderlyingErrorsKey: [detail, CKError(.accountTemporarilyUnavailable)] as [Error],
+            ])]),
+            partialError([identifier: CKError(.unknownItem, userInfo: [
+                NSUnderlyingErrorKey: missingSubscriptionDetail(userInfo: [CKErrorRetryAfterKey: 60]),
+            ])]),
+            partialError([identifier: detail]),
         ]
 
         for deleteError in errors {
