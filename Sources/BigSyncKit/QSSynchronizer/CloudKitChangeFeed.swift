@@ -26,6 +26,22 @@ public enum CloudKitChangeFeedError: Error, Sendable, Equatable {
     case corruptCursor
 }
 
+/// An invalid continuation cannot safely make progress from the request
+/// cursor. Treat it as a failed page, without rebuilding the stored cursor.
+enum CloudKitPaginationError: LocalizedError, Equatable {
+    case databaseCursorDidNotAdvance
+    case recordZoneCursorDidNotAdvance
+
+    var errorDescription: String? {
+        switch self {
+        case .databaseCursorDidNotAdvance:
+            return "CloudKit did not provide a new database change cursor for the next page."
+        case .recordZoneCursorDidNotAdvance:
+            return "CloudKit did not provide a new record-zone change cursor for the next page."
+        }
+    }
+}
+
 /// Database and zone history tokens intentionally have distinct types. Their
 /// archived bytes are private to BigSyncKit so fakes can use stable cursors
 /// without fabricating `CKServerChangeToken` instances.

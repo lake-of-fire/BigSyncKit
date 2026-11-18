@@ -671,7 +671,8 @@ extension CloudKitSynchronizer {
         case let syncError as SyncError:
             allowsLocalWorkTail = syncError == .inboundBoundaryChanged
         case is ChangeFeedMigrationError, is BigSyncCloudAccountPortError,
-             is BigSyncHandledMutationRetryError, is BigSyncSemanticUploadConflictError:
+             is BigSyncHandledMutationRetryError, is BigSyncSemanticUploadConflictError,
+             is CloudKitPaginationError:
             allowsLocalWorkTail = false
         default:
             allowsLocalWorkTail = constraints.isErrorGraphComplete && constraints.codes.isEmpty
@@ -1396,6 +1397,10 @@ extension CloudKitSynchronizer {
                 throw error
             }
             try await revalidateActiveRunContext(for: attemptID)
+            if page.moreComing,
+               page.cursor.serializedData.isEmpty || page.cursor == pageCursor {
+                throw CloudKitPaginationError.databaseCursorDidNotAdvance
+            }
             changedZoneIDs.formUnion(page.changedZoneIDs)
             deletedZoneIDs.formUnion(page.deletions.map(\.zoneID))
             pageDeletions.append(contentsOf: page.deletions)
@@ -1581,6 +1586,10 @@ extension CloudKitSynchronizer {
                 }
                 try await revalidateActiveRunContext(for: attemptID)
                 try validateFetchOwner()
+                if page.moreComing,
+                   page.cursor.serializedData.isEmpty || page.cursor == pageCursor {
+                    throw CloudKitPaginationError.recordZoneCursorDidNotAdvance
+                }
                 try ChangeRequestProcessor.validateInboundPageIdentities(
                     records: page.records,
                     deletedRecordIDs: page.deletedRecordIDs,
