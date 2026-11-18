@@ -773,7 +773,8 @@ extension CloudKitSynchronizer {
                     persistTransientRetryState(
                         context: context,
                         notBefore: Date().addingTimeInterval(retryDelay),
-                        consecutiveFailures: consecutiveTransientCloudKitFailures
+                        consecutiveFailures: consecutiveTransientCloudKitFailures,
+                        validateOwnership: { try checkRunContext(context) }
                     )
                 }
                 guard canContinue() else { return }

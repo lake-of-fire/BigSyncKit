@@ -1037,7 +1037,12 @@ extension SyncPhaseAttemptOwnershipTests {
                 _ = try await sync.synchronize()
                 XCTFail("An account stop must end the current drain")
             } catch {
-                XCTAssertTrue((error as NSError) === original)
+                let delivered = error as NSError
+                XCTAssertEqual(delivered.domain, original.domain)
+                XCTAssertEqual(delivered.code, original.code)
+                let constraints = CloudKitRetryConstraints(error)
+                XCTAssertEqual(constraints.codes, [.partialFailure, code, .requestRateLimited])
+                XCTAssertEqual(constraints.serverMinimum, 137)
             }
             XCTAssertNil(sync.synchronizationTask)
             XCTAssertNil(sync.retrySleepUntil)
