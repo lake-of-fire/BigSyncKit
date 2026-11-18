@@ -1507,6 +1507,79 @@ extension SyncUndoCloseoutW1Tests {
     }
 
     @BigSyncBackgroundActor
+    func testUploadPreparationWithholdsSelectionSupersededByCommittedEdit() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.text = "first generation"
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let firstGeneration = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        adapter._testBeforePreparedMutationGenerationRecheck = {
+            adapter._testBeforePreparedMutationGenerationRecheck = nil
+            try realm.write {
+                object.text = "successor generation"
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        defer { adapter._testBeforePreparedMutationGenerationRecheck = nil }
+
+        let stale = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        XCTAssertTrue(stale.isEmpty)
+        let successor = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        XCTAssertNotEqual(successor, firstGeneration)
+        try await adapter.didFinishImport()
+        let fresh = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        XCTAssertEqual(fresh.first?.generation, successor)
+        XCTAssertEqual(fresh.first?.record["text"] as? String, "successor generation")
+        try await quiet(adapter, realm: realm)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionPreparationWithholdsSelectionSupersededByResurrection() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1ContractNote()
+        object.id = noteID
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let upload = try await adapter.prepareUploadBatch(limit: 50)
+        XCTAssertEqual(upload.records.count, 1)
+        try realm.write {
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let selected = try await adapter.preparedRecordDeletions(limit: 50, restrictedToEntityType: nil)
+        XCTAssertEqual(selected.count, 1)
+        let deletionGeneration = try XCTUnwrap(selected.first?.generation)
+        adapter._testBeforePreparedMutationGenerationRecheck = {
+            adapter._testBeforePreparedMutationGenerationRecheck = nil
+            try realm.write {
+                object.isDeleted = false
+                object.text = "resurrected"
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        defer { adapter._testBeforePreparedMutationGenerationRecheck = nil }
+
+        let stale = try await adapter.preparedRecordDeletions(limit: 50, restrictedToEntityType: nil)
+        XCTAssertTrue(stale.isEmpty)
+        let successor = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        XCTAssertNotEqual(successor, deletionGeneration)
+        try await adapter.didFinishImport()
+        let fresh = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        XCTAssertEqual(fresh.first?.generation, successor)
+        XCTAssertEqual(fresh.first?.record["text"] as? String, "resurrected")
+        try await quiet(adapter, realm: realm)
+    }
+
+    @BigSyncBackgroundActor
     func testCurrentPreparedRetainedUploadPreservesSuccessorGeneration() async throws {
         let f = try await preparedQuarantineFixture()
         let recordID = try XCTUnwrap(f.prepared.first).record.recordID
