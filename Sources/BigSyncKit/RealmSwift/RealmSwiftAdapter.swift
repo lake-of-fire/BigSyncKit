@@ -876,6 +876,19 @@ public final class RealmSwiftAdapter:
                 persistenceRealm.objects(SyncedEntityType.self)
             )
             persistenceRealm.delete(persistenceRealm.objects(ServerToken.self))
+            // The destination replica must never publish the source replica's
+            // unacknowledged identities. Same-account token recovery still
+            // needs to replay them.
+            if requiredResetMode == .localDatasetRebootstrap,
+               persistenceRealm.schema.objectSchema.contains(where: {
+                   $0.className == BigSyncPendingInboundIdentityDelivery.className()
+               }),
+               let delivery = persistenceRealm.object(
+                   ofType: BigSyncPendingInboundIdentityDelivery.self,
+                   forPrimaryKey: BigSyncPendingInboundIdentityDelivery.canonicalID
+               ) {
+                persistenceRealm.delete(delivery)
+            }
             // Page receipts are the proof that makes committed quarantine
             // evidence eligible for retirement. Resetting the receipts must
             // invalidate the corresponding references as one transaction;

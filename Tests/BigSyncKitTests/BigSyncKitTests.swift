@@ -194,6 +194,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private(set) var modifyRecordsOperationCount = 0
     private(set) var recordZoneFetchCount = 0
     private(set) var databaseChangeFetchCount = 0
+    private(set) var lastDatabaseChangeCursor: DatabaseChangeCursor?
     private(set) var recordZoneChangeFetchCount = 0
     private(set) var lastRecordZoneChangeCursor: RecordZoneChangeCursor?
     private(set) var savedZoneCount = 0
@@ -447,6 +448,7 @@ extension FakeCloudKitDatabase: CloudKitChangeFeed {
             accountIdentifierAfterNextDatabaseChangesFetch = nil
         }
         databaseChangeFetchCount += 1
+        lastDatabaseChangeCursor = cursor
         let page = databaseChangePages.isEmpty
             ? FakeDatabaseChangePage(
                 changedZoneIDs: [],
@@ -612,6 +614,7 @@ private final class FakeModelAdapter:
     var cleanUpHandler: (@Sendable () async throws -> Void)?
     var resetSyncCachesHandler: (@Sendable () async throws -> Void)?
     var saveChangesHandler: (@Sendable () async throws -> Void)?
+    var persistImportedChangesError: Error?
     var quarantinedRecordNames = Set<String>()
     var recordsToUploadHandler: (@Sendable () async throws -> Void)?
     var terminalPendingChanges = false
@@ -687,6 +690,7 @@ private final class FakeModelAdapter:
 
     func persistImportedChanges() async throws {
         events.append("persist")
+        if let persistImportedChangesError { throw persistImportedChangesError }
     }
 
     func preparedRecordsToUpload(
@@ -14403,6 +14407,49 @@ final class BigSyncKitTests: XCTestCase {
     }
 
     @BigSyncBackgroundActor
+    func testPagePersistenceFailureKeepsBothCursorsAndRetryRefetchesPage() async throws {
+        let zone = CKRecordZone.ID(zoneName: "persist-before-cursor")
+        let database = FakeCloudKitDatabase()
+        let synchronizer = makeSynchronizer(database: database, recordZoneID: zone)
+        synchronizer.syncMode = .downloadOnly
+        let adapter = FakeModelAdapter(zoneID: zone, priorities: [])
+        synchronizer.addModelAdapter(adapter)
+        let previousDatabaseCursor = DatabaseChangeCursor(serializedData: Data("database-before-page".utf8))
+        let previousZoneCursor = RecordZoneChangeCursor(serializedData: Data("zone-before-page".utf8))
+        synchronizer.storedDatabaseToken = previousDatabaseCursor
+        try await adapter.saveToken(previousZoneCursor)
+
+        let databasePage = FakeDatabaseChangePage(changedZoneIDs: [zone], deletions: [], moreComing: false)
+        let record = makeRecord(type: "PersistedInbound", id: "replay", zoneID: zone)
+        let zonePage = FakeZoneChangePage(zoneID: zone, records: [record], deletedRecordIDs: [], moreComing: false)
+        database.databaseChangePages = [databasePage, databasePage]
+        database.zoneChangePages = [zonePage, zonePage]
+        adapter.persistImportedChangesError = TestSynchronizationError.importedPersistenceCacheFailed
+
+        do {
+            _ = try await synchronizer.synchronize()
+            XCTFail("A failed persistence call must fail the inbound page")
+        } catch TestSynchronizationError.importedPersistenceCacheFailed {}
+        let zoneCursorAfterFailure = await adapter.serverChangeToken
+        XCTAssertEqual(zoneCursorAfterFailure, previousZoneCursor)
+        XCTAssertEqual(synchronizer.storedDatabaseToken, previousDatabaseCursor)
+        XCTAssertEqual(adapter.events.filter { $0 == "saveToken" }.count, 1)
+        XCTAssertEqual(database.recordZoneChangeFetchCount, 1)
+
+        adapter.persistImportedChangesError = nil
+        let retried = try await synchronizer.synchronize()
+        XCTAssertTrue(retried.didImportChanges)
+        XCTAssertEqual(database.lastDatabaseChangeCursor, previousDatabaseCursor)
+        XCTAssertEqual(database.lastRecordZoneChangeCursor, previousZoneCursor)
+        XCTAssertEqual(database.recordZoneChangeFetchCount, 2)
+        XCTAssertEqual(adapter.events.filter { $0 == "save:PersistedInbound" }.count, 2)
+        let zoneCursorAfterRetry = await adapter.serverChangeToken
+        XCTAssertEqual(zoneCursorAfterRetry?.serializedData, Data("zone-2".utf8))
+        XCTAssertEqual(synchronizer.storedDatabaseToken?.serializedData, Data("database-2".utf8))
+        await synchronizer.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
     func testChangeFeedResetPrepareIsIdempotentAfterCrash() async throws {
         let identifier = UUID().uuidString
         var persistenceConfiguration = RealmSwiftAdapter.defaultPersistenceConfiguration()
@@ -17046,6 +17093,85 @@ final class BigSyncKitTests: XCTestCase {
         XCTAssertEqual(observedReplay, expectedIdentities)
         XCTAssertNil(try reopenedAdapter.pendingCommittedInboundIdentityBatch())
         await successfulSync.cancelSynchronizationAndWait()
+    }
+
+    @BigSyncBackgroundActor
+    func testLocalDatasetRebootstrapRetiresPendingInboundIdentityDelivery() async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            committedInboundIdentityDeliveryEnabled: true,
+            fileBacked: true
+        )
+        _ = try await commitUnacknowledgedInboundDeletion(on: fixture.adapter)
+
+        try await activateChangeFeedNamespace(
+            fixture.adapter, account: "destination-account",
+            replicaBindingGenerationIdentifier: "destination-binding"
+        )
+        try await fixture.adapter.prepareChangeFeedReset(
+            accountScopeIdentifier: "destination-account", epoch: 1,
+            mode: .localDatasetRebootstrap
+        )
+
+        let tracking = try XCTUnwrap(fixture.adapter.realmProvider?.persistenceRealm)
+        XCTAssertTrue(tracking.objects(BigSyncPendingInboundIdentityDelivery.self).isEmpty)
+        XCTAssertNil(try fixture.adapter.pendingCommittedInboundIdentityBatch())
+        let resetCursor = await fixture.adapter.serverChangeToken
+        XCTAssertNil(resetCursor)
+    }
+
+    @BigSyncBackgroundActor
+    func testServerReconciliationPreservesPendingInboundIdentityDelivery() async throws {
+        let fixture = try await makeRealmAdapterFixture(
+            committedInboundIdentityDeliveryEnabled: true,
+            fileBacked: true
+        )
+        let committedBatch = try await commitUnacknowledgedInboundDeletion(on: fixture.adapter)
+
+        try await fixture.adapter.prepareChangeFeedReset(
+            accountScopeIdentifier: "source-account", epoch: 1,
+            mode: .serverReconciliation
+        )
+
+        let resetCursor = await fixture.adapter.serverChangeToken
+        XCTAssertNil(resetCursor)
+        XCTAssertEqual(try fixture.adapter.pendingCommittedInboundIdentityBatch(), committedBatch)
+    }
+
+    @BigSyncBackgroundActor
+    private func commitUnacknowledgedInboundDeletion(on adapter: RealmSwiftAdapter) async throws
+        -> CommittedInboundIdentityBatch {
+        try await activateChangeFeedNamespace(
+            adapter, account: "source-account",
+            replicaBindingGenerationIdentifier: "source-binding"
+        )
+        let deleted = makeRecord(
+            type: BigSyncTrackedObject.className(),
+            id: "unacknowledged-deletion",
+            zoneID: adapter.recordZoneID
+        )
+        let cursor = RecordZoneChangeCursor(serializedData: Data("deletion-cursor".utf8))
+        try await adapter.commitInboundPage(.init(
+            previousCursor: nil,
+            nextCursor: cursor,
+            liveResults: [],
+            deletionResults: [.init(
+                event: .init(
+                    ordinal: 0,
+                    entityType: deleted.recordType,
+                    recordID: deleted.recordID
+                ),
+                disposition: .alreadyDeleted
+            )]
+        ))
+        let committedCursor = await adapter.serverChangeToken
+        XCTAssertEqual(committedCursor, cursor)
+        let batch = try XCTUnwrap(try adapter.pendingCommittedInboundIdentityBatch())
+        XCTAssertEqual(batch.identities, [.init(
+            entityType: deleted.recordType,
+            recordName: deleted.recordID.recordName,
+            disposition: .delete
+        )])
+        return batch
     }
 
     @BigSyncBackgroundActor

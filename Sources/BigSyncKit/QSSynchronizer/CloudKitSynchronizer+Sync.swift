@@ -1740,11 +1740,18 @@ extension CloudKitSynchronizer {
                             context.accountScopeIdentifier
                     )
                 }
-                // Receipt-and-token-last: a failed import or lifecycle write
-                // refetches this exact page. Realm-backed adapters bind the
-                // exact dispositions and proven quarantine supersessions to
-                // the cursor in one tracking-Realm transaction.
                 try validateFetchOwner()
+                let realmAdapter = adapter as? RealmSwiftAdapter
+                if realmAdapter == nil {
+                    // Other adapters can stage inbound changes in memory. The
+                    // default page commit only stores the cursor, so a failed
+                    // persistence call must leave this page available to replay.
+                    try await adapter.persistImportedChanges()
+                    try await revalidateActiveRunContext(for: attemptID)
+                    try validateFetchOwner()
+                }
+                // Realm binds exact dispositions and quarantine supersessions
+                // to the cursor in one tracking-Realm transaction.
                 try await adapter.commitInboundPage(InboundPageCommit(
                     previousCursor: pageCursor,
                     nextCursor: page.cursor,
@@ -1753,15 +1760,14 @@ extension CloudKitSynchronizer {
                 ))
                 try await revalidateActiveRunContext(for: attemptID)
                 try validateFetchOwner()
-                // Deferred relationships are already durable in the adapter's
-                // persistence Realm and were proven by commitInboundPage.
-                // Apply them only after the cursor commit so a successful
-                // application cannot erase the evidence that authorized this
-                // page to advance.
-                let didApplyRelationship = try await persistImportedChanges(for: adapter)
-                try await revalidateActiveRunContext(for: attemptID)
-                try validateFetchOwner()
-                if didApplyRelationship { synchronizationDrainDidImportChanges = true }
+                if let realmAdapter {
+                    // The cursor commit proves the deferred intents are durable.
+                    // Applying them earlier could erase that proof.
+                    let didApplyRelationship = try await realmAdapter.persistImportedChangesReportingMutation()
+                    try await revalidateActiveRunContext(for: attemptID)
+                    try validateFetchOwner()
+                    if didApplyRelationship { synchronizationDrainDidImportChanges = true }
+                }
                 activeZoneTokens[zoneID] = page.cursor
                 pageCursor = page.cursor
                 moreComing = page.moreComing
