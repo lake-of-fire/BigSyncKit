@@ -762,7 +762,6 @@ extension CloudKitSynchronizer {
             } else if codes.contains(.accountTemporarilyUnavailable) {
                 shouldRetry = false
                 stopsAccount = true
-                clearPersistedTransientRetryState()
                 terminalHealthCategory = .accountTemporarilyUnavailable
             } else if constraints.requiresDeferredRetry {
                 consecutiveTransientCloudKitFailures += 1
@@ -774,7 +773,8 @@ extension CloudKitSynchronizer {
                     persistTransientRetryState(
                         context: context,
                         notBefore: Date().addingTimeInterval(retryDelay),
-                        consecutiveFailures: consecutiveTransientCloudKitFailures
+                        consecutiveFailures: consecutiveTransientCloudKitFailures,
+                        validateOwnership: { try checkRunContext(context) }
                     )
                 }
                 guard canContinue() else { return }
@@ -830,6 +830,20 @@ extension CloudKitSynchronizer {
         // Keep known recovery intent and retry floors, but never treat a
         // bounded, incomplete error scan as permission for another attempt.
         shouldRetry = shouldRetry && constraints.isErrorGraphComplete
+        // The stopped attempt cannot retry. A later validation of the same
+        // account still owes CloudKit any known server deadline. Persist it
+        // before publishing health, which can synchronously retire this run.
+        if stopsAccount, !constraints.containsAccountChange,
+           let minimum = constraints.serverMinimum, let context = failureContext {
+            persistTransientRetryState(
+                context: context,
+                notBefore: Date().addingTimeInterval(minimum),
+                consecutiveFailures: consecutiveTransientCloudKitFailures,
+                validateOwnership: { try checkRunContext(context) }
+            )
+            guard canContinue() else { return }
+        }
+
         // Keep the drain owned through the health notification. Its observer
         // may cancel or replace this attempt, and must not coalesce a successor
         // into a drain that has already dropped its running state.

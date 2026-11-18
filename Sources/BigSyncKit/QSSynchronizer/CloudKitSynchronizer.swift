@@ -3544,8 +3544,17 @@ public class CloudKitSynchronizer: NSObject {
     internal func persistTransientRetryState(
         context: RunContext,
         notBefore: Date,
-        consecutiveFailures: Int
+        consecutiveFailures: Int,
+        validateOwnership: () throws -> Void = {}
     ) {
+        guard (try? validateOwnership()) != nil else { return }
+        if let existing = persistedTransientRetryState(),
+           existing.accountScopeIdentifier == context.accountScopeIdentifier,
+           existing.notBefore >= notBefore {
+            return
+        }
+        // A custom store can retire this attempt during the previous read.
+        guard (try? validateOwnership()) != nil else { return }
         try? keyValueStore.bigSyncSetDurably(
             value: [
                 "accountScopeIdentifier": context.accountScopeIdentifier,

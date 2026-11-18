@@ -25,6 +25,7 @@ private actor SyncPhaseGate {
 private final class SyncPhaseProbe {
     let accountGate = SyncPhaseGate()
     var currentAccount = "sync-phase-account"
+    var currentAccountStatus: CKAccountStatus = .available
     var uploadsPending = false
     var deletionsPending = false
     var accountEntered: XCTestExpectation?
@@ -54,7 +55,7 @@ private final class SyncPhaseProbe {
     }
     func accountStatus() -> CKAccountStatus {
         accountStatusCalls += 1
-        return .available
+        return currentAccountStatus
     }
     func noteCleanup() { cleanupCount += 1 }
     func noteImport() { importCount += 1 }
@@ -1020,6 +1021,110 @@ extension SyncPhaseAttemptOwnershipTests {
     @BigSyncBackgroundActor
     func testWrappedTemporaryAccountStopSettlesTwoWaitersWithOriginalError() async throws {
         try await checkAccountStopSettlement(code: .accountTemporarilyUnavailable, wrapped: true)
+    }
+
+    @BigSyncBackgroundActor
+    private func requireRetryFloorAfterAccountStop(_ code: CKError.Code) async throws {
+        try await withFixture { sync, _, probe, transport in
+            let accountScope = CloudKitSynchronizer.accountScopeIdentifier(for: probe.currentAccount)
+            let original = CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [
+                "account": CKError(code) as NSError,
+                "backoff": CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]) as NSError,
+            ]]) as NSError
+            await transport.failDatabase(original)
+            let started = Date()
+            do {
+                _ = try await sync.synchronize()
+                XCTFail("An account stop must end the current drain")
+            } catch {
+                let delivered = error as NSError
+                XCTAssertEqual(delivered.domain, original.domain)
+                XCTAssertEqual(delivered.code, original.code)
+                let constraints = CloudKitRetryConstraints(error)
+                XCTAssertEqual(constraints.codes, [.partialFailure, code, .requestRateLimited])
+                XCTAssertEqual(constraints.serverMinimum, 137)
+            }
+            XCTAssertNil(sync.synchronizationTask)
+            XCTAssertNil(sync.retrySleepUntil)
+            let deadline = try XCTUnwrap(sync._test_persistedTransientRetryNotBefore(
+                accountScopeIdentifier: accountScope
+            ))
+            XCTAssertGreaterThanOrEqual(deadline, started.addingTimeInterval(137))
+            let health = try await sync.syncHealthSnapshot()
+            XCTAssertEqual(health?.category, code == .notAuthenticated
+                ? .notAuthenticated : .accountTemporarilyUnavailable)
+            XCTAssertNil(health?.retryNotBefore)
+
+            // A synchronization request revalidates the same account. Cancel
+            // the resumed worker once it parks at the persisted deadline.
+            sync.beginSynchronization()
+            let worker = try XCTUnwrap(sync.synchronizationTask)
+            let watchdog = ProcessInfo.processInfo.systemUptime + 3
+            while sync.retrySleepUntil == nil, sync.syncing,
+                  ProcessInfo.processInfo.systemUptime < watchdog {
+                await Task.yield()
+            }
+            XCTAssertEqual(sync.retrySleepUntil, deadline)
+            let fetches = await transport.databaseFetchCount
+            let mutations = await transport.recordMutationCount
+            XCTAssertEqual(fetches, 1)
+            XCTAssertEqual(mutations, 0)
+            worker.cancel()
+            await worker.value
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testAuthenticationStopRetainsSiblingRetryFloorUntilSameAccountResumes() async throws {
+        try await requireRetryFloorAfterAccountStop(.notAuthenticated)
+    }
+
+    @BigSyncBackgroundActor
+    func testTemporaryAccountStopRetainsSiblingRetryFloorUntilSameAccountResumes() async throws {
+        try await requireRetryFloorAfterAccountStop(.accountTemporarilyUnavailable)
+    }
+
+    @BigSyncBackgroundActor
+    func testTemporaryAccountPreflightStopPreservesExistingRetryFloor() async throws {
+        try await withFixture { sync, _, probe, transport in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            let deadline = Date().addingTimeInterval(137)
+            sync.persistTransientRetryState(context: context, notBefore: deadline, consecutiveFailures: 1)
+            sync.accountValidationRequired = true
+            probe.currentAccountStatus = .temporarilyUnavailable
+            do {
+                _ = try await sync.synchronize()
+                XCTFail("The unavailable account must stop before publishing a run context")
+            } catch let error as CKError {
+                XCTAssertEqual(error.code, .accountTemporarilyUnavailable)
+            }
+            XCTAssertNil(sync.activeRunContext)
+            XCTAssertNil(sync.retrySleepUntil)
+            XCTAssertNil(sync.synchronizationTask)
+            XCTAssertEqual(probe.accountStatusCalls, 1)
+            XCTAssertEqual(probe.accountIdentifierCalls, 0)
+            XCTAssertEqual(sync._test_persistedTransientRetryNotBefore(
+                accountScopeIdentifier: context.accountScopeIdentifier
+            ), deadline)
+            let fetches = await transport.databaseFetchCount
+            XCTAssertEqual(fetches, 0)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountStopDoesNotShortenExistingSameScopeRetryFloor() async throws {
+        try await withFixture { sync, _, _, _ in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            let laterDeadline = Date().addingTimeInterval(3_600)
+            sync.persistTransientRetryState(context: context, notBefore: laterDeadline, consecutiveFailures: 2)
+            let error = CKError(.accountTemporarilyUnavailable, userInfo: [CKErrorRetryAfterKey: 137])
+            await sync.failSynchronization(error: error, for: context.attemptID)
+            XCTAssertEqual(sync._test_persistedTransientRetryNotBefore(
+                accountScopeIdentifier: context.accountScopeIdentifier
+            ), laterDeadline)
+            XCTAssertNil(sync.retrySleepUntil)
+            XCTAssertNil(sync.synchronizationTask)
+        }
     }
 
     @BigSyncBackgroundActor
