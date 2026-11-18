@@ -697,7 +697,7 @@ extension CloudKitSynchronizer {
            constraints.isErrorGraphComplete,
            !constraints.blocksAccountOperations,
            !constraints.requestsTokenRecovery,
-           !constraints.requiresDeferredRetry {
+           !constraints.blocksImmediateRetry {
             // The database-history event already persisted a dedicated
             // recovery request. Retry immediately; the next attempt performs
             // the account-fenced journal rebuild before any upload.
@@ -740,7 +740,7 @@ extension CloudKitSynchronizer {
                             try checkRunContext(context)
                         }
                         recoveryRequestIsDurable = true
-                        shouldRetry = true
+                        shouldRetry = !constraints.blocksImmediateRetry
                     } catch is CancellationError {
                         settleCancellationIfCurrentAttempt(attemptID)
                         return
@@ -782,7 +782,7 @@ extension CloudKitSynchronizer {
                 guard canContinue() else { return }
                 reduceBatchSize()
                 shouldRetry = recoveryRequestIsDurable && constraints.isErrorGraphComplete
-            } else if !constraints.requestsTokenRecovery {
+            } else if !constraints.requestsTokenRecovery || constraints.blocksImmediateRetry {
                 logger.error("QSCloudKitSynchronizer >> Error: \(error)")
             }
         } else if error as? CloudKitChangeFeedError == .corruptCursor {
@@ -1215,7 +1215,7 @@ extension CloudKitSynchronizer {
         guard constraints.isErrorGraphComplete,
               !constraints.blocksAccountOperations,
               !constraints.requestsTokenRecovery,
-              !constraints.requiresDeferredRetry else { return false }
+              !constraints.blocksImmediateRetry else { return false }
         if constraints.containsOnlySizeLimitFailures {
             // A singleton limit cannot be repaired by resending it. Reducible
             // limits are normally handled inside the bounded shrinking drain.
@@ -1571,7 +1571,7 @@ extension CloudKitSynchronizer {
                     guard isChangeFeedMigrationActive,
                           !hasRecordFailures,
                           constraints.isErrorGraphComplete,
-                          !constraints.requiresDeferredRetry,
+                          !constraints.blocksImmediateRetry,
                           !constraints.requestsTokenRecovery else { throw error }
                     // A never-established zone is an empty authoritative
                     // bootstrap. Reconcile local journal work, then let the
@@ -1827,7 +1827,7 @@ extension CloudKitSynchronizer {
                 }
                 if constraints.isErrorGraphComplete,
                    !constraints.blocksAccountOperations,
-                   !constraints.requiresDeferredRetry,
+                   !constraints.blocksImmediateRetry,
                    !constraints.requestsTokenRecovery,
                    isZoneNotFoundOrDeletedError(error) {
                     for adapter in modelAdapters {
@@ -2034,7 +2034,7 @@ extension CloudKitSynchronizer {
 
             try checkRunContext(context)
             guard constraints.isErrorGraphComplete,
-                  !constraints.requiresDeferredRetry,
+                  !constraints.blocksImmediateRetry,
                   !constraints.requestsTokenRecovery else { throw error }
             let newZone = CKRecordZone(zoneID: zoneID)
             do {

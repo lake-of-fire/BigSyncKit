@@ -1409,6 +1409,7 @@ extension SyncPhaseAttemptOwnershipTests {
         _ error: Error,
         withoutRunContext: Bool = false,
         failAdapterTokenReset: Bool = false,
+        expectTokenRecovery: Bool = false,
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws {
@@ -1420,6 +1421,9 @@ extension SyncPhaseAttemptOwnershipTests {
             let delegate = SyncPhaseFailureDelegate()
             sync.delegate = delegate
             if withoutRunContext { sync.activeRunContext = nil }
+            if expectTokenRecovery {
+                sync.storedDatabaseToken = DatabaseChangeCursor(serializedData: Data("expired".utf8))
+            }
             if failAdapterTokenReset {
                 probe.onSave = {
                     throw NSError(domain: "RejectedRecoveryTokenWrite", code: 1)
@@ -1428,6 +1432,18 @@ extension SyncPhaseAttemptOwnershipTests {
 
             await sync.failSynchronization(error: error, for: attempt)
 
+            if expectTokenRecovery {
+                let store = try XCTUnwrap(sync.keyValueStore as? SyncPhaseStore)
+                XCTAssertTrue(store.persistedPropertyLists.contains {
+                    $0["mode"] as? String == ChangeFeedResetMode.serverReconciliation.rawValue
+                        && $0["phase"] as? String == "requested"
+                }, file: file, line: line)
+                XCTAssertNil(sync.storedDatabaseToken, file: file, line: line)
+                XCTAssertEqual(probe.savedTokens.count, 1, file: file, line: line)
+                if let savedToken = probe.savedTokens.first {
+                    XCTAssertNil(savedToken, file: file, line: line)
+                }
+            }
             if failAdapterTokenReset {
                 XCTAssertEqual(probe.savedTokens.count, 1,
                     "Must exercise the actual failing adapter reset", file: file, line: line)
@@ -1461,6 +1477,14 @@ extension SyncPhaseAttemptOwnershipTests {
     func testFailedTokenResetCannotRestartCoalescedLocalWork() async throws {
         try await requireNoCoalescedFailureRetry(
             CKError(.changeTokenExpired), failAdapterTokenReset: true
+        )
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedRetryDirectiveKeepsDurableTokenRecoveryWithoutRetrying() async throws {
+        try await requireNoCoalescedFailureRetry(
+            CKError(.changeTokenExpired, userInfo: [CKErrorRetryAfterKey: "malformed"]),
+            expectTokenRecovery: true
         )
     }
 
@@ -1543,7 +1567,7 @@ extension SyncPhaseAttemptOwnershipTests {
 extension SyncPhaseAttemptOwnershipTests {
     @BigSyncBackgroundActor
     private func lossFailure(reset: Bool = false, sibling: CKError? = nil,
-                             deadline: TimeInterval? = nil, malformed: Bool = false) -> NSError {
+                             deadline: Any? = nil, malformed: Bool = false) -> NSError {
         var info = [String: Any]()
         if reset { info[CKErrorUserDidResetEncryptedDataKey] = true }
         if let deadline { info[CKErrorRetryAfterKey] = deadline }
@@ -1567,6 +1591,7 @@ extension SyncPhaseAttemptOwnershipTests {
             let original = CloudKitRetryConstraints(error)
             let retained = CloudKitRetryConstraints(delivered)
             XCTAssertEqual(retained.serverMinimum, original.serverMinimum)
+            XCTAssertEqual(retained.hasRetryDirective, original.hasRetryDirective)
             XCTAssertEqual(retained.requestsTokenRecovery, original.requestsTokenRecovery)
             XCTAssertEqual(retained.isErrorGraphComplete, original.isErrorGraphComplete)
             let saves = await transport.zoneSaveCount
@@ -1585,6 +1610,10 @@ extension SyncPhaseAttemptOwnershipTests {
 
     @BigSyncBackgroundActor
     func testMissingZoneDeadlineDoesNotCreateZone() async throws { try await requireSetupBlocked(lossFailure(deadline: 137)) }
+    @BigSyncBackgroundActor
+    func testMissingZoneMalformedRetryDirectiveDoesNotCreateZone() async throws {
+        try await requireSetupBlocked(lossFailure(deadline: "malformed"))
+    }
     @BigSyncBackgroundActor
     func testMissingZoneTransientSiblingDoesNotCreateZone() async throws { try await requireSetupBlocked(lossFailure(sibling: CKError(.networkFailure))) }
     @BigSyncBackgroundActor
@@ -1635,6 +1664,29 @@ extension SyncPhaseAttemptOwnershipTests {
     }
     @BigSyncBackgroundActor
     func testConvertedEncryptedResetUsesServerRetryFloor() async throws { try await requireResetBackoff(lossFailure(reset: true, deadline: 137)) }
+    @BigSyncBackgroundActor
+    func testMalformedRetryDirectiveKeepsEncryptedResetIntentWithoutRetrying() async throws {
+        try await withFixture { sync, adapter, _, transport in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            let original = lossFailure(reset: true, deadline: "malformed")
+            await transport.failZoneFetch(original)
+            var delivered: Error?
+            try await sync.setupRecordZoneID(adapter.recordZoneID,
+                attemptID: context.attemptID) { delivered = $0 }
+            let failure = try XCTUnwrap(delivered)
+            XCTAssertTrue(CloudKitRetryConstraints(failure).hasRetryDirective)
+            XCTAssertTrue(try sync.hasPendingEncryptedDataResetRecovery(context: context))
+            XCTAssertEqual((failure as? ChangeFeedMigrationError)?.deletionKind, .encryptedDataReset)
+            sync.syncing = true
+            sync.synchronizationDrainIsActive = true
+            await sync.failSynchronization(error: failure, for: context.attemptID)
+            XCTAssertNil(sync.synchronizationTask)
+            XCTAssertNil(sync.retrySleepUntil)
+            if sync.synchronizationTask != nil { sync.cancelSynchronization() }
+            let requests = await transport.databaseFetchCount
+            XCTAssertEqual(requests, 0)
+        }
+    }
     @BigSyncBackgroundActor
     func testConvertedEncryptedResetUsesTransientBackoff() async throws { try await requireResetBackoff(lossFailure(reset: true, sibling: CKError(.networkFailure))) }
     @BigSyncBackgroundActor
@@ -1733,16 +1785,17 @@ extension SyncPhaseAttemptOwnershipTests {
     @BigSyncBackgroundActor
     private func requireConstrainedCallsite(_ route: LossCallsite, token: Bool = false,
                                            transient: Bool = false, reset: Bool = true,
-                                           bootstrap: Bool = false) async throws {
+                                           bootstrap: Bool = false, malformedDeadline: Bool = false) async throws {
         try await withFixture(migrating: bootstrap) { sync, adapter, probe, transport in
             let context = try XCTUnwrap(sync.activeRunContext)
             if bootstrap {
                 if reset { try sync.requestChangeFeedRecovery(context: context, mode: .encryptedDataReset) }
                 try await sync.beginChangeFeedMigrationIfNeeded(context: context)
             }
+            let deadline: Any? = malformedDeadline ? ("malformed" as Any) : (transient || token ? nil : 137)
             let error = lossFailure(reset: reset,
                 sibling: token ? CKError(.changeTokenExpired) : (transient ? CKError(.networkFailure) : nil),
-                deadline: transient || token ? nil : 137)
+                deadline: deadline)
             var failure: Error?
             switch route {
             case .database:
@@ -1761,7 +1814,8 @@ extension SyncPhaseAttemptOwnershipTests {
             XCTAssertTrue(retained.isErrorGraphComplete)
             XCTAssertEqual(retained.serverMinimum, CloudKitRetryConstraints(error).serverMinimum)
             XCTAssertEqual(retained.requestsTokenRecovery, token)
-            XCTAssertEqual(retained.requiresDeferredRetry, !token)
+            XCTAssertEqual(retained.requiresDeferredRetry, transient || (!token && !malformedDeadline))
+            XCTAssertEqual(retained.hasRetryDirective, deadline != nil)
             let mutations = await transport.recordMutationCount
             let deletes = await transport.zoneDeleteCount
             let saves = await transport.zoneSaveCount
@@ -1791,6 +1845,10 @@ extension SyncPhaseAttemptOwnershipTests {
     func testZoneSaveResetConversionPreservesTokenExpiry() async throws { try await requireConstrainedCallsite(.zoneSave, token: true) }
     @BigSyncBackgroundActor
     func testMissingBootstrapPageCannotConsumeDeadline() async throws { try await requireConstrainedCallsite(.zonePage, reset: false, bootstrap: true) }
+    @BigSyncBackgroundActor
+    func testMissingBootstrapPageCannotConsumeMalformedRetryDirective() async throws {
+        try await requireConstrainedCallsite(.zonePage, reset: false, bootstrap: true, malformedDeadline: true)
+    }
     @BigSyncBackgroundActor
     func testMissingBootstrapPageCannotConsumeTransientSibling() async throws { try await requireConstrainedCallsite(.zonePage, transient: true, reset: false, bootstrap: true) }
     @BigSyncBackgroundActor

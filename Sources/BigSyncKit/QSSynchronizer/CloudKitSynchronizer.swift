@@ -375,7 +375,7 @@ public enum ChangeFeedMigrationError: LocalizedError, CustomNSError {
     internal func preservingOperationError(_ cause: Error) -> ChangeFeedMigrationError {
         let constraints = CloudKitRetryConstraints(cause)
         guard !constraints.isErrorGraphComplete || constraints.blocksAccountOperations
-                || constraints.requiresDeferredRetry || constraints.requestsTokenRecovery
+                || constraints.blocksImmediateRetry || constraints.requestsTokenRecovery
         else { return self }
         switch self {
         case .establishedZoneUnavailable(let zone, let kind):
