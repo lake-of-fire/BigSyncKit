@@ -616,6 +616,8 @@ public final class RealmSwiftAdapter:
         (@BigSyncBackgroundActor @Sendable () async throws -> Void)?
     var _testAfterDeletionMetadataTrackingAdmission:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
+    var _testBeforePreparedMutationGenerationRecheck:
+        (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testAfterAcceptedRetainedDeletionTrackingAdmission:
         (@BigSyncBackgroundActor @Sendable () throws -> Void)?
     var _testBeforeMissingUploadTargetTrackingWrite:
@@ -1907,6 +1909,35 @@ public final class RealmSwiftAdapter:
             return false
         }
         return pendingMutationIsEligibleForActiveTransport(mutation)
+    }
+
+    @BigSyncBackgroundActor
+    private func preparedMutationIsCurrentForPreparation(
+        recordName: String,
+        entityType: String,
+        generation: String?,
+        trackingReadSnapshot: Realm,
+        targetReadSnapshots: inout [String: Realm]
+    ) -> Bool {
+        guard let target = realmProvider?.targetReaderRealmPerSchemaName[entityType] else { return false }
+        let targetSnapshot: Realm
+        if let existing = targetReadSnapshots[entityType] {
+            targetSnapshot = existing
+        } else {
+            targetSnapshot = committedRealmReadSnapshot(in: target)
+            targetReadSnapshots[entityType] = targetSnapshot
+        }
+        if targetSnapshot.schema.objectSchema.contains(where: {
+            $0.className == BigSyncPendingMutation.className()
+        }), let mutation = targetSnapshot.object(ofType: BigSyncPendingMutation.self,
+                                                 forPrimaryKey: recordName),
+           mutation.generation != generation {
+            return false
+        }
+        guard let generation else { return true }
+        return preparedGenerationIsEligibleForActiveTransport(
+            recordName: recordName, entityType: entityType, generation: generation,
+            trackingReadSnapshot: trackingReadSnapshot, targetReadSnapshot: targetSnapshot)
     }
 
     /// The owning synchronizer has awaited callback/adapter quiescence and
@@ -8924,7 +8955,24 @@ public final class RealmSwiftAdapter:
         }
 
         try validatePreparationOwner()
-        return try attachingRetainedDeletionQuarantineEvidence(to: recordsArray)
+#if DEBUG
+        try _testBeforePreparedMutationGenerationRecheck?()
+#endif
+        try validatePreparationOwner()
+        guard let tracking = realmProvider?.persistenceRealm else { return [] }
+        let trackingSnapshot = committedRealmReadSnapshot(in: tracking)
+        var targetSnapshots = [String: Realm]()
+        let eligibleRecords = recordsArray.filter { item in
+            // Staged comparison evidence is still needed to reconcile an
+            // uncertain server result after the local journal advances.
+            if item.comparisonBase?.submissionIdentity != nil { return true }
+            return preparedMutationIsCurrentForPreparation(
+                recordName: item.record.recordID.recordName, entityType: item.record.recordType,
+                generation: item.generation, trackingReadSnapshot: trackingSnapshot,
+                targetReadSnapshots: &targetSnapshots)
+        }
+        try validatePreparationOwner()
+        return try attachingRetainedDeletionQuarantineEvidence(to: eligibleRecords)
     }
     /// Prepares upload records together with an opaque snapshot of their local
     /// mutation generations. Pass this batch back when acknowledging successes.
@@ -9235,9 +9283,24 @@ public final class RealmSwiftAdapter:
                 deletions.append(.init(recordID: recordID, generation: candidate.generation))
             }
         }
-        updateHasChanges(realm: committedRealmReadSnapshot(in: persistenceRealm))
+#if DEBUG
+        try _testBeforePreparedMutationGenerationRecheck?()
+#endif
         try validatePreparationOwner()
-        return deletions
+        let trackingSnapshot = committedRealmReadSnapshot(in: persistenceRealm)
+        var targetSnapshots = [String: Realm]()
+        let eligibleDeletions = deletions.filter { item in
+            guard let entity = trackingSnapshot.object(ofType: SyncedEntity.self,
+                forPrimaryKey: item.recordID.recordName),
+                entity.entityState == .deletedLocally else { return false }
+            return preparedMutationIsCurrentForPreparation(
+                recordName: item.recordID.recordName, entityType: entity.entityType,
+                generation: item.generation, trackingReadSnapshot: trackingSnapshot,
+                targetReadSnapshots: &targetSnapshots)
+        }
+        updateHasChanges(realm: trackingSnapshot)
+        try validatePreparationOwner()
+        return eligibleDeletions
     }
 
     /// Prepares deletions together with an opaque snapshot of their local
