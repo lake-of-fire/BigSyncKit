@@ -129,6 +129,12 @@ public struct CloudKitRecordZoneChangePage: Sendable {
         self.moreComing = moreComing
     }
 
+    private struct ModificationIdentityMismatch: LocalizedError {
+        var errorDescription: String? {
+            "The returned CloudKit record ID does not match its modification key."
+        }
+    }
+
     init<Modification>(
         modificationResultsByID: [CKRecord.ID: Result<Modification, Error>],
         changeToken: CKServerChangeToken?,
@@ -142,16 +148,21 @@ public struct CloudKitRecordZoneChangePage: Sendable {
         for (recordID, result) in modificationResultsByID {
             switch result {
             case .success(let modification):
-                records.append(recordForModification(modification))
+                let record = recordForModification(modification)
+                guard record.recordID == recordID else {
+                    failures[recordID] = ModificationIdentityMismatch()
+                    continue
+                }
+                records.append(record)
             case .failure(let error):
                 failures[recordID] = error
             }
         }
 
         // A failed page must be replayed from the previous cursor. Keep the
-        // record ID for a singleton zone loss so the caller can distinguish
-        // an item failure from an error thrown by the zone operation itself.
-        if failures.count == 1, let (recordID, error) = failures.first {
+        // record ID for malformed modifications and singleton zone losses.
+        if failures.count == 1, let (recordID, error) = failures.first,
+           !(error is ModificationIdentityMismatch) {
             let loss = CloudKitLossClassifier.classify(error: error, defaultZoneID: recordID.zoneID)
             if loss.zoneDispositions.isEmpty {
                 throw error

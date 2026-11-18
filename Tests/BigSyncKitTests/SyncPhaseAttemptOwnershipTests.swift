@@ -36,6 +36,7 @@ private final class SyncPhaseProbe {
     var phaseFinished = false
     var terminalBoundaryEntries = 0
     var importCount = 0
+    var liveImportCount = 0
     var cleanupCount = 0
     var persistenceCount = 0
     var uploadPreparationCount = 0
@@ -59,6 +60,7 @@ private final class SyncPhaseProbe {
     }
     func noteCleanup() { cleanupCount += 1 }
     func noteImport() { importCount += 1 }
+    func noteLiveImport() { liveImportCount += 1 }
     func persist() async throws {
         persistenceCount += 1
         try await onPersist?()
@@ -89,6 +91,7 @@ private class SyncPhaseAdapter: NSObject, ModelAdapter, @unchecked Sendable {
     func resetSyncCaches() async throws {}
     func hasChanges(record: CKRecord, object: Object) -> Bool { false }
     func saveChanges(in records: [CKRecord], forceSave: Bool) async throws -> [InboundLiveResult] {
+        await probe.noteLiveImport()
         if let error = await probe.recordError { throw error }
         return records.enumerated().map {
             .init(event: .init(ordinal: $0.offset, entityType: $0.element.recordType,
@@ -191,6 +194,7 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     private(set) var zoneFetchCount = 0
     private(set) var zoneDeleteCount = 0
     private var zoneFailure: NSError?
+    private var fetchedZoneID: CKRecordZone.ID?
     private var zoneSaveFailure: NSError?
     private var zonePageFailure: NSError?
     private var zonePageModifications: [CKRecord.ID: Result<CKRecord, Error>]?
@@ -211,6 +215,7 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     private var mutationEntered: XCTestExpectation?
     private var mutationGate: SyncPhaseGate?
     func failZoneFetch(_ error: NSError) { zoneFailure = error }
+    func returnZone(_ zoneID: CKRecordZone.ID) { fetchedZoneID = zoneID }
     func holdMutationFailure(_ error: NSError, entered: XCTestExpectation, gate: SyncPhaseGate) {
         mutationFailure = error; mutationEntered = entered; mutationGate = gate
     }
@@ -257,7 +262,7 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     func recordZone(withID id: CKRecordZone.ID) async throws -> CKRecordZone {
         zoneFetchCount += 1
         if let zoneFailure { await observeTransportFailure?(); throw zoneFailure }
-        return CKRecordZone(zoneID: id)
+        return CKRecordZone(zoneID: fetchedZoneID ?? id)
     }
     func save(recordZone: CKRecordZone) async throws -> CKRecordZone {
         zoneSaveCount += 1
@@ -1644,6 +1649,34 @@ extension SyncPhaseAttemptOwnershipTests {
     }
 
     @BigSyncBackgroundActor
+    func testForeignFetchedZoneCannotEstablishOrCreateRequestedZone() async throws {
+        try await withFixture { sync, adapter, _, transport in
+            let requested = adapter.recordZoneID
+            let foreign = CKRecordZone.ID(zoneName: requested.zoneName, ownerName: "another-owner")
+            await transport.returnZone(foreign)
+            var failure: Error?
+            try await sync.setupRecordZoneID(requested,
+                attemptID: sync.synchronizationAttemptID) { failure = $0 }
+
+            XCTAssertEqual((failure as? CocoaError)?.code, .coderValueNotFound)
+            XCTAssertFalse(try sync.configuredZoneIsEstablished(requested))
+            XCTAssertFalse(try sync.configuredZoneIsEstablished(foreign))
+            let fetches = await transport.zoneFetchCount
+            let saves = await transport.zoneSaveCount
+            XCTAssertEqual(fetches, 1)
+            XCTAssertEqual(saves, 0)
+
+            await transport.returnZone(requested)
+            try await sync.setupRecordZoneID(requested,
+                attemptID: sync.synchronizationAttemptID) { failure = $0 }
+            XCTAssertNil(failure)
+            XCTAssertTrue(try sync.configuredZoneIsEstablished(requested))
+            let finalSaves = await transport.zoneSaveCount
+            XCTAssertEqual(finalSaves, 0)
+        }
+    }
+
+    @BigSyncBackgroundActor
     private func requireResetBackoff(_ error: NSError, token: Bool = false) async throws {
         try await withFixture { sync, adapter, _, transport in
             let context = try XCTUnwrap(sync.activeRunContext)
@@ -1886,6 +1919,77 @@ extension SyncPhaseAttemptOwnershipTests {
                 XCTAssertEqual(probe.persistenceCount, 0)
                 XCTAssertNil(try sync.configuredZoneTerminalState(zoneID))
             }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMismatchedSameZoneRecordCannotImportPageOrAdvanceCursor() async throws {
+        try await withFixture(migrating: true) { sync, adapter, probe, transport in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            try await sync.beginChangeFeedMigrationIfNeeded(context: context)
+            let zone = adapter.recordZoneID
+            let expected = CKRecord.ID(recordName: "expected", zoneID: zone)
+            let unexpected = CKRecord.ID(recordName: "unexpected", zoneID: zone)
+            let valid = CKRecord.ID(recordName: "valid", zoneID: zone)
+            let previous = await adapter.serverChangeToken
+            let tokenWrites = probe.savedTokens
+            await transport.returnZonePageModifications([
+                expected: .success(CKRecord(recordType: "SyncPhaseFixture", recordID: unexpected)),
+                valid: .success(CKRecord(recordType: "SyncPhaseFixture", recordID: valid)),
+            ])
+
+            do {
+                _ = try await sync.fetchDatabaseChanges()
+                XCTFail("An invalid zone page cannot return a database cursor")
+            } catch let error as CKError {
+                XCTAssertEqual(error.code, .partialFailure)
+                let items = try XCTUnwrap(error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError])
+                XCTAssertEqual(Set(items.keys), [expected])
+            }
+            XCTAssertEqual(probe.liveImportCount, 0)
+            XCTAssertEqual(probe.persistenceCount, 0)
+            XCTAssertEqual(sync.activeZoneTokens[zone], previous)
+            XCTAssertEqual(probe.savedTokens, tokenWrites)
+            XCTAssertFalse(try sync.configuredZoneIsEstablished(zone))
+            let pages = await transport.zonePageCount
+            XCTAssertEqual(pages, 1)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMismatchedZonePageRecordPreservesSiblingAccountAndRetryConstraints() async throws {
+        try await withFixture { sync, adapter, probe, transport in
+            let zone = adapter.recordZoneID
+            let expected = CKRecord.ID(recordName: "expected", zoneID: zone)
+            let unexpected = CKRecord.ID(recordName: "unexpected", zoneID: zone)
+            let account = CKRecord.ID(recordName: "account", zoneID: zone)
+            let retry = CKRecord.ID(recordName: "retry", zoneID: zone)
+            let previous = sync.activeZoneTokens[zone]
+            await transport.returnZonePageModifications([
+                expected: .success(CKRecord(recordType: "SyncPhaseFixture", recordID: unexpected)),
+                account: .failure(CKError(.notAuthenticated)),
+                retry: .failure(CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137])),
+            ])
+
+            let accountReads = probe.accountIdentifierCalls
+            do {
+                try await sync.fetchZoneChanges([zone])
+                XCTFail("A page with item failures cannot publish changes")
+            } catch let error as CKError {
+                XCTAssertEqual(error.code, .partialFailure)
+                let items = try XCTUnwrap(error.userInfo[CKPartialErrorsByItemIDKey] as? [CKRecord.ID: NSError])
+                XCTAssertEqual(Set(items.keys), [expected, account, retry])
+                XCTAssertEqual((items[account] as? CKError)?.code, .notAuthenticated)
+                XCTAssertEqual((items[retry] as? CKError)?.code, .requestRateLimited)
+                let constraints = CloudKitRetryConstraints(error)
+                XCTAssertTrue(constraints.blocksAccountOperations)
+                XCTAssertEqual(constraints.serverMinimum, 137)
+            }
+            XCTAssertEqual(probe.accountIdentifierCalls - accountReads, 1)
+            XCTAssertEqual(probe.liveImportCount, 0)
+            XCTAssertEqual(probe.persistenceCount, 0)
+            XCTAssertEqual(sync.activeZoneTokens[zone], previous)
+            XCTAssertTrue(probe.savedTokens.isEmpty)
         }
     }
 
