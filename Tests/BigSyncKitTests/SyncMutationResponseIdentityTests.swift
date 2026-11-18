@@ -183,7 +183,7 @@ private actor ResponseIdentityTransport: CloudKitRecordStore, CloudKitRecordFetc
     let route: ResponseRoute
     let alteration: ResponseAlteration
     let siblingError: CKError?
-    let conflictRetryAfter: TimeInterval?
+    let conflictRetryAfter: (any Sendable)?
     let repairUnderlyingError: Error?
     let sizeLimit: ResponseSizeLimit?
     let account: ResponseAccountProbe
@@ -191,7 +191,7 @@ private actor ResponseIdentityTransport: CloudKitRecordStore, CloudKitRecordFetc
     private(set) var attemptedMutationSizes = [Int]()
     private(set) var lookupCount = 0
     init(route: ResponseRoute, alteration: ResponseAlteration, siblingError: CKError?, account: ResponseAccountProbe,
-         conflictRetryAfter: TimeInterval?, repairUnderlyingError: Error? = nil,
+         conflictRetryAfter: (any Sendable)?, repairUnderlyingError: Error? = nil,
          sizeLimit: ResponseSizeLimit? = nil) {
         self.route = route; self.alteration = alteration; self.siblingError = siblingError; self.account = account
         self.conflictRetryAfter = conflictRetryAfter
@@ -321,7 +321,7 @@ final class SyncMutationResponseIdentityTests: XCTestCase {
     @BigSyncBackgroundActor
     private func run(_ route: ResponseRoute, _ alteration: ResponseAlteration, sibling: CKError? = nil,
                      acknowledgeFailure: Error? = nil, failsAccountAfterResult: Bool = false,
-                     conflictRetryAfter: TimeInterval? = nil,
+                     conflictRetryAfter: (any Sendable)? = nil,
                      repairUnderlyingError: Error? = nil,
                      preparationAlteration: ResponsePreparationAlteration = .none,
                      failAccountAfterResultCall: Int? = nil,
@@ -680,6 +680,22 @@ extension SyncMutationResponseIdentityTests {
     @BigSyncBackgroundActor
     func testUploadConflictPreservesOwnRetryDeadline() async throws {
         try await requireDeferredRepair(.saveConflict, retryAfter: 73)
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedRetryDirectiveBlocksUploadConflictRepair() async throws {
+        let (adapter, transport, _, failure) = try await run(
+            .saveConflict, .none, conflictRetryAfter: "malformed"
+        )
+        let constraints = CloudKitRetryConstraints(try XCTUnwrap(failure))
+        XCTAssertTrue(constraints.hasRetryDirective)
+        XCTAssertFalse(constraints.requiresDeferredRetry)
+        XCTAssertTrue(adapter.pending.contains("target"))
+        XCTAssertTrue(adapter.imported.isEmpty)
+        XCTAssertTrue(adapter.rebased.isEmpty)
+        XCTAssertEqual(adapter.uploaded.map { $0.recordID.recordName }, ["success"])
+        let requests = await transport.mutationCount
+        XCTAssertEqual(requests, 1)
     }
     @BigSyncBackgroundActor
     func testUploadConflictPreservesNestedRateLimit() async throws {
@@ -2108,6 +2124,23 @@ extension SyncMutationResponseIdentityTests {
                     XCTAssertEqual(adapter.pending, ["success", "target"])
                 }
             }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedRetryDirectiveBlocksSizeBatchSplitting() async throws {
+        for response: ResponseSizeLimit in [.thrown, .perItem] {
+            let (adapter, transport, _, failure) = try await run(
+                .save, .none, conflictRetryAfter: "malformed", sizeLimit: response
+            )
+            let constraints = CloudKitRetryConstraints(try XCTUnwrap(failure))
+            XCTAssertTrue(constraints.hasRetryDirective)
+            XCTAssertFalse(constraints.requiresDeferredRetry)
+            XCTAssertTrue(constraints.codes.contains(.limitExceeded))
+            XCTAssertEqual(adapter.preparationLimits.count, 1)
+            XCTAssertEqual(adapter.pending, ["success", "target"])
+            let requests = await transport.mutationCount
+            XCTAssertEqual(requests, 1)
         }
     }
 

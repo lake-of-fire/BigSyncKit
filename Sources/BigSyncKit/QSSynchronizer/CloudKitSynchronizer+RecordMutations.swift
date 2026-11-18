@@ -88,7 +88,7 @@ private func validatedMutationResults<Value>(
 private func mutationFailureAllowsImmediateRepair(_ error: Error) -> Bool {
     let constraints = CloudKitRetryConstraints(error)
     return constraints.isErrorGraphComplete
-        && !constraints.requiresDeferredRetry
+        && !constraints.blocksImmediateRetry
         && constraints.codes.isSubset(of: [.unknownItem, .serverRecordChanged])
 }
 
@@ -337,7 +337,7 @@ extension CloudKitSynchronizer {
         return attemptedCount > 1
             && batchSize < requestedBatchSize
             && constraints.containsOnlySizeLimitFailures
-            && !constraints.requiresDeferredRetry
+            && !constraints.blocksImmediateRetry
     }
 
     @BigSyncBackgroundActor

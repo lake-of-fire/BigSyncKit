@@ -24,6 +24,9 @@ struct CloudKitRetryConstraints {
 
     var requestsTokenRecovery: Bool { codes.contains(.changeTokenExpired) }
 
+    /// Unusable server guidance blocks immediate repair without supplying a delay.
+    var blocksImmediateRetry: Bool { hasRetryDirective || requiresDeferredRetry }
+
     var requiresDeferredRetry: Bool {
         serverMinimum != nil || !codes.isDisjoint(with: [
             .serviceUnavailable, .requestRateLimited, .zoneBusy,
@@ -155,8 +158,7 @@ public enum BigSyncCloudKitRetryPolicy {
     public static func allowsImmediateRecordConflictRetry(_ error: Error) -> Bool {
         let constraints = CloudKitRetryConstraints(error)
         return constraints.isErrorGraphComplete
-            && !constraints.requiresDeferredRetry
-            && !constraints.hasRetryDirective
+            && !constraints.blocksImmediateRetry
             && !constraints.blocksAccountOperations
             && !constraints.requestsTokenRecovery
             && constraints.codes.contains(.serverRecordChanged)
@@ -170,8 +172,7 @@ public enum BigSyncCloudKitRetryPolicy {
         guard let cloudError = error as? CKError, cloudError.code == .unknownItem else { return false }
         let constraints = CloudKitRetryConstraints(error)
         return constraints.isErrorGraphComplete
-            && !constraints.requiresDeferredRetry
-            && !constraints.hasRetryDirective
+            && !constraints.blocksImmediateRetry
             && !constraints.blocksAccountOperations
             && !constraints.requestsTokenRecovery
             && CloudKitRetryConstraints.isFailureTree(
