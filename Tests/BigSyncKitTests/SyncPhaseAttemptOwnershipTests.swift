@@ -199,6 +199,8 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     private var zonePageFailure: NSError?
     private var zonePageModifications: [CKRecord.ID: Result<CKRecord, Error>]?
     private var databaseFailure: NSError?
+    private var databasePages = [CloudKitDatabaseChangePage]()
+    private var zonePages = [CloudKitRecordZoneChangePage]()
     private(set) var zonePageCount = 0
     private var observeTransportFailure: (@Sendable () async -> Void)?
     func observeFailures(_ callback: @escaping @Sendable () async -> Void) {
@@ -207,6 +209,8 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
     func failMutation(_ error: NSError) { mutationFailure = error }
     func failDatabase(_ error: NSError) { databaseFailure = error }
     func failZonePage(_ error: NSError) { zonePageFailure = error }
+    func returnDatabasePages(_ pages: [CloudKitDatabaseChangePage]) { databasePages = pages }
+    func returnZonePages(_ pages: [CloudKitRecordZoneChangePage]) { zonePages = pages }
     func returnZonePageModifications(_ results: [CKRecord.ID: Result<CKRecord, Error>]) {
         zonePageModifications = results
     }
@@ -238,12 +242,14 @@ private actor SyncPhaseTransport: CloudKitChangeFeed, CloudKitSubscriptionStore,
             await failureGate?.wait()
             throw heldFailure
         }
+        if !databasePages.isEmpty { return databasePages.removeFirst() }
         return .init(cursor: .init(serializedData: Data("phase-db".utf8)),
                      changedZoneIDs: [], deletions: deletions, moreComing: false)
     }
     func recordZoneChanges(in: CKRecordZone.ID, since: RecordZoneChangeCursor?, desiredKeys: [CKRecord.FieldKey]?, resultsLimit: Int?) async throws -> CloudKitRecordZoneChangePage {
         zonePageCount += 1
         if let zonePageFailure { await observeTransportFailure?(); throw zonePageFailure }
+        if !zonePages.isEmpty { return zonePages.removeFirst() }
         if let zonePageModifications {
             return try CloudKitRecordZoneChangePage(
                 modificationResultsByID: zonePageModifications,
@@ -1919,6 +1925,87 @@ extension SyncPhaseAttemptOwnershipTests {
                 XCTAssertEqual(probe.persistenceCount, 0)
                 XCTAssertNil(try sync.configuredZoneTerminalState(zoneID))
             }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testDatabasePageWithUnusableContinuationCannotApplyZoneDeletion() async throws {
+        for returnedCursorIsEmpty in [false, true] {
+            try await withFixture { sync, adapter, _, transport in
+                let original = DatabaseChangeCursor(serializedData: Data("committed-db".utf8))
+                let returned = returnedCursorIsEmpty
+                    ? DatabaseChangeCursor(serializedData: Data())
+                    : original
+                let zone = adapter.recordZoneID
+                sync.serverChangeToken = original
+                try sync.persistDatabaseToken(original)
+                await transport.returnDatabasePages([
+                    .init(cursor: returned, changedZoneIDs: [],
+                          deletions: [.init(zoneID: zone, kind: .deleted)], moreComing: true),
+                ])
+
+                do {
+                    _ = try await sync.fetchDatabaseChanges()
+                    XCTFail("An invalid database continuation cannot yield a cursor")
+                } catch let error as CloudKitPaginationError {
+                    XCTAssertEqual(error, .databaseCursorDidNotAdvance)
+                }
+                let requests = await transport.databaseFetchCount
+                XCTAssertEqual(requests, 1)
+                XCTAssertEqual(try sync.readStoredDatabaseTokenDurably(), original)
+                XCTAssertNil(try sync.configuredZoneTerminalState(zone))
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testRecordZoneContinuationKeepsOnlyThePriorCommittedPage() async throws {
+        for returnedCursorIsEmpty in [false, true] {
+            try await withFixture { sync, adapter, probe, transport in
+                let zone = adapter.recordZoneID
+                let committed = RecordZoneChangeCursor(serializedData: Data("first-page".utf8))
+                let invalid = returnedCursorIsEmpty
+                    ? RecordZoneChangeCursor(serializedData: Data())
+                    : committed
+                func record(_ name: String) -> CKRecord {
+                    CKRecord(recordType: "SyncPhaseFixture", recordID: .init(recordName: name, zoneID: zone))
+                }
+                await transport.returnZonePages([
+                    .init(cursor: committed, records: [record("first")], deletedRecordIDs: [], moreComing: true),
+                    .init(cursor: invalid, records: [record("stalled")], deletedRecordIDs: [], moreComing: true),
+                    .init(cursor: committed, records: [], deletedRecordIDs: [], moreComing: false),
+                ])
+
+                do {
+                    try await sync.fetchZoneChanges([zone])
+                    XCTFail("An invalid zone continuation cannot complete")
+                } catch let error as CloudKitPaginationError {
+                    XCTAssertEqual(error, .recordZoneCursorDidNotAdvance)
+                }
+                let requests = await transport.zonePageCount
+                XCTAssertEqual(requests, 2)
+                XCTAssertEqual(probe.liveImportCount, 1)
+                XCTAssertEqual(probe.persistenceCount, 1)
+                XCTAssertEqual(probe.savedTokens, [committed])
+                XCTAssertEqual(sync.activeZoneTokens[zone], committed)
+            }
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testTerminalRecordZonePageMayReturnTheRequestedCursor() async throws {
+        try await withFixture { sync, adapter, _, transport in
+            let zone = adapter.recordZoneID
+            let cursor = try XCTUnwrap(sync.activeZoneTokens[zone])
+            await transport.returnZonePages([
+                .init(cursor: cursor, records: [], deletedRecordIDs: [], moreComing: false),
+            ])
+
+            try await sync.fetchZoneChanges([zone])
+
+            let requests = await transport.zonePageCount
+            XCTAssertEqual(requests, 1)
+            XCTAssertEqual(sync.activeZoneTokens[zone], cursor)
         }
     }
 
