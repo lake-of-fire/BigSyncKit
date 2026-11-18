@@ -2527,6 +2527,9 @@ final class CloudKitSynchronizerAccountFencingTests: XCTestCase {
             synchronizer.databaseSubscriptionID,
             "old-account-subscription"
         )
+        // Restore durable reads after the injected write failure so we can
+        // inspect what the aborted account replacement left behind.
+        store.undurableKeySubstring = nil
         XCTAssertNotNil(synchronizer._test_persistedTransientRetryNotBefore(
             accountScopeIdentifier: oldScope
         ))
