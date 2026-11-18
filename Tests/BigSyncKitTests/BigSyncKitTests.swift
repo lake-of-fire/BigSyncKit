@@ -7096,11 +7096,13 @@ final class BigSyncKitTests: XCTestCase {
         )
 
         let otherAccount = CloudKitSynchronizer.RunContext(
-            attemptID: UUID(),
-            runID: UUID(),
+            attemptID: relaunched.synchronizationAttemptID,
+            runID: relaunched.synchronizationRunID,
             accountIdentifier: "other-account",
             accountScopeIdentifier: "scope-b"
         )
+        relaunched.accountScopeAuthorityFence.clear()
+        relaunched.activeRunContext = otherAccount
         try await relaunched.waitForPersistedTransientRetryIfNeeded(
             context: otherAccount
         )

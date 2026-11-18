@@ -1424,6 +1424,8 @@ public class CloudKitSynchronizer: NSObject {
     internal var cancelSync = false
     @BigSyncBackgroundActor
     internal var retrySleepUntil: Date?
+    @BigSyncBackgroundActor
+    private var unpersistedTransientRetryState: TransientRetryState?
     /// In-memory mirror of the current account-scoped durable retry count.
     /// An explicit cancellation stops the active sleep but deliberately keeps
     /// a server-directed floor durable; account replacement rejects and clears
@@ -3524,23 +3526,33 @@ public class CloudKitSynchronizer: NSObject {
         )
     }
 
-    private func persistedTransientRetryState() -> (
-        accountScopeIdentifier: String,
-        notBefore: Date,
-        consecutiveFailures: Int
-    )? {
-        guard let value = keyValueStore.object(
-            forKey: transientRetryStateKey
-        ) as? [String: Any],
-        let accountScopeIdentifier = value["accountScopeIdentifier"] as? String,
-        let notBefore = value["notBefore"] as? Date,
-        let consecutiveFailures = value["consecutiveFailures"] as? Int,
-        consecutiveFailures > 0 else {
-            return nil
-        }
-        return (accountScopeIdentifier, notBefore, consecutiveFailures)
+    private struct TransientRetryState: Equatable {
+        let accountScopeIdentifier: String
+        let notBefore: Date
+        let consecutiveFailures: Int
     }
 
+    private func persistedTransientRetryState() throws -> TransientRetryState? {
+        guard let rawValue = try keyValueStore.bigSyncDurableObject(
+            forKey: transientRetryStateKey
+        ) else { return nil }
+        guard let value = rawValue as? [String: Any],
+        let accountScopeIdentifier = value["accountScopeIdentifier"] as? String,
+        !accountScopeIdentifier.isEmpty,
+        let notBefore = value["notBefore"] as? Date,
+        notBefore.timeIntervalSinceReferenceDate.isFinite,
+        let consecutiveFailures = value["consecutiveFailures"] as? Int,
+        consecutiveFailures > 0 else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return TransientRetryState(
+            accountScopeIdentifier: accountScopeIdentifier,
+            notBefore: notBefore,
+            consecutiveFailures: consecutiveFailures
+        )
+    }
+
+    @BigSyncBackgroundActor
     internal func persistTransientRetryState(
         context: RunContext,
         notBefore: Date,
@@ -3548,50 +3560,101 @@ public class CloudKitSynchronizer: NSObject {
         validateOwnership: () throws -> Void = {}
     ) {
         guard (try? validateOwnership()) != nil else { return }
-        if let existing = persistedTransientRetryState(),
-           existing.accountScopeIdentifier == context.accountScopeIdentifier,
-           existing.notBefore >= notBefore {
-            return
+        let state: TransientRetryState
+        if let pending = unpersistedTransientRetryState,
+           pending.accountScopeIdentifier == context.accountScopeIdentifier,
+           pending.notBefore >= notBefore {
+            state = pending
+        } else {
+            state = TransientRetryState(
+                accountScopeIdentifier: context.accountScopeIdentifier,
+                notBefore: notBefore,
+                consecutiveFailures: max(1, consecutiveFailures)
+            )
+            // Keep a floor for later attempts in this process if either
+            // storage call fails or retires this attempt.
+            unpersistedTransientRetryState = state
         }
-        // A custom store can retire this attempt during the previous read.
-        guard (try? validateOwnership()) != nil else { return }
-        try? keyValueStore.bigSyncSetDurably(
-            value: [
-                "accountScopeIdentifier": context.accountScopeIdentifier,
-                "notBefore": notBefore,
-                "consecutiveFailures": max(1, consecutiveFailures),
-            ],
-            forKey: transientRetryStateKey
-        )
+        do {
+            let existing = try persistedTransientRetryState()
+            // A custom store can retire this attempt during a read or write.
+            guard (try? validateOwnership()) != nil else { return }
+            if existing?.accountScopeIdentifier != state.accountScopeIdentifier
+                || (existing?.notBefore ?? .distantPast) < state.notBefore {
+                try keyValueStore.bigSyncSetDurably(value: [
+                    "accountScopeIdentifier": state.accountScopeIdentifier,
+                    "notBefore": state.notBefore,
+                    "consecutiveFailures": state.consecutiveFailures,
+                ], forKey: transientRetryStateKey)
+                guard (try? validateOwnership()) != nil else { return }
+            }
+            if unpersistedTransientRetryState == state {
+                unpersistedTransientRetryState = nil
+            }
+        } catch {
+            logger.warning("QSCloudKitSynchronizer >> Could not persist CloudKit retry deadline: \(error)")
+        }
     }
 
+    @BigSyncBackgroundActor
     internal func clearPersistedTransientRetryState() {
+        unpersistedTransientRetryState = nil
         try? keyValueStore.bigSyncRemoveDurably(forKey: transientRetryStateKey)
     }
 
+    @BigSyncBackgroundActor
     internal func waitForPersistedTransientRetryIfNeeded(
         context: RunContext
     ) async throws {
-        guard let state = persistedTransientRetryState() else { return }
-        guard state.accountScopeIdentifier == context.accountScopeIdentifier else {
-            clearPersistedTransientRetryState()
-            return
-        }
-        consecutiveTransientCloudKitFailures = state.consecutiveFailures
-        let delay = state.notBefore.timeIntervalSinceNow
-        guard delay > 0 else {
-            clearPersistedTransientRetryState()
-            return
-        }
-        retrySleepUntil = state.notBefore
-        do {
-            try await BigSyncRetrySleep.sleep(for: delay)
-            try await revalidateRunContext(context)
+        try checkRunContext(context)
+        var retriedPendingWrite = false
+        while true {
+            let persisted = try persistedTransientRetryState()
+            try checkRunContext(context)
+            let pending = unpersistedTransientRetryState
+            let state = [persisted, pending].compactMap { $0 }.filter {
+                $0.accountScopeIdentifier == context.accountScopeIdentifier
+            }.max { $0.notBefore < $1.notBefore }
+            if let state {
+                consecutiveTransientCloudKitFailures = state.consecutiveFailures
+            }
+            let delay = state?.notBefore.timeIntervalSinceNow ?? 0
+            guard let state, delay > 0 else {
+                if persisted != nil {
+                    clearPersistedTransientRetryState()
+                    try checkRunContext(context)
+                } else {
+                    unpersistedTransientRetryState = nil
+                }
+                return
+            }
+            // Give storage one chance per attempt to recover the deadline
+            // before sleeping, so a subsequent launch can restore it.
+            if !retriedPendingWrite, pending == state,
+               persisted?.accountScopeIdentifier != state.accountScopeIdentifier
+                    || (persisted?.notBefore ?? .distantPast) < state.notBefore {
+                retriedPendingWrite = true
+                persistTransientRetryState(
+                    context: context,
+                    notBefore: state.notBefore,
+                    consecutiveFailures: state.consecutiveFailures,
+                    validateOwnership: { try checkRunContext(context) }
+                )
+                try checkRunContext(context)
+            }
+            retrySleepUntil = state.notBefore
+            do {
+                try await BigSyncRetrySleep.sleep(for: delay)
+                try await revalidateRunContext(context)
+            } catch {
+                if activeRunContext == context, retrySleepUntil == state.notBefore {
+                    retrySleepUntil = nil
+                }
+                throw error
+            }
             retrySleepUntil = nil
-            clearPersistedTransientRetryState()
-        } catch {
-            retrySleepUntil = nil
-            throw error
+            // Another observation may have extended the floor while we slept.
+            // Re-read it before clearing metadata or admitting transport.
         }
     }
 
@@ -3599,7 +3662,7 @@ public class CloudKitSynchronizer: NSObject {
     internal func _test_persistedTransientRetryNotBefore(
         accountScopeIdentifier: String
     ) -> Date? {
-        guard let state = persistedTransientRetryState(),
+        guard let state = try? persistedTransientRetryState(),
               state.accountScopeIdentifier == accountScopeIdentifier else {
             return nil
         }
