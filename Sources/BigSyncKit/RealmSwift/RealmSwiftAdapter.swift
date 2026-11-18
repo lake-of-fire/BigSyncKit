@@ -8994,7 +8994,10 @@ public final class RealmSwiftAdapter:
         let trackingSnapshot = committedRealmReadSnapshot(in: tracking)
         var targetSnapshots = [String: Realm]()
         let eligibleRecords = recordsArray.filter { item in
-            preparedMutationIsCurrentForPreparation(
+            // A staged comparison proof may be needed to reconcile an
+            // uncertain server result even if the local journal advanced.
+            if item.comparisonBase?.submissionIdentity != nil { return true }
+            return preparedMutationIsCurrentForPreparation(
                 recordName: item.record.recordID.recordName, entityType: item.record.recordType,
                 generation: item.generation, trackingReadSnapshot: trackingSnapshot,
                 targetReadSnapshots: &targetSnapshots)

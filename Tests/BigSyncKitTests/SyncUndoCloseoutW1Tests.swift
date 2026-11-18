@@ -1509,11 +1509,10 @@ extension SyncUndoCloseoutW1Tests {
     @BigSyncBackgroundActor
     func testUploadPreparationWithholdsSelectionSupersededByCommittedEdit() async throws {
         let (adapter, realm) = try await fixture()
-        let object = W1ContractNote()
-        object.id = noteID
+        let object = W1UploadSnapshotRow()
         try realm.write {
             realm.add(object)
-            object.text = "first generation"
+            object.title = "first generation"
             object.refreshChangeMetadata(explicitlyModified: true)
         }
         try await adapter.didFinishImport()
@@ -1521,7 +1520,7 @@ extension SyncUndoCloseoutW1Tests {
         adapter._testBeforePreparedMutationGenerationRecheck = {
             adapter._testBeforePreparedMutationGenerationRecheck = nil
             try realm.write {
-                object.text = "successor generation"
+                object.title = "successor generation"
                 object.refreshChangeMetadata(explicitlyModified: true)
             }
         }
@@ -1533,16 +1532,15 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertNotEqual(successor, firstGeneration)
         try await adapter.didFinishImport()
         let fresh = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
-        XCTAssertEqual(fresh.first?.generation, successor)
-        XCTAssertEqual(fresh.first?.record["text"] as? String, "successor generation")
+        XCTAssertEqual(try XCTUnwrap(fresh.first).generation, successor)
+        XCTAssertEqual(fresh.first?.record["title"] as? String, "successor generation")
         try await quiet(adapter, realm: realm)
     }
 
     @BigSyncBackgroundActor
     func testDeletionPreparationWithholdsSelectionSupersededByResurrection() async throws {
         let (adapter, realm) = try await fixture()
-        let object = W1ContractNote()
-        object.id = noteID
+        let object = W1UploadSnapshotRow()
         try realm.write {
             realm.add(object)
             object.refreshChangeMetadata(explicitlyModified: true)
@@ -1550,6 +1548,8 @@ extension SyncUndoCloseoutW1Tests {
         try await adapter.didFinishImport()
         let upload = try await adapter.prepareUploadBatch(limit: 50)
         XCTAssertEqual(upload.records.count, 1)
+        let saved = try tagged(XCTUnwrap(upload.records.first), "prior-save")
+        try await adapter.acknowledgeUploadedRecords([saved], from: upload)
         try realm.write {
             object.isDeleted = true
             object.refreshChangeMetadata(explicitlyModified: true)
@@ -1562,7 +1562,7 @@ extension SyncUndoCloseoutW1Tests {
             adapter._testBeforePreparedMutationGenerationRecheck = nil
             try realm.write {
                 object.isDeleted = false
-                object.text = "resurrected"
+                object.title = "resurrected"
                 object.refreshChangeMetadata(explicitlyModified: true)
             }
         }
@@ -1574,8 +1574,8 @@ extension SyncUndoCloseoutW1Tests {
         XCTAssertNotEqual(successor, deletionGeneration)
         try await adapter.didFinishImport()
         let fresh = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
-        XCTAssertEqual(fresh.first?.generation, successor)
-        XCTAssertEqual(fresh.first?.record["text"] as? String, "resurrected")
+        XCTAssertEqual(try XCTUnwrap(fresh.first).generation, successor)
+        XCTAssertEqual(fresh.first?.record["title"] as? String, "resurrected")
         try await quiet(adapter, realm: realm)
     }
 
