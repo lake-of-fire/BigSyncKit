@@ -1507,6 +1507,85 @@ extension SyncUndoCloseoutW1Tests {
     }
 
     @BigSyncBackgroundActor
+    func testUploadPreparationWithholdsSelectionSupersededByCommittedEdit() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1UploadSnapshotRow()
+        try realm.write {
+            realm.add(object)
+            object.title = "first generation"
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let firstGeneration = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        adapter._testBeforePreparedMutationGenerationRecheck = {
+            adapter._testBeforePreparedMutationGenerationRecheck = nil
+            try realm.write {
+                object.title = "successor generation"
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        defer { adapter._testBeforePreparedMutationGenerationRecheck = nil }
+
+        let stale = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
+        XCTAssertTrue(stale.isEmpty)
+        let successor = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        XCTAssertNotEqual(successor, firstGeneration)
+        try await adapter.didFinishImport()
+        let fresh = try await adapter.prepareUploadBatch(limit: 50)
+        let record = try XCTUnwrap(fresh.records.first)
+        XCTAssertEqual(fresh.matchingGenerations[record.recordID.recordName], successor)
+        XCTAssertEqual(record["title"] as? String, "successor generation")
+        let accepted = try tagged(record, "accepted-successor")
+        try await adapter.acknowledgeUploadedRecords([accepted], from: fresh)
+        try await quiet(adapter, realm: realm)
+    }
+
+    @BigSyncBackgroundActor
+    func testDeletionPreparationWithholdsSelectionSupersededByResurrection() async throws {
+        let (adapter, realm) = try await fixture()
+        let object = W1UploadSnapshotRow()
+        try realm.write {
+            realm.add(object)
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let upload = try await adapter.prepareUploadBatch(limit: 50)
+        XCTAssertEqual(upload.records.count, 1)
+        let saved = try tagged(XCTUnwrap(upload.records.first), "prior-save")
+        try await adapter.acknowledgeUploadedRecords([saved], from: upload)
+        try realm.write {
+            object.isDeleted = true
+            object.refreshChangeMetadata(explicitlyModified: true)
+        }
+        try await adapter.didFinishImport()
+        let selected = try await adapter.preparedRecordDeletions(limit: 50, restrictedToEntityType: nil)
+        XCTAssertEqual(selected.count, 1)
+        let deletionGeneration = try XCTUnwrap(selected.first?.generation)
+        adapter._testBeforePreparedMutationGenerationRecheck = {
+            adapter._testBeforePreparedMutationGenerationRecheck = nil
+            try realm.write {
+                object.isDeleted = false
+                object.title = "resurrected"
+                object.refreshChangeMetadata(explicitlyModified: true)
+            }
+        }
+        defer { adapter._testBeforePreparedMutationGenerationRecheck = nil }
+
+        let stale = try await adapter.preparedRecordDeletions(limit: 50, restrictedToEntityType: nil)
+        XCTAssertTrue(stale.isEmpty)
+        let successor = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
+        XCTAssertNotEqual(successor, deletionGeneration)
+        try await adapter.didFinishImport()
+        let fresh = try await adapter.prepareUploadBatch(limit: 50)
+        let record = try XCTUnwrap(fresh.records.first)
+        XCTAssertEqual(fresh.matchingGenerations[record.recordID.recordName], successor)
+        XCTAssertEqual(record["title"] as? String, "resurrected")
+        let accepted = try tagged(record, "accepted-resurrection")
+        try await adapter.acknowledgeUploadedRecords([accepted], from: fresh)
+        try await quiet(adapter, realm: realm)
+    }
+
+    @BigSyncBackgroundActor
     func testCurrentPreparedRetainedUploadPreservesSuccessorGeneration() async throws {
         let f = try await preparedQuarantineFixture()
         let recordID = try XCTUnwrap(f.prepared.first).record.recordID
