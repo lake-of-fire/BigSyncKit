@@ -53,7 +53,7 @@ struct CloudKitRetryConstraints {
     fileprivate static func isFailureTree(
         _ error: Error,
         allowing leafCodes: Set<CKError.Code>,
-        allowingDirectMissingRecordDetail: Bool = false
+        allowingDirectMissingItemDetail: Bool = false
     ) -> Bool {
         // Retain the NSError whose address is memoized. Bridging a Swift Error
         // may create a temporary wrapper; a bare ObjectIdentifier set could
@@ -115,9 +115,9 @@ struct CloudKitRetryConstraints {
                 // This exception belongs to the direct public unknownItem edge,
                 // never to a memoized node: a shared detail reached through a
                 // nested path must still fail the ordinary pure-tree proof.
-                if allowingDirectMissingRecordDetail, depth == 0,
+                if allowingDirectMissingItemDetail, depth == 0,
                    cloudError.code == .unknownItem,
-                   isObservedMissingRecordDetail(child as NSError) {
+                   isObservedMissingItemDetail(child as NSError) {
                     maximumChildHeight = max(maximumChildHeight, 1)
                     continue
                 }
@@ -134,12 +134,11 @@ struct CloudKitRetryConstraints {
         return height(of: error as NSError, depth: 0) != nil
     }
 
-    private static func isObservedMissingRecordDetail(_ error: NSError) -> Bool {
-        // A signed macOS single-record fetch returned public unknownItem with
-        // this immediate SDK-private "Record not found" detail. The public
-        // result grants absence authority; this undocumented detail alone does
-        // not. Reject any additional causes/containers or retry metadata, even
-        // malformed or empty payloads, rather than hiding independent failures.
+    private static func isObservedMissingItemDetail(_ error: NSError) -> Bool {
+        // Signed macOS record and subscription lookups returned public
+        // unknownItem with this immediate SDK-private diagnostic. Only the
+        // public result can prove absence. Reject additional causes, item
+        // containers and retry metadata, including malformed payloads.
         guard error.domain == "CKInternalErrorDomain", error.code == 2003 else { return false }
         let info = error.userInfo
         return info[NSUnderlyingErrorKey] == nil
@@ -176,7 +175,7 @@ public enum BigSyncCloudKitRetryPolicy {
             && !constraints.blocksAccountOperations
             && !constraints.requestsTokenRecovery
             && CloudKitRetryConstraints.isFailureTree(
-                error, allowing: [.unknownItem], allowingDirectMissingRecordDetail: true)
+                error, allowing: [.unknownItem], allowingDirectMissingItemDetail: true)
     }
 
     /// Either a direct miss or a single item result for the requested subscription
@@ -206,7 +205,8 @@ public enum BigSyncCloudKitRetryPolicy {
             && constraints.codes == [.unknownItem]
             && !constraints.hasRetryDirective
             && !constraints.blocksAccountOperations
-            && CloudKitRetryConstraints.isFailureTree(itemError, allowing: [.unknownItem])
+            && CloudKitRetryConstraints.isFailureTree(
+                itemError, allowing: [.unknownItem], allowingDirectMissingItemDetail: true)
     }
 }
 
