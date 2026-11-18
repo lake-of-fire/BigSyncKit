@@ -1891,6 +1891,10 @@ final class BigSyncKitTests: XCTestCase {
             } else {
                 XCTAssertFalse(sync.syncing)
                 XCTAssertNil(sync.retrySleepUntil)
+                let deadline = try XCTUnwrap(sync._test_persistedTransientRetryNotBefore(
+                    accountScopeIdentifier: context.accountScopeIdentifier
+                ))
+                XCTAssertGreaterThanOrEqual(deadline, started.addingTimeInterval(60))
             }
             XCTAssertEqual(database.databaseChangeFetchCount, 0)
             XCTAssertEqual(database.modifyRecordsOperationCount, 0)
