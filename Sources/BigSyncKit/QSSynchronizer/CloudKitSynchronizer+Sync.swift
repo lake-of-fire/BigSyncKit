@@ -1991,8 +1991,11 @@ extension CloudKitSynchronizer {
         do {
             // Validate immediately before and after each account-routed await.
             try await revalidateActiveRunContext(for: attemptID)
-            _ = try await zoneStore.recordZone(withID: zoneID)
+            let fetchedZone = try await zoneStore.recordZone(withID: zoneID)
             try await revalidateActiveRunContext(for: attemptID)
+            guard fetchedZone.zoneID == zoneID else {
+                throw CocoaError(.coderValueNotFound)
+            }
             if let context = activeRunContext {
                 try markConfiguredZoneEstablished(
                     zoneID,
