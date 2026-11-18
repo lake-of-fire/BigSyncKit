@@ -145,8 +145,10 @@ private final class LossBootstrapAdapter: SyncPhaseAdapter, ChangeFeedResetMigra
     func finishChangeFeedReset(accountScopeIdentifier: String, epoch: Int, mode: ChangeFeedResetMode) async throws { bootstrapping = false }
 }
 
-private final class SyncPhaseStore: NSObject, KeyValueStore {
+private final class SyncPhaseStore: NSObject, DurableKeyValueStore {
     private var values = [String: Any]()
+    var rejectedReadKey: String?
+    var rejectedWriteKey: String?
     var onDatabaseTokenWrite: (@Sendable () -> Void)?
     private(set) var databaseTokenWrites = 0
     var persistedPropertyLists: [[String: Any]] {
@@ -166,6 +168,17 @@ private final class SyncPhaseStore: NSObject, KeyValueStore {
     func set(boolValue: Bool, forKey key: String) { values[key] = boolValue }
     func removeObject(forKey key: String) { values.removeValue(forKey: key) }
     func synchronize() -> Bool { true }
+    func prepareForUse() throws {}
+    func validateDurability() throws {}
+    func durableObject(forKey key: String) throws -> Any? {
+        if key == rejectedReadKey { throw DurableKeyValueStoreError.unavailable }
+        return object(forKey: key)
+    }
+    func setDurably(value: Any?, forKey key: String) throws {
+        if key == rejectedWriteKey { throw DurableKeyValueStoreError.mutationNotDurable }
+        set(value: value, forKey: key)
+    }
+    func removeDurably(forKey key: String) throws { removeObject(forKey: key) }
 }
 private final class SyncPhaseDatabase: NSObject, CloudKitDatabaseAdapter {
     var databaseScope: CKDatabase.Scope { .private }
@@ -1024,8 +1037,14 @@ extension SyncPhaseAttemptOwnershipTests {
     }
 
     @BigSyncBackgroundActor
-    private func requireRetryFloorAfterAccountStop(_ code: CKError.Code) async throws {
-        try await withFixture { sync, _, probe, transport in
+    private func requireRetryFloorAfterAccountStop(
+        _ code: CKError.Code, rejectPersistingDeadline: Bool = false
+    ) async throws {
+        let store = SyncPhaseStore()
+        try await withFixture(store: store) { sync, _, probe, transport in
+            if rejectPersistingDeadline {
+                store.rejectedWriteKey = sync.durableStateKey("TransientRetryState.v2")
+            }
             let accountScope = CloudKitSynchronizer.accountScopeIdentifier(for: probe.currentAccount)
             let original = CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: [
                 "account": CKError(code) as NSError,
@@ -1046,17 +1065,21 @@ extension SyncPhaseAttemptOwnershipTests {
             }
             XCTAssertNil(sync.synchronizationTask)
             XCTAssertNil(sync.retrySleepUntil)
-            let deadline = try XCTUnwrap(sync._test_persistedTransientRetryNotBefore(
+            let persistedDeadline = sync._test_persistedTransientRetryNotBefore(
                 accountScopeIdentifier: accountScope
-            ))
-            XCTAssertGreaterThanOrEqual(deadline, started.addingTimeInterval(137))
+            )
+            if rejectPersistingDeadline {
+                XCTAssertNil(persistedDeadline)
+            } else {
+                XCTAssertNotNil(persistedDeadline)
+            }
             let health = try await sync.syncHealthSnapshot()
             XCTAssertEqual(health?.category, code == .notAuthenticated
                 ? .notAuthenticated : .accountTemporarilyUnavailable)
             XCTAssertNil(health?.retryNotBefore)
 
             // A synchronization request revalidates the same account. Cancel
-            // the resumed worker once it parks at the persisted deadline.
+            // the resumed worker once it parks at the known deadline.
             sync.beginSynchronization()
             let worker = try XCTUnwrap(sync.synchronizationTask)
             let watchdog = ProcessInfo.processInfo.systemUptime + 3
@@ -1064,7 +1087,10 @@ extension SyncPhaseAttemptOwnershipTests {
                   ProcessInfo.processInfo.systemUptime < watchdog {
                 await Task.yield()
             }
-            XCTAssertEqual(sync.retrySleepUntil, deadline)
+            XCTAssertGreaterThanOrEqual(sync.retrySleepUntil ?? .distantPast, started.addingTimeInterval(137))
+            if let persistedDeadline {
+                XCTAssertEqual(sync.retrySleepUntil, persistedDeadline)
+            }
             let fetches = await transport.databaseFetchCount
             let mutations = await transport.recordMutationCount
             XCTAssertEqual(fetches, 1)
@@ -1082,6 +1108,156 @@ extension SyncPhaseAttemptOwnershipTests {
     @BigSyncBackgroundActor
     func testTemporaryAccountStopRetainsSiblingRetryFloorUntilSameAccountResumes() async throws {
         try await requireRetryFloorAfterAccountStop(.accountTemporarilyUnavailable)
+    }
+
+    @BigSyncBackgroundActor
+    func testAccountStopRetainsRetryFloorWhenStorageRejectsWrite() async throws {
+        try await requireRetryFloorAfterAccountStop(.accountTemporarilyUnavailable, rejectPersistingDeadline: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledBackoffRetainsRetryFloorWhenStorageRejectsWrite() async throws {
+        let store = SyncPhaseStore()
+        try await withFixture(store: store) { sync, _, _, transport in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            store.rejectedWriteKey = sync.durableStateKey("TransientRetryState.v2")
+            let started = Date()
+            await sync.failSynchronization(
+                error: CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137]),
+                for: context.attemptID
+            )
+            let sleepingWorker = try XCTUnwrap(sync.synchronizationTask)
+            XCTAssertNotNil(sync.retrySleepUntil)
+            await sync.cancelSynchronizationAndWait()
+            await sleepingWorker.value
+            XCTAssertNil(sync._test_persistedTransientRetryNotBefore(
+                accountScopeIdentifier: context.accountScopeIdentifier
+            ))
+
+            sync.beginSynchronization()
+            let successor = try XCTUnwrap(sync.synchronizationTask)
+            let watchdog = ProcessInfo.processInfo.systemUptime + 3
+            while sync.retrySleepUntil == nil, sync.syncing,
+                  ProcessInfo.processInfo.systemUptime < watchdog {
+                await Task.yield()
+            }
+            XCTAssertGreaterThanOrEqual(sync.retrySleepUntil ?? .distantPast, started.addingTimeInterval(137))
+            let fetches = await transport.databaseFetchCount
+            let mutations = await transport.recordMutationCount
+            XCTAssertEqual(fetches, 0)
+            XCTAssertEqual(mutations, 0)
+            successor.cancel()
+            await successor.value
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testPendingRetryFloorBecomesDurableWhenStorageRecovers() async throws {
+        let store = SyncPhaseStore()
+        try await withFixture(store: store) { sync, _, _, transport in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            let deadline = Date().addingTimeInterval(137)
+            store.rejectedWriteKey = sync.durableStateKey("TransientRetryState.v2")
+            sync.persistTransientRetryState(context: context, notBefore: deadline, consecutiveFailures: 1)
+            XCTAssertNil(sync._test_persistedTransientRetryNotBefore(
+                accountScopeIdentifier: context.accountScopeIdentifier
+            ))
+
+            store.rejectedWriteKey = nil
+            sync.beginSynchronization()
+            let worker = try XCTUnwrap(sync.synchronizationTask)
+            let watchdog = ProcessInfo.processInfo.systemUptime + 3
+            while sync.retrySleepUntil == nil, sync.syncing,
+                  ProcessInfo.processInfo.systemUptime < watchdog {
+                await Task.yield()
+            }
+            XCTAssertEqual(sync.retrySleepUntil, deadline)
+            XCTAssertEqual(sync._test_persistedTransientRetryNotBefore(
+                accountScopeIdentifier: context.accountScopeIdentifier
+            ), deadline)
+            let fetches = await transport.databaseFetchCount
+            XCTAssertEqual(fetches, 0)
+            worker.cancel()
+            await worker.value
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testCancelledOldRetrySleepKeepsSuccessorDeadline() async throws {
+        try await withFixture { sync, _, _, transport in
+            let context = try XCTUnwrap(sync.activeRunContext)
+            let deadline = Date().addingTimeInterval(137)
+            sync.persistTransientRetryState(context: context, notBefore: deadline, consecutiveFailures: 1)
+            let oldSleeper = Task { @BigSyncBackgroundActor in
+                try await sync.waitForPersistedTransientRetryIfNeeded(context: context)
+            }
+            defer { oldSleeper.cancel() }
+            let oldWatchdog = ProcessInfo.processInfo.systemUptime + 3
+            while sync.retrySleepUntil == nil, ProcessInfo.processInfo.systemUptime < oldWatchdog {
+                await Task.yield()
+            }
+            XCTAssertEqual(sync.retrySleepUntil, deadline)
+            await sync.cancelSynchronizationAndWait()
+
+            sync.beginSynchronization()
+            let successor = try XCTUnwrap(sync.synchronizationTask)
+            let watchdog = ProcessInfo.processInfo.systemUptime + 3
+            while sync.retrySleepUntil == nil, sync.syncing,
+                  ProcessInfo.processInfo.systemUptime < watchdog {
+                await Task.yield()
+            }
+            XCTAssertEqual(sync.retrySleepUntil, deadline)
+            oldSleeper.cancel()
+            try await Self.expectCancellation { try await oldSleeper.value }
+            XCTAssertEqual(sync.retrySleepUntil, deadline)
+            XCTAssertEqual(sync._test_persistedTransientRetryNotBefore(
+                accountScopeIdentifier: context.accountScopeIdentifier
+            ), deadline)
+            let fetches = await transport.databaseFetchCount
+            XCTAssertEqual(fetches, 0)
+            successor.cancel()
+            await successor.value
+        }
+    }
+
+    @BigSyncBackgroundActor
+    private func requireRetryStorageFailureBeforeFeed(rejectRead: Bool) async throws {
+        let store = SyncPhaseStore()
+        try await withFixture(store: store) { sync, _, _, transport in
+            let key = sync.durableStateKey("TransientRetryState.v2")
+            if rejectRead {
+                store.rejectedReadKey = key
+            } else {
+                store.set(value: ["notBefore": "malformed"], forKey: key)
+            }
+            do {
+                _ = try await sync.synchronize()
+                XCTFail("An unreadable retry floor must block CloudKit data work")
+            } catch {
+                if rejectRead {
+                    guard case .unavailable? = error as? DurableKeyValueStoreError else {
+                        return XCTFail("Expected the durable retry read error, got \(error)")
+                    }
+                } else {
+                    XCTAssertEqual((error as? CocoaError)?.code, .fileReadCorruptFile)
+                }
+            }
+            XCTAssertNil(sync.retrySleepUntil)
+            let fetches = await transport.databaseFetchCount
+            let mutations = await transport.recordMutationCount
+            XCTAssertEqual(fetches, 0)
+            XCTAssertEqual(mutations, 0)
+        }
+    }
+
+    @BigSyncBackgroundActor
+    func testUnreadableDurableRetryStateBlocksFeed() async throws {
+        try await requireRetryStorageFailureBeforeFeed(rejectRead: true)
+    }
+
+    @BigSyncBackgroundActor
+    func testMalformedDurableRetryStateBlocksFeed() async throws {
+        try await requireRetryStorageFailureBeforeFeed(rejectRead: false)
     }
 
     @BigSyncBackgroundActor
