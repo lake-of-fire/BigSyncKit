@@ -1758,9 +1758,10 @@ extension CloudKitSynchronizer {
                 // Apply them only after the cursor commit so a successful
                 // application cannot erase the evidence that authorized this
                 // page to advance.
-                try await adapter.persistImportedChanges()
+                let didApplyRelationship = try await persistImportedChanges(for: adapter)
                 try await revalidateActiveRunContext(for: attemptID)
                 try validateFetchOwner()
+                if didApplyRelationship { synchronizationDrainDidImportChanges = true }
                 activeZoneTokens[zoneID] = page.cursor
                 pageCursor = page.cursor
                 moreComing = page.moreComing
@@ -2150,8 +2151,9 @@ extension CloudKitSynchronizer {
             changeRequestProcessor.clearErrors()
             throw firstError
         }
+        let didApplyRelationship: Bool
         do {
-            try await adapter.persistImportedChanges()
+            didApplyRelationship = try await persistImportedChanges(for: adapter)
         } catch {
             // A retired persistence callback cannot clear a successor's
             // processor errors, even when it returns an ordinary error.
@@ -2160,7 +2162,17 @@ extension CloudKitSynchronizer {
             throw error
         }
         try checkSynchronizationAttempt(attemptID)
+        if didApplyRelationship { synchronizationDrainDidImportChanges = true }
         changeRequestProcessor.clearErrors()
+    }
+
+    @BigSyncBackgroundActor
+    private func persistImportedChanges(for adapter: ModelAdapter) async throws -> Bool {
+        if let realmAdapter = adapter as? RealmSwiftAdapter {
+            return try await realmAdapter.persistImportedChangesReportingMutation()
+        }
+        try await adapter.persistImportedChanges()
+        return false
     }
 
     @BigSyncBackgroundActor
