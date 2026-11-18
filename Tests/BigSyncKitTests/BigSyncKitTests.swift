@@ -195,6 +195,7 @@ private final class FakeCloudKitDatabase: NSObject, CloudKitDatabaseAdapter, @un
     private(set) var recordZoneFetchCount = 0
     private(set) var databaseChangeFetchCount = 0
     private(set) var recordZoneChangeFetchCount = 0
+    private(set) var lastRecordZoneChangeCursor: RecordZoneChangeCursor?
     private(set) var savedZoneCount = 0
     private(set) var modifyRecordsAtomicValues = [Bool]()
     private(set) var modifyRecordsSavePolicies = [CKModifyRecordsOperation.RecordSavePolicy]()
@@ -480,6 +481,7 @@ extension FakeCloudKitDatabase: CloudKitChangeFeed {
             }
         }
         recordZoneChangeFetchCount += 1
+        lastRecordZoneChangeCursor = cursor
         let page = zoneChangePages.isEmpty
             ? FakeZoneChangePage(zoneID: zoneID, records: [], deletedRecordIDs: [], moreComing: false)
             : zoneChangePages.removeFirst()
@@ -12389,6 +12391,84 @@ final class BigSyncKitTests: XCTestCase {
             fixture.persistenceRealm.objects(PendingRelationship.self).count,
             0
         )
+    }
+
+    @BigSyncBackgroundActor
+    func testRetryReportsDeferredRelationshipAppliedAfterPageCommit() async throws {
+        for retryFetchesEmptyZonePage in [true, false] {
+            let fixture = try await makeRealmAdapterFixture()
+            fixture.adapter.mergePolicy = .server
+            let zoneID = fixture.adapter.recordZoneID
+            let database = FakeCloudKitDatabase()
+            database.completesEmptyZoneChangeOperation = true
+            let synchronizer = makeSynchronizer(database: database, recordZoneID: zoneID)
+            synchronizer.addModelAdapter(fixture.adapter)
+            let initial = try await synchronizer.synchronize()
+            XCTAssertNotNil(initial.receipt)
+            synchronizer.syncMode = .downloadOnly
+
+            let original = BigSyncRelationshipChild()
+            original.id = "original"
+            let replacement = BigSyncRelationshipChild()
+            replacement.id = "replacement"
+            let parent = BigSyncRelationshipParent()
+            parent.id = "deferred-import-retry"
+            parent.children.append(original)
+            try await fixture.targetRealm.asyncWrite {
+                fixture.targetRealm.add([original, replacement, parent])
+            }
+            let record = makeRecord(type: BigSyncRelationshipParent.className(), id: parent.id, zoneID: zoneID)
+            record["children"] = ["\(BigSyncRelationshipChild.className()).\(replacement.id)"] as CKRecordValue
+            let modifiedAt = Date().addingTimeInterval(60)
+            record["createdAt"] = modifiedAt as CKRecordValue
+            record["modifiedAt"] = modifiedAt as CKRecordValue
+            record["explicitlyModifiedAt"] = modifiedAt as CKRecordValue
+            record["isDeleted"] = false as CKRecordValue
+            database.databaseChangePages = [.init(changedZoneIDs: [zoneID], deletions: [], moreComing: false)]
+            database.zoneChangePages = [.init(zoneID: zoneID, records: [record], deletedRecordIDs: [], moreComing: false)]
+            let priorZoneCursor = await fixture.adapter.serverChangeToken
+            let priorDatabaseCursor = synchronizer.storedDatabaseToken
+            let rejection = NSError(domain: "DeferredRelationshipWriteFailure", code: 1)
+            fixture.adapter._testBeforePendingRelationshipTargetWrite = { throw rejection }
+            defer { fixture.adapter._testBeforePendingRelationshipTargetWrite = nil }
+
+            do {
+                _ = try await synchronizer.synchronize()
+                XCTFail("Expected the deferred relationship application to fail")
+            } catch {
+                XCTAssertEqual((error as NSError).domain, rejection.domain)
+                XCTAssertEqual((error as NSError).code, rejection.code)
+            }
+            let failedZoneCursor = await fixture.adapter.serverChangeToken
+            let committedZoneCursor = try XCTUnwrap(failedZoneCursor)
+            XCTAssertNotEqual(committedZoneCursor, priorZoneCursor)
+            XCTAssertEqual(synchronizer.storedDatabaseToken, priorDatabaseCursor)
+            fixture.persistenceRealm.refresh()
+            XCTAssertEqual(fixture.persistenceRealm.objects(PendingRelationship.self)
+                .filter("relationshipName == %@", "children").count, 1)
+            fixture.targetRealm.refresh()
+            XCTAssertEqual(parent.children.map(\.id), [original.id])
+
+            fixture.adapter._testBeforePendingRelationshipTargetWrite = nil
+            let zoneFetches = database.recordZoneChangeFetchCount
+            if retryFetchesEmptyZonePage {
+                database.databaseChangePages = [.init(changedZoneIDs: [zoneID], deletions: [], moreComing: false)]
+            }
+            let retried = try await synchronizer.synchronize()
+            XCTAssertTrue(retried.didImportChanges)
+            XCTAssertEqual(retried.publicationState, .complete)
+            XCTAssertEqual(database.recordZoneChangeFetchCount, zoneFetches + (retryFetchesEmptyZonePage ? 1 : 0))
+            if retryFetchesEmptyZonePage {
+                XCTAssertEqual(database.lastRecordZoneChangeCursor, committedZoneCursor)
+            }
+            fixture.targetRealm.refresh()
+            XCTAssertEqual(parent.children.map(\.id), [replacement.id])
+            fixture.persistenceRealm.refresh()
+            XCTAssertTrue(fixture.persistenceRealm.objects(PendingRelationship.self).isEmpty)
+            let idle = try await synchronizer.synchronize()
+            XCTAssertFalse(idle.didImportChanges)
+            await synchronizer.cancelSynchronizationAndWait()
+        }
     }
 
     @BigSyncBackgroundActor

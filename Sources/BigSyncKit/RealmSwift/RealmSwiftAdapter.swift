@@ -4973,7 +4973,7 @@ public final class RealmSwiftAdapter:
     }
 
     @BigSyncBackgroundActor
-    func applyPendingRelationships(realmProvider: RealmProvider) async throws {
+    private func applyPendingRelationships(realmProvider: RealmProvider) async throws -> Bool {
         let preparationCancellationGeneration = cancellationGeneration
         let preparationProvider = self.realmProvider
         let preparationContext = recordRebaseContext
@@ -4998,7 +4998,7 @@ public final class RealmSwiftAdapter:
         }
         try validatePreparationOwner()
         guard self.realmProvider === realmProvider else { throw CancellationError() }
-        guard let persistenceRealm = realmProvider.persistenceRealm else { return }
+        guard let persistenceRealm = realmProvider.persistenceRealm else { return false }
 
         struct RelationshipGroupKey: Hashable, Sendable {
             let syncedEntityID: String
@@ -5118,6 +5118,7 @@ public final class RealmSwiftAdapter:
         }
 
         try validatePreparationOwner()
+        var didApplyRelationship = false
         for group in groups {
             try Task.checkCancellation()
             try validatePreparationOwner()
@@ -5288,6 +5289,9 @@ public final class RealmSwiftAdapter:
             if case .superseded = applicationOutcome {
                 continue
             }
+            if case .applied = applicationOutcome {
+                didApplyRelationship = true
+            }
 #if DEBUG
             try await _testBeforePendingRelationshipTrackingWrite?()
 #endif
@@ -5310,6 +5314,7 @@ public final class RealmSwiftAdapter:
             await Task.yield()
             try validatePreparationOwner()
         }
+        return didApplyRelationship
     }
 
     @BigSyncBackgroundActor
@@ -8918,8 +8923,13 @@ public final class RealmSwiftAdapter:
 
     @BigSyncBackgroundActor
     public func persistImportedChanges() async throws {
-        guard let realmProvider else { return }
-        try await applyPendingRelationships(realmProvider: realmProvider)
+        _ = try await persistImportedChangesReportingMutation()
+    }
+
+    @BigSyncBackgroundActor
+    func persistImportedChangesReportingMutation() async throws -> Bool {
+        guard let realmProvider else { return false }
+        return try await applyPendingRelationships(realmProvider: realmProvider)
     }
 
     @BigSyncBackgroundActor
