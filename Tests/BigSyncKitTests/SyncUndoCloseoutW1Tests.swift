@@ -1531,9 +1531,12 @@ extension SyncUndoCloseoutW1Tests {
         let successor = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
         XCTAssertNotEqual(successor, firstGeneration)
         try await adapter.didFinishImport()
-        let fresh = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
-        XCTAssertEqual(try XCTUnwrap(fresh.first).generation, successor)
-        XCTAssertEqual(fresh.first?.record["title"] as? String, "successor generation")
+        let fresh = try await adapter.prepareUploadBatch(limit: 50)
+        let record = try XCTUnwrap(fresh.records.first)
+        XCTAssertEqual(fresh.matchingGenerations[record.recordID.recordName], successor)
+        XCTAssertEqual(record["title"] as? String, "successor generation")
+        let accepted = try tagged(record, "accepted-successor")
+        try await adapter.acknowledgeUploadedRecords([accepted], from: fresh)
         try await quiet(adapter, realm: realm)
     }
 
@@ -1573,9 +1576,12 @@ extension SyncUndoCloseoutW1Tests {
         let successor = try XCTUnwrap(realm.objects(BigSyncPendingMutation.self).first?.generation)
         XCTAssertNotEqual(successor, deletionGeneration)
         try await adapter.didFinishImport()
-        let fresh = try await adapter.preparedRecordsToUpload(limit: 50, restrictedToEntityType: nil)
-        XCTAssertEqual(try XCTUnwrap(fresh.first).generation, successor)
-        XCTAssertEqual(fresh.first?.record["title"] as? String, "resurrected")
+        let fresh = try await adapter.prepareUploadBatch(limit: 50)
+        let record = try XCTUnwrap(fresh.records.first)
+        XCTAssertEqual(fresh.matchingGenerations[record.recordID.recordName], successor)
+        XCTAssertEqual(record["title"] as? String, "resurrected")
+        let accepted = try tagged(record, "accepted-resurrection")
+        try await adapter.acknowledgeUploadedRecords([accepted], from: fresh)
         try await quiet(adapter, realm: realm)
     }
 
