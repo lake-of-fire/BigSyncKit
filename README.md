@@ -52,3 +52,34 @@ Manuel Entrena, manuel@mentrena.com
 ## License
 
 SyncKit is available under the MIT license. See the LICENSE file for more info.
+
+## Local replica publication admission
+
+Call `prepareReplicaBindingGenerationIdentifier` with the worker’s actual store
+before capturing `BigSyncReplicaPublicationAdmission`. Custom publication stores
+must be file backed. Capture reads the installation and complete binding under the
+existing restore lease and namespace file lock; it never prepares identity or
+certifies CloudKit readiness. A pending account port permits journal attribution
+but grants no publication admission.
+
+Use `withCurrent` around the final bounded synchronous publication or commit on
+already admitted destination handles. Acquire SQL/file and account admission
+first. The callback must not await, enter Session or SQL executors, access the
+state store, or begin preparation, restore, or replacement. The same installation
+lease and shared namespace file lock remain held until the callback returns or
+throws. There is no post-commit cancellation check. A composed inner consumer can
+call `validateHeldPublication`; nested `withCurrent` or capture is rejected before
+lock acquisition, including for another client. Realm’s journal identity provider
+may borrow only the matching held client/store identity during that stack frame.
+
+The binding’s additive local `publicationEpoch` retires captured publication
+capabilities on every binding transition. It is separate from mutation-journal
+generations: canceling a pending port can restore the original journal generation
+without reviving a pre-port capability. Existing v1 records receive an epoch in
+one exclusive read/modify/write turn during preparation, retaining their binding
+and unrelated state. Missing or malformed epochs cannot authorize capture. The
+field does not change CloudKit tokens, record payloads, or journal acknowledgement.
+
+Authority-change notifications are wakeups delivered after durable mutation and
+its locks have finished. Consumers must retain and revalidate an admission rather
+than treating notification delivery as authority.

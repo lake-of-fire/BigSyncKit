@@ -5,8 +5,11 @@ extension BigSyncClientIdentity {
     /// Borrow before constructing FileKeyValueStore: its initializer also takes
     /// the namespace file guard, which must not be reacquired during COMMIT.
     public func currentMutationJournalIdentity(storeURL: URL) -> BigSyncMutationJournalIdentity? {
-        if let borrowed = BigSyncReplicaPublicationReadScope.current(identity: self),
-           borrowed.storeURL == storeURL.standardizedFileURL { return borrowed.identity }
+        if BigSyncReplicaPublicationReadScope.isActive {
+            guard let borrowed = BigSyncReplicaPublicationReadScope.current(identity: self),
+                  borrowed.storeURL == storeURL.standardizedFileURL else { return nil }
+            return borrowed.identity
+        }
         return currentMutationJournalIdentity(store: FileKeyValueStore(fileURL: storeURL))
     }
 

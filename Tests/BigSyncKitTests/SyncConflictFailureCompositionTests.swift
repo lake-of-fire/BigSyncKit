@@ -155,6 +155,27 @@ final class SyncConflictFailureCompositionTests: XCTestCase {
             CKError(.serverRecordChanged, userInfo: [NSUnderlyingErrorKey: "malformed"])))
     }
 
+    func testConflictRetryPolicyRejectsUnexpectedItemPayloadsAtEveryDepth() {
+        let payloads: [Any] = [
+            ["record": CKError(.notAuthenticated)],
+            ["record": CKError(.accountTemporarilyUnavailable)],
+            ["record": CKError(.changeTokenExpired)],
+            ["record": CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: 137])],
+            ["record": CKError(.serverRecordChanged)],
+            [String: Error](),
+            ["record": "malformed"],
+            "malformed",
+        ]
+        for payload in payloads {
+            let unexpected = CKError(.serverRecordChanged, userInfo: [CKPartialErrorsByItemIDKey: payload])
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(unexpected))
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+                CKError(.serverRecordChanged, userInfo: [NSUnderlyingErrorKey: unexpected])))
+            XCTAssertFalse(BigSyncCloudKitRetryPolicy.allowsImmediateRecordConflictRetry(
+                CKError(.partialFailure, userInfo: [CKPartialErrorsByItemIDKey: ["nested": unexpected]])))
+        }
+    }
+
     func testConflictRetryPolicyRetainsBoundedPureTreeProofAndSizePolicy() {
         var nested = CKError(.serverRecordChanged) as NSError
         for _ in 0..<40 {

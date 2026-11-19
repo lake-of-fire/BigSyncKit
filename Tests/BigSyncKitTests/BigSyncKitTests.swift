@@ -7,6 +7,20 @@ import Logging
 import RealmSwift
 import RealmSwiftGaps
 
+/// Account revalidation preserves the original operation failure alongside its
+/// exact account-change cause. A generic wrapper is not proof of replacement.
+private func isAccountReplacementFailure(_ error: Error) -> Bool {
+    if (error as? OneOffRecordZoneResetError) == .cloudKitAccountChanged { return true }
+    let wrapped = error as NSError
+    let expected = OneOffRecordZoneResetError.cloudKitAccountChanged as NSError
+    guard wrapped.domain == "BigSyncKit.CloudKitOperationRevalidation", wrapped.code == 1,
+          let accountFailure = wrapped.userInfo[NSUnderlyingErrorKey] as? NSError,
+          accountFailure.domain == expected.domain, accountFailure.code == expected.code,
+          let operationFailures = wrapped.userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError],
+          !operationFailures.isEmpty else { return false }
+    return true
+}
+
 /// Realm exposes persisted properties through KVC, but a Swift @Persisted
 /// key path has no Objective-C key-path string for NSObject.observe to extract.
 /// Use the actual persisted column and preserve the synchronous KVO call stack.
@@ -1463,12 +1477,12 @@ final class BigSyncKitTests: XCTestCase {
             sync.accountScopeAuthorityFence.clear() // Controlled fixture starts with validated authority.
             sync.activeRunContext = original
             let entered = AsyncGate(), release = AsyncGate()
-            let error = CKError(encrypted ? .zoneNotFound : .userDeletedZone, userInfo: encrypted
+            let operationError = CKError(encrypted ? .zoneNotFound : .userDeletedZone, userInfo: encrypted
                 ? [CKErrorUserDidResetEncryptedDataKey: true] : [:])
             let gate: @Sendable () async throws -> Void = {
                 await entered.open()
                 await release.wait()
-                throw error
+                throw operationError
             }
             switch operation {
             case "database": database.reviewDatabaseGate = gate
@@ -1491,8 +1505,14 @@ final class BigSyncKitTests: XCTestCase {
                     }
                     return false
                 } catch {
-                    return error is CancellationError
-                        || (error as? OneOffRecordZoneResetError) == .cloudKitAccountChanged
+                    if changesAccountOnly {
+                        let retained = cloudKitErrors(in: error)
+                        XCTAssertEqual(retained.map(\.code), [operationError.code])
+                        if encrypted {
+                            XCTAssertEqual(retained.first?.userInfo[CKErrorUserDidResetEncryptedDataKey] as? Bool, true)
+                        }
+                    }
+                    return error is CancellationError || isAccountReplacementFailure(error)
                 }
             }
             await entered.wait()
@@ -7279,9 +7299,8 @@ final class BigSyncKitTests: XCTestCase {
         do {
             _ = try await synchronizer.synchronize()
             XCTFail("Expected account replacement before upload")
-        } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
         } catch {
-            XCTFail("Unexpected error: \(error)")
+            XCTAssertTrue(isAccountReplacementFailure(error), "Unexpected error: \(error)")
         }
         XCTAssertEqual(database.modifyRecordsOperationCount, 0)
     }
@@ -7330,18 +7349,8 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Upload callback abandoned the synchronization run")
             return
         }
-        guard let resetError = observedError as? OneOffRecordZoneResetError else {
-            if let observedError {
-                XCTFail("Unexpected error: \(observedError)")
-            } else {
-                XCTFail("Expected account replacement during upload callback")
-            }
-            return
-        }
-        guard case .cloudKitAccountChanged = resetError else {
-            XCTFail("Unexpected reset error: \(resetError)")
-            return
-        }
+        guard let observedError else { return XCTFail("Expected account replacement during callback") }
+        XCTAssertTrue(isAccountReplacementFailure(observedError), "Unexpected error: \(observedError)")
         XCTAssertEqual(database.modifyRecordsOperationCount, 1)
         XCTAssertFalse(synchronizer.syncing)
     }
@@ -7438,18 +7447,8 @@ final class BigSyncKitTests: XCTestCase {
             XCTFail("Deletion callback abandoned the synchronization run")
             return
         }
-        guard let resetError = observedError as? OneOffRecordZoneResetError else {
-            if let observedError {
-                XCTFail("Unexpected error: \(observedError)")
-            } else {
-                XCTFail("Expected account replacement during deletion callback")
-            }
-            return
-        }
-        guard case .cloudKitAccountChanged = resetError else {
-            XCTFail("Unexpected reset error: \(resetError)")
-            return
-        }
+        guard let observedError else { return XCTFail("Expected account replacement during callback") }
+        XCTAssertTrue(isAccountReplacementFailure(observedError), "Unexpected error: \(observedError)")
         XCTAssertEqual(database.modifyRecordsOperationCount, 1)
         XCTAssertFalse(synchronizer.syncing)
     }
@@ -14501,8 +14500,8 @@ final class BigSyncKitTests: XCTestCase {
                     }
                 }
                 XCTFail("Expected account replacement at \(boundary)")
-            } catch OneOffRecordZoneResetError.cloudKitAccountChanged {
-                // Expected.
+            } catch {
+                XCTAssertTrue(isAccountReplacementFailure(error), "Unexpected error: \(error)")
             }
 
             XCTAssertEqual(database.modifyRecordsOperationCount, 0)

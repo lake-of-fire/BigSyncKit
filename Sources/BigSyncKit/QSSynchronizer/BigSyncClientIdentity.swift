@@ -249,6 +249,9 @@ public struct BigSyncClientIdentity: Sendable {
     /// returns the backup-excluded installation identity used by its journal.
     @discardableResult
     public func prepareInstallation() throws -> String {
+        guard !BigSyncReplicaPublicationReadScope.isActive else {
+            throw BigSyncReplicaPublicationError.reentrantPublication
+        }
         try BigSyncClientIdentityLeaseRegistry.retainShared(at: leaseURL)
         _ = try BackupDetection.run(
             store: UserDefaultsAdapter(userDefaults: .standard),
@@ -438,6 +441,9 @@ public struct BigSyncClientIdentity: Sendable {
     public func cancelManualBackupRestoreIntent(
         transactionIdentifier: UUID
     ) throws {
+        guard !BigSyncReplicaPublicationReadScope.isActive else {
+            throw BigSyncReplicaPublicationError.reentrantPublication
+        }
         try BigSyncClientIdentityLeaseRegistry.withExclusive(at: leaseURL) {
             let preflight: BackupDetection.ManualRestorePreflight
             do {
@@ -502,7 +508,7 @@ public struct BigSyncClientIdentity: Sendable {
         rollback: () throws -> Void = {},
         sentinelPublisher: ((URL, FileManager) throws -> Void)?
     ) throws -> BigSyncManualBackupRestoreReceipt {
-        guard BigSyncReplicaPublicationReadScope.current(identity: self) == nil else {
+        guard !BigSyncReplicaPublicationReadScope.isActive else {
             throw BigSyncReplicaPublicationError.reentrantPublication
         }
         let before = currentInstallationIdentifier()
@@ -694,7 +700,7 @@ public struct BigSyncClientIdentity: Sendable {
     /// Captures publication authority from the exact store used by the worker.
     /// Custom non-file stores cannot establish cross-process admission.
     public func capturePublicationAdmission(store: FileKeyValueStore? = nil) throws -> BigSyncReplicaPublicationAdmission {
-        guard BigSyncReplicaPublicationReadScope.current(identity: self) == nil else {
+        guard !BigSyncReplicaPublicationReadScope.isActive else {
             throw BigSyncReplicaPublicationError.reentrantPublication
         }
         let store = store ?? FileKeyValueStore(fileURL: synchronizationStateFileURL)
@@ -706,11 +712,12 @@ public struct BigSyncClientIdentity: Sendable {
                 let key = durableStateNamespace + ".ReplicaBinding.v1"
                 guard let raw = values[key] else { throw BigSyncReplicaPublicationError.unavailable }
                 let binding = try BigSyncReplicaBindingStateStore.decode(raw)
-                guard binding.pendingPort == nil,
+                guard let epoch = try BigSyncReplicaBindingStateStore.publicationEpoch(from: raw),
+                      binding.pendingPort == nil,
                       binding.installationIdentityDigest == BigSyncReplicaBindingStateStore.installationIdentityDigest(for: installation)
                 else { throw BigSyncReplicaPublicationError.unavailable }
                 return BigSyncReplicaPublicationAdmission(identity: self, store: store,
-                    installationIdentifier: installation, binding: binding)
+                    installationIdentifier: installation, binding: binding, publicationEpoch: epoch)
             }
         }
     }
@@ -745,17 +752,19 @@ public enum BigSyncReplicaPublicationError: Error, Equatable { case unavailable,
 /// It avoids recursively acquiring installation/binding locks during COMMIT.
 enum BigSyncReplicaPublicationReadScope {
     private static let key = "BigSyncReplicaPublicationReadScope"
+    static var isActive: Bool { Thread.current.threadDictionary[key] != nil }
     final class Borrowed: NSObject {
         let namespace: String
         let root: URL
         let storeURL: URL
         let identity: BigSyncMutationJournalIdentity
         let binding: BigSyncReplicaBindingSnapshot
+        let publicationEpoch: String
         init(client: BigSyncClientIdentity, store: FileKeyValueStore, identity: BigSyncMutationJournalIdentity,
-             binding: BigSyncReplicaBindingSnapshot) {
+             binding: BigSyncReplicaBindingSnapshot, publicationEpoch: String) {
             namespace = client.durableStateNamespace; root = client.sharedStateBaseURL
             storeURL = store.fileURL.standardizedFileURL; self.identity = identity
-            self.binding = binding
+            self.binding = binding; self.publicationEpoch = publicationEpoch
         }
     }
     static func current(identity: BigSyncClientIdentity) -> Borrowed? {
@@ -779,11 +788,13 @@ public struct BigSyncReplicaPublicationAdmission: @unchecked Sendable {
     public let installationIdentifier: String
     public var replicaBindingGenerationIdentifier: String { binding.activeGenerationIdentifier }
     private let binding: BigSyncReplicaBindingSnapshot
+    private let publicationEpoch: String
 
     fileprivate init(identity: BigSyncClientIdentity, store: FileKeyValueStore,
-        installationIdentifier: String, binding: BigSyncReplicaBindingSnapshot) {
+        installationIdentifier: String, binding: BigSyncReplicaBindingSnapshot, publicationEpoch: String) {
         self.identity = identity; self.store = store
         self.installationIdentifier = installationIdentifier; self.binding = binding
+        self.publicationEpoch = publicationEpoch
     }
 
     /// For a composed inner consumer already enclosed by withCurrent(). This
@@ -792,7 +803,9 @@ public struct BigSyncReplicaPublicationAdmission: @unchecked Sendable {
         guard let borrowed = BigSyncReplicaPublicationReadScope.current(identity: identity),
               borrowed.storeURL == store.fileURL.standardizedFileURL,
               borrowed.identity.installationIdentifier == installationIdentifier,
-              borrowed.binding == binding else { throw BigSyncReplicaPublicationError.superseded }
+              borrowed.binding == binding, borrowed.publicationEpoch == publicationEpoch else {
+            throw BigSyncReplicaPublicationError.superseded
+        }
     }
 
     /// Holds installation/restore admission and the existing cross-process
@@ -803,7 +816,7 @@ public struct BigSyncReplicaPublicationAdmission: @unchecked Sendable {
     /// journal may read the already-held identity via its read-only borrowed
     /// scope; nested publication admission is rejected before acquiring locks.
     public func withCurrent<Value>(_ body: () throws -> Value) throws -> Value {
-        guard BigSyncReplicaPublicationReadScope.current(identity: identity) == nil else {
+        guard !BigSyncReplicaPublicationReadScope.isActive else {
             throw BigSyncReplicaPublicationError.reentrantPublication
         }
         return try identity.withPublication {
@@ -813,10 +826,12 @@ public struct BigSyncReplicaPublicationAdmission: @unchecked Sendable {
             return try store.withDurableSnapshot { values in
                 guard let raw = values[identity.durableStateNamespace + ".ReplicaBinding.v1"],
                       try BigSyncReplicaBindingStateStore.decode(raw) == binding,
+                      try BigSyncReplicaBindingStateStore.publicationEpoch(from: raw) == publicationEpoch,
                       binding.pendingPort == nil else { throw BigSyncReplicaPublicationError.superseded }
                 return try BigSyncReplicaPublicationReadScope.withValue(.init(client: identity, store: store,
                     identity: .init(installationIdentifier: installationIdentifier,
-                        replicaBindingGenerationIdentifier: replicaBindingGenerationIdentifier), binding: binding), body)
+                        replicaBindingGenerationIdentifier: replicaBindingGenerationIdentifier),
+                    binding: binding, publicationEpoch: publicationEpoch), body)
             }
         }
     }
