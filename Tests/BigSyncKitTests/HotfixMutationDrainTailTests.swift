@@ -20,6 +20,114 @@ final class HotfixMutationDrainTailTests: XCTestCase {
     @BigSyncBackgroundActor
     private lazy var realmFixtureOwner = RealmAdapterFixtureOwner(testCase: self)
 
+    private func metadataConfiguration() -> Realm.Configuration {
+        var configuration = Realm.Configuration()
+        configuration.inMemoryIdentifier = "throwing-metadata-" + UUID().uuidString
+        configuration.objectTypes = [
+            HotfixMutationDrainTailObject.self,
+            BigSyncPendingMutation.self,
+        ]
+        return configuration
+    }
+
+    func testThrowingMetadataRollsBackOrdinaryAndPreparedWritesWhenIdentityIsUnavailable() throws {
+        let configuration = metadataConfiguration()
+        BigSyncMutationTracking.install(
+            configurations: [configuration],
+            excludedClassNames: [],
+            mutationJournalIdentityProvider: {
+                BigSyncMutationJournalIdentity(
+                    installationIdentifier: "installation",
+                    replicaBindingGenerationIdentifier: "binding"
+                )
+            }
+        )
+        let realm = try Realm(configuration: configuration)
+        let object = HotfixMutationDrainTailObject()
+        object.id = "tracked"
+        object.payload = "original"
+        let originalTimestamp = Date(timeIntervalSinceReferenceDate: 1_000)
+        try realm.write {
+            realm.add(object)
+            try object.refreshChangeMetadataThrowing(
+                explicitlyModified: true, at: originalTimestamp
+            )
+        }
+        let recordName = HotfixMutationDrainTailObject.className() + "." + object.id
+        let originalMutation = try XCTUnwrap(realm.object(
+            ofType: BigSyncPendingMutation.self, forPrimaryKey: recordName
+        ))
+        let originalGeneration = originalMutation.generation
+
+        BigSyncMutationTracking.install(
+            configurations: [configuration],
+            excludedClassNames: [],
+            mutationJournalIdentityProvider: { nil }
+        )
+        for usesPreparedWrite in [false, true] {
+            let editedTimestamp = originalTimestamp.addingTimeInterval(1)
+            XCTAssertThrowsError(try realm.write {
+                object.payload = "replacement"
+                if usesPreparedWrite {
+                    try BigSyncMutationTracking.withPreparedWrite(
+                        of: HotfixMutationDrainTailObject.self, in: realm
+                    ) { prepared in
+                        try object.refreshChangeMetadataThrowing(
+                            explicitlyModified: true,
+                            at: editedTimestamp,
+                            preparedWrite: prepared
+                        )
+                    }
+                } else {
+                    try object.refreshChangeMetadataThrowing(
+                        explicitlyModified: true, at: editedTimestamp
+                    )
+                }
+            }) { error in
+                guard let identityError = error as? BigSyncMutationIdentityError,
+                      case .unavailable = identityError else {
+                    return XCTFail("Unexpected metadata write error: \(error)")
+                }
+            }
+            XCTAssertEqual(object.payload, "original")
+            XCTAssertEqual(object.modifiedAt, originalTimestamp)
+            XCTAssertEqual(object.explicitlyModifiedAt, originalTimestamp)
+            XCTAssertEqual(realm.objects(BigSyncPendingMutation.self).count, 1)
+            XCTAssertEqual(originalMutation.generation, originalGeneration)
+            XCTAssertEqual(originalMutation.changedAt, originalTimestamp)
+        }
+    }
+
+    func testThrowingMetadataPreservesDeliberateJournalExclusion() throws {
+        let configuration = metadataConfiguration()
+        BigSyncMutationTracking.install(
+            configurations: [configuration],
+            excludedClassNames: [HotfixMutationDrainTailObject.className()],
+            mutationJournalIdentityProvider: { nil }
+        )
+        let realm = try Realm(configuration: configuration)
+        let object = HotfixMutationDrainTailObject()
+        object.id = "excluded"
+        let timestamp = Date(timeIntervalSinceReferenceDate: 2_000)
+        try realm.write {
+            realm.add(object)
+            object.payload = "local edit"
+            try BigSyncMutationTracking.withPreparedWrite(
+                of: HotfixMutationDrainTailObject.self, in: realm
+            ) { prepared in
+                try object.refreshChangeMetadataThrowing(
+                    explicitlyModified: true,
+                    at: timestamp,
+                    preparedWrite: prepared
+                )
+            }
+        }
+        XCTAssertEqual(object.payload, "local edit")
+        XCTAssertEqual(object.modifiedAt, timestamp)
+        XCTAssertEqual(object.explicitlyModifiedAt, timestamp)
+        XCTAssertTrue(realm.objects(BigSyncPendingMutation.self).isEmpty)
+    }
+
     @BigSyncBackgroundActor
     private func fixture() async throws -> (RealmSwiftAdapter, Realm) {
         let nonce = UUID().uuidString

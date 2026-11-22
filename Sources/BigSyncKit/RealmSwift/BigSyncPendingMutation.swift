@@ -1,6 +1,10 @@
 import Foundation
 import RealmSwift
 
+public enum BigSyncMutationIdentityError: Error, Sendable {
+    case unavailable
+}
+
 /// A durable, record-level local mutation journal stored in the target Realm.
 ///
 /// Application writes update this object in the same Realm transaction as the
@@ -343,14 +347,28 @@ enum BigSyncMutationTrackingRegistry {
         generation: String,
         replicaBindingGenerationIdentifier: String?
     ) {
+        do {
+            return try makeMutationGenerationThrowing(context: context)
+        } catch {
+            if context.mutationJournalIdentityProvider != nil {
+                fatalError("BigSync mutation identity is unavailable for a registered target Realm")
+            }
+            fatalError("BigSync installation identity is unavailable for a registered target Realm")
+        }
+    }
+
+    static func makeMutationGenerationThrowing(
+        context: MutationContext
+    ) throws -> (
+        generation: String,
+        replicaBindingGenerationIdentifier: String?
+    ) {
         if let identityProvider = context.mutationJournalIdentityProvider {
             guard let identity = identityProvider(),
                   !identity.installationIdentifier.isEmpty,
                   identity.replicaBindingGenerationIdentifier?.isEmpty
                     != true else {
-                fatalError(
-                    "BigSync mutation identity is unavailable for a registered target Realm"
-                )
+                throw BigSyncMutationIdentityError.unavailable
             }
             if let binding =
                 identity.replicaBindingGenerationIdentifier {
@@ -376,9 +394,7 @@ enum BigSyncMutationTrackingRegistry {
             return (BigSyncPendingMutation.makeGeneration(), nil)
         }
         guard let installationIdentifier = installationProvider() else {
-            fatalError(
-                "BigSync installation identity is unavailable for a registered target Realm"
-            )
+            throw BigSyncMutationIdentityError.unavailable
         }
         return (
             BigSyncPendingMutation.makeGeneration(
