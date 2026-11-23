@@ -27,6 +27,19 @@ public extension ChangeMetadataRecordable {
         }
     }
 
+    /// Propagate this error out of the Realm write to roll back the model
+    /// update, metadata and pending journal row together.
+    func refreshChangeMetadataThrowing(
+        explicitlyModified: Bool,
+        at timestamp: Date = Date()
+    ) throws {
+        modifiedAt = timestamp
+        if explicitlyModified {
+            explicitlyModifiedAt = timestamp
+            try recordBigSyncMutationThrowing(at: timestamp)
+        }
+    }
+
     /// A same-transaction batch keeps the ordinary record-level journal path
     /// while avoiding a Realm configuration copy for every affected record.
     func refreshChangeMetadata(
@@ -38,6 +51,18 @@ public extension ChangeMetadataRecordable {
         if explicitlyModified {
             explicitlyModifiedAt = timestamp
             recordBigSyncMutation(at: timestamp, preparedWrite: preparedWrite)
+        }
+    }
+
+    func refreshChangeMetadataThrowing(
+        explicitlyModified: Bool,
+        at timestamp: Date,
+        preparedWrite: BigSyncMutationTracking.PreparedWrite
+    ) throws {
+        modifiedAt = timestamp
+        if explicitlyModified {
+            explicitlyModifiedAt = timestamp
+            try recordBigSyncMutationThrowing(at: timestamp, preparedWrite: preparedWrite)
         }
     }
 
@@ -53,6 +78,17 @@ public extension ChangeMetadataRecordable {
         at timestamp: Date,
         preparedWrite: BigSyncMutationTracking.PreparedWrite? = nil
     ) {
+        do {
+            try recordBigSyncMutationThrowing(at: timestamp, preparedWrite: preparedWrite)
+        } catch {
+            fatalError("BigSync mutation identity is unavailable: \(error)")
+        }
+    }
+
+    private func recordBigSyncMutationThrowing(
+        at timestamp: Date,
+        preparedWrite: BigSyncMutationTracking.PreparedWrite? = nil
+    ) throws {
         guard let object = self as? Object else {
             assertionFailure("BigSync mutations require a Realm Object")
             return
@@ -116,8 +152,8 @@ public extension ChangeMetadataRecordable {
             // Resurrection must not compare against a pre-deletion lifetime.
             BigSyncRecordBaseline.invalidate(recordName: recordName, in: realm)
         }
-        let mutationGeneration = BigSyncMutationTrackingRegistry
-            .makeMutationGeneration(context: mutationContext)
+        let mutationGeneration = try BigSyncMutationTrackingRegistry
+            .makeMutationGenerationThrowing(context: mutationContext)
         let accountScopeIdentifier = BigSyncMutationTrackingRegistry
             .accountScopeIdentifier(
                 for: object,
