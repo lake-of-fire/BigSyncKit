@@ -499,6 +499,23 @@ public struct BigSyncClientIdentity: Sendable {
         )
     }
 
+    /// Reconciles an already durable restore event without admitting a new
+    /// transaction or a pre-publication intent. Validation runs under the
+    /// exclusive identity lease before a pending sentinel can be published.
+    @discardableResult
+    public func resumePublishedManualBackupRestore(
+        transactionIdentifier: UUID,
+        validatingInstalled: @escaping (BigSyncManualBackupRestoreReceipt) throws -> Void
+    ) throws -> BigSyncManualBackupRestoreReceipt {
+        try withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {},
+            rollback: {},
+            sentinelPublisher: nil,
+            publishedReceiptValidation: validatingInstalled
+        )
+    }
+
     /// Test seam for the event-before-sentinel crash prefix. Production always
     /// uses BackupDetection's atomic excluded-sentinel publisher.
     func withManualBackupRestore(
@@ -506,7 +523,8 @@ public struct BigSyncClientIdentity: Sendable {
         validation: (() throws -> Void)? = nil,
         _ replacement: () throws -> Void,
         rollback: () throws -> Void = {},
-        sentinelPublisher: ((URL, FileManager) throws -> Void)?
+        sentinelPublisher: ((URL, FileManager) throws -> Void)?,
+        publishedReceiptValidation: ((BigSyncManualBackupRestoreReceipt) throws -> Void)? = nil
     ) throws -> BigSyncManualBackupRestoreReceipt {
         guard !BigSyncReplicaPublicationReadScope.isActive else {
             throw BigSyncReplicaPublicationError.reentrantPublication
@@ -534,6 +552,15 @@ public struct BigSyncClientIdentity: Sendable {
                 throw BigSyncManualBackupRestoreError.transactionMismatch
             } catch BackupDetection.Error.manualRestoreStateAmbiguous {
                 throw BigSyncManualBackupRestoreError.stateAmbiguous
+            }
+
+            if let publishedReceiptValidation {
+                switch preflight {
+                case .completed(let receipt), .resumeEvent(let receipt):
+                    try publishedReceiptValidation(makeManualRestoreReceipt(receipt))
+                case .newTransaction, .resumeIntent:
+                    throw BigSyncManualBackupRestoreError.stateAmbiguous
+                }
             }
 
             switch preflight {

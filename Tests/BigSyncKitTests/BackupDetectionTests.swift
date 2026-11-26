@@ -812,6 +812,56 @@ final class BackupDetectionTests: XCTestCase {
         )
     }
 
+    func testPublishedRestoreResumeRequiresDurableEventAndValidatesBeforeSentinel() throws {
+        struct InvalidInstalledGeneration: Error {}
+
+        let identity = BigSyncClientIdentity(
+            synchronizerName: "published-restore-installed-validation",
+            containerName: "container",
+            recordZoneID: CKRecordZone.ID(zoneName: "zone", ownerName: CKCurrentUserDefaultName),
+            sharedStateBaseURL: temporaryRoot()
+        )
+        let oldInstallation = try identity.prepareInstallation()
+        let transactionIdentifier = UUID()
+        XCTAssertThrowsError(try identity.resumePublishedManualBackupRestore(
+            transactionIdentifier: transactionIdentifier
+        ) { _ in XCTFail("No event means there is no installed generation to validate") }) { error in
+            XCTAssertEqual(error as? BigSyncManualBackupRestoreError, .stateAmbiguous)
+        }
+        XCTAssertEqual(identity.currentInstallationIdentifier(), oldInstallation)
+
+        var publishedReceipt: BigSyncManualBackupRestoreReceipt?
+        XCTAssertThrowsError(try identity.withManualBackupRestore(
+            transactionIdentifier: transactionIdentifier,
+            {},
+            sentinelPublisher: { _, _ in throw CocoaError(.fileWriteUnknown) }
+        )) { error in
+            guard let restoreError = error as? BigSyncManualBackupRestoreError,
+                  case .handoffPending(let receipt) = restoreError else {
+                return XCTFail("Expected a durable event before sentinel publication")
+            }
+            publishedReceipt = receipt
+        }
+        let expected = try XCTUnwrap(publishedReceipt)
+        XCTAssertThrowsError(try identity.resumePublishedManualBackupRestore(
+            transactionIdentifier: transactionIdentifier
+        ) { receipt in
+            XCTAssertEqual(receipt, expected)
+            throw InvalidInstalledGeneration()
+        }) { error in
+            XCTAssertTrue(error is InvalidInstalledGeneration)
+        }
+        XCTAssertNil(identity.currentInstallationIdentifier(), "Failed validation must leave the identity fenced")
+
+        let resumed = try identity.resumePublishedManualBackupRestore(
+            transactionIdentifier: transactionIdentifier
+        ) { receipt in
+            XCTAssertEqual(receipt, expected)
+        }
+        XCTAssertEqual(resumed, expected)
+        XCTAssertEqual(identity.currentInstallationIdentifier(), expected.newInstallationIdentifier)
+    }
+
     func testPeerInstallationCannotOpenReplacementUnderOldIdentity() throws {
         let base = temporaryRoot()
         let identity = BigSyncClientIdentity(
